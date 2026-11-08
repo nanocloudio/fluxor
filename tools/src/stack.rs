@@ -40,7 +40,7 @@
 //!
 //! ```yaml
 //! include:
-//!   - stack: sealed_volume        # a stack name, or a file path
+//!   - stack: sealed_volume        # a stack name, a file path, or "@<bound>"
 //!     as: data                    # modules become data_disk, data_seal
 //!     params: { image: data.img }
 //! wiring:
@@ -49,7 +49,10 @@
 //! ```
 //!
 //! A `workloads:` entry takes an `include:` of its own, expanded the same
-//! way into the workload's own `modules:` and `wiring:`.
+//! way into the workload's own `modules:` and `wiring:`. A bound include,
+//! `stack: "@<name>"`, names what the graph needs rather than who provides
+//! it: the project binds the name to a stack under `fluxor.toml`'s
+//! `[uses.stacks]`, and the include then resolves as that stack's name does.
 //!
 //! Expansion runs on the parsed graph before every other pass — ahead of
 //! platform stack expansion and placement — so everything downstream sees
@@ -530,15 +533,24 @@ impl Stack {
             .collect()
     }
 
-    /// Each module's effective type (`type:`, else its name), deduplicated.
-    pub fn module_types(&self) -> BTreeSet<String> {
+    /// Each module's artifact and type, deduplicated: the type for the
+    /// default variant, `<type>-<variant>` for a module that names one —
+    /// the artifact a build resolves for it (a named variant never falls
+    /// back to the bare type). `variant:` is an identity key, never a
+    /// param, so the artifacts are known without rendering.
+    pub fn module_artifacts(&self) -> BTreeSet<(String, String)> {
         self.modules
             .iter()
             .filter_map(|m| {
-                m.get("type")
+                let ty = m
+                    .get("type")
                     .and_then(|t| t.as_str())
-                    .or_else(|| m.get("name").and_then(|n| n.as_str()))
-                    .map(str::to_string)
+                    .or_else(|| m.get("name").and_then(|n| n.as_str()))?;
+                let artifact = match m.get("variant").and_then(|v| v.as_str()) {
+                    Some(v) => format!("{ty}-{v}"),
+                    None => ty.to_string(),
+                };
+                Some((artifact, ty.to_string()))
             })
             .collect()
     }
@@ -769,9 +781,44 @@ pub struct IncludeContext<'a> {
 }
 
 /// Is an include's `stack:` value a file path rather than a store name?
-/// A stack name has no `/` and no extension, so either marks a path.
+/// A stack name has no `/` and no extension, so either marks a path. A
+/// bound name ([`bound_name`]) is tested first, so `@name` is never a
+/// file; a stack file whose name begins with `@` is written `./@….yaml`.
 fn is_path_reference(r: &str) -> bool {
     r.contains('/') || r.ends_with(".yaml") || r.ends_with(".yml")
+}
+
+/// The bound name an include's `stack: "@<name>"` names, or `None` for a
+/// stack name or a path. The project binds it to a stack under
+/// `fluxor.toml::[uses.stacks]`.
+pub fn bound_name(reference: &str) -> Option<&str> {
+    reference.strip_prefix('@')
+}
+
+/// The stack `project_root` binds `name` to under `[uses.stacks]`, or the
+/// refusal naming the line that would bind it.
+pub fn resolve_binding(name: &str, project_root: &Path) -> std::result::Result<String, String> {
+    if !is_stack_name(name) {
+        return Err(format!(
+            "`@{name}` is not a bound name — the name after `@` follows the stack-name rule \
+             ([a-z][a-z0-9_-]*, at most {MAX_NAME_BYTES} bytes); a stack file whose name \
+             begins with `@` is written `./@….yaml`"
+        ));
+    }
+    let bound = crate::project::bound_stacks(project_root)?;
+    bound
+        .get(name)
+        .cloned()
+        .ok_or_else(|| unbound(name, project_root))
+}
+
+/// An unbound name's refusal: the line to add, and where.
+pub fn unbound(name: &str, project_root: &Path) -> String {
+    format!(
+        "`{name}` is not bound — add `{name} = \"<stack>\"` under [uses.stacks] in {} and \
+         run `fluxor update`",
+        project_root.join("fluxor.toml").display()
+    )
 }
 
 /// One expanded include.
@@ -952,7 +999,21 @@ fn expand_scope(
             }
         };
 
-        let stack = load(reference, ctx).map_err(|e| format!("{at}: {e}"))?;
+        // A bound include names its binding and the stack it resolved to
+        // in every error past this point.
+        let (stack, at) = match bound_name(reference) {
+            Some(b) => {
+                let name =
+                    resolve_binding(b, ctx.project_root).map_err(|e| format!("{at}: {e}"))?;
+                let at = format!("include '{alias}' (`{reference}`, bound to stack '{name}')");
+                let stack = load(&name, Some(b), ctx).map_err(|e| format!("{at}: {e}"))?;
+                (stack, at)
+            }
+            None => (
+                load(reference, None, ctx).map_err(|e| format!("{at}: {e}"))?,
+                at,
+            ),
+        };
         let values = resolve_values(&stack.params, &supplied, ctx.graph_dir, ctx.params)
             .map_err(|e| format!("{at}: {e}"))?;
         let (modules, wiring) = stack.render(&values).map_err(|e| format!("{at}: {e}"))?;
@@ -1192,8 +1253,14 @@ fn renumber_groups(
 
 /// Load the stack an include names: a file relative to the graph; or, by
 /// name, the project's own `packaging/stack/<name>.yaml`, else the store
-/// stack its `fluxor.lock` pins under that name.
-fn load(reference: &str, ctx: &IncludeContext<'_>) -> std::result::Result<Stack, String> {
+/// stack its `fluxor.lock` pins under that name. `binding` is the bound
+/// name a `stack: "@<name>"` include resolved `reference` through, named
+/// in the refusal when the stack is not pinned.
+fn load(
+    reference: &str,
+    binding: Option<&str>,
+    ctx: &IncludeContext<'_>,
+) -> std::result::Result<Stack, String> {
     let read_file = |path: &Path| {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("read stack {}: {e}", path.display()))?;
@@ -1217,10 +1284,20 @@ fn load(reference: &str, ctx: &IncludeContext<'_>) -> std::result::Result<Stack,
         .unwrap_or_default();
     let pinned: Vec<&Artifact> = lock.artifacts.iter().filter(|a| a.kind == KIND).collect();
     let Some(entry) = pinned.iter().find(|a| a.name == reference) else {
+        let (what, how) = match binding {
+            Some(b) => (
+                format!("stack '{reference}' (bound to `@{b}` under [uses.stacks])"),
+                "`fluxor update` pins every bound stack from the project index that publishes it",
+            ),
+            None => (
+                format!("stack '{reference}'"),
+                "`fluxor update` pins every stack a graph includes by name from the dependency \
+                 that publishes it",
+            ),
+        };
         return Err(format!(
-            "stack '{reference}' is neither this project's own ({}) nor pinned in {} \
-             (pinned stacks: {}) — `fluxor update` pins every stack a graph includes by name \
-             from the dependency that publishes it",
+            "{what} is neither this project's own ({}) nor pinned in {} (pinned stacks: {}) \
+             — {how}",
             own.display(),
             store_resolve::lockfile_path(ctx.project_root).display(),
             if pinned.is_empty() {
@@ -1374,9 +1451,10 @@ pub fn read_pinned(store: &OciStore, e: &Artifact) -> Result<PinnedStack> {
     Ok(PinnedStack { text, modules })
 }
 
-/// The module artifacts a stack composes, per target, resolved through
-/// the publishing project: its own published modules first, then the
-/// module pins of its `fluxor.lock`. A kernel built-in has no artifact and
+/// The module artifacts a stack composes, per target — each module's
+/// variant artifact when it names one ([`Stack::module_artifacts`]) —
+/// resolved through the publishing project: its own published modules
+/// first, then the module pins of its `fluxor.lock`. A kernel built-in has no artifact and
 /// is carried by every runtime. A module that resolves neither way is
 /// refused: the stack would name a module no consumer could find.
 pub fn module_references(
@@ -1398,16 +1476,16 @@ pub fn module_references(
         .collect();
     let mut out = Vec::new();
     let mut missing = Vec::new();
-    for ty in stack.module_types() {
-        let mine: Vec<&Artifact> = own.iter().filter(|a| a.name == ty).collect();
+    for (artifact, ty) in stack.module_artifacts() {
+        let mine: Vec<&Artifact> = own.iter().filter(|a| a.name == artifact).collect();
         let found: Vec<&Artifact> = if mine.is_empty() {
-            pins.iter().filter(|a| a.name == ty).collect()
+            pins.iter().filter(|a| a.name == artifact).collect()
         } else {
             mine
         };
         if found.is_empty() {
             if !crate::modules::is_builtin_module(&ty) {
-                missing.push(ty);
+                missing.push(artifact);
             }
             continue;
         }
@@ -1576,10 +1654,11 @@ pub fn check_publishable(path: &Path, project_root: &Path) -> Result<String> {
         .map(|a| a.name)
         .collect();
     let missing: Vec<String> = stack
-        .module_types()
+        .module_artifacts()
         .into_iter()
-        .filter(|t| !own.contains(t) && !pinned.contains(t))
-        .filter(|t| !crate::modules::is_builtin_module(t))
+        .filter(|(artifact, ty)| !own.contains(ty) && !pinned.contains(artifact))
+        .filter(|(_, ty)| !crate::modules::is_builtin_module(ty))
+        .map(|(artifact, _)| artifact)
         .collect();
     if !missing.is_empty() {
         return Err(Error::Config(format!(
@@ -2638,10 +2717,49 @@ wiring:
     fn the_check_render_uses_defaults_and_examples() {
         let s = Stack::parse(VOLUME).unwrap();
         s.check_render(Path::new(".")).unwrap();
+        let artifacts: Vec<String> = s.module_artifacts().into_iter().map(|(a, _)| a).collect();
+        assert_eq!(artifacts, ["crypt_block", "file_block"]);
+    }
+
+    /// A module that names a variant composes that variant's artifact,
+    /// `<type>-<variant>`, and the stack records and pins that one: a
+    /// consumer pinning only the bare type would build with whatever
+    /// variant happens to be on disk.
+    #[test]
+    fn a_variant_module_is_referenced_by_its_variant_artifact() {
+        let s = Stack::parse(&VOLUME.replace(
+            "    type: crypt_block\n",
+            "    type: crypt_block\n    variant: slim\n",
+        ))
+        .unwrap();
         assert_eq!(
-            s.module_types().into_iter().collect::<Vec<_>>(),
-            ["crypt_block", "file_block"]
+            s.module_artifacts().into_iter().collect::<Vec<_>>(),
+            [
+                ("crypt_block-slim".to_string(), "crypt_block".to_string()),
+                ("file_block".to_string(), "file_block".to_string()),
+            ]
         );
+
+        // Resolved through the publisher's pins: the variant artifact, not
+        // the bare type it is a variant of.
+        let sb = Sandbox::new();
+        let store = OciStore::open(sb.path().join("store")).unwrap();
+        let pins = vec![
+            module_ref(&store, "crypt_block", "storage"),
+            module_ref(&store, "crypt_block-slim", "storage"),
+            module_ref(&store, "file_block", "storage"),
+        ];
+        store_resolve::write_store_lock(sb.path(), &pins).unwrap();
+        let refs = module_references(&s, sb.path(), "publisher", &store).unwrap();
+        let names: Vec<&str> = refs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["crypt_block-slim", "file_block"]);
+
+        // A variant nobody publishes is named as the artifact it would be.
+        store_resolve::write_store_lock(sb.path(), &pins[..1]).unwrap();
+        let e = module_references(&s, sb.path(), "publisher", &store)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("composes crypt_block-slim, file_block"), "{e}");
     }
 
     // ── store-pinned includes ──────────────────────────────────────────
@@ -2760,6 +2878,109 @@ wiring:
         let w = &graph["workloads"][0];
         assert_eq!(module(w, "data_disk")["path"], "w.img");
         assert!(edges(w).contains(&("data_seal.blocks".into(), "fs.blocks".into())));
+    }
+
+    /// `stack: "@<name>"` resolves through the project's `[uses.stacks]`
+    /// to a stack name, then on the path a name takes: the project's own
+    /// packaged stack, else the pinned store stack. Every refusal past the
+    /// binding names it and the stack it resolved to.
+    #[test]
+    fn a_bound_include_resolves_through_the_projects_binding() {
+        let sb = Sandbox::new();
+        let store_root = sb.path().join("store");
+        let store = OciStore::open(store_root.clone()).unwrap();
+        let disk = module_ref(&store, "file_block", "storage");
+        let seal = module_ref(&store, "crypt_block", "storage");
+        publish_stack(&store, "storage", VOLUME, &[disk, seal]);
+        let graph = |stack: &str, params: Value| {
+            json!({
+                "include": [{"stack": stack, "as": "data", "params": params}],
+                "modules": [{"name": "fs", "type": "fat32"}],
+                "wiring": [{"from": "data.blocks", "to": "fs.blocks"}],
+            })
+        };
+        let toml = sb.path().join("fluxor.toml");
+
+        // Unbound: the line to add, and where.
+        std::fs::write(&toml, "[project]\nname = \"app\"\nversion = \"0\"\n").unwrap();
+        let e = sb
+            .expand_with_store(
+                &mut graph("@disk", json!({"image": "d.img"})),
+                Some(&store_root),
+            )
+            .unwrap_err();
+        assert!(
+            e.starts_with("include 'data' (`@disk`): `disk` is not bound"),
+            "{e}"
+        );
+        assert!(
+            e.contains("add `disk = \"<stack>\"` under [uses.stacks] in")
+                && e.contains("fluxor.toml and run `fluxor update`"),
+            "{e}"
+        );
+        // `@` is tested before the path rule: `@x/y` is no file.
+        let e = sb
+            .expand_with_store(&mut graph("@x/y.yaml", json!({})), Some(&store_root))
+            .unwrap_err();
+        assert!(e.contains("`@x/y.yaml` is not a bound name"), "{e}");
+
+        // Bound but not pinned: load's refusal, naming the binding too.
+        std::fs::write(
+            &toml,
+            "[project]\nname = \"app\"\nversion = \"0\"\n\n[uses.stacks]\ndisk = \"volume\"\n",
+        )
+        .unwrap();
+        let e = sb
+            .expand_with_store(
+                &mut graph("@disk", json!({"image": "d.img"})),
+                Some(&store_root),
+            )
+            .unwrap_err();
+        assert!(
+            e.contains(
+                "include 'data' (`@disk`, bound to stack 'volume'): stack 'volume' (bound \
+                        to `@disk` under [uses.stacks]) is neither this project's own"
+            ),
+            "{e}"
+        );
+        assert!(e.contains("`fluxor update` pins every bound stack"), "{e}");
+
+        // Pinned: expands exactly as an include by name.
+        let desc = store.resolve("stack/volume:0.1.0").unwrap();
+        let artifact = store_resolve::artifact_from_descriptor(&desc)
+            .unwrap()
+            .unwrap();
+        pin(sb.path(), &store, &artifact).unwrap();
+        let mut g = graph("@disk", json!({"image": "d.img"}));
+        sb.expand_with_store(&mut g, Some(&store_root)).unwrap();
+        assert_eq!(module(&g, "data_disk")["path"], "d.img");
+        assert_eq!(module(&g, "data_disk")["type"], "file_block");
+        assert!(edges(&g).contains(&("data_seal.blocks".into(), "fs.blocks".into())));
+
+        // A misfit include is the composer's refusal, prefixed with the
+        // binding and the stack it resolved to.
+        let e = sb
+            .expand_with_store(
+                &mut graph("@disk", json!({"imag": "d.img"})),
+                Some(&store_root),
+            )
+            .unwrap_err();
+        assert!(
+            e.starts_with("include 'data' (`@disk`, bound to stack 'volume'): "),
+            "{e}"
+        );
+        assert!(e.contains("imag"), "{e}");
+
+        // A binding to the project's own stack resolves to its file.
+        std::fs::create_dir_all(sb.path().join("packaging/stack")).unwrap();
+        std::fs::write(
+            sb.path().join("packaging/stack/volume.yaml"),
+            VOLUME.replace("crypt_block", "own_seal"),
+        )
+        .unwrap();
+        let mut g = graph("@disk", json!({"image": "d.img"}));
+        sb.expand_with_store(&mut g, Some(&store_root)).unwrap();
+        assert_eq!(module(&g, "data_seal")["type"], "own_seal");
     }
 
     #[test]

@@ -475,24 +475,23 @@
   </div>
 
   <!-- Mount-aware bootstrap.
-       The synthesiser may mount this shell at any URL prefix:
-         pure-wasm scenarios → /
-         split scenarios (via on:-binding) → /viewer (or any user prefix)
-       Both `host_shims.js` and `scenario.json` are siblings of this
-       page on whichever prefix is in use. We compute the base path
-       from window.location once and use it for every dependent fetch.
-       Computing dynamically (rather than baking absolute paths into
-       the HTML at synthesis time) keeps runtime.html byte-identical
-       across scenarios so the host-FS route can serve the same file
-       in every deployment. -->
+       The host may serve this shell under any URL prefix: a `serve:`
+       binding's `prefix` (`/` by default, `/viewer` or any other when a
+       scenario serves several components). `host_shims.js`,
+       `scenario.json`, `fluxor-manifest.json` and each `list:` binding's
+       directory sit beside this page under that prefix. The base path is
+       computed from window.location once and used for every dependent
+       fetch, and set as the document's <base> so a relative key the
+       kernel fetches (a manifest key is one) resolves beside the page
+       too, even when the page is reached as `/viewer` without its
+       trailing slash. Computing it here, rather than baking it into the
+       page, keeps the shell one file for every scenario. -->
   <script type="module">
     function computeFluxorBase() {
       // Three mount shapes to handle:
-      //   /            → base /            (pure-wasm)
-      //   /viewer      → base /viewer/     (split — http module's
-      //                                     implicit prefix-match
-      //                                     serves both /viewer and
-      //                                     /viewer/<file>)
+      //   /            → base /            (served at the root)
+      //   /viewer      → base /viewer/     (a directory reached without
+      //                                     its trailing slash)
       //   /index.html  → base /            (file-like last segment)
       const p = window.location.pathname;
       if (p.endsWith('/')) return p;
@@ -505,6 +504,11 @@
       return p + '/';
     }
     window.__fluxorBase = computeFluxorBase();
+    {
+      const base = document.createElement('base');
+      base.href = window.__fluxorBase;
+      document.head.prepend(base);
+    }
 
     function loadHostShims(base) {
       return new Promise((resolve, reject) => {
@@ -724,7 +728,7 @@
     // ---------------------------------------------------------------
     // Scenario introspection
     //
-    // The scenario synthesiser auto-mounts `/scenario.json` with the
+    // The scenario synthesiser writes `scenario.json` beside this page with the
     // active wasm component's metadata: scenario name, the
     // `presentation:` block (surfaces + layout), bundle URL, playlist
     // source. The shell composes the DOM from this then drives the
@@ -982,8 +986,9 @@
     // ---------------------------------------------------------------
     // Playlist + navigation
     //
-    // Reads /api/list, filters by extension class, builds URLs that
-    // hit the dual-mode FS_LIST file-serve. Per-role nav:
+    // Reads the `list:` binding's files from `fluxor-manifest.json`,
+    // filters them by extension class, and plays them in key order.
+    // Per-role nav:
     // display surfaces use single-click = next / double-click = prev;
     // player surfaces use single-click = play/pause, double-click =
     // next.
@@ -995,15 +1000,23 @@
       any:   /./,
     };
 
+    // The playlist is the `list:` binding's files, read from
+    // `fluxor-manifest.json` (the synth-time snapshot the `storage.namespace`
+    // provider also reads): every key under `spec.source` is a file served
+    // at `<key>` beside this page.
     async function loadPlaylist(spec) {
       try {
-        const r = await fetch(spec.source);
+        const r = await fetch(window.__fluxorBase + 'fluxor-manifest.json');
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const j = await r.json();
+        const entries = await r.json();
+        const under = spec.source.replace(/^\/+|\/+$/g, '') + '/';
         const filter = EXT_FILTERS[spec.filter] || EXT_FILTERS.any;
-        const names = (j.items || []).filter(n => filter.test(n));
-        if (!names.length) throw new Error('list empty');
-        const urls = names.map(n => `${spec.source}/${n}`);
+        const keys = (Array.isArray(entries) ? entries : [])
+          .map(e => e && e.key)
+          .filter(k => typeof k === 'string' && k.startsWith(under) && filter.test(k))
+          .sort();
+        if (!keys.length) throw new Error('list empty');
+        const urls = keys.map(k => window.__fluxorBase + k);
         append(`[playlist] ${spec.source} → ${urls.length} entries`, 'info');
         return urls;
       } catch (err) {
@@ -1292,9 +1305,9 @@
     //   1. The bundle's embedded asset bank (`fluxor.assets` custom
     //      section) — preferred when present because it's self-
     //      contained and has no network dependency.
-    //   2. `scenario.playlist.source` HTTP listing — the classic
-    //      path; used by scenarios that mount a host-FS gallery via
-    //      a `list:` binding.
+    //   2. `scenario.playlist.source` — the keys under that path in
+    //      `fluxor-manifest.json`; used by scenarios that serve a host
+    //      directory through a `list:` binding.
     //   3. Empty — single-asset / headless scenarios fall through
     //      to a boot with no asset URL.
     //

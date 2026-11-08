@@ -247,11 +247,13 @@ wiring:
 An include entry carries `stack`, `as`, and optionally `params` and
 `node`; any other key is refused.
 
-- **`stack`** is a file path when it contains `/` or ends in `.yaml` or
-  `.yml`, and is resolved against the including graph's directory. This is
-  how tests and examples include fixtures. Otherwise it is a stack name:
-  the project's own `packaging/stack/<name>.yaml`, else the stack its
-  `fluxor.lock` pins under that name ([References](#references)).
+- **`stack`** is a bound name when it begins with `@`
+  ([Bound names](#bound-names)). Otherwise it is a file path when it
+  contains `/` or ends in `.yaml` or `.yml`, and is resolved against the
+  including graph's directory. This is how tests and examples include
+  fixtures. Otherwise it is a stack name: the project's own
+  `packaging/stack/<name>.yaml`, else the stack its `fluxor.lock` pins
+  under that name ([References](#references)).
 - **`as`** is `[a-z][a-z0-9_]*`. It names the instance. It must differ from
   every other include's `as` and from every module name.
 - **`params`** binds values. Every value is held to its declaration: an
@@ -267,6 +269,47 @@ An include entry carries `stack`, `as`, and optionally `params` and
   other text is a string. The forward is checked when the graph is read and
   when a bundle carrying it is emitted.
 - **`node`** places the whole include (see [Placement](#placement)).
+
+### Bound names
+
+A graph that needs a capability another project provides (an HTTP
+client, a file server, a store) names what it needs rather than who
+provides it:
+
+```yaml
+include:
+  - stack: "@http_client"
+    as: web
+    params: { protocol: 0 }
+```
+
+The project the graph belongs to says which stack fills the name, in
+`fluxor.toml`:
+
+```toml
+[uses.stacks]
+http_client = "client_stack"     # bound name = stack name
+```
+
+The name after `@` follows the stack-name rule, and the `@` is tested
+before the path rule, so `@name` is never a file (a stack file whose
+name begins with `@` is written `./@….yaml`). Everything else about the
+include is unchanged: `as`, `params`, `node` and wiring to
+`<as>.<export>`. A bound include may appear wherever an include by name
+may, in a graph's `include:` and in a workload's.
+
+At expansion the bound name resolves through the project's
+`[uses.stacks]`, never through the environment, then takes the path a
+stack name takes: a value naming one of the project's own stacks
+resolves to its `packaging/stack/<name>.yaml`, else to the stack
+`fluxor.lock` pins. An unbound name is refused, naming the line to add;
+every error past the binding names the include, the bound name and the
+stack it resolved to. A bound name means "a stack whose params and exports
+fit this include": the composer holds the stack to the include as it holds
+any stack, so a provider may declare more params, each with a default, and
+more exports. Whoever writes the include documents the name; the CLI
+documents the one it uses, `@file_server`
+([wasm_browser_host.md](wasm_browser_host.md#serving)).
 
 ## Expansion
 
@@ -485,6 +528,23 @@ name no dependency publishes, or two do, is refused, naming them; a pinned
 document that names a stack other than the one its tag names is refused.
 A project's own stacks are never pinned: a name the project ships resolves
 to its `packaging/stack/<name>.yaml`.
+
+Every `[uses.stacks]` value is a reference too, whether or not a graph
+uses it, because a CLI verb's graph is not a file in the project. It is
+pinned the same way — the stack entry and its module references, every
+target it carries — with one difference: its publisher need not be a
+dependency. A bound stack resolves among every project index in the
+store, so a binding pins one stack and its modules rather than its
+publisher's whole module set; none publishing it, or more than one, is
+refused, naming the binding. A stack both bound and included by name is
+resolved once, the bound way. An `@name` in a graph the project versions
+that `[uses.stacks]` does not bind refuses the update, naming the graph.
+
+`fluxor update` holds the set it writes to one epoch, as `fluxor sync`
+does, and names the binding an offending pin came from. In live
+workspace mode the publisher of each stack a member's lock pins orders
+`fluxor workspace publish` and the staleness report, as a dependency
+does.
 
 The build reads a pinned stack from the store by its digest, verifying it,
 and refuses one that composes a module the lockfile does not pin for that

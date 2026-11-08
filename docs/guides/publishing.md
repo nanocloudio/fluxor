@@ -102,8 +102,9 @@ to the project index as `stack/<name>:<version>`. See
 A consumer never pins a stack or a bundle by hand: a graph that includes a
 stack by name, and a bundle listed under `[uses] bundles`, are references,
 and `fluxor update` pins each from the dependency that publishes it (with a
-stack's module references); an update pins exactly the references the
-project makes.
+stack's module references); a stack bound under `[uses.stacks]` is pinned
+from whichever project index publishes it; an update pins exactly the
+references the project makes.
 
 A workload that brings its own modules is published the same way, on its
 own. `fluxor build <graph> --emit=workload --output <dir>` takes the graph's

@@ -490,20 +490,30 @@ pub(crate) fn resolve_dependency(
 pub struct References {
     /// Every `include[].stack` name in a graph the project versions — the
     /// graph's own and its `workloads[].include` — other than the
-    /// project's own `packaging/stack/<name>.yaml`.
+    /// project's own `packaging/stack/<name>.yaml` and other than a stack
+    /// it also binds (that one resolves once, the bound way).
     pub stacks: BTreeSet<String>,
+    /// `fluxor.toml::[uses.stacks]`, bound name → stack, other than a
+    /// binding to the project's own packaged stack. A binding is a
+    /// reference whether or not a graph uses it: a CLI verb's graph is no
+    /// file `references` can see.
+    pub bound: BTreeMap<String, String>,
     /// `fluxor.toml::[uses] bundles`, other than the project's own
     /// `packaging/` bundles.
     pub bundles: BTreeSet<String>,
 }
 
 /// What this project references by name: every stack a graph it versions
-/// includes by name (a file path is not a reference), and every bundle its
-/// `[uses] bundles` declares. Its own packaged stacks and bundles resolve
-/// to themselves and are not references. A nested project's graphs are its
-/// own.
+/// includes by name (a file path is not a reference), every stack its
+/// `[uses.stacks]` binds, and every bundle its `[uses] bundles` declares.
+/// Its own packaged stacks and bundles resolve to themselves and are not
+/// references. A nested project's graphs are its own. A graph's
+/// `stack: "@<name>"` with no `[uses.stacks]` entry is refused here,
+/// naming the graph, so an unbound name is found when the pins are
+/// written rather than at the first composition.
 pub fn references(project_root: &Path) -> Result<References> {
     let mut refs = References::default();
+    let bindings = crate::project::bound_stacks(project_root).map_err(Error::Config)?;
     for rel in crate::project::tracked_files(project_root, &["*.yaml", "*.yml"]) {
         let path = project_root.join(&rel);
         if !crate::project::is_own_file(project_root, &path) {
@@ -527,13 +537,31 @@ pub fn references(project_root: &Path) -> Result<References> {
             .filter_map(serde_yaml::Value::as_sequence)
             .flatten();
         for inc in includes {
-            if let Some(name) = inc.get("stack").and_then(serde_yaml::Value::as_str) {
-                if crate::stack::is_stack_name(name)
-                    && !crate::packaging::stack_path(project_root, name).is_file()
-                {
-                    refs.stacks.insert(name.to_string());
+            let Some(name) = inc.get("stack").and_then(serde_yaml::Value::as_str) else {
+                continue;
+            };
+            if let Some(bound) = crate::stack::bound_name(name) {
+                if let Err(why) = crate::stack::resolve_binding(bound, project_root) {
+                    let alias = inc
+                        .get("as")
+                        .and_then(serde_yaml::Value::as_str)
+                        .unwrap_or("?");
+                    return Err(Error::Config(format!(
+                        "{}: include '{alias}' (`{name}`): {why}",
+                        path.display()
+                    )));
                 }
+            } else if crate::stack::is_stack_name(name)
+                && !crate::packaging::stack_path(project_root, name).is_file()
+            {
+                refs.stacks.insert(name.to_string());
             }
+        }
+    }
+    for (bound, stack) in bindings {
+        if !crate::packaging::stack_path(project_root, &stack).is_file() {
+            refs.stacks.remove(&stack);
+            refs.bound.insert(bound, stack);
         }
     }
     for name in crate::project::used_bundles(project_root).map_err(Error::Config)? {
@@ -581,16 +609,73 @@ fn find_reference<'a>(
     }
 }
 
-/// Pin every reference: each stack with the module references it carries,
-/// and each bundle, from the dependency that publishes it, into `out`.
+/// The one stack named `stack` among every project index in the store,
+/// for the bindings `via` that name it, or a refusal: none publishes it,
+/// or more than one does. A bound stack resolves outside `[dependencies]`
+/// — declaring its publisher would pin the publisher's whole module set,
+/// which a binding exists to avoid. Publishing refuses a stack name
+/// another project holds, but a store can still come to hold two (indexes
+/// pulled from different registries), so the matches are counted, never
+/// guessed between.
+fn find_bound<'a>(
+    indexes: &'a [(String, Vec<Artifact>)],
+    stack: &str,
+    via: &[&str],
+) -> Result<&'a Artifact> {
+    let found: Vec<(&str, &Artifact)> = indexes
+        .iter()
+        .flat_map(|(p, arts)| arts.iter().map(move |a| (p.as_str(), a)))
+        .filter(|(_, a)| a.kind == crate::stack::KIND && a.name == stack)
+        .collect();
+    let bindings = via
+        .iter()
+        .map(|b| format!("`{b} = \"{stack}\"`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match found.as_slice() {
+        [(_, a)] => Ok(a),
+        [] => Err(Error::Config(format!(
+            "[uses.stacks] {bindings}: no project index in the store publishes stack \
+             '{stack}' ({} index(es) searched) — publish it from its project, or bind \
+             another stack",
+            indexes.len()
+        ))),
+        many => Err(Error::Config(format!(
+            "[uses.stacks] {bindings}: stack '{stack}' is published by more than one project \
+             ({}); stack names are unique across the ecosystem — one of them must rename it",
+            many.iter().map(|(p, _)| *p).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+/// Every project index in the store but `me`'s own (its stacks resolve
+/// from its `packaging/`).
+fn every_index(store: &OciStore, me: Option<&str>) -> Result<Vec<(String, Vec<Artifact>)>> {
+    let mut out = Vec::new();
+    for project in store.project_indexes()? {
+        if Some(project.as_str()) == me {
+            continue;
+        }
+        let arts = dependency_index(store, &project)?;
+        out.push((project, arts));
+    }
+    Ok(out)
+}
+
+/// Pin every reference into `out`: each stack with the module references
+/// it carries, and each bundle, from the dependency that publishes it;
+/// each bound stack, with its module references, from whichever project
+/// index publishes it. Returns, for each digest a binding pinned, the
+/// bindings it was pinned for, so a later refusal can name them.
 fn pin_references(
     project_root: &Path,
     store: &OciStore,
     refs: &References,
     out: &mut Vec<Artifact>,
-) -> Result<()> {
-    if refs.stacks.is_empty() && refs.bundles.is_empty() {
-        return Ok(());
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut via: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if refs.stacks.is_empty() && refs.bundles.is_empty() && refs.bound.is_empty() {
+        return Ok(via);
     }
     let mut indexes = Vec::new();
     for dep in crate::project::dependencies(project_root).map_err(Error::Config)? {
@@ -610,7 +695,27 @@ fn pin_references(
         fill_content(store, std::slice::from_mut(&mut bundle));
         out.push(bundle);
     }
-    Ok(())
+    if refs.bound.is_empty() {
+        return Ok(via);
+    }
+    // Bound name(s) per stack: two names may bind one stack, which is
+    // pinned once.
+    let mut by_stack: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (bound, stack) in &refs.bound {
+        by_stack.entry(stack).or_default().push(bound);
+    }
+    let all = every_index(store, me.as_deref())?;
+    for (name, bindings) in by_stack {
+        let stack = find_bound(&all, name, &bindings)?.clone();
+        let held: BTreeSet<String> = out.iter().map(|a| a.digest.clone()).collect();
+        crate::stack::derived_pins(store, &stack, out, me.as_deref())?;
+        for a in out.iter().filter(|a| !held.contains(&a.digest)) {
+            via.entry(a.digest.clone())
+                .or_default()
+                .extend(bindings.iter().map(|b| format!("@{b}")));
+        }
+    }
+    Ok(via)
 }
 
 /// Resolve every declared `[dependencies]` project against the store's
@@ -645,8 +750,21 @@ pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()
             let mut out = resolve_project(project_root)?;
             let refs = references(project_root)?;
             let store = OciStore::open(crate::oci_store::store_root()?)?;
-            pin_references(project_root, &store, &refs, &mut out)?;
+            let via = pin_references(project_root, &store, &refs, &mut out)?;
             sort_entries(&mut out);
+            // The homogeneity rule `fluxor sync` holds the set to, checked
+            // before the set is written, so a set spanning two epochs is
+            // refused here — naming the binding a pin came from — rather
+            // than written and refused at the next sync. Currency (a live
+            // member at the checkout's epoch) stays sync's: update pins
+            // published state.
+            check_epoch_via(
+                &out,
+                &store,
+                &BTreeMap::new(),
+                &via,
+                "publish the project at the older epoch again, then `fluxor update`",
+            )?;
             out
         }
         Some(name) => {
@@ -887,9 +1005,8 @@ pub fn current_epoch_hex(live_projects: &BTreeMap<String, PathBuf>) -> Result<St
 ///
 /// 1. **Homogeneity, for everyone**: every artifact must carry the
 ///    same `io.fluxor.abi-surface`; a mixed set is a hard error naming
-///    `fluxor update`. An artifact with NO epoch annotation
-///    (pre-cutover publish) is a hard error naming `fluxor publish`
-///    in its producer.
+///    `fluxor update`. An artifact with no epoch annotation is a hard
+///    error naming `fluxor publish` in its producer.
 /// 2. **Currency, for live members only**: a live member's artifacts
 ///    must additionally match the current epoch; mismatch is a hard
 ///    error naming `fluxor workspace publish`.
@@ -902,25 +1019,46 @@ pub fn check_epoch(
     store: &OciStore,
     live_projects: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
+    check_epoch_via(
+        entries,
+        store,
+        live_projects,
+        &BTreeMap::new(),
+        "run `fluxor update` to advance the whole set",
+    )
+}
+
+/// [`check_epoch`], naming in a refusal the bindings (`via`: digest → the
+/// `@<name>`s it was pinned for) an offending entry came from, and
+/// `remedy` for a mixed set.
+fn check_epoch_via(
+    entries: &[Artifact],
+    store: &OciStore,
+    live_projects: &BTreeMap<String, PathBuf>,
+    via: &BTreeMap<String, Vec<String>>,
+    remedy: &str,
+) -> Result<()> {
+    let who = |e: &Artifact| match via.get(&e.digest) {
+        Some(b) => format!("'{}' ({}, pinned for {})", e.name, e.project, b.join(", ")),
+        None => format!("'{}' ({})", e.name, e.project),
+    };
     let mut set_epoch: Option<(String, String)> = None; // (epoch, exemplar)
     let mut live_entries: Vec<(&Artifact, String)> = Vec::new();
     for e in entries {
         let annotations = read_pinned_manifest(store, e)?.annotations;
         let Some(epoch) = annotations.get(ANN_ABI_SURFACE) else {
             return Err(Error::Config(format!(
-                "artifact '{}' ({}) carries no epoch annotation (published pre-cutover) — \
-                 run `fluxor publish` in {}",
+                "artifact '{}' ({}) carries no epoch annotation — run `fluxor publish` in {}",
                 e.name, e.reference, e.project
             )));
         };
         match &set_epoch {
-            None => set_epoch = Some((epoch.clone(), format!("'{}' ({})", e.name, e.project))),
+            None => set_epoch = Some((epoch.clone(), who(e))),
             Some((first, exemplar)) if first != epoch => {
                 return Err(Error::Config(format!(
-                    "mixed-epoch artifact set: '{}' ({}) is at epoch {} but {exemplar} is at \
-                     {} — run `fluxor update` to advance the whole set",
-                    e.name,
-                    e.project,
+                    "mixed-epoch artifact set: {} is at epoch {} but {exemplar} is at \
+                     {} — {remedy}",
+                    who(e),
                     short_hex(epoch),
                     short_hex(first),
                 )));
@@ -1110,6 +1248,11 @@ mod tests {
 
     /// Publish stack `name` (no module references) from project `owner`.
     fn publish_stack(store: &OciStore, owner: &str, name: &str) {
+        publish_stack_at(store, owner, name, "00");
+    }
+
+    /// [`publish_stack`] at ABI-surface epoch `epoch`.
+    fn publish_stack_at(store: &OciStore, owner: &str, name: &str, epoch: &str) {
         let text =
             format!("stack: {name}\nversion: 0.1.0\nmodules:\n  - name: out\n    type: cli_out\n");
         let reference = format!("stack/{name}:0.1.0");
@@ -1117,7 +1260,7 @@ mod tests {
             project: owner,
             provenance: crate::oci_store::PROVENANCE_LOCAL,
             source_rev: None,
-            abi_surface_hex: "00",
+            abi_surface_hex: epoch,
             input_digest_hex: None,
             ci_digest_hex: None,
         };
@@ -1292,6 +1435,159 @@ mod tests {
             e.contains(
                 "stack 'ghost' is referenced, but no dependency publishes it (dependencies: alpha)"
             ),
+            "{e}"
+        );
+        assert!(read_store_lock(&root).unwrap().is_none(), "nothing written");
+    }
+
+    /// Append `text` to the consumer's `fluxor.toml` and restage.
+    fn bind(root: &Path, text: &str) {
+        let path = root.join("fluxor.toml");
+        let mut toml = std::fs::read_to_string(&path).unwrap();
+        toml.push_str(text);
+        std::fs::write(&path, toml).unwrap();
+        git(root, &["add", "-A"]);
+    }
+
+    /// A `[uses.stacks]` binding pins its stack from whichever project index
+    /// publishes it — no `[dependencies]` entry, so none of the publisher's
+    /// other artefacts — whether or not a graph uses it; removing it drops
+    /// the pin.
+    #[test]
+    fn a_binding_pins_its_stack_without_a_dependency() {
+        let _env = crate::oci_store::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let no_workspace = dir.path().join("no-workspace.toml");
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        let store = OciStore::open(&store_dir).unwrap();
+        publish_stack(&store, "web", "web_files");
+        publish_stack(&store, "web", "web_unused");
+        let root = dir.path().join("consumer");
+        std::fs::create_dir_all(&root).unwrap();
+        consumer(&root, &[], Some("\"@file_server\""));
+
+        // A graph's unbound name is refused at update, naming the graph.
+        let e = cmd_update(&root, None).unwrap_err().to_string();
+        assert!(
+            e.contains("examples/g.yaml: include 'v' (`@file_server`): `file_server` is not bound"),
+            "{e}"
+        );
+        assert!(read_store_lock(&root).unwrap().is_none(), "nothing written");
+
+        // Bound: pinned from the one index publishing it, and nothing else
+        // of that project's.
+        bind(&root, "\n[uses.stacks]\nfile_server = \"web_files\"\n");
+        let refs = references(&root).unwrap();
+        assert!(refs.stacks.is_empty(), "{refs:?}");
+        assert_eq!(
+            refs.bound,
+            [("file_server".to_string(), "web_files".to_string())].into()
+        );
+        cmd_update(&root, None).unwrap();
+        let lock = read_store_lock(&root).unwrap().unwrap();
+        let names: Vec<(&str, &str)> = lock
+            .artifacts
+            .iter()
+            .map(|a| (a.kind.as_str(), a.name.as_str()))
+            .collect();
+        assert_eq!(names, [("stack", "web_files")], "{:?}", lock.artifacts);
+
+        // A binding is a reference with no graph using it.
+        consumer(&root, &[], None);
+        bind(&root, "\n[uses.stacks]\nfile_server = \"web_files\"\n");
+        assert_eq!(references(&root).unwrap().bound.len(), 1);
+
+        // A binding to the project's own stack resolves to its file and is
+        // not pinned; removing every binding drops the pin.
+        std::fs::create_dir_all(root.join("packaging/stack")).unwrap();
+        std::fs::write(
+            root.join("packaging/stack/web_files.yaml"),
+            "stack: web_files\n",
+        )
+        .unwrap();
+        git(&root, &["add", "-A"]);
+        assert!(references(&root).unwrap().bound.is_empty());
+        cmd_update(&root, None).unwrap();
+        let lock = read_store_lock(&root).unwrap().unwrap();
+        assert!(lock.artifacts.is_empty(), "{:?}", lock.artifacts);
+    }
+
+    /// A binding naming a stack no index publishes, or more than one, is
+    /// refused naming the binding, the stack and the projects.
+    #[test]
+    fn a_binding_no_index_or_several_publish_is_refused() {
+        let _env = crate::oci_store::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let no_workspace = dir.path().join("no-workspace.toml");
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        let store = OciStore::open(&store_dir).unwrap();
+        publish_stack(&store, "web", "web_files");
+        let root = dir.path().join("consumer");
+        std::fs::create_dir_all(&root).unwrap();
+        consumer(&root, &[], None);
+        bind(&root, "\n[uses.stacks]\nfile_server = \"ghost\"\n");
+        let e = cmd_update(&root, None).unwrap_err().to_string();
+        assert!(
+            e.contains(
+                "[uses.stacks] `file_server = \"ghost\"`: no project index in the store \
+                        publishes stack 'ghost'"
+            ),
+            "{e}"
+        );
+
+        let index = vec![
+            (
+                "alpha".to_string(),
+                vec![entry("stack", "alpha", "vol", None)],
+            ),
+            (
+                "beta".to_string(),
+                vec![entry("stack", "beta", "vol", None)],
+            ),
+        ];
+        let e = find_bound(&index, "vol", &["store", "disk"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(
+                "`store = \"vol\"`, `disk = \"vol\"`: stack 'vol' is published by more \
+                        than one project (alpha, beta)"
+            ),
+            "{e}"
+        );
+    }
+
+    /// `fluxor update` holds the set it writes to one epoch, naming the
+    /// binding an offending pin came from, and writes nothing.
+    #[test]
+    fn update_refuses_a_mixed_epoch_set_naming_the_binding() {
+        let _env = crate::oci_store::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let no_workspace = dir.path().join("no-workspace.toml");
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        let store = OciStore::open(&store_dir).unwrap();
+        publish_stack_at(&store, "storage", "vol", "00");
+        publish_stack_at(&store, "web", "web_files", "11");
+        let root = dir.path().join("consumer");
+        std::fs::create_dir_all(&root).unwrap();
+        consumer(&root, &["storage"], Some("vol"));
+        bind(&root, "\n[uses.stacks]\nfile_server = \"web_files\"\n");
+        let e = cmd_update(&root, None).unwrap_err().to_string();
+        assert!(e.contains("mixed-epoch artifact set"), "{e}");
+        assert!(
+            e.contains("'web_files' (web, pinned for @file_server)"),
             "{e}"
         );
         assert!(read_store_lock(&root).unwrap().is_none(), "nothing written");

@@ -45,10 +45,10 @@ Source: `src/platform/wasm/host/runtime.html`,
 
 `runtime.html` is the single generic shell. It:
 
-1. fetches `/scenario.json` to learn what to render, and composes a
-   DOM layout from its `presentation:` block (canvas / player /
-   terminal surfaces);
-2. loads `/fluxor.wasm` and instantiates it with the import object
+1. fetches `scenario.json`, beside the page, to learn what to render,
+   and composes a DOM layout from its `presentation:` block (canvas /
+   player / terminal surfaces);
+2. loads `fluxor.wasm` and instantiates it with the import object
    built by `host_shims.js`;
 3. calls `kernel_init()`, then pumps `kernel_step()` from a
    `requestAnimationFrame` loop in bounded synchronous bursts, so a
@@ -73,15 +73,70 @@ the wasm object provider's rules. The buffer primitive's acquire would hand
 back a kernel address, so across the bridge every acquire and release
 answers `ENOTSUP` and the module uses `channel_read` / `channel_write`.
 
-The `fluxor` CLI's scenario synthesiser serves the pieces as static
-routes on the synthesised host whenever a component targets wasm:
+### Serving
 
-| Route             | Source                                    |
-|-------------------|-------------------------------------------|
-| `/`               | `src/platform/wasm/host/runtime.html`     |
-| `/host_shims.js`  | `src/platform/wasm/host/host_shims.js`    |
-| `/fluxor.wasm`    | `target/wasm/<bundle>.wasm`               |
-| `/scenario.json`  | synthesised inline body                   |
+`fluxor run` on a scenario with a `host:` block (a `kind: scenario` file,
+or a graph's inline `scenario:` block) writes every file the browser
+fetches into one document root, `target/scenarios/<name>/root` under the
+scenario's project, and runs a Linux host graph that serves it. Under each
+`serve:` binding's `prefix` (the root itself for `/`; a `serve:` names a
+wasm component) the root holds:
+
+| File                   | Content                                                    |
+|------------------------|------------------------------------------------------------|
+| `index.html`           | `runtime.html` with the overlay renderer inlined, or a link to the component's `host_page` |
+| `fluxor.wasm`          | a link to the component's bundle, `target/wasm/<graph>.wasm` |
+| `host_shims.js`        | `src/platform/wasm/host/host_shims.js`                     |
+| `fluxor-worker.js`     | `src/platform/wasm/host/fluxor-worker.js`                  |
+| `scenario.json`        | the scenario name, bundle URL, playlist and `presentation:` |
+| `fluxor-manifest.json` | with a `list:` binding: one `{ key, size, mtime, etag }` per listed file |
+| `<path>/`              | each `list:` binding's directory, linked at its `path` (default `/api/list`) |
+
+A manifest key is `<path>/<relpath>` without a leading `/`: the file's URL
+relative to the page, so the kernel fetching a key, and the shell's
+playlist, resolve it under whichever prefix serves the page. The shell
+sets the document's base to that prefix, so `/viewer` and `/viewer/`
+resolve alike. The playlist is the keys under the first `list:` binding's
+path, so the server needs no listing handler. Two `serve:` bindings need
+distinct prefixes, and nothing is placed through a linked directory: a
+prefix or path that would land in one is refused.
+
+The host graph is:
+
+```yaml
+target: linux
+platform:
+  net: {}
+scheduler:
+  accept_cycles: true              # the net_in/net_out pair is a 2-cycle
+include:
+  - stack: "@file_server"
+    as: web
+    params:
+      port: 9876                   # the scenario's host.port
+      root: /abs/path/target/scenarios/<name>/root
+wiring:
+  - from: linux_net.net_out
+    to: web.net_in
+  - from: web.net_out
+    to: linux_net.net_in
+```
+
+`@file_server` is a bound name ([stacks.md](stacks.md#bound-names)): the
+project the scenario belongs to binds it to a stack, its own or a
+published one, under `[uses.stacks]`; Fluxor ships no default. A stack fits when it
+meets this interface:
+
+| Item | Kind | Meaning |
+|---|---|---|
+| `port` | param, `integer` | TCP port to listen on |
+| `root` | param, `string` | absolute path of a directory; a GET for `/p` serves `root/p`, following symbolic links; a path naming a directory serves its `index.html`; the content type comes from the extension (`.wasm` as `application/wasm`) |
+| `net_in`, `net_out` | exports, `NetProto` | the connection to the platform `net` stack |
+
+A provider may declare more params, each with a default, and more
+exports. `fluxor run --print-synthesised` prints the host graph and writes
+the root without a binding; `--validate-only` and a run expand the
+include, so an unbound name is refused there, naming the line to add.
 
 ### Worker mode
 

@@ -1948,7 +1948,7 @@ fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
         (Some(e), Some(c)) if e == c => format!("{} ✓ current surface", short(e)),
         (Some(e), Some(c)) => format!("{} ✗ current surface is {}", short(e), short(c)),
         (Some(e), None) => format!("{} (current surface unknown)", short(e)),
-        (None, _) => "(none — published pre-cutover; run `fluxor publish` in its producer)".into(),
+        (None, _) => "(none — run `fluxor publish` in its producer)".into(),
     };
     println!("kind:          {}", ann(ANN_KIND).unwrap_or("?"));
     println!("digest:        {}", desc.digest);

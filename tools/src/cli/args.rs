@@ -119,8 +119,8 @@ enum Commands {
     /// Scenario flags:
     ///   --print-synthesised      dump the synthesised host graph YAML
     ///                            and exit (no spawning).
-    ///   --print-merged <comp>    dump the binding-augmented config
-    ///                            for the named component and exit.
+    ///   --print-merged <comp>    dump the named component's config as
+    ///                            the run builds it and exit.
     ///   --validate-only          parse, validate, exit (CI-friendly).
     ///   --list [dir]             enumerate scenario files in `dir`
     ///                            (or CWD) and exit. `<config>` may be
@@ -142,8 +142,8 @@ enum Commands {
         /// Scenario only: dump the synthesised host graph YAML and exit.
         #[arg(long)]
         print_synthesised: bool,
-        /// Scenario only: dump the binding-augmented config for the
-        /// named component and exit.
+        /// Scenario only: dump the named component's config as the run
+        /// builds it (its `runtime_override:` applied) and exit.
         #[arg(long, value_name = "COMPONENT")]
         print_merged: Option<String>,
         /// Scenario only: parse + validate the scenario, exit without

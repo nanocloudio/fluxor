@@ -7,7 +7,9 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Create a temp scenario tree:
+    /// Create a temp scenario tree, a project of its own so the work dir
+    /// lands inside it:
+    ///   <tmp>/fluxor.toml, <tmp>/.fluxor
     ///   <tmp>/scenario.yaml
     ///   <tmp>/viewer/graph.yaml        target: wasm
     ///   <tmp>/viewer/viewer.html
@@ -21,6 +23,12 @@ mod tests {
             .tempdir()
             .expect("temp dir");
         let dir = tmp.path();
+        fs::write(
+            dir.join("fluxor.toml"),
+            "[project]\nname = \"scn\"\nversion = \"0\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join(".fluxor"), b"").unwrap();
         fs::create_dir_all(dir.join("viewer")).unwrap();
         fs::create_dir_all(dir.join("assets")).unwrap();
         let graph = dir.join("viewer/graph.yaml");
@@ -90,36 +98,52 @@ bindings:
         );
     }
 
+    /// A sequential scenario runs each component to completion in turn, so
+    /// it takes no host — which also rules out bindings and wasm — and a
+    /// wasm component takes no `duration:` (it is served, not spawned).
     #[test]
-    fn sequential_wasm_component_needs_a_duration() {
-        let yaml = |duration: &str| {
-            format!(
-                "\
+    fn sequential_takes_no_host_and_wasm_takes_no_duration() {
+        let (_tmp, path) = make_temp_tree(
+            "seq_host",
+            "\
 kind: scenario
 name: viewer
 sequential: true
 components:
   viewer:
     graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
-{duration}host:
+host:
   port: 9876
 bindings:
   - serve: viewer
-"
-            )
-        };
-        let (_tmp, path) = make_temp_tree("seq_no_duration", &yaml(""));
-        let s = parse(&path).unwrap();
-        let msg = format!("{}", validate(&s, &path).unwrap_err());
-        assert!(
-            msg.contains("duration") && msg.contains("viewer"),
-            "expected a missing-duration error, got: {msg}"
+",
         );
+        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
+        assert!(e.contains("a sequential scenario takes no `host:` block"), "{e}");
 
-        let (_tmp, path) = make_temp_tree("seq_duration", &yaml("    duration: 30\n"));
-        let s = parse(&path).unwrap();
-        validate(&s, &path).unwrap();
+        let (_tmp, path) = make_temp_tree(
+            "seq_wasm",
+            "kind: scenario\nname: viewer\nsequential: true\ncomponents:\n  viewer:\n    \
+             graph: viewer/graph.yaml\n",
+        );
+        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
+        assert!(e.contains("a sequential scenario takes no `host:` block"), "{e}");
+
+        let (_tmp, path) = make_temp_tree(
+            "wasm_duration",
+            "\
+kind: scenario
+name: viewer
+components:
+  viewer:
+    graph: viewer/graph.yaml
+    duration: 30
+host:
+  port: 9876
+",
+        );
+        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
+        assert!(e.contains("declares `duration:`, but it targets wasm"), "{e}");
     }
 
     #[test]
@@ -201,8 +225,9 @@ host:
     }
 
     #[test]
-    fn print_synthesised_emits_host_routes() {
-        let (_tmp, path) = make_temp_tree(
+    fn print_synthesised_includes_the_bound_file_server() {
+        let _g = cwd_lock();
+        let (tmp, path) = make_temp_tree(
             "synth",
             "\
 kind: scenario
@@ -221,38 +246,32 @@ bindings:
         );
         let s = parse(&path).unwrap();
         let yaml = render_synthesised_host(&s, &path).unwrap().unwrap();
-        assert!(yaml.contains("target: linux"));
-        assert!(yaml.contains("port: 9876"));
-        assert!(yaml.contains("/fluxor.wasm"));
-        assert!(yaml.contains("viewer.html"));
-        assert!(yaml.contains("fs_list"));
-        assert!(yaml.contains(".png,.jpg"));
+        assert!(yaml.contains("target: linux"), "{yaml}");
+        assert!(yaml.contains("stack: '@file_server'"), "{yaml}");
+        assert!(yaml.contains("port: 9876"), "{yaml}");
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("target/scenarios/viewer/root");
+        assert!(yaml.contains(&format!("root: {}", root.display())), "{yaml}");
+        // No module, route or listing handler of any provider's.
+        for absent in ["http", "routes", "fs_list", "fs_path", "modules"] {
+            assert!(!yaml.contains(absent), "`{absent}` in {yaml}");
+        }
     }
 
     #[test]
     fn render_synthesised_returns_none_without_host() {
-        // A scenario whose only binding has explicit `on:` and no
-        // `host:` section — render_synthesised_host returns None.
         let _tmp = tempfile::Builder::new()
             .prefix("fluxor_scenario_test_nosynth_")
             .tempdir()
             .unwrap();
         let dir = _tmp.path();
         fs::create_dir_all(dir.join("decoder")).unwrap();
-        fs::create_dir_all(dir.join("viewer")).unwrap();
         write!(
             fs::File::create(dir.join("decoder/graph.yaml")).unwrap(),
             "target: linux\nmodules: []\nwiring: []\n"
-        )
-        .unwrap();
-        write!(
-            fs::File::create(dir.join("viewer/graph.yaml")).unwrap(),
-            "target: wasm\nmodules: []\nwiring: []\n"
-        )
-        .unwrap();
-        write!(
-            fs::File::create(dir.join("viewer/viewer.html")).unwrap(),
-            "<html></html>"
         )
         .unwrap();
         let path = dir.join("scenario.yaml");
@@ -260,22 +279,38 @@ bindings:
             fs::File::create(&path).unwrap(),
             "\
 kind: scenario
-name: split
+name: headless
 components:
   decoder:
     graph: decoder/graph.yaml
-  viewer:
-    graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
-bindings:
-  - serve: viewer
-    on: decoder.http
+    port: 8080
 "
         )
         .unwrap();
         let s = parse(&path).unwrap();
         validate(&s, &path).unwrap();
+        assert_eq!(s.components["decoder"].port, Some(8080));
         assert!(render_synthesised_host(&s, &path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_binding_takes_no_on_key() {
+        let (_tmp, path) = make_temp_tree(
+            "on_gone",
+            "\
+kind: scenario
+name: viewer
+components:
+  viewer:
+    graph: viewer/graph.yaml
+host:
+  port: 9876
+bindings:
+  - serve: viewer
+    on: decoder.http
+",
+        );
+        assert!(parse(&path).is_err());
     }
 
     #[test]
@@ -327,8 +362,7 @@ bindings:
     }
 
     // -------------------------------------------------------------
-    // Synthesiser shape, route merger, conflict detection, host-FS
-    // gate.
+    // Synthesiser shape and the document root.
     // -------------------------------------------------------------
 
     fn make_split_tree(
@@ -341,6 +375,12 @@ bindings:
             .tempdir()
             .unwrap();
         let dir = tmp.path();
+        fs::write(
+            dir.join("fluxor.toml"),
+            "[project]\nname = \"scn\"\nversion = \"0\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join(".fluxor"), b"").unwrap();
         fs::create_dir_all(dir.join("decoder")).unwrap();
         fs::create_dir_all(dir.join("viewer")).unwrap();
         write!(
@@ -365,9 +405,10 @@ bindings:
 
     #[test]
     fn synthesised_host_opts_into_accept_cycles() {
-        // The synthesised host's `http <-> linux_net` wiring is a
+        // The synthesised host's `web <-> linux_net` wiring is a
         // 2-cycle the scheduler rejects unless the graph attests to it,
         // so the synthesiser sets `scheduler.accept_cycles: true`.
+        let _g = cwd_lock();
         let (_tmp, path) = make_temp_tree(
             "synth_accept_cycles",
             "\
@@ -398,6 +439,7 @@ bindings:
 
     #[test]
     fn synthesised_host_has_canonical_shape() {
+        let _g = cwd_lock();
         let (_tmp, path) = make_temp_tree(
             "synth_shape",
             "\
@@ -406,180 +448,387 @@ name: viewer
 components:
   viewer:
     graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
+host:
+  port: 9876
+bindings:
+  - serve: viewer
+",
+        );
+        let s = parse(&path).unwrap();
+        let config = synthesise_host_config(&s, &path).unwrap().unwrap();
+        assert_eq!(config["target"], "linux");
+        assert!(config["platform"]["net"].is_object());
+        assert!(config.get("modules").is_none());
+        let include = config["include"].as_array().unwrap();
+        assert_eq!(include.len(), 1);
+        assert_eq!(include[0]["stack"], "@file_server");
+        assert_eq!(include[0]["as"], "web");
+        assert_eq!(include[0]["params"]["port"], 9876);
+        let root = PathBuf::from(include[0]["params"]["root"].as_str().unwrap());
+        assert!(root.is_absolute() && root.is_dir(), "{}", root.display());
+        let wiring: Vec<(&str, &str)> = config["wiring"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| (w["from"].as_str().unwrap(), w["to"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            wiring,
+            [
+                ("linux_net.net_out", "web.net_in"),
+                ("web.net_out", "linux_net.net_in")
+            ]
+        );
+    }
+
+    /// The document root holds every file the host serves: the shell, the
+    /// bundle link, the shims, `scenario.json`, and for a `list:` binding
+    /// `fluxor-manifest.json` plus the directory linked at its `path`.
+    #[test]
+    fn the_document_root_holds_what_the_host_serves() {
+        let _g = cwd_lock();
+        let (tmp, path) = make_temp_tree(
+            "docroot",
+            "\
+kind: scenario
+name: viewer
+components:
+  viewer:
+    graph: viewer/graph.yaml
 host:
   port: 9876
 bindings:
   - serve: viewer
   - list: assets
-    formats: [.png, .jpg]
+    formats: [.png]
 ",
         );
+        fs::write(tmp.path().join("assets/a.png"), b"png").unwrap();
+        fs::write(tmp.path().join("assets/b.txt"), b"txt").unwrap();
         let s = parse(&path).unwrap();
-        let config = synthesise_host_config(&s, &path).unwrap().unwrap();
-        // Top-level shape mirrors what `examples/serve_wasm/linux.yaml` carries.
-        assert_eq!(config["target"], "linux");
-        assert!(config["platform"]["net"].is_object());
-        let modules = config["modules"].as_array().unwrap();
-        assert_eq!(modules.len(), 1);
-        // The synthesised serving host names wave's `http` protocol module,
-        // which downstream graphs resolve from the workspace / registry.
-        assert_eq!(modules[0]["name"], "http");
-        assert_eq!(modules[0]["port"], 9876);
-        assert_eq!(modules[0]["host_tcp"], 1);
-        let routes = modules[0]["routes"].as_array().unwrap();
-        // serve binding contributes /, /fluxor.wasm (2 routes);
-        // synthesiser auto-mounts /host_shims.js + /fluxor-worker.js +
-        // /scenario.json (3 more); list binding contributes /api/list
-        // (1 more). Total = 6.
-        assert_eq!(routes.len(), 6);
-        let paths: Vec<&str> = routes.iter().map(|r| r["path"].as_str().unwrap()).collect();
-        assert!(paths.contains(&"/"));
-        assert!(paths.contains(&"/fluxor.wasm"));
-        assert!(paths.contains(&"/host_shims.js"));
-        assert!(paths.contains(&"/fluxor-worker.js"));
-        assert!(paths.contains(&"/scenario.json"));
-        assert!(paths.contains(&"/api/list"));
-        // wiring is the canonical 2-edge linux net loop
-        let wiring = config["wiring"].as_array().unwrap();
-        assert_eq!(wiring.len(), 2);
+        validate(&s, &path).unwrap();
+        let root = write_document_root(&s, &path).unwrap();
+        let project = tmp.path().canonicalize().unwrap();
+        assert_eq!(root, project.join("target/scenarios/viewer/root"));
+        let index = fs::read_to_string(root.join("index.html")).unwrap();
+        assert!(!index.contains(OVERLAY_MARKER), "overlay not inlined");
+        assert!(index.contains("window.FluxorOverlay"));
+        assert_eq!(
+            fs::read_link(root.join("fluxor.wasm")).unwrap(),
+            project.join("target/wasm/graph.wasm")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("host_shims.js")).unwrap(),
+            CANONICAL_HOST_SHIMS_JS_RAW
+        );
+        assert!(root.join("fluxor-worker.js").is_file());
+        let scenario: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("scenario.json")).unwrap()).unwrap();
+        assert_eq!(scenario["bundle"], "/fluxor.wasm");
+        assert_eq!(scenario["playlist"]["source"], "/api/list");
+        assert_eq!(scenario["playlist"]["filter"], "image");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("fluxor-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let keys: Vec<&str> = manifest
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["api/list/a.png"]);
+        // The key is the URL the file is served at.
+        assert_eq!(fs::read(root.join(keys[0])).unwrap(), b"png");
+
+        // Rewritten afresh: a run never serves a stale file, and clearing
+        // the root never reaches through a link.
+        fs::write(root.join("stale"), b"x").unwrap();
+        write_document_root(&s, &path).unwrap();
+        assert!(!root.join("stale").exists());
+        assert!(tmp.path().join("assets/a.png").is_file());
     }
 
+    /// Every `serve:` lands on the host: each prefix is a directory of the
+    /// root holding that component's page, and two prefixes must differ.
     #[test]
-    fn merger_injects_routes_into_named_module() {
-        let (_tmp, path) = make_split_tree(
-            "merge_inject",
-            "\
-target: linux
-modules:
-  - name: http
-    port: 9090
-    routes:
-      - path: /api/list
-        fs_list: /images
-",
-            "\
+    fn serve_bindings_land_under_distinct_prefixes() {
+        let _g = cwd_lock();
+        let yaml = |second: &str| {
+            format!(
+                "\
 kind: scenario
-name: split
+name: two
 components:
-  decoder:
-    graph: decoder/graph.yaml
   viewer:
     graph: viewer/graph.yaml
     host_page: viewer/viewer.html
+  other:
+    graph: viewer/graph.yaml
+host:
+  port: 9876
 bindings:
   - serve: viewer
-    on: decoder.http
-",
-        );
+    prefix: /viewer
+  - serve: other
+    prefix: {second}
+"
+            )
+        };
+        let (tmp, path) = make_temp_tree("prefixes", &yaml("/"));
         let s = parse(&path).unwrap();
-        let merged = merge_bindings_for_component("decoder", &s, &path).unwrap();
-        let routes = merged["modules"][0]["routes"].as_array().unwrap();
-        // Original /api/list + 4 binding-injected routes (page,
-        // bundle, host_shims.js, scenario.json).
-        assert_eq!(routes.len(), 5);
-        let paths: Vec<&str> = routes.iter().map(|r| r["path"].as_str().unwrap()).collect();
-        assert!(paths.contains(&"/api/list"));
-        assert!(paths.contains(&"/"));
-        assert!(paths.contains(&"/fluxor.wasm"));
-        assert!(paths.contains(&"/host_shims.js"));
-        assert!(paths.contains(&"/scenario.json"));
+        validate(&s, &path).unwrap();
+        let root = write_document_root(&s, &path).unwrap();
+        assert_eq!(
+            fs::read_link(root.join("viewer/index.html")).unwrap(),
+            tmp.path().canonicalize().unwrap().join("viewer/viewer.html")
+        );
+        let scenario: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("viewer/scenario.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(scenario["bundle"], "/viewer/fluxor.wasm");
+        assert!(root.join("index.html").is_file());
+
+        let (_tmp, path) = make_temp_tree("prefixes_same", &yaml("/viewer/"));
+        let s = parse(&path).unwrap();
+        let e = validate(&s, &path).unwrap_err().to_string();
+        assert!(e.contains("both serve at `prefix: /viewer/`"), "{e}");
+        let e = write_document_root(&s, &path).unwrap_err().to_string();
+        assert!(e.contains("share `prefix: /viewer/`"), "{e}");
     }
 
+    /// A `list:` directory is linked beside every served page, so a manifest
+    /// key — relative to the page — resolves under any `prefix`; a prefix
+    /// landing on a linked directory is refused rather than written into it.
     #[test]
-    fn merger_detects_route_conflict_with_helpful_error() {
-        let (_tmp, path) = make_split_tree(
-            "merge_conflict",
-            "\
-target: linux
-modules:
-  - name: http
-    port: 9090
-    routes:
-      - path: /
-        fs_path: /existing.html
-",
-            "\
+    fn list_keys_resolve_beside_the_page_under_any_prefix() {
+        let _g = cwd_lock();
+        let yaml = |prefix: &str| {
+            format!(
+                "\
 kind: scenario
-name: split
+name: viewer
 components:
-  decoder:
-    graph: decoder/graph.yaml
   viewer:
     graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
+host:
+  port: 9876
 bindings:
   - serve: viewer
-    on: decoder.http
+    prefix: {prefix}
+  - list: assets
+    path: /media
+"
+            )
+        };
+        let (tmp, path) = make_temp_tree("list_prefix", &yaml("/viewer"));
+        fs::write(tmp.path().join("assets/a.png"), b"png").unwrap();
+        let s = parse(&path).unwrap();
+        validate(&s, &path).unwrap();
+        let root = write_document_root(&s, &path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("viewer/fluxor-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest[0]["key"], "media/a.png");
+        assert_eq!(fs::read(root.join("viewer/media/a.png")).unwrap(), b"png");
+        assert!(!root.join("media").exists());
+
+        // Two components, the second's prefix on the first's linked list.
+        let (tmp, path) = make_temp_tree(
+            "list_prefix_clash",
+            "\
+kind: scenario
+name: viewer
+components:
+  viewer:
+    graph: viewer/graph.yaml
+  other:
+    graph: viewer/graph.yaml
+host:
+  port: 9876
+bindings:
+  - serve: viewer
+  - serve: other
+    prefix: /media
+  - list: assets
+    path: /media
 ",
         );
         let s = parse(&path).unwrap();
-        let err = merge_bindings_for_component("decoder", &s, &path).unwrap_err();
-        let msg = format!("{err}");
-        // The error must name the binding, cite the file,
-        // and suggest a `prefix:` value.
+        validate(&s, &path).unwrap();
+        let e = write_document_root(&s, &path).unwrap_err().to_string();
         assert!(
-            msg.contains("serve: viewer"),
-            "should name the binding, got: {msg}"
+            e.contains("`prefix: /media` is where the document root links a `list:`")
+                || e.contains("`list: assets` is placed at `/media`"),
+            "{e}"
         );
-        assert!(
-            msg.contains("decoder/graph.yaml"),
-            "should cite the file, got: {msg}"
+        assert!(!tmp.path().join("assets/scenario.json").exists());
+        assert!(!tmp.path().join("assets/host_shims.js").exists());
+    }
+
+    /// A name placed inside a linked `list:` directory is refused rather
+    /// than written into the user's tree.
+    #[test]
+    fn nothing_is_placed_through_a_list_link() {
+        let _g = cwd_lock();
+        let (tmp, path) = make_temp_tree(
+            "through_link",
+            "\
+kind: scenario
+name: nested
+components:
+  viewer:
+    graph: viewer/graph.yaml
+host:
+  port: 9876
+bindings:
+  - list: assets
+    path: /media
+  - list: viewer
+    path: /media/inner
+",
         );
-        assert!(
-            msg.contains("prefix:"),
-            "should suggest a prefix, got: {msg}"
-        );
+        let s = parse(&path).unwrap();
+        validate(&s, &path).unwrap();
+        let e = write_document_root(&s, &path).unwrap_err().to_string();
+        assert!(e.contains("lies inside a `list:` binding's directory"), "{e}");
+        assert!(!tmp.path().join("assets/inner").exists());
     }
 
     #[test]
-    fn merger_blocks_binding_on_silicon_without_override() {
+    fn bindings_or_wasm_need_a_host_and_wasm_takes_no_port() {
+        let (_tmp, path) = make_temp_tree(
+            "need_host",
+            "\
+kind: scenario
+name: viewer
+components:
+  viewer:
+    graph: viewer/graph.yaml
+",
+        );
+        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
+        assert!(e.contains("declares a wasm component but no `host:`"), "{e}");
+
+        let (_tmp, path) = make_temp_tree(
+            "wasm_port",
+            "\
+kind: scenario
+name: viewer
+components:
+  viewer:
+    graph: viewer/graph.yaml
+    port: 9000
+host:
+  port: 9876
+",
+        );
+        let e = validate(&parse(&path).unwrap(), &path).unwrap_err().to_string();
+        assert!(e.contains("declares `port:`, but it targets wasm"), "{e}");
+    }
+
+    /// `@file_server` resolves against the scenario's project: unbound, the
+    /// error names the line to add; bound, the include expands onto the
+    /// stack's exports.
+    #[test]
+    fn the_host_include_resolves_through_the_scenarios_project() {
+        let _g = cwd_lock();
+        let (tmp, path) = make_temp_tree(
+            "bound_host",
+            "\
+kind: scenario
+name: viewer
+components:
+  viewer:
+    graph: viewer/graph.yaml
+host:
+  port: 9876
+bindings:
+  - serve: viewer
+",
+        );
+        let s = parse(&path).unwrap();
+        let e = revalidate_all(&s, &path).unwrap_err().to_string();
+        assert!(
+            e.contains("include 'web' (`@file_server`): `file_server` is not bound — add \
+                        `file_server = \"<stack>\"` under [uses.stacks]"),
+            "{e}"
+        );
+
+        fs::write(
+            tmp.path().join("fluxor.toml"),
+            "[project]\nname = \"scn\"\nversion = \"0\"\n\n[uses.stacks]\n\
+             file_server = \"fixture_files\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("packaging/stack")).unwrap();
+        fs::write(
+            tmp.path().join("packaging/stack/fixture_files.yaml"),
+            "\
+stack: fixture_files
+version: 0.1.0
+params:
+  port: { type: integer, required: true, example: 8080 }
+  root: { type: string, required: true, example: /srv }
+  index: { type: string, default: index.html }
+exports:
+  net_in: srv.net_in
+  net_out: srv.net_out
+modules:
+  - name: srv
+    type: fixture_server
+    port: ${param:port}
+    root: ${param:root}
+    index: ${param:index}
+",
+        )
+        .unwrap();
+        let mut host = synthesise_host_config(&s, &path).unwrap().unwrap();
+        let project = crate::project::root_for_config(&path);
+        crate::stack::expand_includes(
+            &mut host,
+            &crate::stack::IncludeContext {
+                graph_dir: &scenario_work_dir(&s, &path),
+                project_root: &project,
+                store_root: None,
+                params: &BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        let srv = &host["modules"][0];
+        assert_eq!(srv["name"], "web_srv");
+        assert_eq!(srv["type"], "fixture_server");
+        assert_eq!(srv["port"], 9876);
+        assert!(srv["root"]
+            .as_str()
+            .unwrap()
+            .ends_with("target/scenarios/viewer/root"));
+        let wiring: Vec<(&str, &str)> = host["wiring"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| (w["from"].as_str().unwrap(), w["to"].as_str().unwrap()))
+            .collect();
+        assert!(wiring.contains(&("linux_net.net_out", "web_srv.net_in")));
+        assert!(wiring.contains(&("web_srv.net_out", "linux_net.net_in")));
+    }
+
+    /// A component's config is its graph with its `runtime_override:`
+    /// applied; the scenario adds nothing else.
+    #[test]
+    fn component_config_applies_the_runtime_override_only() {
         let (_tmp, path) = make_split_tree(
-            "merge_silicon",
+            "comp_config",
             "\
 target: pi5
 modules:
-  - name: http
-    port: 9090
-    routes:
-      - path: /api/list
-        fs_list: /images
-",
-            "\
-kind: scenario
-name: split
-components:
-  decoder:
-    graph: decoder/graph.yaml
-  viewer:
-    graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
-bindings:
-  - serve: viewer
-    on: decoder.http
-",
-        );
-        let s = parse(&path).unwrap();
-        let err = merge_bindings_for_component("decoder", &s, &path).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("host filesystem") && msg.contains("runtime_override"),
-            "should explain the host-FS gate, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn runtime_override_flips_effective_target_in_merged_config() {
-        let (_tmp, path) = make_split_tree(
-            "merge_override",
-            "\
-target: pi5
-modules:
-  - name: http
-    port: 9090
-    routes:
-      - path: /api/list
-        fs_list: /images
+  - name: ip
+  - name: web
+wiring:
+  - from: ip.net_out
+    to: web.net_in
 ",
             "\
 kind: scenario
@@ -588,54 +837,19 @@ components:
   decoder:
     graph: decoder/graph.yaml
     runtime_override: linux
-  viewer:
-    graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
-bindings:
-  - serve: viewer
-    on: decoder.http
+    port: 8080
 ",
         );
         let s = parse(&path).unwrap();
-        let merged = merge_bindings_for_component("decoder", &s, &path).unwrap();
-        assert_eq!(merged["target"], "linux");
-    }
-
-    #[test]
-    fn binding_targeting_missing_module_errors_clearly() {
-        let (_tmp, path) = make_split_tree(
-            "merge_no_module",
-            "\
-target: linux
-modules:
-  - name: NOT_http
-    port: 9090
-",
-            "\
-kind: scenario
-name: split
-components:
-  decoder:
-    graph: decoder/graph.yaml
-  viewer:
-    graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
-bindings:
-  - serve: viewer
-    on: decoder.http
-",
-        );
-        let s = parse(&path).unwrap();
-        let err = merge_bindings_for_component("decoder", &s, &path).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("no module named") && msg.contains("http"),
-            "should name the missing module clearly, got: {msg}"
-        );
+        validate(&s, &path).unwrap();
+        let config = component_config("decoder", &s, &path).unwrap();
+        assert_eq!(config["target"], "linux");
+        assert_eq!(config["wiring"][0]["from"], "linux_net.net_out");
+        assert_eq!(config["modules"].as_array().unwrap().len(), 2);
     }
 
     // -------------------------------------------------------------
-    // effective_target, extract_http_port, write_merged_component_yaml.
+    // effective_target, write_component_yaml.
     // -------------------------------------------------------------
 
     #[test]
@@ -653,9 +867,10 @@ components:
   viewer:
     graph: viewer/graph.yaml
     host_page: viewer/viewer.html
+host:
+  port: 9876
 bindings:
   - serve: viewer
-    on: decoder.http
 ",
         );
         let s = parse(&path).unwrap();
@@ -663,18 +878,6 @@ bindings:
         let viewer = s.components.get("viewer").unwrap();
         assert_eq!(effective_target(&path, decoder), "linux");
         assert_eq!(effective_target(&path, viewer), "wasm");
-    }
-
-    #[test]
-    fn extract_http_port_walks_modules() {
-        let v: serde_json::Value = serde_yaml::from_str(
-            "modules:\n  - name: ws\n    type: ws_stream\n  - name: http\n    port: 9090\n",
-        )
-        .unwrap();
-        assert_eq!(extract_http_port(&v), Some(9090));
-        let v_no_http: serde_json::Value =
-            serde_yaml::from_str("modules:\n  - name: ws\n    type: ws_stream\n").unwrap();
-        assert_eq!(extract_http_port(&v_no_http), None);
     }
 
     /// The crate's one lock for the process working directory.
@@ -695,42 +898,33 @@ bindings:
     }
 
     #[test]
-    fn write_merged_component_yaml_lands_under_target_scenarios() {
-        // The merged YAML lands under `target/scenarios/`, relative to the
-        // working directory.
+    fn write_component_yaml_lands_under_the_scenarios_project() {
+        // The component YAML lands under `target/scenarios/<name>/` of the
+        // scenario's project, whatever the working directory.
         let _g = cwd_lock();
-        let (_tmp, path) = make_split_tree(
-            "wmc_yaml",
-            "\
-target: linux
-modules:
-  - name: http
-    port: 9090
-",
+        let (tmp, path) = make_split_tree(
+            "wc_yaml",
+            "target: linux\nmodules:\n  - name: srv\n",
             "\
 kind: scenario
-name: write_merge_test
+name: write_component_test
 components:
   decoder:
     graph: decoder/graph.yaml
-  viewer:
-    graph: viewer/graph.yaml
-    host_page: viewer/viewer.html
-bindings:
-  - serve: viewer
-    on: decoder.http
 ",
         );
         let s = parse(&path).unwrap();
-        let out = write_merged_component_yaml("decoder", &s, &path).unwrap();
-        assert!(out.is_file(), "merged yaml not written: {}", out.display());
-        let content = fs::read_to_string(&out).unwrap();
-        assert!(content.contains("/fluxor.wasm"));
-        // Bonus: the on-disk YAML must parse back as a valid config Value.
-        let parsed: serde_json::Value = serde_yaml::from_str(&content).unwrap();
+        let out = write_component_yaml("decoder", &s, &path).unwrap();
+        assert_eq!(
+            out,
+            tmp.path()
+                .canonicalize()
+                .unwrap()
+                .join("target/scenarios/write_component_test/decoder.yaml")
+        );
+        let parsed: serde_json::Value =
+            serde_yaml::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(parsed["target"], "linux");
-        // Cleanup
-        let _ = fs::remove_dir_all(scenario_work_dir(&s));
     }
 
     // -------------------------------------------------------------
@@ -876,64 +1070,5 @@ bindings:
             Ok(()) => {}
             Err(e) => panic!("expected pass under runtime_override: linux, got: {e}"),
         }
-    }
-
-    #[test]
-    fn binding_cycle_is_caught() {
-        // Two components, each whose serve-binding points at the
-        // other's http — degenerate, but the dependency graph forms
-        // a cycle.
-        let _tmp = tempfile::Builder::new()
-            .prefix("fluxor_scenario_test_cycle_")
-            .tempdir()
-            .unwrap();
-        let dir = _tmp.path();
-        fs::create_dir_all(dir.join("a")).unwrap();
-        fs::create_dir_all(dir.join("b")).unwrap();
-        write!(
-            fs::File::create(dir.join("a/graph.yaml")).unwrap(),
-            "target: wasm\nmodules: []\nwiring: []\n"
-        )
-        .unwrap();
-        write!(
-            fs::File::create(dir.join("b/graph.yaml")).unwrap(),
-            "target: wasm\nmodules: []\nwiring: []\n"
-        )
-        .unwrap();
-        write!(
-            fs::File::create(dir.join("a/page.html")).unwrap(),
-            "<html></html>"
-        )
-        .unwrap();
-        write!(
-            fs::File::create(dir.join("b/page.html")).unwrap(),
-            "<html></html>"
-        )
-        .unwrap();
-        let path = dir.join("scenario.yaml");
-        write!(
-            fs::File::create(&path).unwrap(),
-            "\
-kind: scenario
-name: cycle
-components:
-  a:
-    graph: a/graph.yaml
-    host_page: a/page.html
-  b:
-    graph: b/graph.yaml
-    host_page: b/page.html
-bindings:
-  - serve: a
-    on: b.http
-  - serve: b
-    on: a.http
-"
-        )
-        .unwrap();
-        let s = parse(&path).unwrap();
-        let err = validate(&s, &path).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("cyclic"), "expected cycle error, got: {msg}");
     }
 }

@@ -403,6 +403,8 @@ struct FluxorTomlParse {
 struct UsesSection {
     #[serde(default)]
     bundles: Vec<String>,
+    #[serde(default)]
+    stacks: std::collections::BTreeMap<String, String>,
 }
 
 /// `fluxor.toml::[uses] bundles`: the bundles this project runs by name
@@ -418,6 +420,43 @@ pub fn used_bundles(project_root: &Path) -> Result<Vec<String>, String> {
         .and_then(|f| f.uses)
         .map(|u| u.bundles)
         .unwrap_or_default())
+}
+
+/// `fluxor.toml::[uses.stacks]`: each bound name the project's graphs, or
+/// a CLI verb composing a graph for it, include as `stack: "@<name>"`,
+/// mapped to the stack that fills it. Every value is a reference
+/// `fluxor update` pins (other than the project's own packaged stacks);
+/// a malformed name or value is refused here, naming the line. Empty when
+/// absent.
+#[allow(
+    dead_code,
+    reason = "read by the lib-context store flow; this file dual-compiles into the bin"
+)]
+pub fn bound_stacks(
+    project_root: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let bound = read_fluxor_toml(project_root)?
+        .and_then(|f| f.uses)
+        .map(|u| u.stacks)
+        .unwrap_or_default();
+    let path = project_root.join("fluxor.toml");
+    for (name, stack) in &bound {
+        if !crate::stack::is_stack_name(name) {
+            return Err(format!(
+                "{}: [uses.stacks] key `{name}` is not a bound name ([a-z][a-z0-9_-]*, at most \
+                 64 bytes)",
+                path.display()
+            ));
+        }
+        if !crate::stack::is_stack_name(stack) {
+            return Err(format!(
+                "{}: [uses.stacks] `{name} = \"{stack}\"` must name a stack \
+                 ([a-z][a-z0-9_-]*, at most 64 bytes)",
+                path.display()
+            ));
+        }
+    }
+    Ok(bound)
 }
 
 #[derive(serde::Deserialize)]

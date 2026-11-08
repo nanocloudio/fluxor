@@ -71,11 +71,14 @@ pub fn is_scenario_file(path: &Path) -> bool {
 //
 //   scenario:
 //     name: image_viewer_pi5
+//     runtime_override: linux
+//     port: 8080             # `main` is the graph itself
 //     companions:
 //       viewer: ../wasm/image_viewer_thin.yaml
+//     host:
+//       port: 9876
 //     bindings:
 //       - serve: viewer
-//         on: main.http      # `main` is the host graph itself
 //         prefix: /viewer
 //
 // When `fluxor run` sees this block on a graph YAML, it synthesises
@@ -93,6 +96,7 @@ pub fn is_scenario_file(path: &Path) -> bool {
 //   * `sequential`       — same as the scenario-file flag
 //   * `runtime_override` — applied to `main`; the dev-iteration knob for
 //                          running a silicon-target graph as a linux process
+//   * `port`             — applied to `main`, as a component's `port:`
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +119,10 @@ struct InlineScenarioBlock {
     /// not go through the inline-scenario flow.
     #[serde(default)]
     pub runtime_override: Option<String>,
+    /// `port:` of the `main` component: the TCP port the run waits for it
+    /// to bind, as `ComponentSpec::port`.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 /// If `graph_path` is a graph YAML with a top-level `scenario:` block,
@@ -169,7 +177,7 @@ pub fn synthesize_from_graph(graph_path: &Path) -> Result<Option<Scenario>> {
             runtime_override: block.runtime_override.clone(),
             host_page: None,
             duration: None,
-            params: BTreeMap::new(),
+            port: block.port,
         },
     );
     for (name, path) in block.companions {
@@ -187,8 +195,8 @@ pub fn synthesize_from_graph(graph_path: &Path) -> Result<Option<Scenario>> {
                 runtime_override: None,
                 host_page: None,
                 duration: None,
-                params: BTreeMap::new(),
-            },
+                port: None,
+                },
         );
     }
 

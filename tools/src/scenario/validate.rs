@@ -11,23 +11,24 @@
 ///   - Mutual exclusion of `graph:` / `scenario:`.
 ///   - `kind: scenario` is set to `"scenario"`.
 ///   - At least one component.
-///   - Wasm components have a host or a serve-binding with `on:` set.
-///   - `host:` present iff at least one binding's `on:` is omitted.
-///   - Binding references resolve (`serve:` / `on:` name defined
-///     components).
+///   - `host:` is declared when there is a binding or a wasm component:
+///     every binding lands on the host, and wasm runs only from an origin.
+///   - `serve:` names a defined wasm component.
+///   - Two `serve:` bindings have distinct `prefix`es; a `list:` binding's
+///     `path` names a directory below `/`.
 ///   - `runtime_override:` is one of {linux, qemu-virt}; never on a wasm
 ///     component.
+///   - `port:` and `duration:` are never on a wasm component: it is served,
+///     not spawned.
 ///   - `host_page:` exists on disk (when set).
 ///   - `list:` directory exists on disk (when set).
-///   - Binding dependency graph is a DAG (cycle → hard error).
-///   - Under `sequential: true`, every component that does not exit on
-///     its own declares `duration:`. A wasm component runs until its tab
-///     closes, so one without `duration:` is an error; any other
-///     component without one draws a warning that it must exit on its
-///     own, which only running it can show.
+///   - `sequential: true` takes no `host:`: it runs each component to
+///     completion in turn, and the host serves until it is stopped. A
+///     component without `duration:` draws a warning that it must exit on
+///     its own, which only running it can show.
 ///
-/// Route conflicts and a binding's module name are checked by the route
-/// merger, which reads each component's graph.
+/// Where each binding's files land is checked when the document root is
+/// written.
 pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
     let base = scenario_path
         .parent()
@@ -130,6 +131,22 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
             }
         }
 
+        if graph_targets.get(name).map(String::as_str) == Some("wasm") {
+            let spawn_only = [
+                ("port", comp.port.is_some()),
+                ("duration", comp.duration.is_some()),
+            ];
+            if let Some((key, _)) = spawn_only.iter().find(|(_, set)| *set) {
+                return Err(Error::Config(format!(
+                    "scenario {}: component `{}` declares `{key}:`, but it targets wasm: a \
+                     wasm component is served by the host, not spawned, so the run neither \
+                     waits on a port of its own nor stops it — drop `{key}:`.",
+                    scenario_path.display(),
+                    name
+                )));
+            }
+        }
+
         if let Some(host_page) = &comp.host_page {
             let resolved = base.join(host_page);
             if !resolved.is_file() {
@@ -146,7 +163,7 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
     }
 
     // --- binding checks ---
-    let mut has_default_origin_binding = false;
+    let mut prefixes: HashMap<String, usize> = HashMap::new();
     for (idx, binding) in scenario.bindings.iter().enumerate() {
         match binding {
             Binding::Serve(serve) => {
@@ -158,15 +175,31 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
                         serve.serve
                     )));
                 }
-                if let Some(target) = &serve.on {
-                    check_on_reference(target, scenario, scenario_path, idx)?;
-                } else {
-                    has_default_origin_binding = true;
+                if graph_targets.get(&serve.serve).map(String::as_str) != Some("wasm") {
+                    return Err(Error::Config(format!(
+                        "scenario {}: bindings[{}] `serve: {}` names a component that does not \
+                         target wasm — the host serves a wasm bundle and its page; any other \
+                         component is spawned and serves its own routes.",
+                        scenario_path.display(),
+                        idx,
+                        serve.serve
+                    )));
                 }
                 if !serve.prefix.starts_with('/') {
                     return Err(Error::Config(format!(
                         "scenario {}: bindings[{}] `prefix: {}` must start with `/`.",
                         scenario_path.display(),
+                        idx,
+                        serve.prefix
+                    )));
+                }
+                let key = serve.prefix.trim_end_matches('/').to_string();
+                if let Some(first) = prefixes.insert(key, idx) {
+                    return Err(Error::Config(format!(
+                        "scenario {}: bindings[{}] and bindings[{}] both serve at `prefix: {}` \
+                         — every `serve:` lands on the host, so give each a distinct `prefix`.",
+                        scenario_path.display(),
+                        first,
                         idx,
                         serve.prefix
                     )));
@@ -184,14 +217,10 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
                         resolved.display()
                     )));
                 }
-                if let Some(target) = &list.on {
-                    check_on_reference(target, scenario, scenario_path, idx)?;
-                } else {
-                    has_default_origin_binding = true;
-                }
-                if !list.path.starts_with('/') {
+                if !list.path.starts_with('/') || list.path.trim_matches('/').is_empty() {
                     return Err(Error::Config(format!(
-                        "scenario {}: bindings[{}] `path: {}` must start with `/`.",
+                        "scenario {}: bindings[{}] `path: {}` must start with `/` and name a \
+                         directory below it (the default is `/api/list`).",
                         scenario_path.display(),
                         idx,
                         list.path
@@ -201,154 +230,47 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
         }
     }
 
-    // --- host requirement ---
-    let needs_default_origin = scenario
+    // --- sequential mode ---
+    let has_wasm = scenario
         .components
-        .iter()
-        .any(|(n, _)| graph_targets.get(n).map(String::as_str) == Some("wasm"))
-        && !scenario.bindings.iter().any(|b| match b {
-            Binding::Serve(s) => s.on.is_some(),
-            _ => false,
-        });
-
-    if needs_default_origin && scenario.host.is_none() {
-        return Err(Error::Config(format!(
-            "scenario {}: declares a wasm component but neither a `host:` block \
-             nor a `serve:` binding with `on:` pointing at a non-wasm component's http \
-             module — wasm cannot run without an origin.",
-            scenario_path.display()
-        )));
-    }
-
-    if has_default_origin_binding && scenario.host.is_none() {
-        return Err(Error::Config(format!(
-            "scenario {}: has bindings without `on:` (i.e. mounting on the synthesised \
-             host) but no `host:` block is declared. Add `host: {{ port: <PORT> }}`.",
-            scenario_path.display()
-        )));
-    }
-
-    // --- binding dependency DAG ---
-    check_binding_dag(scenario, scenario_path)?;
-
-    // --- sequential + duration consistency ---
+        .keys()
+        .any(|n| graph_targets.get(n).map(String::as_str) == Some("wasm"));
     if scenario.sequential {
+        if scenario.host.is_some() || has_wasm || !scenario.bindings.is_empty() {
+            return Err(Error::Config(format!(
+                "scenario {}: `sequential: true` runs each component to completion in turn, \
+                 and the host serves until it is stopped — a sequential scenario takes no \
+                 `host:` block, no binding and no wasm component.",
+                scenario_path.display()
+            )));
+        }
         for (name, comp) in &scenario.components {
-            if comp.duration.is_some() {
-                continue;
-            }
-            let target = graph_targets.get(name).map(String::as_str).unwrap_or("");
-            if target == "wasm" {
-                return Err(Error::Config(format!(
-                    "scenario {}: sequential mode needs `duration:` on wasm component `{}` \
-                     — it runs until its tab closes, so it never ends on its own.",
+            if comp.duration.is_none() {
+                eprintln!(
+                    "warning: scenario {}: sequential mode without `duration:` on \
+                     component `{}` — it must exit on its own.",
                     scenario_path.display(),
                     name
-                )));
+                );
             }
-            eprintln!(
-                "warning: scenario {}: sequential mode without `duration:` on \
-                 component `{}` (target {:?}) — component must exit on its own.",
-                scenario_path.display(),
-                name,
-                target
-            );
         }
     }
 
-    Ok(())
-}
-
-fn check_on_reference(
-    on: &str,
-    scenario: &Scenario,
-    scenario_path: &Path,
-    idx: usize,
-) -> Result<()> {
-    let (comp, _module) = on.split_once('.').ok_or_else(|| {
-        Error::Config(format!(
-            "scenario {}: bindings[{}] `on: {}` must be `<component>.<module>` \
-             (e.g. `decoder.http`).",
-            scenario_path.display(),
-            idx,
-            on
-        ))
-    })?;
-    if !scenario.components.contains_key(comp) {
+    // --- host requirement ---
+    if scenario.host.is_none() && (has_wasm || !scenario.bindings.is_empty()) {
         return Err(Error::Config(format!(
-            "scenario {}: bindings[{}] `on: {}` references undefined component `{}`.",
+            "scenario {}: {} but no `host:` block is declared — every binding lands on the \
+             synthesised host, and wasm runs only from an origin. Add \
+             `host: {{ port: <PORT> }}`.",
             scenario_path.display(),
-            idx,
-            on,
-            comp
+            if has_wasm {
+                "declares a wasm component"
+            } else {
+                "has bindings"
+            }
         )));
     }
-    // Module existence inside the graph is verified by the route
-    // merger; this only catches a misspelt component name.
-    Ok(())
-}
 
-fn check_binding_dag(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
-    // Build a producer→consumer graph: `serve: A` with `on: B.http`
-    // means A's bundle is served by B → B starts before A's customer.
-    // For cycle detection we treat each binding as an edge
-    // `serve_target → on_component`.
-    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for binding in &scenario.bindings {
-        let Binding::Serve(serve) = binding else {
-            continue;
-        };
-        let Some(on) = &serve.on else { continue };
-        let Some((on_comp, _)) = on.split_once('.') else {
-            continue;
-        };
-        adj.entry(serve.serve.as_str()).or_default().push(on_comp);
-    }
-
-    let mut color: HashMap<&str, u8> = HashMap::new(); // 0=white, 1=gray, 2=black
-    fn dfs<'a>(
-        node: &'a str,
-        adj: &'a HashMap<&str, Vec<&str>>,
-        color: &mut HashMap<&'a str, u8>,
-        path: &mut Vec<&'a str>,
-    ) -> std::result::Result<(), Vec<String>> {
-        color.insert(node, 1);
-        path.push(node);
-        if let Some(succs) = adj.get(node) {
-            for &succ in succs {
-                match color.get(succ).copied().unwrap_or(0) {
-                    1 => {
-                        // cycle: from succ's first appearance in path → end → succ
-                        let start = path.iter().position(|&n| n == succ).unwrap_or(0);
-                        let mut cycle: Vec<String> =
-                            path[start..].iter().map(|s| (*s).to_string()).collect();
-                        cycle.push(succ.to_string());
-                        return Err(cycle);
-                    }
-                    2 => {}
-                    _ => dfs(succ, adj, color, path)?,
-                }
-            }
-        }
-        path.pop();
-        color.insert(node, 2);
-        Ok(())
-    }
-
-    for node in adj.keys().copied().collect::<Vec<_>>() {
-        if color.get(node).copied().unwrap_or(0) == 0 {
-            let mut path = Vec::new();
-            if let Err(cycle) = dfs(node, &adj, &mut color, &mut path) {
-                return Err(Error::Config(format!(
-                    "scenario {}: cyclic binding dependency: {}. \
-                     A binding's `on:` target must not (transitively) depend on the \
-                     binding's `serve:` source.",
-                    scenario_path.display(),
-                    cycle.join(" → ")
-                )));
-            }
-        }
-    }
     Ok(())
 }
 

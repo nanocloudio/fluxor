@@ -435,7 +435,7 @@ fn cmd_run_inline_scenario(
         scenario::revalidate_all(&s, host_path)?;
         println!(
             "graph {} (inline scenario): validation passed ({} component(s), {} binding(s); \
-             merged-config re-validation green).",
+             host re-validation green).",
             host_path.display(),
             s.components.len(),
             s.bindings.len()
@@ -446,8 +446,7 @@ fn cmd_run_inline_scenario(
         match scenario::render_synthesised_host(&s, host_path)? {
             Some(yaml) => print!("{yaml}"),
             None => eprintln!(
-                "graph {}: no synthesised host (every binding has an explicit `on:` and no \
-                 `host:` block is declared).",
+                "graph {}: no synthesised host (no `host:` block is declared).",
                 host_path.display()
             ),
         }
@@ -478,7 +477,7 @@ fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> R
         scenario::revalidate_all(&s, scenario_path)?;
         println!(
             "scenario {}: validation passed ({} component(s), {} binding(s); \
-             merged-config re-validation green).",
+             host re-validation green).",
             scenario_path.display(),
             s.components.len(),
             s.bindings.len()
@@ -491,8 +490,7 @@ fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> R
             Some(yaml) => print!("{yaml}"),
             None => {
                 eprintln!(
-                    "scenario {}: no synthesised host (every binding has an explicit `on:` \
-                     and no `host:` block is declared).",
+                    "scenario {}: no synthesised host (no `host:` block is declared).",
                     scenario_path.display()
                 );
             }
@@ -513,25 +511,18 @@ fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> R
         return Ok(());
     }
 
-    // Real spawn: single-component, multi-component, or sequential mode.
     spawn_scenario(&s, scenario_path, flags, _verbose)
 }
 
-/// Spawn a scenario.
-///
-/// Single-component scenarios (`is_single_component` true) take the
-/// single-component path: build component → write synth host → build host → spawn
-/// fluxor-linux → readiness probe → wait → propagate exit.
-///
-/// Multi-component scenarios take the multi-component path: build every wasm
-/// component (passive — bundles served as static artefacts) and every
-/// non-wasm component (active — gets a fluxor-linux process each),
-/// plus the synth host if `host:` is declared. Then:
+/// Spawn a scenario: build every wasm component (passive — its bundle is
+/// served from the document root) and every other component (active —
+/// one `fluxor-linux` process each), plus the synthesised host if
+/// `host:` is declared. Then:
 ///
 ///   - `sequential: true` runs active components one at a time in
 ///     declaration order, propagating the first non-zero exit and
 ///     enforcing per-component `duration:` (SIGTERM → SIGKILL after
-///     2 s). This is the codec-test-harness mode.
+///     2 s). This is the codec-test-harness mode; it has no host.
 ///   - Otherwise spawn all actives in parallel, wait for any to exit,
 ///     SIGTERM the rest, and propagate the first exit.
 ///
@@ -566,14 +557,15 @@ fn spawn_scenario(
     for (comp_name, comp) in &scenario.components {
         let target = scenario::effective_target(scenario_path, comp);
         if target == "wasm" {
-            // Passive: build the bundle into the canonical location
-            // the synthesised host's fs_path: route already points at.
+            // Passive: build the bundle where the document root's
+            // `fluxor.wasm` link points.
             let graph_rel = comp
                 .graph
                 .as_ref()
                 .ok_or_else(|| Error::Config(format!("component `{comp_name}` has no `graph:`")))?;
             let graph_abs = scenario_dir.join(graph_rel);
-            let bundle_target = scenario::wasm_bundle_target_path(comp_name, comp)?;
+            let bundle_target =
+                scenario::wasm_bundle_target_path(scenario_path, comp_name, comp)?;
             eprintln!(
                 "[scenario] {}: building component `{}` (wasm, {}) → {}",
                 scenario.name,
@@ -585,10 +577,9 @@ fn spawn_scenario(
             continue;
         }
 
-        // Active: merge bindings into the component's graph, write to
-        // disk, build, and queue for spawn.
-        let merged_yaml =
-            scenario::write_merged_component_yaml(comp_name, scenario, scenario_path)?;
+        // Active: write the component's config as the run builds it
+        // (its `runtime_override:` applied), build, and queue for spawn.
+        let merged_yaml = scenario::write_component_yaml(comp_name, scenario, scenario_path)?;
         eprintln!(
             "[scenario] {}: building component `{}` ({}) → {}",
             scenario.name,
@@ -611,10 +602,7 @@ fn spawn_scenario(
                 "component `{comp_name}` build has no output parent"
             ))
         })?;
-        let merged_config: serde_json::Value =
-            serde_yaml::from_str(&std::fs::read_to_string(&merged_yaml)?)
-                .map_err(|e| Error::Config(format!("parse merged yaml: {e}")))?;
-        let port = scenario::extract_http_port(&merged_config);
+        let port = comp.port;
         actives.push(ActiveComponent {
             display: comp_name.clone(),
             config_bin: dir.join("config.bin"),
@@ -681,9 +669,9 @@ struct ActiveComponent {
     display: String,
     config_bin: PathBuf,
     modules_bin: PathBuf,
-    /// http listen port (sniffed from the merged config). `None` for
-    /// headless components — the readiness probe degrades to "child
-    /// still alive after a startup grace period".
+    /// The port the component listens on: its scenario `port:`, or the
+    /// host's. `None` for a headless component — the readiness probe
+    /// degrades to "child still alive after a startup grace period".
     port: Option<u16>,
     url: Option<String>,
     duration: Option<std::time::Duration>,

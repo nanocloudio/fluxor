@@ -1057,9 +1057,10 @@ impl StalenessScope {
 
 /// The `fluxor ci` live-staleness check.
 ///
-/// For every workspace-member project among this project's declared
-/// dependencies, compare the member checkout's current per-artifact
-/// input digests against the published `io.fluxor.input-digest`
+/// For every workspace-member project among this project's
+/// [`upstream_projects`] (its declared dependencies, and the publisher of
+/// each stack its lock pins), compare the member checkout's current
+/// per-artifact input digests against the published `io.fluxor.input-digest`
 /// annotations in `<member>/meta:latest`, and the checkout's ABI-surface
 /// epoch against each artifact's published `io.fluxor.abi-surface`.
 ///
@@ -1079,12 +1080,20 @@ pub fn live_staleness_report(project_root: &Path) -> Result<Option<Vec<String>>>
     }
     let members = member_projects()?;
 
-    // Declared dependencies that are workspace members. Deliberately not
+    // Upstream projects (declared dependencies, and the publishers of the
+    // stacks the lock pins) that are workspace members. Deliberately not
     // including this project: see `StalenessScope`.
+    let me = crate::project::project_identity(project_root)
+        .ok()
+        .flatten()
+        .map(|i| i.name);
     let mut relevant: Vec<(String, PathBuf)> = Vec::new();
-    for dep in crate::project::dependencies(project_root).map_err(Error::Config)? {
-        if let Some(path) = members.get(&dep.name) {
-            relevant.push((dep.name, path.clone()));
+    for name in upstream_projects(project_root)? {
+        if Some(&name) == me.as_ref() {
+            continue;
+        }
+        if let Some(path) = members.get(&name) {
+            relevant.push((name, path.clone()));
         }
     }
     if relevant.is_empty() {
@@ -1263,18 +1272,40 @@ fn build_member(name: &str, path: &Path, current_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The projects a checkout builds against: its `fluxor.toml`
+/// `[dependencies]`, and the publisher of each stack its `fluxor.lock`
+/// pins. A bound stack (`[uses.stacks]`) resolves outside
+/// `[dependencies]`, so its publisher is an edge only the lock records;
+/// without it a member binding another member's stack could be synced
+/// before that stack is republished at a new epoch.
+fn upstream_projects(path: &Path) -> Result<BTreeSet<String>> {
+    let mut out: BTreeSet<String> = crate::project::dependencies(path)
+        .map_err(Error::Config)?
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    if let Some(lock) = read_store_lock(path)? {
+        out.extend(
+            lock.artifacts
+                .into_iter()
+                .filter(|a| a.kind == crate::stack::KIND)
+                .map(|a| a.project),
+        );
+    }
+    Ok(out)
+}
+
 /// Topological order over the member set by each member's
-/// checkout-side `fluxor.toml` `[dependencies]` (dependencies first).
+/// [`upstream_projects`] (upstream first).
 fn topo_order(members: &[(String, PathBuf)]) -> Result<Vec<(String, PathBuf)>> {
     let names: BTreeSet<&str> = members.iter().map(|(n, _)| n.as_str()).collect();
     let mut deps_of: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (name, path) in members {
-        let deps = crate::project::dependencies(path).map_err(Error::Config)?;
         deps_of.insert(
             name,
-            deps.into_iter()
-                .map(|d| d.name)
-                .filter(|d| names.contains(d.as_str()))
+            upstream_projects(path)?
+                .into_iter()
+                .filter(|d| names.contains(d.as_str()) && d != name)
                 .collect(),
         );
     }
@@ -1316,6 +1347,38 @@ mod tests {
     }
 
     use crate::oci_store::EnvScope;
+
+    /// A member that pins another member's stack — a bound stack, which
+    /// adds no `[dependencies]` entry — is ordered after it, and counts it
+    /// as upstream.
+    #[test]
+    fn a_pinned_stacks_publisher_is_ordered_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = |name: &str, lock: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("fluxor.toml"),
+                format!("[project]\nname = \"{name}\"\nversion = \"0\"\n"),
+            )
+            .unwrap();
+            if !lock.is_empty() {
+                std::fs::write(crate::store_resolve::lockfile_path(&root), lock).unwrap();
+            }
+            (name.to_string(), root)
+        };
+        let lock = "[[artifact]]\nkind = \"stack\"\nproject = \"web\"\nname = \"web_files\"\n\
+                    reference = \"stack/web_files:0.1.0\"\ndigest = \"sha256:00\"\n";
+        let consumer = member("app", lock);
+        let provider = member("web", "");
+        assert_eq!(
+            upstream_projects(&consumer.1).unwrap(),
+            ["web".to_string()].into()
+        );
+        let order = topo_order(&[consumer, provider]).unwrap();
+        let names: Vec<&str> = order.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["web", "app"]);
+    }
 
     /// A name or target that is not one path component never reaches a
     /// path join: a bundle's module name is publisher-authored.

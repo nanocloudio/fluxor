@@ -25,7 +25,8 @@
 //!   3. **Key sanity** — a key must name something that exists and must
 //!      mean one thing. `forbid_inline_tests` entries name real
 //!      top-level directories; `[[ci.lints.exemption]] crate` is a
-//!      crate *name*; every key under `[ci]` is one the CLI reads.
+//!      crate *name*; every key under `[ci]` is one the CLI reads; every
+//!      `[uses.stacks]` binding maps a bound name to a stack name.
 //!
 //! There is no exemption escape here. An exemption is for a rule a
 //! project can be right to break; no standard sanctions a `fluxor.toml`
@@ -94,6 +95,9 @@ pub fn check(project_root: &Path) -> std::result::Result<(), String> {
     check_inline_test_dirs(project_root, &doc, &mut problems);
     check_lint_exemptions(project_root, &doc, &mut problems);
     check_unknown_keys(&doc, &mut problems);
+    if let Err(e) = crate::project::bound_stacks(project_root) {
+        problems.push(e);
+    }
 
     if problems.is_empty() {
         return Ok(());
@@ -651,6 +655,38 @@ mod tests {
         assert!(e.contains("unknown key `[ci.test] script`"), "{e}");
         assert!(e.contains("keys under `[ci.test]`: scripts"), "{e}");
         assert!(!e.contains("SELF_ID"), "{e}");
+    }
+
+    /// A `[uses.stacks]` binding maps a bound name to a stack name; either
+    /// side outside the stack-name rule is refused, naming the line.
+    #[test]
+    fn a_stack_binding_maps_a_name_to_a_stack_name() {
+        let f = Fixture::new("bound");
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\
+             [uses.stacks]\nfile_server = \"static_files\"\n",
+        );
+        check(&f.0).unwrap();
+
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\
+             [uses.stacks]\nfile_server = \"./files.yaml\"\n",
+        );
+        let e = f.err();
+        assert!(
+            e.contains("`file_server = \"./files.yaml\"` must name a stack"),
+            "{e}"
+        );
+
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\
+             [uses.stacks]\n\"@files\" = \"static_files\"\n",
+        );
+        let e = f.err();
+        assert!(e.contains("key `@files` is not a bound name"), "{e}");
     }
 
     /// `[ci.setup]` takes `scripts`, like `[ci.test]`, and nothing else.

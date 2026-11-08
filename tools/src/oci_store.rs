@@ -681,6 +681,27 @@ impl OciStore {
         Ok(desc)
     }
 
+    /// Every project this store holds an index for: each `<project>/meta:latest`
+    /// descriptor annotated `io.fluxor.kind = project-index`, by its
+    /// `io.fluxor.project`, sorted. A bound stack resolves among these
+    /// rather than among a project's `[dependencies]`.
+    pub fn project_indexes(&self) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .read_index()?
+            .manifests
+            .iter()
+            .filter(|d| d.annotations.get(ANN_KIND).map(String::as_str) == Some("project-index"))
+            .filter_map(|d| {
+                let project = d.annotations.get(ANN_PROJECT)?;
+                let latest = format!("{project}/meta:latest");
+                (d.annotations.get(ANN_REF_NAME) == Some(&latest)).then(|| project.clone())
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Resolve a reference — a tag (`name:ver`), a full `sha256:<hex>`
     /// digest, or an unambiguous digest-hex prefix — to its descriptor.
     pub fn resolve(&self, reference: &str) -> Result<Descriptor> {

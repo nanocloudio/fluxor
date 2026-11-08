@@ -44,8 +44,9 @@ nothing.
 ## References are the pins
 
 A graph the project builds that includes `stack: <name>` references that
-stack. A bundle the project runs by name from a script is declared in
-`fluxor.toml`:
+stack. A bundle the project runs by name from a script, and the stack that
+fills each bound name (`stack: "@<name>"`) its graphs or a CLI verb use,
+are declared in `fluxor.toml`:
 
 ```toml
 [dependencies]
@@ -53,6 +54,9 @@ storage = "0.1"
 
 [uses]
 bundles = ["object-store"]
+
+[uses.stacks]
+file_server = "static_files"     # what `fluxor run`'s browser host includes
 ```
 
 `fluxor update` resolves every reference through the projects in
@@ -65,6 +69,15 @@ publish, or none does, is refused with the reason. A name the
 project ships itself resolves to its own `packaging/` and is never pinned.
 `fluxor sync` verifies and materialises the pins. Module pins come from each
 dependency's index.
+
+A `[uses.stacks]` binding is pinned whether or not a graph uses it, and its
+stack resolves from whichever project in the store publishes it, not only
+from `[dependencies]`: a binding pins that one stack and the modules it
+composes, never the rest of its publisher's modules. Use it when the
+project needs a capability for its examples, tests or a CLI verb rather
+than for what it ships (see
+[../architecture/stacks.md](../architecture/stacks.md#bound-names)). An
+`@name` no binding names refuses the update.
 
 ## Params
 

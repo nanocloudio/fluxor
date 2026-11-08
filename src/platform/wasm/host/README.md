@@ -10,10 +10,10 @@ bundle.
 
 ## Files
 
-- **`runtime.html`** — the single shell. Fetches `/scenario.json`
-  to learn what to render, composes a DOM layout from the
-  `presentation:` block (canvas / player / terminal surfaces),
-  loads `/fluxor.wasm`, instantiates with the shim, and drives
+- **`runtime.html`** — the single shell. Fetches `scenario.json`
+  beside the page to learn what to render, composes a DOM layout from
+  the `presentation:` block (canvas / player / terminal surfaces),
+  loads `fluxor.wasm`, instantiates with the shim, and drives
   `kernel_init` + `kernel_step` in a `requestAnimationFrame`
   loop. Per-role navigation is built into the shell: a display
   surface advances on click and steps back on double-click; a player
@@ -62,20 +62,15 @@ bundle.
 
 ## How they get served
 
-The scenario synthesiser auto-mounts both files as static routes on
-the synthesised host whenever a component targets wasm:
-
-| Route | Source |
-|---|---|
-| `/` | `src/platform/wasm/host/runtime.html` |
-| `/host_shims.js` | `src/platform/wasm/host/host_shims.js` |
-| `/fluxor.wasm` | `target/wasm/<bundle>.wasm` |
-| `/scenario.json` | synthesised inline body (presentation block + playlist source) |
-| `/api/list` | `list:` binding (dual-mode listing + file-serve) |
-
-Five routes against the host profile's `MAX_ROUTES = 8`. Three slots
-remain for routes that bindings inject onto the synthesised host (e.g.
-extra `list:` bindings for separate galleries).
+`fluxor run` on a scenario with a `host:` block writes every file the
+browser fetches into one document root and runs a Linux host that serves
+it through the stack the scenario's project binds as `@file_server`.
+Under each `serve:` binding's `prefix` the root holds `index.html` (this
+shell, with `browser_overlay_runtime.js` inlined), `fluxor.wasm`,
+`host_shims.js`, `fluxor-worker.js`, `scenario.json`, and, with a `list:`
+binding, `fluxor-manifest.json` and the listed directory. The layout and
+the interface a bound file server meets are in
+[`docs/architecture/wasm_browser_host.md`](../../../../docs/architecture/wasm_browser_host.md#serving).
 
 ## Why this lives under `src/platform/wasm/`
 
