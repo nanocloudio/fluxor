@@ -568,8 +568,9 @@ pub fn publish_project_into(
         if identity.name == "fluxor" && !names.iter().any(|n| n == "fluxor") {
             names.push("fluxor".to_string());
         }
-        let triple = detect_host_target()?;
-        for name in names {
+        let host = detect_host_target()?;
+        for entry in names {
+            let (triple, name) = runtime_entry(&entry, &host)?;
             let bin = pr.join("target").join(&triple).join("release").join(&name);
             if !bin.is_file() {
                 if verbose {
@@ -700,6 +701,26 @@ pub fn publish_project_into(
 /// Artefact names whose module manifest declares `[publish] withheld`,
 /// mapped to the declared reason. Keyed by ARTEFACT name, so every variant of
 /// a withheld module is withheld with it.
+/// One `[project].runtimes` entry as `(triple, binary name)`. A bare name is
+/// a binary built for the host, at `target/<host>/release/<name>`; a
+/// `<triple>/<name>` entry is one built for another triple (the wasm kernel,
+/// `wasm32-unknown-unknown/fluxor.wasm`), at `target/<triple>/release/<name>`.
+/// That is the path `fluxor sync` writes a pinned runtime to, so a consumer
+/// finds the binary where the owner built it.
+fn runtime_entry(entry: &str, host: &str) -> Result<(String, String)> {
+    let (triple, name) = match entry.split_once('/') {
+        Some((triple, name)) => (triple, name),
+        None => (host, entry),
+    };
+    let single = |v: &str| !v.is_empty() && v != "." && v != ".." && !v.contains(['/', '\\']);
+    if !single(triple) || !single(name) {
+        return Err(Error::Config(format!(
+            "[project].runtimes entry {entry:?} is neither `<name>` nor `<triple>/<name>`"
+        )));
+    }
+    Ok((triple.to_string(), name.to_string()))
+}
+
 fn withheld_artifacts(project_root: &Path) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for m in crate::modules_build::list(project_root)? {
@@ -1359,5 +1380,35 @@ mod tests {
             first_entry_name("fluxor/src/fluxor-contracts:latest"),
             "src/lib.rs"
         );
+    }
+
+    /// A bare runtime is the host's; `<triple>/<name>` names another
+    /// triple's build. Anything that would escape `target/<triple>/release/`
+    /// is refused.
+    #[test]
+    fn runtime_entries_name_a_triple_or_the_host() {
+        let host = "aarch64-unknown-linux-gnu";
+        assert_eq!(
+            super::runtime_entry("fluxor-linux", host).unwrap(),
+            (host.to_string(), "fluxor-linux".to_string())
+        );
+        assert_eq!(
+            super::runtime_entry("wasm32-unknown-unknown/fluxor.wasm", host).unwrap(),
+            (
+                "wasm32-unknown-unknown".to_string(),
+                "fluxor.wasm".to_string()
+            )
+        );
+        for bad in [
+            "",
+            "/fluxor.wasm",
+            "wasm32/",
+            "a/b/c",
+            "../x",
+            "x/..",
+            "a\\b",
+        ] {
+            assert!(super::runtime_entry(bad, host).is_err(), "{bad:?}");
+        }
     }
 }

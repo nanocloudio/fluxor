@@ -69,8 +69,13 @@ Both the Fluxor kernel and every PIC module compile for
 `wasm32-unknown-unknown` (no_std, no host imports beyond what this doc
 defines). Outputs:
 
-- `target/wasm/firmware.wasm` — the kernel as a single WASM module
-  (built with the `host-wasm` cargo feature)
+- `target/wasm32-unknown-unknown/release/fluxor.wasm` — the kernel as a
+  single WASM module (built with the `host-wasm` cargo feature). Fluxor
+  publishes it as the runtime `fluxor.wasm` (`[project].runtimes`), so a
+  consumer's `fluxor sync` installs the pinned kernel at the same path,
+  matching the SDK its modules are built against. `make firmware
+  TARGET=wasm` also copies it to `target/wasm/firmware.wasm`, like every
+  firmware target, but the bundler reads the runtime path.
 - `target/fluxor/wasm32/modules/<name>.fmod` — each module's `.fmod`
   envelope, with a wasm32 module as its code payload
 
@@ -288,7 +293,8 @@ The user-visible commands parallel the other targets:
 
 ```sh
 fluxor modules build --target wasm    # → target/fluxor/wasm32/modules/*.fmod
-make firmware   TARGET=wasm           # → target/wasm/firmware.wasm
+make firmware   TARGET=wasm           # → target/wasm32-unknown-unknown/release/fluxor.wasm
+                                      #   (fluxor sync installs it in other projects)
 fluxor build    config.yaml           # → target/wasm/<config>.wasm  (with target: wasm)
 ```
 
@@ -299,7 +305,7 @@ Internally, `fluxor build` for `target: wasm`:
 2. Concatenates the selected `.fmod` files into `modules.bin` (same
    layout as every other target) and compiles the config to
    `config.bin`.
-3. Loads `target/wasm/firmware.wasm`, rewrites the two blob
+3. Loads `target/wasm32-unknown-unknown/release/fluxor.wasm`, rewrites the two blob
    placeholders in place (§5), and appends any declared assets.
 4. Writes the result to `target/wasm/<config>.wasm`.
 

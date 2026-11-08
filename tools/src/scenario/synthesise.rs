@@ -64,7 +64,7 @@ pub fn synthesise_host_config(
 /// Partition principle: per-scenario things go in the `.wasm`
 /// bundle (assets, PIC modules, config blob); shared infra lives
 /// in the orchestrator. The shell is the browser-side analog of
-/// `target/wasm/firmware.wasm` — built once into the orchestrator,
+/// `fluxor.wasm` kernel runtime — built once into the orchestrator,
 /// served once per scenario. Same shape as how `fluxor-linux`
 /// hosts countless `bcm2712` configs without those configs
 /// shipping their own kernel.

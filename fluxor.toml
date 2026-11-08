@@ -6,10 +6,13 @@
 [project]
 name     = "fluxor"
 version  = "0.0.1"
-# Host runtime binaries this project owns. The `fluxor publish`
-# runtime sweep publishes only the binaries named here, plus the CLI
-# itself; a binary synced in from upstream is never swept up by it.
-runtimes = ["fluxor-linux"]
+# Runtime binaries this project owns. The `fluxor publish` runtime
+# sweep publishes only the binaries named here, plus the CLI itself; a
+# binary synced in from upstream is never swept up by it. A bare name is
+# built for the host; `<triple>/<name>` for another triple. The browser
+# kernel is pinned like any runtime, so `fluxor sync` gives every
+# consumer the kernel that matches the SDK its modules build against.
+runtimes = ["fluxor-linux", "wasm32-unknown-unknown/fluxor.wasm"]
 
 [required]
 # Wire-ABI pin checked by `fluxor ci`'s version-skew phase: it equals

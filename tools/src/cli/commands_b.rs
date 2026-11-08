@@ -1398,6 +1398,12 @@ fn build_one(
     build_one_from(yaml_path, output_override, None, verbose)
 }
 
+/// The browser kernel every `target: wasm` bundle is made from: Fluxor's
+/// `[project].runtimes` entry `wasm32-unknown-unknown/fluxor.wasm`, at the
+/// path `make firmware TARGET=wasm` builds it to and `fluxor sync` installs
+/// the pinned copy at.
+const WASM_KERNEL: &str = "target/wasm32-unknown-unknown/release/fluxor.wasm";
+
 /// A bare-metal image is the firmware plus the modules: both must have been
 /// built, by the commands named here, before it can be packed.
 fn require_firmware_and_modules(
@@ -1643,15 +1649,20 @@ fn build_one_from(
         }
         "wasm" => {
             // wasm produces one self-contained `.wasm` file: the
-            // kernel `firmware.wasm` with its embedded modules-blob
-            // and config-blob placeholders rewritten in-place. See
+            // kernel with its embedded modules-blob and config-blob
+            // placeholders rewritten in-place. See
             // `docs/architecture/wasm_platform.md` and the
             // `wasm_bundle` module for the rewrite mechanics.
-            let kernel_wasm_path = PathBuf::from(format!("target/{build_id}/firmware.wasm"));
+            //
+            // The kernel is Fluxor's `fluxor.wasm` runtime, read where cargo
+            // builds it in Fluxor and where `fluxor sync` writes the pinned
+            // copy in any other project, so it moves with the lock and the
+            // ABI surface the modules were built against.
+            let kernel_wasm_path = PathBuf::from(WASM_KERNEL);
             if !kernel_wasm_path.exists() {
                 return Err(Error::Config(format!(
-                    "Kernel wasm not found at {}. Run 'make firmware TARGET=wasm' first.",
-                    kernel_wasm_path.display()
+                    "Kernel wasm not found at {WASM_KERNEL}. Run `fluxor sync` to install the \
+                     pinned `fluxor.wasm` runtime (in Fluxor itself, `make firmware TARGET=wasm`)."
                 )));
             }
             if !crate::modules_build::holds_fmod(&modules_dir) {

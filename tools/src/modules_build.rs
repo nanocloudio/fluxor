@@ -208,6 +208,9 @@ struct Candidate {
     /// `[build] opt_level` from the manifest — per-module rustc
     /// `opt-level` for a native target. `None` keeps the default.
     opt_level: Option<String>,
+    /// `[build] wasm_target_features` — wasm features the module compiles
+    /// with. Empty compiles for the baseline.
+    wasm_target_features: Vec<String>,
     /// `builtin = true`: a declaration of a kernel-resident module.
     /// Inventoried, never built — it has no source of its own.
     builtin: bool,
@@ -250,6 +253,8 @@ struct BuildRaw {
     wasm_opt_level: Option<String>,
     #[serde(default)]
     opt_level: Option<String>,
+    #[serde(default)]
+    wasm_target_features: Vec<String>,
 }
 
 /// Raw `[[variant]]` row as discovery sees it. Full validation
@@ -332,6 +337,9 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                 crate::manifest::validate_wasm_opt_level(level)
                     .map_err(|e| Error::Module(format!("{}: {e}", manifest.display())))?;
             }
+            let wasm_target_features = build.wasm_target_features;
+            crate::manifest::validate_wasm_target_features(&wasm_target_features)
+                .map_err(|e| Error::Module(format!("{}: {e}", manifest.display())))?;
             match raw.variant {
                 None => out.push(Candidate {
                     name: name.clone(),
@@ -347,6 +355,7 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                     check_cfg_features: Vec::new(),
                     wasm_opt_level: wasm_opt_level.clone(),
                     opt_level: opt_level.clone(),
+                    wasm_target_features: wasm_target_features.clone(),
                     builtin,
                 }),
                 Some(variants) => {
@@ -391,6 +400,7 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                             check_cfg_features: all.clone(),
                             wasm_opt_level: wasm_opt_level.clone(),
                             opt_level: opt_level.clone(),
+                            wasm_target_features: wasm_target_features.clone(),
                             builtin,
                         });
                     }
@@ -2025,6 +2035,16 @@ fn compile_module_wasm(
         ))
         .arg("-C")
         .arg("strip=symbols");
+    if !cand.wasm_target_features.is_empty() {
+        let plus: Vec<String> = cand
+            .wasm_target_features
+            .iter()
+            .map(|f| format!("+{f}"))
+            .collect();
+        rustc
+            .arg("-C")
+            .arg(format!("target-feature={}", plus.join(",")));
+    }
     rustc.args(cfg_abi_args(spec)).args(cfg_feature_args(cand));
     if opts.strict {
         rustc.arg("-D").arg("warnings");
@@ -3032,6 +3052,7 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
             check_cfg_features: Vec::new(),
             wasm_opt_level: None,
             opt_level: None,
+            wasm_target_features: Vec::new(),
             builtin: false,
         }
     }

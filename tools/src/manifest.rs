@@ -2968,6 +2968,7 @@ impl Manifest {
         for level in [&wasm_opt_level, &opt_level].into_iter().flatten() {
             validate_wasm_opt_level(level)?;
         }
+        validate_wasm_target_features(build.wasm_target_features.as_deref().unwrap_or(&[]))?;
 
         Ok(Manifest {
             module_version,
@@ -3772,6 +3773,36 @@ struct TomlBuild {
     wasm_opt_level: Option<String>,
     /// rustc `opt-level` for a native target. Absent keeps the default.
     opt_level: Option<String>,
+    /// wasm features the module compiles with (`-C target-feature=+…`),
+    /// from [`WASM_TARGET_FEATURES`]. Absent compiles for the baseline.
+    wasm_target_features: Option<Vec<String>>,
+}
+
+/// The wasm features a module may compile with: each is a standardised
+/// proposal every browser the wasm runtime targets ships, so a module that
+/// names one still loads wherever the kernel does.
+pub const WASM_TARGET_FEATURES: [&str; 7] = [
+    "bulk-memory",
+    "extended-const",
+    "multivalue",
+    "nontrapping-fptoint",
+    "reference-types",
+    "sign-ext",
+    "simd128",
+];
+
+/// Validate a `[build] wasm_target_features` list. Shared by the manifest
+/// parse and module-build discovery, like [`validate_wasm_opt_level`].
+pub fn validate_wasm_target_features(features: &[String]) -> Result<()> {
+    for f in features {
+        if !WASM_TARGET_FEATURES.contains(&f.as_str()) {
+            return Err(Error::Module(format!(
+                "invalid [build] wasm_target_features entry '{f}' — expected any of {}",
+                WASM_TARGET_FEATURES.join(", ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The accepted `wasm_opt_level` values — rustc's `opt-level` set.
@@ -4529,6 +4560,17 @@ mod tests {
     /// `[build] wasm_opt_level` parses into the manifest, absent means
     /// `None` (build default), and a value outside rustc's `opt-level`
     /// set is rejected at parse time.
+    #[test]
+    fn build_wasm_target_features_validate() {
+        let with = "version = \"0.1.0\"\n\n[build]\nwasm_target_features = [\"simd128\", \"bulk-memory\"]\n";
+        Manifest::from_toml_str_for_target(with, None).expect("known features parse");
+        let bad = "version = \"0.1.0\"\n\n[build]\nwasm_target_features = [\"atomics\"]\n";
+        let err = Manifest::from_toml_str_for_target(bad, None)
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("wasm_target_features"), "{err}");
+    }
+
     #[test]
     fn build_wasm_opt_level_parses_and_validates() {
         let with = "version = \"0.1.0\"\n\n[build]\nwasm_opt_level = \"z\"\n";
