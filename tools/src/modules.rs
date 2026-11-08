@@ -1266,10 +1266,10 @@ fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 }
 
 /// A `[capacities] heap_from_params` rule's `base` — or a `heap_per_demand`
-/// rule's, for a type with no heap rule — is the module type's default heap
-/// cap, which the composer grows from. It is a copy of a figure
-/// the module computes, so `pack` holds the two equal for the very build it
-/// packs — this ABI, this variant: the module must declare its arena
+/// or `heap_per_param` rule's, for a type with no `heap_from_params` rule —
+/// is the module type's default heap cap, which the composer grows from. It
+/// is a copy of a figure the module computes, so `pack` holds the two equal
+/// for the very build it packs — this ABI, this variant: the module must declare its arena
 /// (`declare_module_arena_bytes!`) and the manifest's `base`, resolved for
 /// both, must be that figure. A drifted `base` would size every derived cap
 /// wrong, too small (the module refuses its params) or too large (the
@@ -1286,10 +1286,12 @@ fn check_heap_rule_base(
     let (key, base) = match (
         manifest.heap_from_params.as_ref(),
         manifest.heap_per_demand.as_ref().and_then(|r| r.base),
+        manifest.heap_per_param.as_ref().and_then(|r| r.base),
     ) {
-        (Some(rule), _) => ("heap_from_params", rule.base),
-        (None, Some(base)) => ("heap_per_demand", base),
-        (None, None) => return Ok(()),
+        (Some(rule), ..) => ("heap_from_params", rule.base),
+        (None, Some(base), _) => ("heap_per_demand", base),
+        (None, None, Some(base)) => ("heap_per_param", base),
+        (None, None, None) => return Ok(()),
     };
     let build = format!(
         "{} / variant {}",
@@ -1312,19 +1314,20 @@ fn check_heap_rule_base(
     }
 }
 
-/// `(tag, type id, name)` of each param a `define_params!` schema declares
-/// (`[S][P][version][count]`, then per param its tag, type id, u32 default,
-/// length-prefixed name and enum table).
-fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String)> {
+/// `(tag, type id, name, default)` of each param a `define_params!` schema
+/// declares (`[S][P][version][count]`, then per param its tag, type id, u32
+/// default, length-prefixed name and enum table).
+fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String, u32)> {
     let mut out = Vec::new();
     if schema.len() < 4 || schema[..2] != [0x53, 0x50] {
         return out;
     }
     let mut pos = 4usize;
     for _ in 0..schema[3] {
-        let Some(&[tag, ty]) = schema.get(pos..pos + 2) else {
+        let Some(&[tag, ty, d0, d1, d2, d3]) = schema.get(pos..pos + 6) else {
             break;
         };
+        let default = u32::from_le_bytes([d0, d1, d2, d3]);
         pos += 6; // tag, type, default
         let Some(&name_len) = schema.get(pos) else {
             break;
@@ -1332,7 +1335,7 @@ fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String)> {
         let Some(name) = schema.get(pos + 1..pos + 1 + name_len as usize) else {
             break;
         };
-        out.push((tag, ty, String::from_utf8_lossy(name).into_owned()));
+        out.push((tag, ty, String::from_utf8_lossy(name).into_owned(), default));
         pos += 1 + name_len as usize;
         let Some(&enums) = schema.get(pos) else {
             break;
@@ -1372,6 +1375,37 @@ fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Re
             input.display()
         )));
     }
+    // A per-param heap rule counts integer params by value, and restates
+    // each one's schema default — the count of an instance that leaves it
+    // unset.
+    for term in manifest.heap_per_param.iter().flat_map(|r| &r.params) {
+        match params.iter().find(|p| p.0 == term.tag) {
+            // `schema::ParamType` ids: 0 `u8`, 1 `u16`, 2 `u32`.
+            Some((_, 0..=2, name, default)) if *default != term.default => {
+                return Err(Error::Module(format!(
+                    "{}: `[capacities] heap_per_param` counts param '{name}' (tag {}) with \
+                     `default = {}`, but it defaults to {default} in the module's \
+                     `define_params!` schema — set `default` to {default}",
+                    input.display(),
+                    term.tag,
+                    term.default
+                )));
+            }
+            Some((_, 0..=2, ..)) => {}
+            found => {
+                let found = match found {
+                    Some((_, _, name, _)) => format!("param '{name}', not an integer"),
+                    None => "no param in the module's `define_params!` schema".to_string(),
+                };
+                return Err(Error::Module(format!(
+                    "{}: `[capacities] heap_per_param` counts params tag {}, which is {found}; \
+                     each term must name a `u8`, `u16` or `u32` param, whose value is the count",
+                    input.display(),
+                    term.tag
+                )));
+            }
+        }
+    }
     let rules: Vec<(&str, &[u8], bool)> = manifest
         .heap_from_params
         .as_ref()
@@ -1396,7 +1430,7 @@ fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Re
                 continue;
             }
             let found = match param {
-                Some((_, _, name)) => format!("param '{name}', neither a string nor an integer"),
+                Some((_, _, name, _)) => format!("param '{name}', neither a string nor an integer"),
                 None => "no param in the module's `define_params!` schema".to_string(),
             };
             let want = if strings {
@@ -1452,7 +1486,7 @@ fn check_claim_selector_params(input: &Path, manifest: &Manifest, schema: &[u8])
 fn check_claim_param(
     input: &Path,
     claim: &manifest::ResourceClaim,
-    params: &[(u8, u8, String)],
+    params: &[(u8, u8, String, u32)],
     key: &str,
     name: &str,
 ) -> Result<()> {
@@ -2413,6 +2447,89 @@ mod tests {
             e.contains("heap_per_demand.base` is 4096 B") && e.contains("set `base` to 8192"),
             "{e}"
         );
+    }
+
+    /// `heap_per_param` is held at pack to the module: its `base` to the
+    /// declared arena, its tag to an integer param of the schema, and its
+    /// `default` to that param's schema default. Refused at manifest load:
+    /// a missing or doubled `base`, and a type stating both per-unit rules.
+    #[test]
+    fn heap_per_param_is_held_to_the_module_it_sizes() {
+        const TOML: &str = "version = \"1.0.0\"\n[capacities]\n\
+            heap_per_param = { base = 4096, params = [{ tag = 3, default = 2, bytes_each = \
+            { default = 4000, thumbv6m = 2000 } }] }\n";
+        let m = Manifest::from_toml_str_for_target(TOML, Some("thumbv6m")).unwrap();
+        let rule = m.heap_per_param.clone().unwrap();
+        let t = &rule.params[0];
+        assert_eq!(
+            (t.tag, t.default, t.bytes_each, rule.base),
+            (3, 2, 2000, Some(4096))
+        );
+        let p = Path::new("tc.elf");
+        check_heap_rule_base(p, &m, Some(4096), Some("thumbv6m"), None).expect("matches");
+        let e = check_heap_rule_base(p, &m, Some(8192), Some("thumbv6m"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("heap_per_param.base` is 4096 B"), "{e}");
+
+        let schema = |ty: u8, default: u32| {
+            let mut s = vec![0x53, 0x50, 1, 1, 3, ty];
+            s.extend_from_slice(&default.to_le_bytes());
+            s.push(5);
+            s.extend_from_slice(b"flows");
+            s.push(0);
+            s
+        };
+        check_param_rule_tags(p, &m, &schema(1, 2)).expect("a u16 defaulting to 2");
+        let e = check_param_rule_tags(p, &m, &schema(1, 8))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("defaults to 8") && e.contains("set `default` to 8"),
+            "{e}"
+        );
+        let e = check_param_rule_tags(p, &m, &schema(3, 2))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("param 'flows', not an integer"), "{e}");
+        let e = check_param_rule_tags(p, &m, &[0x53, 0x50, 1, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("no param in the module's `define_params!` schema"),
+            "{e}"
+        );
+
+        for (toml, want) in [
+            (
+                "heap_per_param = { params = [{ tag = 3, default = 2, bytes_each = 64 }] }",
+                "heap_per_param has no `base`",
+            ),
+            (
+                "heap_from_params = { tags = [1], base = 4096 }\n\
+                 heap_per_param = { base = 4096, params = [{ tag = 3, default = 2, bytes_each = 64 }] }",
+                "drop `base` here",
+            ),
+            (
+                "heap_per_demand = { pool = \"store_subs\", bytes_each = 96, base = 4096 }\n\
+                 heap_per_param = { params = [{ tag = 3, default = 2, bytes_each = 64 }] }",
+                "a type states one",
+            ),
+            ("heap_per_param = { base = 64, params = [] }", "params is empty"),
+            (
+                "heap_per_param = { base = 64, params = [{ tag = 3, default = 2, bytes_each = 64 }, \
+                 { tag = 3, default = 2, bytes_each = 8 }] }",
+                "tag 3 is counted twice",
+            ),
+        ] {
+            let e = Manifest::from_toml_str_for_target(
+                &format!("version = \"1.0.0\"\n[capacities]\n{toml}\n"),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains(want), "{toml}: {e}");
+        }
     }
 
     /// Two params on one tag are refused at pack, rule or no rule, naming

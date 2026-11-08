@@ -1038,27 +1038,35 @@ pub struct HeapFromParams {
     pub included: u32,
 }
 
+/// The `(tag, value)` entries of a params TLV (`[magic][version][len u16]`
+/// then `[tag][len u8][value]` entries, ending at tag 0xFF), walked as a
+/// module's `parse_tlv` walks it: in order, and only while an entry fits
+/// the blob.
+fn params_tlv_entries(tlv: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut off = 4usize;
+    std::iter::from_fn(move || {
+        let &[tag, len] = tlv.get(off..off + 2)? else {
+            return None;
+        };
+        let value = tlv.get(off + 2..off + 2 + usize::from(len))?;
+        if tag == 0xFF {
+            return None;
+        }
+        off += 2 + usize::from(len);
+        Some((tag, value))
+    })
+}
+
 impl HeapFromParams {
     /// Value bytes of the entries under this rule's tags in a params TLV
     /// (`[magic][version][len u16]` then `[tag][len u8][value]` entries,
     /// ending at tag 0xFF), walked as a module's `parse_tlv` walks it: an
     /// entry counts only when it fits the blob.
     pub fn declared_bytes(&self, tlv: &[u8]) -> u64 {
-        let mut total = 0u64;
-        let mut off = 4usize;
-        while off + 2 <= tlv.len() {
-            let tag = tlv[off];
-            let len = tlv[off + 1] as usize;
-            off += 2;
-            if tag == 0xFF {
-                break;
-            }
-            if off + len <= tlv.len() && self.tags.contains(&tag) {
-                total += len as u64;
-            }
-            off += len;
-        }
-        total
+        params_tlv_entries(tlv)
+            .filter(|(tag, _)| self.tags.contains(tag))
+            .map(|(_, value)| value.len() as u64)
+            .sum()
     }
 
     /// The smallest heap cap that holds `bytes` declared bytes: what `base`
@@ -1106,20 +1114,10 @@ impl DemandFromParams {
     /// several), split on `split`, and the non-blank pieces counted.
     pub fn declared_count(&self, tlv: &[u8], integers: &[(u8, u32)]) -> u64 {
         let mut values: Vec<(u8, Vec<u8>)> = self.tags.iter().map(|&t| (t, Vec::new())).collect();
-        let mut off = 4usize;
-        while off + 2 <= tlv.len() {
-            let tag = tlv[off];
-            let len = tlv[off + 1] as usize;
-            off += 2;
-            if tag == 0xFF {
-                break;
+        for (tag, value) in params_tlv_entries(tlv) {
+            if let Some((_, v)) = values.iter_mut().find(|(t, _)| *t == tag) {
+                v.extend_from_slice(value);
             }
-            if off + len <= tlv.len() {
-                if let Some((_, v)) = values.iter_mut().find(|(t, _)| *t == tag) {
-                    v.extend_from_slice(&tlv[off..off + len]);
-                }
-            }
-            off += len;
         }
         values
             .iter()
@@ -1165,6 +1163,64 @@ impl HeapPerDemand {
     /// The heap bytes this rule adds for a pool planned to `ceiling`.
     pub fn extra_for(&self, ceiling: u64) -> u64 {
         u64::from(self.bytes_each).saturating_mul(ceiling)
+    }
+}
+
+/// `[capacities] heap_per_param`: every instance's heap grows by
+/// `bytes_each` per unit of each of its own integer params the rule lists —
+/// counts the graph sets (flows, entries, slots), one table each — on top of
+/// the type's heap figure (`heap_from_params`'s, else this rule's `base`).
+/// Each term restates its param's schema `default`, the count of an instance
+/// that leaves it unset; like `base` it is a copy of a figure the module
+/// declares, and `pack` holds it to the schema. The module takes each table
+/// from its heap at instantiation and refuses an entry past its count by
+/// name. Resolved for the silicon like every other capacity. TOML-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapPerParam {
+    pub params: Vec<HeapParamTerm>,
+    /// The type's own heap cap, stated only by a type without a
+    /// `heap_from_params` rule (whose `base` it otherwise is).
+    pub base: Option<u32>,
+}
+
+/// One counted param of a [`HeapPerParam`] rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapParamTerm {
+    /// The integer param (`u8`, `u16`, `u32`) whose value is the count.
+    pub tag: u8,
+    /// The param's schema default.
+    pub default: u32,
+    pub bytes_each: u32,
+}
+
+impl HeapParamTerm {
+    /// The count an instance's params TLV declares: the param's value
+    /// (little-endian, as the module reads it), its default when unset.
+    pub fn declared_count(&self, tlv: &[u8]) -> u64 {
+        params_tlv_entries(tlv)
+            .find(|&(tag, _)| tag == self.tag)
+            .map_or(u64::from(self.default), |(_, value)| {
+                value
+                    .iter()
+                    .take(4)
+                    .rev()
+                    .fold(0u64, |n, &b| (n << 8) | u64::from(b))
+            })
+    }
+}
+
+impl HeapPerParam {
+    /// The heap bytes the rule adds for an instance's params TLV, and each
+    /// term's `(tag, count, bytes_each)` for the report.
+    pub fn extra_for(&self, tlv: &[u8]) -> (u64, Vec<(u8, u64, u32)>) {
+        let mut total = 0u64;
+        let mut terms = Vec::with_capacity(self.params.len());
+        for t in &self.params {
+            let count = t.declared_count(tlv);
+            total = total.saturating_add(u64::from(t.bytes_each).saturating_mul(count));
+            terms.push((t.tag, count, t.bytes_each));
+        }
+        (total, terms)
     }
 }
 
@@ -1588,6 +1644,9 @@ pub struct Manifest {
     /// `[capacities] heap_per_demand`: heap bytes per unit of a pool's
     /// planned ceiling (see [`HeapPerDemand`]). TOML-only.
     pub heap_per_demand: Option<HeapPerDemand>,
+    /// `[capacities] heap_per_param`: heap bytes per unit of one of the
+    /// instance's own integer params (see [`HeapPerParam`]). TOML-only.
+    pub heap_per_param: Option<HeapPerParam>,
     /// Module attests that its `module_step` / `module_isr_init` /
     /// `module_isr_entry` exports are safe to invoke from an ISR
     /// context: no heap allocation, no `provider_call`, no
@@ -1706,6 +1765,7 @@ impl Default for Manifest {
             heap_from_params: None,
             demand_from_params: Vec::new(),
             heap_per_demand: None,
+            heap_per_param: None,
             isr_safe: false,
             resume_after_fault: false,
             pre_tick_drain: false,
@@ -2854,6 +2914,7 @@ impl Manifest {
             heap_rule,
             demand_rule: demand_from_params,
             heap_demand_rule: heap_per_demand,
+            heap_param_rule: heap_per_param,
         } = resolve_capacities(toml_val.capacities.unwrap_or_default(), abi, "capacities")?;
         let heap_from_params = match heap_rule {
             None => None,
@@ -2891,6 +2952,37 @@ impl Manifest {
                     return Err(Error::Module(
                         "capacities.heap_per_demand has no `base` — the module type's default \
                          heap cap, which the per-demand bytes are added to (or declare a \
+                         heap_from_params rule, whose `base` it then is)"
+                            .into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+        // One per-unit rule grows a type's heap: the two add to the same
+        // figure, and a type holding a pool's demand and a counted table
+        // states one rule for the larger and sizes the other within it.
+        if heap_per_demand.is_some() && heap_per_param.is_some() {
+            return Err(Error::Module(
+                "capacities.heap_per_demand and capacities.heap_per_param both grow the heap \
+                 per unit — a type states one"
+                    .into(),
+            ));
+        }
+        if let Some(rule) = &heap_per_param {
+            match (heap_from_params.is_some(), rule.base.is_some()) {
+                (true, true) => {
+                    return Err(Error::Module(
+                        "capacities.heap_per_param states a `base`, but the module's \
+                         heap_from_params rule already does — the per-param bytes are added \
+                         to that rule's figure; drop `base` here"
+                            .into(),
+                    ))
+                }
+                (false, false) => {
+                    return Err(Error::Module(
+                        "capacities.heap_per_param has no `base` — the module type's default \
+                         heap cap, which the per-param bytes are added to (or declare a \
                          heap_from_params rule, whose `base` it then is)"
                             .into(),
                     ))
@@ -2995,6 +3087,7 @@ impl Manifest {
             heap_from_params,
             demand_from_params,
             heap_per_demand,
+            heap_per_param,
             isr_safe: toml_val.isr_safe,
             resume_after_fault: toml_val.resume_after_fault,
             pre_tick_drain: toml_val.pre_tick_drain,
@@ -3383,6 +3476,7 @@ impl Manifest {
             heap_from_params: None, // toml-only, not serialized
             demand_from_params: Vec::new(),
             heap_per_demand: None,
+            heap_per_param: None,
             isr_safe,
             // Author attestation, TOML-only: a binary-loaded manifest makes
             // no claim, so `fault_policy: restart` is refused (fail-closed).
@@ -4044,6 +4138,7 @@ enum TomlCapacity {
     DemandRule(TomlDemandFromParams),
     DemandRules(Vec<TomlDemandFromParams>),
     HeapDemandRule(TomlHeapPerDemand),
+    HeapParamRule(TomlHeapPerParam),
     Value(CapacityValue),
 }
 
@@ -4068,6 +4163,25 @@ struct TomlHeapPerDemand {
     base: Option<CapacityValue>,
 }
 
+/// `heap_per_param = { base = ..., params = [{ tag = ..., default = ...,
+/// bytes_each = ... }, ...] }`, `base` and each `bytes_each` flat or
+/// per-target.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlHeapPerParam {
+    params: Vec<TomlHeapParamTerm>,
+    base: Option<CapacityValue>,
+}
+
+/// One `{ tag = ..., default = ..., bytes_each = ... }` of `heap_per_param`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlHeapParamTerm {
+    tag: u8,
+    default: u32,
+    bytes_each: CapacityValue,
+}
+
 /// `heap_from_params = { tags = [...], base = ..., included = ... }`, each
 /// number flat or per-target. Every field is optional here so a variant
 /// can change one; module scope requires `tags` and `base`.
@@ -4085,6 +4199,8 @@ const HEAP_FROM_PARAMS_KEY: &str = "heap_from_params";
 const DEMAND_FROM_PARAMS_KEY: &str = "demand_from_params";
 /// The `[capacities]` key that holds the per-demand heap rule.
 const HEAP_PER_DEMAND_KEY: &str = "heap_per_demand";
+/// The `[capacities]` key of the per-param heap rule.
+const HEAP_PER_PARAM_KEY: &str = "heap_per_param";
 
 /// What one `[capacities]` table resolves to: its plain capacities and the
 /// rules it states (`demand_from_params` and `heap_per_demand` at module
@@ -4095,6 +4211,7 @@ struct ResolvedCapacities {
     heap_rule: Option<HeapFromParamsOverride>,
     demand_rule: Vec<DemandFromParams>,
     heap_demand_rule: Option<HeapPerDemand>,
+    heap_param_rule: Option<HeapPerParam>,
 }
 
 /// One `demand_from_params` table, checked: a pool a module declares demand
@@ -4152,6 +4269,55 @@ fn resolve_capacities(
     let mut rule = None;
     for (name, value) in raw {
         let field = format!("{scope}.{name}");
+        if name == HEAP_PER_PARAM_KEY {
+            if scope != "capacities" {
+                return Err(Error::Module(format!(
+                    "{field}: `{name}` is a module-scope rule; a variant cannot change it"
+                )));
+            }
+            let TomlCapacity::HeapParamRule(r) = value else {
+                return Err(Error::Module(format!(
+                    "{field} is a table `{{ base = ..., params = [{{ tag = ..., default = ..., \
+                     bytes_each = ... }}, ...] }}`"
+                )));
+            };
+            if r.params.is_empty() {
+                return Err(Error::Module(format!(
+                    "{field}.params is empty — the rule counts at least one param"
+                )));
+            }
+            let mut params: Vec<HeapParamTerm> = Vec::with_capacity(r.params.len());
+            for (i, t) in r.params.into_iter().enumerate() {
+                let at = format!("{field}.params[{i}]");
+                if t.tag > PARAM_TAG_MAX {
+                    return Err(Error::Module(format!(
+                        "{at}.tag {:#04x} is reserved for kernel metadata ({:#04x}..=0xff); the \
+                         rule counts the module's own integer params",
+                        t.tag,
+                        PARAM_TAG_MAX + 1
+                    )));
+                }
+                if params.iter().any(|p| p.tag == t.tag) {
+                    return Err(Error::Module(format!(
+                        "{at}: tag {} is counted twice — one term per param",
+                        t.tag
+                    )));
+                }
+                params.push(HeapParamTerm {
+                    tag: t.tag,
+                    default: t.default,
+                    bytes_each: t.bytes_each.resolve(abi, &format!("{at}.bytes_each"))?,
+                });
+            }
+            out.heap_param_rule = Some(HeapPerParam {
+                params,
+                base: r
+                    .base
+                    .map(|v| v.resolve(abi, &format!("{field}.base")))
+                    .transpose()?,
+            });
+            continue;
+        }
         if name == DEMAND_FROM_PARAMS_KEY || name == HEAP_PER_DEMAND_KEY {
             if scope != "capacities" {
                 return Err(Error::Module(format!(
@@ -4565,9 +4731,7 @@ mod tests {
         let with = "version = \"0.1.0\"\n\n[build]\nwasm_target_features = [\"simd128\", \"bulk-memory\"]\n";
         Manifest::from_toml_str_for_target(with, None).expect("known features parse");
         let bad = "version = \"0.1.0\"\n\n[build]\nwasm_target_features = [\"atomics\"]\n";
-        let err = Manifest::from_toml_str_for_target(bad, None)
-            .err()
-            .expect("refused");
+        let err = Manifest::from_toml_str_for_target(bad, None).expect_err("refused");
         assert!(err.to_string().contains("wasm_target_features"), "{err}");
     }
 

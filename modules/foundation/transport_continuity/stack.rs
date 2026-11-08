@@ -200,8 +200,12 @@
 
 // ── constants ─────────────────────────────────────────────────────────────
 
-/// Flows one instance moves at once.
-pub const TCS_FLOWS: usize = 2;
+/// The flows one instance moves at once: a table of as many as its `flows`
+/// param says, taken from the module's heap at instantiation (the
+/// composer sizes the heap for it, `[capacities] heap_per_param`). Zeroed
+/// memory is the empty table; a pairing past the table is refused
+/// `CAPACITY`.
+pub type TcsFlows = HeapTable<TcsFlow>;
 
 /// STATUS `reason` when an export or import is refused here (`UNSUPPORTED`
 /// / `INVALID`): which half and why; a per-layer refusal carries the
@@ -2010,7 +2014,7 @@ pub struct TcStack {
     pub anchor_id: [u8; 8],
     /// The custody generation EMISSION_DISABLE reports, advanced per cutoff.
     pub custody_gen: u32,
-    pub flows: [TcsFlow; TCS_FLOWS],
+    pub flows: TcsFlows,
     /// The generation of the handle last issued (0 before the first).
     pub last_gen: u32,
     pub counters: TcsCounters,
@@ -2224,7 +2228,7 @@ impl TcStack {
         Self {
             anchor_id,
             custody_gen: 0,
-            flows: [const { TcsFlow::empty() }; TCS_FLOWS],
+            flows: TcsFlows::EMPTY,
             last_gen: 0,
             counters: TcsCounters {
                 rejected: 0,
@@ -2555,7 +2559,7 @@ impl TcStack {
     /// A frame on a half's port was too large to read: whatever it was,
     /// a crash-continuous stream from that half has a hole now.
     pub fn layer_overrun<O: TcsOut>(&mut self, port: TcsPort, out: &mut O) {
-        for i in 0..TCS_FLOWS {
+        for i in 0..self.flows.len() {
             if self.flows[i].live && self.flows[i].mirroring && port != TcsPort::Evt {
                 self.lose_mirror(i, tcs_lost::LAYER, out);
             }
@@ -2578,7 +2582,7 @@ impl TcStack {
                 f,
             );
         }
-        for i in 0..TCS_FLOWS {
+        for i in 0..self.flows.len() {
             let c = &self.flows[i];
             if c.live && c.step != TcsStep::Idle && now_ms >= c.deadline {
                 self.counters.timeouts += 1;
@@ -2654,7 +2658,7 @@ impl TcStack {
         let slot = h.slot as usize;
         let Some(i) = slot
             .checked_sub(1)
-            .filter(|&i| i < TCS_FLOWS && self.flows[i].live)
+            .filter(|&i| i < self.flows.len() && self.flows[i].live)
         else {
             self.counters.rejected += 1;
             tcs_status(out, op, tc_st::STALE_HANDLE, 0, h, 0, [0; 16]);

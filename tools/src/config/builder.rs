@@ -1877,9 +1877,11 @@ fn instance_heap_cap(
     let type_figure = || {
         rule.map(|r| r.derived_cap(bytes).unwrap_or(u64::from(r.base)))
             .or_else(|| {
-                manifest
-                    .and_then(|m| m.heap_per_demand.as_ref())
+                let m = manifest?;
+                m.heap_per_demand
+                    .as_ref()
                     .and_then(|r| r.base)
+                    .or_else(|| m.heap_per_param.as_ref().and_then(|r| r.base))
                     .map(u64::from)
             })
     };
@@ -1896,24 +1898,41 @@ fn instance_heap_cap(
             None => type_figure().map(to_cap).transpose(),
         };
     }
-    let per_demand = plan.per_demand(manifest).filter(|&(extra, ..)| extra > 0);
-    if rule.is_none() && per_demand.is_none() {
+    // The bytes a per-unit rule adds, and what they are for: a pool's planned
+    // ceiling (`heap_per_demand`), or the instance's own count param
+    // (`heap_per_param`). A type states at most one.
+    let per_unit: Option<(u64, String, &str)> = plan
+        .per_demand(manifest)
+        .map(|(extra, pool, ceiling)| {
+            (extra, format!("`{pool}` planned to {ceiling}"), "heap_per_demand")
+        })
+        .or_else(|| {
+            let r = manifest?.heap_per_param.as_ref()?;
+            let (extra, terms) = r.extra_for(tlv);
+            let what = terms
+                .iter()
+                .map(|(tag, count, each)| format!("{count} × {each} B of params tag {tag}"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            Some((extra, what, "heap_per_param"))
+        })
+        .filter(|&(extra, ..)| extra > 0);
+    if rule.is_none() && per_unit.is_none() {
         return Ok(explicit);
     }
     // The figure the rules derive, `None` while the type's own cap holds it.
-    let derived = match &per_demand {
+    let derived = match &per_unit {
         None => rule.and_then(|r| r.derived_cap(bytes)),
         Some((extra, ..)) => type_figure().map(|f| f + extra),
     };
     if let Some(n) = explicit {
-        if let (Some((extra, pool, ceiling)), Some(need)) = (&per_demand, derived) {
+        if let (Some((extra, what, key)), Some(need)) = (&per_unit, derived) {
             if u64::from(n) < need {
                 return Err(Error::Config(format!(
                     "module '{name}': heap.arena_bytes = {n} is below the {need} B its type \
-                     derives — {extra} B of it for `{pool}` planned to {ceiling} \
-                     (`[capacities] heap_per_demand`). The instance could not hold what the \
-                     pool is planned for. Raise it to at least {need}, or drop it to let the \
-                     composer size it."
+                     derives — {extra} B of it for {what} (`[capacities] {key}`). The \
+                     instance could not hold what it is declared for. Raise it to at least \
+                     {need}, or drop it to let the composer size it."
                 )));
             }
         } else if let Some(r) = rule {
@@ -1932,10 +1951,8 @@ fn instance_heap_cap(
         return Ok(None);
     };
     let cap = to_cap(cap)?;
-    match &per_demand {
-        Some((extra, pool, ceiling)) => eprintln!(
-            "  heap: '{name}' cap {cap} B, {extra} B of it for `{pool}` planned to {ceiling}"
-        ),
+    match &per_unit {
+        Some((extra, what, _)) => eprintln!("  heap: '{name}' cap {cap} B, {extra} B of it for {what}"),
         None => eprintln!("  heap: '{name}' cap {cap} B, sized from {bytes} B of declared params"),
     }
     Ok(Some(cap))

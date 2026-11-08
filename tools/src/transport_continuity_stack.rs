@@ -18,6 +18,7 @@ mod sc;
 
 include!("../../modules/sdk/crypto/sha256.rs");
 include!("../../modules/sdk/contracts/net/transport_continuity.rs");
+include!("../../modules/foundation/transport_continuity/heap_table.rs");
 include!("../../modules/sdk/cores/transport_continuity.rs");
 include!("../../modules/sdk/cores/session_handoff.rs");
 include!("../../modules/foundation/transport_continuity/stack.rs");
@@ -1096,7 +1097,72 @@ mod tests {
         // SAFETY: `an_unpaired_provider_is_zeroed_memory`.
         let mut b = unsafe { zeroed::<TcStack>() };
         b.anchor_id = anchor;
+        b.flows = flow_table(2);
         b
+    }
+
+    /// A module heap for tests: 8-byte-aligned memory, as the kernel's heap
+    /// hands out, leaked so a table outlives its stack. Not zeroed — the
+    /// table zeroes what it takes.
+    unsafe extern "C" fn leaked_heap(size: u32) -> *mut u8 {
+        let words = vec![u64::MAX; (size as usize).div_ceil(8)];
+        Box::leak(words.into_boxed_slice()).as_mut_ptr().cast()
+    }
+
+    /// A table of `n` flows, taken as the module takes one from its heap.
+    fn flow_table(n: usize) -> TcsFlows {
+        // SAFETY: `leaked_heap` is an allocator; zeroed memory is the
+        // unpaired flow (`an_unpaired_provider_is_zeroed_memory`).
+        unsafe { TcsFlows::take(leaked_heap, n) }.expect("table")
+    }
+
+    /// The module sizes its heap by `[capacities] heap_per_param`: one
+    /// flow's bytes per `flows`, on top of its declared arena. The figure is
+    /// a copy of `size_of::<TcsFlow>()` and is held to it here, so the heap
+    /// the composer sizes always holds the table the module takes.
+    #[test]
+    fn the_manifest_sizes_the_heap_for_the_flow_table() {
+        let text = include_str!("../../modules/foundation/transport_continuity/manifest.toml");
+        let m = crate::manifest::Manifest::from_toml_str_for_target(text, Some("aarch64")).unwrap();
+        let rule = m.heap_per_param.expect("heap_per_param");
+        let t = &rule.params[0];
+        assert_eq!(t.bytes_each as usize, core::mem::size_of::<TcsFlow>());
+        assert_eq!((t.tag, t.default, rule.params.len()), (2, 2, 1));
+    }
+
+    /// The table is as long as the param says: that many flows pair, and
+    /// the next is refused `CAPACITY`.
+    #[test]
+    fn the_flow_table_is_as_long_as_the_param_says() {
+        let prepare = |i: u8| {
+            let mut b = [0u8; TC_PAIR_LEN];
+            TcPair {
+                flow_id: [i; 16],
+                flow_epoch: EPOCH,
+                role: TcRole::Standby,
+                mode: TcMode::PlannedOnly,
+                transport: TcTransport::TcpTls,
+                mirror_generation: 1,
+                service_id: [0x5A; 16],
+            }
+            .encode(&mut b);
+            [&[0u8; 8][..], &b].concat()
+        };
+        assert!(flow_table(0).is_empty());
+        for n in [1usize, 2, 5] {
+            let mut h = Host::new(ANCHOR_A);
+            h.p.flows = flow_table(n);
+            for i in 1..=n as u8 {
+                h.op(tc_op::PAIR_PREPARE, &prepare(i));
+                assert_eq!(h.status(tc_op::PAIR_PREPARE).status, tc_st::OK, "{n}: {i}");
+            }
+            h.op(tc_op::PAIR_PREPARE, &prepare(n as u8 + 1));
+            assert_eq!(
+                h.status(tc_op::PAIR_PREPARE).status,
+                tc_st::CAPACITY,
+                "{n} flows"
+            );
+        }
     }
 
     /// The module initialises its provider by zeroing it: all-zero memory

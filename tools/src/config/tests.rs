@@ -4634,6 +4634,69 @@ mod dynamic_capacity_tests {
         );
     }
 
+    /// `heap_per_param` adds `bytes_each` × the instance's own count param to
+    /// the type's figure: the param's value when the graph sets it, its
+    /// schema default when not; an explicit `arena_bytes` below the derived
+    /// figure is refused, naming it.
+    #[test]
+    fn heap_per_param_sizes_the_heap_from_the_instances_count() {
+        let m = Manifest {
+            heap_per_param: Some(crate::manifest::HeapPerParam {
+                params: vec![
+                    crate::manifest::HeapParamTerm {
+                        tag: 3,
+                        default: 2,
+                        bytes_each: 1000,
+                    },
+                    crate::manifest::HeapParamTerm {
+                        tag: 5,
+                        default: 0,
+                        bytes_each: 10,
+                    },
+                ],
+                base: Some(4096),
+            }),
+            ..Manifest::default()
+        };
+        let module = json!({"name": "tc"});
+        let plan = HeapPlan::default();
+        // Unset: the default count.
+        assert_eq!(
+            instance_heap_cap("tc", &module, Some(&m), &tlv_of(&[]), &plan).unwrap(),
+            Some(4096 + 2000)
+        );
+        // Set (a u16 param, little-endian): that count.
+        let tlv = tlv_of(&[(3, &512u16.to_le_bytes())]);
+        assert_eq!(
+            instance_heap_cap("tc", &module, Some(&m), &tlv, &plan).unwrap(),
+            Some(4096 + 512_000)
+        );
+        // Zero units: the type's own cap stands, nothing emitted.
+        let none = tlv_of(&[(3, &[0])]);
+        assert_eq!(
+            instance_heap_cap("tc", &module, Some(&m), &none, &plan).unwrap(),
+            None
+        );
+        // Every counted param adds its own table's bytes.
+        let both = tlv_of(&[(3, &512u16.to_le_bytes()), (5, &[7])]);
+        assert_eq!(
+            instance_heap_cap("tc", &module, Some(&m), &both, &plan).unwrap(),
+            Some(4096 + 512_000 + 70)
+        );
+        // Below the derived figure: refused, naming the count.
+        let small = json!({"name": "tc", "heap": {"arena_bytes": 8192}});
+        let e = instance_heap_cap("tc", &small, Some(&m), &tlv, &plan)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("arena_bytes = 8192")
+                && e.contains("516096 B")
+                && e.contains("512 × 1000 B of params tag 3 + 0 × 10 B of params tag 5")
+                && e.contains("heap_per_param"),
+            "{e}"
+        );
+    }
+
     /// The graph is packed once: a `heap_per_demand` instance carries the
     /// counting pass's placeholder cap, and the plan's figure is written over
     /// it in place — in a base-graph entry and in a workload module's params.

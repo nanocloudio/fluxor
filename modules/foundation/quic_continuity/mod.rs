@@ -9,7 +9,12 @@
 //! - 2 `auth_rsp` / `auth_req` — ACTIVATE's token check (`0xC2` the 48-byte
 //!   per-flow token, `0xC3` the verdict). Unwired, nothing activates.
 //!
-//! Params: `anchor_id` (16 hex digits).
+//! Params: `anchor_id` (16 hex digits); `flows` (u16, default 2): the flows
+//! this instance moves at once. Their table is taken from the module's heap
+//! at instantiation — the composer sizes the heap for the count
+//! (`[capacities] heap_per_param`) — and a pairing past it is refused
+//! `CAPACITY`. An instance whose heap cannot hold the table, or with
+//! `flows = 0`, refuses to start, saying so.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -34,6 +39,7 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 include!("../../sdk/crypto/sha256.rs");
 include!("../../sdk/contracts/net/transport_continuity.rs");
+include!("../transport_continuity/heap_table.rs");
 include!("../../sdk/cores/transport_continuity.rs");
 include!("../../sdk/cores/session_handoff.rs");
 include!("qcs.rs");
@@ -69,6 +75,8 @@ struct State {
     ins: [i32; PORTS],
     outs: [i32; PORTS],
     anchor_id: [u8; 8],
+    /// The `flows` param: the flow table's length.
+    flows: u16,
     queue_full: u32,
     rx: [Rx; PORTS],
     q: [Q; PORTS],
@@ -221,8 +229,15 @@ mod params_def {
                 }
             }
         };
+        2, flows, u16, 2 => |s, d, len| { s.flows = p_u16(d, len, 0, 2); };
     }
 }
+
+/// The heap the module needs besides its flow table: the table's one block
+/// header (8 B), its rounding to the allocator's 16-byte granularity and
+/// the 4-byte canary under `canary_enabled`, within 64 B.
+const ARENA_BASE: u32 = 64;
+declare_module_arena_bytes!(ARENA_BASE);
 
 declare_module_state_bytes!(State);
 
@@ -235,7 +250,7 @@ pub extern "C" fn module_state_size() -> u32 {
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
-    0
+    ARENA_BASE
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -277,10 +292,27 @@ pub unsafe extern "C" fn module_new(
         s.outs[k] = dev_channel_port(sys, 1, k as u8);
         k += 1;
     }
+    s.flows = 2;
     if !params.is_null() && params_len > 0 {
         params_def::parse_tlv(s, params, params_len);
     }
     s.core.anchor_id = s.anchor_id;
+    // The flow table, from the heap the composer sized for `flows`. Zeroed
+    // memory is the unpaired flow, as it is the empty provider.
+    if s.flows == 0 {
+        let msg = b"[qc] refusing to construct: flows = 0 leaves no flow to move";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return abi::errno::EINVAL;
+    }
+    match QcsFlows::take(sys.heap_alloc, usize::from(s.flows)) {
+        Some(table) => s.core.flows = table,
+        None => {
+            let msg = b"[qc] refusing to construct: the heap cannot hold `flows` flows \
+                        (heap.arena_bytes below what heap_per_param sizes)";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            return abi::errno::ENOMEM;
+        }
+    }
     0
 }
 

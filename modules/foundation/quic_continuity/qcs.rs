@@ -30,7 +30,11 @@
 // token this provider rebuilds for its own anchor. `quic` then validates
 // the client's path before it trusts it.
 
-pub const QCS_FLOWS: usize = 2;
+/// The flows one instance moves at once: a table as long as its `flows`
+/// param, taken from the module's heap at instantiation (`[capacities]
+/// heap_per_param`). Zeroed memory is the empty table; a pairing past it is
+/// refused `CAPACITY`.
+pub type QcsFlows = HeapTable<QcsFlow>;
 /// A whole `WHQ1` record.
 pub const QCS_REC_MAX: usize = TC_QUIC_HDR + TC_QUIC_LAYER_MAX;
 /// Why a crash-continuous pairing ended here (STATUS of op ABORT,
@@ -200,7 +204,7 @@ pub struct QcsCounters {
 #[derive(PartialEq)]
 pub struct QcStack {
     pub anchor_id: [u8; 8],
-    pub flows: [QcsFlow; QCS_FLOWS],
+    pub flows: QcsFlows,
     /// The generation of the handle last issued (0 before the first).
     pub last_gen: u32,
     pub custody_gen: u32,
@@ -373,7 +377,7 @@ impl QcStack {
     pub const fn new(anchor_id: [u8; 8]) -> Self {
         Self {
             anchor_id,
-            flows: [const { QcsFlow::empty() }; QCS_FLOWS],
+            flows: QcsFlows::EMPTY,
             last_gen: 0,
             custody_gen: 0,
             counters: QcsCounters {
@@ -388,7 +392,7 @@ impl QcStack {
 
     fn by_handle(&self, h: TcHandle) -> Option<usize> {
         let i = (h.slot as usize).checked_sub(1)?;
-        (i < QCS_FLOWS && self.flows[i].live && self.flows[i].handle == h).then_some(i)
+        (i < self.flows.len() && self.flows[i].live && self.flows[i].handle == h).then_some(i)
     }
 
     fn by_flow(&self, flow: &[u8]) -> Option<usize> {
@@ -413,7 +417,7 @@ impl QcStack {
 
     /// The deadlines of per-layer replies.
     pub fn tick<O: QcsOut>(&mut self, now: u64, out: &mut O) {
-        for i in 0..QCS_FLOWS {
+        for i in 0..self.flows.len() {
             let c = &self.flows[i];
             if c.live && c.step != QcsStep::Idle && c.step != QcsStep::Token && now > c.deadline {
                 self.counters.timeouts += 1;

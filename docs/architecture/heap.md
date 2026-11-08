@@ -230,6 +230,41 @@ larger cap costs nothing until it is used: the first segment is `cap >> 7`
 (at least the 64 KiB quantum) and the heap grows with use. A committed-heap
 profile carves the whole cap, for every instance of the type.
 
+### Per-param cap: `[capacities] heap_per_param`
+
+A module that keeps tables of as many entries as its own params say —
+flows it can move at once, affinity entries, slots — takes each table from
+its heap, and the composer sizes the heap from the counts:
+
+```toml
+[capacities]
+heap_per_param = { base = 4096, params = [
+    { tag = 3, default = 4096, bytes_each = { default = 72, thumbv6m = 40 } },
+    { tag = 9, default = 0, bytes_each = 96 },
+] }
+```
+
+| Field | Meaning |
+|---|---|
+| `base` | the type's default cap, stated only by a type without a `heap_from_params` rule (whose `base` it otherwise is); it holds what the module allocates besides the tables, and each table's block header, rounding and canary ([rule 5](#rules-for-module-authors)) |
+| `params[].tag` | one of the module's own integer params (`u8`, `u16`, `u32`) whose value is a table's count; each param once |
+| `params[].default` | that param's schema default: the count of an instance that leaves it unset |
+| `params[].bytes_each` | heap bytes per entry of that table, per ABI like any capacity |
+
+Packing an instance, the composer reads each param's value (its `default`
+when the graph leaves it unset) and emits tag `0xEF` = the type's figure +
+the sum of `bytes_each` × count; counts of zero add nothing, and when every
+count is zero nothing is emitted. An explicit `heap.arena_bytes` below that
+is refused, naming each count. The module takes its tables at
+instantiation and refuses an entry past a table's count; nothing about a
+count is compiled in. A module that cannot take a table refuses to
+construct, saying which.
+
+`pack` holds the rule to the module: `base` to the declared arena, each
+`tag` to an integer param of the module's `define_params!` schema, and each
+`default` to that param's schema default. A type states at most one
+per-unit rule, `heap_per_demand` or `heap_per_param`.
+
 ### Declared demand per instance: `[capacities] demand_from_params`
 
 What a module will ask of a kernel pool at run time is declared demand

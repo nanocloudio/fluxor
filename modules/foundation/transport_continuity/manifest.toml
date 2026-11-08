@@ -111,3 +111,8 @@ buffer_size = 2048
 # Module-scope observability is exempt.
 [observability]
 exempt = "control-plane bridge — no data bytes cross it; the connection it moves is observed at ip and tls"
+
+[capacities]
+# The flow table, from the heap: one flow per `flows` (params tag 2),
+# on top of the declared arena (the allocation header).
+heap_per_param = { base = 64, params = [{ tag = 2, default = 2, bytes_each = 387224 }] }
