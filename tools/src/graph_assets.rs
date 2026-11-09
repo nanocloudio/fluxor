@@ -3,10 +3,12 @@
 //! module params name one by.
 //!
 //! An entry is a path (`- some/file.png`, or `{ path: …, name: … }`), or a
-//! build step: `{ name: <n>, build: "@<bound>", from: <path> }`. A build
-//! step composes a Linux graph around the stack the project binds to
+//! build step: `{ name: <n>, build: "@<bound>", from: <path>, params: {…} }`.
+//! A build step composes a Linux graph around the stack the project binds to
 //! `<bound>` ([`build_step_graph`]), runs it on the project's host runtime
-//! with `input` set to the absolute path of `from`, and keeps what it writes
+//! with `input` set to the absolute path of `from` and its `params` beside
+//! it (a `${asset:<name>}` there names an asset declared earlier, and
+//! resolves to its file), and keeps what it writes
 //! to `output` as the asset's file, `target/assets/<n>` under the project.
 //! From there a built asset is a file like any other: a wasm bundle bakes it
 //! into its `fluxor.assets` section.
@@ -40,8 +42,12 @@ pub enum Source {
     /// A file, absolute.
     File(PathBuf),
     /// Built at build time by the stack bound to `binding`, from `from`
-    /// (absolute; a file or a directory).
-    Build { binding: String, from: PathBuf },
+    /// (absolute; a file or a directory), given `params` beside `input`.
+    Build {
+        binding: String,
+        from: PathBuf,
+        params: BTreeMap<String, Value>,
+    },
 }
 
 /// One `assets:` entry.
@@ -133,6 +139,20 @@ pub fn parse(config: &Value, graph: &Path) -> Result<Vec<Asset>> {
         if out.iter().any(|a| a.name == asset.name) {
             return Err(at(format!("asset '{}' is declared twice", asset.name)));
         }
+        if let Source::Build { params, .. } = &asset.source {
+            for value in params.values() {
+                for name in placeholders(value).map_err(at)? {
+                    if !out.iter().any(|a| a.name == name) {
+                        return Err(at(format!(
+                            "`params:` names `{PLACEHOLDER}{name}}}`, which is not an asset \
+                             declared before '{}' — a build step's params name assets \
+                             declared earlier in `assets:`, which build first",
+                            asset.name
+                        )));
+                    }
+                }
+            }
+        }
         out.push(asset);
     }
     Ok(out)
@@ -161,11 +181,37 @@ fn parse_entry(entry: &Value, base: &Path) -> std::result::Result<Asset, String>
     };
     if let Some(k) = m
         .keys()
-        .find(|k| !matches!(k.as_str(), "name" | "path" | "build" | "from"))
+        .find(|k| !matches!(k.as_str(), "name" | "path" | "build" | "from" | "params"))
     {
         return Err(format!(
-            "unknown key `{k}` (an entry takes name, and path or build + from)"
+            "unknown key `{k}` (an entry takes name, and path or build + from + params)"
         ));
+    }
+    let params = match m.get("params") {
+        None => BTreeMap::new(),
+        Some(Value::Object(p)) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in p {
+                if k == "input" {
+                    return Err(
+                        "`params:` cannot set `input` — the build step's `input` is \
+                                `from:`"
+                            .into(),
+                    );
+                }
+                if !matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
+                    return Err(format!(
+                        "`params: {k}` must be a string, a number or a boolean"
+                    ));
+                }
+                out.insert(k.clone(), v.clone());
+            }
+            out
+        }
+        Some(_) => return Err("`params:` must be a map of the build step's params".into()),
+    };
+    if !params.is_empty() && m.get("build").is_none() {
+        return Err("`params:` belongs to a build step (`build: \"@<name>\"`)".into());
     }
     let text = |key: &str| match m.get(key) {
         None => Ok(None),
@@ -204,6 +250,7 @@ fn parse_entry(entry: &Value, base: &Path) -> std::result::Result<Asset, String>
                 source: Source::Build {
                     binding: binding.to_string(),
                     from: absolute(&base.join(from)),
+                    params,
                 },
             })
         }
@@ -227,6 +274,47 @@ pub fn files(config: &Value, graph: &Path, project_root: &Path) -> Result<Vec<(S
 // ============================================================================
 // `${asset:<name>}`
 // ============================================================================
+
+/// The asset names a value's `${asset:<name>}` placeholders name.
+fn placeholders(v: &Value) -> std::result::Result<Vec<String>, String> {
+    let Value::String(s) = v else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    let mut rest = s.as_str();
+    while let Some(pos) = rest.find(PLACEHOLDER) {
+        let after = &rest[pos + PLACEHOLDER.len()..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unclosed `{PLACEHOLDER}` in {s:?}"))?;
+        names.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    Ok(names)
+}
+
+/// `v` with each `${asset:<name>}` replaced by `file(name)`.
+fn substitute(v: &Value, file: &dyn Fn(&str) -> Option<PathBuf>) -> Value {
+    let Value::String(s) = v else {
+        return v.clone();
+    };
+    let mut text = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(pos) = rest.find(PLACEHOLDER) {
+        text.push_str(&rest[..pos]);
+        let after = &rest[pos + PLACEHOLDER.len()..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        match file(&after[..end]) {
+            Some(p) => text.push_str(&p.display().to_string()),
+            None => text.push_str(&rest[pos..pos + PLACEHOLDER.len() + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+    text.push_str(rest);
+    Value::String(text)
+}
 
 /// Does any value of the graph `config`, outside its `assets:` declarations,
 /// name an asset?
@@ -365,7 +453,17 @@ pub fn anchor(config: &mut Value, base: &Path) {
 /// given `input`, writing its `output` to stdout and, where the stack
 /// exports them, its `diagnostics` to stderr and its `exit` code to the
 /// process's.
-pub fn build_step_graph(binding: &str, input: &Path, exports: &BTreeSet<String>) -> Value {
+pub fn build_step_graph(
+    binding: &str,
+    input: &Path,
+    params: &BTreeMap<String, Value>,
+    exports: &BTreeSet<String>,
+) -> Value {
+    let mut p = serde_json::Map::new();
+    p.insert("input".into(), Value::String(input.display().to_string()));
+    for (k, v) in params {
+        p.insert(k.clone(), v.clone());
+    }
     let mut wiring =
         vec![json!({ "from": format!("{STEP_ALIAS}.output"), "to": "cli_out.bytes_in" })];
     if exports.contains("diagnostics") {
@@ -380,7 +478,7 @@ pub fn build_step_graph(binding: &str, input: &Path, exports: &BTreeSet<String>)
         "include": [{
             "stack": format!("@{binding}"),
             "as": STEP_ALIAS,
-            "params": { "input": input.display().to_string() },
+            "params": p,
         }],
         "wiring": wiring,
     })
@@ -422,18 +520,48 @@ pub fn build_all(config: &Value, graph: &Path, verbose: bool) -> Result<()> {
     }
     let project_root = crate::project::root_for_config(graph);
     for asset in &assets {
-        let Source::Build { binding, from } = &asset.source else {
+        let Source::Build {
+            binding,
+            from,
+            params,
+        } = &asset.source
+        else {
             continue;
         };
-        build_one_asset(&asset.name, binding, from, graph, &project_root, verbose)?;
+        // `parse` held every placeholder to an asset declared earlier, which
+        // has built by now; it resolves to that asset's file.
+        let file = |name: &str| {
+            assets
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| a.file(&project_root))
+        };
+        let params: BTreeMap<String, Value> = params
+            .iter()
+            .map(|(k, v)| (k.clone(), substitute(v, &file)))
+            .collect();
+        build_one_asset(
+            &asset.name,
+            binding,
+            from,
+            &params,
+            graph,
+            &project_root,
+            verbose,
+        )?;
     }
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one asset's whole description, passed through"
+)]
 fn build_one_asset(
     name: &str,
     binding: &str,
     from: &Path,
+    params: &BTreeMap<String, Value>,
     graph: &Path,
     project_root: &Path,
     verbose: bool,
@@ -470,7 +598,7 @@ fn build_one_asset(
         )));
     }
 
-    let step = build_step_graph(binding, from, &exports);
+    let step = build_step_graph(binding, from, params, &exports);
     let yaml = serde_yaml::to_string(&step)
         .map_err(|e| Error::Config(format!("{what}: serialise build-step graph: {e}")))?;
     let step_path = dir.join("build.yaml");
@@ -570,6 +698,7 @@ mod tests {
                     source: Source::Build {
                         binding: "compiler".into(),
                         from: "/p/examples/docs/page.html".into(),
+                        params: BTreeMap::new(),
                     },
                 },
                 Asset {
@@ -613,6 +742,26 @@ mod tests {
             ),
             ("{ name: a }", "names no file"),
             ("{ name: a, path: x, size: 3 }", "unknown key `size`"),
+            (
+                "{ name: a, path: x, params: { k: v } }",
+                "`params:` belongs to a build step",
+            ),
+            (
+                "{ name: a, build: \"@c\", from: y, params: [1] }",
+                "`params:` must be a map",
+            ),
+            (
+                "{ name: a, build: \"@c\", from: y, params: { input: z } }",
+                "cannot set `input`",
+            ),
+            (
+                "{ name: a, build: \"@c\", from: y, params: { k: [1] } }",
+                "`params: k` must be a string, a number or a boolean",
+            ),
+            (
+                "{ name: a, build: \"@c\", from: y, params: { k: \"${asset:b}\" } }",
+                "names `${asset:b}`, which is not an asset declared before 'a'",
+            ),
             ("{ name: a/b, path: x }", "'a/b' is not an asset name"),
             (
                 "{ name: a, build: 3, from: y }",
@@ -700,7 +849,12 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
-        let g = build_step_graph("compiler", Path::new("/p/docs/page.html"), &all);
+        let g = build_step_graph(
+            "compiler",
+            Path::new("/p/docs/page.html"),
+            &BTreeMap::new(),
+            &all,
+        );
         assert_eq!(
             g,
             json!({
@@ -719,11 +873,47 @@ mod tests {
             })
         );
         let only: BTreeSet<String> = ["output".to_string()].into();
-        let g = build_step_graph("compiler", Path::new("/in"), &only);
+        let params: BTreeMap<String, Value> = [
+            ("fonts".to_string(), json!("/p/target/assets/a.gpk")),
+            ("sizes".to_string(), json!(16)),
+        ]
+        .into();
+        let g = build_step_graph("compiler", Path::new("/in"), &params, &only);
+        assert_eq!(
+            g["include"][0]["params"],
+            json!({ "input": "/in", "fonts": "/p/target/assets/a.gpk", "sizes": 16 })
+        );
         assert_eq!(
             g["wiring"],
             json!([{ "from": "build.output", "to": "cli_out.bytes_in" }])
         );
+    }
+
+    #[test]
+    fn build_params_name_earlier_assets_by_their_files() {
+        let g = Path::new("/p/examples/g.yaml");
+        let config = graph(
+            "assets:\n  - { name: a.gpk, build: \"@baker\", from: ../f.ttf, params: { sizes: \
+             \"16,24\" } }\n  - { name: d, build: \"@c\", from: ../d.html, params: { fonts: \
+             \"${asset:a.gpk},${asset:a.gpk}\" } }\n",
+        );
+        let assets = parse(&config, g).unwrap();
+        let Source::Build { params, .. } = &assets[1].source else {
+            panic!("a build step");
+        };
+        let root = Path::new("/p");
+        let file = |name: &str| assets.iter().find(|a| a.name == name).map(|a| a.file(root));
+        assert_eq!(
+            substitute(&params["fonts"], &file),
+            json!("/p/target/assets/a.gpk,/p/target/assets/a.gpk")
+        );
+        // Declared after the step that names it: refused.
+        let late = graph(
+            "assets:\n  - { name: d, build: \"@c\", from: x, params: { f: \"${asset:a}\" } }\n  \
+             - { name: a, path: y }\n",
+        );
+        let e = parse(&late, g).unwrap_err().to_string();
+        assert!(e.contains("assets[0]: `params:` names `${asset:a}`"), "{e}");
     }
 
     #[test]

@@ -1,0 +1,46 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Font baker: a TrueType font in, a glyph pack out
+# (`abi::contracts::glyph_pack`). A build-time module, run as the
+# `font_bake` stack, the usual provider of the `@font_baker` bound name a
+# graph's asset builds through. Fluxor ships no fonts: the project supplies
+# the file the asset's `from` names.
+#
+# Params (PIC schema via define_params!):
+#   input   the absolute path of the font file
+#   sizes   whole CSS pixel sizes, comma-separated (default "16")
+#   scales  device pixel ratios, comma-separated (default "1"); one strike
+#           per size × scale, in pixels per em
+#   format  the strikes' variant, a `GLYPH_FORMATS` name: "a8" (default) or "a1"
+#   chars   the code points kept, as a CSS unicode-range list
+#           ("U+0020-007E, U+2026"); empty keeps every one the font maps
+#
+# Ports: `output` carries the pack; `diagnostics` one line per error,
+# `<input>: error: <message>`; `exit` the exit code (i32 LE), 0 for a pack.
+
+[[resources]]
+requires_contract = "fs"
+access = "read"
+
+[[ports]]
+name = "output"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "diagnostics"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+required = false
+
+[[ports]]
+name = "exit"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+required = false
+
+[observability]
+exempt = "build-time tool: bakes one font and finishes"

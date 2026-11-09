@@ -262,6 +262,12 @@ pub mod contracts {
     pub mod encoded {
         include!("contracts/encoded.rs");
     }
+    /// Glyph pack — a font face baked by `font_bake`: metrics, character
+    /// map, advances, OpenType layout tables, and strikes in a
+    /// `GLYPH_FORMATS` variant. Read in place.
+    pub mod glyph_pack {
+        include!("contracts/glyph_pack.rs");
+    }
     pub mod input {
         pub mod gamepad {
             include!("contracts/input/gamepad.rs");

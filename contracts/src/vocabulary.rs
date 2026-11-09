@@ -550,6 +550,27 @@ pub const AUDIO_PACKINGS: FactValues = &["raw", "framed"];
 /// The packings `VideoEncoded` admits.
 pub const VIDEO_PACKINGS: FactValues = &["raw", "annexb", "length_prefixed"];
 
+// The glyph pack formats: how a pack's strikes encode glyph bitmaps
+// (`modules/sdk/contracts/glyph_pack.rs`, whose `FORMAT_*` bytes are pinned
+// against this table). POSITIONAL, like `CODECS`: a pack carries its format
+// byte in band and a consumer refuses a variant it cannot draw. Admitted as
+// codecs are: `font_bake` produces both, and a text producer consumes them.
+//
+// - `a1` — a bit a pixel, for one-bit panels.
+// - `a8` — a coverage byte a pixel.
+
+/// Every glyph pack format, in wire-byte order.
+pub const GLYPH_FORMATS: &[&str] = &["a1", "a8"];
+
+/// The wire byte for a glyph pack format, or `None` for a name outside
+/// [`GLYPH_FORMATS`].
+pub fn glyph_format_byte(format: &str) -> Option<u8> {
+    GLYPH_FORMATS
+        .iter()
+        .position(|f| *f == format)
+        .map(|i| i as u8)
+}
+
 /// The wire byte for `codec`, or `None` for a name outside [`CODECS`].
 pub fn codec_byte(codec: &str) -> Option<u8> {
     CODECS.iter().position(|c| *c == codec).map(|i| i as u8)

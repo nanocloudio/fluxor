@@ -904,11 +904,25 @@ fn published_artifacts(
     let bytes = store.read_blob(&desc.digest)?;
     let idx: crate::oci_store::ImageIndex = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Config(format!("corrupt project index {}: {e}", desc.digest)))?;
+    index_artifacts(&idx).map(Some)
+}
+
+/// The artifacts of a project index whose sources staleness compares, by
+/// name. A stack is left out: it carries no input digest, and its name may
+/// be a module's (a build step's stack is usually named for its module), so
+/// counting it would report that module stale however often it is
+/// published.
+fn index_artifacts(
+    idx: &crate::oci_store::ImageIndex,
+) -> Result<BTreeMap<String, Vec<PublishedArtifact>>> {
     let mut out = BTreeMap::new();
     for child in &idx.manifests {
         let Some(a) = crate::store_resolve::artifact_from_descriptor(child)? else {
             continue;
         };
+        if a.kind == "stack" {
+            continue;
+        }
         out.entry(a.name)
             .or_insert_with(Vec::new)
             .push(PublishedArtifact {
@@ -916,7 +930,7 @@ fn published_artifacts(
                 epoch: child.annotations.get(ANN_ABI_SURFACE).cloned(),
             });
     }
-    Ok(Some(out))
+    Ok(out)
 }
 
 /// Why one artifact is not current against what is published.
@@ -1898,6 +1912,46 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("producer-common"), "{found:?}");
         assert!(found[0].contains("sources changed"), "{found:?}");
+    }
+
+    /// A stack named for its module (`font_bake`) carries no input
+    /// digest; the module is current when its own digest matches.
+    #[test]
+    fn a_stack_sharing_a_module_name_is_not_staleness() {
+        use crate::oci_store::{Descriptor, ImageIndex, ANN_KIND, ANN_MODULE_NAME};
+        let child = |kind: &str, reference: &str, input: Option<&str>| {
+            let mut annotations = crate::oci_store::Annotations::new();
+            annotations.insert(ANN_KIND.into(), kind.into());
+            annotations.insert(ANN_REF_NAME.into(), reference.into());
+            if kind == "module" {
+                annotations.insert(ANN_MODULE_NAME.into(), "font_bake".into());
+            }
+            if let Some(d) = input {
+                annotations.insert(ANN_INPUT_DIGEST.into(), d.into());
+            }
+            Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: format!("sha256:{:064}", reference.len()),
+                size: 1,
+                annotations,
+            }
+        };
+        let idx = ImageIndex {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.index.v1+json".into(),
+            manifests: vec![
+                child("module", "aarch64/font_bake:0.0.1", Some("abc")),
+                child("stack", "stack/font_bake:0.1.0", None),
+            ],
+        };
+        let published = index_artifacts(&idx).unwrap();
+        let current = BTreeMap::from([("font_bake".to_string(), "abc".to_string())]);
+        assert!(stale_artifacts(&current, "e", Some(&published)).is_empty());
+        let edited = BTreeMap::from([("font_bake".to_string(), "def".to_string())]);
+        assert_eq!(
+            stale_artifacts(&edited, "e", Some(&published)),
+            vec![("font_bake".to_string(), StaleReason::Inputs)]
+        );
     }
 
     /// The root project of the family declares no dependencies. The phase

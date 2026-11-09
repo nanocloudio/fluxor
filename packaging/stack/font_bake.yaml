@@ -1,0 +1,48 @@
+# Fluxor's font baker as a build-time stack: a TrueType font in, a glyph pack
+# out (`abi::contracts::glyph_pack`, docs/architecture/stacks.md, Build-time
+# assets).
+#
+# Fits the `font_baker` name a graph's asset builds through
+# (`build: "@font_baker"`), which follows the build-step interface: `input`
+# is the absolute path of the asset's `from`, the font file the project
+# supplies (Fluxor ships none); `output` carries the pack, `diagnostics` one
+# line per error, and `exit` the exit code, 0 for a pack.
+#
+#   assets:
+#     - name: sans.gpk
+#       build: "@font_baker"
+#       from: ../fonts/DejaVuSans.ttf
+#       params: { sizes: "13,16,24", scales: "1,2", chars: "U+0020-00FF" }
+stack: font_bake
+version: 0.1.0
+
+params:
+  input:
+    type: string
+    required: true
+    example: /srv/fonts/DejaVuSans.ttf
+  sizes:
+    type: string
+    default: "16"
+  scales:
+    type: string
+    default: "1"
+  format:
+    type: string
+    default: a8
+  chars:
+    type: string
+    default: ""
+
+exports:
+  output: font_bake.output
+  diagnostics: font_bake.diagnostics
+  exit: font_bake.exit
+
+modules:
+  - name: font_bake
+    input: ${param:input}
+    sizes: ${param:sizes}
+    scales: ${param:scales}
+    format: ${param:format}
+    chars: ${param:chars}

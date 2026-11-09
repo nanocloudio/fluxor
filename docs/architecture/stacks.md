@@ -326,12 +326,31 @@ assets:
     from: ../documents/album_browser.html
 ```
 
-A map takes `name` and either `path`, or `build` and `from`; any other key
-is refused, as is a name that is not one path segment or that two entries
-share. `build` is a bound name (`@<name>`, bound under `[uses.stacks]` like
+A map takes `name` and either `path`, or `build` and `from` (and, for a
+build, `params`); any other key is refused, as is a name that is not one
+path segment or that two entries share. `build` is a bound name (`@<name>`, bound under `[uses.stacks]` like
 any include's), and `from` is a file or a directory, relative to the graph.
 `fluxor update` pins the binding as it pins every other, and refuses a
 tracked graph whose asset names an unbound name, naming the file.
+
+A build step's `params` are a map of strings, numbers and booleans that
+pass to its stack beside `input` (which they cannot set). A
+`${asset:<name>}` in them names an asset declared **earlier** in the list,
+and resolves to that asset's file, since the step runs on Linux. Assets
+build in the order they are declared, so a document compiler can read the
+glyph packs built before it:
+
+```yaml
+assets:
+  - name: sans.gpk
+    build: "@font_baker"
+    from: ../fonts/DejaVuSans.ttf
+    params: { sizes: "16,24", scales: "1,2" }
+  - name: page.doc
+    build: "@document_compiler"
+    from: ../documents/page.html
+    params: { fonts: "${asset:sans.gpk}" }
+```
 
 A module param names an asset with `${asset:<name>}`, as a whole value or
 inside text:
@@ -390,12 +409,15 @@ this interface:
 | Item | Kind | Meaning |
 |---|---|---|
 | `input` | param, `string` | absolute path of the entry's `from`, a file or a directory |
+| the entry's `params` | params | each as given, `${asset:}` resolved to an earlier asset's file |
 | `output` | export, `OctetStream`, required | the asset's bytes, to end of stream |
 | `diagnostics` | export, `OctetStream`, optional | the step's errors, one line each (`file:line:col: error: …` reads best) |
 | `exit` | export, `OctetStream`, optional | one `i32` little-endian exit code; non-zero fails the build |
 
 As for any bound name, a provider may declare more params, each with a
-default, and more exports. A provider is usually the project's own stack
+default, and more exports. Fluxor provides `font_bake`, the usual provider of
+`@font_baker` (a TrueType font in, a glyph pack out,
+`abi::contracts::glyph_pack`). A provider is usually the project's own stack
 (`packaging/stack/<name>.yaml`, resolved unpinned), or one it pins from
 another project. Typical providers: a document compiler that turns an
 application's HTML and CSS into a document image, a package packer, a
