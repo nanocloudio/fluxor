@@ -333,8 +333,10 @@ a runtime backstop.
 
 Source: `tools/src/manifest.rs`
 
-Two boolean fields, both author claims (no static enforcement beyond
-a NEON-import lint for `isr_safe`):
+Two boolean fields, both author claims with no static enforcement.
+An ISR module may use FP/SIMD registers: on aarch64 the Tier 2 entry
+runs inside a frame that keeps the interrupted code's FP/SIMD state
+(see the dispatch path below):
 
 ```toml
 # modules/drivers/<your_isr_module>/manifest.toml
@@ -431,8 +433,7 @@ Source: `src/kernel/exec/isr_tier.rs`,
 Tier 1b admission and dispatch:
 
 1. **Build time.** `validate_isr_tier_admission` confirms every
-   module in a Tier 1b domain has `isr_safe = true` and runs the
-   NEON-import lint against the module's source tree. The wiring
+   module in a Tier 1b domain has `isr_safe = true`. The wiring
    check rejects any YAML edge with an ISR-tier endpoint (see the
    I/O contract above).
 2. **`prepare_graph`.** Stores per-module domain and
@@ -477,6 +478,16 @@ Tier 2 (IRQ-owned) admission and dispatch:
   target so a dedicated Tier 2 core receives its own interrupts.
   The hardware IRQ dispatches into `isr_tier2_trampoline`, which
   looks the module up by IRQ number and invokes `module_isr_entry`.
+- On aarch64 the EL1 IRQ vector saves general registers only. The
+  trampoline calls `module_isr_entry` through `fluxor_tier2_isr_frame`
+  (`src/arch/fp_frame.rs`), which keeps q0–q31, FPSR and FPCR across
+  the call, so module code compiled `+neon` cannot disturb the code the
+  IRQ interrupted. Everything else on the IRQ path is kept scalar:
+  `fluxor ci` phase `irq-neon-free` links every `aarch64-unknown-none`
+  kernel (each board and the UEFI host) and fails if any function reached
+  from `irq_handler`, `isr_tier2_trampoline` or `event_signal_from_isr`
+  names an FP/SIMD register. Cortex-M33 stacks its FPU in hardware and Cortex-M0+ has
+  none, so the frame is aarch64 only.
 - A Tier 2 domain that owns its own core runs the dedicated
   `domains::run` arm for `exec_mode == 4`: cross-domain pumping
   plus WFI, with dispatch driven entirely by the hardware IRQ.

@@ -68,6 +68,8 @@ pub(crate) use fluxor_tools::presentation_resolver;
 // lib-only (pure text analysis over the register and its sources), so the
 // bin reaches the lib's single copy rather than mounting it twice.
 pub(crate) use fluxor_tools::limit_register;
+// The `irq-neon-free` phase `ci.rs` runs.
+pub(crate) use fluxor_tools::irq_neon_free;
 pub(crate) use fluxor_tools::protection;
 pub(crate) use fluxor_tools::stack_depth;
 pub(crate) use fluxor_tools::store_resolve;

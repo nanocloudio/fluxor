@@ -1261,28 +1261,110 @@ pub struct ProviderReach<'a> {
     pub caller: ProviderCaller,
 }
 
-/// The contracts the platform's own provider answers for `caller`'s modules
-/// on `runtime`: what a `platform` selector reaches, and what a call that
-/// names no volume reaches when no module provides the contract unkeyed.
-/// `None` for a runtime not listed, whose platform is then not checked.
-///
-/// Mirrors the kernel's `provider::register` calls under `src/platform/`:
-/// - Linux and wasm answer `fs`, `storage.object` and `storage.namespace`
-///   from the host (Linux answers a workload inside a root of its own);
-/// - bcm2712's `storage.object` / `storage.namespace` store serves the node
-///   alone (`EACCES` to a workload), and its `fs` provider serves workloads
-///   alone, each inside a root on the node's volume (`ENOSYS` to the node's
-///   own modules, which reach that volume through its module provider);
-/// - the RP, ESP32 and UEFI runtimes register none of them.
-fn platform_contracts(runtime: &str, caller: ProviderCaller) -> Option<&'static [&'static str]> {
-    const HOST: &[&str] = &["fs", "storage.object", "storage.namespace"];
-    match (runtime, caller) {
-        ("linux" | "wasm", _) => Some(HOST),
-        ("bcm2712", ProviderCaller::Node) => Some(&["storage.object", "storage.namespace"]),
-        ("bcm2712", ProviderCaller::Workload) => Some(&["fs"]),
-        ("rp2040" | "rp2350" | "esp32" | "uefi", _) => Some(&[]),
-        _ => None,
+/// The contracts `runtime`'s platform answers a call from `caller`'s modules,
+/// from the target's `[providers]` table (`targets/{silicon,host}/<runtime>.toml`).
+/// `None` for a runtime the target registry does not know, whose platform is
+/// then not checked.
+fn platform_contracts(runtime: &str, caller: ProviderCaller) -> Option<Vec<String>> {
+    let target = crate::target::load_target(runtime, &crate::project::root()).ok()?;
+    Some(match caller {
+        ProviderCaller::Node => target.providers.node,
+        ProviderCaller::Workload => target.providers.workload,
+    })
+}
+
+/// Contracts the kernel provides on every target, whatever the platform.
+const KERNEL_CONTRACTS: &[&str] = &["channel", "timer", "event", "buffer"];
+
+/// A module claim nothing in the graph or on its target answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRefusal {
+    /// The module instance.
+    pub module: String,
+    /// The contract it requires.
+    pub contract: &'static str,
+    /// The whole refusal, for the operator.
+    pub message: String,
+}
+
+/// Every contract claim in the graph that nothing answers: not the kernel,
+/// not the target's platform (`[providers]`), not a module in the graph.
+/// Such a call answers ENOSYS at run time. Empty when the target is not
+/// known. Optional claims (`optional = true`) and claims the instance's
+/// params never exercise are not requirements.
+pub fn required_contract_refusals(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    reach: ProviderReach<'_>,
+) -> Vec<ProviderRefusal> {
+    let Some(runtime) = reach.runtime else {
+        return Vec::new();
+    };
+    let Some(platform) = platform_contracts(runtime, reach.caller) else {
+        return Vec::new();
+    };
+    let provided: std::collections::BTreeSet<&str> = module_names
+        .iter()
+        .filter_map(|n| manifests.get(n))
+        .flat_map(|m| m.provides.iter().map(|s| surface_contract(s)))
+        .collect();
+    let whose = match reach.caller {
+        ProviderCaller::Node => "the node's own modules",
+        ProviderCaller::Workload => "a workload's modules",
+    };
+    let mut refusals = Vec::new();
+    for name in module_names {
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
+        for claim in &m.resources {
+            if claim.optional || !claim.exercised_by(|p| runtime_param(config, name, p)) {
+                continue;
+            }
+            let contract = crate::manifest::contract_name_to_str(claim.device_class);
+            if KERNEL_CONTRACTS.contains(&contract)
+                || provided.contains(contract)
+                || platform.iter().any(|c| c == contract)
+            {
+                continue;
+            }
+            refusals.push(ProviderRefusal {
+                module: name.clone(),
+                contract,
+                message: format!(
+                    "`{name}` requires `{contract}`, which nothing on {runtime} answers for \
+                     {whose}: not the kernel, not the target's `[providers]` ({}), and no \
+                     module in the graph provides it, so its first call would answer ENOSYS. \
+                     Add the module that provides `{contract}`, mark the claim \
+                     `optional = true` if the module does without it, or declare it in the \
+                     target's `[providers]` if the platform registers it.",
+                    if platform.is_empty() {
+                        "none".to_string()
+                    } else {
+                        platform.join(", ")
+                    }
+                ),
+            });
+        }
     }
+    refusals.sort_by(|a, b| a.message.cmp(&b.message));
+    refusals.dedup();
+    refusals
+}
+
+/// Fail the build on any refusal, naming every one.
+pub fn enforce_required_contracts(refusals: Vec<ProviderRefusal>, scope: &str) -> Result<()> {
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Config(
+        refusals
+            .iter()
+            .map(|r| format!("{scope}{}", r.message))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
 }
 
 /// The value a string param of module instance `name` packs to, as the
@@ -1297,6 +1379,36 @@ fn instance_str_param(config: &Value, name: &str, key: &str) -> Option<String> {
         .iter()
         .find(|e| e.get("name").and_then(Value::as_str) == Some(name))?;
     entry_str_param(config, entry, key)
+}
+
+/// [`instance_str_param`] as the instance reads it at run time: a value the
+/// builder embeds (`${file:<path>}`, read at build and packed as extended
+/// tags) is no param at run time, so it exercises no claim.
+///
+/// A param the packer derives from a structured entry is read as the packer
+/// derives it: the `route_<n>_*` params an http `routes:` list expands to.
+fn runtime_param(config: &Value, name: &str, key: &str) -> Option<String> {
+    instance_str_param(config, name, key)
+        .or_else(|| route_param(config, name, key))
+        .filter(|v| crate::trust_anchors::file_source(v).is_none())
+}
+
+/// The `route_<n>_*` param `key` of instance `name`, as the packer expands
+/// its `routes:` list (`schema::expand_routes`).
+fn route_param(config: &Value, name: &str, key: &str) -> Option<String> {
+    if !key.starts_with("route_") {
+        return None;
+    }
+    let routes = config
+        .get("modules")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(name))?
+        .get("routes")?
+        .as_array()?;
+    let mut kv = HashMap::new();
+    crate::schema::expand_routes(routes, &mut kv, config.get("data")).ok()?;
+    kv.get(key)?.as_str().map(str::to_string)
 }
 
 /// [`instance_str_param`] for a module entry already in hand.
@@ -1620,7 +1732,7 @@ pub fn validate_single_provider(
             // A claim the instance's configuration never exercises
             // (`active_when_params`, none of them set) makes no call, so it
             // reaches no provider.
-            if !claim.exercised_by(|p| instance_str_param(config, name, p)) {
+            if !claim.exercised_by(|p| runtime_param(config, name, p)) {
                 continue;
             }
             let contract = crate::manifest::contract_name_to_str(claim.device_class);
@@ -1702,7 +1814,7 @@ pub fn validate_single_provider(
                             .collect::<Vec<_>>()
                             .join(", ");
                         let fate = match platform {
-                            Some((runtime, served)) if served.contains(&contract) => format!(
+                            Some((runtime, served)) if served.iter().any(|c| c == contract) => format!(
                                 "on {runtime} the call reaches the platform's own `{contract}` \
                                  provider, not these volumes"
                             ),
@@ -1724,10 +1836,10 @@ pub fn validate_single_provider(
                         )));
                     }
                     Some(v) if v == PLATFORM_SELECTOR => {
-                        let Some((runtime, served)) = platform else {
+                        let Some((runtime, served)) = &platform else {
                             continue;
                         };
-                        if !served.contains(&contract) {
+                        if !served.iter().any(|c| c == contract) {
                             return Err(Error::Config(format!(
                                 "`{name}`'s `{contract}` claim {how}, the platform's own provider, \
                                  which on {runtime} answers no `{contract}` call of {whose}. Name a \

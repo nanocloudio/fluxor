@@ -61,7 +61,12 @@ SECTIONS {
      * past __bss_start is therefore ERASED before the loader reads it —
      * the module table decodes as empty and the board boots a graph with
      * no modules: no network, no telemetry, no console, indistinguishable
-     * from a board that never booted.
+     * from a board that never booted. The same holds for the config: a
+     * config whose checksummed body reaches __bss_start loses its last
+     * bytes to the clear, fails its checksum and is refused before the
+     * network is up, so a board without serial is silent. A body that ends
+     * below __bss_start boots, whatever its size inside the window; bytes
+     * after the body (the post-body tail) that cross it read as zero.
      *
      * With plain ALIGN(4096) the usable window is only the gap that
      * happens to fall between the firmware's end and the next alignment

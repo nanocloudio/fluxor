@@ -32,6 +32,12 @@ buffer_size = 256
 [[resources]]
 requires_contract = "fs"
 access = "read"
+# Preset-selector mode (no `path_*`, no `dir`) opens nothing.
+active_when_params = [
+  "dir",
+  "path_0", "path_1", "path_2", "path_3", "path_4", "path_5", "path_6", "path_7",
+  "path_8", "path_9", "path_10", "path_11", "path_12", "path_13", "path_14", "path_15",
+]
 
 [commands]
 accepts = ["next", "prev", "toggle", "select"]

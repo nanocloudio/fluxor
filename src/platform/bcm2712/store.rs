@@ -333,7 +333,7 @@ unsafe fn telemetry(store: &Store) {
     num!(TLM_LOST);
     // Straight into the log ring, the same sink `log::info!` lands in on this
     // board — so the rig's UDP capture carries it with everything else.
-    crate::kernel::sys::log_ring::push_bytes(&buf[..pos]);
+    crate::kernel::sys::log_ring::push_record(&buf[..pos]);
 }
 
 impl Store {

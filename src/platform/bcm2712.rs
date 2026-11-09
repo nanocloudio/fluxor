@@ -147,13 +147,17 @@ static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
 /// one GIC SPI. Returns 0 on success, -ENOMEM if the binding table is full.
 #[cfg(feature = "board-pi5")]
 fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
-    gic::set_irq_mux(|| {
-        // SAFETY: runs on the IRQ path after `pcie1_msi_init` succeeded (the
-        // caller checks it before registering), with the MSI controller's
-        // registers mapped by the boot page tables.
-        let _ = unsafe { fluxor::platform::pcie::pcie1_msi_dispatch() };
-    });
+    gic::set_irq_mux(pcie1_msi_mux);
     irq_bind(spi_irq, gic::EVENT_HANDLE_MUX, 0, 0)
+}
+
+/// The IRQ multiplexer `register_pcie1_msi_spi` registers.
+#[cfg(feature = "board-pi5")]
+fn pcie1_msi_mux() {
+    // SAFETY: runs on the IRQ path after `pcie1_msi_init` succeeded (the
+    // caller checks it before registering), with the MSI controller's
+    // registers mapped by the boot page tables.
+    let _ = unsafe { fluxor::platform::pcie::pcie1_msi_dispatch() };
 }
 
 #[cfg(not(feature = "board-pi5"))]
@@ -1372,6 +1376,10 @@ fn bcm_step_guard_post_check() {
     step_guard::set_armed(false);
 }
 
+fn bcm_core_id() -> usize {
+    current_core_id() as usize
+}
+
 fn bcm_read_cycle_count() -> u32 {
     bcm_read_counter() as u32
 }
@@ -2431,7 +2439,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     runtime_params: bcm_runtime_params,
     init_gpio: |_| 0, // no GPIO init on aarch64 (handled by PIC modules)
     csprng_fill: bcm_csprng_fill,
-    core_id: || current_core_id() as usize,
+    core_id: bcm_core_id,
     irq_bind,
     sleep_until: bcm_sleep_until,
     smp_quiesce_peers: domains::quiesce_peers,

@@ -1,7 +1,11 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
+# The `spi` contract this driver registers itself as the provider of.
+provides = ["spi"]
 permissions = ["platform_raw"]
 
+# DMA channels are allocated one at a time from the platform's pool, so the
+# claim is shared with every other DMA user in the graph.
 [[resources]]
 requires_contract = "platform_dma"
-access = "exclusive"
+access = "write"

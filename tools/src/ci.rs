@@ -663,6 +663,21 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         })
     });
 
+    // ───── AArch64 IRQ path free of FP/SIMD ──────────────────────────────
+    //
+    // The EL1 IRQ vector saves general registers only, so the kernel's own
+    // interrupt path must touch no vector register; module code reached from
+    // an IRQ runs inside the FP/SIMD frame. The compiler emits SIMD wherever
+    // the target allows it, so the check reads each aarch64 kernel's linked
+    // image (every board, and the UEFI host) rather than the source.
+    results.push(if skip.kernel || !runs_kernel_link(project_root) {
+        skipped("irq-neon-free")
+    } else {
+        run_step("irq-neon-free", verbose, || {
+            crate::irq_neon_free::run(project_root, verbose)
+        })
+    });
+
     // ───── project test scripts (E2E gate) ───────────────────────────────
     //
     // A fmod-only project has no cargo tests — its behaviour is proven by

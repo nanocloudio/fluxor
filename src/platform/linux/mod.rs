@@ -30,6 +30,7 @@ pub mod net_identity;
 pub mod net_policy;
 pub mod net_route;
 pub mod owner_drain;
+pub mod owner_release;
 pub mod owner_root;
 pub mod owner_status;
 pub mod providers;

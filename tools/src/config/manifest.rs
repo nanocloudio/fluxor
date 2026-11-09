@@ -147,13 +147,13 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
 ///
 /// Returns the first hit (`<dir>/<type_name>` whose directory
 /// exists). Centralising the lookup keeps the manifest loader
-/// (`load_module_manifests_with_extra`) and the ISR-tier NEON-lint
+/// (`load_module_manifests_with_extra`) and the ISR-tier source checks
 /// in `validate_isr_tier_admission` aligned: if a config-declared
 /// `module_search_paths:` entry collides with a bundled module of
 /// the same `type:` name, both readers must agree on which one
-/// wins. Were the order to differ between them, the lint would clear
+/// wins. Were the order to differ between them, the checks would clear
 /// one source tree while the loader shipped another, admitting an ISR
-/// module whose `isr_safe` and NEON-import checks were never run
+/// module whose `isr_safe` and `module_isr_entry` checks were never run
 /// against the code that actually loads.
 fn resolve_module_root(
     type_name: &str,

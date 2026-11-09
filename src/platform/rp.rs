@@ -91,7 +91,7 @@ impl log::Log for RingLogger {
             }
             w.pos
         };
-        fluxor::kernel::sys::log_ring::push_bytes(&buf[..written]);
+        fluxor::kernel::sys::log_ring::push_record(&buf[..written]);
     }
     fn flush(&self) {}
 }

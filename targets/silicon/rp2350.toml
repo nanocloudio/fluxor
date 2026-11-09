@@ -266,6 +266,10 @@ config_buffer_kb = 16
 # so a rig reads this image's boot, not a tail of it. The host-class 64 KiB
 # ring does not fit beside the state and buffer arenas.
 log_ring_kb = 8
+# Telemetry ring (`kernel::sys::telemetry_ring`): metric, span and PSTATUS
+# records waiting for `observe`/`otel` to drain them. It must hold one whole
+# PSTATUS round (80 B per module slot plus 32 B per kernel pool).
+telemetry_ring_kb = 8
 # Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
 # out of the linker's 512 KiB RAM region. What is left over is the
 # stack, which grows down from the top of that region and which every
@@ -370,3 +374,14 @@ provider_alarms = [3]
 # here uses that driver.
 foreign_instance = "TIMER0"
 foreign_alarms = [0]
+
+# The contracts this platform registers a provider for, named as a manifest's
+# `requires_contract` names them. The composer refuses a graph whose module
+# requires a contract that neither the kernel (`channel`, `timer`, `event`,
+# `buffer`), this list, nor a module in the graph provides: the call would
+# otherwise answer ENOSYS at run time. `workload`, where present, is what the
+# platform answers a workload's modules; absent, the same as `platform`.
+[providers]
+# `pio` is not the platform's: the `pio_rp` module answers it (cyw43's
+# gSPI commands and PIO program streams alike).
+platform = ["gpio", "platform_dma", "platform_dma_fd"]

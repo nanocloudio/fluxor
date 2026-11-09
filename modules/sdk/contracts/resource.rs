@@ -197,8 +197,7 @@ pub const fn module_provided_pool_contract(pool: u16) -> Option<u16> {
 // ── Capacity-envelope config section ───
 //
 // The composer's per-deployment pool envelope, carried as a post-body
-// config section (PAST the checksummed body: growing `body_size` hangs the
-// bare-metal Pi 5 boot).
+// config section, past the checksummed body.
 // Section layout, mirroring the resident-workload (FXPD) section's
 // self-describing header:
 //

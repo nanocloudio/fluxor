@@ -620,14 +620,35 @@ fn generate_config_impl(
 
     // One provider per (surface, selector), and every claim reaching a
     // provider that answers it. See storage_capability_surface.md.
+    let claim_manifests = exercised_claims(
+        config
+            .get("modules")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &manifests,
+        schema_param_is_one_of(loc),
+    )?;
     validate_single_provider(
         config,
         &module_names,
-        &manifests,
+        &claim_manifests,
         ProviderReach {
             runtime: runtime_owned.as_deref(),
             caller: ProviderCaller::Node,
         },
+    )?;
+    enforce_required_contracts(
+        required_contract_refusals(
+            config,
+            &module_names,
+            &claim_manifests,
+            ProviderReach {
+                runtime: runtime_owned.as_deref(),
+                caller: ProviderCaller::Node,
+            },
+        ),
+        "",
     )?;
     // One writer of the network stack's `addr_ctl` on a node that creates
     // workloads: the kernel.
@@ -917,8 +938,7 @@ fn generate_config_impl(
     // Domain metadata: 4 entries × DOMAIN_META_ENTRY_SIZE (4) bytes:
     //   tick_us:u16 LE | exec_mode:u8 | adaptive_flags:u8
     // tick_min_us/tick_max_us are appended in the post-body adaptive section
-    // AFTER the checksum (see below), NOT in this entry — growing the checksummed
-    // body_size hangs the bare-metal Pi 5 boot.
+    // after the checksum (see below), not in this entry.
     let domains_arr = config
         .get("execution")
         .and_then(|e| e.get("domains"))
@@ -966,9 +986,8 @@ fn generate_config_impl(
 
     // Adaptive-tick post-body section: 4 domains × [tick_min_us:u16 LE,
     // tick_max_us:u16 LE] = 16 bytes, appended AFTER the checksum so it sits
-    // PAST body_size (the kernel reads it at total_size). Deliberately not in
-    // body_size / not checksum-covered: growing body_size hangs the bare-metal
-    // Pi 5 boot, and trailing bytes past it are harmless.
+    // past body_size (the kernel reads it at total_size), not checksum-covered:
+    // the kernel range-checks each value.
     // Mirrors `kernel::boot::config::ADAPTIVE_POST_SIZE`; default 0 ⇒ kernel uses the
     // domain tick (adaptive is a no-op when unconfigured).
     let adaptive_domains = config
@@ -1639,6 +1658,84 @@ fn build_workload_section(
 
 use crate::add_subgraph::{WorkloadEdge, WorkloadEnd};
 
+/// The manifests as the provider checks read them: each instance's claims
+/// limited to the ones its build and its params exercise. A claim naming
+/// `variants` counts only when the instance is built as one of them; a claim
+/// with a `when` counts only when every condition holds for the instance's
+/// params, its schema's defaults standing in for unset ones (the
+/// `[[requires_when]]` resolution, [`schema_param_is_one_of`]).
+///
+/// `is_one_of(module_type, entry, param, values)` answers whether the
+/// instance's effective value of `param` is one of `values`: `Ok(None)` when
+/// the module has no schema, `Ok(Some(None))` when the schema does not declare
+/// the param or values.
+pub(crate) fn exercised_claims(
+    entries: &[Value],
+    manifests: &HashMap<String, Manifest>,
+    is_one_of: impl Fn(&str, &Value, &str, &[String]) -> Result<Option<Option<bool>>>,
+) -> Result<HashMap<String, Manifest>> {
+    let mut out = HashMap::with_capacity(manifests.len());
+    for (name, m) in manifests {
+        let mut m = m.clone();
+        let entry = entries
+            .iter()
+            .find(|e| e.get("name").and_then(Value::as_str) == Some(name.as_str()));
+        let mut kept = Vec::with_capacity(m.resources.len());
+        for claim in std::mem::take(&mut m.resources) {
+            if !claim.variants.is_empty()
+                && !m
+                    .selected_variant
+                    .as_ref()
+                    .is_some_and(|v| claim.variants.contains(v))
+            {
+                continue;
+            }
+            if !claim.when.is_empty() {
+                let empty = Value::Object(Default::default());
+                let entry = entry.unwrap_or(&empty);
+                let mtype = entry.get("type").and_then(Value::as_str).unwrap_or(name);
+                let mut holds = true;
+                for (param, values) in &claim.when {
+                    let Some(answer) = is_one_of(mtype, entry, param, values)? else {
+                        return Err(Error::Config(format!(
+                            "module '{name}': a `{}` claim is conditioned on params (`when`), \
+                             but the module has no parameter schema to resolve them against",
+                            crate::manifest::contract_name_to_str(claim.device_class)
+                        )));
+                    };
+                    match answer {
+                        Some(hit) => holds &= hit,
+                        None => {
+                            return Err(Error::Config(format!(
+                                "module '{name}': a `{}` claim's `when` names `{param}` = \
+                                 {values:?}, which its schema does not declare",
+                                crate::manifest::contract_name_to_str(claim.device_class)
+                            )))
+                        }
+                    }
+                }
+                if !holds {
+                    continue;
+                }
+            }
+            kept.push(claim);
+        }
+        m.resources = kept;
+        out.insert(name.clone(), m);
+    }
+    Ok(out)
+}
+
+/// [`exercised_claims`]'s value test against the module's built schema.
+fn schema_param_is_one_of(
+    loc: schema::ModuleLocation<'_>,
+) -> impl Fn(&str, &Value, &str, &[String]) -> Result<Option<Option<bool>>> + '_ {
+    move |mtype, entry, param, values| {
+        Ok(schema::load_schema_for_module(mtype, loc)?
+            .map(|ps| schema::param_is_one_of(entry, &ps, param, values)))
+    }
+}
+
 /// The graph's `workloads:` section, each as the subgraph the kernel admits
 /// (`add_subgraph::Workload`): modules by name_hash with their params, and
 /// the edges between them. Empty when the graph declares none. The resident
@@ -1664,7 +1761,7 @@ pub fn build_workloads(
 
 /// Whether the platform of `runtime` answers `caller`'s `fs` calls.
 fn fs_reachable(runtime: &str, caller: ProviderCaller) -> bool {
-    platform_contracts(runtime, caller).is_some_and(|c| c.contains(&"fs"))
+    platform_contracts(runtime, caller).is_some_and(|c| c.iter().any(|x| x == "fs"))
 }
 
 /// Refuse a credential form the instance could not use where it runs.
@@ -1928,6 +2025,7 @@ fn build_workloads_counted(
                 params,
             });
         }
+        let local_claims = exercised_claims(&local_entries, &local_manifests, schema_param_is_one_of(loc))?;
         validate_single_provider(
             &json!({
                 "modules": local_entries,
@@ -1935,7 +2033,7 @@ fn build_workloads_counted(
                 "data": data_section.cloned().unwrap_or(Value::Null),
             }),
             &local_names,
-            &local_manifests,
+            &local_claims,
             ProviderReach {
                 runtime,
                 caller: ProviderCaller::Workload,
@@ -1945,6 +2043,22 @@ fn build_workloads_counted(
             Error::Config(why) => Error::Config(format!("workload {pi}: {why}")),
             other => other,
         })?;
+        enforce_required_contracts(
+            required_contract_refusals(
+                &json!({
+                    "modules": local_entries,
+                    "wiring": workload_yaml.get("wiring").cloned().unwrap_or(Value::Null),
+                    "data": data_section.cloned().unwrap_or(Value::Null),
+                }),
+                &local_names,
+                &local_claims,
+                ProviderReach {
+                    runtime,
+                    caller: ProviderCaller::Workload,
+                },
+            ),
+            &format!("workload {pi}: "),
+        )?;
         // `wiring:` is the graph syntax: `module.port` (a bare `module` is
         // its first output in `from:`, its first input in `to:`), resolved
         // against the module's manifest. The node's network is the platform

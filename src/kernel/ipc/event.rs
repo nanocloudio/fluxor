@@ -140,7 +140,7 @@ pub fn paused_owners_present() -> bool {
 pub fn module_wake_masked(module_idx: usize) -> bool {
     #[cfg(feature = "multitenant")]
     {
-        module_idx < crate::kernel::exec::scheduler::module_slots()
+        module_idx < crate::kernel::exec::scheduler::committed_module_slots()
             && (PAUSED_MODULES[module_idx / 64].load(Ordering::Acquire) >> (module_idx % 64)) & 1
                 != 0
     }
@@ -155,7 +155,7 @@ pub fn module_wake_masked(module_idx: usize) -> bool {
 #[inline]
 pub fn defer_masked_wake(module_idx: usize) {
     #[cfg(feature = "multitenant")]
-    if module_idx < crate::kernel::exec::scheduler::module_slots() {
+    if module_idx < crate::kernel::exec::scheduler::committed_module_slots() {
         PAUSED_DEFERRED_WAKES[module_idx / 64]
             .fetch_or(1u64 << (module_idx % 64), Ordering::Release);
     }
@@ -319,14 +319,21 @@ pub fn event_signal(handle: i32) -> i32 {
 ///
 /// # Safety
 /// Caller must ensure handle is a valid, allocated event slot.
+///
+/// Never inlined: it is a root of the `irq-neon-free` gate's walk.
+#[inline(never)]
 pub fn event_signal_from_isr(handle: i32) {
-    if handle < 0 || handle as usize >= slots().len() {
+    // The committed slots, never `slots()`: interrupt context does not size
+    // a table, and an unsized table has no event to signal.
+    let Some(slot) = usize::try_from(handle)
+        .ok()
+        .and_then(|i| EVENT_SLOTS.committed().get(i))
+    else {
         return;
-    }
-    let slot = &slots()[handle as usize];
+    };
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
-    if (owner as usize) < crate::kernel::exec::scheduler::module_slots()
+    if (owner as usize) < crate::kernel::exec::scheduler::committed_module_slots()
         && !latch_module_wake(owner as usize)
     {
         // Owner paused: wake deferred, doorbell suppressed.
@@ -445,7 +452,7 @@ pub fn relatch_module_wake(module_idx: usize) {
 /// the same `fetch_or`.
 #[inline]
 pub fn latch_module_wake(module_idx: usize) -> bool {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
+    if module_idx >= crate::kernel::exec::scheduler::committed_module_slots() {
         return false;
     }
     if paused_owners_present() && module_wake_masked(module_idx) {

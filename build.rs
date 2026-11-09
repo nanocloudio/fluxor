@@ -173,6 +173,7 @@ struct KernelConfig {
     buffer_arena_kb: u32,
     config_buffer_kb: u32,
     log_ring_kb: u32,
+    telemetry_ring_kb: u32,
     ram_static_max_kb: u32,
     kernel_stack_reserve_kb: u32,
     sys_hz: u32,
@@ -370,6 +371,12 @@ fn generate_chip_rs(
         "LOG_RING_CAPACITY",
         "usize",
         &format!("{}", k.log_ring_kb * 1024),
+    );
+    emit_const(
+        &mut g,
+        "TELEMETRY_RING_CAPACITY",
+        "usize",
+        &format!("{}", k.telemetry_ring_kb * 1024),
     );
 
     // The kernel stack: what the RAM region leaves above the static-RAM

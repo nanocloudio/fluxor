@@ -11,54 +11,54 @@
 //!
 //! # Semantics
 //!
-//! - Single producer, two consumers. Both observe the same byte stream
-//!   in the same order; advancing one tail does not affect the other.
-//! - On overflow the **new** byte is dropped and the affected consumers'
-//!   dropped counters bump. Each consumer reads its own counter via
-//!   `take_dropped_local` / `take_dropped_net` and can surface a gap
-//!   marker. Bytes already queued are preserved.
+//! - Any context on any core produces, through [`push_record`] alone, and a
+//!   record is published whole or not at all (`super::ring`): a drain never
+//!   sees a torn record or two records interleaved. Both consumers observe the
+//!   same byte stream in the same order; advancing one tail does not affect
+//!   the other.
+//! - On overflow the **new** record is dropped whole and each consumer it
+//!   would overrun counts its bytes. Each consumer reads its own counter via
+//!   `take_dropped_local` / `take_dropped_net` and can surface a gap marker.
+//!   Bytes already queued are preserved.
 //! - Both consumers are opt-in. The net consumer activates on its first
 //!   `drain_net` call; the local consumer activates when the platform
 //!   runtime calls [`activate_local`] (typically at boot for a sink
 //!   whose FIFO is always drained by hardware, or on connect for a
 //!   sink that stalls until a host is attached). An inactive consumer
 //!   does not participate in the overflow check — the producer is
-//!   never back-pressured by a sink that is not yet ready.
+//!   never back-pressured by a sink that is not yet ready. With neither
+//!   active the ring still records, so a consumer that arrives later, and
+//!   `read_tail` in a panic handler, have history to read.
 //!
 //! # Why drop-new rather than overwrite
 //!
 //! Overwrite-on-full would require the producer to mutate consumer tail
-//! pointers, which is unsafe under any real concurrency. Drop-new is a
-//! pure SPMC pattern and survives being called from tighter contexts
-//! (ISRs, cross-core) later.
-use portable_atomic::{AtomicBool, AtomicU32, Ordering};
-/// Ring capacity. Must be a power of two; sized to cover early boot until
-/// a consumer can reach its transport. Per-silicon, through the kernel's
-/// capacity seam: a host-class ring pushes .bss past the linker's RAM
-/// region on both RP parts once STATE_ARENA and BUFFER_ARENA are placed
-/// beside it.
+//! pointers, which a consumer on another core reads without the lock.
+//! Drop-new leaves every tail to its consumer.
+
+use super::ring::{DropUnit, Ring, WhenIdle};
+
+/// Ring capacity, from the kernel's capacity profile
+/// (`config::LOG_RING_CAPACITY`): a power of two, sized to cover early boot
+/// until a consumer can reach its transport. On RP it is the silicon TOML's
+/// `log_ring_kb`, since a host-class ring does not fit beside the state and
+/// buffer arenas.
 ///
-/// Raising it is not free, and not currently an improvement: the whole
-/// retained span is replayed in one burst when a consumer attaches, so
-/// the ring is also the size of that burst. On the Pi 5 rig a 256 KiB
-/// ring outran the collector, which received FEWER of the early records
-/// than a 64 KiB one — the oldest datagrams, the ones the replay exists
-/// to deliver, are the ones a socket buffer drops first. Pacing the
-/// replay is the prerequisite for a bigger ring.
+/// The ring is also the size of the replay burst a consumer gets when it
+/// attaches, since the whole retained span is sent at once. A network
+/// collector's socket buffer drops the oldest datagrams of a burst first, and
+/// those are the records the replay exists to deliver. So a larger ring
+/// delivers fewer early records, not more, until the replay is paced.
 const CAPACITY: usize = crate::kernel::config::LOG_RING_CAPACITY;
-const MASK: usize = CAPACITY - 1;
-static mut BUF: [u8; CAPACITY] = [0; CAPACITY];
-static HEAD: AtomicU32 = AtomicU32::new(0);
-static TAIL_LOCAL: AtomicU32 = AtomicU32::new(0);
-static TAIL_NET: AtomicU32 = AtomicU32::new(0);
-static DROPPED_LOCAL: AtomicU32 = AtomicU32::new(0);
-static DROPPED_NET: AtomicU32 = AtomicU32::new(0);
-/// True once `drain_net` has been called at least once. While false, the
-/// net tail does not participate in the overflow check.
-static NET_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Starts false. Platform runtime calls [`activate_local`] when its
-/// local-transport sink is ready to accept bytes without stalling.
-static LOCAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Consumer slot of the local (platform-owned) drain.
+const LOCAL: usize = 0;
+
+/// Consumer slot of the net drain.
+const NET: usize = 1;
+
+static RING: Ring<CAPACITY, 2> = Ring::new(WhenIdle::Retain, DropUnit::Bytes);
+
 /// Activate the local consumer. Called by the platform runtime once the
 /// local-transport sink can accept bytes without stalling — at boot for
 /// transports whose FIFO is always drained by hardware (a UART line
@@ -71,12 +71,11 @@ static LOCAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// back-pressured on it while the flag was false). Idempotent on
 /// subsequent calls.
 pub fn activate_local() {
-    if !LOCAL_ACTIVE.load(Ordering::Acquire) {
-        let head = HEAD.load(Ordering::Acquire);
-        TAIL_LOCAL.store(head, Ordering::Release);
-        LOCAL_ACTIVE.store(true, Ordering::Release);
+    if !RING.is_active(LOCAL) {
+        RING.activate(&RING.lock(), LOCAL, |head| head);
     }
 }
+
 /// Activate the local consumer **with** its backlog.
 ///
 /// As [`activate_local`], but the tail is seeded to the oldest byte the ring
@@ -89,105 +88,37 @@ pub fn activate_local() {
 /// active the producer overwrites freely, so the backlog is bounded by the
 /// ring, not by how long the board has been up.
 pub fn activate_local_from_backlog() {
-    if !LOCAL_ACTIVE.load(Ordering::Acquire) {
-        let head = HEAD.load(Ordering::Acquire);
-        TAIL_LOCAL.store(backlog_tail(head), Ordering::Release);
-        LOCAL_ACTIVE.store(true, Ordering::Release);
+    if !RING.is_active(LOCAL) {
+        RING.activate(&RING.lock(), LOCAL, backlog_tail);
     }
 }
+
 /// Deactivate the local consumer.
 pub fn disable_local() {
-    LOCAL_ACTIVE.store(false, Ordering::Release);
+    RING.deactivate(&RING.lock(), LOCAL);
 }
-/// Push one byte into the ring. Non-blocking: drops on full and bumps
-/// the affected consumer's dropped-byte counter(s).
+
+/// Publish one record: a whole log line, or the whole of what one caller
+/// writes at once. Non-blocking. A record that would overrun an active
+/// consumer is dropped whole and counted in that consumer's dropped bytes.
 #[inline]
-pub fn push_byte(b: u8) {
-    let head = HEAD.load(Ordering::Relaxed);
-    let (lag_local, local_active) = if LOCAL_ACTIVE.load(Ordering::Acquire) {
-        let tail_local = TAIL_LOCAL.load(Ordering::Acquire);
-        (head.wrapping_sub(tail_local) as usize, true)
-    } else {
-        (0, false)
-    };
-    let (lag_net, net_active) = if NET_ACTIVE.load(Ordering::Acquire) {
-        let tail_net = TAIL_NET.load(Ordering::Acquire);
-        (head.wrapping_sub(tail_net) as usize, true)
-    } else {
-        (0, false)
-    };
-    // With no active consumer the head still advances so `read_tail` can
-    // dump history in panic handlers, but the producer never drops.
-    if !local_active && !net_active {
-        // SAFETY: `head as usize & MASK` is in-bounds for `BUF[0..CAPACITY]`
-        // since MASK = CAPACITY - 1; volatile write is single-byte and
-        // ordered against the subsequent `HEAD.store(Release)`.
-        unsafe {
-            let ptr = (&raw mut BUF[0]).add((head as usize) & MASK);
-            core::ptr::write_volatile(ptr, b);
-        }
-        HEAD.store(head.wrapping_add(1), Ordering::Release);
-        return;
-    }
-    let lag = if lag_local > lag_net {
-        lag_local
-    } else {
-        lag_net
-    };
-    if lag >= CAPACITY {
-        if local_active {
-            DROPPED_LOCAL.fetch_add(1, Ordering::Relaxed);
-        }
-        if net_active {
-            DROPPED_NET.fetch_add(1, Ordering::Relaxed);
-        }
-        return;
-    }
-    // SAFETY: `head as usize & MASK` is in-bounds for `BUF`; volatile
-    // write happens-before `HEAD.store(Release)` below.
-    unsafe {
-        let ptr = (&raw mut BUF[0]).add((head as usize) & MASK);
-        core::ptr::write_volatile(ptr, b);
-    }
-    HEAD.store(head.wrapping_add(1), Ordering::Release);
+pub fn push_record(bytes: &[u8]) {
+    let _ = RING.push_bytes(bytes);
 }
-/// Push a slice. Bytes that would overflow are dropped and counted.
-pub fn push_bytes(s: &[u8]) {
-    for &b in s {
-        push_byte(b);
-    }
-}
-#[inline]
-fn drain_from(tail_reg: &AtomicU32, out: &mut [u8]) -> usize {
-    let tail = tail_reg.load(Ordering::Relaxed);
-    let head = HEAD.load(Ordering::Acquire);
-    let available = head.wrapping_sub(tail) as usize;
-    let n = core::cmp::min(available, out.len());
-    let mut i = 0;
-    while i < n {
-        let idx = (tail.wrapping_add(i as u32) as usize) & MASK;
-        // SAFETY: `idx & MASK` is in-bounds for `BUF`; volatile read
-        // paired with the `HEAD.load(Acquire)` above.
-        out[i] = unsafe { core::ptr::read_volatile((&raw const BUF[0]).add(idx)) };
-        i += 1;
-    }
-    if n > 0 {
-        tail_reg.store(tail.wrapping_add(n as u32), Ordering::Release);
-    }
-    n
-}
+
 /// Drain for the local (platform-owned) debug transport. Advances the
 /// local tail only.
 pub fn drain_local(out: &mut [u8]) -> usize {
-    if !LOCAL_ACTIVE.load(Ordering::Acquire) {
+    if !RING.is_active(LOCAL) {
         return 0;
     }
-    drain_from(&TAIL_LOCAL, out)
+    RING.drain_bytes(LOCAL, out)
 }
+
 /// Drain for the net-side consumer (`LOG_RING_DRAIN` syscall). Advances
 /// the net tail only.
 ///
-/// The first call activates the net consumer and seeds `TAIL_NET` to the
+/// The first call activates the net consumer and seeds its tail to the
 /// OLDEST byte the ring still holds, not to `HEAD`, so the backlog that
 /// accumulated before the consumer could reach its transport is
 /// delivered first. This is [`activate_local_from_backlog`]'s rule on
@@ -196,21 +127,17 @@ pub fn drain_local(out: &mut [u8]) -> usize {
 /// It matters more here than for a console, because the net consumer
 /// cannot start early even in principle: `log_net` forwards nothing
 /// until its endpoint is bound, and binding waits on DHCP. Seeding to
-/// `HEAD` therefore discarded exactly the window nothing else can see —
+/// `HEAD` would discard exactly the window nothing else can see —
 /// instantiation, and any refusal during it — on a board whose only
-/// other transport is a serial line that may not be attached. The bytes
-/// were in the ring the whole time; the tail was simply placed past
-/// them.
+/// other transport is a serial line that may not be attached.
 ///
 /// The ring holds at most `CAPACITY` bytes, so the replay is bounded by
 /// the ring rather than by how long the board took to get an address.
 pub fn drain_net(out: &mut [u8]) -> usize {
-    if !NET_ACTIVE.load(Ordering::Acquire) {
-        let head = HEAD.load(Ordering::Acquire);
-        TAIL_NET.store(backlog_tail(head), Ordering::Release);
-        NET_ACTIVE.store(true, Ordering::Release);
+    if !RING.is_active(NET) {
+        RING.activate(&RING.lock(), NET, backlog_tail);
     }
-    drain_from(&TAIL_NET, out)
+    RING.drain_bytes(NET, out)
 }
 
 /// The oldest byte a backlog replay should start at, given `head`.
@@ -238,44 +165,42 @@ fn backlog_tail(head: u32) -> u32 {
     if (head as usize) <= CAPACITY {
         return start;
     }
-    let mut i = 0usize;
-    while i < retained {
-        let idx = (start.wrapping_add(i as u32) as usize) & MASK;
-        // SAFETY: `idx & MASK` is in-bounds for `BUF`; single-byte
-        // volatile read of a byte the producer has already published.
-        let b = unsafe { core::ptr::read_volatile((&raw const BUF[0]).add(idx)) };
-        if b == b'\n' {
+    for i in 0..retained {
+        if RING.byte_at(start.wrapping_add(i as u32)) == b'\n' {
             return start.wrapping_add(i as u32 + 1);
         }
-        i += 1;
     }
     start
 }
+
 /// Atomically read and clear the local-tail dropped-byte counter.
 pub fn take_dropped_local() -> u32 {
-    DROPPED_LOCAL.swap(0, Ordering::Relaxed)
+    RING.take_dropped(LOCAL)
 }
+
 /// Atomically read and clear the net-tail dropped-byte counter.
 pub fn take_dropped_net() -> u32 {
-    DROPPED_NET.swap(0, Ordering::Relaxed)
+    RING.take_dropped(NET)
 }
+
 /// Non-destructive snapshot of the drop counters and consumer state,
 /// for diagnostic surfaces that must not disturb the main accounting.
 /// Returns `(dropped_local, dropped_net, local_active, net_active)`.
 pub fn peek_stats() -> (u32, u32, bool, bool) {
     (
-        DROPPED_LOCAL.load(Ordering::Relaxed),
-        DROPPED_NET.load(Ordering::Relaxed),
-        LOCAL_ACTIVE.load(Ordering::Relaxed),
-        NET_ACTIVE.load(Ordering::Relaxed),
+        RING.dropped(LOCAL),
+        RING.dropped(NET),
+        RING.is_active(LOCAL),
+        RING.is_active(NET),
     )
 }
+
 /// Snapshot the most recent `out.len()` bytes of ring history into `out`
 /// without advancing the tail. Returns the number of bytes copied.
 ///
 /// Intended for panic / exception handlers that want to dump the tail of
 /// the log alongside fault state. Unlike `drain`, this does not consume
-/// bytes and does not cooperate with the SPSC consumer — it reads the
+/// bytes and does not cooperate with the consumers — it reads the
 /// underlying buffer directly. Safe to call from any context: no locks,
 /// no allocation, no scheduler dependency.
 ///
@@ -286,39 +211,27 @@ pub fn peek_stats() -> (u32, u32, bool, bool) {
 /// with this call may yield slightly truncated or partially-updated
 /// bytes; the call will not corrupt memory.
 pub fn read_tail(out: &mut [u8]) -> usize {
-    let head = HEAD.load(Ordering::Relaxed);
-    if head == 0 {
-        return 0;
-    }
-    let history = if (head as usize) < CAPACITY {
-        head as usize
-    } else {
-        CAPACITY
-    };
+    let head = RING.head();
+    let history = core::cmp::min(head as usize, CAPACITY);
     let n = core::cmp::min(out.len(), history);
     let start = head.wrapping_sub(n as u32);
-    let mut i = 0;
-    while i < n {
-        let idx = (start.wrapping_add(i as u32) as usize) & MASK;
-        // SAFETY: `idx & MASK` is in-bounds for `BUF`; volatile read
-        // for panic-handler history dump.
-        out[i] = unsafe { core::ptr::read_volatile((&raw const BUF[0]).add(idx)) };
-        i += 1;
+    for (i, o) in out[..n].iter_mut().enumerate() {
+        *o = RING.byte_at(start.wrapping_add(i as u32));
     }
     n
 }
-/// Test-only serialisation lock. Every test that touches the
-/// module-level statics (`HEAD`, `TAIL_LOCAL`, `TAIL_NET`,
-/// `LOCAL_ACTIVE`, `NET_ACTIVE`, dropped counters) — including
-/// integration tests under `tests/` and `platform::debug` —
+
+/// Test-only serialisation lock. Every test that depends on the ring's
+/// state (its head, tails, active consumers and dropped counters) —
+/// including integration tests under `tests/` and `platform::debug` —
 /// must hold this lock for the duration of the test body. Cargo
-/// runs tests in parallel by default and the statics aren't safe
-/// to mutate concurrently.
+/// runs tests in parallel by default and the ring is one static.
 ///
 /// Exposed as `pub` (gated on `host-linux`) so integration tests
 /// in `tests/` can serialise on the same lock.
 #[cfg(feature = "host-linux")]
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Acquire the test serialisation lock. Recovers from poisoning —
 /// a previous test that panicked still left global state behind,
 /// but every caller resets the ring before relying on it.
@@ -326,19 +239,15 @@ pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
+
 /// Test-only reset. Brings the ring back to its post-boot state
 /// so tests don't see bytes pushed by earlier cases. Exposed as
 /// `pub` (gated on `host-linux`) so integration tests can call it.
 #[cfg(feature = "host-linux")]
 pub fn _test_reset() {
-    HEAD.store(0, Ordering::Release);
-    TAIL_LOCAL.store(0, Ordering::Release);
-    TAIL_NET.store(0, Ordering::Release);
-    DROPPED_LOCAL.store(0, Ordering::Release);
-    DROPPED_NET.store(0, Ordering::Release);
-    LOCAL_ACTIVE.store(false, Ordering::Release);
-    NET_ACTIVE.store(false, Ordering::Release);
+    RING.reset();
 }
+
 /// Capacity of the log ring on the host build. Exposed for
 /// integration tests under `tests/` that need to push past the
 /// wrap point.

@@ -104,6 +104,22 @@ pub fn module_slots() -> usize {
     }
 }
 
+/// [`module_slots`] without sizing the table, for interrupt context and the
+/// wake latch it reaches: a table no plan has sized holds no module, so every
+/// index reads as out of range.
+#[inline]
+pub fn committed_module_slots() -> usize {
+    #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
+    {
+        // SAFETY: as `module_slots`.
+        unsafe { (&*core::ptr::addr_of!(SCHED)).modules.committed().len() }
+    }
+    #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
+    {
+        MAX_MODULES
+    }
+}
+
 /// Edge slots live now (see [`module_slots`]).
 #[inline]
 pub fn edge_slots() -> usize {

@@ -86,6 +86,9 @@ mod profile_linux {
     /// Capacity of the in-memory log ring (`kernel::sys::log_ring`). Sized
     /// for moderate trace volume.
     pub const LOG_RING_CAPACITY: usize = 65536;
+    /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
+    /// round for `MAX_MODULES` slots, and never under 32 KiB.
+    pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
     /// Kernel elastic region backing Tier B chunk grants
     /// (`resource::ELASTIC_ALLOC`). 16 MiB: room for TLS-session growth to
     /// its compiled maximum (~7.9 MiB at `tls::MAX_SESSIONS`, once 104 KiB
@@ -188,6 +191,9 @@ mod profile_bcm2712 {
     /// replayed in one burst when a consumer attaches, and on the Pi 5 rig a
     /// 256 KiB ring outran the collector's socket buffer.
     pub const LOG_RING_CAPACITY: usize = 65536;
+    /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
+    /// round for `MAX_MODULES` slots, and never under 32 KiB.
+    pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
     /// Tier B elastic region (see the Linux profile). Zero-initialised, so
     /// the size costs kernel `.bss` rather than image.
     pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
@@ -263,6 +269,9 @@ mod profile_uefi {
     pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
     /// Early-boot log ring (see the BCM2712 profile).
     pub const LOG_RING_CAPACITY: usize = 65536;
+    /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
+    /// round for `MAX_MODULES` slots, and never under 32 KiB.
+    pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
     /// Tier B elastic region (see the Linux profile).
     pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
     /// Grant granularity: the 64 KiB platform quantum.
@@ -330,6 +339,9 @@ mod profile_wasm {
     pub const MAX_BRIDGES: usize = 16;
     /// Early-boot log ring.
     pub const LOG_RING_CAPACITY: usize = 16384;
+    /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
+    /// round for `MAX_MODULES` slots, and never under 32 KiB.
+    pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
     /// Tier B elastic region. Browser tabs page lazily, but the region is
     /// still budgeted small.
     pub const ELASTIC_REGION_SIZE: usize = 2 * 1024 * 1024;
@@ -405,6 +417,9 @@ mod profile_rp {
     /// Early-boot log ring, from `[kernel] log_ring_kb`. Must be a power of
     /// two.
     pub const LOG_RING_CAPACITY: usize = crate::platform::chip::LOG_RING_CAPACITY;
+    /// The telemetry ring, from `[kernel] telemetry_ring_kb`. Must be a power
+    /// of two and hold one PSTATUS round.
+    pub const TELEMETRY_RING_CAPACITY: usize = crate::platform::chip::TELEMETRY_RING_CAPACITY;
     /// The module-index DOMAIN, not a table size: the module tables are sized
     /// from the plan within it. A `ModuleMask` holds one bit per index.
     pub const MAX_MODULES: usize = 32;
@@ -467,6 +482,34 @@ const _: () = assert!(
     LOG_RING_CAPACITY.is_power_of_two(),
     "the log ring is indexed by mask"
 );
+const _: () = assert!(
+    TELEMETRY_RING_CAPACITY.is_power_of_two(),
+    "the telemetry ring is indexed by mask"
+);
+const _: () = assert!(
+    TELEMETRY_RING_CAPACITY >= pstatus_round(MAX_MODULES),
+    "the telemetry ring holds one whole PSTATUS round"
+);
+
+/// One PSTATUS round for `max_modules` slots: a `STEP` (52 B) and a `RES`
+/// (28 B) per module slot and a `POOL` (32 B) per kernel resource pool. The
+/// scheduler emits a round in one burst with no drain between, so a ring
+/// smaller than this drops the tail of every round.
+pub const fn pstatus_round(max_modules: usize) -> usize {
+    max_modules * (52 + 28) + crate::abi::contracts::resource::KERNEL_POOL_COUNT * 32
+}
+
+/// A telemetry ring for `max_modules` slots: the next power of two over one
+/// PSTATUS round, and never under 32 KiB.
+#[cfg(not(feature = "rp"))]
+const fn telemetry_ring_for(max_modules: usize) -> usize {
+    let p = pstatus_round(max_modules).next_power_of_two();
+    if p > 32768 {
+        p
+    } else {
+        32768
+    }
+}
 const _: () = assert!(
     HEAP_SEGMENTS >= 1 && HEAP_SEGMENTS <= 32,
     "a heap's first segment is cap >> (HEAP_SEGMENTS - 1)"

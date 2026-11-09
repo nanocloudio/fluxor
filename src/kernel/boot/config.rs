@@ -713,18 +713,16 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 pub const GRAPH_EDGE_SIZE: usize = 12;
 /// Per-domain metadata entry, bytes: `tick_us:u16 | exec_mode:u8 |
 /// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags`.
-/// `tick_min_us`/`tick_max_us` are deliberately NOT in this (checksummed) entry:
-/// they ride in the POST-BODY adaptive section past `total_size` (see
-/// `ADAPTIVE_POST_SIZE`), because a larger checksummed `body_size` hangs the
-/// bare-metal Pi 5 boot. Kernel and tools ship together, so a blob of any other
-/// layout is rejected by the body-size/CRC check.
+/// `tick_min_us`/`tick_max_us` are not in this (checksummed) entry: they ride in
+/// the post-body adaptive section past `total_size` (see `ADAPTIVE_POST_SIZE`).
+/// Kernel and tools ship together, so a blob of any other layout is rejected by
+/// the body-size/CRC check.
 pub const DOMAIN_META_ENTRY_SIZE: usize = 4;
 pub const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// Adaptive-tick post-body section: 4 domains × `[tick_min_us:u16, tick_max_us:u16]`.
-/// Stored AFTER the checksummed body (past `total_size`), never inside
-/// `body_size`: a larger `body_size` hangs the bare-metal Pi 5 boot, while
-/// trailing bytes past it are harmless. See the read site in
-/// `read_config_from_slice`.
+/// Stored after the checksummed body (past `total_size`), not covered by the
+/// CRC: values are range-checked and fall back to the domain tick. See the read
+/// site in `read_config_from_slice`.
 pub const ADAPTIVE_POST_SIZE: usize = 16;
 
 /// Resident-workload config-section magic: "FXPD". The section is appended
@@ -1427,10 +1425,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             config.domain_adaptive_flags[d] = *base.add(3);
             // Default tick_min/tick_max to the domain's effective tick; the
             // post-body adaptive section (read below, after the hw section)
-            // overrides these when present. They live there — not here in the
-            // graph domain meta — because growing the checksummed `body_size`
-            // hangs the bare-metal Pi 5 boot (rig-proven), whereas trailing bytes
-            // past `body_size` are harmless.
+            // overrides these when present.
             let eff = if dtick > 0 { dtick } else { global_tick };
             config.domain_tick_min_us[d] = eff;
             config.domain_tick_max_us[d] = eff;
@@ -1453,13 +1448,12 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
 
     // Adaptive-tick post-body section: 4 domains × [tick_min_us:u16 LE,
     // tick_max_us:u16 LE] = 16 bytes, placed AFTER the checksummed body (at
-    // `total_size`), NOT inside `body_size`. This is deliberate: growing
-    // `body_size` itself hangs the bare-metal Pi 5 boot (rig-proven, mechanism
-    // unresolved — a body of N+16 hangs where N boots), but trailing bytes PAST
-    // `body_size` are harmless (rig-proven: a 16B post-body pad boots). So the
-    // body/checksum/parse stay byte-identical to a config without adaptive data,
-    // and these values ride along in the gap before the next 256B image
-    // boundary. Not checksum-covered → range-validated + 0/garbage ⇒ domain
+    // `total_size`), not inside `body_size`, so the body, checksum and parse
+    // stay byte-identical to a config without adaptive data, and these values
+    // ride along in the gap before the next 256B image boundary. On bcm2712 the
+    // whole config, body and tail, must end below `__bss_start`: `_start`
+    // clears from there, so a body that reaches it fails its checksum
+    // (`linker/memory-bcm2712.x`). Not checksum-covered → range-validated + 0/garbage ⇒ domain
     // tick, and adaptive is default-off (flags=0) so a torn tail is inert.
     let post_off = total_size; // = 8 + body_size, first byte past the CRC'd body
     if post_off + ADAPTIVE_POST_SIZE <= blob_len {
@@ -1495,9 +1489,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     }
 
     // Post-body section chain, right after the 16-byte adaptive post-body and
-    // PAST the checksummed body (the additive discipline — growing `body_size`
-    // hangs the bare-metal Pi 5 boot; trailing sections are rig-proven
-    // harmless). Every section is self-describing with the same header:
+    // past the checksummed body. Every section is self-describing with the same header:
     // `[magic u32][section_len u32][crc16 u16][payload]`, `crc16` over
     // `section[10..section_len]` — so the walk skips sections by length and an
     // unknown magic ends the chain. Known sections:

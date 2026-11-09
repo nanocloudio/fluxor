@@ -14,19 +14,11 @@
 //! session; `continuity.rs`) and are optional — unwired, the record path
 //! is unchanged.
 
-// `no_std` / `no_main` are stripped under EITHER the host-test
-// feature (the explicit "build me as a host rlib" knob) OR
-// `cfg(test)` (cargo's own test-runner harness). The PIC build
-// sets neither, so the firmware blob stays bare-metal.
-//
-// The `cfg(test)` arm matters because `cargo test -p
-// fluxor-mod-tls --target aarch64-unknown-linux-gnu` without
-// `--features host-test` would otherwise fail with `undefined
-// reference to main` — cargo's test harness needs a normal
-// `main` entrypoint to instantiate `#[test]` functions, which
-// `#![no_main]` suppresses.
-#![cfg_attr(not(any(feature = "host-test", test)), no_std)]
-#![cfg_attr(not(any(feature = "host-test", test)), no_main)]
+// `no_std` / `no_main` are stripped under the host-test feature (the
+// "build me as a host rlib" knob the harness sets). The PIC build does
+// not set it, so the firmware blob stays bare-metal.
+#![cfg_attr(not(feature = "host-test"), no_std)]
+#![cfg_attr(not(feature = "host-test"), no_main)]
 #![allow(
     unsafe_code,
     reason = "PIC module: ABI shim and crypto primitives over raw buffers"

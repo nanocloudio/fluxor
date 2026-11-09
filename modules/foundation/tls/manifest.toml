@@ -61,13 +61,13 @@ when       = { peer_auth = ["ca_dns", "ca_uri"], clock_policy = "require" }
 capability = "trust.system"
 when       = { trust = "system" }
 
-# The `trust` contract (class 0x1D) is what `trust = "system"` asks. Declared
-# unconditionally because a manifest resource is a GRANT — permission to call
-# the class — and not a claim that a provider exists; the `[[requires_when]]`
-# above is what refuses a target where none does. A graph that never names
-# `trust = "system"` never makes the call, and the grant costs it nothing.
+# The `trust` contract (class 0x1D) is what `trust = "system"` asks, and only
+# that value calls it, so the claim is optional: the `[[requires_when]]` above
+# is what refuses a target with no `trust.system` when a graph names it. A
+# graph that never names `trust = "system"` never makes the call.
 [[resources]]
 requires_contract = "trust"
+optional = true
 # Read: a verdict is asked for and returned. Nothing is stored, and no
 # anchor material crosses in either direction.
 access = "read"

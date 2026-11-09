@@ -652,12 +652,12 @@ mod scheduler_validation_tests {
         assert_ne!(port_index("tls", "clear_out"), 0);
         // A control input rides the edge's control bit.
         let edges = workload_wiring(
-            json!([{"name": "a", "type": "link"}, {"name": "b", "type": "link"}]),
-            json!([{"from": "a.ctrl_fwd", "to": "b.control"}]),
+            json!([{"name": "a", "type": "fs_bank"}, {"name": "b", "type": "fs_bank"}]),
+            json!([{"from": "a.notify", "to": "b.commands"}]),
         )
         .unwrap();
-        assert_eq!(edges[0].from_port, port_index("link", "ctrl_fwd"));
-        assert_eq!(edges[0].to_port, 0x80 | port_index("link", "control"));
+        assert_eq!(edges[0].from_port, port_index("fs_bank", "notify"));
+        assert_eq!(edges[0].to_port, 0x80 | port_index("fs_bank", "commands"));
     }
 
     /// What a workload's wiring cannot say is refused, naming the edge.
@@ -1606,7 +1606,7 @@ mod scheduler_validation_tests {
         // content types only when **both** endpoints have manifests, so
         // a Tier 1b module with no edges (or bare/default ports) passes
         // it untouched and lands in the graph without ever running
-        // through the `isr_safe` check or the NEON-import lint.
+        // through the `isr_safe` check.
         //
         // Hard-error here so the operator gets a single, focused
         // diagnostic naming the unresolved module rather than a
@@ -1636,22 +1636,22 @@ mod scheduler_validation_tests {
         // `extract_module_search_paths` returns a *priority-ordered*
         // list with explicit YAML `module_search_paths:` entries
         // first, and the manifest loader
-        // (`load_module_manifests_with_extra`) and the ISR NEON-lint
+        // (`load_module_manifests_with_extra`) and the ISR source checks
         // must both honour that order. Were either to search
         // `standard_module_dirs()` first, a config-declared override
         // colliding with a bundled module of the same `type:` would
-        // have ISR admission read `isr_safe` and scan source from the
+        // have ISR admission read `isr_safe` and check source from the
         // bundled copy — silently admitting a module the operator had
         // explicitly redirected to a vetted vendor tree.
         //
         // This test plants the *same* type name twice:
         //   - standard tree (`<project>/modules/foundation/coll/`)
-        //     declares `isr_safe = true` and a NEON-free src tree.
-        //   - extra dir (`<override>/coll/`) declares
-        //     `isr_safe = true` but imports NEON in its src.
+        //     declares `isr_safe = true` and exports `module_isr_entry`.
+        //   - extra dir (`<override>/coll/`) declares `isr_safe = true`
+        //     but exports no ISR entry.
         //
         // If standard wins, admission passes (wrong). If the
-        // extra dir wins, the NEON lint fires.
+        // extra dir wins, the Tier 2 export check fires.
         let project = tempfile::tempdir().expect("tempdir-project");
         let extra = tempfile::tempdir().expect("tempdir-extra");
         let _env = super::test_env::EnvGuard::set(&[("FLUXOR_PROJECT_ROOT", project.path())]);
@@ -1664,7 +1664,11 @@ mod scheduler_validation_tests {
             "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
         )
         .expect("write std manifest");
-        std::fs::write(std_src.join("lib.rs"), "fn unused() {}\n").expect("write std src");
+        std::fs::write(
+            std_src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write std src");
 
         let ovr_dir = extra.path().join("coll");
         let ovr_src = ovr_dir.join("src");
@@ -1674,29 +1678,27 @@ mod scheduler_validation_tests {
             "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
         )
         .expect("write override manifest");
-        std::fs::write(
-            ovr_src.join("lib.rs"),
-            "use core::arch::aarch64::*;\nfn unused() {}\n",
-        )
-        .expect("write override src");
+        std::fs::write(ovr_src.join("lib.rs"), "fn module_step(_s: *mut u8) -> i32 { 0 }\n")
+            .expect("write override src");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
         });
         let modules = vec![json!({
             "name": "coll",
             "type": "coll",
-            "domain": "audio_isr",
+            "domain": "irq_owner",
+            "irq": 42,
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![extra.path()];
         let err =
             validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("extras-first lookup must surface the NEON-importing override");
+                .expect_err("extras-first lookup must surface the entry-less override");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("NEON") && msg.contains("coll"),
-            "extras must shadow the standard tree — NEON lint should fire on the override, got: {msg}"
+            msg.contains("module_isr_entry") && msg.contains("coll"),
+            "extras must shadow the standard tree — the export check should fire on the override, got: {msg}"
         );
     }
 
@@ -1818,15 +1820,14 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn admission_neon_lint_finds_standard_tree_modules_too() {
-        // The NEON-import lint must find a module's src root wherever
-        // its manifest resolved from, `standard_module_dirs()`
-        // included. A lint searching only `modules_dir +
-        // extra_module_dirs` would never run `check_isr_safe_no_neon`
-        // against a module under `modules/drivers/<name>`, which would
-        // then pass admission silently. This test plants an
-        // `isr_safe = true` module with a NEON import in a fake
-        // project root and asserts the lint catches it.
+    fn admission_isr_entry_check_finds_standard_tree_modules_too() {
+        // The source checks must find a module's src root wherever its
+        // manifest resolved from, `standard_module_dirs()` included. A
+        // lookup searching only `modules_dir + extra_module_dirs` would
+        // never run the `module_isr_entry` export check against a module
+        // under `modules/drivers/<name>`, which would then pass admission
+        // silently. This test plants an `isr_safe = true` Tier 2 module with
+        // no ISR entry in a fake project root and asserts the check sees it.
         let project = tempfile::tempdir().expect("tempdir");
         // `standard_module_dirs()` reads `$FLUXOR_PROJECT_ROOT`
         // dynamically. Use the shared file-scope env lock + Drop
@@ -1834,9 +1835,7 @@ mod scheduler_validation_tests {
         // `module_discovery_tests` (which also mutates this var)
         // and (b) restores the original value even on panic.
         let _env = super::test_env::EnvGuard::set(&[("FLUXOR_PROJECT_ROOT", project.path())]);
-        // Plant a driver under modules/drivers/<name>/ with both a
-        // manifest and a NEON-importing src tree.
-        let drivers = project.path().join("modules/drivers/neon_isr_module");
+        let drivers = project.path().join("modules/drivers/entryless_isr_module");
         let src = drivers.join("src");
         std::fs::create_dir_all(&src).expect("mkdir");
         std::fs::write(
@@ -1846,29 +1845,28 @@ mod scheduler_validation_tests {
         .expect("write manifest");
         std::fs::write(
             src.join("lib.rs"),
-            // The lint scans .rs files for marker substrings.
-            "use core::arch::aarch64::*;\nfn unused() {}\n",
+            "fn module_step(_s: *mut u8) -> i32 { 0 }\n",
         )
         .expect("write src");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
         });
         let modules = vec![json!({
-            "name": "neon_isr_module",
-            "type": "neon_isr_module",
-            "domain": "audio_isr",
+            "name": "entryless_isr_module",
+            "type": "entryless_isr_module",
+            "domain": "irq_owner",
+            "irq": 42,
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
         let err =
             validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("standard-tree NEON-importing ISR module must be rejected");
+                .expect_err("a standard-tree Tier 2 module without module_isr_entry must be rejected");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("NEON")
-                && (msg.contains("neon_isr_module") || msg.contains("core::arch::aarch64")),
-            "diagnostic must name NEON + the offending module/source, got: {msg}"
+            msg.contains("module_isr_entry") && msg.contains("entryless_isr_module"),
+            "diagnostic must name the missing export + the offending module, got: {msg}"
         );
         // `_env` drops here, restoring `FLUXOR_PROJECT_ROOT` and
         // releasing the file-scope env lock.
@@ -2472,6 +2470,201 @@ mod continuity_tests {
         assert_eq!(rule.declared_count(&tlv, &integers), 3 + 0x110 + 2);
     }
 
+    fn claim(class: u8, optional: bool, active_when: &[&str]) -> ResourceClaim {
+        ResourceClaim {
+            device_class: class,
+            access_mode: 0,
+            instance: 0xFF,
+            selector: ClaimSelector::Default,
+            active_when_params: names(active_when),
+            optional,
+            variants: Vec::new(),
+            when: Vec::new(),
+        }
+    }
+
+    fn refusals(target: &str, graph: &Value, m: &HashMap<String, Manifest>) -> Vec<String> {
+        let mut module_names: Vec<String> = m.keys().cloned().collect();
+        module_names.sort();
+        let found = required_contract_refusals(
+            graph,
+            &module_names,
+            m,
+            ProviderReach {
+                runtime: Some(target),
+                caller: ProviderCaller::Node,
+            },
+        );
+        found.into_iter().map(|r| r.message).collect()
+    }
+
+    /// A claim nothing answers is refused, naming module, contract and target;
+    /// the kernel's own contracts, the target's `[providers]` and a module in
+    /// the graph each answer it.
+    #[test]
+    fn a_required_contract_must_be_answered_by_kernel_platform_or_module() {
+        let fs_user = Manifest {
+            resources: vec![claim(0x09, false, &[]), claim(0x05, false, &[])],
+            ..Manifest::default()
+        };
+        let graph = json!({"modules": [{"name": "user"}]});
+        let alone: HashMap<String, Manifest> = [("user".to_string(), fs_user.clone())].into();
+        // uefi answers no `fs`; `channel` is the kernel's.
+        let r = refusals("uefi", &graph, &alone);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].contains("`user` requires `fs`") && r[0].contains("uefi"), "{r:?}");
+        // linux's platform answers `fs`.
+        assert!(refusals("linux", &graph, &alone).is_empty());
+        // A module in the graph that provides `file.data` answers `fs`.
+        let with_fat: HashMap<String, Manifest> = [
+            ("user".to_string(), fs_user),
+            ("fat32".to_string(), prov(&["file.data"])),
+        ]
+        .into();
+        let graph = json!({"modules": [{"name": "user"}, {"name": "fat32"}]});
+        assert!(refusals("uefi", &graph, &with_fat).is_empty());
+    }
+
+    /// An optional claim and an unexercised one are never refused, and a
+    /// value the builder embeds (`${file:…}`) exercises nothing at run time.
+    #[test]
+    fn optional_unexercised_and_embedded_claims_are_not_refused() {
+        let m: HashMap<String, Manifest> = [(
+            "tls".to_string(),
+            Manifest {
+                resources: vec![claim(0x1D, true, &[]), claim(0x09, false, &["cert_file"])],
+                ..Manifest::default()
+            },
+        )]
+        .into();
+        let unset = json!({"modules": [{"name": "tls"}]});
+        assert!(refusals("bcm2712", &unset, &m).is_empty());
+        let embedded = json!({"modules": [{"name": "tls", "cert_file": "${file:pki/c.der}"}]});
+        assert!(refusals("bcm2712", &embedded, &m).is_empty());
+        let path = json!({"modules": [{"name": "tls", "cert_file": "/etc/c.der"}]});
+        let r = refusals("bcm2712", &path, &m);
+        assert_eq!(r.len(), 1, "a runtime path reads through `fs`: {r:?}");
+    }
+
+    /// Any refusal fails the build, and the error names every one.
+    #[test]
+    fn every_refusal_fails_the_build_and_is_named() {
+        enforce_required_contracts(Vec::new(), "").unwrap();
+        let refusal = |module: &str, contract: &'static str| ProviderRefusal {
+            module: module.to_string(),
+            contract,
+            message: format!("`{module}` requires `{contract}`"),
+        };
+        let e = enforce_required_contracts(
+            vec![refusal("a", "fs"), refusal("b", "spi")],
+            "workload 0: ",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("workload 0: `a` requires `fs`") && e.contains("workload 0: `b` requires `spi`"),
+            "{e}"
+        );
+    }
+
+    /// A claim keyed to `route_<n>_*` params is read as the packer expands a
+    /// `routes:` list: only a route that serves files exercises it.
+    #[test]
+    fn a_routes_list_exercises_a_claim_only_through_its_file_routes() {
+        let m: HashMap<String, Manifest> = [(
+            "http".to_string(),
+            Manifest {
+                resources: vec![claim(0x09, false, &["fs_root", "route_0_fs_path"])],
+                ..Manifest::default()
+            },
+        )]
+        .into();
+        let inline = json!({"modules": [{"name": "http",
+            "routes": [{"path": "/", "body": "<h1>hi</h1>"}]}]});
+        assert!(refusals("uefi", &inline, &m).is_empty());
+        let files = json!({"modules": [{"name": "http",
+            "routes": [{"path": "/", "fs_path": "/web/index.html"}]}]});
+        assert_eq!(refusals("uefi", &files, &m).len(), 1);
+    }
+
+    /// A claim counts only under the variant it names and when its `when`
+    /// conditions hold for the instance, schema defaults included.
+    #[test]
+    fn a_claim_counts_only_under_its_variant_and_when() {
+        // The instance's effective `update_durability` is `durable` only
+        // when set so: its default is not.
+        let durable = |_: &str, entry: &Value, param: &str, values: &[String]| {
+            assert_eq!(param, "update_durability");
+            let v = entry.get(param).and_then(Value::as_str).unwrap_or("default");
+            Ok(Some(Some(values.iter().any(|w| w == v))))
+        };
+        let mut disk_only = claim(0x09, false, &[]);
+        disk_only.variants = names(&["disk"]);
+        let mut durable_only = claim(0x09, false, &[]);
+        durable_only.when = vec![("update_durability".to_string(), names(&["durable"]))];
+        let man = |variant: &str| Manifest {
+            resources: vec![disk_only.clone(), durable_only.clone()],
+            selected_variant: Some(variant.to_string()),
+            ..Manifest::default()
+        };
+        let kept = |variant: &str, entry: Value| {
+            let m: HashMap<String, Manifest> = [("d".to_string(), man(variant))].into();
+            crate::config::exercised_claims(&[entry], &m, durable).unwrap()["d"]
+                .resources
+                .len()
+        };
+        assert_eq!(kept("disk", json!({"name": "d", "type": "dns", "update_durability": "durable"})), 2);
+        assert_eq!(kept("volatile", json!({"name": "d", "type": "dns", "update_durability": "durable"})), 1);
+        assert_eq!(kept("disk", json!({"name": "d", "type": "dns", "update_durability": "volatile"})), 1);
+        // Unset: the schema default (not `durable`) stands in.
+        assert_eq!(kept("volatile", json!({"name": "d", "type": "dns"})), 0);
+    }
+
+    /// `variants` must name declared variants, and `when` parses as in
+    /// `[[requires_when]]`.
+    #[test]
+    fn claim_variants_and_when_parse() {
+        let head = "version = \"0.1.0\"\n[[variant]]\nname = \"disk\"\nfeatures = []\ndefault = true\n[[variant]]\nname = \"volatile\"\nfeatures = [\"volatile\"]\n";
+        let ok = format!("{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"disk\"]\nwhen = {{ persist = \"fs\" }}\n");
+        let m = Manifest::from_toml_str_for_target(&ok, None).unwrap();
+        assert_eq!(m.resources[0].variants, names(&["disk"]));
+        assert_eq!(m.resources[0].when, vec![("persist".to_string(), names(&["fs"]))]);
+        assert_eq!(m.selected_variant.as_deref(), Some("disk"));
+        let bad = format!("{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"dsk\"]\n");
+        let e = Manifest::from_toml_str_for_target(&bad, None).unwrap_err().to_string();
+        assert!(e.contains("`dsk`"), "{e}");
+    }
+
+    /// bcm2712 answers `fs` for a workload's modules and `storage.*` for the
+    /// node's own, from its `[providers]` table.
+    #[test]
+    fn the_target_table_separates_node_and_workload_callers() {
+        let m: HashMap<String, Manifest> = [(
+            "w".to_string(),
+            Manifest {
+                resources: vec![claim(0x09, false, &[]), claim(0x14, false, &[])],
+                ..Manifest::default()
+            },
+        )]
+        .into();
+        let graph = json!({"modules": [{"name": "w"}]});
+        let node = refusals("bcm2712", &graph, &m);
+        assert!(node.len() == 1 && node[0].contains("`fs`"), "{node:?}");
+        let workload = required_contract_refusals(
+            &graph,
+            &names(&["w"]),
+            &m,
+            ProviderReach {
+                runtime: Some("bcm2712"),
+                caller: ProviderCaller::Workload,
+            },
+        );
+        assert!(
+            workload.len() == 1 && workload[0].contract == "storage.object",
+            "{workload:?}"
+        );
+    }
+
     /// A module provider and every module it serves share a domain; on a node
     /// that admits live-added workloads the provider sits in the primary one.
     #[test]
@@ -2484,6 +2677,9 @@ mod continuity_tests {
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
                 active_when_params: Vec::new(),
+                optional: false,
+                variants: Vec::new(),
+                when: Vec::new(),
             }],
             ..Manifest::default()
         };
@@ -2567,6 +2763,9 @@ mod continuity_tests {
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
                 active_when_params: Vec::new(),
+                optional: false,
+                variants: Vec::new(),
+                when: Vec::new(),
             }],
             permissions: crate::manifest::ManifestPermissions {
                 bits: permission::PLATFORM_RAW,
@@ -2582,6 +2781,9 @@ mod continuity_tests {
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
                 active_when_params: Vec::new(),
+                optional: false,
+                variants: Vec::new(),
+                when: Vec::new(),
             }],
             ..Manifest::default()
         };
@@ -2747,6 +2949,9 @@ mod continuity_tests {
                 instance: 0xFF,
                 selector,
                 active_when_params: Vec::new(),
+                optional: false,
+                variants: Vec::new(),
+                when: Vec::new(),
             }],
             ..Manifest::default()
         }
@@ -3086,6 +3291,9 @@ mod continuity_tests {
                 instance: 0xFF,
                 selector: ClaimSelector::Default,
                 active_when_params: Vec::new(),
+                optional: false,
+                variants: Vec::new(),
+                when: Vec::new(),
             }];
             (name.to_string(), m)
         };
@@ -3259,6 +3467,9 @@ mod continuity_tests {
             instance: 0xFF,
             selector: ClaimSelector::Default,
             active_when_params: names(&["routes_prefix"]),
+            optional: false,
+            variants: Vec::new(),
+            when: Vec::new(),
         }];
         m.insert("http".to_string(), http);
         let config = |routes: Value| {

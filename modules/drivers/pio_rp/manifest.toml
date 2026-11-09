@@ -1,5 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
+# The `pio` contract this driver registers itself as the provider of.
+provides = ["pio"]
 permissions = ["platform_raw"]
 
 # The stream buffers at their small-die sizes, for a graph that streams
@@ -16,10 +18,12 @@ features = ["small_stream"]
 # pio_rp uses both DMA families:
 #   - platform_dma: raw channels for CMD blocking transfers.
 #   - platform_dma_fd: async fds for streaming workloads.
+# Each channel is allocated from the platform's pool, so both claims are
+# shared with every other DMA user in the graph.
 [[resources]]
 requires_contract = "platform_dma"
-access = "exclusive"
+access = "write"
 
 [[resources]]
 requires_contract = "platform_dma_fd"
-access = "exclusive"
+access = "write"

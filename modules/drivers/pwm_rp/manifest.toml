@@ -1,5 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["rp2350"]
+# The `pwm` contract this driver registers itself as the provider of.
+provides = ["pwm"]
 permissions = ["platform_raw"]
 
 [[resources]]

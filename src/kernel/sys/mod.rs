@@ -8,6 +8,7 @@ pub mod incarnation;
 pub mod log_ring;
 pub mod params_tlv;
 pub mod resource_ledger;
+pub mod ring;
 pub mod telemetry_ring;
 pub mod time_sync;
 pub mod wall_clock;

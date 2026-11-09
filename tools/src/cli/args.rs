@@ -448,7 +448,7 @@ enum Commands {
     /// sdk-materialisation, live-staleness, limit-register,
     /// abi-surface-pin, modules-build (strict), host-binary, cargo unit
     /// tests, wasm-host-shims (node), examples, packaging,
-    /// kernel-link (rp), project-e2e, and the cargo integration tests.
+    /// kernel-link (rp), irq-neon-free, project-e2e, and the cargo integration tests.
     /// Every phase runs even when an earlier one fails; the summary lists
     /// every phase and the exit status is non-zero if any failed. A
     /// warning does not fail the run.

@@ -38,6 +38,9 @@ pub mod gpu_pack;
 pub mod hash;
 pub mod hygiene;
 pub mod identity_key;
+// `fluxor ci`'s `irq-neon-free` phase: the AArch64 kernel's IRQ path, walked
+// on the linked image, names no FP/SIMD register.
+pub mod irq_neon_free;
 // Published, parameterised stacks: the stack document, its typed params
 // and exports, include expansion, and the store side of publishing and
 // pinning one.

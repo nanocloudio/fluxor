@@ -2801,9 +2801,10 @@ pub unsafe fn linux_net_detach(owner: crate::kernel::workload::owner::OwnerHandl
 }
 
 /// Close every connection slot stamped with `owner`, across all instances.
-/// The drain driver calls this BEFORE `free_owner`, so an observer never sees
-/// the owner's terminal record while its port is still accepting. Platform
-/// thread only.
+/// The platform's owner release (`owner_release`) calls it on every
+/// `free_owner`, before the owner's handle is revoked, so an observer never
+/// sees the owner's terminal record while its port is still accepting.
+/// Platform thread only.
 pub fn linux_net_close_owner_conns(owner: crate::kernel::workload::owner::OwnerHandle) {
     // SAFETY: single-threaded platform access to registered live instances,
     // reached through a raw pointer.

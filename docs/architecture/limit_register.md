@@ -121,7 +121,7 @@ http::ARENA_WORKING_SET_CONNS <= http::MAX_CONCURRENT_CONNS | modules/sdk/abi/co
 tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE | modules/foundation/ip/mod.rs
 PACKET_HOLDS_DEFAULT as usize <= PACKET_HOLDS_MAX | modules/foundation/ip/mod.rs
 HO_SRC_ENTRIES >= tcp::SYN_COOKIE_WATERMARK as usize * 2 | modules/foundation/ip/mod.rs
-CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
+TELEMETRY_RING_CAPACITY >= pstatus_round(MAX_MODULES) | src/kernel/config.rs
 TS_TXREC_MAX == sc::STRICT_TX_RECORDS | modules/foundation/transport_continuity/stack.rs
 TS_SEND_MAX == sc::STRICT_SEND_BYTES | modules/foundation/transport_continuity/stack.rs
 TS_RECV_MAX == sc::STRICT_RECV_BYTES | modules/foundation/transport_continuity/stack.rs
@@ -159,7 +159,7 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | Exchange record | `RECORD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the largest record either side of an exchange writes, and so one channel record — what an `ExchangeRequest` or `ExchangeResponse` port declares as `max_record`. A body of any size crosses as many records under credit, so this bounds a reader's buffer, never a request or an answer |
 | Exchange collected body | `PAYLOAD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the largest body a provider that takes requests whole collects, and the one ceiling every provider of `stream.ordered_ack` derives from, so a requester has a number it can hold itself to. A per-provider ceiling is undiscoverable by the requester that must stay under it. A provider whose backend cannot take the full size declares the smaller number as its `max_payload` capability fact, which the build checks against the requester's own `max_payload` fact |
 | Exchange ordering key | `KEY_MAX` | modules/sdk/contracts/exchange.rs | 512 | Policy: the largest `target` a publish carries — a table or topic identifier plus a 256-byte natural key, with room for requesters whose ordering unit is wider. The key is the ordering unit and is opaque to the provider |
-| Telemetry ring capacity | `CAPACITY` | src/kernel/sys/telemetry_ring.rs | 4096 | Policy, per target family: 4 KiB on RP2040, 8 KiB on RP2350, and elsewhere one PSTATUS round rounded up to a power of two and never under 32 KiB (512 KiB on the 4096-index module domain of linux, 128 KiB on the 1024 module slots of bcm2712 and uefi). A const assert holds it at or above one whole PSTATUS round — the scheduler emits a round as one uninterrupted burst, so a ring under that size drops the tail of *every* round and the high-index modules never report at all |
+| Telemetry ring capacity | `TELEMETRY_RING_CAPACITY` | src/kernel/config.rs | — | Policy, per capacity profile: 4 KiB on RP2040, 8 KiB on RP2350 (from the silicon TOML's `[kernel] telemetry_ring_kb`, which `profile_rp` re-exports), and elsewhere one PSTATUS round rounded up to a power of two and never under 32 KiB (512 KiB on the 4096-index module domain of linux, 128 KiB on the 1024 module slots of bcm2712 and uefi). A const assert holds it at or above one whole PSTATUS round — the scheduler emits a round as one uninterrupted burst, so a ring under that size drops the tail of *every* round and the high-index modules never report at all |
 | Block buffers lent at once | `MAX_LENDS` | src/kernel/module/block_lend.rs | 128 | Policy: the kernel's ledger of buffers lent to `storage.block` sources, across every consumer. Deeper than any source's queue (nvme holds 8 per queue) so it only binds on a runaway consumer; a `SUBMIT` past it is `EAGAIN` before the source sees it |
 | Torn-down modules awaiting their lends | `MAX_QUARANTINED` | src/kernel/module/block_lend.rs | 8 | Policy: modules torn down while a source still holds a buffer lent from them, whose memory is kept until the source returns it. Past it the memory stays lent and is not released (a leak, never a corruption) |
 | Channels closed on a quarantine's behalf | `MAX_ADOPTED` | src/kernel/module/block_lend.rs | 16 | Policy: channels carrying a lend of a torn-down module, closed once the lends are back. Past it a channel stays open |
@@ -595,6 +595,11 @@ LOG_RING_CAPACITY | src/kernel/config.rs | 65536 | bcm2712
 LOG_RING_CAPACITY | src/kernel/config.rs | 65536 | uefi
 LOG_RING_CAPACITY | src/kernel/config.rs | 16384 | wasm-kernel
 LOG_RING_CAPACITY | src/kernel/config.rs | crate::platform::chip::LOG_RING_CAPACITY | rp
+TELEMETRY_RING_CAPACITY | src/kernel/config.rs | super::telemetry_ring_for(MAX_MODULES) | linux
+TELEMETRY_RING_CAPACITY | src/kernel/config.rs | super::telemetry_ring_for(MAX_MODULES) | bcm2712
+TELEMETRY_RING_CAPACITY | src/kernel/config.rs | super::telemetry_ring_for(MAX_MODULES) | uefi
+TELEMETRY_RING_CAPACITY | src/kernel/config.rs | super::telemetry_ring_for(MAX_MODULES) | wasm-kernel
+TELEMETRY_RING_CAPACITY | src/kernel/config.rs | crate::platform::chip::TELEMETRY_RING_CAPACITY | rp
 ELASTIC_REGION_SIZE | src/kernel/config.rs | 16 * 1024 * 1024 | linux
 ELASTIC_REGION_SIZE | src/kernel/config.rs | 16 * 1024 * 1024 | bcm2712
 ELASTIC_REGION_SIZE | src/kernel/config.rs | 16 * 1024 * 1024 | uefi
@@ -647,9 +652,6 @@ MAX_PATH | modules/sdk/abi/config.rs | 32 | embedded
 RECORD_MAX | modules/sdk/contracts/exchange.rs | 8192 | *
 PAYLOAD_MAX | modules/sdk/contracts/exchange.rs | 8192 | *
 KEY_MAX | modules/sdk/contracts/exchange.rs | 512 | *
-CAPACITY | src/kernel/sys/telemetry_ring.rs | 4096 | chip-rp2040
-CAPACITY | src/kernel/sys/telemetry_ring.rs | 8192 | rp2350-chip
-CAPACITY | src/kernel/sys/telemetry_ring.rs | round_capacity(PSTATUS_ROUND) | non-rp
 RING_CONSUMERS | modules/sdk/contracts/telemetry.rs | 4 | *
 TELEMETRY_MAX_RECORD | src/kernel/exec/scheduler/module_types.rs | 144 | *
 DIM_MAX_PRODUCT | modules/sdk/contracts/telemetry.rs | 65534 | *
@@ -1196,7 +1198,6 @@ STATE_CANARY_SIZE | src/kernel/module/loader.rs | canary layout
 IMAGE_HEADER_SIZE | src/kernel/module/ota_stage.rs | staged-image header layout
 MAX_SEALED | src/kernel/security/key_vault.rs | derived: MAX_KEY_BYTES plus the AEAD nonce and tag
 MAX_ATTEST_RECORD | src/kernel/security/key_vault.rs | scratch derived from the host profile's table sizes
-MAX_RECORD | src/kernel/sys/telemetry_ring.rs | mirror of TELEMETRY_MAX_RECORD
 MANIFEST_HEADER_SIZE | tools/src/manifest.rs | manifest layout
 SIGNATURE_BLOCK_SIZE | tools/src/manifest.rs | signature block layout
 MAX_AUTHORITY_LEN | modules/foundation/remote_channel/mod.rs | holds the `authority` parameter as written; the provider's own name ceiling binds the dial

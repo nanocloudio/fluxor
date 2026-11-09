@@ -658,6 +658,22 @@ mod imp {
             }
         }
 
+        /// The committed slots, for a reader in interrupt context: never sizes
+        /// the table. A table no plan or first use has sized reads as empty,
+        /// and so does one an older plan sized (RP), so an IRQ path never
+        /// reaches the carve allocator.
+        #[inline]
+        pub fn committed(&self) -> &[T] {
+            if self.raw.state.load(Ordering::Acquire) != sized() {
+                return &[];
+            }
+            let len = self.raw.len.load(Ordering::Acquire);
+            // SAFETY: as `slice`.
+            unsafe {
+                core::slice::from_raw_parts(self.raw.ptr.load(Ordering::Acquire) as *const T, len)
+            }
+        }
+
         /// Return every committed slot to its initial value.
         pub fn reinit(&mut self) {
             let init = self.init;
@@ -746,6 +762,12 @@ mod imp {
 
         /// A static table is sized by its type.
         pub fn size_unplanned(&self, _n: impl FnOnce() -> usize) {}
+
+        /// Every slot: a static table is whole from the start.
+        #[inline]
+        pub fn committed(&self) -> &[T] {
+            &self.items
+        }
 
         /// Every slot is live already; refuse only past `N`.
         pub fn grow(&self, n: usize) -> Result<(), TableError> {

@@ -27,6 +27,7 @@ struct TomlSiliconFile {
     memory: Option<TomlMemoryConfig>,
     kernel: Option<TomlKernelConfig>,
     isolation: Option<TomlIsolationConfig>,
+    providers: Option<TomlProviders>,
     /// Platform stack defaults — used by host descriptors (e.g.
     /// `[platform.net] provider = "host"`); silicon files omit it. Values are
     /// `toml::Value` so structured sections (e.g. `[platform.pcie] aliases`,
@@ -43,6 +44,16 @@ struct TomlKernelConfig {
     ram_static_max_kb: Option<u32>,
     kernel_stack_reserve_kb: Option<u32>,
     kernel_stack_kb: Option<u32>,
+}
+
+/// `[providers]`: the contracts the target's platform answers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlProviders {
+    /// What the platform answers a call from the node's own modules.
+    platform: Vec<String>,
+    /// What it answers a call from a workload's modules, where that differs.
+    workload: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -453,6 +464,53 @@ pub struct TargetDescriptor {
     /// (`[isolation] isolated_stack_kb`). Pinned to the kernel's
     /// `ISOLATED_STACK_BYTES`.
     pub isolated_stack_kb: Option<u32>,
+    /// The contracts the target's platform registers a provider for
+    /// (`[providers]`), by whose modules call it.
+    pub providers: PlatformProviders,
+}
+
+/// The contracts a target's platform answers (`[providers]`), named as a
+/// manifest's `requires_contract` names them. A contract the kernel itself
+/// provides on every target, or one a module in the graph provides, is not
+/// listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlatformProviders {
+    /// Answered to the node's own modules.
+    pub node: Vec<String>,
+    /// Answered to a workload's modules.
+    pub workload: Vec<String>,
+}
+
+impl PlatformProviders {
+    fn from_toml(p: Option<&TomlProviders>, path: &Path) -> Result<Self> {
+        let Some(p) = p else {
+            return Err(Error::Config(format!(
+                "{}: no [providers] table; every silicon and host target names the \
+                 contracts its platform answers (`platform = [...]`, empty for none)",
+                path.display()
+            )));
+        };
+        let check = |names: &[String]| -> Result<()> {
+            for n in names {
+                if !fluxor_contracts::vocabulary::PROVIDER_CONTRACTS.contains(&n.as_str()) {
+                    return Err(Error::Config(format!(
+                        "{}: [providers] names '{n}', which is not a provider contract ({})",
+                        path.display(),
+                        fluxor_contracts::vocabulary::PROVIDER_CONTRACTS.join(", ")
+                    )));
+                }
+            }
+            Ok(())
+        };
+        check(&p.platform)?;
+        if let Some(w) = &p.workload {
+            check(w)?;
+        }
+        Ok(Self {
+            node: p.platform.clone(),
+            workload: p.workload.clone().unwrap_or_else(|| p.platform.clone()),
+        })
+    }
 }
 
 /// Build configuration for targets that support kernel compilation.
@@ -804,6 +862,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
 
     let p = &silicon.peripherals;
     let isolation = IsolationFacts::from_toml(silicon.isolation.as_ref(), &silicon.target.id)?;
+    let providers = PlatformProviders::from_toml(silicon.providers.as_ref(), path)?;
     // A target names a runtime from the table and an ABI that runtime
     // loads; anything else would send its modules to a shelf nothing
     // builds and admit modules that cannot run there.
@@ -871,6 +930,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         isolation,
         kernel_stack_kb: silicon.kernel.as_ref().and_then(|k| k.kernel_stack_kb),
         isolated_stack_kb: silicon.isolation.as_ref().and_then(|i| i.isolated_stack_kb),
+        providers,
     })
 }
 

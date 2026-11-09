@@ -59,8 +59,13 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "forbid_inline_tests",
             "max_inline_lines",
             "allow_crate_root",
+            "ratchet",
         ],
     ),
+    // Counted findings a rule still has in one file; the count only goes
+    // down. Every key is required: a row without a reason is not an
+    // allowance.
+    ("ci.hygiene.ratchet", &["rule", "path", "count", "reason"]),
     // Declared prefixes where a crate-root `#![allow(...)]` is permitted.
     // Both keys are required: an exemption without a reason is a
     // conformance failure, not an escape hatch.

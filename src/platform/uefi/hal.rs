@@ -43,6 +43,14 @@ fn wake_scheduler() {
     }
 }
 
+fn read_cycle_count() -> u32 {
+    timer::read_timer_count_64() as u32
+}
+
+fn core_id() -> usize {
+    current_core_id() as usize
+}
+
 fn now_micros() -> u64 {
     let freq = timer::timer_freq().max(1);
     let count = u128::from(timer::read_timer_count_64());
@@ -257,7 +265,7 @@ pub static HAL_OPS: HalOps = HalOps {
     step_guard_arm,
     step_guard_disarm: || fluxor::kernel::exec::step_guard::set_armed(false),
     step_guard_post_check,
-    read_cycle_count: || timer::read_timer_count_64() as u32,
+    read_cycle_count,
     isr_tier_init: || {},
     isr_tier_start: |_| {},
     isr_tier_stop: || {},
@@ -268,7 +276,7 @@ pub static HAL_OPS: HalOps = HalOps {
     runtime_params: |_, _| hal::RuntimeParams::Compiled,
     init_gpio: |_| 0,
     csprng_fill,
-    core_id: || current_core_id() as usize,
+    core_id,
     irq_bind: gic::irq_bind,
     sleep_until,
     smp_quiesce_peers: fluxor::kernel::exec::domains::quiesce_peers,

@@ -1221,29 +1221,13 @@ fn validate_isr_tier_admission(
                 tier = tier_label(exec_mode)
             )));
         }
-        // ISR-tier modules are scalar-only by contract.
-        // NEON registers are not preserved across a Tier 1b/Tier 2
-        // ISR — a module that pulls in `core::arch::aarch64` SIMD
-        // intrinsics from inside its ISR entry would corrupt the
-        // preempted cooperative thread's NEON file. Run the
-        // source-static lint on the module's `src/` tree; if it
-        // finds NEON markers, reject the placement.
-        //
-        // The lookup goes through `resolve_module_root` so the
-        // search order is identical to the manifest loader's: an
-        // explicit YAML `module_search_paths:` entry shadowing a
-        // bundled module wins for both `isr_safe` and the NEON
-        // lint, instead of one reader trusting the bundled copy
-        // and the other trusting the override.
+        // The lookup goes through `resolve_module_root` so the search order
+        // is identical to the manifest loader's: an explicit YAML
+        // `module_search_paths:` entry shadowing a bundled module wins for
+        // both `isr_safe` and the export check, instead of one reader
+        // trusting the bundled copy and the other trusting the override.
         let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
         if let Some(root) = resolve_module_root(module_type, extra_module_dirs) {
-            if let Err(e) = crate::manifest::check_isr_safe_no_neon(&root) {
-                return Err(Error::Config(format!(
-                    "module '{name}' (type '{module_type}') admitted to domain \
-                     '{domain_label}' (tier {tier}) but its source declares NEON: {e}",
-                    tier = tier_label(exec_mode)
-                )));
-            }
             // Tier 2 (IRQ-owned) modules are dispatched from hardware-IRQ
             // context through their `module_isr_entry` export, NOT the
             // cooperative `module_step`. The authoritative gate is the

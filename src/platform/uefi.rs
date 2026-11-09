@@ -331,7 +331,7 @@ impl log::Log for RingLogger {
         let _ = core::fmt::write(&mut line, *record.args());
         line.buf[line.at] = b'\r';
         line.buf[line.at + 1] = b'\n';
-        fluxor::kernel::sys::log_ring::push_bytes(&line.buf[..line.at + 2]);
+        fluxor::kernel::sys::log_ring::push_record(&line.buf[..line.at + 2]);
     }
     fn flush(&self) {}
 }

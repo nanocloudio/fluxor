@@ -526,6 +526,9 @@ pub unsafe fn isr_tier1b_handler() {
 ///
 /// # Safety
 /// Called from ISR context.
+///
+/// Never inlined: it is a root of the `irq-neon-free` gate's walk.
+#[inline(never)]
 pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
     if !enter() {
         return -1;
@@ -540,6 +543,9 @@ pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
 
         crate::kernel::exec::scheduler::set_current_module(slot.module_index as usize);
         let before = hal::read_cycle_count();
+        #[cfg(target_arch = "aarch64")]
+        let rc = crate::arch::fp_frame::call_isr_entry(slot.isr_entry, slot.state_ptr);
+        #[cfg(not(target_arch = "aarch64"))]
         let rc = (slot.isr_entry)(slot.state_ptr);
         let after = hal::read_cycle_count();
 

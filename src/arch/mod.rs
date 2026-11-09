@@ -19,6 +19,12 @@ pub mod nvic;
 /// The Cortex-M vector table and reset path.
 pub mod vector;
 
+/// The FP/SIMD frame around a call into module code from an AArch64 IRQ.
+/// Compiled for every AArch64 build, hosted ones included, so the harness
+/// drives the frame the kernel uses.
+#[cfg(target_arch = "aarch64")]
+pub mod fp_frame;
+
 /// Cortex-M instruction primitives. ARM-only: `core::arch::asm!` throughout.
 #[cfg(target_arch = "arm")]
 pub mod cortex_m;

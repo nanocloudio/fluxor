@@ -887,9 +887,9 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     (5 + n) as i32
 }
 
-/// Drain/revocation hook: destroy every workload belonging to a revoked owner.
-/// Called from the owner-drain path (beside `linux_net_close_owner_conns`),
-/// which frees the owner itself, so the slot is only cleared here.
+/// Destroy every workload belonging to an owner being freed. Called from the
+/// platform's owner release (`owner_release`) on every `free_owner`, which
+/// frees the owner itself, so the slot is only cleared here.
 pub fn linux_workload_close_owner(owner: OwnerHandle) {
     // SAFETY: platform-thread single-writer access to the workload table and the
     // backend slots it owns.

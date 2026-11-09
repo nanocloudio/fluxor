@@ -20,8 +20,6 @@
 
 /// One armed drain.
 use super::owner_status::rfc3339_utc;
-use super::providers::linux_net_close_owner_conns;
-use super::workload::linux_workload_close_owner;
 
 struct DrainEntry {
     owner_uid: [u8; 16],
@@ -123,13 +121,10 @@ pub fn drain_tick(now_unix: u64) {
         }
         let timed_out = expired && !quiescent && !gone;
         if !gone {
-            // Close the owner's network endpoints BEFORE revoking it, so an
-            // observer never sees the terminal record while a port is still
-            // accepting.
-            linux_net_close_owner_conns(handle);
-            // Tear down the owner's isolated workloads (containers) too, so a
-            // revoked owner's host processes do not outlive its lease.
-            linux_workload_close_owner(handle);
+            // `free_owner`'s release edge closes the owner's network endpoints
+            // and host-process workloads (`owner_release`) before it returns,
+            // so an observer never sees the terminal record below while a port
+            // is still accepting or a host process still runs.
             match crate::kernel::exec::scheduler::free_owner(handle) {
                 Ok(()) => {}
                 Err(err) => log::warn!(

@@ -1800,6 +1800,7 @@ mod tests {
             "BUFFER_ARENA_SIZE",
             "MAX_MODULE_CONFIG_SIZE",
             "LOG_RING_CAPACITY",
+            "TELEMETRY_RING_CAPACITY",
         ] {
             let decl = format!("pub const {konst}: usize = crate::platform::chip::{konst};");
             assert!(

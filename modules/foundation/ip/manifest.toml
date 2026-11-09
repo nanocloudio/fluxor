@@ -20,6 +20,7 @@ cutoff = "ring_handoff"
 [[resources]]
 requires_contract = "workload"
 access = "write"
+optional = true
 
 # The node's segments, peer routes and held addresses (`net_route` TAKE /
 # REPORT): ip realizes them on bare metal. Both ops are admitted from the
@@ -29,6 +30,7 @@ access = "write"
 [[resources]]
 requires_contract = "net_route"
 access = "read"
+optional = true
 
 # Packet policy and service translation (`net_policy` READ / ATTACH): with
 # `policy_tables` set, ip is the enforcer of those tables on bare metal and
@@ -37,6 +39,7 @@ access = "read"
 [[resources]]
 requires_contract = "net_policy"
 access = "read"
+active_when_params = ["policy_tables"]
 
 [[ports]]
 name = "frames_rx"

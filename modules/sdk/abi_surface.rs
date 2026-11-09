@@ -90,7 +90,7 @@ use self::surface_src::kernel_abi as ka;
 /// The embeddable full-digest const (generated; see
 /// `abi_surface_srcpin.rs`), surfaced here so modules and the kernel reach
 /// it as `abi::abi_surface::ABI_SURFACE_DIGEST`. The host-tools mount only
-/// reads it under `#[cfg(test)]` (it computes the digest fresh at runtime),
+/// reads it in its own test build (it computes the digest fresh at runtime),
 /// so allow dead_code for the non-test tools build.
 #[allow(
     dead_code,

@@ -1722,8 +1722,8 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     // reclaims them here; after this point the handle's generation moves and
     // a provider belonging to this owner's own graph is torn down below.
     // Delivered from here rather than from the platform drain driver so the
-    // paths that bypass it — the workload verbs (KILL/DESTROY) and admission
-    // rollback — are covered by the same edge.
+    // paths that bypass it — the workload verbs (KILL/DESTROY), `FREE_OWNER`
+    // and admission rollback — are covered by the same edge.
     crate::kernel::module::provider::notify_owner_released(handle);
     // Its net lanes go before its channels close, and the provider closes
     // every endpoint they opened.

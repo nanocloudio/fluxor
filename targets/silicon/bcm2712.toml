@@ -82,3 +82,17 @@ isolated_slots = 2
 
 # NOTE: no [memory] here — the memory map is a board/emulator fact, declared in
 # the board overlay (see the header). BCM2712 silicon does not fix RAM origin.
+
+# The contracts this platform registers a provider for, named as a manifest's
+# `requires_contract` names them. The composer refuses a graph whose module
+# requires a contract that neither the kernel (`channel`, `timer`, `event`,
+# `buffer`), this list, nor a module in the graph provides: the call would
+# otherwise answer ENOSYS at run time. `workload`, where present, is what the
+# platform answers a workload's modules; absent, the same as `platform`.
+[providers]
+# `storage.*` is the board's key store (the node's own modules; a workload is
+# refused EACCES), `fs` is a workload's root on the node's volume (the node
+# reaches that volume through its module provider).
+platform = ["net_policy", "net_route", "pcie_device", "platform_nic_ring",
+            "storage.namespace", "storage.object", "workload"]
+workload = ["fs"]

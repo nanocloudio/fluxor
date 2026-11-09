@@ -411,17 +411,17 @@ fn linux_isr_tier_start(_period_us: u32) {}
 fn linux_isr_tier_stop() {}
 fn linux_isr_tier_poll() {}
 
-/// The platform's owner-release hook: an owner's root and what it opened
-/// through it (`owner_root`), the host namespace and HTTP object handles an
-/// owner acting with the node's authority opened, and the terminal sessions
-/// it opened into host-process workloads.
+/// The platform's owner-release hook, fired by the kernel on every owner it
+/// frees: what the owner holds through the library's providers
+/// (`owner_release`: network endpoints, host-process workloads and terminal
+/// sessions, its root), then the host namespace and HTTP object handles an
+/// owner acting with the node's authority opened.
 fn linux_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
-    fluxor::platform::linux::owner_root::release(owner);
+    fluxor::platform::linux::owner_release::release_owner(owner);
     // SAFETY: owner release runs on the scheduler thread, as every dispatch.
     unsafe {
         ns_release_opener(owner);
         obj_release_opener(owner);
-        fluxor::platform::linux::host_backend::hp_tty_release_owner(owner);
     }
 }
 

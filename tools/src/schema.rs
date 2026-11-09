@@ -1648,7 +1648,7 @@ fn resolve_pinned_fmod(
 ///   - `body` without → static (0)
 ///   - `source: files` → file (2)
 ///   - `proxy:` → proxy (3)
-fn expand_routes(
+pub(crate) fn expand_routes(
     routes: &[Value],
     kv: &mut HashMap<String, Value>,
     data_section: Option<&Value>,

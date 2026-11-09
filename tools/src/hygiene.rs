@@ -97,6 +97,25 @@ impl Rule {
         }
     }
 
+    /// The rule a `rule = "..."` name in a config row names.
+    pub fn from_name(name: &str) -> Option<Rule> {
+        [
+            Rule::InlineTests,
+            Rule::AllowWithoutReason,
+            Rule::CrateRootAllow,
+            Rule::ModuleStructure,
+            Rule::ShadowGuard,
+            Rule::SdkMount,
+            Rule::RepoFiles,
+            Rule::ConsumerNaming,
+            Rule::PendingWrite,
+            Rule::TenancyVocabulary,
+            Rule::DescriptorHygiene,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == name)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Rule::InlineTests => "inline-tests",
@@ -144,6 +163,18 @@ struct HygieneTable {
     /// a crate-root allow is permitted under it.
     #[serde(default)]
     allow_crate_root: Vec<AllowCrateRootRow>,
+    /// `[[ci.hygiene.ratchet]]` rows: findings a rule still has in one file,
+    /// counted.
+    #[serde(default)]
+    ratchet: Vec<RatchetRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RatchetRow {
+    rule: String,
+    path: String,
+    count: usize,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,6 +200,22 @@ pub struct Config {
     /// reason: plain path lists are not allowed, and an exemption without a
     /// reason is a conformance failure, not an escape hatch.
     pub allow_crate_root: Vec<(String, String)>,
+    /// Findings a rule still has in one file, as a ratchet: exactly `count`
+    /// findings of `rule` in `path` are the allowance. More fail as usual;
+    /// fewer fail too, naming the count the row should now carry, so an
+    /// allowance only ever goes down. Each row carries why the findings
+    /// cannot go yet.
+    pub ratchet: Vec<Ratchet>,
+}
+
+/// One `[[ci.hygiene.ratchet]]` row.
+#[derive(Debug, Clone)]
+pub struct Ratchet {
+    pub rule: Rule,
+    /// Repo-relative path, `/`-separated.
+    pub path: String,
+    pub count: usize,
+    pub reason: String,
 }
 
 impl Default for Config {
@@ -183,6 +230,7 @@ impl Default for Config {
             // Empty: a project that declares no exemption gets the standard's
             // flat ban, which is the right default for a single-target tree.
             allow_crate_root: Vec::new(),
+            ratchet: Vec::new(),
         }
     }
 }
@@ -201,6 +249,10 @@ pub enum ConfigError {
     },
     #[error("unknown hygiene mode {0:?}: expected \"strict\" or \"permissive\"")]
     UnknownMode(String),
+    #[error("`[[ci.hygiene.ratchet]]` names unknown rule {0:?}")]
+    UnknownRatchetRule(String),
+    #[error("`[[ci.hygiene.ratchet]]` row for {0} carries no reason")]
+    RatchetWithoutReason(String),
 }
 
 impl Config {
@@ -239,6 +291,23 @@ impl Config {
                 .into_iter()
                 .map(|e| (e.prefix, e.reason))
                 .collect(),
+            ratchet: h
+                .ratchet
+                .into_iter()
+                .map(|r| {
+                    let rule = Rule::from_name(&r.rule)
+                        .ok_or_else(|| ConfigError::UnknownRatchetRule(r.rule.clone()))?;
+                    if r.reason.trim().is_empty() {
+                        return Err(ConfigError::RatchetWithoutReason(r.path.clone()));
+                    }
+                    Ok(Ratchet {
+                        rule,
+                        path: r.path,
+                        count: r.count,
+                        reason: r.reason,
+                    })
+                })
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -366,6 +435,8 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     scan_shadow_guard(project_root, &mut report);
     scan_repo_files(project_root, &mut report);
 
+    apply_ratchets(&mut report, &config.ratchet);
+
     report.violations.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -373,6 +444,52 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
             .then_with(|| (a.rule as u8).cmp(&(b.rule as u8)))
     });
     Ok(report)
+}
+
+/// Hold each ratchet row's findings to its count: exactly `count` are the
+/// allowance and leave the report; more stay in it, with a line saying so;
+/// fewer leave it and are replaced by one finding asking for the row to be
+/// lowered.
+fn apply_ratchets(report: &mut Report, ratchets: &[Ratchet]) {
+    for r in ratchets {
+        let path = PathBuf::from(&r.path);
+        let found = report
+            .violations
+            .iter()
+            .filter(|v| v.rule == r.rule && v.path == path)
+            .count();
+        if found > r.count {
+            report.violations.push(Violation {
+                path,
+                line: 0,
+                rule: r.rule,
+                message: format!(
+                    "{found} `{}` finding(s) against a ratchet allowance of {} ({})",
+                    r.rule.as_str(),
+                    r.count,
+                    r.reason.trim()
+                ),
+            });
+            continue;
+        }
+        report
+            .violations
+            .retain(|v| !(v.rule == r.rule && v.path == path));
+        if found < r.count {
+            report.violations.push(Violation {
+                path,
+                line: 0,
+                rule: r.rule,
+                message: format!(
+                    "the ratchet allows {} `{}` finding(s) and {found} remain: lower the \
+                     `[[ci.hygiene.ratchet]]` row's count to {found}{}",
+                    r.count,
+                    r.rule.as_str(),
+                    if found == 0 { " (remove the row)" } else { "" }
+                ),
+            });
+        }
+    }
 }
 
 /// Structure rules for the `modules/` tree: a module is a directory, never a crate; tier placement
@@ -1711,15 +1828,15 @@ fn classify_tier(rel: &Path) -> Tier {
 /// a host build: the same block is compiled and executed there, which is
 /// the outcome the rule wants.
 ///
-/// The roots are the three ways a module source becomes host-compiled: a
-/// file under `tests/`-like tiers, a file under `src/` (a crate lib that
-/// mounts module surfaces), and a `[test] harness` a manifest declares.
-/// From each root the mounts are followed transitively — a harness that
-/// mounts `../mod.rs` makes that file host-compiled, and anything it
-/// mounts in turn.
+/// The roots are the files a product crate compiles: those under `src/`
+/// (a crate lib that mounts module surfaces). A test that mounts a module
+/// file does not make it host-compiled: the test runs, the module ships
+/// `no_std`, and an inline block in it is still compiled away there. From
+/// each root the mounts are followed transitively — a lib that mounts
+/// `abi.rs` makes that file host-compiled, and anything it mounts in turn.
 ///
 /// Derived, never listed: the alternative is an exemption row per file,
-/// which is how thirty of them accumulated saying the same sentence.
+/// each saying the same sentence.
 fn host_compiled_closure(project_root: &Path) -> HashSet<PathBuf> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: Vec<PathBuf> = Vec::new();
@@ -1734,24 +1851,9 @@ fn host_compiled_closure(project_root: &Path) -> HashSet<PathBuf> {
         let Ok(rel) = path.strip_prefix(project_root) else {
             continue;
         };
-        match path.extension().and_then(|s| s.to_str()) {
-            // A host root: cargo compiles it, so what it mounts is host code.
-            Some("rs") if !classify_tier(rel).eq(&Tier::Modules) => {
-                queue.push(rel.to_path_buf());
-            }
-            // A declared module harness is host-compiled by `fluxor test`.
-            Some("toml") if path.file_name().is_some_and(|n| n == "manifest.toml") => {
-                if let Some(h) = fs::read_to_string(path)
-                    .ok()
-                    .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
-                    .and_then(|d| d.get("test")?.get("harness")?.as_str().map(str::to_string))
-                {
-                    if let Some(dir) = rel.parent() {
-                        queue.push(dir.join(h));
-                    }
-                }
-            }
-            _ => {}
+        // A product root: cargo compiles it, so what it mounts is host code.
+        if path.extension().is_some_and(|e| e == "rs") && classify_tier(rel) == Tier::Src {
+            queue.push(rel.to_path_buf());
         }
     }
 
@@ -1774,10 +1876,9 @@ fn host_compiled_closure(project_root: &Path) -> HashSet<PathBuf> {
 
 /// The file a line mounts, by either mechanism: `#[path = "…"]` on a
 /// `mod`, or `include!("…")`. Both splice a source file into the
-/// compiling crate, so both carry host-compilation to their target —
-/// following only one is how six of these exemptions survived a sweep
-/// that removed the rest.
-fn mount_target(line: &str) -> Option<String> {
+/// compiling crate, so both carry host-compilation to their target, and
+/// following only one would miss what the other mounts.
+pub fn mount_target(line: &str) -> Option<String> {
     let t = line.trim();
     let rest = match (t.strip_prefix("#[path"), t.find("include!(")) {
         (Some(after), _) => after.trim_start().strip_prefix('=')?,
@@ -1790,7 +1891,7 @@ fn mount_target(line: &str) -> Option<String> {
 }
 
 /// Resolve `rel` against `base` textually — `..` pops, `.` is dropped.
-fn lexical_join(base: &Path, rel: &str) -> PathBuf {
+pub fn lexical_join(base: &Path, rel: &str) -> PathBuf {
     let mut out = base.to_path_buf();
     for part in rel.split('/') {
         match part {
@@ -2284,6 +2385,7 @@ mod tests {
             forbid_inline_tests: vec!["modules".into(), "src".into()],
             max_inline_lines: 80,
             allow_crate_root: Vec::new(),
+            ratchet: Vec::new(),
         }
     }
 
@@ -2293,6 +2395,7 @@ mod tests {
             forbid_inline_tests: vec!["modules".into(), "src".into()],
             max_inline_lines: cap,
             allow_crate_root: Vec::new(),
+            ratchet: Vec::new(),
         }
     }
 
@@ -2787,6 +2890,101 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
             Some("../../../modules/common/sector_dedup.rs")
         );
         assert_eq!(mount_target("let p = \"not a mount\";"), None);
+    }
+
+    /// Only a product crate's source makes a module file host-compiled. A
+    /// test that mounts one runs its own code; the module still ships
+    /// `no_std`, where an inline block in it compiles away.
+    #[test]
+    fn only_product_source_makes_a_mounted_module_host_compiled() {
+        let root = TempRoot::new("closure");
+        root.file(
+            "tests/harness/tests/t.rs",
+            "#[path = \"../../../modules/a/mod.rs\"]\nmod a;\n",
+        )
+        .file("src/lib.rs", "#[path = \"../modules/b/mod.rs\"]\nmod b;\n")
+        .file("modules/a/mod.rs", "\n")
+        .file("modules/b/mod.rs", "\n");
+        let closure = host_compiled_closure(root.path());
+        assert!(closure.contains(Path::new("modules/b/mod.rs")));
+        assert!(!closure.contains(Path::new("modules/a/mod.rs")));
+    }
+
+    fn finding(path: &str, rule: Rule) -> Violation {
+        Violation {
+            path: PathBuf::from(path),
+            line: 1,
+            rule,
+            message: String::new(),
+        }
+    }
+
+    fn ratchet(path: &str, count: usize) -> Ratchet {
+        Ratchet {
+            rule: Rule::InlineTests,
+            path: path.to_string(),
+            count,
+            reason: "moves with the next digest".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_ratchet_absorbs_exactly_its_count_and_only_its_rule_and_file() {
+        let mut report = Report {
+            violations: vec![
+                finding("m/x.rs", Rule::InlineTests),
+                finding("m/x.rs", Rule::InlineTests),
+                finding("m/x.rs", Rule::AllowWithoutReason),
+                finding("m/y.rs", Rule::InlineTests),
+            ],
+            files_scanned: 2,
+        };
+        apply_ratchets(&mut report, &[ratchet("m/x.rs", 2)]);
+        let left: Vec<_> = report
+            .violations
+            .iter()
+            .map(|v| (v.path.to_string_lossy().into_owned(), v.rule))
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                ("m/x.rs".to_string(), Rule::AllowWithoutReason),
+                ("m/y.rs".to_string(), Rule::InlineTests),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ratchet_over_its_count_keeps_every_finding() {
+        let mut report = Report {
+            violations: vec![
+                finding("m/x.rs", Rule::InlineTests),
+                finding("m/x.rs", Rule::InlineTests),
+            ],
+            files_scanned: 1,
+        };
+        apply_ratchets(&mut report, &[ratchet("m/x.rs", 1)]);
+        assert_eq!(
+            report.violations.len(),
+            3,
+            "both findings and the over-count line"
+        );
+        assert!(report.violations[2].message.contains("allowance of 1"));
+    }
+
+    #[test]
+    fn a_ratchet_under_its_count_asks_to_be_lowered() {
+        let mut report = Report {
+            violations: vec![finding("m/x.rs", Rule::InlineTests)],
+            files_scanned: 1,
+        };
+        apply_ratchets(&mut report, &[ratchet("m/x.rs", 3)]);
+        assert_eq!(report.violations.len(), 1);
+        assert!(
+            report.violations[0].message.contains("count to 1"),
+            "{}",
+            report.violations[0].message
+        );
     }
 
     #[test]

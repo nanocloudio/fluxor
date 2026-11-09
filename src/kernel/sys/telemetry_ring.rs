@@ -1,121 +1,54 @@
-//! Kernel telemetry ring — multi-producer, multi-consumer record buffer for
-//! the observability surface. The record-stream sibling of
-//! [`super::log_ring`]: independent consumer tails, drop-new on overflow,
-//! activation on subscribe.
+//! Kernel telemetry ring — record buffer for the observability surface, on the
+//! same core as [`super::log_ring`] (`super::ring`): independent consumer
+//! tails, record-atomic push from any context on any core, drop-new on
+//! overflow, activation on subscribe.
 //!
-//! Two things differ from the log ring, both deliberate:
+//! What differs from the log ring:
 //!
-//! - **Multi-producer.** Any module emits via `TLM_EMIT`, and the kernel itself
-//!   produces PSTATUS records, so a reserve+copy+publish serialises under a
-//!   short spinlock. v1 emission is **step-context only** (ISR emission is a
-//!   stated extension point), so the lock is never taken from an interrupt and
-//!   cannot deadlock on the single-core targets — there it is simply
-//!   uncontended.
-//! - **Record-atomic.** A whole record is copied before `HEAD` is published
-//!   (Release), so a drain reading up to `HEAD` (Acquire) never sees a torn
-//!   record. Drains copy and skip in whole-record units, sized from the header
-//!   via the scheduler's `telemetry_record_len` mirror.
+//! - **Records, not bytes.** Any module emits via `TLM_EMIT` and the kernel
+//!   itself produces PSTATUS records. Drains copy and skip whole records,
+//!   sized from each header by `abi::contracts::telemetry::record_len`, and a
+//!   dropped record counts once.
+//! - **Nothing kept for nobody.** A record emitted while no consumer is
+//!   subscribed is discarded: there is no replay.
+//! - **Four owned, filtered slots.** `observe`, one `otel` per export
+//!   destination, and a spare; each claimed by a module and filtered by
+//!   signal type at drain time.
 
-use crate::kernel::exec::scheduler::module_types::telemetry_record_len;
-use portable_atomic::{AtomicBool, AtomicU32, Ordering};
+use super::ring::{DropUnit, Pushed, Ring, WhenIdle};
+use crate::abi::contracts::telemetry as tlm;
+use portable_atomic::{AtomicU32, Ordering};
 
 /// Independent drain slots. Each carries a tail, dropped counter, active flag,
 /// and filter word: `observe` + one `otel` per export destination + a spare.
 pub const CONSUMERS: usize = 4;
 
-// Capacity per target family, power of two. The `rp` MCUs are RAM-constrained
-// (the USB and network stacks + kernel share ~256/520 KiB), so they get a
-// modest ring. Elsewhere the ring holds at least 32 KiB and always one whole
-// PSTATUS round, which grows with the module ceiling: 128 KiB on the host
-// profile's 1024 slots.
-#[cfg(feature = "chip-rp2040")]
-const CAPACITY: usize = 4096;
-#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-const CAPACITY: usize = 8192; // rp2350
-#[cfg(not(feature = "rp"))]
-const CAPACITY: usize = round_capacity(PSTATUS_ROUND);
+/// Ring capacity, from the kernel's capacity profile
+/// (`config::TELEMETRY_RING_CAPACITY`), which holds at least one whole
+/// PSTATUS round.
+const CAPACITY: usize = crate::kernel::config::TELEMETRY_RING_CAPACITY;
 
-/// A ring for one PSTATUS round of `round` bytes: the next power of two,
-/// and never under 32 KiB.
-#[cfg(not(feature = "rp"))]
-const fn round_capacity(round: usize) -> usize {
-    let p = round.next_power_of_two();
-    if p > 32768 {
-        p
-    } else {
-        32768
-    }
-}
-const MASK: usize = CAPACITY - 1;
+/// Header bytes every record starts with; a shorter emit is refused.
+const MIN_RECORD: usize = 12;
 
-/// One PSTATUS round: a `STEP` (52 B) and a `RES` (28 B) for every module slot,
-/// plus a `POOL` (32 B) for every kernel resource pool. The scheduler emits a
-/// whole round in one uninterrupted burst with no drain interleaved, so a ring
-/// smaller than this drops the tail of *every* round and the high-index
-/// modules / pools never report. Pinned here so the per-target capacity above
-/// cannot be sized below the round it has to hold.
-const PSTATUS_ROUND: usize = crate::kernel::exec::scheduler::MAX_MODULES * (52 + 28)
-    + crate::abi::contracts::resource::KERNEL_POOL_COUNT * 32;
-const _: () = assert!(CAPACITY >= PSTATUS_ROUND);
+static RING: Ring<CAPACITY, CONSUMERS> = Ring::new(WhenIdle::Discard, DropUnit::Records);
 
-/// Largest record accepted in one reservation — a 16-bucket histogram
-/// metric (144 B). A larger record is rejected whole. Mirror of
-/// `abi::contracts::telemetry::MAX_RECORD_SIZE`, pinned by the same test that
-/// pins `telemetry_record_len`.
-const MAX_RECORD: usize = crate::kernel::exec::scheduler::module_types::TELEMETRY_MAX_RECORD;
-
-// Signal-type filter bits — mirror of `abi::contracts::telemetry::FILTER_*`.
-const FILTER_METRIC: u32 = 1 << 0;
-const FILTER_SPAN: u32 = 1 << 1;
-const FILTER_PSTATUS: u32 = 1 << 2;
-
-static mut BUF: [u8; CAPACITY] = [0; CAPACITY];
-static HEAD: AtomicU32 = AtomicU32::new(0);
-static TAILS: [AtomicU32; CONSUMERS] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-static DROPPED: [AtomicU32; CONSUMERS] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-static ACTIVE: [AtomicBool; CONSUMERS] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
-static FILTERS: [AtomicU32; CONSUMERS] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
+/// Each slot's filter word (`tlm::FILTER_*`).
+static FILTERS: [AtomicU32; CONSUMERS] = [const { AtomicU32::new(0) }; CONSUMERS];
 /// Module index that claimed each slot. `observe` is a permission, not an
 /// identity — without this any holder could drain a peer's slot and silently
 /// starve it, since a drain advances the tail. Checked on every drain.
-static OWNERS: [AtomicU32; CONSUMERS] = [
-    AtomicU32::new(NO_OWNER),
-    AtomicU32::new(NO_OWNER),
-    AtomicU32::new(NO_OWNER),
-    AtomicU32::new(NO_OWNER),
-];
+static OWNERS: [AtomicU32; CONSUMERS] = [const { AtomicU32::new(NO_OWNER) }; CONSUMERS];
 const NO_OWNER: u32 = u32::MAX;
-static LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Producer-side enabled gate (10):
-/// non-zero when at least one consumer is subscribed, so the SDK can skip
-/// building a record when nothing would consume it. Published to modules via the
-/// `SyscallTable.telemetry_enabled` pointer (EL1/host). A benign racy
-/// single-word read on the producer side.
+/// Producer-side enabled gate: non-zero when at least one consumer is
+/// subscribed, so the SDK can skip building a record when nothing would consume
+/// it. Published to modules via the `SyscallTable.telemetry_enabled` pointer
+/// (EL1/host). A benign racy single-word read on the producer side.
 static ENABLED: AtomicU32 = AtomicU32::new(0);
 
 fn refresh_enabled() {
-    let any = (0..CONSUMERS).any(|s| ACTIVE[s].load(Ordering::Acquire));
+    let any = (0..CONSUMERS).any(|s| RING.is_active(s));
     ENABLED.store(any as u32, Ordering::Release);
 }
 
@@ -130,45 +63,6 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Acquire) != 0
 }
 
-/// RAII spinlock guard for the multi-producer emit/subscribe path.
-struct Guard;
-impl Guard {
-    #[inline]
-    fn acquire() -> Self {
-        while LOCK
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        Guard
-    }
-}
-impl Drop for Guard {
-    #[inline]
-    fn drop(&mut self) {
-        LOCK.store(false, Ordering::Release);
-    }
-}
-
-#[inline]
-fn ring_byte(pos: u32) -> u8 {
-    // SAFETY: `& MASK` is in-bounds for BUF; volatile read paired with the
-    // producer's `HEAD.store(Release)`.
-    unsafe { core::ptr::read_volatile((&raw const BUF[0]).add((pos as usize) & MASK)) }
-}
-
-#[inline]
-fn admits(filter: u32, signal: u8) -> bool {
-    let bit = match signal {
-        2 => FILTER_METRIC,  // SIGNAL_METRIC
-        3 => FILTER_SPAN,    // SIGNAL_SPAN
-        4 => FILTER_PSTATUS, // SIGNAL_PSTATUS
-        _ => 0,
-    };
-    filter & bit != 0
-}
-
 /// Emit one complete record. The kernel stamps identity: `module_idx` overwrites
 /// the record's `module` field (bytes 2..4) so a module cannot forge another's.
 ///
@@ -177,65 +71,26 @@ fn admits(filter: u32, signal: u8) -> bool {
 /// consumer is dropped silently — nothing would consume it.
 pub fn emit(module_idx: u16, rec: &[u8]) {
     let len = rec.len();
-    if len < 12 || len > MAX_RECORD {
+    if !(MIN_RECORD..=tlm::MAX_RECORD_SIZE).contains(&len) {
         return;
     }
-    let _g = Guard::acquire();
-    let head = HEAD.load(Ordering::Relaxed);
-
-    let mut any_active = false;
-    let mut overflow = false;
-    for slot in 0..CONSUMERS {
-        if ACTIVE[slot].load(Ordering::Acquire) {
-            any_active = true;
-            let lag = head.wrapping_sub(TAILS[slot].load(Ordering::Acquire)) as usize;
-            if lag + len > CAPACITY {
-                overflow = true;
-            }
-        }
-    }
-    if !any_active {
-        return;
-    }
-    if overflow {
-        for slot in 0..CONSUMERS {
-            if ACTIVE[slot].load(Ordering::Acquire) {
-                let lag = head.wrapping_sub(TAILS[slot].load(Ordering::Acquire)) as usize;
-                if lag + len > CAPACITY {
-                    DROPPED[slot].fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        return;
-    }
-
     let ident = module_idx.to_le_bytes();
-    for (k, &b) in rec.iter().enumerate() {
-        let stamped = match k {
-            2 => ident[0],
-            3 => ident[1],
-            _ => b,
-        };
-        let idx = (head.wrapping_add(k as u32) as usize) & MASK;
-        // SAFETY: `idx` in-bounds via MASK; single writer under LOCK.
-        unsafe {
-            core::ptr::write_volatile((&raw mut BUF[0]).add(idx), stamped);
-        }
-    }
-    HEAD.store(head.wrapping_add(len as u32), Ordering::Release);
+    let _: Pushed = RING.push(len, |k| match k {
+        2 => ident[0],
+        3 => ident[1],
+        _ => rec[k],
+    });
 }
 
 /// Claim a drain slot for `owner` with `filter`, seeding its tail to HEAD (start
 /// from "now"). Returns the slot id, or `-1` if all slots are in use.
 pub fn subscribe(owner: u16, filter: u32) -> i32 {
-    let _g = Guard::acquire();
+    let held = RING.lock();
     for slot in 0..CONSUMERS {
-        if !ACTIVE[slot].load(Ordering::Acquire) {
-            TAILS[slot].store(HEAD.load(Ordering::Acquire), Ordering::Release);
-            DROPPED[slot].store(0, Ordering::Release);
+        if !RING.is_active(slot) {
             FILTERS[slot].store(filter, Ordering::Release);
             OWNERS[slot].store(owner as u32, Ordering::Release);
-            ACTIVE[slot].store(true, Ordering::Release);
+            RING.activate(&held, slot, |head| head);
             refresh_enabled();
             return slot as i32;
         }
@@ -243,12 +98,12 @@ pub fn subscribe(owner: u16, filter: u32) -> i32 {
     -1
 }
 
-/// Release a drain slot. Takes the lock so `ENABLED` cannot be recomputed from a
-/// half-updated slot table while a concurrent subscribe holds it.
+/// Release a drain slot. Under the lock, so `ENABLED` cannot be recomputed
+/// from a half-updated slot table while a concurrent subscribe holds it.
 pub fn unsubscribe(slot: usize) {
     if slot < CONSUMERS {
-        let _g = Guard::acquire();
-        ACTIVE[slot].store(false, Ordering::Release);
+        let held = RING.lock();
+        RING.deactivate(&held, slot);
         OWNERS[slot].store(NO_OWNER, Ordering::Release);
         refresh_enabled();
     }
@@ -265,38 +120,38 @@ pub fn owns(slot: usize, caller: u16) -> bool {
 /// against the drop counter. Stops at HEAD or when the next admitted record
 /// would not fit in `out`. Returns bytes copied.
 pub fn drain(slot: usize, out: &mut [u8]) -> usize {
-    if slot >= CONSUMERS || !ACTIVE[slot].load(Ordering::Acquire) {
+    if slot >= CONSUMERS || !RING.is_active(slot) {
         return 0;
     }
-    let head = HEAD.load(Ordering::Acquire);
+    let head = RING.head();
     let filter = FILTERS[slot].load(Ordering::Relaxed);
-    let mut tail = TAILS[slot].load(Ordering::Relaxed);
+    let mut tail = RING.tail(slot);
     let mut written = 0usize;
     loop {
         let avail = head.wrapping_sub(tail) as usize;
-        if avail < 12 {
+        if avail < MIN_RECORD {
             break;
         }
-        let signal = ring_byte(tail);
-        let kind = ring_byte(tail.wrapping_add(1));
-        let rlen = telemetry_record_len(signal, kind);
+        let signal = RING.byte_at(tail);
+        let kind = RING.byte_at(tail.wrapping_add(1));
+        let rlen = tlm::record_len(signal, kind);
         // A record-atomic ring never publishes a partial or malformed record,
         // so this guards only against a corrupted tail — stop rather than spin.
         if rlen == 0 || avail < rlen {
             break;
         }
-        if admits(filter, signal) {
+        if tlm::filter_admits(filter, signal, kind) {
             if written + rlen > out.len() {
                 break;
             }
-            for k in 0..rlen {
-                out[written + k] = ring_byte(tail.wrapping_add(k as u32));
+            for (k, o) in out[written..written + rlen].iter_mut().enumerate() {
+                *o = RING.byte_at(tail.wrapping_add(k as u32));
             }
             written += rlen;
         }
         tail = tail.wrapping_add(rlen as u32);
     }
-    TAILS[slot].store(tail, Ordering::Release);
+    RING.set_tail(slot, tail);
     written
 }
 
@@ -304,7 +159,7 @@ pub fn drain(slot: usize, out: &mut [u8]) -> usize {
 /// means the consumer missed records and should emit a gap marker.
 pub fn take_dropped(slot: usize) -> u32 {
     if slot < CONSUMERS {
-        DROPPED[slot].swap(0, Ordering::Relaxed)
+        RING.take_dropped(slot)
     } else {
         0
     }
@@ -314,13 +169,12 @@ pub fn take_dropped(slot: usize) -> u32 {
 /// head + drop counts onto its wire layout; lag and active are for the kernel's
 /// own self-observability line.
 pub fn stats() -> (u32, [(bool, u32, u32); CONSUMERS]) {
-    let head = HEAD.load(Ordering::Acquire);
+    let head = RING.head();
     let mut slots = [(false, 0u32, 0u32); CONSUMERS];
-    for slot in 0..CONSUMERS {
-        let active = ACTIVE[slot].load(Ordering::Acquire);
-        let lag = head.wrapping_sub(TAILS[slot].load(Ordering::Acquire));
-        let dropped = DROPPED[slot].load(Ordering::Relaxed);
-        slots[slot] = (active, if active { lag } else { 0 }, dropped);
+    for (slot, out) in slots.iter_mut().enumerate() {
+        let active = RING.is_active(slot);
+        let lag = head.wrapping_sub(RING.tail(slot));
+        *out = (active, if active { lag } else { 0 }, RING.dropped(slot));
     }
     (head, slots)
 }
@@ -331,22 +185,16 @@ pub fn capacity() -> usize {
     CAPACITY
 }
 
-/// Zero all ring state (head, per-slot tails/drops/active/filters, enabled,
-/// lock). The ring is a process-global static, so the harness conformance tests
-/// call this to isolate each case. `#[doc(hidden)]` + never invoked by firmware
-/// (cf. `owner_plan::reset_staged_plan_for_test`); inline unit tests are barred
-/// from production `src/` by the `src_shape_no_inline_tests` lint, so the ring's
-/// tests live in `tests/harness/tests/telemetry_ring.rs`.
+/// Zero all ring state (head, per-slot tails/drops/active/filters, owners,
+/// enabled). The ring is a process-global static, so the harness tests
+/// (`tests/harness/tests/telemetry_ring.rs`) call this to isolate each case.
+/// Never invoked by firmware.
 #[doc(hidden)]
 pub fn reset_for_test() {
-    HEAD.store(0, Ordering::Release);
+    RING.reset();
     for slot in 0..CONSUMERS {
-        TAILS[slot].store(0, Ordering::Release);
-        DROPPED[slot].store(0, Ordering::Release);
-        ACTIVE[slot].store(false, Ordering::Release);
         FILTERS[slot].store(0, Ordering::Release);
         OWNERS[slot].store(NO_OWNER, Ordering::Release);
     }
     ENABLED.store(0, Ordering::Release);
-    LOCK.store(false, Ordering::Release);
 }

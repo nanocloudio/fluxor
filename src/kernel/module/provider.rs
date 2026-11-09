@@ -1194,12 +1194,11 @@ pub fn release_module_providers(module_idx: ModuleId) {
 // away, or it holds them until the next reset. The kernel is the only party
 // that knows, so it has to say so.
 //
-// Two platform calls (`linux_net_close_owner_conns`,
-// `linux_workload_close_owner`) cover the kernel's OWN per-owner state on the
-// drain path. This is the module-provider counterpart, delivered from
-// `free_owner` itself rather than from the drain driver, so the paths that
-// never reach the drain driver — the workload verbs (KILL, DESTROY) and
-// admission rollback — are covered too.
+// The platform's owner-release hook covers what the platform's own providers
+// hold for an owner. This is the module-provider counterpart. Both are
+// delivered from `free_owner` itself rather than from the drain driver, so
+// the paths that never reach the drain driver — the workload verbs (KILL,
+// DESTROY), `FREE_OWNER` and admission rollback — are covered too.
 //
 // Ordering is the whole point: the notification runs BEFORE any teardown, so
 // the owner handle still resolves, the provider module's state is still live,

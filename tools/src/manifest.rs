@@ -674,26 +674,36 @@ fn validate_requires_when(entries: Vec<TomlRequiresWhen>) -> Result<Vec<Requires
                  requirement belongs in `[requires]`"
             )));
         }
-        let mut when = Vec::with_capacity(e.when.len());
-        for (param, values) in e.when {
-            let values = match values {
-                TomlWhenValues::One(v) => vec![v],
-                TomlWhenValues::Any(vs) => vs,
-            };
-            if param.trim().is_empty()
-                || values.is_empty()
-                || values.iter().any(|v| v.trim().is_empty())
-            {
-                return Err(Error::Module(format!(
-                    "[[requires_when]] for `{capability}`: every `when` condition needs a \
-                     parameter name and at least one value"
-                )));
-            }
-            when.push((param, values));
-        }
+        let when = parse_when(e.when, &format!("[[requires_when]] for `{capability}`"))?;
         out.push(RequiresWhen { capability, when });
     }
     Ok(out)
+}
+
+/// A `when = { param = value | [values] }` table as `(param, values)` pairs,
+/// ordered by parameter name: every condition names a parameter and at least
+/// one value.
+fn parse_when(
+    table: std::collections::BTreeMap<String, TomlWhenValues>,
+    context: &str,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let mut when = Vec::with_capacity(table.len());
+    for (param, values) in table {
+        let values = match values {
+            TomlWhenValues::One(v) => vec![v],
+            TomlWhenValues::Any(vs) => vs,
+        };
+        if param.trim().is_empty()
+            || values.is_empty()
+            || values.iter().any(|v| v.trim().is_empty())
+        {
+            return Err(Error::Module(format!(
+                "{context}: every `when` condition needs a parameter name and at least one value"
+            )));
+        }
+        when.push((param, values));
+    }
+    Ok(when)
 }
 
 /// Validate `provides = [..]` entries against the providable vocabulary
@@ -934,6 +944,21 @@ pub struct ResourceClaim {
     /// like `selector`, it is checked at `pack` against the module's own
     /// `str` params.
     pub active_when_params: Vec<String>,
+    /// The module handles the contract being absent (`optional = true`): it
+    /// answers ENOSYS by falling back or by not offering what needs it. A
+    /// claim is otherwise a requirement, and the composer refuses a graph in
+    /// which nothing answers it (`config::validate::required_contract_refusals`).
+    /// Tools-side only, never serialised.
+    pub optional: bool,
+    /// The variants whose build makes the call (`variants = [...]`); empty,
+    /// every variant. A claim another variant compiles out is no requirement
+    /// of an instance built as that variant. Tools-side only.
+    pub variants: Vec<String>,
+    /// Parameter values under which the call is made (`when = { param =
+    /// [values] }`, the `[[requires_when]]` form: enum names or numbers, the
+    /// schema default standing in for an unset parameter, every condition
+    /// holding); empty, always. Tools-side only.
+    pub when: Vec<(String, Vec<String>)>,
 }
 
 impl ResourceClaim {
@@ -1626,6 +1651,10 @@ pub struct Manifest {
     /// fmod embeds is the already-filtered port table, not the variant
     /// declaration.
     pub variants: Vec<VariantDecl>,
+    /// The variant this manifest describes: the default one as parsed, the
+    /// one `apply_variant` selected after. `None` for a module that declares
+    /// no `[[variant]]`. TOML-only.
+    pub selected_variant: Option<String>,
     /// `[capacities]` — module-scope capacity declarations, already
     /// resolved for the silicon this manifest was loaded for (same
     /// flat-or-per-silicon form as a port's `buffer_size`). These size a
@@ -1761,6 +1790,7 @@ impl Default for Manifest {
             observability: Observability::default(),
             builtin: false,
             variants: Vec::new(),
+            selected_variant: None,
             capacities: std::collections::BTreeMap::new(),
             heap_from_params: None,
             demand_from_params: Vec::new(),
@@ -2008,75 +2038,6 @@ fn validate_instruments(obs: &Observability) -> Result<()> {
     Ok(())
 }
 
-/// NEON / aarch64 intrinsic substrings that signal an
-/// ISR-unsafe import. A Tier 1b/Tier 2 module (`isr_safe = true`,
-/// `domain_exec_mode == 2 or 4`) hard-preempts the cooperative tier,
-/// and the ISR is documented as scalar-only. If a module accidentally
-/// pulls in a NEON intrinsic, restoring its NEON state on ISR
-/// completion is the caller's job — and nothing in the runtime saves
-/// the NEON file. A Tier 1b ISR that clobbers NEON would corrupt the
-/// preempted cooperative thread's vector regs.
-///
-/// The substrings below cover the canonical NEON paths in `core::arch`:
-///   * `core::arch::aarch64` — the `arm_neon` module re-exports
-///   * `arm_neon::` — direct import of the intrinsic module
-///   * `vqaddq_`, `vld1q_`, `vst1q_`, `vmlaq_`, etc. — common intrinsic
-///     prefixes (`v[name][q]_[type]`). The `vld1q_`/`vst1q_` plus
-///     `vqaddq_` triplet covers ~95% of real NEON use without a wide
-///     false-positive surface.
-const NEON_IMPORT_MARKERS: &[&str] = &[
-    "core::arch::aarch64",
-    "arm_neon::",
-    "::vld1q_",
-    "::vst1q_",
-    "::vqaddq_",
-    "::vaddq_",
-    "::vmulq_",
-    "::vmlaq_",
-];
-
-/// Scan a module source tree for NEON / aarch64 SIMD imports.
-/// Returns `Ok(())` if no markers found, `Err` listing the offending
-/// files otherwise. Designed to be called from the build path when
-/// `manifest.isr_safe == true` so a module that claims ISR safety
-/// can't quietly pull in NEON intrinsics.
-///
-/// The check is **substring-based and source-static** — it parses
-/// `.rs` files under `src_root` and looks for the marker strings
-/// in `NEON_IMPORT_MARKERS`. Inside a string literal or comment that
-/// happens to mention the marker, the check will false-positive;
-/// fix the source comment or split the literal in those cases. The
-/// alternative (full Rust parsing) costs ~100× more for the same
-/// signal.
-pub fn check_isr_safe_no_neon(src_root: &Path) -> Result<()> {
-    if !src_root.exists() {
-        return Ok(());
-    }
-    let mut offenders: Vec<String> = Vec::new();
-    walk_rs(src_root, &mut |path, source| {
-        for marker in NEON_IMPORT_MARKERS {
-            if source.contains(marker) {
-                offenders.push(format!(
-                    "{}: contains `{}` (NEON-marker substring)",
-                    path.display(),
-                    marker,
-                ));
-                break;
-            }
-        }
-    });
-    if offenders.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Module(format!(
-            "ISR-tier module declares `isr_safe = true` but its source imports NEON / \
-             aarch64 SIMD intrinsics. Tier 1b/Tier 2 ISRs are scalar-only by contract \
-             — NEON registers are not preserved across an ISR. Offending files:\n  {}",
-            offenders.join("\n  "),
-        )))
-    }
-}
-
 /// Scan a module source tree for an actual `module_isr_entry` **export**
 /// — the IRQ-context entry point a Tier 2 (IRQ-owned) module must
 /// provide. Returns `Ok(())` if any `.rs` file under `src_root` defines
@@ -2105,8 +2066,7 @@ pub fn check_isr_safe_no_neon(src_root: &Path) -> Result<()> {
 /// `//` line comments are stripped before matching. Residual gaps the
 /// source scan cannot see (a `#[cfg(...)]`-disabled definition, a
 /// block-comment-spanned signature) are caught by the authoritative
-/// packer/loader gate described above — the same tradeoff
-/// `check_isr_safe_no_neon` carries.
+/// packer/loader gate described above.
 pub fn check_module_exports_isr_entry(src_root: &Path) -> Result<()> {
     if !src_root.exists() {
         return Err(Error::Module(format!(
@@ -2358,6 +2318,7 @@ impl Manifest {
         };
         let omit = decl.omit_ports.clone();
         let omitted_caps = decl.omit_capabilities.clone();
+        self.selected_variant = Some(variant.to_string());
         for (k, v) in &decl.capacities {
             self.capacities.insert(k.clone(), *v);
         }
@@ -2532,6 +2493,22 @@ impl Manifest {
                 instance,
                 selector,
                 active_when_params,
+                optional: r.optional.unwrap_or(false),
+                variants: r.variants.clone().unwrap_or_default(),
+                when: match r.when.clone() {
+                    Some(t) if t.is_empty() => {
+                        return Err(Error::Module(format!(
+                            "[[resources]] requires_contract = \"{}\": an empty `when` \
+                             conditions nothing; drop it",
+                            r.device_class
+                        )))
+                    }
+                    Some(t) => parse_when(
+                        t,
+                        &format!("[[resources]] requires_contract = \"{}\"", r.device_class),
+                    )?,
+                    None => Vec::new(),
+                },
             });
         }
 
@@ -3062,6 +3039,26 @@ impl Manifest {
         }
         validate_wasm_target_features(build.wasm_target_features.as_deref().unwrap_or(&[]))?;
 
+        // A claim's `variants` names variants the module declares: a typo
+        // would silently drop the claim from every build.
+        for claim in &resources {
+            for v in &claim.variants {
+                if !variants.iter().any(|d| &d.name == v) {
+                    let known: Vec<&str> = variants.iter().map(|d| d.name.as_str()).collect();
+                    return Err(Error::Module(format!(
+                        "[[resources]] requires_contract = \"{}\": `variants` names `{v}`, \
+                         which is not a declared [[variant]] ({})",
+                        contract_name_to_str(claim.device_class),
+                        if known.is_empty() {
+                            "none declared".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    )));
+                }
+            }
+        }
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -3082,6 +3079,7 @@ impl Manifest {
             capabilities,
             observability,
             builtin,
+            selected_variant: variants.iter().find(|v| v.default).map(|v| v.name.clone()),
             variants,
             capacities,
             heap_from_params,
@@ -3358,6 +3356,9 @@ impl Manifest {
                 // The binary manifest does not carry the selector.
                 selector: ClaimSelector::Default,
                 active_when_params: Vec::new(),
+                optional: false,
+                variants: Vec::new(),
+                when: Vec::new(),
             });
             offset += 4;
         }
@@ -3472,8 +3473,9 @@ impl Manifest {
             observability: Observability::default(), // not serialized in binary format
             builtin: false,
             variants: Vec::new(), // toml-only, not serialized
+            selected_variant: None,
             capacities: std::collections::BTreeMap::new(), // toml-only, not serialized
-            heap_from_params: None, // toml-only, not serialized
+            heap_from_params: None,                        // toml-only, not serialized
             demand_from_params: Vec::new(),
             heap_per_demand: None,
             heap_per_param: None,
@@ -4501,6 +4503,12 @@ struct TomlResource {
     /// The params whose configuration exercises the claim. See
     /// [`ResourceClaim::active_when_params`].
     active_when_params: Option<Vec<String>>,
+    /// See [`ResourceClaim::optional`].
+    optional: Option<bool>,
+    /// See [`ResourceClaim::variants`].
+    variants: Option<Vec<String>>,
+    /// See [`ResourceClaim::when`].
+    when: Option<std::collections::BTreeMap<String, TomlWhenValues>>,
 }
 
 /// The `active_when_params` a `[[resources]]` row declares: absent, none
@@ -4950,6 +4958,9 @@ mod tests {
             instance: 0xFF,
             selector: ClaimSelector::Default,
             active_when_params: Vec::new(),
+            optional: false,
+            variants: Vec::new(),
+            when: Vec::new(),
         });
         m.dependencies.push(Dependency {
             name_hash: 0x12345678,
@@ -4977,6 +4988,9 @@ mod tests {
             instance: 0xFF,
             selector: ClaimSelector::Default,
             active_when_params: Vec::new(),
+            optional: false,
+            variants: Vec::new(),
+            when: Vec::new(),
         }); // GPIO
         m.resources.push(ResourceClaim {
             device_class: 0x04,
@@ -4984,6 +4998,9 @@ mod tests {
             instance: 0xFF,
             selector: ClaimSelector::Default,
             active_when_params: Vec::new(),
+            optional: false,
+            variants: Vec::new(),
+            when: Vec::new(),
         }); // PIO
         m.resources.push(ResourceClaim {
             device_class: 0x3F,
@@ -4991,6 +5008,9 @@ mod tests {
             instance: 0xFF,
             selector: ClaimSelector::Default,
             active_when_params: Vec::new(),
+            optional: false,
+            variants: Vec::new(),
+            when: Vec::new(),
         }); // highest representable position
         assert_eq!(
             m.required_caps_mask().unwrap(),
@@ -5007,6 +5027,9 @@ mod tests {
             instance: 0xFF,
             selector: ClaimSelector::Default,
             active_when_params: Vec::new(),
+            optional: false,
+            variants: Vec::new(),
+            when: Vec::new(),
         });
         assert!(m.required_caps_mask().is_err());
     }

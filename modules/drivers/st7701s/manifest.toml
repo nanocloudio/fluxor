@@ -24,9 +24,11 @@ access = "exclusive"
 requires_contract = "timer"
 access = "write"
 
+# Its channels are allocated from the platform's pool, so the claim is
+# shared with every other DMA user in the graph.
 [[resources]]
 requires_contract = "platform_dma_fd"
-access = "exclusive"
+access = "write"
 
 # Module-scope observability — exempt.
 [observability]
