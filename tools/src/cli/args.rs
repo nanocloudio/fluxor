@@ -1017,9 +1017,9 @@ enum ModulesAction {
     },
     /// Sign a packed .fmod module with an Ed25519 private key.
     ///
-    /// Overwrites the module's manifest with one carrying a valid
-    /// Ed25519 signature over the existing SHA-256 integrity hash plus the
-    /// signer's public-key fingerprint. The module's code/data/export
+    /// Overwrites the module's manifest with one carrying an Ed25519
+    /// signature over the module's signing envelope plus the signer's
+    /// public-key fingerprint. The module's code/data/export
     /// sections are unchanged.
     Sign {
         /// Input .fmod file (modified in place unless --output is given)

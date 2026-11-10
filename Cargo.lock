@@ -891,6 +891,7 @@ dependencies = [
  "clap",
  "fluxor-abi",
  "fluxor-contracts",
+ "fluxor-sdk",
  "libc",
  "log",
  "proc-macro2",

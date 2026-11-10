@@ -187,13 +187,3 @@ mode                = "permissive"
 forbid_inline_tests = ["modules"]
 max_inline_lines    = 1000
 
-# Inline-test findings a file may still hold, as a ratchet: each count only
-# goes down.
-[[ci.hygiene.ratchet]]
-rule   = "inline-tests"
-path   = "modules/sdk/contracts/net/dnssec.rs"
-count  = 7
-reason = """`#[cfg(test)] mod tests` in the SDK's DNSSEC validator. dnssec.rs is \
-part of the hashed SDK surface, so moving the suite to \
-tests/harness/tests/dnssec_unit.rs moves the ABI digest; it goes with an ABI \
-epoch advance."""

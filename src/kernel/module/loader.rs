@@ -11,6 +11,7 @@
 //! quarantined module's memory. No other core allocates or frees module
 //! state, so the state arena needs no lock; other cores read only the
 //! word-sized occupancy figures. See `docs/architecture/concurrency.md`.
+use crate::abi::wire::fmod::{signing_envelope, ManifestLayout};
 use crate::abi::SyscallTable;
 use crate::fnv1a32;
 use crate::kernel::boot::config::read_layout;
@@ -239,39 +240,6 @@ impl LoaderError {
         }
     }
 }
-/// Offsets of the manifest's flag-gated blocks, computed from its fixed
-/// 17-byte head. The blocks sit in the order `tools/src/manifest.rs::to_bytes`
-/// writes them — port records, resource records, dependency records, port
-/// capacities (flag bit 5), stack (flag bit 6), then the integrity hash — and
-/// every reader past the dependency records takes its offset from here.
-#[derive(Clone, Copy)]
-struct ManifestLayout {
-    /// Port-capacity block (flag bit 5).
-    capacity: usize,
-    /// Stack block (flag bit 6).
-    stack: usize,
-    /// Arena block (flag bit 7).
-    arena: usize,
-    /// Integrity hash (flag bit 0); the signature block follows it.
-    hash: usize,
-}
-
-impl ManifestLayout {
-    fn of(port_count: u8, resource_count: u8, dep_count: u8, flags: u8) -> Self {
-        let ports = port_count as usize;
-        let capacity = 17 + ports * 4 + resource_count as usize * 4 + dep_count as usize * 8;
-        let stack = capacity + if flags & 0x20 != 0 { ports * 8 } else { 0 };
-        let arena = stack + if flags & 0x40 != 0 { 2 } else { 0 };
-        let hash = arena + if flags & 0x80 != 0 { 4 } else { 0 };
-        Self {
-            capacity,
-            stack,
-            arena,
-            hash,
-        }
-    }
-}
-
 // ============================================================================
 // Flash memory primitives
 // ============================================================================
@@ -3127,7 +3095,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     // check (recomputable by anyone, so no authenticity on its
                     // own). AUTHENTICITY over the full security envelope (header,
                     // export table, schema, manifest capability metadata) is the
-                    // SIGNATURE's job — see the `module_signing_envelope` hash in
+                    // SIGNATURE's job — see the `signing_envelope` hash in
                     // the signature-verification block below, which the Ed25519
                     // signature is taken over. Keeping integrity as code||data
                     // keeps unsigned/dev modules loadable (pack stamps the same).
@@ -3172,17 +3140,10 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     sig.copy_from_slice(&manifest_data[sig_offset..sig_offset + 64]);
                     let mut _signer_fp = [0u8; 32];
                     _signer_fp.copy_from_slice(&manifest_data[sig_offset + 64..sig_offset + 96]);
-                    // The signature is taken over the SIGNING ENVELOPE — the full
-                    // security-relevant image, NOT just code/data — so a tampered
-                    // header / export table / schema / manifest-capability field
-                    // breaks the signature. MUST byte-match the signer (`tools`
-                    // `cmd_sign`):
-                    //   header[0..64]          (sizes, export_count, abi_version…)
-                    //   skip header[64..66]    (manifest_size: signing grows it)
-                    //   header[66..80] || code || data || export-table || schema
-                    //   manifest[0..hash_offset] with flags byte 14 bits 0-1
-                    //     (has_integrity/has_signature) MASKED — the only
-                    //     [0..hash_offset] bytes that differ unsigned vs signed.
+                    // The signature is taken over the signing envelope
+                    // (`abi::wire::fmod::signing_envelope`), the same bytes
+                    // the signer hashes: header, code, data, exports, schema,
+                    // the manifest before its hash, and the attestation.
                     let hash = {
                         use crate::kernel::security::crypto::sha256::Sha256;
                         let mut eh = Sha256::new();
@@ -3192,31 +3153,11 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                         // ModuleHeader::SIZE.
                         let pre =
                             unsafe { core::slice::from_raw_parts(module.base, manifest_offset) };
-                        eh.update(&pre[0..64]);
-                        eh.update(&pre[66..manifest_offset]);
-                        eh.update(&manifest_data[0..14]);
-                        eh.update(&[manifest_data[14] & 0xFC]);
-                        eh.update(&manifest_data[15..hash_offset]);
-                        // ABI-surface attestation: at its CANONICAL offset —
-                        // integrity hash (32) then signature block (96) then
-                        // attestation (32) — and the manifest must end exactly
-                        // there. Reading "the last 32 bytes" instead would let
-                        // an inflated manifest carry a second, signed copy at
-                        // the end while parsers read a substituted value at
-                        // the canonical offset. Matches `cmd_sign`, which
-                        // hashes the freshly-serialized (slack-free) layout.
-                        // The attestation's value is compared to this
-                        // kernel's surface below, for every module; here it
-                        // is only covered by the signature.
-                        if manifest_data[14] & 0x10 != 0 {
-                            let attn_offset = hash_offset + 32 + 96;
-                            if manifest_size != attn_offset + 32 {
-                                log::error!(
-                                    "[loader] {name}: attestation flag with non-canonical manifest size"
-                                );
-                                return Err(LoaderError::SignatureInvalid);
-                            }
-                            eh.update(&manifest_data[attn_offset..attn_offset + 32]);
+                        if signing_envelope(pre, manifest_data, |b| eh.update(b)).is_err() {
+                            log::error!(
+                                "[loader] {name}: signed manifest is truncated or non-canonical"
+                            );
+                            return Err(LoaderError::SignatureInvalid);
                         }
                         let d = eh.finalize();
                         let mut h = [0u8; 32];
@@ -3257,13 +3198,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                 }
                 let attn_offset =
                     ManifestLayout::of(manifest_data[5], manifest_data[6], manifest_data[7], flags)
-                        .hash
-                        + if has_integrity || has_signature {
-                            32
-                        } else {
-                            0
-                        }
-                        + if has_signature { 96 } else { 0 };
+                        .attestation;
                 if manifest_size != attn_offset + 32 {
                     log::error!(
                         "[loader] {name}: attestation flag with non-canonical manifest size"

@@ -101,6 +101,10 @@ webpki-roots = "0.26.11"
 # tooling.
 tempfile = "3.27.0"
 
+# `tests/module_sign_roundtrip.rs` verifies the CLI signer's output with the
+# SDK's Ed25519, independently of the tools' own signing code.
+fluxor-sdk = { path = "../crates/fluxor-sdk" }
+
 # `tests/param_store.rs` mounts `src/platform/linux/param_store.rs` the
 # way the platform does, with `include!`, so it needs the crates that
 # source uses. The store logs what it read and what it refused.

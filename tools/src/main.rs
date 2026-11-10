@@ -121,6 +121,16 @@ mod workspace;
 #[path = "../../modules/sdk/wire/wire.rs"]
 mod wire;
 
+/// The `.fmod` container's signed region — path-mounted from
+/// `modules/sdk/wire/fmod.rs`, the definition the kernel loader verifies
+/// against, so the signer hashes exactly the bytes the loader does.
+#[allow(
+    dead_code,
+    reason = "the signer reads a subset of the container constants the kernel loader shares"
+)]
+#[path = "../../modules/sdk/wire/fmod.rs"]
+mod fmod;
+
 /// Canonical ABI wire-surface encoding (see `tools/src/lib.rs` mount).
 #[path = "../../modules/sdk/abi_surface.rs"]
 mod abi_surface;

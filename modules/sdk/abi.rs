@@ -39,6 +39,12 @@
 /// agree on these bytes.
 pub mod wire {
     include!("wire/wire.rs");
+
+    /// The `.fmod` container's signed region: manifest block layout and
+    /// the signing envelope shared by the signer and the loader.
+    pub mod fmod {
+        include!("wire/fmod.rs");
+    }
 }
 
 /// Capacity / sizing tunables — one coherent envelope per board

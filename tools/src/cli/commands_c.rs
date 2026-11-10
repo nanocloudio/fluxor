@@ -1644,58 +1644,19 @@ fn cmd_sign(
     let mut integrity_hash = [0u8; 32];
     integrity_hash.copy_from_slice(&ih.finalize());
 
-    // (2) SIGNING ENVELOPE hash = the full security-relevant image. The Ed25519
-    // signature is taken over THIS, not the integrity hash, so a tampered header
-    // / export table / schema / manifest-capability field breaks the signature
-    // even though code||data is untouched. MUST byte-match the kernel loader's
-    // signature-verification envelope (`validate_module`):
-    //   header[0..64]  (skip manifest_size @64..66 — signing grows it)
-    //   || header[66..80] || code || data || export-table || schema
-    //   || manifest[0..hash_offset] with flags byte 14 bits 0-1 masked
-    //     (has_integrity / has_signature — the only [0..hash_offset] bytes that
-    //      differ between the unsigned and signed image).
-    // The manifest header+var region [0..hash_offset] is independent of the
-    // hash/signature VALUES, so serialize with placeholder integrity+sig to get
-    // the final layout, hash [0..hash_offset], then fill in the real values
-    // (which only touch bytes at/after hash_offset).
+    // (2) The signature covers the signing envelope (`fmod::signing_envelope`,
+    // the definition the kernel loader verifies against), not the integrity
+    // hash, so a tampered header, export table, schema or manifest block
+    // breaks it even though code||data is untouched. The envelope holds no
+    // hash or signature bytes, so serializing with placeholders gives the
+    // final layout; the real values are filled in afterwards.
     manifest.integrity_hash = Some(integrity_hash);
     manifest.signature = Some([0u8; 64]);
     manifest.signer_fp = Some([0u8; 32]);
     let layout = manifest.to_bytes();
-    let var_size = manifest.ports.len() * 4
-        + manifest.resources.len() * 4
-        + manifest.dependencies.len() * 8
-        + if layout[14] & 0x20 != 0 {
-            // Port-capacity section (flag bit 5) sits before the hash —
-            // covered by the signing envelope. Must mirror the kernel
-            // verifier's offset math exactly.
-            manifest.ports.len() * 8
-        } else {
-            0
-        }
-        + if layout[14] & 0x40 != 0 {
-            // Stack block (flag bit 6), likewise before the hash.
-            2
-        } else {
-            0
-        };
-    let hash_offset = 17 + var_size; // = MANIFEST_HEADER_SIZE (u16 permissions)
-    if hash_offset + 32 > layout.len() {
-        return Err(Error::Module("manifest layout too small for hash".into()));
-    }
     let mut h = sha2::Sha256::new();
-    h.update(&fmod[0..64]);
-    h.update(&fmod[66..manifest_offset]);
-    h.update(&layout[0..14]);
-    h.update([layout[14] & 0xFC]);
-    h.update(&layout[15..hash_offset]);
-    // ABI-surface attestation (trailing 32 bytes when flag bit 4 is set):
-    // signed, so a stale artifact can't be re-labeled compatible by
-    // rewriting the attestation while keeping a valid signature. MUST
-    // byte-match the kernel verifier.
-    if layout[14] & 0x10 != 0 {
-        h.update(&layout[layout.len() - 32..]);
-    }
+    crate::fmod::signing_envelope(&fmod[..manifest_offset], &layout, |b| h.update(b))
+        .map_err(|e| Error::Module(format!("manifest has no signing envelope: {e:?}")))?;
     let mut envelope_hash = [0u8; 32];
     envelope_hash.copy_from_slice(&h.finalize());
 

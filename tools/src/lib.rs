@@ -121,6 +121,12 @@ pub mod workspace;
 #[path = "../../modules/sdk/wire/wire.rs"]
 pub mod wire;
 
+/// The `.fmod` container's signed region — path-mounted from
+/// `modules/sdk/wire/fmod.rs`, the definition the kernel loader verifies
+/// against, so the signer hashes exactly the bytes the loader does.
+#[path = "../../modules/sdk/wire/fmod.rs"]
+pub mod fmod;
+
 /// Canonical ABI wire-surface encoding — path-mounted from
 /// `modules/sdk/abi_surface.rs` so host tools and the kernel fold the
 /// exact same byte stream into the ABI-surface digest that pins graph
