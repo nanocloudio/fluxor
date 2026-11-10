@@ -208,8 +208,7 @@ use dns_wire::*;
 // The stream surface, for DNS-over-TLS: the same `CMD_CONNECT_TO` every
 // other connector dials with, so a DoT upstream is named the way every
 // other upstream in the family is.
-#[path = "../../sdk/contracts/net/net_proto.rs"]
-mod net_proto;
+use abi::contracts::net::net_proto;
 
 // DNSSEC validation. Mounted flat, as the crypto it calls is: the validator
 // answers a verdict and this module decides what to do about one.

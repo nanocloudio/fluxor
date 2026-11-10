@@ -1,5 +1,5 @@
 // ============================================================================
-// Linux `workload` provider (contract class 0x1A) — the consumer-facing
+// Linux `workload` provider (contract class `workload`) — the consumer-facing
 // isolated-workload surface.
 // ============================================================================
 //
@@ -23,23 +23,23 @@ use crate::abi::contracts::workload as wl;
 use crate::abi::platform::linux::host_process as hp;
 use crate::kernel::workload::owner::OwnerHandle;
 
-// Host-process opcodes (`hp::EXEC`/`hp::TTY_*`, class 0x1B): the host class
+// Host-process opcodes (`hp::EXEC`/`hp::TTY_*`, class `host_process`): the host class
 // numbers them and owns the consts. Only their arg/out wire formats — backend
 // detail, not contract surface — are documented here:
 //
 // Workload-scoped ops carry `[workload_fd: i32 LE]` before the payloads below
 // (handle = -1 calls; the kernel routes handle-tagged calls by tag→class).
 //
-// * `EXEC` (0x1B02) — one-shot: run a command inside a workload and capture
+// * `EXEC` — one-shot: run a command inside a workload and capture
 //   its output. Payload in = command line; out = `[out_len:u32][output…]`;
 //   return = exit code.
-// * `TTY_OPEN` (0x1B03) — start an interactive PTY session. Payload =
+// * `TTY_OPEN` (`host_process::TTY_OPEN`) — start an interactive PTY session. Payload =
 //   `[rows:u16][cols:u16][cmd…]`; return = session id.
-// * `TTY_STEP` (0x1B04) — pump a session: write stdin, drain output, poll
+// * `TTY_STEP` — pump a session: write stdin, drain output, poll
 //   exit. `arg` in = `[sid:u32][wlen:u32][stdin…]`; out =
 //   `[rlen:u32][state:u8][code:i32][out…]`.
-// * `TTY_RESIZE` (0x1B05) — `arg` = `[sid:u32][rows:u16][cols:u16]`.
-// * `TTY_CLOSE` (0x1B06) — kill+reap+free a session. `arg` = `[sid:u32]`;
+// * `TTY_RESIZE` — `arg` = `[sid:u32][rows:u16][cols:u16]`.
+// * `TTY_CLOSE` — kill+reap+free a session. `arg` = `[sid:u32]`;
 //   return = exit code.
 
 /// The workload-index domain: one workload per sandbox. The table is sized
@@ -905,7 +905,7 @@ pub fn linux_workload_close_owner(owner: OwnerHandle) {
 }
 
 /// Host-process (0x1B) provider dispatch — the linux host mechanics that sit
-/// beside the stable 0x1A workload surface. Every op is a `handle = -1`
+/// beside the stable `workload` surface. Every op is a `handle = -1`
 /// call; workload-targeting ops carry the tagged workload fd in the leading
 /// 4 bytes of `arg` (LE), TTY session ops their session id.
 ///

@@ -279,7 +279,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             8 => {
                 let r = ((*s.syscalls).provider_call)(
                     3,
-                    0x0C40, // LOG_WRITE
+                    abi::registry::kernel::LOG_WRITE, // LOG_WRITE
                     (state as usize).wrapping_add(0x0040_0000) as *mut u8,
                     16,
                 );

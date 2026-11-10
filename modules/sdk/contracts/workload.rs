@@ -1,4 +1,4 @@
-// Contract: workload — platform-neutral isolated-workload surface (class 0x1A).
+// Contract: workload — platform-neutral isolated-workload surface (class `workload`).
 //
 // Layer: contracts (public, stable).
 //
@@ -84,22 +84,22 @@
 /// spec, for its identity or another, answers `EBUSY` — another owner's
 /// `CREATE` for the staged identity answers `EACCES`; [`LOOKUP`] finds the
 /// staged identity and [`DESTROY`] by identity abandons it.
-pub const CREATE: u32 = 0x1A00;
+pub use super::super::registry::workload::CREATE;
 
 /// `START` — release the create/start barrier so the workload begins executing.
 /// `handle` = the `WorkloadHandle`. Returns `0` or a negative errno.
-pub const START: u32 = 0x1A01;
+pub use super::super::registry::workload::START;
 
 /// `WAIT` — poll terminal state. `out` (>= 5 bytes) = `[state:u8][code:i32 LE]`
 /// where `state` is [`STATE_RUNNING`]/[`STATE_EXITED`]/[`STATE_SIGNALLED`] and
 /// `code` is the exit code (EXITED) or terminating signal (SIGNALLED).
 /// Non-blocking; repeat calls return the cached terminal state once observed.
-pub const WAIT: u32 = 0x1A02;
+pub use super::super::registry::workload::WAIT;
 
 /// `SIGNAL` — deliver a signal/stop request. `arg` = `[signo:u32 LE]`
 /// (portable subset: `TERM`/`KILL`; a backend maps to its mechanism). Returns
 /// `0` or a negative errno.
-pub const SIGNAL: u32 = 0x1A03;
+pub use super::super::registry::workload::SIGNAL;
 
 /// `DESTROY` — stop (graceful → forced), reap, release the owner/lease and any
 /// backend resources (isolation domain, arena). Idempotent. Returns `0`.
@@ -107,28 +107,27 @@ pub const SIGNAL: u32 = 0x1A03;
 /// With `handle = -1` and `arg` = the 16-byte identity, destroys by identity:
 /// a live workload as above, or a `CREATE` still being staged, which is rolled
 /// back. `ENOENT` when nothing carries the identity.
-pub const DESTROY: u32 = 0x1A04;
+pub use super::super::registry::workload::DESTROY;
 
-// ---- 0x1A05..0x1A0A: unassigned ----
-// The host-process mechanics (exec, PTY, read) are the 0x1B class,
-// `abi::platform::linux::host_process`. These values stay unassigned.
+// The host-process mechanics (exec, PTY, read) are the `host_process`
+// contract, `abi::platform::linux::host_process`.
 
-/// `PAUSE` — freeze a workload (reversible; not a terminal state). Each
-/// backend realizes it with its own freeze mechanism (host-process: the
-/// process freezer; metal: its own quiesce). Idempotent: PAUSE on a paused
-/// workload returns status 0; PAUSE on a terminal workload is a state error.
-/// Advertised via [`caps::PAUSE`].
-pub const PAUSE: u32 = 0x1A0B;
-/// `RESUME` — thaw a paused workload, see [`PAUSE`]. Idempotent: RESUME on a
-/// running workload returns status 0.
-pub const RESUME: u32 = 0x1A0C;
 /// `LANES` — the caller's own lanes into a workload it staged from an fmod
 /// graph: the edges whose FLXA endpoint is the caller (kind 4). Writes
 /// `[count:u8]` then `count × ([key:u8][to_caller:i32 LE][from_caller:i32
 /// LE])`: the channel the caller reads for the key's edge into it, and the
 /// one it writes for the key's edge out of it, -1 for a direction the graph
 /// does not have. Returns the bytes written.
-pub const LANES: u32 = 0x1A0D;
+pub use super::super::registry::workload::LANES;
+/// `PAUSE` — freeze a workload (reversible; not a terminal state). Each
+/// backend realizes it with its own freeze mechanism (host-process: the
+/// process freezer; metal: its own quiesce). Idempotent: PAUSE on a paused
+/// workload returns status 0; PAUSE on a terminal workload is a state error.
+/// Advertised via [`caps::PAUSE`].
+pub use super::super::registry::workload::PAUSE;
+/// `RESUME` — thaw a paused workload, see [`PAUSE`]. Idempotent: RESUME on a
+/// running workload returns status 0.
+pub use super::super::registry::workload::RESUME;
 /// Most caller lanes one workload holds.
 pub const MAX_CALLER_LANES: usize = 8;
 
@@ -143,6 +142,22 @@ pub const MAX_CALLER_LANES: usize = 8;
 // `NET_LANE_TAKE` and `NET_LANE_ADMIT`; none of the three creates anything,
 // so they need the workload contract grant but not `platform_raw`.
 
+/// `NET_LANE_ADMIT` — may a lane's owner bind a new endpoint? `arg` is a
+/// [`net_lane::ADMIT_LEN`]-byte request: `[owner slot:u16 LE][0:u16]
+/// [owner generation:u32 LE][protocol:u8][0:u8][port:u16 LE]`, protocol
+/// [`NET_PROTO_TCP`] or [`NET_PROTO_UDP`]. Returns 0; -1 (`EPERM`) when the
+/// owner is gone or draining (it admits nothing new); `EACCES` when the node's
+/// committed plan grants that owner no lease on the port, or for a caller
+/// that is not the provider. The same gate a built-in provider applies.
+pub use super::super::registry::workload::NET_LANE_ADMIT;
+/// `NET_LANE_TAKE` — the next lane change queued for the provider, as one
+/// [`net_lane`] record into `arg` (at least [`net_lane::RECORD_LEN`] bytes).
+/// Returns `RECORD_LEN`, 0 when none is queued, or `EACCES` for a caller
+/// that is not the provider. A lane's detach is queued after its attach and
+/// before any attach that reuses its channels, so a provider that takes every
+/// queued change before touching a lane never writes a channel the kernel
+/// has handed to someone else.
+pub use super::super::registry::workload::NET_LANE_TAKE;
 /// `NET_PROVIDE` — claim the net-provider role for workload lanes, stating
 /// how many lanes the provider holds. `handle` = -1, `arg` =
 /// `[lanes:u8]` ([`net_lane::PROVIDE_LEN`] bytes): the provider's lane
@@ -153,23 +168,7 @@ pub const MAX_CALLER_LANES: usize = 8;
 /// provider holds the role (a node has one network). Claiming it again from
 /// the same module is 0; a larger capacity then grows the tables, and a
 /// smaller one keeps them.
-pub const NET_PROVIDE: u32 = 0x1A0E;
-/// `NET_LANE_TAKE` — the next lane change queued for the provider, as one
-/// [`net_lane`] record into `arg` (at least [`net_lane::RECORD_LEN`] bytes).
-/// Returns `RECORD_LEN`, 0 when none is queued, or `EACCES` for a caller
-/// that is not the provider. A lane's detach is queued after its attach and
-/// before any attach that reuses its channels, so a provider that takes every
-/// queued change before touching a lane never writes a channel the kernel
-/// has handed to someone else.
-pub const NET_LANE_TAKE: u32 = 0x1A0F;
-/// `NET_LANE_ADMIT` — may a lane's owner bind a new endpoint? `arg` is a
-/// [`net_lane::ADMIT_LEN`]-byte request: `[owner slot:u16 LE][0:u16]
-/// [owner generation:u32 LE][protocol:u8][0:u8][port:u16 LE]`, protocol
-/// [`NET_PROTO_TCP`] or [`NET_PROTO_UDP`]. Returns 0; -1 (`EPERM`) when the
-/// owner is gone or draining (it admits nothing new); `EACCES` when the node's
-/// committed plan grants that owner no lease on the port, or for a caller
-/// that is not the provider. The same gate a built-in provider applies.
-pub const NET_LANE_ADMIT: u32 = 0x1A10;
+pub use super::super::registry::workload::NET_PROVIDE;
 
 /// `NET_RESOLVER` — the name-service context of a lane's owner, for the
 /// net provider. `arg` is `[owner slot:u16 LE][0:u16][owner generation:u32
@@ -179,7 +178,7 @@ pub const NET_LANE_ADMIT: u32 = 0x1A10;
 /// serves it), `ERANGE` when `arg` is too short, or `EACCES` for a caller
 /// that is not the provider. Like the lane ops it creates nothing and needs
 /// the workload contract grant but not `platform_raw`.
-pub const NET_RESOLVER: u32 = 0x1A13;
+pub use super::super::registry::workload::NET_RESOLVER;
 
 /// The per-owner name-service context: a Tier-2 option on [`CREATE`],
 /// namespace [`resolver::NS`], key [`resolver::KEY`], whose value is
@@ -334,14 +333,14 @@ pub mod net_lane {
     pub const PROVIDE_LEN: usize = 1;
 }
 
-/// `CAPS` (`0x1AFF`) — backend capability discovery. Writes the fixed prefix
+/// `CAPS` — backend capability discovery. Writes the fixed prefix
 /// `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]` then a
 /// namespace-directory the caller consults *before* flagging a Tier-2 entry
 /// required:
 ///   `[ns_count:u16] then ns_count × ([ns_len:u8][ns bytes][key_count:u16] then
 ///    key_count × ([key_len:u8][key bytes]))`.
 /// `postures`/`source_kinds`/`ops`/`net` are bitmaps over the constants below.
-pub const CAPS: u32 = 0x1AFF;
+pub use super::super::registry::workload::CAPS;
 
 // ---- posture ladder — Tier-1 `posture` field values ----
 
@@ -409,13 +408,13 @@ pub mod pack_ref {
 /// LE]` of the owner. Returns the tagged `WorkloadHandle`, `EINPROGRESS` when
 /// the identity's `CREATE` is still being staged (continue it with the same
 /// spec, or abandon it with [`DESTROY`] by identity), or `ENOENT`.
-pub const LOOKUP: u32 = 0x1A12;
+pub use super::super::registry::workload::LOOKUP;
 /// `MODULE_DIGESTS` — what the node's own image holds, so an orchestrator can
 /// pin a workload against it: writes `[count:u16 LE][0:u16]` then `count`
 /// records `[name_hash:u32 LE][sha256 of the module's full .fmod bytes:32]`
 /// into the caller's buffer (`arg`, `arg_len`), as many as fit; returns the
 /// total count. Not workload-scoped (handle -1).
-pub const MODULE_DIGESTS: u32 = 0x1A11;
+pub use super::super::registry::workload::MODULE_DIGESTS;
 /// One [`MODULE_DIGESTS`] record.
 pub const MODULE_DIGEST_RECORD: usize = 36;
 // Every other source kind is backend-defined (the linux host bundle kind is

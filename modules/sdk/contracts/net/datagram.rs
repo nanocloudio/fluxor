@@ -11,9 +11,10 @@
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto so the same SDK helpers (net_read_frame,
-// net_write_frame) serve both. Opcode ranges are
-// disjoint from net_proto so a misconfigured channel fails loudly
-// rather than silently misparsing.
+// net_write_frame) serve both, and
+// the ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives every
+// message type of every surface sharing this header a distinct value,
+// so a misconfigured channel fails loudly rather than silently misparsing.
 //
 // Endpoint identity: endpoint IDs (`ep_id: u8`) are allocated by the
 // datagram provider (`ip`, `linux_net`) in response to
@@ -80,7 +81,7 @@ pub const BIND_FLAG_RX_ONLY: u8 = 0x01;
 /// Port 0 requests ephemeral allocation. Provider responds with
 /// MSG_DG_BOUND carrying the allocated ep_id and local_port. A trailing
 /// `owner_tag` stamps the endpoint's owner; absent means tag 0.
-pub const CMD_DG_BIND: u8 = 0x20;
+pub use super::super::super::registry::msg::datagram::CMD_DG_BIND;
 
 /// Send a datagram from `ep_id` to the given destination. Source
 /// is always the endpoint's bound port; there is no per-frame source
@@ -95,12 +96,12 @@ pub const CMD_DG_BIND: u8 = 0x20;
 /// distinguished from the variable-length data:
 ///
 /// [ep_id: u8] [OWNER_TAG_MARK] [owner_tag: u16 LE] [af: u8] [addr] [port: u16 LE] [data...]
-pub const CMD_DG_SEND_TO: u8 = 0x21;
+pub use super::super::super::registry::msg::datagram::CMD_DG_SEND_TO;
 
 /// Close an endpoint and release its resources.
 /// Payload: [ep_id: u8], or the owner-tagged form
 /// [ep_id: u8] [OWNER_TAG_MARK] [owner_tag: u16 LE].
-pub const CMD_DG_CLOSE: u8 = 0x22;
+pub use super::super::super::registry::msg::datagram::CMD_DG_CLOSE;
 
 /// Marker byte introducing the owner tag on CMD_DG_SEND_TO and
 /// CMD_DG_CLOSE. It occupies the byte that otherwise holds `af`, and is
@@ -122,7 +123,7 @@ pub const OWNER_TAG_NONE: u16 = 0;
 /// Bind completed. Consumer learns ep_id and the actual local port
 /// (which may differ from the requested port if port 0 was used).
 /// Payload: [ep_id: u8] [local_port: u16 LE].
-pub const MSG_DG_BOUND: u8 = 0x40;
+pub use super::super::super::registry::msg::datagram::MSG_DG_BOUND;
 
 /// Parts of a `MSG_DG_BOUND` payload: `(ep_id, local_port)`.
 ///
@@ -142,14 +143,14 @@ pub fn dg_bound_parts(payload: &[u8]) -> (u8, u16) {
 ///
 /// IPv4 payload: [ep_id: u8] [af: u8 = 4] [src_addr: 4 bytes BE] [src_port: u16 LE] [data...]
 /// IPv6 payload: [ep_id: u8] [af: u8 = 6] [src_addr: 16 bytes BE] [src_port: u16 LE] [data...]
-pub const MSG_DG_RX_FROM: u8 = 0x41;
+pub use super::super::super::registry::msg::datagram::MSG_DG_RX_FROM;
 
 /// Endpoint closed (by consumer request or provider teardown).
 /// Payload: [ep_id: u8].
-pub const MSG_DG_CLOSED: u8 = 0x42;
+pub use super::super::super::registry::msg::datagram::MSG_DG_CLOSED;
 
 /// Endpoint error. Payload: [ep_id: u8] [errno: i8].
-pub const MSG_DG_ERROR: u8 = 0x43;
+pub use super::super::super::registry::msg::datagram::MSG_DG_ERROR;
 
 // ─── Payload layout helpers ────────────────────────────────────────
 

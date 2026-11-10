@@ -13,8 +13,7 @@
     reason = "the contract and core are mounted whole; the bridge reaches a part"
 )]
 
-#[path = "../../modules/sdk/contracts/net/session_ctrl.rs"]
-mod sc;
+use fluxor_abi::contracts::net::session_ctrl as sc;
 
 include!("../../modules/sdk/crypto/sha256.rs");
 include!("../../modules/sdk/contracts/net/transport_continuity.rs");

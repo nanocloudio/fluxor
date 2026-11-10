@@ -452,7 +452,7 @@ pub struct TargetDescriptor {
     /// step on the kernel stack, in KiB (`[kernel] kernel_stack_reserve_kb`).
     pub kernel_stack_reserve_kb: Option<u32>,
     /// Whether the target has an MMU — derived from the isolation facts'
-    /// region model, so paged arenas and isolation agree about it.
+    /// region model.
     pub has_mmu: bool,
     /// The target's isolation facts.
     pub isolation: IsolationFacts,
@@ -492,11 +492,11 @@ impl PlatformProviders {
         };
         let check = |names: &[String]| -> Result<()> {
             for n in names {
-                if !fluxor_contracts::vocabulary::PROVIDER_CONTRACTS.contains(&n.as_str()) {
+                if !crate::manifest::provider_contracts().contains(&n.as_str()) {
                     return Err(Error::Config(format!(
                         "{}: [providers] names '{n}', which is not a provider contract ({})",
                         path.display(),
-                        fluxor_contracts::vocabulary::PROVIDER_CONTRACTS.join(", ")
+                        crate::manifest::provider_contracts().join(", ")
                     )));
                 }
             }

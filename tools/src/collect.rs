@@ -29,13 +29,9 @@
 
 use std::collections::BTreeMap;
 
-/// Wire contract, `include!`d verbatim from the module SDK so the host
-/// decoder and the device emitter compile the same bytes — the same
-/// single-source pattern the test harness uses for encoder cores.
-pub mod tlm {
-    #![allow(dead_code, reason = "host decoder consumes a subset of the contract")]
-    include!("../../modules/sdk/contracts/telemetry.rs");
-}
+/// Wire contract, from the module SDK through `fluxor-abi`, so the host
+/// decoder and the device emitter compile the same bytes.
+pub use fluxor_abi::contracts::telemetry as tlm;
 
 use crate::manifest::InstrumentKind;
 

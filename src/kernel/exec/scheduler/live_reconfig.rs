@@ -7,7 +7,7 @@ use super::*;
 // ============================================================================
 //
 // Raw primitives exposed to the `modules/reconfigure` PIC module via the
-// `dev_system` reconfigure opcodes (0x0C67–0x0C6F).
+// `dev_system` reconfigure opcodes (`reconfigure::SET_PHASE`–`reconfigure::MODULE_DONE`).
 
 /// Return the current reconfigure phase.
 pub fn reconfigure_phase() -> ReconfigurePhase {

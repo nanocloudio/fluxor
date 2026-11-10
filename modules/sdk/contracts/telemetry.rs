@@ -45,16 +45,15 @@ pub const PSTATUS_POOL: u8 = 3;
 
 // ── Syscall op numbers ────────── TLM_EMIT is an implicit primitive (any
 // module, like LOG_WRITE); the consumer ops require the read-only `observe`
-// permission. Kept out of the monitor range `0x0C52..=0x0C5F` (blanket
-// monitor-gated).
-/// Append one record to the telemetry ring (kernel stamps identity).
-pub const TLM_EMIT: u32 = 0x0C3E;
-/// Claim a drain slot with a filter word; returns the slot id (or negative).
-pub const TLM_SUBSCRIBE: u32 = 0x0C4D;
+// permission.
 /// Copy whole records from a slot into a buffer; advances the tail.
-pub const TLM_DRAIN: u32 = 0x0C4E;
+pub use super::super::registry::telemetry::TLM_DRAIN;
+/// Append one record to the telemetry ring (kernel stamps identity).
+pub use super::super::registry::telemetry::TLM_EMIT;
 /// Ring head + per-slot lag/drop counters.
-pub const TLM_STATS: u32 = 0x0C4F;
+pub use super::super::registry::telemetry::TLM_STATS;
+/// Claim a drain slot with a filter word; returns the slot id (or negative).
+pub use super::super::registry::telemetry::TLM_SUBSCRIBE;
 
 /// Consumer slots the ring exposes — the `TLM_STATS` reply is
 /// `[head u32][dropped u32 × RING_CONSUMERS]`, so a caller sizes its buffer
@@ -67,8 +66,8 @@ pub const TLM_STATS_LEN: usize = 4 + RING_CONSUMERS * 4;
 
 /// `TLM_SUBSCRIBE` arg layout: a 4-byte filter word, optionally followed by an
 /// 8-byte LE PSTATUS cadence (ms) the subscriber wants the kernel to emit at.
-/// Folding the cadence into subscribe avoids a separate op in the full
-/// `0x0C4x` space; `0` / a 4-byte arg leaves the kernel default.
+/// Folding the cadence into subscribe avoids a separate op; `0` / a 4-byte
+/// arg leaves the kernel default.
 pub const SUBSCRIBE_INTERVAL_OFFSET: usize = 4;
 
 // ── Reserved module identities (kernel-stamped) ─────────────── The kernel

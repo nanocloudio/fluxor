@@ -255,17 +255,17 @@ the handle's contract.
 
 | Class | ID | Opcode Range |
 |-------|----|-------------|
-| Event | `0x0B` | `0x0B00-0x0BFF` |
+| Event | `0x04` | `0x0400-0x04FF` |
 
 ### Opcodes
 
 | Opcode | Name | Args | Returns |
 |--------|------|------|---------|
-| `0x0B00` | `CREATE` | handle=-1 | Event handle (>=0) or error |
-| `0x0B01` | `SIGNAL` | handle=event | 0 or error |
-| `0x0B02` | `POLL` | handle=event | 1 (was signaled), 0 (not), or error |
-| `0x0B03` | `DESTROY` | handle=event | 0 or error |
-| `0x0C51` | `BIND_IRQ` (kernel_abi::event; kernel-primitive 0x0C5x range) | handle=event, arg=[irq:u32 LE, mmio_base:u64 LE] (12B) | 0 or error |
+| `0x0400` | `CREATE` | handle=-1 | Event handle (>=0) or error |
+| `0x0401` | `SIGNAL` | handle=event | 0 or error |
+| `0x0402` | `POLL` | handle=event | 1 (was signaled), 0 (not), or error |
+| `0x0403` | `DESTROY` | handle=event | 0 or error |
+| `0x0451` | `BIND_IRQ` | handle=event, arg=[irq:u32 LE, mmio_base:u64 LE] (12B) | 0 or error |
 
 ### Error Codes
 

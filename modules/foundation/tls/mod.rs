@@ -48,9 +48,8 @@ use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
+use abi::contracts::net::net_proto;
 use abi::SyscallTable;
-#[path = "../../sdk/contracts/net/net_proto.rs"]
-mod net_proto;
 
 // PIC runtime (syscalls, helpers, intrinsics)
 include!("../../sdk/runtime.rs");

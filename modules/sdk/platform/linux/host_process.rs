@@ -1,4 +1,4 @@
-// Platform: linux host-process operations (contract class 0x1B).
+// Platform: linux host-process operations (contract class `host_process`).
 //
 // Layer: platform/linux (host-specific, unstable). Host-PROCESS mechanics —
 // command execution, PTY sessions, stdout/stderr drains, the host-process
@@ -15,11 +15,8 @@
 // unregistered class returns `ENOSYS`, which IS the discovery.
 
 /// Provider contract class for host-process ops.
-pub const CLASS: u16 = 0x001B;
+pub const CLASS: u16 = super::super::super::registry::host_process::ID;
 
-/// Drain merged stdout/stderr. `arg = [workload_fd: i32 LE][out …]`; returns
-/// bytes written into `out` after the fd prefix (0 = none pending).
-pub const READ: u32 = 0x1B01;
 /// One-shot command in a running workload. `arg = [workload_fd: i32 LE]
 /// [payload …]` (payload wire per the linux backend docs). The command
 /// joins the workload — its namespaces (every one, or it does not run), its
@@ -27,7 +24,12 @@ pub const READ: u32 = 0x1B01;
 /// and system-call filter (see [`SOURCE_HOST_PROCESS`]) — and holds no
 /// descriptor of the runtime's. `EINVAL` before START or while the workload
 /// is PAUSEd, `ESRCH` when its container is gone.
-pub const EXEC: u32 = 0x1B02;
+pub use super::super::super::registry::host_process::EXEC;
+/// Drain merged stdout/stderr. `arg = [workload_fd: i32 LE][out …]`; returns
+/// bytes written into `out` after the fd prefix (0 = none pending).
+pub use super::super::super::registry::host_process::READ;
+/// Kill+reap+free a session. Session id in `arg`.
+pub use super::super::super::registry::host_process::TTY_CLOSE;
 /// Open an interactive PTY session. `arg = [workload_fd: i32 LE][params …]`.
 /// The session joins the workload as [`EXEC`] does, with the same refusals.
 /// The session belongs to whoever opened it — the calling module, under its
@@ -35,13 +37,11 @@ pub const EXEC: u32 = 0x1B02;
 /// module or owner answer `EACCES`, and an unknown session id `EINVAL`. The
 /// session is closed (its process killed and reaped) when the opener's owner
 /// is released, and when the workload it joined is destroyed.
-pub const TTY_OPEN: u32 = 0x1B03;
-/// Pump a session (stdin/out/exit). Session id in `arg` (unchanged framing).
-pub const TTY_STEP: u32 = 0x1B04;
+pub use super::super::super::registry::host_process::TTY_OPEN;
 /// Resize a session's window. Session id in `arg`.
-pub const TTY_RESIZE: u32 = 0x1B05;
-/// Kill+reap+free a session. Session id in `arg`.
-pub const TTY_CLOSE: u32 = 0x1B06;
+pub use super::super::super::registry::host_process::TTY_RESIZE;
+/// Pump a session (stdin/out/exit). Session id in `arg` (unchanged framing).
+pub use super::super::super::registry::host_process::TTY_STEP;
 
 /// Host-only `source_kind` for the workload CREATE header: the source-ref
 /// carries explicit host-process spawn params, realized by the linux
@@ -192,7 +192,7 @@ pub const GROUPS_STRICT: u8 = 1 << 0;
 /// argument, no workload fd; returns the [`caps`] bit set. A bit is set only
 /// when the runtime holds the privilege the feature needs, so a writer that
 /// reads it never sends a request the host would refuse.
-pub const CAPS: u32 = 0x1B00;
+pub use super::super::super::registry::host_process::CAPS;
 
 /// [`CAPS`] bits.
 pub mod caps {
@@ -215,32 +215,31 @@ pub mod caps {
 /// provider spawns a command and streams its output. Registered only by the
 /// linux platform; the kernel routes its fd tag via the dynamic tag-route
 /// registration, keeping the generic kernel free of host vocabulary.
-pub const PROC_CLASS: u16 = 0x0016;
+pub const PROC_CLASS: u16 = super::super::super::registry::proc::ID;
 
+/// Kill if still running, reap, and free the slot.
+pub use super::super::super::registry::proc::PROC_CLOSE;
+/// Read merged stdout and stderr. `arg` = the output buffer; returns the
+/// bytes written, 0 when nothing is ready this step.
+pub use super::super::super::registry::proc::PROC_READ;
 /// Spawn a command. `handle = -1`, `arg` = the command line (UTF-8, words
 /// split on whitespace). The executable must be on the node's allowlist
 /// (`SECTOR_PROC_ALLOW`); it starts in the granted root with only the
 /// granted environment. Returns a [`FD_TAG_PROC`]-tagged handle, `EACCES`
 /// for a command off the allowlist, `ENOMEM` with every slot in use.
-pub const PROC_SPAWN: u32 = 0x1600;
-/// Read merged stdout and stderr. `arg` = the output buffer; returns the
-/// bytes written, 0 when nothing is ready this step.
-pub const PROC_READ: u32 = 0x1601;
+pub use super::super::super::registry::proc::PROC_SPAWN;
 /// Whether the command has finished: 1 while it runs or output is still to
 /// be read, 0 once it has exited and every byte was read. On 0, an `arg` of
 /// at least 4 bytes receives its exit code (i32 LE): `128 + signal` when a
 /// signal ended it, -1 when it could not be read. A command past the grant's
 /// timeout is killed and reported so.
-pub const PROC_STATUS: u32 = 0x1602;
-/// Kill if still running, reap, and free the slot.
-pub const PROC_CLOSE: u32 = 0x1603;
+pub use super::super::super::registry::proc::PROC_STATUS;
 
 /// `workload` CAPS `source_kinds` bit for [`SOURCE_HOST_PROCESS`] (bit 1 — the
 /// stable contract defines only bit 0, `SOURCE_FMOD_GRAPH`; higher bits are
 /// backend-defined and this is the linux backend's).
 pub const CAPS_SOURCE_HOST_PROCESS: u8 = 1 << 1;
 
-/// Host process-executor handle tag (class [`PROC_CLASS`], 0x0016) —
-/// the proc-executor's spawned-process handles. Numeric value is a kernel
-/// fd-tag registry reservation; the semantic constant lives here.
-pub const FD_TAG_PROC: i32 = 25;
+/// Host process-executor handle tag: the `proc` contract's id, carried by
+/// the proc-executor's spawned-process handles.
+pub const FD_TAG_PROC: i32 = super::super::super::registry::proc::FD_TAG;

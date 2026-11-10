@@ -856,9 +856,6 @@ version = "0.0.1"
 [[package]]
 name = "fluxor-contracts"
 version = "0.0.1"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "fluxor-launcher"

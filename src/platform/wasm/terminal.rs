@@ -4,7 +4,7 @@
 //! embedded targets — see the log strings flow at runtime without
 //! needing F12 / DevTools.
 //!
-//! Drains via the diag-contract `LOG_RING_DRAIN` opcode (0x0C64),
+//! Drains via the diag-contract `LOG_RING_DRAIN` opcode (`diag::LOG_RING_DRAIN`),
 //! identical to `modules/foundation/log_net` on the embedded side.
 //! Multi-consumer: the kernel's log ring supports independent
 //! tails, so a graph can wire both `wasm_browser_terminal` AND
@@ -28,7 +28,7 @@ extern "C" {
 /// LOG_RING_DRAIN opcode (diag contract). Returns the number of
 /// bytes written into the caller's buffer, or 0 when the ring is
 /// empty. Matches the opcode used by `log_net`.
-const LOG_RING_DRAIN: u32 = 0x0C64;
+use crate::abi::registry::diag::LOG_RING_DRAIN;
 
 /// Per-tick drain budget. Sized to keep one step under a few
 /// hundred microseconds even on the slowest paths; the host shim

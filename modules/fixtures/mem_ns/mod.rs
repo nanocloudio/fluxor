@@ -2,7 +2,7 @@
 //!
 //! The contract-proving provider for the namespace surface
 //! (`modules/sdk/contracts/storage/namespace.rs`), and the implementor of
-//! `BIND` (0x1308) that proves it. Exists so the surface — and the
+//! `BIND` that proves it. Exists so the surface — and the
 //! `mount` routing tier above it — is testable with **no on-disk
 //! format in the loop**: a repo that owns a contract holds an in-repo
 //! provider that proves it.
@@ -75,17 +75,17 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 
 // Namespace contract opcodes (modules/sdk/contracts/storage/namespace.rs).
-const NS_LOOKUP: u32 = 0x1300;
-const NS_STAT: u32 = 0x1301;
-const NS_LIST: u32 = 0x1302;
-const NS_RENAME: u32 = 0x1303;
-const NS_DELETE: u32 = 0x1304;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const NS_CLOSE: u32 = 0x1306;
-const NS_CHANGES: u32 = 0x1307;
-const NS_BIND: u32 = 0x1308;
-const NS_TAKE_RUNG: u32 = 0x1309;
-const NS_CAPS: u32 = 0x13FF;
+const NS_LOOKUP: u32 = abi::registry::storage_namespace::LOOKUP;
+const NS_STAT: u32 = abi::registry::storage_namespace::STAT;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
+const NS_RENAME: u32 = abi::registry::storage_namespace::RENAME;
+const NS_DELETE: u32 = abi::registry::storage_namespace::DELETE;
+const NS_SUBSCRIBE: u32 = abi::registry::storage_namespace::SUBSCRIBE;
+const NS_CLOSE: u32 = abi::registry::storage_namespace::CLOSE;
+const NS_CHANGES: u32 = abi::registry::storage_namespace::CHANGES;
+const NS_BIND: u32 = abi::registry::storage_namespace::BIND;
+const NS_TAKE_RUNG: u32 = abi::registry::storage_namespace::TAKE_RUNG;
+const NS_CAPS: u32 = abi::registry::storage_namespace::CAPS;
 
 // namespace.rs::caps bits.
 const NS_CAP_BIND: u32 = 1 << 0;

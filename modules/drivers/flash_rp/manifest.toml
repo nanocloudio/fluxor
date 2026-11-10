@@ -1,6 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
-permissions = ["flash_raw", "backing_provider"]
+permissions = ["flash_raw"]
 # `store` (out[2]) is a `storage.block` source over the flash's data store.
 provides = ["storage.block"]
 

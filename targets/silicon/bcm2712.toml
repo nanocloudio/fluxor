@@ -93,6 +93,6 @@ isolated_slots = 2
 # `storage.*` is the board's key store (the node's own modules; a workload is
 # refused EACCES), `fs` is a workload's root on the node's volume (the node
 # reaches that volume through its module provider).
-platform = ["net_policy", "net_route", "pcie_device", "platform_nic_ring",
+platform = ["metal_device", "net_policy", "net_route", "pcie_device", "platform_nic_ring",
             "storage.namespace", "storage.object", "workload"]
 workload = ["fs"]

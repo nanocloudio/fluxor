@@ -2,8 +2,8 @@
 //!
 //! Drives the reconfigure state machine
 //! (RUNNING → DRAINING → MIGRATING → RUNNING) using kernel primitives
-//! exposed via the `dev_system` reconfigure opcodes (0x0C67-0x0C6F, and
-//! `SLOT_CAPACITY` at 0x0C23).
+//! exposed via the `dev_system` reconfigure opcodes (`reconfigure::SET_PHASE`-`reconfigure::MODULE_DONE`, and
+//! `SLOT_CAPACITY` at `reconfigure::SLOT_CAPACITY`).
 //! Graphs that do not include this module carry none of the drain,
 //! transition, or timeout logic.
 //!
@@ -50,9 +50,10 @@ use abi::internal::reconfigure::{
     CALL_DRAIN as SYS_RECONFIG_CALL_DRAIN, MARK_FINISHED as SYS_RECONFIG_MARK_FINISHED,
     MODULE_COUNT as SYS_RECONFIG_MODULE_COUNT, MODULE_DONE as SYS_RECONFIG_MODULE_DONE,
     MODULE_INFO as SYS_RECONFIG_MODULE_INFO, MODULE_UPSTREAM as SYS_RECONFIG_MODULE_UPSTREAM,
-    SELF_INDEX as SYS_RECONFIG_SELF_INDEX, SET_PHASE as SYS_RECONFIG_SET_PHASE,
-    SLOT_CAPACITY as SYS_RECONFIG_SLOT_CAPACITY, TRIGGER_REBUILD as SYS_RECONFIG_TRIGGER_REBUILD,
+    SET_PHASE as SYS_RECONFIG_SET_PHASE, SLOT_CAPACITY as SYS_RECONFIG_SLOT_CAPACITY,
+    TRIGGER_REBUILD as SYS_RECONFIG_TRIGGER_REBUILD,
 };
+use abi::kernel_abi::SELF_INDEX as SYS_SELF_INDEX;
 
 // Optional graph_slot integration. When a graph_slot provider is
 // registered (wire `reconfigure.gs_req` → `graph_slot.requests`), the
@@ -159,7 +160,7 @@ struct State {
 // ============================================================================
 
 unsafe fn sys_self_index(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, SYS_RECONFIG_SELF_INDEX, core::ptr::null_mut(), 0)
+    (sys.provider_call)(-1, SYS_SELF_INDEX, core::ptr::null_mut(), 0)
 }
 
 unsafe fn sys_set_phase(sys: &SyscallTable, phase: u8) {

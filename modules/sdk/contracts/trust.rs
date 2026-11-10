@@ -22,7 +22,7 @@
 
 /// Provider class id (opcode class 0x1Dxx). Mirrors
 /// `kernel::module::provider::contract::TRUST`.
-pub const CLASS: u16 = 0x001D;
+pub const CLASS: u16 = super::super::registry::trust::ID;
 
 /// Returns 1 when a trust provider is present. Where none is registered
 /// nothing answers this class at all, so the caller sees a negative errno
@@ -31,7 +31,7 @@ pub const CLASS: u16 = 0x001D;
 /// handshake; composition refuses a graph that asks for platform
 /// verification on a target with no provider before either, through the
 /// `trust.system` target capability.
-pub const PROBE: u32 = 0x1D00;
+pub use super::super::registry::trust::PROBE;
 
 /// Verify a certificate chain against the platform's trust policy.
 /// handle=-1.
@@ -69,7 +69,7 @@ pub const PROBE: u32 = 0x1D00;
 /// says the platform did not answer, so a consumer must fail closed
 /// WITHOUT recording that the platform refused the chain — and must never
 /// read it as a pass.
-pub const VERIFY: u32 = 0x1D01;
+pub use super::super::registry::trust::VERIFY;
 
 /// What the chain is being verified FOR. A platform applies different
 /// policy to a server it is dialling than to a client presenting itself,

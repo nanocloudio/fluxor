@@ -20,15 +20,15 @@ pub mod edge {
     pub const BOTH: u8 = 3;
 }
 
-pub const CLAIM: u32 = 0x0100;
-pub const RELEASE: u32 = 0x0101;
-pub const SET_MODE: u32 = 0x0102;
-pub const SET_PULL: u32 = 0x0103;
-pub const SET_LEVEL: u32 = 0x0104;
-pub const GET_LEVEL: u32 = 0x0105;
-pub const SET_OUTPUT: u32 = 0x0106;
-pub const SET_INPUT: u32 = 0x0107;
+pub use super::super::super::registry::gpio::CLAIM;
+pub use super::super::super::registry::gpio::GET_LEVEL;
+pub use super::super::super::registry::gpio::RELEASE;
+pub use super::super::super::registry::gpio::SET_INPUT;
+pub use super::super::super::registry::gpio::SET_LEVEL;
+pub use super::super::super::registry::gpio::SET_MODE;
+pub use super::super::super::registry::gpio::SET_OUTPUT;
+pub use super::super::super::registry::gpio::SET_PULL;
 /// Bind event to GPIO edge. handle=gpio (pin).
 /// arg[0]=edge (1=rising, 2=falling, 3=both), arg[1..5]=event_handle (i32 LE).
 /// Sets up edge detection and auto-signals the event on each detected edge.
-pub const WATCH_EDGE: u32 = 0x010A;
+pub use super::super::super::registry::gpio::WATCH_EDGE;

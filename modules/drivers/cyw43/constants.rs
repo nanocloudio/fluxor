@@ -79,7 +79,7 @@ pub const IRQ_COMMAND_ERROR: u32 = 0x0008;
 pub const IRQ_DATA_ERROR: u32 = 0x0010;
 pub const IRQ_F2_PACKET_AVAILABLE: u32 = 0x0020;
 pub const IRQ_F1_OVERFLOW: u32 = 0x0080;
-pub const IRQ_F1_INTR: u32 = 0x2000;
+pub const IRQ_F1_INTR: u32 = 1 << 13;
 
 /// Status register bits
 pub const STATUS_DATA_NOT_AVAILABLE: u32 = 0x00000001;
@@ -482,7 +482,7 @@ pub const MAX_FRAME_SIZE: usize = 2048;
 /// 8.8 fixed-point format: 3.0 = 0x0300
 /// The divider for the RM2 module's gSPI clock.
 /// PIO infrastructure shifts left 8 to build register value.
-pub const DEFAULT_CLOCK_DIV: u32 = 0x0300;
+pub const DEFAULT_CLOCK_DIV: u32 = 3 << 8;
 
 // ============================================================================
 // NVRAM Data (board configuration for CYW43439)

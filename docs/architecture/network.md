@@ -818,11 +818,11 @@ construct. A repeated authenticated transaction (same key and MAC) inside
 `TXN_RETAIN_MS` is answered from the retained response. Messages are UDP,
 at most 512 bytes.
 
-## Network Functions: NAT, Mirrors, Chains, Attachment Tunnels, Offload
+## Network Functions: NAT, Mirrors, Chains, Attachment Tunnels
 
 The primitives a managed traffic fabric's packet paths are built from
-(an egress gateway, a service-chain director, a private-service broker
-and an offload gate), as SDK cores a module includes and decision-seam
+(an egress gateway, a service-chain director and a private-service
+broker), as SDK cores a module includes and decision-seam
 dispositions `ip` honours. Apart from the seam's own modules
 (`seam_shard`, `fwd_split`, `rescue_tunnel`), no module here wires the
 cores into a translator, chain hop or tunnel end — those modules are the
@@ -969,13 +969,6 @@ consumer's.
   made where the key is: `at_seal_mac` / `at_open_mac` take the MAC as a
   function (a vault `HMAC_SHA256` slot's `SIGN`), byte-identical to
   `at_seal` / `at_open` under the key.
-- **Offload** (`contracts/net/offload.rs`). What a hardware flow-decision
-  provider says and is told: its attested `(generation, digest)` and
-  capabilities, each decision against the seam's `pkt_id` so the director
-  can decide the same packet and compare, its counters, and the mode
-  (off/shadow/active) the director sets. The gate that decides whether to
-  believe it is the director's. Contract only: no provider exists; one
-  **needs hardware**.
 
 ## Platform Stack Expansion
 
@@ -1096,9 +1089,9 @@ by their source, and an advertisement by its target.
 **The VIP authority's token** (`identity.rs` §The VIP authority's token). With `arm_authority` set, an install is disarmed
 whatever it asks, and `ADDR_ARM` must carry the authority's emission token
 after its install token (`[auth_len u16][auth]`). `ip` does not parse it: it
-asks the authority it wires (`auth_req` out[7], `MSG_ARM_AUTH_CHECK` 0x7A
+asks the authority it wires (`auth_req` out[7], `MSG_ARM_AUTH_CHECK` 0xAC
 with the install generation and this host's boot incarnation) and arms only
-on an accepting `ARM_AUTH_VERDICT` (0x7B, matched by address, generation and
+on an accepting `ARM_AUTH_VERDICT` (0xAD, matched by address, generation and
 the token's digest on `auth_rsp` in[5]). A refusal is `MSG_ADDR_REFUSED` with
 `0x80 | code`; no token is `refusal::NO_AUTHORITY`; no verdict within
 `ARM_AUTH_WAIT_MS` is `refusal::AUTHORITY`. Unwired, nothing arms. The

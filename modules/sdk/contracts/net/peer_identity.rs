@@ -30,7 +30,7 @@
 // offers a shortcut that skips them.
 
 /// Frame type for a peer-identity record.
-pub const MSG_PEER_IDENTITY: u8 = 0x5A;
+pub use super::super::super::registry::msg::peer_identity::MSG_PEER_IDENTITY;
 
 /// `[msg_type:1][payload_len:2]`.
 pub const FRAME_HDR: usize = 3;

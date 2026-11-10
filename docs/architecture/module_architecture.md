@@ -559,8 +559,8 @@ module can only read its own:
 
 | Opcode | Use |
 |---|---|
-| `PROGRAM_INFO` (`0x0C2B`) | `arg[0]` = slot in; out: in-place address (0 on wasm), size, kind, region address and length, format (`program::INFO_LEN` bytes). `ENOENT` for no program in that slot. |
-| `PROGRAM_READ` (`0x0C2C`) | `arg` = `[slot][0; 3][offset: u32 LE]` in, program bytes from `offset` out; answers the count, 0 at the end. |
+| `PROGRAM_INFO` (`0x002B`) | `arg[0]` = slot in; out: in-place address (0 on wasm), size, kind, region address and length, format (`program::INFO_LEN` bytes). `ENOENT` for no program in that slot. |
+| `PROGRAM_READ` (`0x002C`) | `arg` = `[slot][0; 3][offset: u32 LE]` in, program bytes from `offset` out; answers the count, 0 at the end. |
 
 Both are ungated and need no capability. The kernel bounds the section
 against the mapped bundle and checks its layout — entries in owner

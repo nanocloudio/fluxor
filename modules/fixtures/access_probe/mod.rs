@@ -42,7 +42,7 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 
-const MMIO_READ32: u32 = 0x0CE4;
+const MMIO_READ32: u32 = abi::registry::metal_device::MMIO_READ32;
 const EFAULT: i32 = -14;
 
 #[repr(C)]

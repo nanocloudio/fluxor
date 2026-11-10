@@ -12,7 +12,7 @@ pub const UF2_MAGIC_START1: u32 = 0x9E5D5157;
 pub const UF2_MAGIC_END: u32 = 0x0AB16F30;
 pub const UF2_BLOCK_SIZE: usize = 512;
 pub const UF2_DATA_SIZE: usize = 256;
-pub const UF2_FLAGS_FAMILY: u32 = 0x2000;
+pub const UF2_FLAGS_FAMILY: u32 = 1 << 13;
 
 /// RP2350 ARM Secure family ID
 pub const UF2_FAMILY_RP2350: u32 = 0xE48BFF59;

@@ -375,10 +375,10 @@ tiers exclusively via bridge rings:
 - The bridge slot indices are populated into each ISR-tier module's
   `in_bridges` / `out_bridges` arrays at admission time.
 - From inside the step body, a module discovers its own bridge
-  endpoints with the `SELF_BRIDGES` op (`0x0C44`), which returns
+  endpoints with the `SELF_BRIDGES` op (`0x2244`), which returns
   tagged bridge fds, and then moves data with the bridge ops
-  `WRITE` (`0x0CE0`), `READ` (`0x0CE1`), `POLL` (`0x0CE2`), and
-  `INFO` (`0x0CE3`). These five ops are exempt from the ISR-tier
+  `WRITE` (`0x22E0`), `READ` (`0x22E1`), `POLL` (`0x22E2`), and
+  `INFO` (`0x22E3`). These five ops are exempt from the ISR-tier
   syscall deny because the underlying ring operations are lock-free
   and allocation-free; every other `provider_call` op is denied from
   ISR context. Up to `MAX_BRIDGES_PER_MODULE` (4) input and output

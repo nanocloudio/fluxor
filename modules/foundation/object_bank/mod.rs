@@ -103,13 +103,13 @@ include!("../../sdk/cores/bank_stream.rs");
 
 /// storage.namespace opcodes (enumerate) + storage.object opcodes
 /// (stream). Mirror of `abi::contracts::storage::{namespace,object}`.
-const NS_LOOKUP: u32 = 0x1300;
-const NS_LIST: u32 = 0x1302;
-const NS_CLOSE: u32 = 0x1306;
-const NS_CAPS: u32 = 0x13FF;
-const OBJ_GET: u32 = 0x1421;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_CLOSE: u32 = 0x1425;
+const NS_LOOKUP: u32 = abi::registry::storage_namespace::LOOKUP;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
+const NS_CLOSE: u32 = abi::registry::storage_namespace::CLOSE;
+const NS_CAPS: u32 = abi::registry::storage_namespace::CAPS;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
 
 /// Close any currently open handle. Used between selections + on
 /// auto-advance EOF detection.

@@ -1,9 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
-# Lattice KV — paged-arena key-value store. Demonstrates transparent
-# demand paging on MMU-capable targets (bcm2712) and resident-arena
-# storage on MMU-less targets (rp2350).
+# Lattice KV — a key-value store in the module's resident arena.
 
 # The store reads its heap arena raw (`ARENA_GET` in `module_new`), so the
 # kernel commits the whole cap at instantiation (params tag 0xEE).

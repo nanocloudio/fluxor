@@ -105,7 +105,7 @@ mod playback_backend {
 use std::io::{Seek, SeekFrom};
 
 const LINUX_AUDIO_HASH: u32 = 0xF62EA500; // fnv1a32("linux_audio")
-const STREAM_CLOCK_QUERY: u32 = 0x1C00;
+use fluxor::abi::registry::stream_clock::QUERY as STREAM_CLOCK_QUERY;
 
 struct LinuxAudioClock {
     started: bool,

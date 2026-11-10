@@ -1,7 +1,7 @@
 // Credentials named by path and read at runtime.
 //
 // `cert_file`, `key_file` and `trust` given as a plain path are read by the
-// instance itself, through the `fs` contract (class 0x09: OPEN / READ /
+// instance itself, through the `fs` contract (class `fs`: OPEN / READ /
 // CLOSE), so an image carries no credential and no deployment's trust: the
 // platform's file surface supplies them where the instance runs. On the
 // Linux host that surface is the caller's — the host's paths for a node

@@ -67,18 +67,16 @@ pub fn has_abi_surface(repo: &Path) -> bool {
 pub fn compute(repo: &Path) -> Result<PinPlan> {
     use sha2::{Digest, Sha256};
 
-    let srcpin = crate::hash::compute_contracts_platform_src_hash(repo)?;
+    // The registry is generated first: the pin covers the generated file.
+    let gen_path = crate::abi_registry::gen_path(repo);
+    let generated = crate::abi_registry::generate(repo)?;
+    let srcpin = crate::hash::compute_contracts_platform_src_hash_with(
+        repo,
+        &[(gen_path.clone(), generated.clone())],
+    )?;
 
-    // Mirror `abi_surface::write_surface`: numeric walk ‖ "contracts_platform_src"\0 ‖ srcpin.
     let mut h = Sha256::new();
-    crate::abi_surface::for_each_field(&mut |name, value| {
-        h.update(name.as_bytes());
-        h.update([0u8]);
-        h.update(value.to_le_bytes());
-    });
-    h.update(b"contracts_platform_src");
-    h.update([0u8]);
-    h.update(srcpin);
+    crate::abi_surface::write_surface_with(&srcpin, &mut |b| h.update(b));
     let digest: [u8; 32] = h.finalize().into();
     let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
 
@@ -96,7 +94,7 @@ pub fn compute(repo: &Path) -> Result<PinPlan> {
 
     Ok(PinPlan {
         digest_hex,
-        edits: vec![(srcpin_file, sp), (hash_file, hs)],
+        edits: vec![(gen_path, generated), (srcpin_file, sp), (hash_file, hs)],
     })
 }
 

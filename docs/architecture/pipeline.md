@@ -515,17 +515,6 @@ instance takes over without dropping connections. See
 [reconfigure.md](reconfigure.md) for the full state machine and the
 drain protocol.
 
-## Demand-Paged Arenas
-
-On targets with an MMU (BCM2712 / Pi 5), modules can request
-demand-paged arenas larger than physical RAM. The kernel allocates
-virtual address space backed by a page pool with clock eviction and a
-backing store (NVMe or RAM disk). The module sees a flat large arena
-and accesses pages directly; the kernel handles faults transparently.
-This lets data-heavy workloads (large lookup tables, decoded image
-caches, streaming buffers) run on the same scheduler that drives
-microsecond-scale audio modules.
-
 ## Static Memory
 
 Source: `src/kernel/exec/scheduler/merge.rs`, `src/kernel/config.rs`

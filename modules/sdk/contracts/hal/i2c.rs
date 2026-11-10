@@ -2,11 +2,11 @@
 //
 // Layer: contracts/hal (public, stable).
 
-pub const OPEN: u32 = 0x0300;
-pub const CLOSE: u32 = 0x0301;
-pub const WRITE: u32 = 0x0302;
-pub const READ: u32 = 0x0303;
-pub const WRITE_READ: u32 = 0x0304;
-pub const CLAIM: u32 = 0x0305;
-pub const RELEASE: u32 = 0x0306;
-pub const GET_CAPS: u32 = 0x0307;
+pub use super::super::super::registry::i2c::CLAIM;
+pub use super::super::super::registry::i2c::CLOSE;
+pub use super::super::super::registry::i2c::GET_CAPS;
+pub use super::super::super::registry::i2c::OPEN;
+pub use super::super::super::registry::i2c::READ;
+pub use super::super::super::registry::i2c::RELEASE;
+pub use super::super::super::registry::i2c::WRITE;
+pub use super::super::super::registry::i2c::WRITE_READ;

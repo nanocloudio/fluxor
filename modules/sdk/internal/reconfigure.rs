@@ -6,31 +6,23 @@
 // drain / transition-plan / timeout logic lives in that module. Not
 // part of the public ABI.
 
-/// Return the caller's own module index. handle=-1, arg=NULL.
-/// Returns the index, or negative errno if the calling context is unknown.
-pub const SELF_INDEX: u32 = 0x0C67;
-/// Set the current reconfigure phase.
-/// handle=-1, arg=[phase:u8]. 0=Running, 1=Draining, 2=Migrating.
-pub const SET_PHASE: u32 = 0x0C68;
 /// Invoke module_drain() on module N.
 /// handle=-1, arg=[module_idx:u16 LE]. Returns module's drain return code, or -1.
-pub const CALL_DRAIN: u32 = 0x0C69;
+pub use super::super::registry::reconfigure::CALL_DRAIN;
 /// Mark module N as finished so the scheduler skips it.
 /// handle=-1, arg=[module_idx:u16 LE]. Returns 0.
-pub const MARK_FINISHED: u32 = 0x0C6A;
+pub use super::super::registry::reconfigure::MARK_FINISHED;
 /// Query active module count.
 /// handle=-1, arg=NULL. Returns module count (>=0) or negative errno.
-pub const MODULE_COUNT: u32 = 0x0C6B;
+pub use super::super::registry::reconfigure::MODULE_COUNT;
+/// Query whether module N has returned StepOutcome::Done (finished).
+/// handle=-1, arg=[module_idx:u16 LE]. Returns 1 if finished, 0 otherwise.
+pub use super::super::registry::reconfigure::MODULE_DONE;
 /// Query module capability flags.
 /// handle=-1, arg=[module_idx:u16 LE]. Returns flags bitmask:
 ///   bit 0 = drain_capable, bit 1 = deferred_ready,
 ///   bit 2 = mailbox_safe,  bit 3 = in_place_writer.
-pub const MODULE_INFO: u32 = 0x0C6C;
-/// Request a graph rebuild. The main loop consumes this after the
-/// current step_modules returns.
-/// handle=-1, arg=[config_ptr:usize, config_len:usize] (platform pointer size).
-/// Returns 0.
-pub const TRIGGER_REBUILD: u32 = 0x0C6D;
+pub use super::super::registry::reconfigure::MODULE_INFO;
 /// Query a window of the upstream-module bitmask for module N (for
 /// topological drain ordering). handle=-1, arg layout: in
 /// `[module_idx:u16 LE][first_word:u16 LE]`, out `[mask word u64 LE × W]`
@@ -41,10 +33,10 @@ pub const TRIGGER_REBUILD: u32 = 0x0C6D;
 /// of any width and knows where it ends; a `first_word` at or past `total`
 /// writes nothing. Returns -EINVAL if the arg is null or shorter than one
 /// word.
-pub const MODULE_UPSTREAM: u32 = 0x0C6E;
-/// Query whether module N has returned StepOutcome::Done (finished).
-/// handle=-1, arg=[module_idx:u16 LE]. Returns 1 if finished, 0 otherwise.
-pub const MODULE_DONE: u32 = 0x0C6F;
+pub use super::super::registry::reconfigure::MODULE_UPSTREAM;
+/// Set the current reconfigure phase.
+/// handle=-1, arg=[phase:u8]. 0=Running, 1=Draining, 2=Migrating.
+pub use super::super::registry::reconfigure::SET_PHASE;
 /// Query the kernel's module-slot capacity: one past the highest module
 /// index this kernel can hold. handle=-1, arg=NULL. Returns the count
 /// (positive).
@@ -52,22 +44,20 @@ pub const MODULE_DONE: u32 = 0x0C6F;
 /// Kernel capacity is not ABI: the figure is per kernel platform and may be
 /// raised without moving the ABI surface, so a module that keeps per-slot
 /// state sizes it from this answer at runtime and never from a compiled
-/// constant. Its wire number sits in the 0x0C20..=0x0C29 run beside
-/// `OWNER_RELEASED`, because the 0x0C67..=0x0C6F block is full; it is gated by
-/// the same `reconfigure` permission as that block.
-pub const SLOT_CAPACITY: u32 = 0x0C23;
+/// constant. Gated by the `reconfigure` permission.
+pub use super::super::registry::reconfigure::SLOT_CAPACITY;
+/// Request a graph rebuild. The main loop consumes this after the
+/// current step_modules returns.
+/// handle=-1, arg=[config_ptr:usize, config_len:usize] (platform pointer size).
+/// Returns 0.
+pub use super::super::registry::reconfigure::TRIGGER_REBUILD;
 
 // ── Live graph mutation (add owner / free owner) ────────────────────────────
 // Splice a self-contained subgraph into a running graph, and tear it down,
 // without a destructive rebuild. Add and teardown only: partial
 // replacement and migration are not part of this surface.
 //
-// Wire numbers live in the free 0x0C47..=0x0C4A gap between the kernel core
-// primitives (0x0C40..=0x0C46) and the monitor range (0x0C52..=0x0C5F) — a
-// dedicated live-mutation block that is deliberately OUTSIDE both the
-// peripheral register-bridge range (0x0C70..=0x0CCF: I2C/SPI/ADC/UART/PIO)
-// and the monitor-gated 0x0C5x range. They classify as PLATFORM_RAW via the
-// permission classifier's catch-all in src/kernel/module/syscalls.rs.
+// They require `platform_raw` (the registry's permission for them).
 
 /// Add a new owner's subgraph to the running graph.
 /// handle=-1, arg = bounded binary `AddSubgraph` (magic `FLXA`, version,
@@ -79,7 +69,7 @@ pub const SLOT_CAPACITY: u32 = 0x0C23;
 /// call: a module whose load cannot complete synchronously refuses the add
 /// `EAGAIN`. In-process callers use `scheduler::apply_add` directly (built-in
 /// or already-resident modules).
-pub const APPLY_ADD: u32 = 0x0C47;
+pub use super::super::registry::reconfigure::APPLY_ADD;
 /// `AddSubgraph` header flag: the new owner acts with its creator's
 /// authority. Honoured only from the module syscall, and only when the
 /// calling module acts with the node's authority: the owner then reaches the
@@ -94,15 +84,12 @@ pub const ADD_FLAG_CREATOR_AUTHORITY: u16 = 0x0001;
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
 /// -1 for the system owner, -2 for a handle that no longer resolves, and -3
 /// for an owner still being added (its add publishes or rolls it back).
-pub const FREE_OWNER: u32 = 0x0C48;
+pub use super::super::registry::reconfigure::FREE_OWNER;
 
 // ── Owner pause/resume: metal PAUSE as a reversible quiesce verb ─────────────
-// The OWNER-level kernel mechanism a 0x1A workload backend or orchestrator
-// maps PAUSE/RESUME onto: the admission close and wake masking that drain
-// uses, plus the resume re-latch path. In the 0x0C47..=0x0C4A
-// live-mutation block
-// beside APPLY_ADD/FREE_OWNER — NOT in monitor-gated 0x0C5x, and NOT in the
-// peripheral register-bridge range (0x0C70..=0x0CCF).
+// The OWNER-level kernel mechanism a workload backend or orchestrator maps
+// PAUSE/RESUME onto: the admission close and wake masking that drain uses,
+// plus the resume re-latch path.
 
 /// Pause an owner (reversible quiesce): close admission for its subgraph,
 /// let in-flight steps complete (no preemption), and mask its wake sources
@@ -110,13 +97,13 @@ pub const FREE_OWNER: u32 = 0x0C48;
 /// graphs stop being stepped. Idempotent; the system owner is refused.
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
 /// negative `PauseError` otherwise.
-pub const OWNER_PAUSE: u32 = 0x0C49;
+pub use super::super::registry::reconfigure::OWNER_PAUSE;
 /// Resume a paused owner: reopen admission and re-latch every wake that
 /// arrived while paused (each masked-arrival produces a wake now, exactly
 /// once). Idempotent on an Active owner.
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
 /// negative `PauseError` otherwise.
-pub const OWNER_RESUME: u32 = 0x0C4A;
+pub use super::super::registry::reconfigure::OWNER_RESUME;
 
 // ── Owner release: the kernel's notification TO a provider ──────────────────
 // Every other opcode in this file travels module → kernel. This one travels
@@ -129,10 +116,6 @@ pub const OWNER_RESUME: u32 = 0x0C4A;
 // `module_observes_owner_release`; a provider that has not is never called
 // with this opcode. The kernel ignores the return value — a provider that
 // answers `-ENOSYS` is simply one with nothing to release.
-//
-// Wire number sits in the 0x0C20..=0x0C29 run (beside OTA_STAGE_* and
-// SLOT_CAPACITY) rather than beside FREE_OWNER, because the 0x0C47..=0x0C4A
-// live-mutation block is full.
 
 /// Notify a provider that `owner` is about to be freed. Delivered before any
 /// teardown: the owner's slot/generation still resolve, the provider module's
@@ -149,7 +132,7 @@ pub const OWNER_RESUME: u32 = 0x0C4A;
 /// Return value is ignored. The handler MUST be bounded: it runs inline on
 /// the scheduler thread inside the teardown path, so it releases bookkeeping
 /// and hands long work to the provider's own steps.
-pub const OWNER_RELEASED: u32 = 0x0C22;
+pub use super::super::registry::reconfigure::OWNER_RELEASED;
 
 /// Byte length of the `OWNER_RELEASED` argument record.
 pub const OWNER_RELEASED_ARG_LEN: usize = 8;
@@ -163,16 +146,16 @@ pub const OWNER_RELEASED_ARG_LEN: usize = 8;
 // Gated platform_raw via the dev_system catch-all; ENOSYS on targets
 // without a RAM staging surface.
 
+/// Control the staged image. handle=-1, arg = `[cmd: u8]`:
+/// 0 COMMIT (validate + activate; 0 / -EINVAL bad header, sha, or
+/// populate failure / -EACCES ABI-pin mismatch / -EBUSY epoch not
+/// newer than live / -ERROR protect failure), 1 ABORT (discard staged
+/// bytes), 2 EPOCH (returns the live epoch, saturated to i32).
+pub use super::super::registry::reconfigure::OTA_STAGE_CTRL;
 /// Stream graph-image bytes into the staging buffer.
 /// handle=-1, arg = `[offset: u32 LE][payload bytes]`. `offset == 0`
 /// begins a fresh stage; writes advance monotonically — an offset
 /// below the staged length is -EINVAL, a forward gap is zero-filled
 /// (layered-pull alignment padding). Returns 0 / -EINVAL / -ENOSPC
 /// (over capacity) / -ENOSYS (no staging surface).
-pub const OTA_STAGE_WRITE: u32 = 0x0C20;
-/// Control the staged image. handle=-1, arg = `[cmd: u8]`:
-/// 0 COMMIT (validate + activate; 0 / -EINVAL bad header, sha, or
-/// populate failure / -EACCES ABI-pin mismatch / -EBUSY epoch not
-/// newer than live / -ERROR protect failure), 1 ABORT (discard staged
-/// bytes), 2 EPOCH (returns the live epoch, saturated to i32).
-pub const OTA_STAGE_CTRL: u32 = 0x0C21;
+pub use super::super::registry::reconfigure::OTA_STAGE_WRITE;

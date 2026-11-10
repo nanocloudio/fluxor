@@ -170,7 +170,7 @@ const CHECKS_APPLIED: u8 = wire::check::PATH
     | wire::check::EKU
     | wire::check::CONSTRAINTS;
 
-/// PROBE and VERIFY for class 0x1D, on `handle = -1`.
+/// PROBE and VERIFY for class `trust`, on `handle = -1`.
 ///
 /// Returns 1 for PROBE, 0 for a VERIFY that produced a verdict — written
 /// into the caller's trailing out block, never returned in the status —

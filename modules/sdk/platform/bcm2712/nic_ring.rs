@@ -10,16 +10,16 @@
 /// handle=-1, arg=[dev_idx:u8, bar_idx:u8] (2 bytes).
 /// On success, writes full 64-bit address to arg[2..10] if space allows.
 /// Returns lower 32 bits of mapped address, or negative errno.
-pub const NIC_BAR_MAP: u32 = 0x0CF0;
+pub use super::super::super::registry::platform_nic_ring::NIC_BAR_MAP;
 /// Unmap a previously mapped BAR region.
 /// handle=-1, arg=[virt_addr:u64 LE] (8 bytes). Returns 0 or negative errno.
-pub const NIC_BAR_UNMAP: u32 = 0x0CF1;
+pub use super::super::super::registry::platform_nic_ring::NIC_BAR_UNMAP;
 /// Create a NIC DMA ring (RX+TX descriptors + buffer pool).
 /// handle=-1, arg=[rx_desc_count:u16, tx_desc_count:u16, buf_size:u16, buf_count:u16] (8 bytes).
 /// Returns ring handle (>=0) or negative errno.
-pub const NIC_RING_CREATE: u32 = 0x0CF2;
+pub use super::super::super::registry::platform_nic_ring::NIC_RING_CREATE;
 /// Destroy a NIC DMA ring. handle=-1, arg=[ring_handle:u8] (1 byte).
-pub const NIC_RING_DESTROY: u32 = 0x0CF3;
+pub use super::super::super::registry::platform_nic_ring::NIC_RING_DESTROY;
 /// Get NIC ring info (addresses, sizes). handle=ring_handle, arg=32-byte output buffer.
 /// Returns 32 on success (bytes written), or negative errno.
-pub const NIC_RING_INFO: u32 = 0x0CF4;
+pub use super::super::super::registry::platform_nic_ring::NIC_RING_INFO;

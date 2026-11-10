@@ -1486,7 +1486,7 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
     written as i32
 }
 
-/// Get fault statistics for a module (for `provider_query` FAULT_STATS).
+/// Get fault statistics for a module (for `monitor::FAULT_STATS_QUERY`).
 pub fn get_fault_stats(module_idx: usize) -> FaultStats {
     if module_idx >= module_slots() {
         return FaultStats::default();

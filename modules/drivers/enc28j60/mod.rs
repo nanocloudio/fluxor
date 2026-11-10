@@ -147,8 +147,8 @@ mod params_def {
 // `provider_call`.
 // ============================================================================
 
-const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_SPI_CONTRACT: u32 = 0x0002;
+const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
+const HAL_SPI_CONTRACT: u32 = abi::registry::spi::ID as u32;
 
 /// Claim a GPIO pin via provider_open(HAL_GPIO, CLAIM).
 unsafe fn dev_gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {

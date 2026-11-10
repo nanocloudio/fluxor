@@ -58,6 +58,7 @@ pub enum Rule {
     PendingWrite,
     TenancyVocabulary,
     DescriptorHygiene,
+    AbiLiteral,
 }
 
 impl Rule {
@@ -111,6 +112,7 @@ impl Rule {
             Rule::PendingWrite,
             Rule::TenancyVocabulary,
             Rule::DescriptorHygiene,
+            Rule::AbiLiteral,
         ]
         .into_iter()
         .find(|r| r.as_str() == name)
@@ -129,6 +131,7 @@ impl Rule {
             Rule::PendingWrite => "pending-write",
             Rule::TenancyVocabulary => "tenancy-vocabulary",
             Rule::DescriptorHygiene => "descriptor-hygiene",
+            Rule::AbiLiteral => "abi-literal",
         }
     }
 }
@@ -428,6 +431,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         }
         file_violations.extend(scan_pending_writes(&rel, &content, &write_consts));
         file_violations.extend(scan_descriptor_hygiene(&rel, &content));
+        file_violations.extend(scan_abi_literals(&rel, &content));
         report.violations.extend(file_violations);
     }
 
@@ -1779,6 +1783,63 @@ fn should_skip(entry: &walkdir::DirEntry) -> bool {
     )
 }
 
+/// An ABI number is declared once, in the ABI registry
+/// (`modules/sdk/abi/registry.toml`); everywhere else names it through the
+/// generated `abi::registry`. A `u32` constant spelled as a four-digit hex
+/// literal whose high byte is a registered opcode class restates an opcode.
+fn scan_abi_literals(rel: &Path, src: &str) -> Vec<Violation> {
+    use std::sync::OnceLock;
+    static PAT: OnceLock<regex::Regex> = OnceLock::new();
+    let pat = PAT.get_or_init(|| {
+        regex::Regex::new(
+            r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})\s*;",
+        )
+        .expect("abi-literal pattern")
+    });
+    static ID_PAT: OnceLock<regex::Regex> = OnceLock::new();
+    let id_pat = ID_PAT.get_or_init(|| {
+        regex::Regex::new(
+            r"\bconst\s+([A-Z0-9_]*CONTRACT[A-Z0-9_]*)\s*:\s*u(?:8|16|32|64)\s*=\s*0x([0-9A-Fa-f]{1,4})\s*;",
+        )
+        .expect("abi-literal id pattern")
+    });
+    let mut out = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        for c in id_pat.captures_iter(code) {
+            let id = u32::from_str_radix(&c[2], 16).unwrap_or(u32::MAX);
+            if fluxor_abi::registry::class_registered(id) {
+                out.push(Violation {
+                    path: rel.to_path_buf(),
+                    line: i + 1,
+                    rule: Rule::AbiLiteral,
+                    message: format!(
+                        "`{}` restates a contract id: name it as `abi::registry::<contract>::ID`",
+                        &c[1]
+                    ),
+                });
+            }
+        }
+        for c in pat.captures_iter(code) {
+            let class = u32::from_str_radix(&c[2], 16).unwrap_or(0);
+            // Class 0x00 cannot be told from a small constant by its spelling.
+            if class != 0 && fluxor_abi::registry::class_registered(class) {
+                out.push(Violation {
+                    path: rel.to_path_buf(),
+                    line: i + 1,
+                    rule: Rule::AbiLiteral,
+                    message: format!(
+                        "`{}` restates an opcode of class {class:#04x}: name it through \
+                         `abi::registry` (declared in modules/sdk/abi/registry.toml)",
+                        &c[1]
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
 fn is_generated_marker(content: &str) -> bool {
     content
         .lines()
@@ -3063,14 +3124,16 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
     #[test]
     fn a_write_is_known_by_its_literal_or_a_constant() {
-        let lit = "fn f() { provider_call(-1, 0x1424, p, n); }";
+        let lit =
+            "fn f() { provider_call(-1, fluxor_abi::registry::storage_object::DELETE, p, n); }";
         assert_eq!(pending(lit), 1);
-        let retain = "fn f() { provider_call(-1, 0x142C, p, n); }";
+        let retain =
+            "fn f() { provider_call(-1, fluxor_abi::registry::storage_object::RETAIN, p, n); }";
         assert_eq!(pending(retain), 1, "a RETAIN is a write");
         let retain = "fn f() { provider_call(-1, obj::RETAIN, p, n); }";
         assert_eq!(pending(retain), 1, "a RETAIN by name");
         let konst =
-            "const OBJ_COMMIT: u32 = 0x1428; fn f() { provider_call(h, OBJ_COMMIT, p, 0); }";
+            "const OBJ_COMMIT: u32 = fluxor_abi::registry::storage_object::PUT_STREAMED_COMMIT; fn f() { provider_call(h, OBJ_COMMIT, p, 0); }";
         assert_eq!(pending(konst), 1);
         let alias = "const OBJ_PUT: u32 = abi::contracts::storage::object::PUT; fn f() { provider_call(-1, OBJ_PUT, p, n); }";
         assert_eq!(pending(alias), 1, "a constant aliasing the SDK's opcode");
@@ -3101,7 +3164,7 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
     #[test]
     fn reads_and_other_contracts_are_not_writes() {
-        let get = "fn f() { provider_call(-1, obj::GET, p, n); provider_call(-1, 0x1421, p, n); }";
+        let get = "fn f() { provider_call(-1, obj::GET, p, n); provider_call(-1, fluxor_abi::registry::storage_object::GET, p, n); }";
         assert_eq!(pending(get), 0);
         let fs_delete = "fn f() { provider_call(-1, fs::DELETE, p, n); }";
         assert_eq!(pending(fs_delete), 0, "fs is not the storage write surface");

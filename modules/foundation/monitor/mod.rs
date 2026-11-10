@@ -52,7 +52,7 @@ name_table!(STATE_NAMES = [b"running", b"faulted", b"recovering", b"terminated"]
 name_table!(PROTECTION_NAMES = [b"none", b"guarded", b"contained", b"isolated"]);
 include!("../../sdk/runtime/params.rs");
 
-// Opcodes imported from the layered ABI — no hardcoded 0x0Cxx here.
+// Opcodes imported from the layered ABI — no hardcoded numbers here.
 use abi::internal::monitor::{
     module_state_flags, MODULE_STATE_LEN, MODULE_STATE_MAX, MODULE_STATE_QUERY,
     STEP_HISTOGRAM_QUERY,

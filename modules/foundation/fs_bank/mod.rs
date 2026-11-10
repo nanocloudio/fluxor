@@ -98,11 +98,11 @@ include!("../../sdk/cores/bank_stream.rs");
 // ============================================================================
 
 /// FS opcodes (mirror of `abi::contracts::storage::fs`).
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_CLOSE: u32 = 0x0903;
-const FS_OPENDIR: u32 = 0x0907;
-const FS_READDIR: u32 = 0x0908;
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_OPENDIR: u32 = abi::registry::fs::OPENDIR;
+const FS_READDIR: u32 = abi::registry::fs::READDIR;
 
 /// Close any currently open FD. Used between selections + on
 /// auto-advance EOF detection.

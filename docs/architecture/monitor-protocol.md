@@ -286,13 +286,13 @@ Status codes: `ok`, `underflow`, `overflow`, `missed_present`,
 
 Source: `modules/sdk/internal/monitor.rs`.
 
-- `FAULT_MONITOR_SUBSCRIBE` (`0x0C52`) — bind an event handle that the
+- `FAULT_MONITOR_SUBSCRIBE` (`0x2152`) — bind an event handle that the
   kernel signals on every fault.
-- `FAULT_MONITOR_POP` (`0x0C53`) — pop the oldest fault record (16 bytes,
+- `FAULT_MONITOR_POP` (`0x2153`) — pop the oldest fault record (16 bytes,
   module and cause as u16; see `step_guard::FaultRecord`).
-- `FAULT_STATS_QUERY` (`0x0C54`) — fetch the current `FaultStats` for a
+- `FAULT_STATS_QUERY` (`0x2154`) — fetch the current `FaultStats` for a
   module index.
-- `STEP_HISTOGRAM_QUERY` (`0x0C55`) — fetch the 8-bucket histogram for a
+- `STEP_HISTOGRAM_QUERY` (`0x2155`) — fetch the 8-bucket histogram for a
   module (or the global histogram with `handle=-1`).
 
 A monitor module reads these syscalls on a slow cadence and prints the

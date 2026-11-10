@@ -104,7 +104,6 @@ const _: () = assert!(
 pub const CHANNEL_TYPE_PIPE: u8 = 3;
 
 // Poll flags — re-exported from abi::poll for kernel-internal use.
-pub use crate::abi::poll::CONN as POLL_CONN;
 pub use crate::abi::poll::ERR as POLL_ERR;
 pub use crate::abi::poll::HUP as POLL_HUP;
 pub use crate::abi::poll::IN as POLL_IN;
@@ -117,27 +116,27 @@ pub use crate::abi::poll::WROTE as POLL_WROTE;
 
 /// Post a u32 notification value to a channel's sideband slot.
 /// Semantics are channel-defined (seek position, sample rate, etc.).
-pub const IOCTL_NOTIFY: u32 = 1;
+pub use crate::abi::registry::ioctl::NOTIFY as IOCTL_NOTIFY;
 
 /// Atomically read and clear the sideband notification. arg: pointer to u32 output.
 /// Returns CHAN_OK if value was pending (written to arg), CHAN_EAGAIN if not.
-pub const IOCTL_POLL_NOTIFY: u32 = 2;
+pub use crate::abi::registry::ioctl::POLL_NOTIFY as IOCTL_POLL_NOTIFY;
 
 /// Full channel reset: clears ring buffer (or mailbox state), HUP flag,
 /// sticky event flags (HUP/ERR), and aux_u32. After flush the channel
 /// behaves as if freshly opened.
-pub const IOCTL_FLUSH: u32 = 3;
+pub use crate::abi::registry::ioctl::FLUSH as IOCTL_FLUSH;
 
 /// Set HUP flag (end-of-stream signal from producer).
 /// Consumer detects via channel_poll/fd_poll with POLL_HUP.
-pub const IOCTL_SET_HUP: u32 = 4;
+pub use crate::abi::registry::ioctl::SET_HUP as IOCTL_SET_HUP;
 
 /// Bytes a write can place in the ring right now. arg: pointer to u32
 /// output; 0 for a full ring and for a mailbox channel, which has no ring to
 /// measure (`channel_writable_bytes`). Lets a producer that admits data on
 /// someone else's behalf (a TCP receive window) offer only what the ring can
 /// take, instead of offering more and refusing it at delivery.
-pub const IOCTL_WRITABLE: u32 = 5;
+pub use crate::abi::registry::ioctl::WRITABLE as IOCTL_WRITABLE;
 
 /// Channel-side ioctl handler registered by a module. Signature matches
 /// [`syscall_channel_ioctl`] (cmd + arg pointer), with a state pointer
@@ -160,15 +159,10 @@ const NO_AUX_PENDING: u32 = u32::MAX;
 // ============================================================================
 
 pub const CHAN_OK: i32 = errno::OK;
-pub const CHAN_ERROR: i32 = errno::ERROR;
 pub const CHAN_EAGAIN: i32 = errno::EAGAIN;
 pub const CHAN_EBUSY: i32 = errno::EBUSY;
 pub const CHAN_EINVAL: i32 = errno::EINVAL;
-pub const CHAN_EINPROGRESS: i32 = errno::EINPROGRESS;
 pub const CHAN_ENOSYS: i32 = errno::ENOSYS;
-pub const CHAN_ENOTCONN: i32 = errno::ENOTCONN;
-pub const CHAN_ECONNREFUSED: i32 = errno::ECONNREFUSED;
-pub const CHAN_ETIMEDOUT: i32 = errno::ETIMEDOUT;
 
 // ============================================================================
 // Channel Storage

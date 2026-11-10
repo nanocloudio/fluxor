@@ -348,7 +348,7 @@ pub struct SchedulerState {
     /// Per-module required_caps bitmask from manifest — public contract bits only
     pub(crate) required_caps: ModTable<u64>,
     /// Per-module fine-grained permissions bitmap (from manifest binary
-    /// byte 15). Gates privileged 0x0Cxx opcodes by category — see the
+    /// byte 15). Gates privileged opcodes by category — see the
     /// `permission` module in `syscalls.rs`. Separate from `required_caps`
     /// so non-contract permissions don't overload the contract bitmask.
     pub(crate) permissions: ModTable<u16>,
@@ -1263,8 +1263,8 @@ pub fn clear_instantiation_state() {
 /// Persistent per-module state-pointer shadow. The RP path populates
 /// `SCHED.modules` directly, but the bcm2712 domain-instantiator keeps
 /// modules in `DOMAIN_MODULES` and leaves `SCHED.modules` empty — so a
-/// late-bound registration syscall (e.g. `BACKING_PROVIDER_ENABLE` in
-/// `step_ready`, long after `module_new`) can't find the state through
+/// late-bound lookup (a registration made from `step_ready`, long after
+/// `module_new`) can't find the state through
 /// `SCHED.modules`. This shadow is set by both paths and read as the
 /// second-choice source in `get_module_state`.
 static mut MODULE_STATE_PTR: [*mut u8; MAX_MODULES] = [core::ptr::null_mut(); MAX_MODULES];

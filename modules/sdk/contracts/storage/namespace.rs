@@ -106,7 +106,7 @@ pub use super::object::{write_answer, WriteAnswer};
 /// re-`LOOKUP`. The fence on this handle (via
 /// `provider_query(handle, query_key::LAST_FENCE, …)`) is
 /// `ViewConsistent { source, revision }`.
-pub const LOOKUP: u32 = 0x1300;
+pub use super::super::super::registry::storage_namespace::LOOKUP;
 
 /// Read metadata for a resolved entry.
 ///
@@ -122,7 +122,7 @@ pub const LOOKUP: u32 = 0x1300;
 /// ```
 ///
 /// Returns the number of bytes written, or negative errno.
-pub const STAT: u32 = 0x1301;
+pub use super::super::super::registry::storage_namespace::STAT;
 
 /// List entries under a prefix, in ascending bytewise name order, one page
 /// per call, resumed by a cursor.
@@ -241,7 +241,7 @@ pub const STAT: u32 = 0x1301;
 ///     this prefix.
 ///   - `ENOMEM` — `out_cap` cannot hold one entry plus the trailer.
 ///   - `EOVERFLOW` — a name in range exceeds `STORAGE_KEY_MAX`.
-pub const LIST: u32 = 0x1302;
+pub use super::super::super::registry::storage_namespace::LIST;
 
 /// Rename or move an entry. Atomic within a single namespace
 /// provider.
@@ -271,7 +271,7 @@ pub const LIST: u32 = 0x1302;
 /// decision and its fence. The provider keys an undecided write by the
 /// calling module and the request's bytes, so asking again is never a
 /// second write. This is the same rule as `storage.object`'s writes.
-pub const RENAME: u32 = 0x1303;
+pub use super::super::super::registry::storage_namespace::RENAME;
 
 /// Delete an entry.
 ///
@@ -288,7 +288,7 @@ pub const RENAME: u32 = 0x1303;
 /// Returns 0 or negative errno, or `EINPROGRESS` as for `RENAME`. Same
 /// fence-advertisement rules as `RENAME` — the encoded fence is written
 /// into `fence_out_ptr` atomically with the op return.
-pub const DELETE: u32 = 0x1304;
+pub use super::super::super::registry::storage_namespace::DELETE;
 
 /// Watch a prefix: the provider signals the caller's kernel event whenever
 /// something under the prefix changes. Level-triggered — a doorbell, never a
@@ -360,7 +360,7 @@ pub const DELETE: u32 = 0x1304;
 ///     subscriptions are swept, or the calling owner holds the provider's
 ///     per-owner quota where it keeps one. A provider whose table is a
 ///     resource-ledger pool counts the refusal against that pool.
-pub const SUBSCRIBE: u32 = 0x1305;
+pub use super::super::super::registry::storage_namespace::SUBSCRIBE;
 
 /// Which of the caller's subscriptions on an event have rung since it last
 /// asked; returns and clears their rung bits.
@@ -388,11 +388,11 @@ pub const SUBSCRIBE: u32 = 0x1305;
 /// cleared. A failed take (`EINVAL` for a malformed request, `ENOMEM` when
 /// `out_cap` cannot hold the header and one handle) clears no bit, so the
 /// subscriptions it would have named stay rung for the take that follows.
-pub const TAKE_RUNG: u32 = 0x1309;
+pub use super::super::super::registry::storage_namespace::TAKE_RUNG;
 
 /// Close a LOOKUP or SUBSCRIBE handle. A subscription closed by its opener
 /// is gone with its rung bit; its handle may name a later subscription.
-pub const CLOSE: u32 = 0x1306;
+pub use super::super::super::registry::storage_namespace::CLOSE;
 
 /// What changed under a prefix since a point — one bounded page per call. The
 /// read a [`SUBSCRIBE`] doorbell asks for, and the primitive a long-poll watch
@@ -471,7 +471,7 @@ pub const CLOSE: u32 = 0x1306;
 /// device, a spent walk budget); when `sub` names one of the caller's
 /// subscriptions the provider rings it again once the cause clears, so a
 /// consumer woken only by its event never stalls on a wait.
-pub const CHANGES: u32 = 0x1307;
+pub use super::super::super::registry::storage_namespace::CHANGES;
 
 /// Create a binding: `path → {kind, target}` — the one op that mints
 /// a name. Fails with `-17 EEXIST` when the path is already bound and
@@ -507,7 +507,7 @@ pub const CHANGES: u32 = 0x1307;
 /// tier keeps the fused forms, a split provider (index without bytes)
 /// implements BIND alone. The fused and split paths are the same
 /// operation, with the same outcome and the same fence.
-pub const BIND: u32 = 0x1308;
+pub use super::super::super::registry::storage_namespace::BIND;
 
 /// Capability bits: which optional ops this provider implements.
 ///
@@ -516,7 +516,7 @@ pub const BIND: u32 = 0x1308;
 /// negative errno. A provider that does not implement `CAPS` itself
 /// returns `ENOSYS`, which callers treat as "mandatory read surface
 /// only" (LOOKUP/STAT/LIST/CLOSE per its own errnos, no mutation ops).
-pub const CAPS: u32 = 0x13FF;
+pub use super::super::super::registry::storage_namespace::CAPS;
 
 /// Capability bits returned by [`CAPS`]. A provider sets bit B iff
 /// calling the corresponding opcode would succeed for valid input
@@ -526,16 +526,16 @@ pub const CAPS: u32 = 0x13FF;
 /// [`caps::CHILD_NAMES`] is the one bit that names no opcode: it states the
 /// shape of the provider's `LIST` names.
 pub mod caps {
-    /// [`super::BIND`] (0x1308) — provider can mint a binding.
+    /// [`super::BIND`] (`storage_namespace::BIND`) — provider can mint a binding.
     pub const BIND: u32 = 1 << 0;
-    /// [`super::RENAME`] (0x1303).
+    /// [`super::RENAME`].
     pub const RENAME: u32 = 1 << 1;
-    /// [`super::DELETE`] (0x1304).
+    /// [`super::DELETE`].
     pub const DELETE: u32 = 1 << 2;
-    /// [`super::SUBSCRIBE`] (0x1305) and [`super::TAKE_RUNG`] (0x1309) —
+    /// [`super::SUBSCRIBE`] and [`super::TAKE_RUNG`] —
     /// change doorbells.
     pub const SUBSCRIBE: u32 = 1 << 3;
-    /// [`super::CHANGES`] (0x1307) — windowed change reads.
+    /// [`super::CHANGES`] — windowed change reads.
     pub const CHANGES: u32 = 1 << 4;
     /// Not an opcode: `LIST` is directory-shaped, its entries the immediate
     /// children of the prefix named relative to it. Clear: key-shaped,

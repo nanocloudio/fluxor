@@ -18,6 +18,7 @@
 )]
 
 pub mod abi_pin;
+pub mod abi_registry;
 pub mod add_subgraph;
 pub mod agent_logs;
 pub mod agent_protocol;

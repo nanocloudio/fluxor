@@ -36,7 +36,7 @@ use crate::kernel::security::key_vault::{self as software, zeroize};
 pub type Dispatch = unsafe fn(i32, u32, *mut u8, usize) -> i32;
 
 /// Handle-field bit set on every handle the hardware backend mints.
-pub const HARDWARE_FIELD_BIT: i32 = 1 << 25;
+pub const HARDWARE_FIELD_BIT: i32 = 1 << crate::abi::registry::fd::SLOT_FIELD_BITS;
 
 static mut HARDWARE: Option<Dispatch> = None;
 

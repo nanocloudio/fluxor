@@ -186,7 +186,7 @@ pub const fn write_answer(rc: i32) -> WriteAnswer {
 /// below. A provider that enumerates its keys refuses (`EINVAL`) a key it
 /// could not list: the empty key, and one longer than the listing surfaces
 /// it serves can carry.
-pub const PUT: u32 = 0x1420;
+pub use super::super::super::registry::storage_object::PUT;
 
 /// Conditions a mutating op may be made subject to.
 ///
@@ -346,7 +346,7 @@ impl<'a> Kept<'a> {
 /// Returns a non-negative handle (used with `RANGE_GET` / `CLOSE`)
 /// or negative errno. The handle's fence is read via
 /// `provider_query(handle, query_key::LAST_FENCE, …)`.
-pub const GET: u32 = 0x1421;
+pub use super::super::super::registry::storage_object::GET;
 
 /// Read metadata for a blob without opening a handle.
 ///
@@ -380,7 +380,7 @@ pub const GET: u32 = 0x1421;
 /// number of bytes written to `out_ptr`, or negative errno: `ENXIO` for
 /// an absent key, `ENOMEM` when `out_cap` cannot hold the record,
 /// `EINVAL` for a null `out_ptr`.
-pub const HEAD: u32 = 0x1422;
+pub use super::super::super::registry::storage_object::HEAD;
 
 /// Read a byte range from an open object handle.
 ///
@@ -396,7 +396,7 @@ pub const HEAD: u32 = 0x1422;
 /// buffer. Returns the number of bytes actually read (which may be
 /// less than `length` near the tail) or negative errno. Fence is
 /// advertised per-handle via `query_key::LAST_FENCE`.
-pub const RANGE_GET: u32 = 0x1423;
+pub use super::super::super::registry::storage_object::RANGE_GET;
 
 /// Delete a blob.
 ///
@@ -415,10 +415,10 @@ pub const RANGE_GET: u32 = 0x1423;
 /// Returns 0 or negative errno, `ERETAINED` for a retained or held object
 /// (see [`Kept`]). The provider writes the encoded fence into `fence_out_ptr`
 /// atomically with returning success.
-pub const DELETE: u32 = 0x1424;
+pub use super::super::super::registry::storage_object::DELETE;
 
 /// Close a GET or PUT_STREAMED_OPEN handle.
-pub const CLOSE: u32 = 0x1425;
+pub use super::super::super::registry::storage_object::CLOSE;
 
 // ── Embedded-image decode (cover art) ───────────────────────────────
 //
@@ -433,9 +433,9 @@ pub const CLOSE: u32 = 0x1425;
 // returns a non-negative handle. `IMG_RECV(handle)` drains the
 // `width*height*2`-byte RGB565 buffer (EAGAIN while the async decode is
 // pending). `IMG_CLOSE(handle)` releases it.
-pub const IMG_DECODE: u32 = 0x1430;
-pub const IMG_RECV: u32 = 0x1431;
-pub const IMG_CLOSE: u32 = 0x1432;
+pub use super::super::super::registry::storage_object::IMG_CLOSE;
+pub use super::super::super::registry::storage_object::IMG_DECODE;
+pub use super::super::super::registry::storage_object::IMG_RECV;
 
 // ── Large-blob streaming write (event.log composition) ──────────────
 //
@@ -485,7 +485,7 @@ pub const IMG_CLOSE: u32 = 0x1432;
 /// statement about a moment that has passed by the time it matters — which
 /// is the same race a `HEAD` followed by an unconditional write loses, and
 /// the reason [`precondition`] insists on a single linearization point.
-pub const PUT_STREAMED_OPEN: u32 = 0x1426;
+pub use super::super::super::registry::storage_object::PUT_STREAMED_OPEN;
 
 /// Append a chunk of body bytes to a streaming-write handle.
 ///
@@ -500,7 +500,7 @@ pub const PUT_STREAMED_OPEN: u32 = 0x1426;
 /// byte, never within the same step (see "Streamed writes: `EAGAIN` is
 /// backpressure" above). Any other negative answer is a failure of the
 /// stream, which the caller aborts.
-pub const PUT_STREAMED_WRITE: u32 = 0x1427;
+pub use super::super::super::registry::storage_object::PUT_STREAMED_WRITE;
 
 /// Atomically finalise a streaming write into an object PUT.
 ///
@@ -519,7 +519,7 @@ pub const PUT_STREAMED_WRITE: u32 = 0x1427;
 /// achieved, and the encoded fence is also written into
 /// `fence_out_ptr`. After COMMIT the handle is no longer writable;
 /// callers MUST call `CLOSE`.
-pub const PUT_STREAMED_COMMIT: u32 = 0x1428;
+pub use super::super::super::registry::storage_object::PUT_STREAMED_COMMIT;
 
 /// Discard a streaming-write handle without committing.
 ///
@@ -528,7 +528,7 @@ pub const PUT_STREAMED_COMMIT: u32 = 0x1428;
 /// the staged event-log stream; subsequent reads under `key` do
 /// not observe any appended chunks. After ABORT the handle is
 /// released — callers do not need to `CLOSE`.
-pub const PUT_STREAMED_ABORT: u32 = 0x1429;
+pub use super::super::super::registry::storage_object::PUT_STREAMED_ABORT;
 
 // ── Retention and legal hold ────────────────────────────────────────
 
@@ -563,7 +563,7 @@ pub const PUT_STREAMED_ABORT: u32 = 0x1429;
 /// fence into `fence_out_ptr`. A grant authorizes it with the store's write
 /// permission ([`grant::access_of`]): it changes what later writes may do, as
 /// a write does, and a scope that may write its objects may protect them.
-pub const RETAIN: u32 = 0x142C;
+pub use super::super::super::registry::storage_object::RETAIN;
 
 /// [`RETAIN`]'s `hold` byte.
 pub mod hold {
@@ -728,7 +728,7 @@ pub mod retain {
 ///   - `EOVERFLOW` — a key in range exceeds `STORAGE_KEY_MAX`.
 ///   - `ENOSYS` — the provider cannot enumerate its keys (an HTTP origin
 ///     offers no listing).
-pub const LIST: u32 = 0x142A;
+pub use super::super::super::registry::storage_object::LIST;
 
 /// Most entries one [`LIST`] page may carry. S3's `MaxKeys` ceiling;
 /// bounds the work one call does.
@@ -1092,7 +1092,7 @@ pub mod list {
 /// chain is refused (its reason in byte 0), `EINVAL` when the request or
 /// scope is malformed, `ENOSYS` from a provider with no roots, or `ENOMEM`
 /// when no grant slot is free.
-pub const PRESENT: u32 = 0x142B;
+pub use super::super::super::registry::storage_object::PRESENT;
 
 /// Grants, scopes, and which permission each op needs. Shared so a
 /// provider, a consumer and an issuer compute the same object for the same

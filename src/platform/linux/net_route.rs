@@ -79,7 +79,7 @@ const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_FLAGS: u16 = 8;
 const IFA_PROTO: u16 = 11;
-const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+const IFA_F_NOPREFIXROUTE: u32 = crate::abi::registry::spi::OPEN;
 const ETH_P_ARP: u16 = 0x0806;
 
 /// What the forwarding probe found.

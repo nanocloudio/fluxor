@@ -17,7 +17,7 @@
 
 /// Returns 1 if a key-vault backend is present, 0 if not. Call with
 /// handle=-1 and arg=null to detect at `module_new`.
-pub const PROBE: u32 = 0x1000;
+pub use super::super::registry::key_vault::PROBE;
 
 /// Store (import) a private key. handle=-1.
 ///
@@ -43,7 +43,7 @@ pub const PROBE: u32 = 0x1000;
 /// the encoded key exactly, and a caller holding an already-expanded key
 /// learns from the reported length that this backend is not where it can
 /// import one.
-pub const STORE: u32 = 0x1001;
+pub use super::super::registry::key_vault::STORE;
 
 /// ECDH: derive shared secret. handle = slot.
 ///
@@ -58,7 +58,7 @@ pub const STORE: u32 = 0x1001;
 /// Refused unless the slot's `usage_mask` carries [`usage::AGREE`]. A
 /// signing key used for key agreement is a cross-purpose reuse, and the
 /// place to stop it is the mask rather than the caller's discipline.
-pub const ECDH: u32 = 0x1002;
+pub use super::super::registry::key_vault::ECDH;
 
 /// Sign with the slot's private key. handle = slot.
 ///
@@ -93,7 +93,7 @@ pub const ECDH: u32 = 0x1002;
 ///   one — and `PREHASH` is refused rather than answered with it. The
 ///   signature is 2420 / 3309 / 4627 bytes by parameter set, so a caller
 ///   must size its buffer from [`SUITE_QUERY`] and not from a constant.
-pub const SIGN: u32 = 0x1003;
+pub use super::super::registry::key_vault::SIGN;
 
 /// ECDSA verify (P-256) with a caller-supplied public key — the stored
 /// slots are not consulted. handle=-1.
@@ -111,10 +111,10 @@ pub const SIGN: u32 = 0x1003;
 /// written wrong at any of the places it would otherwise be written.
 ///
 /// Returns 1 if valid, 0 if invalid, negative errno on malformed input.
-pub const VERIFY: u32 = 0x1004;
+pub use super::super::registry::key_vault::VERIFY;
 
 /// Zeroise and free the slot. handle = slot. Returns 0.
-pub const DESTROY: u32 = 0x1005;
+pub use super::super::registry::key_vault::DESTROY;
 
 /// Generate a keypair inside the backend. handle=-1.
 ///
@@ -134,7 +134,7 @@ pub const DESTROY: u32 = 0x1005;
 /// `usage_mask` is sealed into the key here and checked on every later
 /// operation. Sealed at birth rather than checked at the call site,
 /// because a call-site check is one some call site will not have.
-pub const GENERATE: u32 = 0x1006;
+pub use super::super::registry::key_vault::GENERATE;
 
 /// Return the public key for a slot (for JWK/JWKS/kid derivation).
 ///
@@ -145,7 +145,7 @@ pub const GENERATE: u32 = 0x1006;
 /// Public material only, and refused unless the slot's `usage_mask`
 /// carries [`usage::EXPORT_PUBLIC`] — which never implies the private half
 /// may be exported.
-pub const PUBLIC: u32 = 0x1007;
+pub use super::super::registry::key_vault::PUBLIC;
 
 /// Report the backend's isolation tier. handle=-1, arg → 1-byte
 /// buffer; writes a `u8` ordinal (see [`tier`]), returns 1.
@@ -154,7 +154,7 @@ pub const PUBLIC: u32 = 0x1007;
 /// capabilities, hence not per-suite); a consumer with a security
 /// requirement checks `tier >= N` and MUST NOT claim a hardware
 /// guarantee it did not read from here.
-pub const TIER: u32 = 0x1008;
+pub use super::super::registry::key_vault::TIER;
 
 /// Key suites: what a slot's key bytes mean, which operations it admits,
 /// and how big each answer is.
@@ -322,7 +322,7 @@ pub const MAX_LABEL: usize = 64;
 /// `pub_len_out`. When the buffer is too small the call returns `-ERANGE`
 /// with `pub_len_out` set to what was required — the caller resizes once
 /// rather than guessing, which matters when a suite's public key is 2 KB.
-pub const OPEN_OR_GENERATE: u32 = 0x1009;
+pub use super::super::registry::key_vault::OPEN_OR_GENERATE;
 
 /// Open an existing key by label, failing if absent.
 ///
@@ -333,7 +333,7 @@ pub const OPEN_OR_GENERATE: u32 = 0x1009;
 /// and "use it, creating one if needed" are different intentions, and a
 /// verifier that silently generated a key would verify nothing while
 /// appearing to work.
-pub const OPEN: u32 = 0x100A;
+pub use super::super::registry::key_vault::OPEN;
 
 /// Destroy the key named by `label`, wherever it is stored.
 ///
@@ -347,7 +347,7 @@ pub const OPEN: u32 = 0x100A;
 /// By label rather than by handle because the point is to remove the
 /// PERSISTED key: destroying a handle frees a slot and leaves the sealed
 /// blob, which would come back on the next open.
-pub const DESTROY_BY_LABEL: u32 = 0x100B;
+pub use super::super::registry::key_vault::DESTROY_BY_LABEL;
 
 /// Report what a slot is.
 ///
@@ -359,7 +359,7 @@ pub const DESTROY_BY_LABEL: u32 = 0x100B;
 /// it asked for. `persisted_out` sits next to `tier_out` and is
 /// deliberately separate from it: a caller that conflates the two is the
 /// failure mode this whole surface is shaped to prevent.
-pub const DESCRIBE: u32 = 0x100C;
+pub use super::super::registry::key_vault::DESCRIBE;
 
 /// `persisted_out` values of [`DESCRIBE`].
 pub mod persisted {
@@ -386,7 +386,7 @@ pub mod persisted {
 /// P-256 supported" and cannot answer "how big is an ML-DSA-65
 /// signature" — which is what a caller sizing a buffer actually needs,
 /// and the question a suite whose signature is 4627 bytes forces.
-pub const SUITE_QUERY: u32 = 0x100D;
+pub use super::super::registry::key_vault::SUITE_QUERY;
 
 /// Enumerate supported suites.
 ///
@@ -394,7 +394,7 @@ pub const SUITE_QUERY: u32 = 0x100D;
 /// `[cursor:u16][_pad:u16][out_ptr:u64][out_cap:u16][count_out:u16]`;
 /// writes `count_out` `u16` suite ids. Returns the next cursor, or 0 when
 /// the enumeration is complete.
-pub const SUITE_ENUM: u32 = 0x100E;
+pub use super::super::registry::key_vault::SUITE_ENUM;
 
 /// Sign the running composition. handle = a signing slot. arg layout:
 /// `[challenge:32][out_ptr:u64][out_cap:u16][out_len_out:u16]`; the
@@ -412,7 +412,7 @@ pub const SUITE_ENUM: u32 = 0x100E;
 /// does. It proves bytes and wiring, never that they are correct or
 /// intended. The composition digest — SHA-256 of the record with the
 /// challenge zeroed — is the identity [`KEY_WRAP`] binds to.
-pub const ATTEST_COMPOSITION: u32 = 0x100F;
+pub use super::super::registry::key_vault::ATTEST_COMPOSITION;
 
 /// Wrap a slot's key for one destination vault. handle = the slot (must
 /// permit [`usage::WRAP`]). arg layout:
@@ -428,7 +428,7 @@ pub const ATTEST_COMPOSITION: u32 = 0x100F;
 /// The key never appears in the clear on any surface: only the vault
 /// holding `dest_pub`'s private half can open it, and only while its
 /// composition still digests to `attest_digest` ([`KEY_UNWRAP`]).
-pub const KEY_WRAP: u32 = 0x1010;
+pub use super::super::registry::key_vault::KEY_WRAP;
 
 /// Unwrap into a fresh slot. handle = the slot holding this vault's P-256
 /// private key (must permit [`usage::AGREE`]). arg layout:
@@ -436,7 +436,7 @@ pub const KEY_WRAP: u32 = 0x1010;
 /// when the blob's `attest_digest` is not this composition's digest —
 /// the composition changed since it was attested, and the key was wrapped
 /// for the one that was — or `-EINVAL` when the blob does not open.
-pub const KEY_UNWRAP: u32 = 0x1011;
+pub use super::super::registry::key_vault::KEY_UNWRAP;
 
 /// Seal bytes under an [`suite::AEAD_KEY`] slot. handle = the slot (must
 /// permit [`usage::SEAL`]). arg layout:
@@ -446,14 +446,14 @@ pub const KEY_UNWRAP: u32 = 0x1011;
 /// The nonce is fresh from the CSPRNG per call. What the bytes mean — a
 /// resumption ticket, a checkpoint — is the caller's; the vault only
 /// guarantees that the key never leaves it.
-pub const AEAD_SEAL: u32 = 0x1012;
+pub use super::super::registry::key_vault::AEAD_SEAL;
 
 /// Open what [`AEAD_SEAL`] produced. handle = the slot (must permit
 /// [`usage::OPEN`]). arg layout:
 /// `[aad_len:u16][aad][blob_len:u16][blob][out_ptr:u64][out_cap:u16][out_len_out:u16]`;
 /// output the plaintext. Returns 0, `-EINVAL` when the tag does not
 /// verify, or `-ERANGE`.
-pub const AEAD_OPEN: u32 = 0x1013;
+pub use super::super::registry::key_vault::AEAD_OPEN;
 
 /// Derive a purpose key from a [`suite::KDF_KEY`] slot. handle = the
 /// master (must permit [`usage::DERIVE`]). arg layout: see [`derive`].
@@ -461,7 +461,7 @@ pub const AEAD_OPEN: u32 = 0x1013;
 /// `HKDF-SHA256(ikm = master, salt = derive::SALT, info = label ‖ context)`
 /// as a key of the target suite with the target uses. A derived key is
 /// never persisted: it is derived again when needed.
-pub const DERIVE: u32 = 0x1014;
+pub use super::super::registry::key_vault::DERIVE;
 
 /// Seal up to [`units::MAX_ENTRIES`] buffers in place under an AEAD slot
 /// ([`suite::AEAD_KEY`] or [`suite::AEAD_AES256_GCM`], must permit
@@ -474,14 +474,14 @@ pub const DERIVE: u32 = 0x1014;
 /// vault-drawn random nonces suit a record now and then and not a storage
 /// device writing the same key for years. The slot is owned by one module,
 /// so no other can seal under it.
-pub const AEAD_SEAL_UNITS: u32 = 0x1015;
+pub use super::super::registry::key_vault::AEAD_SEAL_UNITS;
 
 /// Open up to [`units::MAX_ENTRIES`] buffers in place, verifying each tag.
 /// An entry whose tag does not verify has its status set to
 /// [`units::STATUS_AUTH_FAILED`] and its buffer zeroed, so unauthenticated
 /// plaintext is never left behind. Returns the number of entries that
 /// failed, or a negative errno when the request was refused before any.
-pub const AEAD_OPEN_UNITS: u32 = 0x1016;
+pub use super::super::registry::key_vault::AEAD_OPEN_UNITS;
 
 /// Split a 32-byte key 2-of-3 and wrap each share to its own recipient.
 /// handle = the key (must permit [`usage::WRAP`]; a [`suite::KDF_KEY`],
@@ -494,7 +494,7 @@ pub const AEAD_OPEN_UNITS: u32 = 0x1016;
 /// as it is made, and the scratch is zeroed. Any two envelopes, opened by
 /// their recipients, give the key back through [`SHARE_COMBINE`]; one gives
 /// nothing.
-pub const SHARE_SPLIT: u32 = 0x1017;
+pub use super::super::registry::key_vault::SHARE_SPLIT;
 
 /// Open one share envelope and seal the share to another recipient.
 /// handle = the P-256 key the envelope is wrapped to (must permit
@@ -506,7 +506,7 @@ pub const SHARE_SPLIT: u32 = 0x1017;
 /// only sealed to the new recipient, bound to a new purpose, lease fence,
 /// expiry and policy digest. The recovery set, protected resource, epoch
 /// and share index are carried over and cannot be changed.
-pub const SHARE_REWRAP: u32 = 0x1018;
+pub use super::super::registry::key_vault::SHARE_REWRAP;
 
 /// Open two share envelopes and reconstruct their key into a fresh handle,
 /// owned by the caller. handle=-1. arg layout: see [`share::combine`]. The
@@ -523,7 +523,7 @@ pub const SHARE_REWRAP: u32 = 0x1018;
 /// Reconstruction happens only here, and the key it yields is a handle:
 /// neither share nor key is ever written to the caller. The new key is
 /// never persisted; a volume attaches again after a restart.
-pub const SHARE_COMBINE: u32 = 0x1019;
+pub use super::super::registry::key_vault::SHARE_COMBINE;
 
 /// Attest a key: signed evidence of what a handle is, bound to a caller's
 /// challenge, never its bytes. handle = the key attested. arg layout: see
@@ -536,7 +536,7 @@ pub const SHARE_COMBINE: u32 = 0x1019;
 /// uses, owner namespace, persistence and the vault's tier, and carries the
 /// composition digest, so a verifier that trusts the signer's public key
 /// learns which composition holds which kind of key under which policy.
-pub const ATTEST_KEY: u32 = 0x101A;
+pub use super::super::registry::key_vault::ATTEST_KEY;
 
 /// Share envelopes (the recovery and attachment format): one 2-of-3 share
 /// of a 32-byte key, sealed to one recipient's P-256 key.

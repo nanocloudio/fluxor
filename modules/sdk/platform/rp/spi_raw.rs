@@ -5,8 +5,8 @@
 // Used by the spi_pl022 PIC provider module. Portable consumers
 // should call the HAL SPI contract (`contracts/hal/spi.rs`) instead.
 
-pub const REG_WRITE: u32 = 0x0CA0;
-pub const REG_READ: u32 = 0x0CA1;
-pub const BUS_INFO: u32 = 0x0CA2;
-pub const PIN_INIT: u32 = 0x0CA3;
-pub const SET_ENABLE: u32 = 0x0CA4;
+pub use super::super::super::registry::rp_raw::SPI_BUS_INFO as BUS_INFO;
+pub use super::super::super::registry::rp_raw::SPI_PIN_INIT as PIN_INIT;
+pub use super::super::super::registry::rp_raw::SPI_REG_READ as REG_READ;
+pub use super::super::super::registry::rp_raw::SPI_REG_WRITE as REG_WRITE;
+pub use super::super::super::registry::rp_raw::SPI_SET_ENABLE as SET_ENABLE;

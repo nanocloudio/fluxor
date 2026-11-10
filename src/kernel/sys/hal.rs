@@ -253,10 +253,6 @@ pub struct HalOps {
         params: &[u8],
         deadline_us: u32,
     ) -> i32,
-    /// Map / unmap one 4 KiB page in a module's protection tables (paged
-    /// arena). No-ops where module page tables don't exist.
-    pub protection_map_page: fn(module_idx: usize, vaddr: usize, phys: usize, writable: bool),
-    pub protection_unmap_page: fn(module_idx: usize, vaddr: usize),
     /// Arm the stack fence for the module about to be called: `depth` is the
     /// stack the composer admitted it, in bytes, below the kernel's own
     /// reserve; 0 disarms. Platforms whose modules do not step on the kernel
@@ -270,6 +266,9 @@ pub struct HalOps {
     /// collector on network-less targets. Returns bytes accepted; `0` if the sink
     /// isn't ready or the target has none.
     pub serial_write: fn(bytes: &[u8]) -> usize,
+    /// Device registers, DMA memory and the scan-before-bind PCI table for
+    /// `metal_device`; `None` where the machine serves no such contract.
+    pub metal_device: Option<&'static crate::kernel::module::metal_device::MetalDeviceOps>,
 }
 
 /// The result of a protected call that could not be made: a fault, so the
@@ -363,13 +362,10 @@ pub unsafe fn protected_call(
 ) -> i32 {
     (ops().protected_call)(module_idx, entry, args, params, deadline_us)
 }
+/// The platform's `metal_device` table, where it serves one.
 #[inline]
-pub fn protection_map_page(module_idx: usize, vaddr: usize, phys: usize, writable: bool) {
-    (ops().protection_map_page)(module_idx, vaddr, phys, writable)
-}
-#[inline]
-pub fn protection_unmap_page(module_idx: usize, vaddr: usize) {
-    (ops().protection_unmap_page)(module_idx, vaddr)
+pub fn metal_device() -> Option<&'static crate::kernel::module::metal_device::MetalDeviceOps> {
+    ops().metal_device
 }
 #[inline]
 pub fn stack_fence_intact() -> bool {

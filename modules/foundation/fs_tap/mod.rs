@@ -43,9 +43,9 @@ const LINE_MAX: usize = 128;
 /// Maximum path length accepted by the `path` param.
 const MAX_PATH_LEN: usize = 96;
 
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_CLOSE: u32 = 0x0903;
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
 /// Decided `FS_OPEN` answers about the path itself.
 const ERR_NOENT: i32 = -2;
 const ERR_NOTDIR: i32 = -20;

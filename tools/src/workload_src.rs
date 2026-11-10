@@ -113,7 +113,8 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
         .and_then(|m| m.as_sequence())
         .cloned()
         .unwrap_or_default();
-    let mut all = Vec::new();
+    let mut first_module = None;
+    let mut module_types: Vec<String> = Vec::new();
     for m in &modules {
         // `type:` overrides; `name:` is the fallback (the common single-
         // instance spelling).
@@ -122,7 +123,22 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
             .and_then(|v| v.as_str())
             .or_else(|| m.get("name").and_then(|v| v.as_str()))
             .ok_or_else(|| Error::Config("graph module without name/type".into()))?;
-        all.push(ty.to_string());
+        if first_module.is_none() {
+            first_module = Some(ty.to_string());
+        }
+        if crate::modules::is_builtin_module(ty) {
+            continue;
+        }
+        // The artifact, not the type: a non-default variant builds as
+        // `<type>-<variant>.fmod` (see `modules::artifact_name`), and two
+        // instances of one artifact pin it once.
+        let artifact = match m.get("variant").and_then(|v| v.as_str()) {
+            Some(v) => format!("{ty}-{v}"),
+            None => ty.to_string(),
+        };
+        if !module_types.contains(&artifact) {
+            module_types.push(artifact);
+        }
     }
     let edges = doc
         .get("wiring")
@@ -130,12 +146,9 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
         .map(|w| w.len())
         .unwrap_or(0);
     Ok(GraphFacts {
-        modules: all.len() as u16,
-        first_module: all.first().cloned(),
-        module_types: all
-            .into_iter()
-            .filter(|t| !crate::modules::is_builtin_module(t))
-            .collect(),
+        modules: modules.len() as u16,
+        first_module,
+        module_types,
         edges: edges as u16,
     })
 }
@@ -1572,6 +1585,20 @@ buffer_bytes = 32768
         assert_eq!(f.modules, 3);
         assert_eq!(f.first_module.as_deref(), Some("cli_in"));
         assert_eq!(f.module_types, vec!["tool".to_string()]);
+    }
+
+    #[test]
+    fn graph_facts_pin_variant_artifacts_once() {
+        let f = graph_facts(
+            "target: linux\nmodules:\n  - name: a\n    type: http\n    variant: exchange\n  \
+             - name: b\n    type: http\n    variant: exchange\n  - name: tls\n",
+        )
+        .unwrap();
+        assert_eq!(f.modules, 3);
+        assert_eq!(
+            f.module_types,
+            vec!["http-exchange".to_string(), "tls".to_string()]
+        );
     }
 
     #[test]

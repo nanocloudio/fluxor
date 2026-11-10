@@ -9,9 +9,10 @@
 //
 // Stream only. Datagram traffic (UDP and friends) lives on the
 // `datagram` surface in the sibling `datagram.rs`; packet-preserving
-// flows (QUIC/SRTP/classifiers) live on `packet.rs`. Opcode ranges
-// are disjoint across the three so a shared channel can carry multiple
-// contracts unambiguously.
+// flows (QUIC/SRTP/classifiers) live on `packet.rs`. The ABI registry's
+// `net_tlv` msgset (`abi/registry.toml`) gives every message type of every
+// surface sharing this header a distinct value, so a shared channel can
+// carry multiple contracts unambiguously.
 //
 // Frame format: [msg_type: u8] [len: u16 LE] [payload: len bytes]
 // Carried over channels between IP / TLS / HTTP / MQTT modules. The
@@ -205,13 +206,13 @@ pub fn accepted_parts(payload: &[u8]) -> (u16, u16) {
 /// stage appends `[generation: u16 LE]` ([`session_generation`]) to the
 /// port-qualified form, then `[alpn_len: u8][alpn…]`, the application
 /// protocol it negotiated ([`session_alpn`]; length 0 for none).
-pub const MSG_ACCEPTED: u8 = 0x01;
+pub use super::super::super::registry::msg::net_proto::MSG_ACCEPTED;
 /// Received data. Payload: `[conn_id: u16 LE][data…]`. The `data` portion of a
 /// single `MSG_DATA` frame MUST NOT exceed [`MAX_DATA_FRAGMENT`] — a producer
 /// that has more bytes splits them across multiple frames. This bounds every
 /// consumer's per-frame scratch (so the alignment-safe reader never has to drop
 /// a tail) and matches the natural TCP-MSS segmentation of the bare-metal stack.
-pub const MSG_DATA: u8 = 0x02;
+pub use super::super::super::registry::msg::net_proto::MSG_DATA;
 
 /// Normative maximum `data` bytes in one [`MSG_DATA`] frame (one TCP MSS). A
 /// `net_out` producer (IP, the Linux host adapter, …) chunks larger reads into
@@ -241,7 +242,7 @@ pub const MAX_DATA_FRAGMENT: usize = 1460;
 /// that withholds its close because some other transport freed the id
 /// underneath it — between them every client-closed keepalive connection
 /// leaks a slot until the table is full.
-pub const MSG_CLOSED: u8 = 0x03;
+pub use super::super::super::registry::msg::net_proto::MSG_CLOSED;
 /// How long a transport keeps a closed connection's id reserved for the
 /// consumer's [`CMD_CLOSE`] after [`MSG_CLOSED`] before releasing it itself.
 /// Five seconds: several scheduler passes on the slowest target and far
@@ -273,7 +274,7 @@ pub fn closed_parts(payload: &[u8]) -> Option<(u16, u8)> {
 /// `local_port` echoes the port from the consumer's `CMD_BIND`; a
 /// multi-anchor consumer records it and matches it against the
 /// `local_port` in subsequent `MSG_ACCEPTED` frames (see `MSG_ACCEPTED`).
-pub const MSG_BOUND: u8 = 0x04;
+pub use super::super::super::registry::msg::net_proto::MSG_BOUND;
 /// Outbound connect completed. Payload: `[conn_id: u16 LE][requester_tag: u16 LE]`.
 /// `requester_tag` echoes the tag the consumer put on its `CMD_CONNECT_TO` (its
 /// module index **+ 1** — the `dev_requester_tag` wire encoding, NOT the raw
@@ -284,7 +285,7 @@ pub const MSG_BOUND: u8 = 0x04;
 /// stage appends `[generation: u16 LE]` ([`session_generation`]), then
 /// `[alpn_len: u8][alpn…]`, the application protocol it negotiated
 /// ([`session_alpn`]; length 0 for none).
-pub const MSG_CONNECTED: u8 = 0x05;
+pub use super::super::super::registry::msg::net_proto::MSG_CONNECTED;
 /// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE?]`. For a
 /// connect-phase failure the trailing `requester_tag` echoes the failing
 /// `CMD_CONNECT_TO`'s tag so a consumer that has no conn_id yet can recognise its
@@ -295,7 +296,7 @@ pub const MSG_CONNECTED: u8 = 0x05;
 /// (bad `sock_type`, no free slot), which is indistinguishable from a valid id
 /// `0` — so a consumer must match a connect failure on `requester_tag` ALONE,
 /// never on a conn_id it has not yet been assigned.
-pub const MSG_ERROR: u8 = 0x06;
+pub use super::super::super::registry::msg::net_proto::MSG_ERROR;
 /// Ask the consumer to send its retained bytes again from `from_seq` on the
 /// named connection. Payload: `[conn_id: u16 LE][from_seq: u32 LE]`. A
 /// transport that leaves the send buffer to its consumer (the bare-metal
@@ -303,7 +304,7 @@ pub const MSG_ERROR: u8 = 0x06;
 /// partial acknowledgement in recovery; the consumer answers with
 /// [`CMD_RESEND`]. A consumer that retains nothing drops it as any unknown
 /// opcode, and the transport then has nothing to resend for it.
-pub const MSG_RETRANSMIT: u8 = 0x07;
+pub use super::super::super::registry::msg::net_proto::MSG_RETRANSMIT;
 /// `MSG_RETRANSMIT` payload length.
 pub const RETRANSMIT_LEN: usize = CONN_ID_LEN + 4;
 /// The peer's cumulative acknowledgement moved. Payload: `[conn_id: u16 LE]
@@ -313,7 +314,7 @@ pub const RETRANSMIT_LEN: usize = CONN_ID_LEN + 4;
 /// places the consumer's retained bytes in sequence space however many it
 /// handed down before the first report reached it. Sent when it moves, not
 /// per segment.
-pub const MSG_ACK: u8 = 0x08;
+pub use super::super::super::registry::msg::net_proto::MSG_ACK;
 /// `MSG_ACK` payload length.
 pub const ACK_LEN: usize = CONN_ID_LEN + 4 + 4;
 
@@ -350,7 +351,7 @@ pub fn retransmit_parts(payload: &[u8]) -> Option<(u16, u32)> {
 /// frame, so it never affects the data path. The trailing `trace_flags` byte is
 /// the W3C flags (low bit = `sampled`), so the head-sampling decision survives
 /// each hop.
-pub const MSG_TRACE_CTX: u8 = 0x09;
+pub use super::super::super::registry::msg::net_proto::MSG_TRACE_CTX;
 
 /// `MSG_TRACE_CTX` payload length: conn_id + 16-byte trace id + 8-byte span id
 /// + 1-byte W3C trace-flags.
@@ -369,7 +370,7 @@ pub const TRACE_CTX_LEN: usize = CONN_ID_LEN + 16 + 8 + 1;
 /// consumer that reads it has it before any byte of the stream. A stage that
 /// relabels connection ids (`tls`, a demultiplexer) re-emits it with its own
 /// id. A consumer that does not use it drops it as any unknown opcode.
-pub const MSG_PEER: u8 = 0x0A;
+pub use super::super::super::registry::msg::net_proto::MSG_PEER;
 
 /// `MSG_PEER` payload length.
 pub const PEER_LEN: usize = CONN_ID_LEN + 1 + 16 + 2;
@@ -387,7 +388,7 @@ pub const PEER_LEN: usize = CONN_ID_LEN + 1 + 16 + 2;
 /// keeps the numbering. Emitted by a record layer that opts in (`tls`'s
 /// `write_horizon`); a consumer that does not use it drops it as any
 /// unknown opcode.
-pub const MSG_HORIZON: u8 = 0x0B;
+pub use super::super::super::registry::msg::net_proto::MSG_HORIZON;
 /// `MSG_HORIZON` payload length.
 pub const HORIZON_LEN: usize = CONN_ID_LEN + 8;
 
@@ -417,7 +418,7 @@ pub fn horizon_parts(payload: &[u8]) -> Option<(u16, u64)> {
 /// Sent once, after the activated stream's `MSG_PEER` (after its accept
 /// when it has no peer report) and before any of its data, redelivered or
 /// new. A consumer that does not use it drops it as any unknown opcode.
-pub const MSG_RESUMED: u8 = 0x0C;
+pub use super::super::super::registry::msg::net_proto::MSG_RESUMED;
 /// `MSG_RESUMED` payload length.
 pub const RESUMED_LEN: usize = CONN_ID_LEN + 8 + 8 + 8;
 
@@ -489,13 +490,13 @@ pub fn peer_parts(payload: &[u8]) -> Option<(u16, u8, [u8; 16], u16)> {
 
 // Upstream: consumer → IP/net
 /// Bind to port and listen. Payload: [port: u16 LE]
-pub const CMD_BIND: u8 = 0x10;
+pub use super::super::super::registry::msg::net_proto::CMD_BIND;
 /// Send data on connection. Payload: `[conn_id: u16 LE][data…]`. The `data` portion
 /// MUST NOT exceed [`MAX_CMD_DATA`]; a consumer with more bytes issues multiple
 /// `CMD_SEND`s. The net stack (IP / host adapter) re-segments to MSS on the
 /// wire. This bounds the receiver's command scratch; an oversized frame is
 /// drained and rejected alignment-safely rather than mis-parsed.
-pub const CMD_SEND: u8 = 0x11;
+pub use super::super::super::registry::msg::net_proto::CMD_SEND;
 
 /// Normative maximum `data` bytes in one upstream command frame (`CMD_SEND`).
 /// Receivers (IP, the Linux host adapter) size their command scratch to
@@ -510,7 +511,7 @@ pub const MAX_CMD_DATA: usize = 8192;
 /// Always safe after [`MSG_CLOSED`] within [`CLOSED_ID_GRACE_MS`] — the id
 /// is still the consumer's — and a no-op on an id the transport has already
 /// released.
-pub const CMD_CLOSE: u8 = 0x12;
+pub use super::super::super::registry::msg::net_proto::CMD_CLOSE;
 /// `CMD_CLOSE`'s `how`: reset the connection.
 pub const CLOSE_ABORT: u8 = 1;
 
@@ -520,7 +521,7 @@ pub const CLOSE_ABORT: u8 = 1;
 /// it allocates nothing: of the bytes it carries, those in `[SND.UNA,
 /// SND.NXT)` go out again and the rest (acknowledged since, or never sent)
 /// are dropped.
-pub const CMD_RESEND: u8 = 0x18;
+pub use super::super::super::registry::msg::net_proto::CMD_RESEND;
 /// `CMD_RESEND` header length before its data.
 pub const RESEND_HEAD: usize = CONN_ID_LEN + 4;
 /// The consumer has consumed the first `in_bytes` clear bytes a stage
@@ -537,7 +538,7 @@ pub const RESEND_HEAD: usize = CONN_ID_LEN + 4;
 /// (`MSG_RESUMED`), redelivering from exactly that byte. A payload of any
 /// other length is ignored; a stage that does not defer drops it as any
 /// unknown opcode.
-pub const CMD_DELIVERED: u8 = 0x19;
+pub use super::super::super::registry::msg::net_proto::CMD_DELIVERED;
 /// `CMD_DELIVERED` payload length.
 pub const DELIVERED_LEN: usize = CONN_ID_LEN + 16;
 
@@ -566,7 +567,7 @@ pub fn delivered_parts(payload: &[u8]) -> Option<(u16, u64, u64)> {
 /// instead of dialling a garbage address: byte 1 of this payload is the
 /// address's last octet, which would alias `af` if the two shapes shared
 /// an opcode. One opcode dials; this one only says no.
-pub const CMD_CONNECT: u8 = 0x13;
+pub use super::super::super::registry::msg::net_proto::CMD_CONNECT;
 
 /// Initiate an outbound connection to a target.
 /// Payload: `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u16 LE?]`
@@ -592,7 +593,7 @@ pub const CMD_CONNECT: u8 = 0x13;
 /// Emit with [`write_connect_to`], read with [`read_connect_to`]; parse a
 /// `host[:port]` authority with [`Target::parse`] so a literal is never
 /// mistaken for a name.
-pub const CMD_CONNECT_TO: u8 = 0x14;
+pub use super::super::super::registry::msg::net_proto::CMD_CONNECT_TO;
 
 /// Address family on `CMD_CONNECT_TO`: a DNS name, `[len: u8][name…]`.
 pub const AF_NAME: u8 = 1;

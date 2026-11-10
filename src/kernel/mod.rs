@@ -6,7 +6,7 @@ pub mod boot; // config + device tree
 pub mod config; // single capacity seam onto platform::chip
 pub mod exec; // scheduler run loop, ISR tiers, step guard
 pub mod ipc; // channels, ring buffers, buffer pool, events, fd
-pub mod mem; // heap, page pool
+pub mod mem; // heap, arenas
 pub mod module; // loader, provider, syscalls, el0 gateway
 pub mod net_policy; // net.policy (0x1E) table store shared by every provider
 pub mod net_route; // net.route (0x20) segment / peer-route / held-address tables
@@ -35,16 +35,9 @@ pub fn boot(ops: &'static sys::hal::HalOps) {
 /// `abi::internal::*` layer on the module side — these are the kernel's
 /// implementation of the registration hooks that pic modules invoke.
 pub mod internal {
-    pub mod backing_provider;
     pub mod bridge;
 }
 
-// Top-level aliases — existing call sites reach `crate::kernel::backing_provider::*`
-// and `crate::kernel::bridge::*`. Both remain kernel-private; the
-// public ABI does not surface them.
-pub use internal::backing_provider;
+// Top-level alias — call sites reach `crate::kernel::bridge::*`. It remains
+// kernel-private; the public ABI does not surface it.
 pub use internal::bridge;
-
-// Kernel-owned memory-service aliases (module lives in `mem::backing`).
-pub use mem::backing::backing_store;
-pub use mem::backing::pager;

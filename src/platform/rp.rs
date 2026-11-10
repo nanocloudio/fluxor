@@ -234,7 +234,7 @@ fn rp_boot_hardware() -> Option<(Hardware, planner::ResourcePlan)> {
     }
 
     // PIO blocks are accessed via raw PAC through the PIO register bridge
-    // (provider_call opcodes 0x0C70-0x0C7B). PIC pio_stream module
+    // (provider_call opcodes `rp_raw::PIO_SM_EXEC`-`rp_raw::PIO_SM_RESTART`). PIC pio_stream module
     // manages SM/DMA at runtime.
 
     Some((hw, plan))
@@ -577,8 +577,6 @@ static RP_HAL_OPS: HalOps = HalOps {
     protection_release_module: rp_protection_release,
     protection_gateway_table: rp_gateway_table,
     protected_call: rp_protected_call,
-    protection_map_page: |_, _, _, _| {},
-    protection_unmap_page: |_, _| {},
     stack_fence_arm: fluxor::platform::rp_boot::stack_fence_arm,
     stack_fence_intact: fluxor::platform::rp_boot::stack_fence_intact,
     // Bytes for the console, written directly rather than through the log
@@ -590,6 +588,7 @@ static RP_HAL_OPS: HalOps = HalOps {
         }
         b.len()
     },
+    metal_device: None,
 };
 
 fn rp_now_unix_millis() -> u64 {

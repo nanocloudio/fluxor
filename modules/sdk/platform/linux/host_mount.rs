@@ -1,4 +1,4 @@
-// Platform: linux host mounts (contract class 0x1F).
+// Platform: linux host mounts (contract class `host_mount`).
 //
 // Layer: platform/linux (host-specific). A node that publishes block devices
 // to its own kernel (an NBD export of an encrypted volume) must mount the
@@ -39,14 +39,14 @@
 // process executor (`host_process::PROC_CLASS`).
 
 /// Provider contract class for host mounts.
-pub const CLASS: u16 = 0x001F;
+pub const CLASS: u16 = super::super::super::registry::host_mount::ID;
 
 /// The privileges this runtime holds for these ops, as a bit set:
 /// [`PRIV_SYS_ADMIN`] (it may mount: `MOUNT`, `UMOUNT`, a memory-backed
 /// `PROJECT`) and [`PRIV_CHOWN`] (it may give a file any group: `PROJECT`
 /// and `GROUP_TREE` with a group the runtime is not a member of).
 /// `handle = -1`, no argument.
-pub const PRIV: u32 = 0x1F00;
+pub use super::super::super::registry::host_mount::PRIV;
 /// [`PRIV`] bit: the runtime can mount in its own mount namespace — it holds
 /// `CAP_SYS_ADMIN` over the user namespace that owns that mount namespace,
 /// as `mount(2)` checks, probed with nothing mounted. Holding the capability
@@ -67,7 +67,10 @@ pub const PRIV_CHOWN: i32 = 1 << 1;
 /// (or reached through a symlink), `EBUSY` for one holding a different mount;
 /// `EAGAIN` while the mount runs or while the caller's jobs are all running.
 /// A directory that already holds this device with the same access answers 0.
-pub const MOUNT: u32 = 0x1F01;
+pub use super::super::super::registry::host_mount::MOUNT;
+/// The mount root, written into `arg`. Returns its length, or `ENOSPC` when
+/// `arg` is too short.
+pub use super::super::super::registry::host_mount::ROOT;
 /// Unmount. `arg = [dir]`, relative to the mount root. Returns 1 when it
 /// unmounted, 0 when nothing was mounted there (also the answer to an
 /// unmount whose earlier answer was dropped), or a negative errno (`EBUSY`,
@@ -85,11 +88,21 @@ pub const MOUNT: u32 = 0x1F01;
 /// reports no mount id answers `ENOSYS`. The directory holding `dir` must
 /// not be one a workload can write: an entry renamed there between the
 /// identification and the unmount is not seen.
-pub const UMOUNT: u32 = 0x1F02;
-/// The mount root, written into `arg`. Returns its length, or `ENOSPC` when
-/// `arg` is too short.
-pub const ROOT: u32 = 0x1F03;
+pub use super::super::super::registry::host_mount::UMOUNT;
 
+/// Give a directory tree under the mount root to a group. `arg =
+/// [dir_len:u16][dir][group:u32][policy:u8]`: every file, directory and
+/// link inside `dir` (and `dir` itself) is group-owned by `group`; files get
+/// group read and write, directories group read, write and search and the
+/// setgid bit, so what the workload creates later inherits the group. A
+/// mount point inside `dir` is left alone (its own volume); symlinks are
+/// never followed. `dir` itself may be a mount point — the volume being
+/// prepared. `policy` [`GT_ALWAYS`] walks the whole tree;
+/// [`GT_ON_ROOT_MISMATCH`] does nothing when `dir` already has the group,
+/// the setgid bit and group read, write and search. Returns 0, or a
+/// negative errno (`ENOENT`, `EINVAL`, `EPERM`); `EAGAIN` while it runs, as
+/// `MOUNT`.
+pub use super::super::super::registry::host_mount::GROUP_TREE;
 /// Project files into a directory under the mount root, replacing what an
 /// earlier projection there put, atomically for a reader. `arg =
 /// [dir_len:u16][dir][group:u32][flags:u8][count:u16][entry]×count`, then
@@ -133,7 +146,7 @@ pub const ROOT: u32 = 0x1F03;
 /// in `dir` that is not the projection's own `..data` link), `EPERM` (a group the
 /// runtime may not give, a memory mount without `CAP_SYS_ADMIN`); `EAGAIN`
 /// while it runs, as `MOUNT`.
-pub const PROJECT: u32 = 0x1F04;
+pub use super::super::super::registry::host_mount::PROJECT;
 /// Remove a directory tree under the mount root. `arg = [dir]`, relative to
 /// the root. The walk never follows a symlink (a link is removed, not what
 /// it names) and never crosses into another mount: a memory filesystem a
@@ -148,20 +161,7 @@ pub const PROJECT: u32 = 0x1F04;
 /// tree is gone (also when there was none), or a negative errno (`EBUSY`,
 /// `EINVAL` for a path through a symlink, `EPERM`); `EAGAIN` while it runs,
 /// as `MOUNT`.
-pub const REMOVE_TREE: u32 = 0x1F05;
-/// Give a directory tree under the mount root to a group. `arg =
-/// [dir_len:u16][dir][group:u32][policy:u8]`: every file, directory and
-/// link inside `dir` (and `dir` itself) is group-owned by `group`; files get
-/// group read and write, directories group read, write and search and the
-/// setgid bit, so what the workload creates later inherits the group. A
-/// mount point inside `dir` is left alone (its own volume); symlinks are
-/// never followed. `dir` itself may be a mount point — the volume being
-/// prepared. `policy` [`GT_ALWAYS`] walks the whole tree;
-/// [`GT_ON_ROOT_MISMATCH`] does nothing when `dir` already has the group,
-/// the setgid bit and group read, write and search. Returns 0, or a
-/// negative errno (`ENOENT`, `EINVAL`, `EPERM`); `EAGAIN` while it runs, as
-/// `MOUNT`.
-pub const GROUP_TREE: u32 = 0x1F06;
+pub use super::super::super::registry::host_mount::REMOVE_TREE;
 
 /// Make a directory under the mount root with an exact mode. `arg =
 /// [dir_len:u16][dir][mode:u16]`, little-endian: `dir` relative to the mount
@@ -175,7 +175,7 @@ pub const GROUP_TREE: u32 = 0x1F06;
 /// out, a symlink on the way to or at `dir`), `ENOTDIR` (a component that is
 /// not a directory), `EPERM` (a directory the runtime may not change);
 /// `EAGAIN` while it runs, as `MOUNT`.
-pub const MKDIR_MODE: u32 = 0x1F07;
+pub use super::super::super::registry::host_mount::MKDIR_MODE;
 
 /// `MOUNT` flag: mount read-only.
 pub const F_RDONLY: u8 = 1 << 0;

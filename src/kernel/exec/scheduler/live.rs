@@ -2530,7 +2530,7 @@ pub unsafe fn free_owner_encoded(arg: *const u8, arg_len: usize) -> i32 {
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and pause that owner
-/// (`OWNER_PAUSE = 0x0C49`). Same handle record as `FREE_OWNER`.
+/// (`reconfigure::OWNER_PAUSE`). Same handle record as `FREE_OWNER`.
 ///
 /// # Safety
 /// `arg` must point to at least `arg_len` readable bytes.
@@ -2545,7 +2545,7 @@ pub unsafe fn owner_pause_encoded(arg: *const u8, arg_len: usize) -> i32 {
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and resume that owner
-/// (`OWNER_RESUME = 0x0C4A`).
+/// (`reconfigure::OWNER_RESUME`).
 ///
 /// # Safety
 /// `arg` must point to at least `arg_len` readable bytes.

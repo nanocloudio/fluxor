@@ -1,5 +1,5 @@
 // ============================================================================
-// Linux host-process backend for the `workload` contract (class 0x1A)
+// Linux host-process backend for the `workload` contract (class `workload`)
 // ============================================================================
 //
 // The namespace/cgroup isolation MECHANISM behind the `workload` host-process

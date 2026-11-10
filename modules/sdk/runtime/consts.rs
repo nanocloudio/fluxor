@@ -2,27 +2,26 @@
 // Channel Poll Constants
 // ============================================================================
 
-pub const POLL_IN: u32 = 0x01;
-pub const POLL_OUT: u32 = 0x02;
-pub const POLL_ERR: u32 = 0x04;
-pub const POLL_HUP: u32 = 0x08;
-pub const POLL_CONN: u32 = 0x10;
+pub use abi::registry::poll::ERR as POLL_ERR;
+pub use abi::registry::poll::HUP as POLL_HUP;
+pub use abi::registry::poll::IN as POLL_IN;
+pub use abi::registry::poll::OUT as POLL_OUT;
 /// The channel has carried at least one byte since its last flush.
 /// Poll for `POLL_HUP | POLL_WROTE` to tell a stream that ended from
 /// one that never started — `POLL_HUP` alone does not distinguish them.
-pub const POLL_WROTE: u32 = 0x20;
+pub use abi::registry::poll::WROTE as POLL_WROTE;
 
 // ============================================================================
 // Common Error Codes (from kernel errno)
 // ============================================================================
 
-pub const E_IO: i32 = -5;
-pub const E_AGAIN: i32 = -11;
-pub const E_BUSY: i32 = -16;
-pub const E_INVAL: i32 = -22;
-pub const E_INPROGRESS: i32 = -36;
-pub const E_NOSYS: i32 = -38;
-pub const E_CONNREFUSED: i32 = -111;
+pub use abi::registry::errno::EAGAIN as E_AGAIN;
+pub use abi::registry::errno::EBUSY as E_BUSY;
+pub use abi::registry::errno::ECONNREFUSED as E_CONNREFUSED;
+pub use abi::registry::errno::EINPROGRESS as E_INPROGRESS;
+pub use abi::registry::errno::EINVAL as E_INVAL;
+pub use abi::registry::errno::EIO as E_IO;
+pub use abi::registry::errno::ENOSYS as E_NOSYS;
 
 // ============================================================================
 // Socket Types (net_proto stream surface)
@@ -33,7 +32,7 @@ pub const E_CONNREFUSED: i32 = -111;
 pub const SOCK_TYPE_STREAM: u8 = 1;
 
 /// Flag ORed onto opcode to dispatch to the next provider below the caller.
-pub const CHAIN_NEXT: u32 = 0x0001_0000;
+pub use abi::registry::CHAIN_NEXT;
 
 // ============================================================================
 // Network Interface State (emitted as MSG_NETIF_STATE payload byte on the
@@ -51,13 +50,13 @@ pub const NETIF_STATE_ERROR: u8 = 255;
 // Channel Ioctl Commands
 // ============================================================================
 
-pub const IOCTL_NOTIFY: u32 = 1;
-pub const IOCTL_POLL_NOTIFY: u32 = 2;
-pub const IOCTL_FLUSH: u32 = 3;
-pub const IOCTL_EOF: u32 = 4;
+pub use abi::registry::ioctl::FLUSH as IOCTL_FLUSH;
+pub use abi::registry::ioctl::NOTIFY as IOCTL_NOTIFY;
+pub use abi::registry::ioctl::POLL_NOTIFY as IOCTL_POLL_NOTIFY;
+pub use abi::registry::ioctl::SET_HUP as IOCTL_EOF;
 /// Bytes a write can place in the channel's ring now (`[u32 out]`); 0 for a
 /// full ring and for a mailbox channel, which has no ring to measure.
-pub const IOCTL_WRITABLE: u32 = 5;
+pub use abi::registry::ioctl::WRITABLE as IOCTL_WRITABLE;
 
 // ============================================================================
 // FMP Well-Known Message Types (pre-computed FNV-1a hashes)

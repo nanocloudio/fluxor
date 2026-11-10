@@ -175,9 +175,8 @@ rp-otp-provision = []
 # Kernel hardware CAPABILITIES (what a platform can do, not which chip it is).
 # The kernel branches on these, never on chip identity; a chip or host feature
 # turns on whichever it provides.
-#   kernel-vm: kernel-managed page-table virtual memory (external-arena paging,
-#              isolated/page-aligned allocation), on which a platform builds
-#              EL0 module isolation.
+#   kernel-vm: kernel-managed page-table virtual memory (isolated/page-aligned
+#              allocation), on which a platform builds EL0 module isolation.
 #   kernel-mpu: MPU-based module isolation on a microcontroller: gated
 #              modules run unprivileged on their own process stack behind the
 #              gateway, inside regions from the shared planner.

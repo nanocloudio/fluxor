@@ -136,20 +136,25 @@ unsafe fn i2c_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     *bp.add(2) = v[1];
     *bp.add(3) = v[2];
     *bp.add(4) = v[3];
-    (sys.provider_call)(bus as i32, 0x0CB0, bp, 5);
+    (sys.provider_call)(bus as i32, abi::registry::rp_raw::I2C_REG_WRITE, bp, 5);
 }
 
 unsafe fn i2c_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
-    (sys.provider_call)(bus as i32, 0x0CB1, bp, 5);
+    (sys.provider_call)(bus as i32, abi::registry::rp_raw::I2C_REG_READ, bp, 5);
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 
 unsafe fn i2c_set_enable(sys: &SyscallTable, bus: u8, enable: bool) {
     let mut buf = [if enable { 1u8 } else { 0u8 }];
-    (sys.provider_call)(bus as i32, 0x0CB4, buf.as_mut_ptr(), 1);
+    (sys.provider_call)(
+        bus as i32,
+        abi::registry::rp_raw::I2C_SET_ENABLE,
+        buf.as_mut_ptr(),
+        1,
+    );
 }
 
 // ============================================================================
@@ -333,13 +338,13 @@ unsafe fn poll_i2c_transfer(s: &mut I2cState, idx: usize) {
 // Provider dispatch
 // ============================================================================
 
-const I2C_OPEN: u32 = 0x0300;
-const I2C_CLOSE: u32 = 0x0301;
-const I2C_WRITE: u32 = 0x0302;
-const I2C_READ: u32 = 0x0303;
-const I2C_WRITE_READ: u32 = 0x0304;
-const I2C_CLAIM: u32 = 0x0305;
-const I2C_RELEASE: u32 = 0x0306;
+const I2C_OPEN: u32 = abi::registry::i2c::OPEN;
+const I2C_CLOSE: u32 = abi::registry::i2c::CLOSE;
+const I2C_WRITE: u32 = abi::registry::i2c::WRITE;
+const I2C_READ: u32 = abi::registry::i2c::READ;
+const I2C_WRITE_READ: u32 = abi::registry::i2c::WRITE_READ;
+const I2C_CLAIM: u32 = abi::registry::i2c::CLAIM;
+const I2C_RELEASE: u32 = abi::registry::i2c::RELEASE;
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this

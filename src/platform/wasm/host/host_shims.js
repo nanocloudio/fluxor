@@ -2324,8 +2324,8 @@ registerProcessor('pcm-ring', PcmRing);
               // the bridge: an acquire answers ENOTSUP with a zeroed record
               // and the module falls back to channel_read/channel_write.
               // With nothing acquirable, a release is ENOTSUP too.
-              const BUF_ACQUIRE_WRITE = 0x0A00, BUF_ACQUIRE_READ = 0x0A02;
-              const BUF_ACQUIRE_INPLACE = 0x0A04, ACQUIRED_SIZE = 16, ENOTSUP = -95;
+              const BUF_ACQUIRE_WRITE = 0x0300 /* registry: buffer::ACQUIRE_WRITE */, BUF_ACQUIRE_READ = 0x0302 /* registry: buffer::ACQUIRE_READ */;
+              const BUF_ACQUIRE_INPLACE = 0x0304 /* registry: buffer::ACQUIRE_INPLACE */, ACQUIRED_SIZE = 16, ENOTSUP = -95;
               if (op >= BUF_ACQUIRE_WRITE && op <= BUF_ACQUIRE_INPLACE) {
                 const acquire = op === BUF_ACQUIRE_WRITE || op === BUF_ACQUIRE_READ
                   || op === BUF_ACQUIRE_INPLACE;
@@ -2348,21 +2348,24 @@ registerProcessor('pcm-ring', PcmRing);
                 // storage.namespace LIST:
                 // [prefix_len u16][prefix][cursor_len u16][cursor]
                 // [out u64][out_cap u32][fence u64][fence_cap u16]
-                0x1302: (dv) => {
+                // registry: storage_namespace::LIST
+                0x0E02: (dv) => {
                   const pl = at16(dv, 0); const cl = pl < 0 ? -1 : at16(dv, 2 + pl);
                   if (cl < 0) return null;
                   const o = 4 + pl + cl;
                   return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
                 },
                 // RENAME: [src_len u16][src][dst_len u16][dst][flags u8][fence]
-                0x1303: (dv) => {
+                // registry: storage_namespace::RENAME
+                0x0E03: (dv) => {
                   const sl = at16(dv, 0); const dl = sl < 0 ? -1 : at16(dv, 2 + sl);
                   if (dl < 0) return null;
                   const o = 4 + sl + dl + 1;
                   return [[o, o + 8, 2, true]];
                 },
                 // namespace DELETE: [path_len u16][path][flags u8][fence]
-                0x1304: (dv) => {
+                // registry: storage_namespace::DELETE
+                0x0E04: (dv) => {
                   const pl = at16(dv, 0);
                   if (pl < 0) return null;
                   const o = 2 + pl + 1;
@@ -2370,33 +2373,39 @@ registerProcessor('pcm-ring', PcmRing);
                 },
                 // BIND: [path_len u16][path][kind u8][flags u8]
                 // [target_len u16][target][fence]
-                0x1308: (dv) => {
+                // registry: storage_namespace::BIND
+                0x0E08: (dv) => {
                   const pl = at16(dv, 0); const tl = pl < 0 ? -1 : at16(dv, 2 + pl + 2);
                   if (tl < 0) return null;
                   const o = 2 + pl + 4 + tl;
                   return [[o, o + 8, 2, true]];
                 },
                 // HEAD: [key_len u16][key][out u64][out_cap u32][fence]
-                0x1422: (dv) => {
+                // registry: storage_object::HEAD
+                0x0F22: (dv) => {
                   const kl = at16(dv, 0);
                   if (kl < 0) return null;
                   const o = 2 + kl;
                   return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
                 },
                 // RANGE_GET: [offset u64][length u32][out u64]
-                0x1423: () => [[12, 8, 4, false]],
+                // registry: storage_object::RANGE_GET
+                0x0F23: () => [[12, 8, 4, false]],
                 // object DELETE: [key_len u16][key][precondition u8]
                 // [etag_len u8][etag][fence]
-                0x1424: (dv) => {
+                // registry: storage_object::DELETE
+                0x0F24: (dv) => {
                   const kl = at16(dv, 0); const el = kl < 0 ? -1 : at8(dv, 2 + kl + 1);
                   if (el < 0) return null;
                   const o = 2 + kl + 2 + el;
                   return [[o, o + 8, 2, true]];
                 },
                 // PUT_STREAMED_COMMIT: [fence]
-                0x1428: () => [[0, 8, 2, true]],
+                // registry: storage_object::PUT_STREAMED_COMMIT
+                0x0F28: () => [[0, 8, 2, true]],
                 // RETAIN: [key_len u16][key][retain_until_ms u64][hold u8][fence]
-                0x142C: (dv) => {
+                // registry: storage_object::RETAIN
+                0x0F2C: (dv) => {
                   const kl = at16(dv, 0);
                   if (kl < 0) return null;
                   const o = 2 + kl + 9;
@@ -2404,7 +2413,8 @@ registerProcessor('pcm-ring', PcmRing);
                 },
                 // object LIST: [prefix_len u16][prefix][cursor_len u16]
                 // [cursor][max_keys u16][out u64][out_cap u32][fence]
-                0x142A: (dv) => {
+                // registry: storage_object::LIST
+                0x0F2A: (dv) => {
                   const pl = at16(dv, 0); const cl = pl < 0 ? -1 : at16(dv, 2 + pl);
                   if (cl < 0) return null;
                   const o = 4 + pl + cl + 2;
@@ -2465,7 +2475,7 @@ registerProcessor('pcm-ring', PcmRing);
               //      [body_len:u64][precondition:u8][etag_len:u8][etag]
               //      [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
               //      [fence_ptr:u64][fence_cap:u16]
-              const OBJ_PUT_OP = 0x1420;
+              const OBJ_PUT_OP = 0x0F20 /* registry: storage_object::PUT */;
               if (op === OBJ_PUT_OP) {
                 const EINVAL = -22, ENOSYS = -38, ENODEV = -19;
                 const KEY_MAX = 255, KEY_REF_MAX = 64, FENCE_WIRE_MAX = 62, TAG_VOLATILE = 0;

@@ -1539,14 +1539,46 @@ pub fn load_schema_for_module(
     module_type: &str,
     loc: ModuleLocation<'_>,
 ) -> crate::Result<Option<ParamSchema>> {
-    let fmod_path = loc.dir.join(format!("{module_type}.fmod"));
+    load_schema_for_artifact(module_type, module_type, loc)
+}
+
+/// The schema of the artefact a graph module entry loads: `<type>-<variant>`
+/// when the entry names a `variant:`, as the packer resolves it, else
+/// `<type>`. A project may hold only a variant's artefact (a stack that pins
+/// `http-exchange` and nothing else), and a lookup by the bare type then
+/// finds no schema and packs the instance with no params at all — it runs
+/// on its defaults without a word. The bare type is still tried after the
+/// variant, since every variant of a module is built from one params table.
+pub fn load_schema_for_entry(
+    entry: &serde_json::Value,
+    module_type: &str,
+    loc: ModuleLocation<'_>,
+) -> crate::Result<Option<ParamSchema>> {
+    if let Some(variant) = entry.get("variant").and_then(|v| v.as_str()) {
+        let artifact = format!("{module_type}-{variant}");
+        if let Some(schema) = load_schema_for_artifact(&artifact, module_type, loc)? {
+            return Ok(Some(schema));
+        }
+    }
+    load_schema_for_module(module_type, loc)
+}
+
+/// [`load_schema_for_module`] for one artefact name, which differs from the
+/// module type only for a non-default variant.
+fn load_schema_for_artifact(
+    artifact: &str,
+    module_type: &str,
+    loc: ModuleLocation<'_>,
+) -> crate::Result<Option<ParamSchema>> {
+    let fmod_path = loc.dir.join(format!("{artifact}.fmod"));
     let info = if fmod_path.exists() {
         match ModuleInfo::from_file(&fmod_path) {
             Ok(i) => i,
             Err(_) => return Ok(None),
         }
     } else {
-        let Some(pinned) = resolve_pinned_fmod(module_type, loc)? else {
+        // The lock pins a variant under its artefact name (`http-exchange`).
+        let Some(pinned) = resolve_pinned_fmod(artifact, loc)? else {
             return Ok(None);
         };
         ModuleInfo::from_file(&pinned.path)
@@ -2385,6 +2417,53 @@ mod tests {
         };
         let schema = load_schema_for_module("not_pinned_anywhere", loc).expect("not a hard error");
         assert!(schema.is_none(), "no pin, no .fmod → no schema");
+    }
+
+    /// An entry naming a `variant:` reads the schema of the artefact the
+    /// packer loads, `<type>-<variant>`, which the lock pins under that name.
+    /// With only `pinned-exchange` pinned, the lookup must reach that pin (and
+    /// fail closed on it) rather than look for a bare `pinned` and pack the
+    /// instance with no params.
+    #[test]
+    fn a_variant_entry_reads_its_own_artifact_schema() {
+        let (project, store, modules_dir) = pinned_but_missing_fixture();
+        let lock = project.path().join("fluxor.lock");
+        let pinned = std::fs::read_to_string(&lock).expect("lockfile");
+        std::fs::write(&lock, pinned.replace("pinned_conn", "pinned-exchange")).expect("relock");
+        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
+        let loc = ModuleLocation {
+            dir: &modules_dir,
+            abi: "aarch64",
+            project_root: project.path(),
+        };
+        let entry = serde_json::json!({ "name": "c", "type": "pinned", "variant": "exchange" });
+        let err = load_schema_for_entry(&entry, "pinned", loc)
+            .expect_err("the variant's pin is consulted, and its artefact is missing");
+        assert!(
+            err.to_string().contains("pin local/pinned-exchange:1"),
+            "{err}"
+        );
+        // Without the variant the same type finds nothing: no pin, no .fmod.
+        let bare = serde_json::json!({ "name": "c", "type": "pinned" });
+        assert!(load_schema_for_entry(&bare, "pinned", loc)
+            .expect("no error")
+            .is_none());
+    }
+
+    /// A variant with no artefact of its own falls back to the bare type's.
+    #[test]
+    fn a_variant_entry_falls_back_to_the_type_schema() {
+        let (project, store, modules_dir) = pinned_but_missing_fixture();
+        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
+        let loc = ModuleLocation {
+            dir: &modules_dir,
+            abi: "aarch64",
+            project_root: project.path(),
+        };
+        let entry = serde_json::json!({ "name": "c", "type": "pinned_conn", "variant": "web" });
+        let err = load_schema_for_entry(&entry, "pinned_conn", loc)
+            .expect_err("falls back to the type's pin");
+        assert!(err.to_string().contains("pin local/pinned_conn:1"), "{err}");
     }
 
     /// The abi and project come from the caller, not from where the

@@ -15,3 +15,8 @@ timer_class = "agnostic"
 
 [observability]
 exempt = "fixture whose evidence is its one verdict line"
+
+# Device registers, DMA memory and cache maintenance.
+[[resources]]
+requires_contract = "metal_device"
+access = "write"

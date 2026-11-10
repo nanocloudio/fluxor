@@ -681,47 +681,12 @@ pub fn fact_is_numeric(capability: &str, fact: &str) -> bool {
         .is_some_and(|(_, admitted)| *admitted == FACT_NUMERIC)
 }
 
-/// Canonical provider-contract names accepted in
-/// `[[resources]].requires_contract`. Lowercase `snake_case` naming a stable
-/// privileged operation family, with the two storage surfaces in their dotted
-/// spelling because they mirror the public semantic storage surfaces. The
-/// ABI-coupled numeric dispatch IDs live in `fluxor-tools`
-/// (`manifest::contract_id_from_name`); this is the name vocabulary only.
-pub const PROVIDER_CONTRACTS: &[&str] = &[
-    "gpio",
-    "spi",
-    "i2c",
-    "pio",
-    "channel",
-    "timer",
-    "platform_nic_ring",
-    "platform_dma",
-    "fs",
-    "buffer",
-    "event",
-    "uart",
-    "adc",
-    "pwm",
-    "platform_dma_fd",
-    "pcie_device",
-    "storage.namespace",
-    "storage.object",
-    "usb_host",
-    "proc",
-    "workload",
-    "trust",
-    "net_policy",
-    "host_mount",
-    "net_route",
-];
-
-/// Names accepted in a module manifest's `provides = [..]` field — the
-/// producer side of a resolvable dependency. A superset of the
-/// `PROVIDER_CONTRACTS` service/contract names above with the storage
+/// Names accepted in a module manifest's `provides = [..]` field beside the
+/// contracts the ABI registry lets a manifest name: the storage
 /// **surface** family (`docs/architecture/storage_capability_surface.md`): `storage.block`
 /// and `file.data` are surfaces a provider advertises but are not
-/// class-byte-dispatched contracts, so they live here rather than in
-/// `PROVIDER_CONTRACTS`. Validated case-insensitively at manifest parse so a
+/// class-byte-dispatched contracts, so they live here rather than in the
+/// registry. Validated case-insensitively at manifest parse so a
 /// typo (`file.dat`, `storage.blocks`) fails the build instead of silently
 /// never resolving.
 pub const PROVIDER_SURFACES: &[&str] = &["storage.block", "file.data"];

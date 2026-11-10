@@ -14,14 +14,14 @@
 // params before each module's `module_new()`. Overrides persist across
 // reboots.
 
-/// Store a runtime parameter override (persists across reboots).
-/// handle=-1, arg=[tag:u8, value_bytes...], arg_len=1+value_len.
-/// Scoped to current module instance. Returns 0 or negative errno.
-pub const STORE: u32 = 0x0C34;
+/// Clear all runtime overrides for current module (arg_len=0) or
+/// global factory reset (arg[0]=0xFF). handle=-1.
+pub use super::super::super::registry::runtime_params::CLEAR_ALL;
 /// Delete a runtime parameter override (reverts to compiled default).
 /// handle=-1, arg=[tag:u8], arg_len=1.
 /// Scoped to current module instance. Returns 0 or negative errno.
-pub const DELETE: u32 = 0x0C35;
-/// Clear all runtime overrides for current module (arg_len=0) or
-/// global factory reset (arg[0]=0xFF). handle=-1.
-pub const CLEAR_ALL: u32 = 0x0C36;
+pub use super::super::super::registry::runtime_params::DELETE;
+/// Store a runtime parameter override (persists across reboots).
+/// handle=-1, arg=[tag:u8, value_bytes...], arg_len=1+value_len.
+/// Scoped to current module instance. Returns 0 or negative errno.
+pub use super::super::super::registry::runtime_params::STORE;

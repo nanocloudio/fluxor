@@ -1970,8 +1970,7 @@ impl ModuleHeader {
     ///     bit 5: wasm_payload — module body is a wasm payload (set by
     ///       `pack_fmod_wasm`, read by `platform/wasm.rs`).
     ///     bits 6-7: reserved (0). Fine-grained permissions
-    ///     (reconfigure / flash_raw / platform_raw / backing_provider /
-    ///     monitor / bridge) live in the manifest binary at byte 15,
+    ///     (reconfigure / flash_raw / platform_raw / monitor / bridge …) live in the manifest binary at byte 15,
     ///     read by `LoadedModule::manifest_permissions()`.
     ///   byte 1: step_period_ticks (0 = every tick, N = step every N
     ///     scheduler ticks). The scheduler enforces this verbatim in

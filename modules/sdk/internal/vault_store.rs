@@ -10,7 +10,7 @@
 // region, an SD card's file or partition, an NVMe window, a host file) is a
 // graph's choice, with one implementation behind all of them.
 //
-// Every opcode takes handle=-1, rides the key-vault provider (class 0x10),
+// Every opcode takes handle=-1, rides the key-vault provider (class `key_vault`),
 // and needs the `vault_store` permission; after `ATTACH` only the attaching
 // instance is answered. All fields are little-endian.
 //
@@ -33,7 +33,7 @@
 /// that is not a multiple of 512 bytes in `MIN_IMAGE..=` the kernel's
 /// `MAX_IMAGE`, an unknown seal mode, or one that differs from the store
 /// already loaded.
-pub const ATTACH: u32 = 0x1040;
+pub use super::super::registry::vault_store::ATTACH;
 
 /// One piece of a slot as the medium holds it. arg:
 /// `[phase:u8][slot:u8][_pad:2][offset:u32][ptr:u64][len:u32][_pad:4]`.
@@ -41,26 +41,26 @@ pub const ATTACH: u32 = 0x1040;
 /// `image_len`. Returns 0; `-EINVAL` out of order or out of phase; `-EIO`
 /// when a `FILL` ends with bytes that are not the image its `SCAN` chose
 /// (the medium changed between the passes): load again from `SCAN`.
-pub const LOAD: u32 = 0x1041;
+pub use super::super::registry::vault_store::LOAD;
 
 /// After both slots were scanned: which slot to `FILL`. Returns 0 or 1, or
 /// 2 when neither held an image and the store starts empty (and is ready).
-pub const DECIDE: u32 = 0x1042;
+pub use super::super::registry::vault_store::DECIDE;
 
 /// The image waiting to be written, if any. arg: `[seq_out:u64][slot_out:u8]
 /// [_pad:7]`. Returns 1 when one is waiting, 0 when the medium holds the
 /// newest, `-EAGAIN` before the load finished.
-pub const PENDING: u32 = 0x1043;
+pub use super::super::registry::vault_store::PENDING;
 
 /// Copy part of image `seq`. arg: `[seq:u64][offset:u32][len:u32][ptr:u64]`.
 /// Returns 0; `-EAGAIN` when the image is no longer `seq` (ask `PENDING`
 /// again).
-pub const READ: u32 = 0x1044;
+pub use super::super::registry::vault_store::READ;
 
 /// Image `seq` reached its slot (status 0: written and flushed, so it
 /// survives a power cut) or did not (a negative errno). arg:
 /// `[seq:u64][status:i32][_pad:4]`. Returns 0.
-pub const DONE: u32 = 0x1045;
+pub use super::super::registry::vault_store::DONE;
 
 /// Pass of a [`LOAD`].
 pub mod phase {

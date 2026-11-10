@@ -117,7 +117,7 @@ graph whose gated modules the kernel would refuse:
 | Refused | Why |
 |---|---|
 | A level above everything the target implements | No backend enforces it |
-| A permission that reaches past the gateway (`RECONFIGURE`, `FLASH_RAW`, `BACKING_PROVIDER`, `MONITOR`, `BRIDGE`, `PCIE_DEVICE`, `USB_HOST`, `PLATFORM_RAW`, `PLATFORM_DMA`) | The kernel would act on the module's behalf with authority it does not have |
+| A permission that reaches past the gateway (`RECONFIGURE`, `FLASH_RAW`, `MONITOR`, `BRIDGE`, `PCIE_DEVICE`, `USB_HOST`, `PLATFORM_RAW`, `PLATFORM_DMA`) | The kernel would act on the module's behalf with authority it does not have |
 | Providing a contract | Other modules' calls would run its code privileged |
 | An interrupt-tier module (tier 1b, 2) | An ISR runs privileged with no gateway |
 | An `isolated` module whose code the model cannot draw as one region | Use `contained` |

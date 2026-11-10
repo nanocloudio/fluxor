@@ -29,7 +29,7 @@
 // - `EXEC` runs one request to completion inside the call and writes its
 //   completion. It MAY WAIT on the device — for the request, and for the
 //   flush an `F_PREFLUSH` asks for — so it is for a consumer outside any
-//   caller's step deadline (a pager, a vault, a fixture's own step).
+//   caller's step deadline (a vault, a fixture's own step).
 // - `SUBMIT` queues one request and returns; `REAP` hands back one finished
 //   completion. For a consumer that keeps several requests in flight.
 //   `SUBMIT` never waits, `F_PREFLUSH` included: the source queues the

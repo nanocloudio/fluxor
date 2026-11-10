@@ -82,13 +82,13 @@ const READ_CS: u8 = abi::internal::flash::sideband_op::READ_CS;
 // Constants — Flash Store Provider
 // ============================================================================
 
-const FLASH_STORE_ENABLE: u32 = 0x0C37;
-const FLASH_RAW_ERASE: u32 = 0x0C38;
-const FLASH_RAW_PROGRAM: u32 = 0x0C39;
+const FLASH_STORE_ENABLE: u32 = abi::registry::provider_registry::FLASH_STORE_ENABLE;
+const FLASH_RAW_ERASE: u32 = abi::registry::flash::RAW_ERASE;
+const FLASH_RAW_PROGRAM: u32 = abi::registry::flash::RAW_PROGRAM;
 
-const PARAM_STORE_OP: u32 = 0x0C34;
-const PARAM_DELETE_OP: u32 = 0x0C35;
-const PARAM_CLEAR_ALL_OP: u32 = 0x0C36;
+const PARAM_STORE_OP: u32 = abi::registry::runtime_params::STORE;
+const PARAM_DELETE_OP: u32 = abi::registry::runtime_params::DELETE;
+const PARAM_CLEAR_ALL_OP: u32 = abi::registry::runtime_params::CLEAR_ALL;
 
 const XIP_BASE: u32 = abi::platform::rp::flash_layout::XIP_BASE;
 const SECTOR_SIZE: usize = abi::platform::rp::flash_layout::PARAM_STORE_SIZE;

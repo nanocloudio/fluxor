@@ -2,7 +2,7 @@
 //!
 //! Runs in the SYSTEM graph and drives one pause→resume cycle against a
 //! resident workload's owner via the OWNER_PAUSE / OWNER_RESUME live-mutation
-//! ops (0x0C49/0x0C4A, beside APPLY_ADD/FREE_OWNER):
+//! ops (`reconfigure::OWNER_PAUSE`/`reconfigure::OWNER_RESUME`, beside APPLY_ADD/FREE_OWNER):
 //!
 //!   at `pause_at_ms`  → OWNER_PAUSE  `[slot:u16 LE][generation:u32 LE]`
 //!   at `resume_at_ms` → OWNER_RESUME (same handle record)

@@ -91,8 +91,8 @@ range:
 None of these required changing the graph model. Each required
 building modules and, in some cases, extending the execution model
 with additional tiers: hardware-timer-driven execution for hard
-real-time control, poll-mode execution for throughput-bound workloads,
-demand-paged memory for datasets larger than physical RAM. The core
+real-time control, poll-mode execution for throughput-bound workloads.
+The core
 abstraction, modules connected by typed channels, executed with
 explicit timing and validated before deployment, stayed the same.
 

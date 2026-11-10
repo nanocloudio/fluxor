@@ -1807,26 +1807,26 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
 /// whatever contract it serves. See `abi::internal::reconfigure`.
 const OWNER_RELEASED: u32 = abi::internal::reconfigure::OWNER_RELEASED;
 const OWNER_RELEASED_ARG_LEN: usize = abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN;
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_WRITE_ASYNC: u32 = 0x090F;
-const FS_FSYNC_SUBMIT: u32 = 0x0910;
-const FS_FSYNC_POLL: u32 = 0x0911;
-const FS_OPENDIR: u32 = 0x0907;
-const FS_READDIR: u32 = 0x0908;
-/// `OPEN_CREATE` (0x0909) is documented in
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_SEEK: u32 = abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_STAT: u32 = abi::registry::fs::STAT;
+const FS_FSYNC: u32 = abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = abi::registry::fs::WRITE;
+const FS_WRITE_ASYNC: u32 = abi::registry::fs::WRITE_ASYNC;
+const FS_FSYNC_SUBMIT: u32 = abi::registry::fs::FSYNC_SUBMIT;
+const FS_FSYNC_POLL: u32 = abi::registry::fs::FSYNC_POLL;
+const FS_OPENDIR: u32 = abi::registry::fs::OPENDIR;
+const FS_READDIR: u32 = abi::registry::fs::READDIR;
+/// `OPEN_CREATE` (`fs::OPEN_CREATE`) is documented in
 /// `modules/sdk/contracts/storage/fs.rs` and reserved at the
 /// SDK level, but FAT32 doesn't implement file creation — no FAT
 /// table writeback, no cluster allocator, no directory-entry
 /// emit. We explicitly return ENOSYS rather than fall through to
 /// the catch-all so the gap is obvious to readers of this file.
-const FS_OPEN_CREATE: u32 = 0x0909;
-/// `UNLINK` (0x090A) — remove a file by path. The synchronous part is
+const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
+/// `UNLINK` — remove a file by path. The synchronous part is
 /// O(1): mark the 8.3 directory entry deleted (`0xE5`) and durably write
 /// that one sector. The cluster chain is NOT walked inline — freeing an
 /// N-cluster chain is O(N) device round-trips, which would blow the
@@ -1837,10 +1837,10 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 /// chain second — an interruption leaks clusters (safe, matches the
 /// truncate posture) but can never leave a live entry pointing at freed
 /// clusters.
-const FS_UNLINK: u32 = 0x090A;
-const FS_PREALLOCATE: u32 = 0x090E;
+const FS_UNLINK: u32 = abi::registry::fs::UNLINK;
+const FS_PREALLOCATE: u32 = abi::registry::fs::PREALLOCATE;
 
-/// `RENAME` (0x090D) — move an 8.3 entry to another name, publishing the
+/// `RENAME` — move an 8.3 entry to another name, publishing the
 /// new name durably. FAT32 has no directory-mutation primitive that spans
 /// two sectors atomically, so the ordering is made recoverable instead: an
 /// intent record in the volume's spare reserved sectors names both entries
@@ -1848,31 +1848,31 @@ const FS_PREALLOCATE: u32 = 0x090E;
 /// resolves whichever intermediate state the interruption left. See
 /// `fs_op_rename` for the phase sequence and `fs_rename_recover` for the
 /// state discrimination.
-const FS_RENAME: u32 = 0x090D;
+const FS_RENAME: u32 = abi::registry::fs::RENAME;
 
-/// `FSYNC_NAME` (0x0912) — durably publish the parent-directory entry
+/// `FSYNC_NAME` — durably publish the parent-directory entry
 /// naming a path. FAT32 already writes every name-minting directory
 /// sector synchronously (`fs_op_create`, `fs_op_unlink`), so the entry is
 /// in the device's cache the moment the op returns; what is missing for
 /// durability is the cache flush, which is exactly what this opcode adds.
-const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_FSYNC_NAME: u32 = abi::registry::fs::FSYNC_NAME;
 
-/// `CAPS` (0x09FF) — capability-discovery opcode. Returns a u32
+/// `CAPS` (`fs::CAPS`) — capability-discovery opcode. Returns a u32
 /// LE bitmap of supported FS opcodes. Callers query this before
 /// invoking write-tier ops (currently just `OPEN_CREATE`) so
 /// they can branch on capability rather than catch `ENOSYS`.
-const FS_CAPS: u32 = 0x09FF;
+const FS_CAPS: u32 = abi::registry::fs::CAPS;
 
-/// `MKDIR` (0x090B) — create one directory by path. The parent must
+/// `MKDIR` — create one directory by path. The parent must
 /// already exist; the new directory is minted with its `.` and `..`
 /// entries and published like any other name (see `fs_op_mkdir`).
-const FS_MKDIR: u32 = 0x090B;
-const FS_RMDIR: u32 = 0x0915;
+const FS_MKDIR: u32 = abi::registry::fs::MKDIR;
+const FS_RMDIR: u32 = abi::registry::fs::RMDIR;
 
-/// `TRUNCATE` (0x090C) — set an existing file's length, releasing the
+/// `TRUNCATE` — set an existing file's length, releasing the
 /// clusters past the new end. Shrink only; growing a file is what
 /// `PREALLOCATE` and `WRITE` are for.
-const FS_TRUNCATE: u32 = 0x090C;
+const FS_TRUNCATE: u32 = abi::registry::fs::TRUNCATE;
 
 /// FS capability bits — must match
 /// `modules/sdk/contracts/storage/fs.rs::caps`.
@@ -11107,7 +11107,7 @@ pub unsafe fn test_intent_lba(state: *const u8) -> u32 {
 /// mounted state with an explicit minimal FAT32 geometry, bypassing the
 /// async init state machine (which needs the NOTIFY+channel block-source
 /// protocol). The harness backs the sync block ioctls (`provider_call`
-/// opcode `0x0506`) with a zeroed RAM disk; the geometry below must match
+/// opcode `channel::IOCTL`) with a zeroed RAM disk; the geometry below must match
 /// what the harness sizes that disk for.
 ///
 /// Geometry: 512 B sectors, 8 sectors/cluster (4 KiB clusters),

@@ -343,22 +343,10 @@ pub fn kernel_pool_domain(target: &str, pool: &str) -> Option<(u64, &'static str
     }
 }
 
-/// The module ABI's kernel surface, embedded for the tagged-fd slot field.
-const KERNEL_ABI: &str = include_str!("../../modules/sdk/abi/kernel_abi.rs");
-
-/// Slots a tagged fd's slot field can name (`kernel_abi::fd::SLOT_MASK` + 1):
-/// the domain of the event and timer tables, whose handles carry their slot
-/// there.
+/// Slots a tagged fd's slot field can name (`fd::SLOT_MASK` + 1): the
+/// domain of the event and timer tables, whose handles carry their slot there.
 fn fd_slot_domain() -> Option<u64> {
-    let decl = "pub const SLOT_MASK: i32 = ";
-    let at = KERNEL_ABI.find(decl)? + decl.len();
-    let rest = &KERNEL_ABI[at..];
-    let lit = rest[..rest.find(';')?].trim().replace('_', "");
-    let mask = match lit.strip_prefix("0x") {
-        Some(hex) => u64::from_str_radix(hex, 16).ok()?,
-        None => lit.parse().ok()?,
-    };
-    Some(mask + 1)
+    Some(fluxor_abi::registry::fd::SLOT_MASK as u64 + 1)
 }
 
 /// What a config gives the kernel's boot plan to derive pool sizes from

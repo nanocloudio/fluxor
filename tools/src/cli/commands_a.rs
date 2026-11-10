@@ -788,7 +788,7 @@ fn check_stack_budget(
 /// Refused: more isolated modules than the target has slots for; a gated
 /// module holding any permission that reaches past the gateway (raw
 /// peripherals, DMA, flash, graph reconfiguration, the fault monitor,
-/// cross-domain dispatch, PCIe, USB host, backing providers); a gated module
+/// cross-domain dispatch, PCIe, USB host); a gated module
 /// that provides a contract, whose other modules' calls would run its code
 /// privileged.
 fn check_gated_admission(

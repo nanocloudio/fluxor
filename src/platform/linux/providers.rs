@@ -56,11 +56,18 @@ struct LinuxFileSlot {
     charged: bool,
 }
 
-/// Bits of a handle that name the slot; the rest above them, up to the
-/// tag, carry the slot's generation.
+/// Bits of a handle that name the slot; the rest above them, up to the top
+/// of the field a provider may use (`fd::SLOT_FIELD_BITS`), carry the
+/// slot's generation. The bit above that field is the kernel's routed bit:
+/// a generation reaching it makes the kernel read the handle as a routed
+/// one that names no route, and every op on it answers `EBADF`.
 const SLOT_BITS: u32 = 8;
 const _: () = assert!(MAX_OPEN_FILES <= 1 << SLOT_BITS);
-const GEN_MASK: u32 = (crate::abi::kernel_abi::fd::SLOT_MASK as u32) >> SLOT_BITS;
+const GEN_MASK: u32 = ((1 << crate::abi::registry::fd::SLOT_FIELD_BITS) - 1) >> SLOT_BITS;
+const _: () = assert!(
+    (GEN_MASK << SLOT_BITS | ((1 << SLOT_BITS) - 1)) >> crate::abi::registry::fd::SLOT_FIELD_BITS
+        == 0
+);
 
 /// The handle for slot `idx` at its current generation.
 fn slot_handle(idx: usize, generation: u32) -> i32 {
@@ -808,7 +815,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
     // Linux implements the full read-tier, the write-tier, both
-    // name-publication ops (RENAME 0x090D, FSYNC_NAME 0x0912) and TRUNCATE.
+    // name-publication ops (RENAME, FSYNC_NAME) and TRUNCATE.
     // FSYNC_ASYNC stays clear: this provider fences with a blocking
     // `fsync(2)`. A workload's root offers no hard links.
     if opcode == dev_fs::CAPS {
@@ -1479,7 +1486,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 }
 
 // ============================================================================
-// Linux PROC Provider — the impure boundary (host process executor, class 0x16)
+// Linux PROC Provider — the impure boundary (host process executor, class `proc`)
 // ============================================================================
 //
 // `do <cmd>` (sector) calls this via provider_call, gated by

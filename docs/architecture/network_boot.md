@@ -244,9 +244,9 @@ Source: `src/kernel/module/ota_stage.rs`,
 Staging is a kernel surface reached through two `dev_system` opcodes,
 available to modules with the `platform_raw` permission:
 
-- `OTA_STAGE_WRITE` (`0x0C20`) — payload `[offset: u32 LE][bytes]`.
+- `OTA_STAGE_WRITE` (`0x2020`) — payload `[offset: u32 LE][bytes]`.
   Forward gaps are zero-filled; backward offsets are rejected.
-- `OTA_STAGE_CTRL` (`0x0C21`) — `COMMIT` (0), `ABORT` (1), `EPOCH`
+- `OTA_STAGE_CTRL` (`0x2021`) — `COMMIT` (0), `ABORT` (1), `EPOCH`
   (2, returns the live epoch).
 
 The stage is RAM: two 8 MiB, 16 KiB-aligned static buffers used

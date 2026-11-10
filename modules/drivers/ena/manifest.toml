@@ -26,3 +26,8 @@ access = "exclusive"
 
 [observability]
 exempt = "L2 frame DMA shim: wire-byte throughput is observed at the ip module above it; its '[ena]' lines report bring-up, link and faults"
+
+# Device registers, DMA memory and cache maintenance.
+[[resources]]
+requires_contract = "metal_device"
+access = "write"

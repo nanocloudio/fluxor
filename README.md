@@ -122,8 +122,6 @@ the same ABI surface on that architecture.
 - Per-module sandboxing at three protection levels (None / Guarded /
   Isolated), MPU-enforced on RP2350 and MMU-enforced on aarch64
 - Live graph reconfigure with a four-phase drain protocol
-- Demand-paged arenas for workloads larger than physical RAM (aarch64
-  targets)
 - Stacks at build time: a config's `platform:` section expands into the
   board-appropriate driver chain, and its `include:` takes in published
   stacks — parameterised subsystems other projects own — by name

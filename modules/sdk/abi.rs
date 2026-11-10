@@ -56,6 +56,14 @@ pub mod config {
     include!("abi/config.rs");
 }
 
+/// Every ABI number, generated from `abi/registry.toml` by `fluxor
+/// abi-regen`: contract ids, opcodes, permission bits, errno, poll bits,
+/// ioctl commands and fd tags, with the lookups the kernel and tools derive
+/// from them.
+pub mod registry {
+    include!("abi/registry_gen.rs");
+}
+
 pub mod kernel_abi {
     include!("abi/kernel_abi.rs");
 }
@@ -95,6 +103,11 @@ pub mod contracts {
         /// root-complex mechanics stay under `platform` (D-HW-TAXONOMY).
         pub mod pcie_device {
             include!("contracts/hal/pcie.rs");
+        }
+        /// Device registers, DMA memory and cache maintenance on a
+        /// bare-metal aarch64 machine.
+        pub mod metal_device {
+            include!("contracts/hal/metal_device.rs");
         }
     }
     pub mod net {
@@ -139,11 +152,6 @@ pub mod contracts {
         /// platform or a module provider and reported per entry.
         pub mod route {
             include!("contracts/net/route.rs");
-        }
-        /// A hardware flow-decision provider beside the software director:
-        /// its attested generation, its decisions and its counters.
-        pub mod offload {
-            include!("contracts/net/offload.rs");
         }
     }
     /// Observability telemetry envelope (metric / span signals).
@@ -204,9 +212,6 @@ pub mod contracts {
         }
         pub mod runtime_params {
             include!("contracts/storage/runtime_params.rs");
-        }
-        pub mod paged_arena {
-            include!("contracts/storage/paged_arena.rs");
         }
         /// Raw logical-block I/O over a `blocks` channel.
         pub mod block {
@@ -374,17 +379,8 @@ pub mod platform {
         }
     }
     pub mod bcm2712 {
-        pub mod mmio_dma {
-            include!("platform/bcm2712/mmio_dma.rs");
-        }
-        pub mod pcie_config {
-            include!("platform/bcm2712/pcie_config.rs");
-        }
         pub mod nic_ring {
             include!("platform/bcm2712/nic_ring.rs");
-        }
-        pub mod msi {
-            include!("platform/bcm2712/msi.rs");
         }
     }
 }

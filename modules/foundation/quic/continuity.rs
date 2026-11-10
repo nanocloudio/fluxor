@@ -386,7 +386,12 @@ unsafe fn cont_seal(
     p += pt.len();
     arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
     arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, 0x1012, arg.as_mut_ptr(), p + 12);
+    let rc = (sys.provider_call)(
+        handle,
+        abi::registry::key_vault::AEAD_SEAL,
+        arg.as_mut_ptr(),
+        p + 12,
+    );
     if rc < 0 {
         return 0;
     }
@@ -416,7 +421,12 @@ unsafe fn cont_open(
     p += blob.len();
     arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
     arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, 0x1013, arg.as_mut_ptr(), p + 12);
+    let rc = (sys.provider_call)(
+        handle,
+        abi::registry::key_vault::AEAD_OPEN,
+        arg.as_mut_ptr(),
+        p + 12,
+    );
     if rc < 0 {
         return 0;
     }

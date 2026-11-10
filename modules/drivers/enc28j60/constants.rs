@@ -13,10 +13,10 @@ pub const ENC_BIT_FIELD_CLR: u8 = 0xA0;
 pub const ENC_SOFT_RESET: u8 = 0xFF;
 
 /// HAL contract opcodes
-pub const DEV_GPIO_CLAIM: u32 = 0x0100;
-pub const DEV_GPIO_SET_MODE: u32 = 0x0102;
-pub const DEV_GPIO_SET_LEVEL: u32 = 0x0104;
-pub const DEV_SPI_OPEN: u32 = 0x0200;
-pub const DEV_SPI_TRANSFER_START: u32 = 0x0207;
-pub const DEV_SPI_TRANSFER_POLL: u32 = 0x0208;
-pub const DEV_SPI_POLL_BYTE: u32 = 0x0209;
+pub const DEV_GPIO_CLAIM: u32 = super::abi::registry::gpio::CLAIM;
+pub const DEV_GPIO_SET_MODE: u32 = super::abi::registry::gpio::SET_MODE;
+pub const DEV_GPIO_SET_LEVEL: u32 = super::abi::registry::gpio::SET_LEVEL;
+pub const DEV_SPI_OPEN: u32 = super::abi::registry::spi::OPEN;
+pub const DEV_SPI_TRANSFER_START: u32 = super::abi::registry::spi::TRANSFER_START;
+pub const DEV_SPI_TRANSFER_POLL: u32 = super::abi::registry::spi::TRANSFER_POLL;
+pub const DEV_SPI_POLL_BYTE: u32 = super::abi::registry::spi::POLL_BYTE;

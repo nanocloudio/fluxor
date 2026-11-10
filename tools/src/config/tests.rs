@@ -2504,7 +2504,7 @@ mod continuity_tests {
     #[test]
     fn a_required_contract_must_be_answered_by_kernel_platform_or_module() {
         let fs_user = Manifest {
-            resources: vec![claim(0x09, false, &[]), claim(0x05, false, &[])],
+            resources: vec![claim(fluxor_abi::registry::fs::ID as u8, false, &[]), claim(fluxor_abi::registry::channel::ID as u8, false, &[])],
             ..Manifest::default()
         };
         let graph = json!({"modules": [{"name": "user"}]});
@@ -2532,7 +2532,7 @@ mod continuity_tests {
         let m: HashMap<String, Manifest> = [(
             "tls".to_string(),
             Manifest {
-                resources: vec![claim(0x1D, true, &[]), claim(0x09, false, &["cert_file"])],
+                resources: vec![claim(fluxor_abi::registry::trust::ID as u8, true, &[]), claim(fluxor_abi::registry::fs::ID as u8, false, &["cert_file"])],
                 ..Manifest::default()
             },
         )]
@@ -2574,7 +2574,7 @@ mod continuity_tests {
         let m: HashMap<String, Manifest> = [(
             "http".to_string(),
             Manifest {
-                resources: vec![claim(0x09, false, &["fs_root", "route_0_fs_path"])],
+                resources: vec![claim(fluxor_abi::registry::fs::ID as u8, false, &["fs_root", "route_0_fs_path"])],
                 ..Manifest::default()
             },
         )]
@@ -2598,9 +2598,9 @@ mod continuity_tests {
             let v = entry.get(param).and_then(Value::as_str).unwrap_or("default");
             Ok(Some(Some(values.iter().any(|w| w == v))))
         };
-        let mut disk_only = claim(0x09, false, &[]);
+        let mut disk_only = claim(fluxor_abi::registry::fs::ID as u8, false, &[]);
         disk_only.variants = names(&["disk"]);
-        let mut durable_only = claim(0x09, false, &[]);
+        let mut durable_only = claim(fluxor_abi::registry::fs::ID as u8, false, &[]);
         durable_only.when = vec![("update_durability".to_string(), names(&["durable"]))];
         let man = |variant: &str| Manifest {
             resources: vec![disk_only.clone(), durable_only.clone()],
@@ -2642,7 +2642,7 @@ mod continuity_tests {
         let m: HashMap<String, Manifest> = [(
             "w".to_string(),
             Manifest {
-                resources: vec![claim(0x09, false, &[]), claim(0x14, false, &[])],
+                resources: vec![claim(fluxor_abi::registry::fs::ID as u8, false, &[]), claim(fluxor_abi::registry::storage_object::ID as u8, false, &[])],
                 ..Manifest::default()
             },
         )]
@@ -2672,7 +2672,7 @@ mod continuity_tests {
         use crate::manifest::ResourceClaim;
         let caller = Manifest {
             resources: vec![ResourceClaim {
-                device_class: 0x13, // storage.namespace
+                device_class: fluxor_abi::registry::storage_namespace::ID as u8,
                 access_mode: 0,
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
@@ -2758,7 +2758,7 @@ mod continuity_tests {
         use crate::manifest::{permission, ResourceClaim};
         let creator = Manifest {
             resources: vec![ResourceClaim {
-                device_class: 0x1A,
+                device_class: fluxor_abi::registry::workload::ID as u8,
                 access_mode: 1,
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
@@ -2776,7 +2776,7 @@ mod continuity_tests {
         // platform_raw: not a creator.
         let stack = Manifest {
             resources: vec![ResourceClaim {
-                device_class: 0x1A,
+                device_class: fluxor_abi::registry::workload::ID as u8,
                 access_mode: 1,
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
@@ -2944,7 +2944,7 @@ mod continuity_tests {
     fn fs_consumer(selector: ClaimSelector) -> Manifest {
         Manifest {
             resources: vec![ResourceClaim {
-                device_class: 0x09,
+                device_class: fluxor_abi::registry::fs::ID as u8,
                 access_mode: 1,
                 instance: 0xFF,
                 selector,
@@ -6340,9 +6340,9 @@ mod boot_plan_tests {
     /// is their domain.
     #[test]
     fn events_are_held_to_the_fd_slot_domain() {
-        let ask = figures(&[("events", 1 << 26)]);
+        let ask = figures(&[("events", 1 << 25)]);
         check_boot_plan("linux", &shape(1, 0), &ask, NONE).expect("every slot the field names");
-        let ask = figures(&[("timers", (1 << 26) + 1)]);
+        let ask = figures(&[("timers", (1 << 25) + 1)]);
         let e = check_boot_plan("linux", &shape(1, 0), &ask, NONE).unwrap_err();
         assert!(
             e.contains("pool 'timers'") && e.contains("tagged-fd slot domain"),

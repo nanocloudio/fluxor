@@ -139,16 +139,23 @@
 // binds: `FSYNC_NAME` after `OPEN_CREATE`, and `RENAME` here, achieve
 // the same fence as `BIND` and `RENAME` there.
 
+/// Release a handle. Never waits and always releases: the handle is gone
+/// whatever the answer. Returns 0, or `EBADF` for a handle that is not open.
+/// Unwritten data and size metadata are written back by the provider's step
+/// after the close; their failure is not reported here. A caller that needs
+/// durability fences (`FSYNC`, `FSYNC_SUBMIT`/`FSYNC_POLL`, `FSYNC_NAME`)
+/// before closing.
+pub use super::super::super::registry::fs::CLOSE;
 /// Open a file by path. `handle = -1`; `arg` is the UTF-8 path. Returns a
 /// tagged FD, a negative errno, or `EAGAIN` while what the walk needs is
 /// still being fetched.
-pub const OPEN: u32 = 0x0900;
+pub use super::super::super::registry::fs::OPEN;
 /// Read from the FD's offset. `handle=file`, `arg` is the output buffer.
 /// Returns the bytes read — possibly short — 0 at end of file, or `EAGAIN`
 /// when no byte could be read yet (the data is being fetched). Once a byte
 /// has moved the answer is the short count, never `EAGAIN`; the offset
 /// advances by exactly what was answered.
-pub const READ: u32 = 0x0901;
+pub use super::super::super::registry::fs::READ;
 /// Set the absolute read/write offset. `handle=file`.
 ///
 /// `arg` is `[offset: u32 LE]`, or `[offset: u64 LE]` when `arg_len >= 8`.
@@ -163,15 +170,21 @@ pub const READ: u32 = 0x0901;
 ///
 /// `EAGAIN` while the chain walk to the offset needs data still being
 /// fetched; the offset has not moved.
-pub const SEEK: u32 = 0x0902;
-/// Release a handle. Never waits and always releases: the handle is gone
-/// whatever the answer. Returns 0, or `EBADF` for a handle that is not open.
-/// Unwritten data and size metadata are written back by the provider's step
-/// after the close; their failure is not reported here. A caller that needs
-/// durability fences (`FSYNC`, `FSYNC_SUBMIT`/`FSYNC_POLL`, `FSYNC_NAME`)
-/// before closing.
-pub const CLOSE: u32 = 0x0903;
+pub use super::super::super::registry::fs::SEEK;
 
+/// Byte-durability fence: commit this file's contents and its own recorded
+/// size past the device's volatile cache. `handle=file`.
+///
+/// May answer `EINPROGRESS`: the fence is taken and the caller re-asks with
+/// the same request until it is decided. The final 0 means the FD's bytes
+/// written before the fence was taken, and size metadata covering them, are
+/// durable — data reaching media before the size that describes it — and the
+/// achieved fence is `LocalDurable { device_id }`. A negative errno is a
+/// failed fence.
+///
+/// It does NOT publish the name that finds the file — see [`FSYNC_NAME`]
+/// and the durability vocabulary at the top of this file.
+pub use super::super::super::registry::fs::FSYNC;
 /// Report a handle's size and modification time.
 ///
 /// `arg` points at an output buffer. Its width selects the shape:
@@ -213,25 +226,12 @@ pub const CLOSE: u32 = 0x0903;
 ///   - **`nlink` is the number of names.** [`UNLINK`] removes a name and
 ///     queues storage for reclamation when the last one goes. A provider
 ///     without hard links reports 1, which is true.
-pub const STAT: u32 = 0x0904;
-/// Byte-durability fence: commit this file's contents and its own recorded
-/// size past the device's volatile cache. `handle=file`.
-///
-/// May answer `EINPROGRESS`: the fence is taken and the caller re-asks with
-/// the same request until it is decided. The final 0 means the FD's bytes
-/// written before the fence was taken, and size metadata covering them, are
-/// durable — data reaching media before the size that describes it — and the
-/// achieved fence is `LocalDurable { device_id }`. A negative errno is a
-/// failed fence.
-///
-/// It does NOT publish the name that finds the file — see [`FSYNC_NAME`]
-/// and the durability vocabulary at the top of this file.
-pub const FSYNC: u32 = 0x0905;
+pub use super::super::super::registry::fs::STAT;
 /// Write data. handle=file, arg=data, arg_len=data_len. Returns the bytes
 /// taken, which may be short; `EAGAIN` only when none were. The caller
 /// advances by the answer. Taken bytes belong to the provider, which writes
 /// them back in the background; they are volatile until a fence.
-pub const WRITE: u32 = 0x0906;
+pub use super::super::super::registry::fs::WRITE;
 
 /// Open a directory for enumeration.
 ///
@@ -243,7 +243,7 @@ pub const WRITE: u32 = 0x0906;
 ///
 /// The directory is positioned at its first entry; successive
 /// `READDIR` calls advance through the chain.
-pub const OPENDIR: u32 = 0x0907;
+pub use super::super::super::registry::fs::OPENDIR;
 
 /// Read the next batch of directory entries from a `OPENDIR` handle.
 ///
@@ -272,7 +272,7 @@ pub const OPENDIR: u32 = 0x0907;
 /// If the buffer is too small to hold even one entry, the provider
 /// returns `-7 E2BIG` without advancing the cursor so the caller can
 /// retry with a larger buffer.
-pub const READDIR: u32 = 0x0908;
+pub use super::super::super::registry::fs::READDIR;
 
 /// Open a file with create-on-missing semantics. Same arg layout as
 /// `OPEN` — `handle = -1`, `arg` is the UTF-8 path, `arg_len` is
@@ -301,7 +301,7 @@ pub const READDIR: u32 = 0x0908;
 /// Normatively `storage.namespace::BIND(kind=object)` +
 /// `file.data::OPEN` fused into one round trip — see
 /// `namespace.rs::BIND` for the fused/split equivalence.
-pub const OPEN_CREATE: u32 = 0x0909;
+pub use super::super::super::registry::fs::OPEN_CREATE;
 
 /// Remove a filesystem entry by path.
 ///
@@ -309,7 +309,7 @@ pub const OPEN_CREATE: u32 = 0x0909;
 /// `arg_len` is its byte length. Returns `0` on success or a negative errno.
 /// Providers that do not support mutation return `ENOSYS` and leave
 /// [`caps::UNLINK`] clear.
-pub const UNLINK: u32 = 0x090A;
+pub use super::super::super::registry::fs::UNLINK;
 
 /// Create a single directory by path. The parent must already exist (this is
 /// `mkdir`, not `mkdir -p`); a missing parent returns `ENOENT`. An existing
@@ -322,7 +322,7 @@ pub const UNLINK: u32 = 0x090A;
 /// `arg_len` is its byte length. Returns `0` on success or a negative errno.
 /// Providers that do not support mutation return `ENOSYS` and leave
 /// [`caps::MKDIR`] clear.
-pub const MKDIR: u32 = 0x090B;
+pub use super::super::super::registry::fs::MKDIR;
 
 /// Reserve a fixed-capacity file through an existing writable FD.
 ///
@@ -337,7 +337,7 @@ pub const MKDIR: u32 = 0x090B;
 /// deliberately distinct from sparse truncate: the final 0 promises that the
 /// capacity is physically backed and crash-visible. Providers without that guarantee
 /// return `ENOSYS` and leave [`caps::PREALLOCATE`] clear.
-pub const PREALLOCATE: u32 = 0x090E;
+pub use super::super::super::registry::fs::PREALLOCATE;
 
 /// Shrink an existing file to `len` bytes, releasing the storage past the
 /// new end.
@@ -356,7 +356,7 @@ pub const PREALLOCATE: u32 = 0x090E;
 /// with storage still attached. Returns `EBUSY` when a writable handle is
 /// open on the file, `EISDIR` for a directory. Providers that do not
 /// support it return `ENOSYS` and leave [`caps::TRUNCATE`] clear.
-pub const TRUNCATE: u32 = 0x090C;
+pub use super::super::super::registry::fs::TRUNCATE;
 
 /// Write data through an FD that submits now and proves durability
 /// later — the provider hands the sectors to the block source's async
@@ -372,7 +372,7 @@ pub const TRUNCATE: u32 = 0x090C;
 /// A short return is backpressure, not an error: the provider accepted
 /// the returned prefix and the caller writes the rest later. Like every
 /// call of this contract it never waits on the device.
-pub const WRITE_ASYNC: u32 = 0x090F;
+pub use super::super::super::registry::fs::WRITE_ASYNC;
 
 /// Open a non-blocking durability fence over every write issued on this
 /// FD so far. `handle=file`; `arg` is a ≥8-byte output buffer that
@@ -400,7 +400,7 @@ pub const WRITE_ASYNC: u32 = 0x090F;
 /// that produced it, and only until that FD is closed. Presenting it on
 /// another FD, or after `CLOSE`, returns `EINVAL` — never a false
 /// durable.
-pub const FSYNC_SUBMIT: u32 = 0x0910;
+pub use super::super::super::registry::fs::FSYNC_SUBMIT;
 
 /// Non-blocking poll of a fence ticket from [`FSYNC_SUBMIT`].
 /// `handle=file`; `arg` holds the `u64` LE ticket. Returns 0 = durable,
@@ -435,7 +435,7 @@ pub const FSYNC_SUBMIT: u32 = 0x0910;
 /// This fence covers an existing entry's contents and size frontier. It
 /// says nothing about whether the *name* that finds the file is durable
 /// in its parent directory — see [`FSYNC_NAME`].
-pub const FSYNC_POLL: u32 = 0x0911;
+pub use super::super::super::registry::fs::FSYNC_POLL;
 
 /// Durably publish the parent-directory entry naming `path`.
 ///
@@ -469,7 +469,7 @@ pub const FSYNC_POLL: u32 = 0x0911;
 /// [`caps::FSYNC_NAME`] clear. A consumer that needs crash-safe
 /// publication MUST check the bit and fail closed when it is absent
 /// rather than treating file [`FSYNC`] as name publication — it is not.
-pub const FSYNC_NAME: u32 = 0x0912;
+pub use super::super::super::registry::fs::FSYNC_NAME;
 
 /// Remove an empty directory by path.
 ///
@@ -487,7 +487,7 @@ pub const FSYNC_NAME: u32 = 0x0912;
 ///
 /// As with [`UNLINK`], the removal is minted here and published by
 /// [`FSYNC_NAME`] on the path.
-pub const RMDIR: u32 = 0x0915;
+pub use super::super::super::registry::fs::RMDIR;
 
 /// Add a second name for an existing file.
 ///
@@ -514,7 +514,7 @@ pub const RMDIR: u32 = 0x0915;
 /// and returns `ENOSYS`. It does NOT emulate one by copying: two names for
 /// one file and two files with equal contents differ under mutation, and a
 /// consumer that asked for the first would silently get the second.
-pub const LINK: u32 = 0x0913;
+pub use super::super::super::registry::fs::LINK;
 
 /// Read a symbolic link's target without following it.
 ///
@@ -537,7 +537,7 @@ pub const LINK: u32 = 0x0913;
 /// where a path is often the whole of an authority check that turns a
 /// symlink into a confused-deputy primitive: the caller names one thing, the
 /// provider opens another, and nothing in the return value says so.
-pub const READLINK: u32 = 0x0914;
+pub use super::super::super::registry::fs::READLINK;
 
 /// Rename an entry, publishing the new name durably.
 ///
@@ -596,7 +596,7 @@ pub const READLINK: u32 = 0x0914;
 /// operation. Neither weakens the guarantee above: the artefact is never
 /// reachable by no name, and the destination is authoritative from the
 /// moment `RENAME` answers 0.
-pub const RENAME: u32 = 0x090D;
+pub use super::super::super::registry::fs::RENAME;
 
 /// FS provider capability bitmap. `provider_call(handle, CAPS,
 /// out, out_len)` writes a `u32` (little-endian, 4 bytes) into
@@ -656,7 +656,7 @@ pub const RENAME: u32 = 0x090D;
 /// runs its degraded tier for the lifetime of the process, and is
 /// indistinguishable from one running on a volume that genuinely
 /// cannot support the capability.
-pub const CAPS: u32 = 0x09FF;
+pub use super::super::super::registry::fs::CAPS;
 
 /// # Errno taxonomy
 ///
@@ -746,47 +746,47 @@ pub mod errno_classes {
 pub mod caps {
     // ── Handle-acquisition tier ─────────────────────────────
     // Opcodes called with handle = -1 that return a new FD.
-    /// [`OPEN`] (0x0900) — read-only file open by path.
+    /// [`OPEN`] (`fs::OPEN`) — read-only file open by path.
     pub const OPEN: u32 = 1 << 0;
-    /// [`OPENDIR`] (0x0907) — open a directory for iteration.
+    /// [`OPENDIR`] (`fs::OPENDIR`) — open a directory for iteration.
     /// Implies the returned FD supports `READDIR`.
     pub const OPENDIR: u32 = 1 << 1;
-    /// [`OPEN_CREATE`] (0x0909) — open with O_CREAT semantics.
+    /// [`OPEN_CREATE`] (`fs::OPEN_CREATE`) — open with O_CREAT semantics.
     pub const OPEN_CREATE: u32 = 1 << 2;
 
     // ── Write tier (mutate state through an existing FD) ────
-    /// [`WRITE`] (0x0906) — write bytes through an FD. The
+    /// [`WRITE`] — write bytes through an FD. The
     /// opcode predates `CAPS`; advertising the bit lets callers
     /// distinguish read-only providers (e.g. FAT32 v1, wasm
     /// fetch) from writable ones (linux) without trial-and-
     /// error.
     pub const WRITE: u32 = 1 << 3;
-    /// [`FSYNC`] (0x0905) — durability fence on an FD. As with
+    /// [`FSYNC`] — durability fence on an FD. As with
     /// `WRITE`, the opcode predates the capability bitmap and
     /// the bit is the discovery channel.
     pub const FSYNC: u32 = 1 << 4;
 
     // Unimplemented capability bits remain clear until their opcode and
     // provider implementations land in lockstep.
-    /// [`UNLINK`] (0x090A) — remove a file by path.
+    /// [`UNLINK`] — remove a file by path.
     pub const UNLINK: u32 = 1 << 5;
-    /// [`TRUNCATE`] (0x090C) — shrink a file, releasing the storage past
+    /// [`TRUNCATE`] — shrink a file, releasing the storage past
     /// the new end.
     pub const TRUNCATE: u32 = 1 << 6;
-    /// [`MKDIR`] (0x090B) — create one directory by path.
+    /// [`MKDIR`] — create one directory by path.
     pub const MKDIR: u32 = 1 << 7;
-    /// [`RENAME`] (0x090D) — atomic, durably published rename.
+    /// [`RENAME`] — atomic, durably published rename.
     pub const RENAME: u32 = 1 << 8;
-    /// [`PREALLOCATE`] (0x090E) — physically reserve fixed file capacity and
+    /// [`PREALLOCATE`] — physically reserve fixed file capacity and
     /// leave its descriptor positioned at byte zero.
     pub const PREALLOCATE: u32 = 1 << 9;
-    /// [`WRITE_ASYNC`] (0x090F) + [`FSYNC_SUBMIT`]/[`FSYNC_POLL`]
-    /// (0x0910/0x0911) — the pipelined async durable-write tier. Set iff
+    /// [`WRITE_ASYNC`] + [`FSYNC_SUBMIT`]/[`FSYNC_POLL`]
+    /// — the pipelined async durable-write tier. Set iff
     /// the provider (and its block source) implement submit-now /
     /// fence-later durability; callers fall back to `WRITE`+`FSYNC` when
     /// clear.
     pub const FSYNC_ASYNC: u32 = 1 << 10;
-    /// [`FSYNC_NAME`] (0x0912) — durable publication of a parent-directory
+    /// [`FSYNC_NAME`] — durable publication of a parent-directory
     /// entry. Set iff the provider can prove a name reaches non-volatile
     /// media independently of the file's own bytes.
     pub const FSYNC_NAME: u32 = 1 << 11;
@@ -800,7 +800,7 @@ pub mod caps {
     // Bit 13 is unassigned.
     /// A name can be added to an existing file, and `nlink` counts names.
     pub const LINK: u32 = 1 << 14;
-    /// [`RMDIR`] (0x0915) — remove an empty directory by path.
+    /// [`RMDIR`] — remove an empty directory by path.
     pub const RMDIR: u32 = 1 << 16;
     /// Symbolic links exist on this volume and `READLINK` resolves one.
     /// Resolution stays in the consumer: a provider that silently follows

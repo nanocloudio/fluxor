@@ -5,17 +5,17 @@
 // Portable SPI operations with async transfer start/poll. Chip backings
 // live in `platform/<chip>/*`.
 
-pub const OPEN: u32 = 0x0200;
-pub const CLOSE: u32 = 0x0201;
-pub const BEGIN: u32 = 0x0202;
-pub const END: u32 = 0x0203;
-pub const SET_CS: u32 = 0x0204;
-pub const CLAIM: u32 = 0x0205;
-pub const CONFIGURE: u32 = 0x0206;
-pub const TRANSFER_START: u32 = 0x0207;
-pub const TRANSFER_POLL: u32 = 0x0208;
-pub const POLL_BYTE: u32 = 0x0209;
-pub const GET_CAPS: u32 = 0x020A;
+pub use super::super::super::registry::spi::BEGIN;
+pub use super::super::super::registry::spi::CLAIM;
+pub use super::super::super::registry::spi::CLOSE;
+pub use super::super::super::registry::spi::CONFIGURE;
+pub use super::super::super::registry::spi::END;
+pub use super::super::super::registry::spi::GET_CAPS;
+pub use super::super::super::registry::spi::OPEN;
+pub use super::super::super::registry::spi::POLL_BYTE;
+pub use super::super::super::registry::spi::SET_CS;
+pub use super::super::super::registry::spi::TRANSFER_POLL;
+pub use super::super::super::registry::spi::TRANSFER_START;
 
 /// Arguments for SPI `OPEN` via `provider_call`.
 #[repr(C)]

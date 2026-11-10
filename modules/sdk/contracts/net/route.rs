@@ -32,13 +32,13 @@
 
 /// Provider class id (opcode class 0x20xx). Mirrors
 /// `kernel::module::provider::contract::NET_ROUTE`.
-pub const CLASS: u16 = 0x0020;
+pub const CLASS: u16 = super::super::super::registry::net_route::ID;
 
 /// Returns 0 when a net.route provider is present. handle=-1, arg=null.
-pub const PROBE: u32 = 0x2000;
+pub use super::super::super::registry::net_route::PROBE;
 
 /// Capability bitmap. handle=-1, arg = `[caps_out:u32]` (written). Returns 0.
-pub const CAPS: u32 = 0x2001;
+pub use super::super::super::registry::net_route::CAPS;
 
 /// Replace the segment table, whole and atomically. handle=-1, arg =
 /// `[count:u8][segment]×count` ([`segment`]). Returns 0, or `EINVAL`
@@ -48,7 +48,7 @@ pub const CAPS: u32 = 0x2001;
 /// gateway, or another module is the writer), `EAGAIN` (the store stayed
 /// busy; nothing changed), or the platform's error realizing it. On any
 /// error the table is as it was.
-pub const SEGMENTS: u32 = 0x2002;
+pub use super::super::super::registry::net_route::SEGMENTS;
 
 /// Replace the peer-route table, whole and atomically. handle=-1, arg =
 /// `[count:u16][route]×count` ([`peer`]). Returns 0, `EINVAL` (malformed, or
@@ -63,7 +63,7 @@ pub const SEGMENTS: u32 = 0x2002;
 /// neighbours on it. The addresses are those on the node's host links;
 /// loopback, the links workloads attach by, and held addresses (which the
 /// node answers for, not a link it is on) are not among them.
-pub const ROUTES: u32 = 0x2003;
+pub use super::super::super::registry::net_route::ROUTES;
 
 /// Replace the held-address table, whole. handle=-1, arg =
 /// `[count:u16][held]×count` ([`held`]), one entry per address. Realization
@@ -71,7 +71,7 @@ pub const ROUTES: u32 = 0x2003;
 /// address twice), `ENOSPC`, `EBUSY` (another writer, or a node whose held
 /// addresses are written to its network stack directly) or `EAGAIN`, as
 /// [`SEGMENTS`].
-pub const HOLD: u32 = 0x2004;
+pub use super::super::super::registry::net_route::HOLD;
 
 /// Read the realization state. handle=-1, arg = the out buffer:
 /// `[state_generation:u64]` then one [`entry`] per segment, route and held
@@ -81,7 +81,7 @@ pub const HOLD: u32 = 0x2004;
 /// written, so a buffer of exactly 8 bytes is a cheap poll); `EINVAL` under 8
 /// bytes; `EAGAIN` when a concurrent writer kept the state from being read
 /// consistently (the caller keeps its previous copy).
-pub const READ: u32 = 0x2005;
+pub use super::super::super::registry::net_route::READ;
 
 /// A realizing module provider (the bare-metal network stack) reports
 /// per-entry state. handle=-1, arg = `[entry]×n` ([`entry`]), each indexed
@@ -91,7 +91,7 @@ pub const READ: u32 = 0x2005;
 /// none. Returns 0, `EINVAL` (malformed, or an index past its table),
 /// `EACCES` (not the provider), or `EAGAIN` when the tables moved since that
 /// TAKE (the provider takes again and reports against those).
-pub const REPORT: u32 = 0x2006;
+pub use super::super::super::registry::net_route::REPORT;
 
 /// The table contents, for a realizing module provider. handle=-1, arg = the
 /// out buffer: `[table_generation:u64][n_segments:u8][rsv:u8]
@@ -101,7 +101,7 @@ pub const REPORT: u32 = 0x2006;
 /// holds it (an 8-byte buffer is a cheap poll of the generation; a
 /// [`TAKE_HEAD`]-byte one also learns the counts it is missing); `EINVAL`
 /// under 8 bytes. Same admission as [`REPORT`].
-pub const TAKE: u32 = 0x2007;
+pub use super::super::super::registry::net_route::TAKE;
 
 /// Capability bits: set only when the realization would take effect.
 pub mod caps {

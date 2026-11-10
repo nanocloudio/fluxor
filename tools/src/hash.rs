@@ -134,7 +134,25 @@ pub fn contracts_platform_src_files(repo_root: &Path) -> Result<Vec<std::path::P
     reason = "consumed by the lib-side drift test; the bin mounts this file too"
 )]
 pub fn compute_contracts_platform_src_hash(repo_root: &Path) -> Result<[u8; 32]> {
-    let files = contracts_platform_src_files(repo_root)?;
+    compute_contracts_platform_src_hash_with(repo_root, &[])
+}
+
+/// [`compute_contracts_platform_src_hash`] with some files' contents given
+/// rather than read: the pin of a tree about to be written.
+#[allow(
+    dead_code,
+    reason = "consumed by abi_pin; the bin mounts this file too"
+)]
+pub fn compute_contracts_platform_src_hash_with(
+    repo_root: &Path,
+    overrides: &[(std::path::PathBuf, String)],
+) -> Result<[u8; 32]> {
+    let mut files = contracts_platform_src_files(repo_root)?;
+    for (path, _) in overrides {
+        if !files.contains(path) {
+            files.push(path.clone());
+        }
+    }
     let mut rels: Vec<(String, std::path::PathBuf)> = files
         .into_iter()
         .map(|p| {
@@ -151,7 +169,10 @@ pub fn compute_contracts_platform_src_hash(repo_root: &Path) -> Result<[u8; 32]>
     for (rel, path) in rels {
         h.update(rel.as_bytes());
         h.update([0u8]);
-        let text = fs::read_to_string(&path)?;
+        let text = match overrides.iter().find(|(p, _)| *p == path) {
+            Some((_, t)) => t.clone(),
+            None => fs::read_to_string(&path)?,
+        };
         h.update(canonicalize_source(&text).as_bytes());
         h.update([0u8]);
     }
@@ -289,7 +310,7 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "b30ca54d0cd688c0d1cafeb9ab2eb2a9841ec1519d566f60e120908b7dd6d238",
+            hex, "4712248a3ccc4a329911bc22e45828c3031e4e3ce72cd4a474523a1e75e69cbc",
             "ABI wire-surface changed — this is a deliberate wire break or it is \
              a mistake; see docs/architecture/abi_surface.md before updating"
         );
@@ -301,13 +322,13 @@ mod tests {
     /// would silently miss (a false negative in a compatibility guard).
     #[test]
     fn source_canon_drops_noise_keeps_wire_tokens() {
-        let base = "pub const OP: u32 = 0x1A00; // opcode\n";
+        let base = "pub const OP: u32 = 0x7F00; // opcode\n";
         // Comment edits, block comments, reformatting, blank lines: all neutral.
-        let comment = "pub const OP: u32 = 0x1A00; // a completely different note\n";
-        let block = "/* banner */\npub const OP: u32 = 0x1A00;\n";
-        let reformat = "pub  const OP:u32   =0x1A00;\n\n\n";
+        let comment = "pub const OP: u32 = 0x7F00; // a completely different note\n";
+        let block = "/* banner */\npub const OP: u32 = 0x7F00;\n";
+        let reformat = "pub  const OP:u32   =0x7F00;\n\n\n";
         // `///` doc comments lex to `#[doc=...]` attrs — must be dropped too.
-        let docced = "/// This opcode does a thing.\npub const OP: u32 = 0x1A00;\n";
+        let docced = "/// This opcode does a thing.\npub const OP: u32 = 0x7F00;\n";
         assert_eq!(canonicalize_source(base), canonicalize_source(comment));
         assert_eq!(canonicalize_source(base), canonicalize_source(block));
         assert_eq!(canonicalize_source(base), canonicalize_source(reformat));
@@ -325,7 +346,7 @@ mod tests {
 
         // Any wire change moves it: opcode value, and — critically — whitespace
         // INSIDE a string literal (no false-negative).
-        let value = "pub const OP: u32 = 0x1A01;\n";
+        let value = "pub const OP: u32 = 0x7F01;\n";
         assert_ne!(canonicalize_source(base), canonicalize_source(value));
         assert_ne!(
             canonicalize_source("pub const S: &str = \"a  b\";\n"),
@@ -340,7 +361,11 @@ mod tests {
         assert_eq!(abi_surface_digest(), abi_surface_digest());
         let mut len = 0usize;
         crate::abi_surface::write_surface(&mut |b| len += b.len());
-        assert!(len > 500, "surface stream suspiciously small: {len} bytes");
+        assert_eq!(
+            len,
+            14 + 1 + 8 + 22 + 1 + 32,
+            "surface stream is epoch then pin"
+        );
     }
 
     /// Drift guard for the checked-in contracts/platform source pin. When
@@ -352,7 +377,7 @@ mod tests {
     fn contracts_platform_srcpin_is_current() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let computed = compute_contracts_platform_src_hash(&repo).expect("hashable");
-        let stored = crate::abi_surface::srcpin_for_test();
+        let stored = crate::abi_surface::CONTRACTS_PLATFORM_SRC_HASH;
         if computed != stored {
             let arr: Vec<String> = computed.iter().map(|b| format!("0x{b:02x}")).collect();
             panic!(

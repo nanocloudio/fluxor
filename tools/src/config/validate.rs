@@ -1972,7 +1972,7 @@ pub fn validate_fault_policy(
 /// lands in the primary domain unless it names another, and the composer
 /// cannot see which it will name, so a provider any workload may reach
 /// stays there. The rule is general: it holds for every module-providable
-/// contract (`PROVIDER_CONTRACTS`), not only the store.
+/// contract (`manifest::provider_contracts`), not only the store.
 ///
 /// `modules` is every module the composer validates — the base graph and the
 /// resident workloads' modules — each with its manifest by name. The node
@@ -2012,7 +2012,7 @@ pub fn validate_provider_domains(
             > 0;
     for &(provider, p_domain, ref p_domain_name, pm, _) in &placed {
         for contract in &pm.provides {
-            if !fluxor_contracts::vocabulary::PROVIDER_CONTRACTS.contains(&contract.as_str()) {
+            if !crate::manifest::provider_contracts().contains(&contract.as_str()) {
                 continue; // a surface (`file.data`), not a dispatched contract
             }
             let Ok(id) = crate::manifest::contract_id_from_name(contract) else {
@@ -2652,7 +2652,7 @@ pub fn validate_net_identity_writers(
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
 ) -> Result<()> {
-    const WORKLOAD: u8 = 0x1A;
+    const WORKLOAD: u8 = fluxor_abi::registry::workload::ID as u8;
     let declared = config
         .get("workload_node")
         .and_then(|v| v.as_bool())

@@ -69,8 +69,8 @@ const LINK_CRC_SIZE: usize = 2;
 const SYNC_PAYLOAD_SIZE: usize = 24;
 
 // UART opcodes
-const DEV_UART_OPEN: u32 = 0x0D00;
-const DEV_UART_CONFIGURE: u32 = 0x0D05;
+const DEV_UART_OPEN: u32 = abi::registry::uart::OPEN;
+const DEV_UART_CONFIGURE: u32 = abi::registry::uart::CONFIGURE;
 
 // Modes
 const MODE_TX: u8 = 0;
@@ -524,7 +524,8 @@ pub unsafe extern "C" fn module_new(
         if s.mode == MODE_RX || s.mode == MODE_BIDIR {
             let dev_call = (*s.syscalls).provider_call;
             let mut port_arg = [1u8, 1u8]; // port_type=out, index=1
-            s.ctrl_out_chan = (dev_call)(-1, 0x050C, port_arg.as_mut_ptr(), 2);
+            s.ctrl_out_chan =
+                (dev_call)(-1, abi::registry::channel::PORT, port_arg.as_mut_ptr(), 2);
         }
 
         let sys = &*s.syscalls;
@@ -567,7 +568,7 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
     // binds it to the HAL_UART contract and subsequent calls on the
     // handle route through the tracked contract rather than the
     // class-byte fallback.
-    const HAL_UART_CONTRACT: u32 = 0x000D;
+    const HAL_UART_CONTRACT: u32 = abi::registry::uart::ID as u32;
     let bus_arg = [s.uart_bus];
     let tx_h = (dev_open)(HAL_UART_CONTRACT, DEV_UART_OPEN, bus_arg.as_ptr(), 1);
     if tx_h < 0 {
@@ -658,7 +659,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
             let uart_tx = s.uart_tx_handle;
             let result = (dev_call)(
                 uart_tx,
-                0x0D02,
+                abi::registry::uart::WRITE,
                 s.wire_buf.as_mut_ptr().add(s.wire_pending_offset as usize),
                 s.wire_pending_len as usize,
             );
@@ -666,7 +667,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                 s.wire_pending_offset = 0;
                 s.wire_pending_len = 0;
             } else if result == 0 {
-                let poll = (dev_call)(uart_tx, 0x0D04, core::ptr::null_mut(), 0);
+                let poll = (dev_call)(uart_tx, abi::registry::uart::POLL, core::ptr::null_mut(), 0);
                 if poll > 0 {
                     s.wire_pending_offset = 0;
                     s.wire_pending_len = 0;
@@ -860,7 +861,12 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
 
 #[inline(always)]
 unsafe fn send_wire(s: &mut LinkState, dev_call: DevCallFn, wire_len: usize) {
-    let result = (dev_call)(s.uart_tx_handle, 0x0D02, s.wire_buf.as_mut_ptr(), wire_len);
+    let result = (dev_call)(
+        s.uart_tx_handle,
+        abi::registry::uart::WRITE,
+        s.wire_buf.as_mut_ptr(),
+        wire_len,
+    );
     if result == 0 {
         s.wire_pending_offset = 0;
         s.wire_pending_len = wire_len as u16;
@@ -871,7 +877,7 @@ unsafe fn send_wire(s: &mut LinkState, dev_call: DevCallFn, wire_len: usize) {
 unsafe fn compute_frame_id(s: &LinkState, dev_call: DevCallFn) -> u32 {
     if s.sync_valid {
         let mut buf = [0u8; 8];
-        (dev_call)(-1, 0x0602, buf.as_mut_ptr(), 8); // TIMER_MICROS
+        (dev_call)(-1, abi::registry::timer::MILLIS, buf.as_mut_ptr(), 8); // TIMER_MICROS
         let now_us = u64::from_le_bytes(buf);
         let elapsed_us = now_us.wrapping_sub(s.local_micros_at_sync);
         let rate = s.master_rate_q16 >> 16;
@@ -902,13 +908,18 @@ unsafe fn poll_uart_rx(s: &mut LinkState, dev_call: DevCallFn) {
 
     let result = (dev_call)(
         s.uart_rx_handle,
-        0x0D03,
+        abi::registry::uart::READ,
         s.rx_accum.as_mut_ptr().add(s.rx_accum_len as usize),
         space,
     );
 
     let bytes = if result == 0 {
-        let poll = (dev_call)(s.uart_rx_handle, 0x0D04, core::ptr::null_mut(), 0);
+        let poll = (dev_call)(
+            s.uart_rx_handle,
+            abi::registry::uart::POLL,
+            core::ptr::null_mut(),
+            0,
+        );
         if poll <= 0 {
             return;
         }
@@ -1031,7 +1042,7 @@ unsafe fn handle_sync(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const 
     s.master_rate_q16 = rate_q16;
 
     let mut tbuf = [0u8; 8];
-    (dev_call)(-1, 0x0602, tbuf.as_mut_ptr(), 8);
+    (dev_call)(-1, abi::registry::timer::MILLIS, tbuf.as_mut_ptr(), 8);
     s.local_micros_at_sync = u64::from_le_bytes(tbuf);
     s.sync_valid = true;
 }
@@ -1089,7 +1100,12 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
     }
 
     if s.beacon_pending {
-        let poll = (dev_call)(s.uart_tx_handle, 0x0D04, core::ptr::null_mut(), 0);
+        let poll = (dev_call)(
+            s.uart_tx_handle,
+            abi::registry::uart::POLL,
+            core::ptr::null_mut(),
+            0,
+        );
         if poll == 0 {
             return;
         }
@@ -1098,7 +1114,12 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
 
     let dev_query = (*s.syscalls).provider_query;
     let mut st_buf = [0u8; 24];
-    let r = (dev_query)(-1, 0x0C30, st_buf.as_mut_ptr(), 24);
+    let r = (dev_query)(
+        -1,
+        abi::registry::kernel::STREAM_TIME,
+        st_buf.as_mut_ptr(),
+        24,
+    );
     if r < 0 {
         return;
     }
@@ -1114,7 +1135,7 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
     }
 
     let mut us_buf = [0u8; 8];
-    (dev_call)(-1, 0x0602, us_buf.as_mut_ptr(), 8);
+    (dev_call)(-1, abi::registry::timer::MILLIS, us_buf.as_mut_ptr(), 8);
     let now_us = u64::from_le_bytes(us_buf);
 
     let mut payload = [0u8; SYNC_PAYLOAD_SIZE];
@@ -1136,7 +1157,7 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
     if wire_len > 0 {
         let result = (dev_call)(
             s.uart_tx_handle,
-            0x0D02,
+            abi::registry::uart::WRITE,
             s.beacon_wire.as_mut_ptr(),
             wire_len,
         );

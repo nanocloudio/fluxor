@@ -1,0 +1,2661 @@
+# The ABI number registry: every contract id, opcode, permission bit, errno,
+# poll bit, ioctl command and channel message type is declared here once.
+# `fluxor abi-regen` generates `registry_gen.rs` from it; nothing else may
+# restate a number. A contract's id is its opcode class byte, its vtable
+# index, its `required_caps` bit and, when it mints handles, their fd tag.
+
+[registry]
+semantic_epoch = 1
+max_contracts = 64
+chain_next = 0x10000
+
+[[permission]]
+name = "reconfigure"
+bit = 0
+doc = "Graph slot commit, boot counter, FMP routing."
+
+[[permission]]
+name = "flash_raw"
+bit = 1
+doc = "Flash ERASE and PROGRAM, bounded to declared sectors."
+
+[[permission]]
+name = "platform_raw"
+bit = 2
+doc = "MMIO, NIC ring create, raw peripheral register bridges, workload spawn."
+
+[[permission]]
+name = "monitor"
+bit = 3
+doc = "Fault monitor BIND / WAIT / ACK / REPORT / RAISE, step histograms."
+
+[[permission]]
+name = "bridge"
+bit = 4
+doc = "Cross-domain / cross-core dispatch."
+
+[[permission]]
+name = "pcie_device"
+bit = 5
+doc = "Kernel-mediated PCIe device binding (bind/config/BAR/MSI/info on a validated device handle), distinct from raw MMIO/DMA (`platform_raw`)."
+
+[[permission]]
+name = "dma"
+bit = 6
+doc = "DMA-buffer allocation from the kernel's bounded DMA arena and cache maintenance on those buffers; narrower than raw register access (`platform_raw` still gates `MMIO_READ32`/`MMIO_WRITE32`)."
+
+[[permission]]
+name = "observe"
+bit = 7
+doc = "Read-only telemetry-ring drain (`TLM_SUBSCRIBE`/`DRAIN`/`STATS`); deliberately not `monitor`, which also grants `FAULT_RAISE`."
+
+[[permission]]
+name = "usb_host"
+bit = 8
+doc = "Kernel-mediated USB host binding on a validated controller handle; distinct from `platform_raw`, which would hand a USB driver the whole address space."
+
+[[permission]]
+name = "vault_store"
+bit = 9
+doc = "Keep the key vault's durable image: the holder sees every persisted record and decides what reaches the medium."
+
+[[errno]]
+name = "OK"
+value = 0
+
+[[errno]]
+name = "ERROR"
+value = -1
+
+[[errno]]
+name = "EACCES"
+value = -13
+
+[[errno]]
+name = "EFAULT"
+value = -14
+
+[[errno]]
+name = "ENXIO"
+value = -6
+
+[[errno]]
+name = "EIO"
+value = -5
+
+[[errno]]
+name = "EAGAIN"
+value = -11
+
+[[errno]]
+name = "ENOMEM"
+value = -12
+
+[[errno]]
+name = "ENOSPC"
+value = -28
+
+[[errno]]
+name = "E2BIG"
+value = -7
+
+[[errno]]
+name = "EEXIST"
+value = -17
+
+[[errno]]
+name = "EISDIR"
+value = -21
+
+[[errno]]
+name = "EXDEV"
+value = -18
+
+[[errno]]
+name = "ENOTEMPTY"
+value = -39
+
+[[errno]]
+name = "ESRCH"
+value = -3
+
+[[errno]]
+name = "EBUSY"
+value = -16
+
+[[errno]]
+name = "ENODEV"
+value = -19
+
+[[errno]]
+name = "ENOEXEC"
+value = -8
+
+[[errno]]
+name = "EINVAL"
+value = -22
+
+[[errno]]
+name = "EINPROGRESS"
+value = -36
+
+[[errno]]
+name = "ENOSYS"
+value = -38
+
+[[errno]]
+name = "ENOENT"
+value = -2
+
+[[errno]]
+name = "ERANGE"
+value = -34
+
+[[errno]]
+name = "EOVERFLOW"
+value = -75
+
+[[errno]]
+name = "ENOTSUP"
+value = -95
+
+[[errno]]
+name = "ENOTCONN"
+value = -107
+
+[[errno]]
+name = "ETIMEDOUT"
+value = -110
+
+[[errno]]
+name = "ECONNREFUSED"
+value = -111
+
+[[errno]]
+name = "ERETAINED"
+value = -200
+
+[[poll]]
+name = "IN"
+bit = 0x01
+
+[[poll]]
+name = "OUT"
+bit = 0x02
+
+[[poll]]
+name = "ERR"
+bit = 0x04
+
+[[poll]]
+name = "HUP"
+bit = 0x08
+
+[[poll]]
+name = "WROTE"
+bit = 0x20
+
+[[ioctl]]
+name = "NOTIFY"
+value = 1
+
+[[ioctl]]
+name = "POLL_NOTIFY"
+value = 2
+
+[[ioctl]]
+name = "FLUSH"
+value = 3
+
+[[ioctl]]
+name = "SET_HUP"
+value = 4
+
+[[ioctl]]
+name = "WRITABLE"
+value = 5
+
+[[contract]]
+name = "kernel"
+id = 0x00
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "LOG_WRITE"
+  op = 0x40
+  gate = { handle = "value", arg = "in", max = "any" }
+
+  [[contract.op]]
+  name = "SERIAL_WRITE"
+  op = 0x66
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "HANDLE_POLL"
+  op = 0x41
+  gate = { handle = "channel", arg = "inout", max = 1 }
+
+  [[contract.op]]
+  name = "STREAM_TIME"
+  op = 0x30
+  query = 24
+
+  [[contract.op]]
+  name = "GRAPH_SAMPLE_RATE"
+  op = 0x31
+  query = 4
+
+  [[contract.op]]
+  name = "DOWNSTREAM_LATENCY"
+  op = 0x33
+  query = 4
+
+  [[contract.op]]
+  name = "REPORT_LATENCY"
+  op = 0x50
+  gate = { handle = "global", arg = "in", max = 4 }
+
+  [[contract.op]]
+  name = "REPORT_STEP_EFFECT"
+  op = 0x45
+  gate = { handle = "global", arg = "in", max = 1 }
+
+  [[contract.op]]
+  name = "ARENA_GET"
+  op = 0x3A
+  gate = { handle = "global", arg = "out", max = 4 }
+
+  [[contract.op]]
+  name = "RANDOM_FILL"
+  op = 0x3C
+  gate = { handle = "global", arg = "out", max = "any" }
+
+  [[contract.op]]
+  name = "SYS_CLOCK_HZ"
+  op = 0x3B
+  query = 4
+
+  [[contract.op]]
+  name = "SELF_INDEX"
+  op = 0x42
+
+  [[contract.op]]
+  name = "MODULE_INSTANCE_PARAMS"
+  op = 0x43
+
+  [[contract.op]]
+  name = "OWNER_TAG"
+  op = 0x4B
+
+  [[contract.op]]
+  name = "NET_IDENT_PROVIDER"
+  op = 0x4C
+
+  [[contract.op]]
+  name = "BOOT_INCARNATION"
+  op = 0x2F
+  gate = { handle = "global", arg = "out", max = 16 }
+
+  [[contract.op]]
+  name = "PROGRAM_INFO"
+  op = 0x2B
+  gate = { handle = "global", arg = "inout", max = 64 }
+
+  [[contract.op]]
+  name = "PROGRAM_READ"
+  op = 0x2C
+  gate = { handle = "global", arg = "inout", max = "any" }
+
+  [[contract.op]]
+  name = "SLOT_SIGNING_ROOT"
+  op = 0x2D
+  gate = { handle = "global", arg = "out", max = 32 }
+
+  [[contract.op]]
+  name = "SLOT_ADMITTED"
+  op = 0x2E
+  gate = { handle = "global", arg = "none", max = 0 }
+
+  [[contract.op]]
+  name = "FLASH_LAYOUT"
+  op = 0x2A
+  gate = { handle = "global", arg = "out", max = 20 }
+
+  [[contract.op]]
+  name = "MODULE_FLOW_BUDGET"
+  op = 0x46
+  gate = { handle = "global", arg = "inout", max = "any" }
+
+  [[contract.op]]
+  name = "GET_HW_ETHERNET_MAC"
+  op = 0x3D
+
+  [[contract.op]]
+  name = "QUERY_OP"
+  op = 0xFE
+  route = "handle"
+
+  [[contract.op]]
+  name = "QUERY_CLASS"
+  op = 0x01
+
+  [[contract.op]]
+  name = "QUERY_NAME"
+  op = 0x02
+
+  [[contract.op]]
+  name = "QUERY_CAPABILITIES"
+  op = 0x03
+
+  [[contract.op]]
+  name = "QUERY_STATE"
+  op = 0x04
+
+  [[contract.op]]
+  name = "QUERY_ERROR_COUNT"
+  op = 0x05
+
+  [[contract.op]]
+  name = "QUERY_HEAP_STATS"
+  op = 0x06
+
+  [[contract.op]]
+  name = "QUERY_LAST_FENCE"
+  op = 0x08
+
+  [[contract.op]]
+  name = "QUERY_CALLER_OWNER"
+  op = 0x09
+
+  [[contract.op]]
+  name = "QUERY_CALLER_MODULE"
+  op = 0x0a
+
+  [[contract.op]]
+  name = "QUERY_MODULE_LIVE"
+  op = 0x0b
+
+  [[contract.op]]
+  name = "QUERY_EVENT_OWNER"
+  op = 0x0c
+
+  [[contract.op]]
+  name = "SIGNAL_CORE"
+  op = 0x52
+  permission = "platform_raw"
+
+[[contract]]
+name = "channel"
+id = 0x01
+manifest = true
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+  admission = true
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "IOCTL"
+  op = 0x06
+  gate = { handle = "channel", arg = "inout", max = "walk" }
+  walker = "channel_ioctl"
+
+  [[contract.op]]
+  name = "REGISTER_IOCTL"
+  op = 0x07
+
+  [[contract.op]]
+  name = "PORT"
+  op = 0x0C
+  gate = { handle = "global", arg = "inout", max = 2 }
+
+[[contract]]
+name = "timer"
+id = 0x02
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "MILLIS"
+  op = 0x02
+  gate = { handle = "global", arg = "out", max = 8 }
+
+  [[contract.op]]
+  name = "MICROS"
+  op = 0x03
+  gate = { handle = "global", arg = "out", max = 8 }
+
+  [[contract.op]]
+  name = "UNIX_MILLIS"
+  op = 0x08
+  gate = { handle = "global", arg = "out", max = 8 }
+
+  [[contract.op]]
+  name = "TRUSTED_UNIX"
+  op = 0x09
+  gate = { handle = "global", arg = "out", max = 36 }
+
+  [[contract.op]]
+  name = "CREATE"
+  op = 0x04
+  admission = true
+
+  [[contract.op]]
+  name = "SET"
+  op = 0x05
+  admission = true
+
+  [[contract.op]]
+  name = "CANCEL"
+  op = 0x06
+
+  [[contract.op]]
+  name = "DESTROY"
+  op = 0x07
+
+  [[contract.op]]
+  name = "DISCIPLINE"
+  op = 0x0A
+  permission = "platform_raw"
+  gate = { handle = "global", arg = "in", max = 20 }
+
+[[contract]]
+name = "buffer"
+id = 0x03
+manifest = true
+
+  [[contract.op]]
+  name = "ACQUIRE_WRITE"
+  op = 0x00
+
+  [[contract.op]]
+  name = "RELEASE_WRITE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "ACQUIRE_READ"
+  op = 0x02
+
+  [[contract.op]]
+  name = "RELEASE_READ"
+  op = 0x03
+
+  [[contract.op]]
+  name = "ACQUIRE_INPLACE"
+  op = 0x04
+
+[[contract]]
+name = "event"
+id = 0x04
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "CREATE"
+  op = 0x00
+  admission = true
+  gate = { handle = "mints", arg = "none", max = 0 }
+
+  [[contract.op]]
+  name = "SIGNAL"
+  op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
+
+  [[contract.op]]
+  name = "POLL"
+  op = 0x02
+  gate = { handle = "minted", arg = "none", max = 0 }
+
+  [[contract.op]]
+  name = "DESTROY"
+  op = 0x03
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
+
+  [[contract.op]]
+  name = "BIND_IRQ"
+  op = 0x51
+  admission = true
+
+[[contract]]
+name = "key_vault"
+id = 0x05
+mints = true
+
+  [[contract.op]]
+  name = "PROBE"
+  op = 0x00
+
+  [[contract.op]]
+  name = "STORE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "ECDH"
+  op = 0x02
+
+  [[contract.op]]
+  name = "SIGN"
+  op = 0x03
+
+  [[contract.op]]
+  name = "VERIFY"
+  op = 0x04
+
+  [[contract.op]]
+  name = "DESTROY"
+  op = 0x05
+
+  [[contract.op]]
+  name = "GENERATE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "PUBLIC"
+  op = 0x07
+
+  [[contract.op]]
+  name = "TIER"
+  op = 0x08
+
+  [[contract.op]]
+  name = "OPEN_OR_GENERATE"
+  op = 0x09
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x0A
+
+  [[contract.op]]
+  name = "DESTROY_BY_LABEL"
+  op = 0x0B
+
+  [[contract.op]]
+  name = "DESCRIBE"
+  op = 0x0C
+
+  [[contract.op]]
+  name = "SUITE_QUERY"
+  op = 0x0D
+
+  [[contract.op]]
+  name = "SUITE_ENUM"
+  op = 0x0E
+
+  [[contract.op]]
+  name = "ATTEST_COMPOSITION"
+  op = 0x0F
+
+  [[contract.op]]
+  name = "KEY_WRAP"
+  op = 0x10
+
+  [[contract.op]]
+  name = "KEY_UNWRAP"
+  op = 0x11
+
+  [[contract.op]]
+  name = "AEAD_SEAL"
+  op = 0x12
+
+  [[contract.op]]
+  name = "AEAD_OPEN"
+  op = 0x13
+
+  [[contract.op]]
+  name = "DERIVE"
+  op = 0x14
+
+  [[contract.op]]
+  name = "AEAD_SEAL_UNITS"
+  op = 0x15
+
+  [[contract.op]]
+  name = "AEAD_OPEN_UNITS"
+  op = 0x16
+
+  [[contract.op]]
+  name = "SHARE_SPLIT"
+  op = 0x17
+
+  [[contract.op]]
+  name = "SHARE_REWRAP"
+  op = 0x18
+
+  [[contract.op]]
+  name = "SHARE_COMBINE"
+  op = 0x19
+
+  [[contract.op]]
+  name = "ATTEST_KEY"
+  op = 0x1A
+
+[[contract]]
+name = "gpio"
+id = 0x06
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "CLAIM"
+  op = 0x00
+
+  [[contract.op]]
+  name = "RELEASE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "SET_MODE"
+  op = 0x02
+
+  [[contract.op]]
+  name = "SET_PULL"
+  op = 0x03
+
+  [[contract.op]]
+  name = "SET_LEVEL"
+  op = 0x04
+
+  [[contract.op]]
+  name = "GET_LEVEL"
+  op = 0x05
+
+  [[contract.op]]
+  name = "SET_OUTPUT"
+  op = 0x06
+
+  [[contract.op]]
+  name = "SET_INPUT"
+  op = 0x07
+
+  [[contract.op]]
+  name = "WATCH_EDGE"
+  op = 0x0A
+
+[[contract]]
+name = "spi"
+id = 0x07
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "BEGIN"
+  op = 0x02
+
+  [[contract.op]]
+  name = "END"
+  op = 0x03
+
+  [[contract.op]]
+  name = "SET_CS"
+  op = 0x04
+
+  [[contract.op]]
+  name = "CLAIM"
+  op = 0x05
+
+  [[contract.op]]
+  name = "CONFIGURE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "TRANSFER_START"
+  op = 0x07
+
+  [[contract.op]]
+  name = "TRANSFER_POLL"
+  op = 0x08
+
+  [[contract.op]]
+  name = "POLL_BYTE"
+  op = 0x09
+
+  [[contract.op]]
+  name = "GET_CAPS"
+  op = 0x0A
+
+[[contract]]
+name = "i2c"
+id = 0x08
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "WRITE"
+  op = 0x02
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x03
+
+  [[contract.op]]
+  name = "WRITE_READ"
+  op = 0x04
+
+  [[contract.op]]
+  name = "CLAIM"
+  op = 0x05
+
+  [[contract.op]]
+  name = "RELEASE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "GET_CAPS"
+  op = 0x07
+
+[[contract]]
+name = "pio"
+id = 0x09
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "STREAM_ALLOC"
+  op = 0x00
+
+  [[contract.op]]
+  name = "STREAM_LOAD_PROGRAM"
+  op = 0x01
+
+  [[contract.op]]
+  name = "STREAM_GET_BUFFER"
+  op = 0x02
+
+  [[contract.op]]
+  name = "STREAM_CONFIGURE"
+  op = 0x03
+
+  [[contract.op]]
+  name = "STREAM_CAN_PUSH"
+  op = 0x04
+
+  [[contract.op]]
+  name = "STREAM_PUSH"
+  op = 0x05
+
+  [[contract.op]]
+  name = "STREAM_FREE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "STREAM_TIME"
+  op = 0x07
+
+  [[contract.op]]
+  name = "DIRECT_BUFFER"
+  op = 0x08
+
+  [[contract.op]]
+  name = "DIRECT_PUSH"
+  op = 0x09
+
+  [[contract.op]]
+  name = "PROGRAM_STATUS"
+  op = 0x0A
+
+  [[contract.op]]
+  name = "STREAM_SET_RATE"
+  op = 0x0B
+
+  [[contract.op]]
+  name = "CMD_ALLOC"
+  op = 0x10
+
+  [[contract.op]]
+  name = "CMD_LOAD_PROGRAM"
+  op = 0x11
+
+  [[contract.op]]
+  name = "CMD_CONFIGURE"
+  op = 0x12
+
+  [[contract.op]]
+  name = "CMD_TRANSFER"
+  op = 0x13
+
+  [[contract.op]]
+  name = "CMD_POLL"
+  op = 0x14
+
+  [[contract.op]]
+  name = "CMD_FREE"
+  op = 0x15
+
+  [[contract.op]]
+  name = "CMD_LEVEL"
+  op = 0x16
+
+  [[contract.op]]
+  name = "RX_STREAM_ALLOC"
+  op = 0x20
+
+  [[contract.op]]
+  name = "RX_STREAM_LOAD_PROGRAM"
+  op = 0x21
+
+  [[contract.op]]
+  name = "RX_STREAM_CONFIGURE"
+  op = 0x22
+
+  [[contract.op]]
+  name = "RX_STREAM_CAN_PULL"
+  op = 0x23
+
+  [[contract.op]]
+  name = "RX_STREAM_PULL"
+  op = 0x24
+
+  [[contract.op]]
+  name = "RX_STREAM_FREE"
+  op = 0x25
+
+  [[contract.op]]
+  name = "RX_STREAM_GET_BUFFER"
+  op = 0x26
+
+  [[contract.op]]
+  name = "RX_STREAM_SET_RATE"
+  op = 0x27
+
+[[contract]]
+name = "uart"
+id = 0x0A
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "WRITE"
+  op = 0x02
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x03
+
+  [[contract.op]]
+  name = "POLL"
+  op = 0x04
+
+  [[contract.op]]
+  name = "CONFIGURE"
+  op = 0x05
+
+[[contract]]
+name = "adc"
+id = 0x0B
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x02
+
+  [[contract.op]]
+  name = "POLL"
+  op = 0x03
+
+  [[contract.op]]
+  name = "CONFIGURE"
+  op = 0x04
+
+[[contract]]
+name = "pwm"
+id = 0x0C
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x01
+
+  [[contract.op]]
+  name = "CONFIGURE"
+  op = 0x02
+
+  [[contract.op]]
+  name = "SET_DUTY"
+  op = 0x03
+
+  [[contract.op]]
+  name = "GET_DUTY"
+  op = 0x04
+
+[[contract]]
+name = "fs"
+id = 0x0D
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+  admission = true
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x01
+
+  [[contract.op]]
+  name = "SEEK"
+  op = 0x02
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x03
+
+  [[contract.op]]
+  name = "STAT"
+  op = 0x04
+
+  [[contract.op]]
+  name = "FSYNC"
+  op = 0x05
+
+  [[contract.op]]
+  name = "WRITE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "OPENDIR"
+  op = 0x07
+  admission = true
+
+  [[contract.op]]
+  name = "READDIR"
+  op = 0x08
+
+  [[contract.op]]
+  name = "OPEN_CREATE"
+  op = 0x09
+  admission = true
+
+  [[contract.op]]
+  name = "UNLINK"
+  op = 0x0A
+
+  [[contract.op]]
+  name = "MKDIR"
+  op = 0x0B
+
+  [[contract.op]]
+  name = "PREALLOCATE"
+  op = 0x0E
+
+  [[contract.op]]
+  name = "TRUNCATE"
+  op = 0x0C
+
+  [[contract.op]]
+  name = "WRITE_ASYNC"
+  op = 0x0F
+
+  [[contract.op]]
+  name = "FSYNC_SUBMIT"
+  op = 0x10
+
+  [[contract.op]]
+  name = "FSYNC_POLL"
+  op = 0x11
+
+  [[contract.op]]
+  name = "FSYNC_NAME"
+  op = 0x12
+
+  [[contract.op]]
+  name = "RMDIR"
+  op = 0x15
+
+  [[contract.op]]
+  name = "LINK"
+  op = 0x13
+
+  [[contract.op]]
+  name = "READLINK"
+  op = 0x14
+
+  [[contract.op]]
+  name = "RENAME"
+  op = 0x0D
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+
+[[contract]]
+name = "storage.namespace"
+id = 0x0E
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "LOOKUP"
+  op = 0x00
+
+  [[contract.op]]
+  name = "STAT"
+  op = 0x01
+
+  [[contract.op]]
+  name = "LIST"
+  op = 0x02
+
+  [[contract.op]]
+  name = "RENAME"
+  op = 0x03
+
+  [[contract.op]]
+  name = "DELETE"
+  op = 0x04
+
+  [[contract.op]]
+  name = "SUBSCRIBE"
+  op = 0x05
+
+  [[contract.op]]
+  name = "TAKE_RUNG"
+  op = 0x09
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "CHANGES"
+  op = 0x07
+
+  [[contract.op]]
+  name = "BIND"
+  op = 0x08
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+
+[[contract]]
+name = "storage.object"
+id = 0x0F
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "PUT"
+  op = 0x20
+  gate = { handle = "scoped", arg = "in", max = "walk" }
+  walker = "storage_put"
+
+  [[contract.op]]
+  name = "GET"
+  op = 0x21
+  gate = { handle = "scoped_mints", arg = "in", max = "any" }
+
+  [[contract.op]]
+  name = "HEAD"
+  op = 0x22
+  gate = { handle = "scoped", arg = "in", max = "walk" }
+  walker = "storage_head"
+
+  [[contract.op]]
+  name = "RANGE_GET"
+  op = 0x23
+  gate = { handle = "minted", arg = "in", max = "walk" }
+  walker = "storage_range_get"
+
+  [[contract.op]]
+  name = "DELETE"
+  op = 0x24
+  gate = { handle = "scoped", arg = "in", max = "walk" }
+  walker = "storage_delete"
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x25
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
+
+  [[contract.op]]
+  name = "IMG_DECODE"
+  op = 0x30
+
+  [[contract.op]]
+  name = "IMG_RECV"
+  op = 0x31
+
+  [[contract.op]]
+  name = "IMG_CLOSE"
+  op = 0x32
+
+  [[contract.op]]
+  name = "PUT_STREAMED_OPEN"
+  op = 0x26
+
+  [[contract.op]]
+  name = "PUT_STREAMED_WRITE"
+  op = 0x27
+
+  [[contract.op]]
+  name = "PUT_STREAMED_COMMIT"
+  op = 0x28
+
+  [[contract.op]]
+  name = "PUT_STREAMED_ABORT"
+  op = 0x29
+
+  [[contract.op]]
+  name = "RETAIN"
+  op = 0x2C
+  gate = { handle = "scoped", arg = "in", max = "walk" }
+  walker = "storage_retain"
+
+  [[contract.op]]
+  name = "LIST"
+  op = 0x2A
+  gate = { handle = "scoped", arg = "in", max = "walk" }
+  walker = "storage_list"
+
+  [[contract.op]]
+  name = "PRESENT"
+  op = 0x2B
+  gate = { handle = "mints", arg = "inout", max = "any" }
+
+[[contract]]
+name = "telemetry"
+id = 0x10
+permission = "observe"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "TLM_EMIT"
+  op = 0x3E
+  permission = "none"
+  gate = { handle = "global", arg = "in", max = "any" }
+
+  [[contract.op]]
+  name = "TLM_SUBSCRIBE"
+  op = 0x4D
+
+  [[contract.op]]
+  name = "TLM_DRAIN"
+  op = 0x4E
+
+  [[contract.op]]
+  name = "TLM_STATS"
+  op = 0x4F
+
+[[contract]]
+name = "resource"
+id = 0x11
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "ELASTIC_ALLOC"
+  op = 0x3F
+
+  [[contract.op]]
+  name = "POOL_SAMPLE"
+  op = 0x25
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "LEDGER_DENY"
+  op = 0x24
+
+[[contract]]
+name = "runtime_params"
+id = 0x12
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "STORE"
+  op = 0x34
+
+  [[contract.op]]
+  name = "DELETE"
+  op = 0x35
+
+  [[contract.op]]
+  name = "CLEAR_ALL"
+  op = 0x36
+
+[[contract]]
+name = "stream_clock"
+id = 0x13
+
+  [[contract.op]]
+  name = "QUERY"
+  op = 0x00
+
+[[contract]]
+name = "trust"
+id = 0x14
+manifest = true
+
+  [[contract.op]]
+  name = "PROBE"
+  op = 0x00
+
+  [[contract.op]]
+  name = "VERIFY"
+  op = 0x01
+
+[[contract]]
+name = "net_policy"
+id = 0x15
+manifest = true
+
+  [[contract.op]]
+  name = "PROBE"
+  op = 0x00
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0x01
+
+  [[contract.op]]
+  name = "REPLACE"
+  op = 0x02
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "CLEAR"
+  op = 0x03
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x04
+
+  [[contract.op]]
+  name = "ATTACH"
+  op = 0x05
+
+[[contract]]
+name = "net_route"
+id = 0x16
+manifest = true
+
+  [[contract.op]]
+  name = "PROBE"
+  op = 0x00
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0x01
+
+  [[contract.op]]
+  name = "SEGMENTS"
+  op = 0x02
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "ROUTES"
+  op = 0x03
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "HOLD"
+  op = 0x04
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x05
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "REPORT"
+  op = 0x06
+
+  [[contract.op]]
+  name = "TAKE"
+  op = 0x07
+
+[[contract]]
+name = "workload"
+id = 0x17
+mints = true
+manifest = true
+permission = "platform_raw"
+unlisted = "platform_raw"
+
+  [[contract.op]]
+  name = "CREATE"
+  op = 0x00
+
+  [[contract.op]]
+  name = "START"
+  op = 0x01
+
+  [[contract.op]]
+  name = "WAIT"
+  op = 0x02
+
+  [[contract.op]]
+  name = "SIGNAL"
+  op = 0x03
+
+  [[contract.op]]
+  name = "DESTROY"
+  op = 0x04
+
+  [[contract.op]]
+  name = "PAUSE"
+  op = 0x0B
+
+  [[contract.op]]
+  name = "RESUME"
+  op = 0x0C
+
+  [[contract.op]]
+  name = "LANES"
+  op = 0x0D
+
+  [[contract.op]]
+  name = "NET_PROVIDE"
+  op = 0x0E
+  permission = "none"
+
+  [[contract.op]]
+  name = "NET_LANE_TAKE"
+  op = 0x0F
+  permission = "none"
+
+  [[contract.op]]
+  name = "NET_LANE_ADMIT"
+  op = 0x10
+  permission = "none"
+
+  [[contract.op]]
+  name = "NET_RESOLVER"
+  op = 0x13
+  permission = "none"
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+
+  [[contract.op]]
+  name = "LOOKUP"
+  op = 0x12
+
+  [[contract.op]]
+  name = "MODULE_DIGESTS"
+  op = 0x11
+
+[[contract]]
+name = "host_process"
+id = 0x18
+permission = "platform_raw"
+unlisted = "platform_raw"
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x01
+
+  [[contract.op]]
+  name = "EXEC"
+  op = 0x02
+
+  [[contract.op]]
+  name = "TTY_OPEN"
+  op = 0x03
+
+  [[contract.op]]
+  name = "TTY_STEP"
+  op = 0x04
+
+  [[contract.op]]
+  name = "TTY_RESIZE"
+  op = 0x05
+
+  [[contract.op]]
+  name = "TTY_CLOSE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0x00
+
+[[contract]]
+name = "host_mount"
+id = 0x19
+manifest = true
+permission = "platform_raw"
+
+  [[contract.op]]
+  name = "PRIV"
+  op = 0x00
+  permission = "none"
+
+  [[contract.op]]
+  name = "MOUNT"
+  op = 0x01
+
+  [[contract.op]]
+  name = "UMOUNT"
+  op = 0x02
+
+  [[contract.op]]
+  name = "ROOT"
+  op = 0x03
+  permission = "none"
+
+  [[contract.op]]
+  name = "PROJECT"
+  op = 0x04
+
+  [[contract.op]]
+  name = "REMOVE_TREE"
+  op = 0x05
+
+  [[contract.op]]
+  name = "GROUP_TREE"
+  op = 0x06
+
+  [[contract.op]]
+  name = "MKDIR_MODE"
+  op = 0x07
+
+[[contract]]
+name = "proc"
+id = 0x1A
+mints = true
+manifest = true
+
+  [[contract.op]]
+  name = "PROC_SPAWN"
+  op = 0x00
+
+  [[contract.op]]
+  name = "PROC_READ"
+  op = 0x01
+
+  [[contract.op]]
+  name = "PROC_STATUS"
+  op = 0x02
+
+  [[contract.op]]
+  name = "PROC_CLOSE"
+  op = 0x03
+
+[[contract]]
+name = "usb_host"
+id = 0x1B
+mints = true
+manifest = true
+unlisted = "usb_host"
+
+[[contract]]
+name = "pcie_device"
+id = 0x1C
+mints = true
+manifest = true
+permission = "pcie_device"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "BIND"
+  op = 0xA0
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0xA1
+
+  [[contract.op]]
+  name = "CFG_READ32"
+  op = 0xA2
+
+  [[contract.op]]
+  name = "CFG_WRITE32"
+  op = 0xA3
+
+  [[contract.op]]
+  name = "BAR_MAP"
+  op = 0xA4
+
+  [[contract.op]]
+  name = "MSI_ALLOC"
+  op = 0xA5
+
+  [[contract.op]]
+  name = "INFO"
+  op = 0xA6
+
+[[contract]]
+name = "platform_nic_ring"
+id = 0x1D
+mints = true
+manifest = true
+permission = "platform_raw"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "NIC_BAR_MAP"
+  op = 0xF0
+
+  [[contract.op]]
+  name = "NIC_BAR_UNMAP"
+  op = 0xF1
+
+  [[contract.op]]
+  name = "NIC_RING_CREATE"
+  op = 0xF2
+
+  [[contract.op]]
+  name = "NIC_RING_DESTROY"
+  op = 0xF3
+
+  [[contract.op]]
+  name = "NIC_RING_INFO"
+  op = 0xF4
+
+[[contract]]
+name = "platform_dma"
+id = 0x1E
+mints = true
+manifest = true
+permission = "platform_raw"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "ALLOC"
+  op = 0x80
+
+  [[contract.op]]
+  name = "FREE"
+  op = 0x81
+
+  [[contract.op]]
+  name = "START"
+  op = 0x82
+
+  [[contract.op]]
+  name = "BUSY"
+  op = 0x83
+
+  [[contract.op]]
+  name = "ABORT"
+  op = 0x84
+
+[[contract]]
+name = "platform_dma_fd"
+id = 0x1F
+mints = true
+manifest = true
+permission = "platform_raw"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "CREATE"
+  op = 0x85
+
+  [[contract.op]]
+  name = "START"
+  op = 0x86
+
+  [[contract.op]]
+  name = "RESTART"
+  op = 0x87
+
+  [[contract.op]]
+  name = "FREE"
+  op = 0x88
+
+  [[contract.op]]
+  name = "QUEUE"
+  op = 0x89
+
+[[contract]]
+name = "reconfigure"
+id = 0x20
+permission = "reconfigure"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "SET_PHASE"
+  op = 0x68
+
+  [[contract.op]]
+  name = "CALL_DRAIN"
+  op = 0x69
+
+  [[contract.op]]
+  name = "MARK_FINISHED"
+  op = 0x6A
+
+  [[contract.op]]
+  name = "MODULE_COUNT"
+  op = 0x6B
+
+  [[contract.op]]
+  name = "MODULE_INFO"
+  op = 0x6C
+
+  [[contract.op]]
+  name = "TRIGGER_REBUILD"
+  op = 0x6D
+
+  [[contract.op]]
+  name = "MODULE_UPSTREAM"
+  op = 0x6E
+
+  [[contract.op]]
+  name = "MODULE_DONE"
+  op = 0x6F
+
+  [[contract.op]]
+  name = "SLOT_CAPACITY"
+  op = 0x23
+
+  [[contract.op]]
+  name = "APPLY_ADD"
+  op = 0x47
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "FREE_OWNER"
+  op = 0x48
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "OWNER_PAUSE"
+  op = 0x49
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "OWNER_RESUME"
+  op = 0x4A
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "OWNER_RELEASED"
+  op = 0x22
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "OTA_STAGE_WRITE"
+  op = 0x20
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "OTA_STAGE_CTRL"
+  op = 0x21
+  permission = "platform_raw"
+
+[[contract]]
+name = "monitor"
+id = 0x21
+permission = "monitor"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "FAULT_MONITOR_SUBSCRIBE"
+  op = 0x52
+
+  [[contract.op]]
+  name = "FAULT_MONITOR_POP"
+  op = 0x53
+
+  [[contract.op]]
+  name = "FAULT_STATS_QUERY"
+  op = 0x54
+
+  [[contract.op]]
+  name = "STEP_HISTOGRAM_QUERY"
+  op = 0x55
+
+  [[contract.op]]
+  name = "MODULE_STATE_QUERY"
+  op = 0x57
+
+  [[contract.op]]
+  name = "FAULT_RAISE"
+  op = 0x56
+
+  [[contract.op]]
+  name = "ARENA_USAGE"
+  op = 0x32
+  permission = "platform_raw"
+
+  [[contract.op]]
+  name = "ISR_METRICS"
+  op = 0xE8
+  permission = "none"
+
+[[contract]]
+name = "bridge"
+id = 0x22
+mints = true
+permission = "bridge"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "WRITE"
+  op = 0xE0
+
+  [[contract.op]]
+  name = "READ"
+  op = 0xE1
+
+  [[contract.op]]
+  name = "POLL"
+  op = 0xE2
+
+  [[contract.op]]
+  name = "INFO"
+  op = 0xE3
+
+  [[contract.op]]
+  name = "SELF_BRIDGES"
+  op = 0x44
+  permission = "none"
+
+[[contract]]
+name = "flash"
+id = 0x23
+permission = "flash_raw"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "RAW_ERASE"
+  op = 0x38
+
+  [[contract.op]]
+  name = "RAW_PROGRAM"
+  op = 0x39
+
+  [[contract.op]]
+  name = "SIDEBAND"
+  op = 0x10
+
+[[contract]]
+name = "provider_registry"
+id = 0x24
+permission = "flash_raw"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "FLASH_STORE_ENABLE"
+  op = 0x37
+
+[[contract]]
+name = "diag"
+id = 0x25
+permission = "platform_raw"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "LOG_RING_DRAIN"
+  op = 0x64
+
+  [[contract.op]]
+  name = "FAN_DIAG_SNAPSHOT"
+  op = 0x65
+  permission = "none"
+
+[[contract]]
+name = "vault_store"
+id = 0x26
+permission = "vault_store"
+
+  [[contract.op]]
+  name = "ATTACH"
+  op = 0x40
+
+  [[contract.op]]
+  name = "LOAD"
+  op = 0x41
+
+  [[contract.op]]
+  name = "DECIDE"
+  op = 0x42
+
+  [[contract.op]]
+  name = "PENDING"
+  op = 0x43
+
+  [[contract.op]]
+  name = "READ"
+  op = 0x44
+
+  [[contract.op]]
+  name = "DONE"
+  op = 0x45
+
+[[contract]]
+name = "rp_raw"
+id = 0x27
+permission = "platform_raw"
+unlisted = "platform_raw"
+route = "class"
+
+  [[contract.op]]
+  name = "PWM_PIN_ENABLE"
+  op = 0x60
+
+  [[contract.op]]
+  name = "PWM_PIN_DISABLE"
+  op = 0x61
+
+  [[contract.op]]
+  name = "PWM_SLICE_WRITE"
+  op = 0x62
+
+  [[contract.op]]
+  name = "PWM_SLICE_READ"
+  op = 0x63
+
+  [[contract.op]]
+  name = "PIO_SM_EXEC"
+  op = 0x70
+
+  [[contract.op]]
+  name = "PIO_SM_WRITE_REG"
+  op = 0x71
+
+  [[contract.op]]
+  name = "PIO_SM_READ_REG"
+  op = 0x72
+
+  [[contract.op]]
+  name = "PIO_SM_ENABLE"
+  op = 0x73
+
+  [[contract.op]]
+  name = "PIO_INSTR_ALLOC"
+  op = 0x74
+
+  [[contract.op]]
+  name = "PIO_INSTR_WRITE"
+  op = 0x75
+
+  [[contract.op]]
+  name = "PIO_INSTR_FREE"
+  op = 0x76
+
+  [[contract.op]]
+  name = "PIO_PIN_SETUP"
+  op = 0x77
+
+  [[contract.op]]
+  name = "PIO_GPIOBASE"
+  op = 0x78
+
+  [[contract.op]]
+  name = "PIO_TXF_WRITE"
+  op = 0x79
+
+  [[contract.op]]
+  name = "PIO_FSTAT_READ"
+  op = 0x7A
+
+  [[contract.op]]
+  name = "PIO_SM_RESTART"
+  op = 0x7B
+
+  [[contract.op]]
+  name = "PIO_INPUT_SYNC_BYPASS"
+  op = 0x7C
+
+  [[contract.op]]
+  name = "PIO_CMD_TRANSFER"
+  op = 0x7D
+
+  [[contract.op]]
+  name = "PIO_CMD_POLL"
+  op = 0x7E
+
+  [[contract.op]]
+  name = "PIO_PIN_LEVEL"
+  op = 0x7F
+
+  [[contract.op]]
+  name = "SPI9_SEND"
+  op = 0x90
+
+  [[contract.op]]
+  name = "SPI9_RESET"
+  op = 0x91
+
+  [[contract.op]]
+  name = "SPI9_CS_SET"
+  op = 0x92
+
+  [[contract.op]]
+  name = "SPI_REG_WRITE"
+  op = 0xA0
+
+  [[contract.op]]
+  name = "SPI_REG_READ"
+  op = 0xA1
+
+  [[contract.op]]
+  name = "SPI_BUS_INFO"
+  op = 0xA2
+
+  [[contract.op]]
+  name = "SPI_PIN_INIT"
+  op = 0xA3
+
+  [[contract.op]]
+  name = "SPI_SET_ENABLE"
+  op = 0xA4
+
+  [[contract.op]]
+  name = "I2C_REG_WRITE"
+  op = 0xB0
+
+  [[contract.op]]
+  name = "I2C_REG_READ"
+  op = 0xB1
+
+  [[contract.op]]
+  name = "I2C_BUS_INFO"
+  op = 0xB2
+
+  [[contract.op]]
+  name = "I2C_PIN_INIT"
+  op = 0xB3
+
+  [[contract.op]]
+  name = "I2C_SET_ENABLE"
+  op = 0xB4
+
+  [[contract.op]]
+  name = "UART_REG_WRITE"
+  op = 0xC0
+
+  [[contract.op]]
+  name = "UART_REG_READ"
+  op = 0xC1
+
+  [[contract.op]]
+  name = "UART_PIN_INIT"
+  op = 0xC2
+
+  [[contract.op]]
+  name = "UART_SET_ENABLE"
+  op = 0xC3
+
+  [[contract.op]]
+  name = "ADC_REG_WRITE"
+  op = 0xD0
+
+  [[contract.op]]
+  name = "ADC_REG_READ"
+  op = 0xD1
+
+  [[contract.op]]
+  name = "ADC_PIN_INIT"
+  op = 0xD2
+
+[[contract]]
+name = "metal_device"
+id = 0x28
+manifest = true
+permission = "platform_raw"
+unlisted = "platform_raw"
+
+  [[contract.op]]
+  name = "MMIO_READ32"
+  op = 0xE4
+
+  [[contract.op]]
+  name = "MMIO_WRITE32"
+  op = 0xE5
+
+  [[contract.op]]
+  name = "DMA_ALLOC_CONTIG"
+  op = 0xE6
+  permission = "dma"
+
+  [[contract.op]]
+  name = "CACHE_FLUSH_RANGE"
+  op = 0xE7
+  permission = "dma"
+
+  [[contract.op]]
+  name = "DMA_FLUSH"
+  op = 0xEA
+  permission = "dma"
+
+  [[contract.op]]
+  name = "DMA_INVALIDATE"
+  op = 0xEB
+  permission = "dma"
+
+  [[contract.op]]
+  name = "DMA_ALLOC_STREAMING"
+  op = 0xEC
+  permission = "dma"
+
+  [[contract.op]]
+  name = "PCIE_RESCAN"
+  op = 0xF5
+
+  [[contract.op]]
+  name = "PCIE_CFG_READ32"
+  op = 0xF6
+
+  [[contract.op]]
+  name = "PCIE_CFG_WRITE32"
+  op = 0xF7
+
+
+
+[[msgset]]
+name = "net_tlv"
+members = ["net_proto", "datagram", "packet", "session_ctrl", "identity", "peer_identity", "mux"]
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_ACCEPTED"
+  value = 0x01
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_DATA"
+  value = 0x02
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_CLOSED"
+  value = 0x03
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_BOUND"
+  value = 0x04
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_CONNECTED"
+  value = 0x05
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_ERROR"
+  value = 0x06
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_RETRANSMIT"
+  value = 0x07
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_ACK"
+  value = 0x08
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_TRACE_CTX"
+  value = 0x09
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_PEER"
+  value = 0x0A
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_HORIZON"
+  value = 0x0B
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "MSG_RESUMED"
+  value = 0x0C
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "CMD_BIND"
+  value = 0x10
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "CMD_SEND"
+  value = 0x11
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "CMD_CLOSE"
+  value = 0x12
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "CMD_RESEND"
+  value = 0x18
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "CMD_DELIVERED"
+  value = 0x19
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "CMD_CONNECT"
+  value = 0x13
+
+  [[msgset.msg]]
+  surface = "net_proto"
+  name = "CMD_CONNECT_TO"
+  value = 0x14
+
+  [[msgset.msg]]
+  surface = "datagram"
+  name = "CMD_DG_BIND"
+  value = 0x20
+
+  [[msgset.msg]]
+  surface = "datagram"
+  name = "CMD_DG_SEND_TO"
+  value = 0x21
+
+  [[msgset.msg]]
+  surface = "datagram"
+  name = "CMD_DG_CLOSE"
+  value = 0x22
+
+  [[msgset.msg]]
+  surface = "datagram"
+  name = "MSG_DG_BOUND"
+  value = 0x40
+
+  [[msgset.msg]]
+  surface = "datagram"
+  name = "MSG_DG_RX_FROM"
+  value = 0x41
+
+  [[msgset.msg]]
+  surface = "datagram"
+  name = "MSG_DG_CLOSED"
+  value = 0x42
+
+  [[msgset.msg]]
+  surface = "datagram"
+  name = "MSG_DG_ERROR"
+  value = 0x43
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "CMD_PKT_BIND"
+  value = 0x50
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "CMD_PKT_TX"
+  value = 0x51
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "CMD_PKT_CLOSE"
+  value = 0x52
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_BOUND"
+  value = 0x60
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_RX"
+  value = 0x61
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_CLOSED"
+  value = 0x62
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_ERROR"
+  value = 0x63
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "CMD_PKT_DISPOSE"
+  value = 0x53
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "CMD_PKT_CLONE"
+  value = 0x54
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_DECIDE"
+  value = 0x64
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_FORWARD"
+  value = 0x65
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_CLONED"
+  value = 0x66
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_EXPIRED"
+  value = 0x67
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_MIRROR_LOST"
+  value = 0x68
+
+  [[msgset.msg]]
+  surface = "packet"
+  name = "MSG_PKT_DECIDE6"
+  value = 0x69
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_HELLO"
+  value = 0x70
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_ATTACH"
+  value = 0x71
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_DETACH"
+  value = 0x72
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_DRAIN"
+  value = 0x73
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_EXPORT_BEGIN"
+  value = 0x74
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_EXPORT_CHUNK"
+  value = 0x75
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_EXPORT_END"
+  value = 0x76
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_RESUME"
+  value = 0x77
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_EPOCH_BUMP"
+  value = 0x78
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_RELOCATE"
+  value = 0x79
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_HELLO_ACK"
+  value = 0x90
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_ATTACHED"
+  value = 0x91
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_DETACHED"
+  value = 0x92
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_DRAINED"
+  value = 0x93
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_IMPORT_BEGIN"
+  value = 0x94
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_IMPORT_CHUNK"
+  value = 0x95
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_IMPORT_END"
+  value = 0x96
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_RESUMED"
+  value = 0x97
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_EPOCH_CONFIRMED"
+  value = 0x98
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_RELOCATED"
+  value = 0x99
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_PAIR_PREPARE"
+  value = 0x7A
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_CHECKPOINT_BEGIN"
+  value = 0x7B
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_CHECKPOINT_NEXT"
+  value = 0x7C
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_CHECKPOINT_COMMIT"
+  value = 0x7D
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_DELTA_APPLY"
+  value = 0x7E
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_DELTA_ACK"
+  value = 0x7F
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_QUIESCE_BEGIN"
+  value = 0x80
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_QUIESCE_STATUS"
+  value = 0x81
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_CUT_EXPORT"
+  value = 0x82
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_CUT_IMPORT"
+  value = 0x83
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_EMISSION_ARM"
+  value = 0x84
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_ACTIVATE"
+  value = 0x85
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_RETIRE"
+  value = 0x86
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_ABORT"
+  value = 0x87
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_RESERVATION_GRANT"
+  value = 0x88
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_TOMBSTONE"
+  value = 0x89
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "CMD_SC_CUSTODY"
+  value = 0x8A
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_CONTINUITY"
+  value = 0x9A
+
+  [[msgset.msg]]
+  surface = "session_ctrl"
+  name = "MSG_SC_ERROR"
+  value = 0x9F
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "ADDR_ADD"
+  value = 0xA0
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "ADDR_DEL"
+  value = 0xA1
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "ADDR_ARM"
+  value = 0xA2
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "ADDR_FENCE"
+  value = 0xA3
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "MSG_ADDR_ADDED"
+  value = 0xA8
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "MSG_ADDR_ARMED"
+  value = 0xA9
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "MSG_ADDR_FENCED"
+  value = 0xAA
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "MSG_ADDR_REFUSED"
+  value = 0xAB
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "MSG_ARM_AUTH_CHECK"
+  value = 0xAC
+
+  [[msgset.msg]]
+  surface = "identity"
+  name = "ARM_AUTH_VERDICT"
+  value = 0xAD
+
+  [[msgset.msg]]
+  surface = "peer_identity"
+  name = "MSG_PEER_IDENTITY"
+  value = 0xC8
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_SESSION_OPEN"
+  value = 0xB0
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_SESSION_CLOSE"
+  value = 0xB1
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_STREAM_OPEN"
+  value = 0xB2
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_STREAM_CLOSE"
+  value = 0xB3
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_STREAM_SEND"
+  value = 0xB4
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_STREAM_ACK"
+  value = 0xB5
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_DATAGRAM_SEND"
+  value = 0xB6
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_STREAM_RESET"
+  value = 0xB7
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_STREAM_STOP_SENDING"
+  value = 0xB8
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "CMD_MUX_STREAM_OPEN_WITH"
+  value = 0xB9
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_SESSION_OPENED"
+  value = 0xC0
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_SESSION_CLOSED"
+  value = 0xC1
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_STREAM_OPENED"
+  value = 0xC2
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_STREAM_ACCEPTED"
+  value = 0xC3
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_STREAM_CLOSED"
+  value = 0xC4
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_STREAM_RX"
+  value = 0xC5
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_DATAGRAM_RX"
+  value = 0xC7
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_STREAM_RESET"
+  value = 0xCA
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_STREAM_STOPPED"
+  value = 0xCB
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_SESSION_ERROR"
+  value = 0xCE
+
+  [[msgset.msg]]
+  surface = "mux"
+  name = "MSG_MUX_STREAM_ERROR"
+  value = 0xCF

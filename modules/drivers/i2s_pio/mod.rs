@@ -63,15 +63,15 @@ mod pio;
 // `kernel::module::provider::contract::HAL_PIO` and `abi::platform::rp::pio`).
 // ============================================================================
 
-const HAL_PIO_CONTRACT: u32 = 0x0004;
-const DEV_PIO_STREAM_ALLOC: u32 = 0x0400;
-const DEV_PIO_STREAM_LOAD_PROGRAM: u32 = 0x0401;
-const DEV_PIO_STREAM_GET_BUFFER: u32 = 0x0402;
-const DEV_PIO_STREAM_CONFIGURE: u32 = 0x0403;
-const DEV_PIO_STREAM_CAN_PUSH: u32 = 0x0404;
-const DEV_PIO_STREAM_PUSH: u32 = 0x0405;
-const DEV_PIO_STREAM_FREE: u32 = 0x0406;
-const DEV_PIO_STREAM_SET_RATE: u32 = 0x040B;
+const HAL_PIO_CONTRACT: u32 = abi::registry::pio::ID as u32;
+const DEV_PIO_STREAM_ALLOC: u32 = abi::registry::pio::STREAM_ALLOC;
+const DEV_PIO_STREAM_LOAD_PROGRAM: u32 = abi::registry::pio::STREAM_LOAD_PROGRAM;
+const DEV_PIO_STREAM_GET_BUFFER: u32 = abi::registry::pio::STREAM_GET_BUFFER;
+const DEV_PIO_STREAM_CONFIGURE: u32 = abi::registry::pio::STREAM_CONFIGURE;
+const DEV_PIO_STREAM_CAN_PUSH: u32 = abi::registry::pio::STREAM_CAN_PUSH;
+const DEV_PIO_STREAM_PUSH: u32 = abi::registry::pio::STREAM_PUSH;
+const DEV_PIO_STREAM_FREE: u32 = abi::registry::pio::STREAM_FREE;
+const DEV_PIO_STREAM_SET_RATE: u32 = abi::registry::pio::STREAM_SET_RATE;
 
 // ============================================================================
 // HAL_PIO argument structs (mirrors abi::PioLoadProgramArgs, PioConfigureArgs)

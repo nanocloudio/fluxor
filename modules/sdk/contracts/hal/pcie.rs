@@ -42,28 +42,28 @@
 /// Returns a non-negative device handle on success or a negative errno
 /// (ENODEV if unresolved, EAGAIN if the link hasn't trained yet,
 /// EBUSY if a class selector matches more than one device).
-pub const BIND: u32 = 0x0CA0;
+pub use super::super::super::registry::pcie_device::BIND;
 
 /// Release the handle. Default close op invoked by `provider_close`.
 /// `handle = dev_handle`, arg = empty.
-pub const CLOSE: u32 = 0x0CA1;
+pub use super::super::super::registry::pcie_device::CLOSE;
 
 /// Read a 32-bit word from the device's PCI configuration space.
 /// `handle = dev_handle`, arg = [offset:u16 LE] at bytes 0..2;
 /// writes value:u32 LE to arg[4..8] on success. Returns 0 or -errno.
 /// Caller must pass at least 8 bytes so the output slot exists.
-pub const CFG_READ32: u32 = 0x0CA2;
+pub use super::super::super::registry::pcie_device::CFG_READ32;
 
 /// Write a 32-bit word to the device's PCI configuration space.
 /// `handle = dev_handle`, arg = [offset:u16 LE, _pad:u16, value:u32 LE]
 /// (8 bytes). Returns 0 or -errno.
-pub const CFG_WRITE32: u32 = 0x0CA3;
+pub use super::super::super::registry::pcie_device::CFG_WRITE32;
 
 /// Map the device's BARn into kernel virtual address space.
 /// `handle = dev_handle`, arg = [bar_idx:u8] at byte 0. Writes the
 /// resulting 64-bit virt address (LE) to arg[2..10]. Returns 0 or
 /// -errno. Caller must pass at least 10 bytes.
-pub const BAR_MAP: u32 = 0x0CA4;
+pub use super::super::super::registry::pcie_device::BAR_MAP;
 
 /// Allocate an MSI-X vector for the device, registering `event_handle`
 /// as the kernel-side fd that fires when the vector asserts. The kernel
@@ -71,7 +71,7 @@ pub const BAR_MAP: u32 = 0x0CA4;
 /// `handle = dev_handle`, arg = [event_handle:i32 LE] at bytes 0..4.
 /// Writes [vec:u8, _pad:u8×3, target_addr:u64 LE, data:u32 LE] to
 /// arg[4..20]. Returns 0 or -errno. Caller must pass at least 20 bytes.
-pub const MSI_ALLOC: u32 = 0x0CA5;
+pub use super::super::super::registry::pcie_device::MSI_ALLOC;
 
 /// Read back device introspection. `handle = dev_handle`, arg is a
 /// 32-byte output buffer. Writes:
@@ -79,4 +79,4 @@ pub const MSI_ALLOC: u32 = 0x0CA5;
 ///     bus:u8, dev:u8, func:u8, _pad:u8,
 ///     alias:[u8; 20] null-terminated (empty if bound by class) ]
 /// Returns 32 on success or -errno.
-pub const INFO: u32 = 0x0CA6;
+pub use super::super::super::registry::pcie_device::INFO;

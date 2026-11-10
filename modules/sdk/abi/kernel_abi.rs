@@ -244,12 +244,8 @@ const _: () = {
 /// Poll event flags (used with `handle_poll` / `channel_poll`).
 /// These values are part of the stable ABI — modules hardcode them.
 pub mod poll {
-    /// Data available for reading.
-    pub const IN: u32 = 0x01;
-    /// Space available for writing.
-    pub const OUT: u32 = 0x02;
     /// Error condition.
-    pub const ERR: u32 = 0x04;
+    pub use super::super::registry::poll::ERR;
     /// Hang-up (peer closed / end-of-stream).
     ///
     /// On its own this does NOT mean the stream carried anything. A
@@ -258,9 +254,11 @@ pub mod poll {
     /// first write hangs up its outputs — and a consumer reading `HUP`
     /// as "the stream is complete" then treats a stream that never
     /// started as one that ended empty. Pair it with [`WROTE`].
-    pub const HUP: u32 = 0x08;
-    /// Connection established.
-    pub const CONN: u32 = 0x10;
+    pub use super::super::registry::poll::HUP;
+    /// Data available for reading.
+    pub use super::super::registry::poll::IN;
+    /// Space available for writing.
+    pub use super::super::registry::poll::OUT;
     /// The channel has carried at least one byte since it was last
     /// flushed. Sticky: once set it stays set until `IOCTL_FLUSH`
     /// begins a new stream.
@@ -276,72 +274,83 @@ pub mod poll {
     /// and retires, which presents the next consumer downstream with the
     /// same reading. One misread at the head of a chain retires all of
     /// it, within a few steps of boot and with no error anywhere.
-    pub const WROTE: u32 = 0x20;
+    pub use super::super::registry::poll::WROTE;
 }
 
 /// Standard error codes (negative errno values).
 /// These values are part of the stable ABI — modules hardcode them.
 pub mod errno {
-    /// Operation completed successfully.
-    pub const OK: i32 = 0;
-    /// Generic / unspecified error.
-    pub const ERROR: i32 = -1;
+    /// Argument list / output buffer too long — caller should retry
+    /// with a larger buffer. Used by FS_READDIR when one entry
+    /// doesn't fit and no progress could be made.
+    pub use super::super::registry::errno::E2BIG;
     /// Permission denied (capability check failed).
-    pub const EACCES: i32 = -13;
-    /// A pointer the caller passed is not the caller's memory.
-    pub const EFAULT: i32 = -14;
-    /// No such device or address (e.g. I2C NACK).
-    pub const ENXIO: i32 = -6;
-    /// I/O error: the medium refused or lost what it was given.
-    pub const EIO: i32 = -5;
+    pub use super::super::registry::errno::EACCES;
     /// Resource temporarily unavailable — try again.
-    pub const EAGAIN: i32 = -11;
+    pub use super::super::registry::errno::EAGAIN;
+    /// Resource busy.
+    pub use super::super::registry::errno::EBUSY;
+    /// Entry already exists. `LINK` against a name that is taken.
+    pub use super::super::registry::errno::EEXIST;
+    /// A pointer the caller passed is not the caller's memory.
+    pub use super::super::registry::errno::EFAULT;
+    /// Operation in progress (async not yet complete).
+    pub use super::super::registry::errno::EINPROGRESS;
+    /// Invalid argument.
+    pub use super::super::registry::errno::EINVAL;
+    /// I/O error: the medium refused or lost what it was given.
+    pub use super::super::registry::errno::EIO;
+    /// Target is a directory. `LINK` against one, and `UNLINK` against one
+    /// on a provider that separates directory removal into `RMDIR`.
+    pub use super::super::registry::errno::EISDIR;
+    /// No such device.
+    pub use super::super::registry::errno::ENODEV;
+    /// A module that cannot be brought up: no module of that name, or one
+    /// whose constructor refused.
+    pub use super::super::registry::errno::ENOEXEC;
     /// Cannot allocate memory / no free slots.
-    pub const ENOMEM: i32 = -12;
+    pub use super::super::registry::errno::ENOMEM;
     /// Capacity denial — a resource-ledger pool or budget is exhausted.
     /// Distinct from `ENOMEM` (allocator failure): the request was
     /// well-formed and the denial is accounted (pool `denials` counter,
     /// PSTATUS `POOL` records).
-    pub const ENOSPC: i32 = -28;
-    /// Argument list / output buffer too long — caller should retry
-    /// with a larger buffer. Used by FS_READDIR when one entry
-    /// doesn't fit and no progress could be made.
-    pub const E2BIG: i32 = -7;
-    /// Entry already exists. `LINK` against a name that is taken.
-    pub const EEXIST: i32 = -17;
-    /// Target is a directory. `LINK` against one, and `UNLINK` against one
-    /// on a provider that separates directory removal into `RMDIR`.
-    pub const EISDIR: i32 = -21;
-    /// Cross-device link: the two paths are not on the same volume, so no
-    /// second name can reference the same file.
-    pub const EXDEV: i32 = -18;
+    pub use super::super::registry::errno::ENOSPC;
+    /// Function / syscall not implemented.
+    pub use super::super::registry::errno::ENOSYS;
     /// Directory not empty. `RMDIR` against a directory that still holds
     /// entries; the check is the provider's, because a caller's enumeration
     /// only describes the moment it looked.
-    pub const ENOTEMPTY: i32 = -39;
+    pub use super::super::registry::errno::ENOTEMPTY;
+    /// No such device or address (e.g. I2C NACK).
+    pub use super::super::registry::errno::ENXIO;
+    /// Generic / unspecified error.
+    pub use super::super::registry::errno::ERROR;
     /// No such process / no such context. Answered by
     /// [`query_key::CALLER_OWNER`] when nothing is on the provider stack —
     /// there is no requester to name, which is a different statement from
     /// "the requester is the system owner".
-    pub const ESRCH: i32 = -3;
-    /// Resource busy.
-    pub const EBUSY: i32 = -16;
-    /// No such device.
-    pub const ENODEV: i32 = -19;
-    /// A module that cannot be brought up: no module of that name, or one
-    /// whose constructor refused.
-    pub const ENOEXEC: i32 = -8;
-    /// Invalid argument.
-    pub const EINVAL: i32 = -22;
-    /// Operation in progress (async not yet complete).
-    pub const EINPROGRESS: i32 = -36;
-    /// Function / syscall not implemented.
-    pub const ENOSYS: i32 = -38;
+    pub use super::super::registry::errno::ESRCH;
+    /// Cross-device link: the two paths are not on the same volume, so no
+    /// second name can reference the same file.
+    pub use super::super::registry::errno::EXDEV;
+    /// Operation completed successfully.
+    pub use super::super::registry::errno::OK;
 
     /// No such entry. A lookup that found nothing, as distinct from one
     /// that could not be performed.
-    pub const ENOENT: i32 = -2;
+    pub use super::super::registry::errno::ENOENT;
 
+    /// Connection refused.
+    pub use super::super::registry::errno::ECONNREFUSED;
+    /// Transport endpoint is not connected.
+    pub use super::super::registry::errno::ENOTCONN;
+    /// Operation not supported (e.g. wrong pin mode).
+    pub use super::super::registry::errno::ENOTSUP;
+    /// A value is too large for the width the caller asked it in. Used by
+    /// FS_STAT when a file's size does not fit the 32-bit output form, so
+    /// the caller learns to ask again with a wider buffer rather than
+    /// receiving a clamped number it cannot distinguish from a real one.
+    pub use super::super::registry::errno::EOVERFLOW;
     /// The caller's buffer is too small, and the call has written the
     /// exact requirement into the layout's `*_len_out` field.
     ///
@@ -350,24 +359,13 @@ pub mod errno {
     /// caller should resize — a caller that cannot tell those apart either
     /// gives up on a recoverable call or retries an unrecoverable one
     /// forever.
-    pub const ERANGE: i32 = -34;
-    /// A value is too large for the width the caller asked it in. Used by
-    /// FS_STAT when a file's size does not fit the 32-bit output form, so
-    /// the caller learns to ask again with a wider buffer rather than
-    /// receiving a clamped number it cannot distinguish from a real one.
-    pub const EOVERFLOW: i32 = -75;
-    /// Operation not supported (e.g. wrong pin mode).
-    pub const ENOTSUP: i32 = -95;
-    /// Transport endpoint is not connected.
-    pub const ENOTCONN: i32 = -107;
-    /// Connection timed out.
-    pub const ETIMEDOUT: i32 = -110;
-    /// Connection refused.
-    pub const ECONNREFUSED: i32 = -111;
+    pub use super::super::registry::errno::ERANGE;
     /// A `storage.object` object's retention or legal hold refuses the
     /// change. No host errno has this value, so a provider relaying a host
     /// call's answer can never produce it by accident.
-    pub const ERETAINED: i32 = -200;
+    pub use super::super::registry::errno::ERETAINED;
+    /// Connection timed out.
+    pub use super::super::registry::errno::ETIMEDOUT;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -376,8 +374,7 @@ pub mod errno {
 //
 // The channel ring-buffer contract. `channel_read` / `channel_write` /
 // `channel_poll` are direct syscalls on the SyscallTable; the opcodes
-// below are reserved for the control plane (open/close/bind/listen/
-// accept) and for ioctl sideband.
+// below open and close channels, find ports and carry ioctl sideband.
 //
 // Channel ioctl commands the kernel handles (stable ABI values, passed in
 // the ioctl `cmd` parameter rather than as opcodes; `runtime/consts.rs`
@@ -392,23 +389,16 @@ pub mod errno {
 //                    0 for a full ring and for a mailbox channel, which has
 //                    no ring to measure
 pub mod channel {
-    pub const OPEN: u32 = 0x0500;
-    pub const CLOSE: u32 = 0x0501;
-    pub const CONNECT: u32 = 0x0502;
-    pub const READ: u32 = 0x0503;
-    pub const WRITE: u32 = 0x0504;
-    pub const POLL: u32 = 0x0505;
-    pub const IOCTL: u32 = 0x0506;
+    pub use super::super::registry::channel::CLOSE;
+    pub use super::super::registry::channel::IOCTL;
+    pub use super::super::registry::channel::OPEN;
+    pub use super::super::registry::channel::PORT;
     /// Bind a module-provided ioctl handler to this channel.
     /// Arg layout: `{ state_ptr: u64 LE, handler_fn: u64 LE }` (16 B).
     /// Any `channel_ioctl` cmd not handled by the kernel's built-in set
     /// (NOTIFY / POLL_NOTIFY / FLUSH / SET_HUP / WRITABLE) is forwarded to
     /// `handler_fn(state_ptr, cmd, arg)`. `handler_fn = 0` clears.
-    pub const REGISTER_IOCTL: u32 = 0x0507;
-    pub const BIND: u32 = 0x0509;
-    pub const LISTEN: u32 = 0x050A;
-    pub const ACCEPT: u32 = 0x050B;
-    pub const PORT: u32 = 0x050C;
+    pub use super::super::registry::channel::REGISTER_IOCTL;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -458,8 +448,8 @@ pub mod trusted_time {
 }
 
 pub mod timer {
-    pub const MILLIS: u32 = 0x0602;
-    pub const MICROS: u32 = 0x0603;
+    pub use super::super::registry::timer::MICROS;
+    pub use super::super::registry::timer::MILLIS;
     /// Wall-clock milliseconds since the Unix epoch (0 if the platform has no RTC).
     /// Distinct from MILLIS (monotonic uptime).
     ///
@@ -469,8 +459,38 @@ pub mod timer {
     /// been stepped backwards. Suitable for timestamps a human reads and for
     /// cache ages; NOT suitable for deciding whether a credential is still
     /// valid. Use `TRUSTED_UNIX` for that. handle=-1, arg=[u64 LE].
-    pub const UNIX_MILLIS: u32 = 0x0608;
+    pub use super::super::registry::timer::UNIX_MILLIS;
 
+    /// Cancel timer. handle=timer_fd.
+    pub use super::super::registry::timer::CANCEL;
+    /// Create a timer fd. handle=-1. Returns tagged timer fd.
+    ///
+    /// A timer is an fd in every sense that matters: `SET` arms it, the
+    /// generic fd `POLL` reports `POLL_IN` once it has fired, and the KERNEL
+    /// steps the owning module when it fires — the owner's wake bit latches
+    /// exactly as an event's does, once per arming, and the earliest armed
+    /// timer bounds the pacer's sleep, relaxed idle backstop included. So a
+    /// module that arms 5 ms is stepped at ~5 ms on an idle domain whose
+    /// backstop is 50 ms, not at 50: a module waits on its timer rather than
+    /// polling the clock on a tick it does not control.
+    pub use super::super::registry::timer::CREATE;
+    /// Destroy timer. handle=timer_fd.
+    pub use super::super::registry::timer::DESTROY;
+    /// Anchor the platform's wall clock to a network time measurement — for a
+    /// board with no RTC and no OS time service (the `sntp` foundation module
+    /// calls it). `handle=-1`, `arg` = `[unix_us: u64 LE][monotonic_us: u64
+    /// LE][error_us: u32 LE]` (20 bytes): at monotonic instant `monotonic_us`
+    /// (a `MICROS` reading, not in the future) it was `unix_us`, within
+    /// `error_us`. The platform then reports `NETWORK_SYNC` through
+    /// `TRUSTED_UNIX`, its uncertainty growing with the anchor's age, until
+    /// the anchor goes stale (one hour without a fresh one). `EINVAL` for an anchor that cannot be true (a
+    /// Unix time before 2024, or a monotonic instant in the future).
+    /// Privileged (`platform_raw`): whoever anchors the clock decides every
+    /// credential's validity window. `ENOSYS` on a platform whose wall clock
+    /// does not come from this anchor (bcm2712 is the one that does).
+    pub use super::super::registry::timer::DISCIPLINE;
+    /// Start/restart timer. handle=timer_fd, arg[0..4]=delay_ms (LE).
+    pub use super::super::registry::timer::SET;
     /// A security-grade time observation: what time it is, and what is known
     /// about how much that is worth.
     ///
@@ -502,60 +522,30 @@ pub mod timer {
     /// cached decision with the epoch it was made under and invalidates the
     /// decision when the epoch moves. Without it a clock that goes backwards
     /// and comes forward again is invisible.
-    pub const TRUSTED_UNIX: u32 = 0x0609;
-    /// Create a timer fd. handle=-1. Returns tagged timer fd.
-    ///
-    /// A timer is an fd in every sense that matters: `SET` arms it, the
-    /// generic fd `POLL` reports `POLL_IN` once it has fired, and the KERNEL
-    /// steps the owning module when it fires — the owner's wake bit latches
-    /// exactly as an event's does, once per arming, and the earliest armed
-    /// timer bounds the pacer's sleep, relaxed idle backstop included. So a
-    /// module that arms 5 ms is stepped at ~5 ms on an idle domain whose
-    /// backstop is 50 ms, not at 50: a module waits on its timer rather than
-    /// polling the clock on a tick it does not control.
-    pub const CREATE: u32 = 0x0604;
-    /// Start/restart timer. handle=timer_fd, arg[0..4]=delay_ms (LE).
-    pub const SET: u32 = 0x0605;
-    /// Cancel timer. handle=timer_fd.
-    pub const CANCEL: u32 = 0x0606;
-    /// Destroy timer. handle=timer_fd.
-    pub const DESTROY: u32 = 0x0607;
-    /// Anchor the platform's wall clock to a network time measurement — for a
-    /// board with no RTC and no OS time service (the `sntp` foundation module
-    /// calls it). `handle=-1`, `arg` = `[unix_us: u64 LE][monotonic_us: u64
-    /// LE][error_us: u32 LE]` (20 bytes): at monotonic instant `monotonic_us`
-    /// (a `MICROS` reading, not in the future) it was `unix_us`, within
-    /// `error_us`. The platform then reports `NETWORK_SYNC` through
-    /// `TRUSTED_UNIX`, its uncertainty growing with the anchor's age, until
-    /// the anchor goes stale (one hour without a fresh one). `EINVAL` for an anchor that cannot be true (a
-    /// Unix time before 2024, or a monotonic instant in the future).
-    /// Privileged (`platform_raw`): whoever anchors the clock decides every
-    /// credential's validity window. `ENOSYS` on a platform whose wall clock
-    /// does not come from this anchor (bcm2712 is the one that does).
-    pub const DISCIPLINE: u32 = 0x060A;
+    pub use super::super::registry::timer::TRUSTED_UNIX;
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // Buffer primitive (zero-copy slot acquisition)
 // ─────────────────────────────────────────────────────────────────────
 pub mod buffer {
+    /// Acquire the channel's pending message for modification (READY →
+    /// PRODUCER); `RELEASE_WRITE` then hands it on. Argument: an [`acquired`]
+    /// record, written by the kernel.
+    pub use super::super::registry::buffer::ACQUIRE_INPLACE;
+    /// Acquire the channel's pending message for reading (READY → CONSUMER).
+    /// Argument: an [`acquired`] record, written by the kernel.
+    pub use super::super::registry::buffer::ACQUIRE_READ;
     /// Acquire the channel's buffer for writing (STREAMING → PRODUCER).
     /// Argument: an [`acquired`] record, written by the kernel.
-    pub const ACQUIRE_WRITE: u32 = 0x0A00;
+    pub use super::super::registry::buffer::ACQUIRE_WRITE;
+    /// Return the message buffer (CONSUMER → STREAMING). No argument.
+    pub use super::super::registry::buffer::RELEASE_READ;
     /// Publish the written buffer (PRODUCER → READY). Argument: `u32` LE, the
     /// length of the message in bytes (at most the capacity `ACQUIRE_WRITE`
     /// reported). A length of `0` publishes an empty message; an argument
     /// shorter than 4 bytes is `EINVAL` and publishes nothing.
-    pub const RELEASE_WRITE: u32 = 0x0A01;
-    /// Acquire the channel's pending message for reading (READY → CONSUMER).
-    /// Argument: an [`acquired`] record, written by the kernel.
-    pub const ACQUIRE_READ: u32 = 0x0A02;
-    /// Return the message buffer (CONSUMER → STREAMING). No argument.
-    pub const RELEASE_READ: u32 = 0x0A03;
-    /// Acquire the channel's pending message for modification (READY →
-    /// PRODUCER); `RELEASE_WRITE` then hands it on. Argument: an [`acquired`]
-    /// record, written by the kernel.
-    pub const ACQUIRE_INPLACE: u32 = 0x0A04;
+    pub use super::super::registry::buffer::RELEASE_WRITE;
 
     /// The record the three acquire operations fill in. The call's result is
     /// the status and never the address: a pointer does not fit the `i32` a
@@ -581,19 +571,19 @@ pub mod buffer {
 // Event primitive (single-bit ISR→module wake signal)
 // ─────────────────────────────────────────────────────────────────────
 pub mod event {
-    /// Create event. handle=-1, arg=unused. Returns event handle (>=0) or <0 on error.
-    pub const CREATE: u32 = 0x0B00;
-    /// Signal event. handle=event. Returns 0 or <0.
-    pub const SIGNAL: u32 = 0x0B01;
-    /// Poll event (non-blocking, clears signaled flag). handle=event.
-    /// Returns 1 if was signaled (now cleared), 0 if not signaled, <0 on error.
-    pub const POLL: u32 = 0x0B02;
-    /// Destroy event and free slot. handle=event. Returns 0 or <0.
-    pub const DESTROY: u32 = 0x0B03;
     /// Bind an event handle to a hardware IRQ number.
     /// handle=event_handle, arg=[irq_number:u32 LE], arg_len=4.
     /// The kernel signals the event when the IRQ fires (ISR-safe).
-    pub const BIND_IRQ: u32 = 0x0C51;
+    pub use super::super::registry::event::BIND_IRQ;
+    /// Create event. handle=-1, arg=unused. Returns event handle (>=0) or <0 on error.
+    pub use super::super::registry::event::CREATE;
+    /// Destroy event and free slot. handle=event. Returns 0 or <0.
+    pub use super::super::registry::event::DESTROY;
+    /// Poll event (non-blocking, clears signaled flag). handle=event.
+    /// Returns 1 if was signaled (now cleared), 0 if not signaled, <0 on error.
+    pub use super::super::registry::event::POLL;
+    /// Signal event. handle=event. Returns 0 or <0.
+    pub use super::super::registry::event::SIGNAL;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -605,29 +595,29 @@ pub mod event {
 // ABI. Anything that only infrastructure modules touch (fault monitor,
 // reconfigure, bridge) lives in `internal/*` instead.
 
+/// Poll any handle. handle=fd, arg[0]=events mask. Returns poll result bitmask.
+pub use super::registry::kernel::HANDLE_POLL;
 /// Log message. handle=log_level, arg=message, arg_len=message length.
-pub const LOG_WRITE: u32 = 0x0C40;
+pub use super::registry::kernel::LOG_WRITE;
 /// Write raw bytes to the platform debug serial sink (binary-safe, unlike
 /// LOG_WRITE which UTF-8-filters). arg=bytes, arg_len=count. Returns bytes
-/// accepted. The telemetry `transport_buffer` sink; `platform_raw`-gated. 0x0C66 is
+/// accepted. The telemetry `transport_buffer` sink; `platform_raw`-gated. `kernel::SERIAL_WRITE` is
 /// the slot the dispatch comment reserves for "raw UART / USB writes", beside
-/// LOG_RING_DRAIN (0x0C64) / FAN_DIAG_SNAPSHOT (0x0C65).
-pub const SERIAL_WRITE: u32 = 0x0C66;
-/// Poll any handle. handle=fd, arg[0]=events mask. Returns poll result bitmask.
-pub const HANDLE_POLL: u32 = 0x0C41;
+/// LOG_RING_DRAIN (`diag::LOG_RING_DRAIN`) / FAN_DIAG_SNAPSHOT (`diag::FAN_DIAG_SNAPSHOT`).
+pub use super::registry::kernel::SERIAL_WRITE;
 
+/// Query downstream latency for current module. handle=-1. Returns u32 frames.
+pub use super::registry::kernel::DOWNSTREAM_LATENCY;
+/// Query graph-level sample rate. handle=-1. Returns u32 (0 = not set).
+pub use super::registry::kernel::GRAPH_SAMPLE_RATE;
+/// Report module's own processing latency in frames. handle=-1, arg[0..4]=frames (u32 LE).
+pub use super::registry::kernel::REPORT_LATENCY;
 /// Query stream time via `provider_query`. `handle=-1` returns the
 /// first active PIO stream's StreamTime (delegated to HAL_PIO
 /// internally — no PIO handle or ownership required by the caller).
 /// `handle=<stream>` returns that specific stream's time. Returns a
 /// 24-byte StreamTime struct.
-pub const STREAM_TIME: u32 = 0x0C30;
-/// Query graph-level sample rate. handle=-1. Returns u32 (0 = not set).
-pub const GRAPH_SAMPLE_RATE: u32 = 0x0C31;
-/// Query downstream latency for current module. handle=-1. Returns u32 frames.
-pub const DOWNSTREAM_LATENCY: u32 = 0x0C33;
-/// Report module's own processing latency in frames. handle=-1, arg[0..4]=frames (u32 LE).
-pub const REPORT_LATENCY: u32 = 0x0C50;
+pub use super::registry::kernel::STREAM_TIME;
 
 /// Report this module's `StepEffect` for the current scheduler pass.
 /// handle=-1, arg[0]=effect code (u8):
@@ -636,7 +626,7 @@ pub const REPORT_LATENCY: u32 = 0x0C50;
 /// authorising an immediate same-module re-step (that stays `StepOutcome::Burst`
 /// only). Idle/Waiting do not heat the pacer. A no-permission core primitive;
 /// a module that never calls it is treated as `Idle`.
-pub const REPORT_STEP_EFFECT: u32 = 0x0C45;
+pub use super::registry::kernel::REPORT_STEP_EFFECT;
 
 /// `StepEffect` codes for `REPORT_STEP_EFFECT` (wire-stable; mirrors the
 /// kernel's `scheduler::step_effect`).
@@ -650,7 +640,7 @@ pub mod step_effect {
 
 /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
 /// Returns arena size in bytes (0 if no arena allocated).
-pub const ARENA_GET: u32 = 0x0C3A;
+pub use super::registry::kernel::ARENA_GET;
 
 /// Fill buffer with cryptographically secure random bytes.
 /// handle=-1, arg=output buffer, arg_len=requested byte count.
@@ -659,20 +649,18 @@ pub const ARENA_GET: u32 = 0x0C3A;
 /// that gets 0 has every one of `arg_len` bytes.
 /// Entropy comes from whatever the platform calls a CSPRNG — a hardware
 /// TRNG where one exists, the host CSPRNG where the kernel is hosted.
-pub const RANDOM_FILL: u32 = 0x0C3C;
+pub use super::registry::kernel::RANDOM_FILL;
 
 /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
-pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
+pub use super::registry::kernel::SYS_CLOCK_HZ;
 
 /// Query the calling module's own scheduler index. handle=-1, no arg.
 /// Returns the index — a u16 value below the kernel's module-slot count
 /// (`internal::reconfigure::SLOT_CAPACITY`) — on success, negative errno on
 /// failure.
 /// Used by anchors / workers to render `mod=<idx>` in MON_SESSION
-/// telemetry lines. Distinct from `internal::reconfigure::SELF_INDEX`
-/// (0x0C67), which is gated by the `reconfigure` permission and is
-/// only meant for orchestration modules.
-pub const SELF_INDEX: u32 = 0x0C42;
+/// telemetry lines, and by orchestration modules to name themselves.
+pub use super::registry::kernel::SELF_INDEX;
 
 /// Copy the calling module's per-instance params blob into `out`.
 /// handle=-1; arg=output buffer of size `out_len`. Returns the number
@@ -687,7 +675,7 @@ pub const SELF_INDEX: u32 = 0x0C42;
 /// Wasm modules pull params through this query, since the kernel /
 /// module memory split rules out the direct path. The opcode is
 /// honoured on every target.
-pub const MODULE_INSTANCE_PARAMS: u32 = 0x0C43;
+pub use super::registry::kernel::MODULE_INSTANCE_PARAMS;
 
 /// Query the calling module's owner slot (`owner_tag`).
 /// handle=-1, arg=NULL. Returns the module's owner slot (0..MAX_OWNERS-1)
@@ -705,7 +693,7 @@ pub const MODULE_INSTANCE_PARAMS: u32 = 0x0C43;
 /// (same permission class as `SELF_INDEX` / `MODULE_INSTANCE_PARAMS`); a
 /// module can only ever read its OWN owner, never another's. Without it the
 /// module syscall ABI exposes no way to learn the calling owner at all.
-pub const OWNER_TAG: u32 = 0x0C4B;
+pub use super::registry::kernel::OWNER_TAG;
 
 /// Register the CALLING module as the node's net-identity provider (the
 /// module owning the shared network stack that realizes `net::identity`
@@ -716,7 +704,7 @@ pub const OWNER_TAG: u32 = 0x0C4B;
 /// Gated to base-graph (system-owned) modules — a workload module cannot
 /// hijack identity installs — and first-wins (`EBUSY` on a second claim).
 /// `ENOSYS` on single-tenant builds (no workload backend to serve).
-pub const NET_IDENT_PROVIDER: u32 = 0x0C4C;
+pub use super::registry::kernel::NET_IDENT_PROVIDER;
 
 /// This boot's incarnation: 16 bytes drawn from the kernel CSPRNG once per
 /// boot, the same for every module that asks. What it is for: anything
@@ -725,11 +713,9 @@ pub const NET_IDENT_PROVIDER: u32 = 0x0C4C;
 /// structurally unmatchable rather than merely unlikely. Ungated self-query.
 /// `handle = -1`, `arg` receives 16 bytes.
 ///
-/// Sits below the 0x0C4x kernel-info run its neighbours occupy, because
-/// that run is full and its tail (0x0C4D..0x0C4F) is the OBSERVE-gated
-/// telemetry drain. An ungated self-query placed there would be refused to
-/// every caller holding no observe capability.
-pub const BOOT_INCARNATION: u32 = 0x0C2F;
+/// Ungated: a self-query every module may make, whatever capability it
+/// holds.
+pub use super::registry::kernel::BOOT_INCARNATION;
 
 /// Describe one of the calling module's programs: an opaque blob the
 /// graph bundled for this module instance (a compiled script, a model, a
@@ -748,7 +734,7 @@ pub const BOOT_INCARNATION: u32 = 0x0C2F;
 /// instead. An isolated module is granted read-only, never-executable
 /// access to its region (`region_addr`, `region_len`): an MPU region of
 /// exactly that span on RP, its pages EL0 read-only on the Pi 5.
-pub const PROGRAM_INFO: u32 = 0x0C2B;
+pub use super::registry::kernel::PROGRAM_INFO;
 
 /// Copy bytes of one of the calling module's programs into `arg`.
 /// `handle = -1`; on entry `arg` holds `[slot: u8][0; 3][offset: u32 LE]`
@@ -757,7 +743,7 @@ pub const PROGRAM_INFO: u32 = 0x0C2B;
 /// the end). The request rides in the buffer it is answered in, so the call
 /// carries no pointer and is served the same through the isolation gateway
 /// and across the wasm memory split. `ENOENT` for no program in that slot.
-pub const PROGRAM_READ: u32 = 0x0C2C;
+pub use super::registry::kernel::PROGRAM_READ;
 
 /// The root this kernel verifies graph-slot signatures against: the 32-byte
 /// Ed25519 public key compiled into the firmware. `handle = -1`, `arg`
@@ -765,7 +751,7 @@ pub const PROGRAM_READ: u32 = 0x0C2C;
 /// slot signature. Ungated: the key is public, and a slot writer
 /// (`graph_slot`) checks a signature before it activates a slot rather than
 /// leaving a bad image for the next boot to discover.
-pub const SLOT_SIGNING_ROOT: u32 = 0x0C2D;
+pub use super::registry::kernel::SLOT_SIGNING_ROOT;
 
 /// Which graph slots this boot's slot selector admitted: `handle = -1`, the
 /// answer is a mask (bit 0 = slot A, bit 1 = slot B), on an RP board only
@@ -774,7 +760,7 @@ pub const SLOT_SIGNING_ROOT: u32 = 0x0C2D;
 /// and its payload matches its digest. A slot writer that cannot afford to
 /// verify a signature every time it asks which slot is live (`graph_slot`)
 /// starts from this, and tracks the slots it erases and activates itself.
-pub const SLOT_ADMITTED: u32 = 0x0C2E;
+pub use super::registry::kernel::SLOT_ADMITTED;
 
 /// How this board's flash is partitioned: `handle = -1`, `arg` receives
 /// `flash_layout::GRAPH_FLASH_LEN` bytes, `flash_layout::GraphFlash::encode`
@@ -785,7 +771,7 @@ pub const SLOT_ADMITTED: u32 = 0x0C2E;
 /// rather than compiling a geometry in, and one module build serves every
 /// board of its silicon. Ungated: it is the shape of the flash, not its
 /// contents.
-pub const FLASH_LAYOUT: u32 = 0x0C2A;
+pub use super::registry::kernel::FLASH_LAYOUT;
 
 /// The program section: per-module-instance program blobs carried after
 /// the module table. Its offset from the table's start, a multiple of
@@ -835,21 +821,20 @@ pub mod program {
 /// `arg[2..6]` to resolve a runtime bridge/repacking alias. The provider handle
 /// is always global (`-1`) because raw channel descriptors are untagged. A
 /// one-byte request (`arg_len == 1`) is an output-port query.
-pub const MODULE_FLOW_BUDGET: u32 = 0x0C46;
+pub use super::registry::kernel::MODULE_FLOW_BUDGET;
+
+/// Raise software-generated interrupt `sgi` (0..=15) on core `core`: the
+/// stimulus a Tier-2 module that owns an SGI is tested with. handle=-1,
+/// arg=[core:u8, sgi:u8] (2 bytes). Requires `platform_raw`. Returns 0,
+/// `EINVAL` for a core the machine does not have or an `sgi` above 15, or
+/// `ENOSYS` where the machine has no generic interrupt controller.
+pub use super::registry::kernel::SIGNAL_CORE;
 
 /// Read the hardware-provisioned ethernet MAC address from platform
 /// sources (on bcm2712, the DTB passed by Pi 5 firmware). handle=-1,
 /// arg=output buffer of exactly 6 bytes. Returns 6 on success, or
 /// negative errno (ENODEV) if no MAC is available.
-pub const GET_HW_ETHERNET_MAC: u32 = 0x0C3D;
-
-/// Get paged arena info. handle=-1, arg=20-byte output buffer.
-/// Returns: [base_vaddr:u64 LE, virtual_size:u64 LE, status:u32 LE].
-/// status: 0=no arena, 1=active.
-pub const PAGED_ARENA_GET: u32 = 0x0CF8;
-/// Prefault pages into paged arena. handle=-1, arg=[offset_pages:u32 LE, count:u32 LE] (8 bytes).
-/// Returns number of pages prefaulted.
-pub const PAGED_ARENA_PREFAULT: u32 = 0x0CFA;
+pub use super::registry::kernel::GET_HW_ETHERNET_MAC;
 
 // ─────────────────────────────────────────────────────────────────────
 // Provider query keys
@@ -858,22 +843,19 @@ pub const PAGED_ARENA_PREFAULT: u32 = 0x0CFA;
 // Uniform introspection surface for `provider_query`. Contracts may
 // define additional keys in a contract-specific numeric range.
 pub mod query_key {
-    /// Contract id (returns u8)
-    pub const CLASS: u32 = 1;
-    /// Human-readable name (returns null-terminated string)
-    pub const NAME: u32 = 2;
     /// Capability bitfield (returns u32, contract-specific)
-    pub const CAPABILITIES: u32 = 3;
-    /// Current state (returns u8, contract-specific)
-    pub const STATE: u32 = 4;
+    pub use super::super::registry::kernel::QUERY_CAPABILITIES as CAPABILITIES;
+    /// Contract id (returns u8)
+    pub use super::super::registry::kernel::QUERY_CLASS as CLASS;
     /// Error count since last reset (returns u32)
-    pub const ERROR_COUNT: u32 = 5;
+    pub use super::super::registry::kernel::QUERY_ERROR_COUNT as ERROR_COUNT;
     /// Heap statistics (returns HeapStats struct, 16 bytes).
     /// handle=-1 queries the calling module's heap.
-    pub const HEAP_STATS: u32 = 6;
-    /// Fault statistics (returns FaultStats struct, 12 bytes).
-    /// handle=-1 queries the calling module, handle=N queries module N.
-    pub const FAULT_STATS: u32 = 7;
+    pub use super::super::registry::kernel::QUERY_HEAP_STATS as HEAP_STATS;
+    /// Human-readable name (returns null-terminated string)
+    pub use super::super::registry::kernel::QUERY_NAME as NAME;
+    /// Current state (returns u8, contract-specific)
+    pub use super::super::registry::kernel::QUERY_STATE as STATE;
 
     /// Most recent `contracts::fence::Fence` advertised on this
     /// handle. Cross-class: any storage / file / namespace / object
@@ -886,7 +868,7 @@ pub mod query_key {
     /// `Fence::decode` — an unknown tag is not promoted to
     /// `Volatile`; it means the provider did not advertise a
     /// recognised fence and the consumer refuses to proceed.
-    pub const LAST_FENCE: u32 = 8;
+    pub use super::super::registry::kernel::QUERY_LAST_FENCE as LAST_FENCE;
 
     /// Owner of the module that invoked the provider frame currently
     /// running. `handle = -1`; writes `[slot: u16 LE][_pad: u16][generation:
@@ -902,7 +884,7 @@ pub mod query_key {
     /// stepping normally is not serving anybody's request, and answering
     /// with the system owner there would let a provider charge its own
     /// background work to whoever last called it.
-    pub const CALLER_OWNER: u32 = 9;
+    pub use super::super::registry::kernel::QUERY_CALLER_OWNER as CALLER_OWNER;
 
     /// The module occupancy that invoked the provider frame currently
     /// running: `handle = -1`; writes `[module idx: u16 LE][_pad: u16]
@@ -911,7 +893,7 @@ pub mod query_key {
     /// so the pair names one occupancy: a provider stamps what it holds for
     /// a module with it and asks [`MODULE_LIVE`] later whether that
     /// occupancy still stands. `ESRCH` when nothing is on the provider stack.
-    pub const CALLER_MODULE: u32 = 10;
+    pub use super::super::registry::kernel::QUERY_CALLER_MODULE as CALLER_MODULE;
 
     /// Whether a module occupancy still stands: the out buffer carries an
     /// 8-byte record as [`CALLER_MODULE`] writes it, `handle = -1`. Returns 1
@@ -919,7 +901,7 @@ pub mod query_key {
     /// finished, 0 otherwise. A provider holding work for a module checks it
     /// lazily — before acting on the module's behalf — instead of relying on
     /// a release notification's timing.
-    pub const MODULE_LIVE: u32 = 11;
+    pub use super::super::registry::kernel::QUERY_MODULE_LIVE as MODULE_LIVE;
 
     /// The module occupancy that owns event `handle` (a tagged event fd):
     /// writes the [`CALLER_MODULE`] record of the owning module and returns
@@ -929,100 +911,45 @@ pub mod query_key {
     /// created the event. A provider that signals a subscriber's event
     /// checks it before every signal, so an event slot freed and taken by
     /// another module never wakes the wrong one.
-    pub const EVENT_OWNER: u32 = 12;
+    pub use super::super::registry::kernel::QUERY_EVENT_OWNER as EVENT_OWNER;
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // File-descriptor tagging
 // ─────────────────────────────────────────────────────────────────────
 //
-// Every handle Fluxor hands back to a module is encoded as a tagged
-// i32: bits [30..26] = 5-bit type tag, bits [25..0] = 26-bit slot.
-// Bit 31 is always 0 so tagged fds stay positive and unambiguous
-// against negative errno values.
-//
-// The kernel resolves `(handle) -> contract_id` from the tag rather
-// than from a shared lookup table — contract handle-spaces are
-// disjoint by bit pattern. PIC module providers (fat32, a
-// log-structured store, …)
-// self-tag the handles they return from open-style ops; the
-// kernel-side `fd.rs` re-exports from this module so the bit layout
-// has a single source of truth.
+// Every handle Fluxor hands back to a module is a tagged i32: bit 31
+// clear, so a handle never reads as an errno; a contract tag above the
+// slot; the slot below. A contract that mints handles tags them with its
+// own id, so the kernel resolves `(handle) -> contract` from the tag alone.
+// Tag 0 is untagged: a channel port or a raw integer. PIC module providers
+// (fat32, a log-structured store, …) self-tag the handles they return from
+// open-style ops; the layout and the helpers are the registry's.
 pub mod fd {
-    pub const FD_TAG_CHANNEL: i32 = 0;
-    pub const FD_TAG_EVENT: i32 = 2;
-    pub const FD_TAG_TIMER: i32 = 3;
-    pub const FD_TAG_DMA: i32 = 7;
-    pub const FD_TAG_BRIDGE: i32 = 8;
-    pub const FD_TAG_KEY_VAULT: i32 = 9;
-    pub const FD_TAG_PCIE_DEVICE: i32 = 10;
-    pub const FD_TAG_NIC_RING: i32 = 11;
-    pub const FD_TAG_DMA_CHANNEL: i32 = 12;
-    pub const FD_TAG_FS: i32 = 13;
-    pub const FD_TAG_BUFFER: i32 = 14;
-    pub const FD_TAG_HAL_GPIO: i32 = 15;
-    pub const FD_TAG_HAL_SPI: i32 = 16;
-    pub const FD_TAG_HAL_I2C: i32 = 17;
-    pub const FD_TAG_HAL_UART: i32 = 18;
-    pub const FD_TAG_HAL_ADC: i32 = 19;
-    pub const FD_TAG_HAL_PWM: i32 = 20;
-    pub const FD_TAG_HAL_PIO: i32 = 21;
-    pub const FD_TAG_STORAGE_NAMESPACE: i32 = 22;
-    pub const FD_TAG_STORAGE_OBJECT: i32 = 23;
-    /// USB host controller handle. Allocated as part of the scaffold
-    /// for `provider::contract::USB_HOST` (0x0015) — `provider_open`
-    /// will tag its returned handles with this once the host stack
-    /// lands. No live producer yet.
-    pub const FD_TAG_USB_HOST: i32 = 24;
-    // 25: host process-executor tag — registry value reserved here; the
-    // semantic constant lives at `abi::platform::linux::host_process::FD_TAG_PROC`.
-    // 26 unused (reserved; do not reuse).
-    /// Isolated-workload handle (`provider::contract::WORKLOAD`, 0x001A):
-    /// `workload::CREATE` tags the returned slot with this; the lifecycle ops
-    /// (START/WAIT/SIGNAL/DESTROY/READ) carry it back, stripped via `slot_of`.
-    pub const FD_TAG_WORKLOAD: i32 = 27;
+    pub use super::super::registry::fd::*;
 
-    pub const TAG_SHIFT: u32 = 26;
-    pub const SLOT_MASK: i32 = 0x03FF_FFFF;
-
-    /// Encode a type tag and slot index into a tagged fd. A negative
-    /// `slot` passes through unchanged so PIC provider open-ops can
-    /// pipe an errno through `tag_fd(TAG, errno)` without altering
-    /// the error code.
-    #[inline]
-    pub const fn tag_fd(tag: i32, slot: i32) -> i32 {
-        if slot < 0 {
-            return slot;
-        }
-        // Fail closed on an out-of-range tag rather than masking it into a
-        // valid one. The tag field is 5 bits [30..26] with bit 31 reserved,
-        // so only tags 0..32 are encodable. Masking a tag of 32+ to 5 bits
-        // would ALIAS a real contract (32 -> tag 0 = channels) and silently
-        // mis-route a handle; returning EINVAL makes callers treat it as the
-        // error it is (they already check for negative returns). Valid tags
-        // are pinned < 32 by `fd_tag_wire_surface.rs`, so this never fires in
-        // practice — it is the construction-time backstop.
-        if tag < 0 || tag >= 32 {
-            return -22; // EINVAL
-        }
-        (tag << TAG_SHIFT) | (slot & SLOT_MASK)
-    }
-
-    /// Decode a tagged fd into `(tag, slot)`.
-    #[inline]
-    pub const fn untag_fd(fd: i32) -> (i32, i32) {
-        let tag = (fd >> TAG_SHIFT) & 0x1F;
-        let slot = fd & SLOT_MASK;
-        (tag, slot)
-    }
-
-    /// Strip the tag and return only the slot index. Used at typed
-    /// inbound entry points that receive a tagged handle from a
-    /// chained caller.
-    #[inline]
-    pub const fn slot_of(fd: i32) -> i32 {
-        fd & SLOT_MASK
-    }
+    /// Channel ports are untagged.
+    pub const FD_TAG_CHANNEL: i32 = UNTAGGED;
+    pub const FD_TAG_EVENT: i32 = super::super::registry::event::FD_TAG;
+    pub const FD_TAG_TIMER: i32 = super::super::registry::timer::FD_TAG;
+    pub const FD_TAG_DMA: i32 = super::super::registry::platform_dma_fd::FD_TAG;
+    pub const FD_TAG_BRIDGE: i32 = super::super::registry::bridge::FD_TAG;
+    pub const FD_TAG_KEY_VAULT: i32 = super::super::registry::key_vault::FD_TAG;
+    pub const FD_TAG_PCIE_DEVICE: i32 = super::super::registry::pcie_device::FD_TAG;
+    pub const FD_TAG_NIC_RING: i32 = super::super::registry::platform_nic_ring::FD_TAG;
+    pub const FD_TAG_DMA_CHANNEL: i32 = super::super::registry::platform_dma::FD_TAG;
+    pub const FD_TAG_FS: i32 = super::super::registry::fs::FD_TAG;
+    pub const FD_TAG_HAL_GPIO: i32 = super::super::registry::gpio::FD_TAG;
+    pub const FD_TAG_HAL_SPI: i32 = super::super::registry::spi::FD_TAG;
+    pub const FD_TAG_HAL_I2C: i32 = super::super::registry::i2c::FD_TAG;
+    pub const FD_TAG_HAL_UART: i32 = super::super::registry::uart::FD_TAG;
+    pub const FD_TAG_HAL_ADC: i32 = super::super::registry::adc::FD_TAG;
+    pub const FD_TAG_HAL_PWM: i32 = super::super::registry::pwm::FD_TAG;
+    pub const FD_TAG_HAL_PIO: i32 = super::super::registry::pio::FD_TAG;
+    pub const FD_TAG_STORAGE_NAMESPACE: i32 = super::super::registry::storage_namespace::FD_TAG;
+    pub const FD_TAG_STORAGE_OBJECT: i32 = super::super::registry::storage_object::FD_TAG;
+    pub const FD_TAG_USB_HOST: i32 = super::super::registry::usb_host::FD_TAG;
+    pub const FD_TAG_WORKLOAD: i32 = super::super::registry::workload::FD_TAG;
 }
 
 /// Provider instance selectors — the shared hash the kernel and modules

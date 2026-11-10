@@ -288,9 +288,8 @@ pub static HAL_OPS: HalOps = HalOps {
     protection_release_module: |_| {},
     protection_gateway_table: core::ptr::null,
     protected_call: fluxor::arch::aarch64::isolation::protected_call,
-    protection_map_page: |_, _, _, _| {},
-    protection_unmap_page: |_, _| {},
     stack_fence_arm: |_| {},
     stack_fence_intact: || true,
     serial_write: super::serial_write,
+    metal_device: Some(&super::devices::METAL_DEVICE),
 };

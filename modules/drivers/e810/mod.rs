@@ -77,9 +77,9 @@ const E810_QINT_RQCTL: usize = 0x0015_0000; // RX Queue Interrupt Cause Control
 const E810_PRTMAC_LINK: usize = 0x001E_2040; // MAC link status (simplified)
 
 // NIC syscall opcodes
-const NIC_BAR_MAP: u32 = 0x0CF0;
-const NIC_RING_CREATE: u32 = 0x0CF2;
-const NIC_RING_INFO: u32 = 0x0CF4;
+const NIC_BAR_MAP: u32 = abi::registry::platform_nic_ring::NIC_BAR_MAP;
+const NIC_RING_CREATE: u32 = abi::registry::platform_nic_ring::NIC_RING_CREATE;
+const NIC_RING_INFO: u32 = abi::registry::platform_nic_ring::NIC_RING_INFO;
 
 // ============================================================================
 // Constants

@@ -117,15 +117,8 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 
 /// Width of the public contract-id space. A contract id is a bit position
 /// in the fmod header's `required_caps` (u64 at `reserved[6..14]`) and the
-/// index of the kernel's vtable registry, so this mirrors
-/// `MAX_CONTRACTS` in `src/kernel/module/provider.rs`; the two are checked
-/// against each other by `tools/tests/contract_id_inventory.rs`.
-pub const CONTRACT_ID_SPACE: usize = 64;
-
-/// Positions consumed in the `required_caps` space, counting the four
-/// reserved ids and excluding the kernel-internal dispatch bucket (0x0C).
-/// Registered in `docs/architecture/limit_register.md`.
-pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 32;
+/// index of the kernel's vtable registry.
+pub const CONTRACT_ID_SPACE: usize = fluxor_abi::registry::MAX_CONTRACTS;
 
 /// Parse a contract name from `[[resources]].requires_contract`. Only
 /// public contract names are accepted here — `"internal"` and specific
@@ -137,114 +130,37 @@ pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 32;
 /// mask and unregisterable as a vtable, and is refused by
 /// [`Manifest::required_caps_mask`].
 pub fn contract_id_from_name(s: &str) -> Result<u8> {
-    match s.to_ascii_lowercase().as_str() {
-        "gpio" => Ok(0x01),
-        "spi" => Ok(0x02),
-        "i2c" => Ok(0x03),
-        "pio" => Ok(0x04),
-        "channel" => Ok(0x05),
-        "timer" => Ok(0x06),
-        "platform_nic_ring" => Ok(0x07),
-        "platform_dma" => Ok(0x08),
-        "fs" => Ok(0x09),
-        "buffer" => Ok(0x0A),
-        "event" => Ok(0x0B),
-        "uart" => Ok(0x0D),
-        "adc" => Ok(0x0E),
-        "pwm" => Ok(0x0F),
-        "platform_dma_fd" => Ok(0x11),
-        "pcie_device" => Ok(0x12),
-        // Storage capability surfaces (see
-        // docs/architecture/storage_capability_surface.md). Both are
-        // module-providable contracts; class bytes match the kernel
-        // `provider::contract::STORAGE_*` constants.
-        "storage.namespace" => Ok(0x13),
-        "storage.object" => Ok(0x14),
-        // USB host controller binding. Allocated so foundation modules
-        // can name the contract; no platform registers a vtable for it,
-        // so `provider_open` against it returns ENOSYS.
-        "usb_host" => Ok(0x15),
-        // Host process executor (the impure boundary). Host-linux only; a node
-        // without the `proc` grant ENOSYS-denies.
-        "proc" => Ok(0x16),
-        // "keyspace" (0x17) is not accepted here — the keyspace surface
-        // lives in lattice; the ID stays reserved.
-        // "oci" (0x18) / "netfilter" (0x19) are not accepted — host
-        // isolation is declared as "workload" (0x1A); their mechanism is
-        // that contract's Linux backend. The IDs stay reserved.
-        // Platform-neutral isolated-workload surface (workload). Host-linux;
-        // class byte matches provider::contract::WORKLOAD. Also requires the
-        // platform_raw permission.
-        "workload" => Ok(0x1A),
-        // The platform's verdict on a certificate chain. A module naming it
-        // is saying it will ASK rather than verify, which is the only thing
-        // this contract lets it do: no anchors cross it.
-        "trust" => Ok(0x1D),
-        "net_policy" => Ok(0x1E),
-        // Host mounts of block devices under the operator's mount root.
-        // Host-linux; also requires the platform_raw permission.
-        "host_mount" => Ok(0x1F),
-        // The node's segments, peer routes and held addresses. Also requires
-        // the platform_raw permission for its table ops.
-        "net_route" => Ok(0x20),
-        // Anything that looks like a permission name is a manifest
-        // schema error — those go in `permissions = [...]`, not
-        // `[[resources]]`.
-        "internal" | "system" | "reconfigure" | "flash_raw" | "backing_provider"
-        | "platform_raw" | "monitor" | "bridge" | "vault_store" => Err(Error::Module(format!(
-            "`{s}` is a permission, not a contract. Declare it in the \
-                 top-level `permissions = [\"{s}\", ...]` list, not under \
-                 `[[resources]]`. See docs/architecture/abi_layers.md."
-        ))),
-        _ => Err(Error::Module(format!(
-            "unknown contract name: {s} — expected one of: {} (see \
-             docs/architecture/abi_layers.md)",
-            PROVIDER_CONTRACTS.join(", ")
-        ))),
+    let name = s.to_ascii_lowercase();
+    if let Some(id) = fluxor_abi::registry::contract_of_name(&name) {
+        return u8::try_from(id).map_err(|_| Error::Module(format!("contract `{s}` id {id:#x}")));
     }
+    // Anything that looks like a permission name is a manifest schema
+    // error — those go in `permissions = [...]`, not `[[resources]]`.
+    if matches!(name.as_str(), "internal" | "system")
+        || fluxor_abi::registry::permission::of_name(&name).is_some()
+    {
+        return Err(Error::Module(format!(
+            "`{s}` is a permission, not a contract. Declare it in the \
+             top-level `permissions = [\"{s}\", ...]` list, not under \
+             `[[resources]]`. See docs/architecture/abi_layers.md."
+        )));
+    }
+    Err(Error::Module(format!(
+        "unknown contract name: {s} — expected one of: {} (see \
+         docs/architecture/abi_layers.md)",
+        provider_contracts().join(", ")
+    )))
+}
+
+/// The contracts a manifest may name, in registry order.
+pub fn provider_contracts() -> Vec<&'static str> {
+    (0..fluxor_abi::registry::MANIFEST_CONTRACTS)
+        .filter_map(fluxor_abi::registry::manifest_contract)
+        .collect()
 }
 
 pub fn contract_name_to_str(class: u8) -> &'static str {
-    // Must round-trip with `contract_id_from_name`: every id that
-    // `_from_name` accepts MUST be present here, and the returned
-    // name MUST be one that `_from_name` round-trips back to the
-    // same id. The drift-guard test in
-    // `tools/tests/contract_id_round_trip.rs` enforces both
-    // directions.
-    match class {
-        0x01 => "gpio",
-        0x02 => "spi",
-        0x03 => "i2c",
-        0x04 => "pio",
-        0x05 => "channel",
-        0x06 => "timer",
-        0x07 => "platform_nic_ring",
-        0x08 => "platform_dma",
-        0x09 => "fs",
-        0x0A => "buffer",
-        0x0B => "event",
-        0x0C => "internal",
-        0x0D => "uart",
-        0x0E => "adc",
-        0x0F => "pwm",
-        0x11 => "platform_dma_fd",
-        0x12 => "pcie_device",
-        // Storage capability surfaces — kept in sync with
-        // `provider::contract::STORAGE_{NAMESPACE,OBJECT}` (kernel)
-        // and `contract_id_from_name` (this file). Without these rows
-        // an error quoting bit 0x13/0x14 of a required-caps mask would
-        // render the byte as "unknown".
-        0x13 => "storage.namespace",
-        0x14 => "storage.object",
-        0x15 => "usb_host",
-        0x16 => "proc",
-        0x1A => "workload",
-        0x1D => "trust",
-        0x1E => "net_policy",
-        0x1F => "host_mount",
-        0x20 => "net_route",
-        _ => "unknown",
-    }
+    fluxor_abi::registry::contract_name(class.into()).unwrap_or("unknown")
 }
 
 // Canonical capability registry lives in `fluxor-contracts` so sibling
@@ -252,7 +168,7 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
 // reason `CONTENT_TYPES` lives there). Re-exported here for manifest
 // validation and the presentation-group checks.
 pub use fluxor_contracts::vocabulary::CAPABILITY_NAMES;
-use fluxor_contracts::vocabulary::{PROVIDER_CONTRACTS, PROVIDER_SURFACES};
+use fluxor_contracts::vocabulary::PROVIDER_SURFACES;
 
 /// Validate capability names against the whitelist and canonicalize each
 /// entry to its lowercase form in place. Downstream consumers — the
@@ -707,19 +623,19 @@ fn parse_when(
 }
 
 /// Validate `provides = [..]` entries against the providable vocabulary
-/// (service/contract names in `PROVIDER_CONTRACTS` plus the storage
+/// (service/contract names in `provider_contracts()` plus the storage
 /// **surface** family in `PROVIDER_SURFACES`). Like capabilities, `provides`
 /// is resolved by exact string match downstream — the config resolver wires
 /// consumers to providers by name — so an unwhitelisted typo would silently
 /// never resolve. Fail it at parse instead, with a did-you-mean.
 fn validate_provides_names(provides: &[String]) -> Result<()> {
     for p in provides {
-        let known = PROVIDER_CONTRACTS
+        let known = provider_contracts()
             .iter()
             .chain(PROVIDER_SURFACES.iter())
             .any(|n| n.eq_ignore_ascii_case(p));
         if !known {
-            let candidates: Vec<String> = PROVIDER_CONTRACTS
+            let candidates: Vec<String> = provider_contracts()
                 .iter()
                 .chain(PROVIDER_SURFACES.iter())
                 .map(|s| s.to_string())
@@ -1277,7 +1193,7 @@ pub struct HeapFromParamsOverride {
 }
 
 /// Fine-grained module permissions. Each category gates a specific
-/// subset of 0x0Cxx orchestration / platform opcodes; a module that
+/// subset of orchestration / platform opcodes; a module that
 /// needs only one surface does not implicitly get the others.
 ///
 /// Serialised as a little-endian u16 bitmap into the manifest binary at
@@ -1288,74 +1204,17 @@ pub struct ManifestPermissions {
     pub bits: u16,
 }
 
-/// Permission category bits. Keep in sync with the kernel's
-/// `permission` module in `src/kernel/module/syscalls.rs`.
+/// Manifest permission bits, from the ABI registry.
 pub mod permission {
-    pub const RECONFIGURE: u16 = 1 << 0; // graph slot commit, boot counter, FMP routing
-    pub const FLASH_RAW: u16 = 1 << 1; // flash ERASE / PROGRAM
-    pub const BACKING_PROVIDER: u16 = 1 << 2; // paged-arena / backing-provider registration
-    pub const PLATFORM_RAW: u16 = 1 << 3; // MMIO/DMA/PCIe/NIC, raw peripheral register bridges
-    pub const MONITOR: u16 = 1 << 4; // fault monitor BIND/WAIT/ACK/REPORT/RAISE
-    pub const BRIDGE: u16 = 1 << 5; // cross-domain / cross-core dispatch
-    pub const PCIE_DEVICE: u16 = 1 << 6; // kernel-mediated PCIe device bind/config/BAR/MSI
-    pub const DMA: u16 = 1 << 7; // DMA-arena buffer alloc + cache maintenance
-    pub const OBSERVE: u16 = 1 << 8; // read-only telemetry-ring drain (TLM_SUBSCRIBE/DRAIN/STATS)
-    pub const USB_HOST: u16 = 1 << 9; // kernel-mediated USB host controller bind + transfers
-    pub const VAULT_STORE: u16 = 1 << 10; // keep the key vault's durable image (vault_store)
+    pub use fluxor_abi::registry::permission::{of_name as from_name, *};
 
-    pub fn from_name(s: &str) -> Option<u16> {
-        match s {
-            "reconfigure" => Some(RECONFIGURE),
-            "flash_raw" => Some(FLASH_RAW),
-            "backing_provider" => Some(BACKING_PROVIDER),
-            "platform_raw" => Some(PLATFORM_RAW),
-            "monitor" => Some(MONITOR),
-            "bridge" => Some(BRIDGE),
-            "pcie_device" => Some(PCIE_DEVICE),
-            "dma" => Some(DMA),
-            "observe" => Some(OBSERVE),
-            "usb_host" => Some(USB_HOST),
-            "vault_store" => Some(VAULT_STORE),
-            _ => None,
-        }
-    }
-
+    /// The manifest names of every bit set in `bits`, in bit order.
     pub fn names(bits: u16) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if bits & RECONFIGURE != 0 {
-            out.push("reconfigure");
-        }
-        if bits & FLASH_RAW != 0 {
-            out.push("flash_raw");
-        }
-        if bits & BACKING_PROVIDER != 0 {
-            out.push("backing_provider");
-        }
-        if bits & PLATFORM_RAW != 0 {
-            out.push("platform_raw");
-        }
-        if bits & MONITOR != 0 {
-            out.push("monitor");
-        }
-        if bits & BRIDGE != 0 {
-            out.push("bridge");
-        }
-        if bits & PCIE_DEVICE != 0 {
-            out.push("pcie_device");
-        }
-        if bits & DMA != 0 {
-            out.push("dma");
-        }
-        if bits & OBSERVE != 0 {
-            out.push("observe");
-        }
-        if bits & USB_HOST != 0 {
-            out.push("usb_host");
-        }
-        if bits & VAULT_STORE != 0 {
-            out.push("vault_store");
-        }
-        out
+        (0..16)
+            .filter_map(fluxor_abi::registry::permission::nth)
+            .filter(|b| bits & b != 0)
+            .filter_map(fluxor_abi::registry::permission::name)
+            .collect()
     }
 }
 
@@ -2519,7 +2378,7 @@ impl Manifest {
                 None => {
                     return Err(Error::Module(format!(
                         "unknown permission: {name} — expected one of: reconfigure, \
-                         flash_raw, backing_provider, platform_raw, monitor, bridge \
+                         flash_raw, platform_raw, monitor, bridge \
                          (see docs/architecture/abi_layers.md)",
                     )));
                 }
@@ -3982,8 +3841,7 @@ pub struct TomlRequires {
     /// intrinsics simply don't exist (link error or panic at runtime).
     pub neon: bool,
     /// Memory-management unit with page-table isolation. Modules that
-    /// rely on paged arenas declare this; the
-    /// build rejects placement on Cortex-M / Cortex-A targets without
+    /// rely on it declare this; the build rejects placement on Cortex-M / Cortex-A targets without
     /// an MMU (RP2350 has an MPU but not an MMU).
     pub mmu: bool,
 }
@@ -4485,7 +4343,11 @@ struct TomlPort {
     gates_readiness: Option<bool>,
 }
 
+// deny_unknown_fields: a top-level key written after a `[[resources]]`
+// header (`timer_class`, `provides`) belongs to that entry in TOML, and would
+// otherwise vanish without a word.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlResource {
     /// Public contract this module needs access to: a name
     /// [`contract_id_from_name`] accepts. Non-contract permissions go in
@@ -4953,7 +4815,7 @@ mod tests {
             gates_readiness: true,
         });
         m.resources.push(ResourceClaim {
-            device_class: 0x04,
+            device_class: fluxor_abi::registry::pio::ID as u8,
             access_mode: 2,
             instance: 0xFF,
             selector: ClaimSelector::Default,
@@ -4973,7 +4835,10 @@ mod tests {
         assert_eq!(m2.ports.len(), 1);
         assert_eq!(m2.ports[0].content_type, 3);
         assert_eq!(m2.resources.len(), 1);
-        assert_eq!(m2.resources[0].device_class, 0x04);
+        assert_eq!(
+            m2.resources[0].device_class,
+            fluxor_abi::registry::pio::ID as u8
+        );
         assert_eq!(m2.dependencies.len(), 1);
         assert_eq!(m2.dependencies[0].name_hash, 0x12345678);
         assert_eq!(m2.integrity_hash.unwrap(), [0xAB; 32]);
@@ -4983,7 +4848,7 @@ mod tests {
     fn required_caps_mask() {
         let mut m = Manifest::default();
         m.resources.push(ResourceClaim {
-            device_class: 0x01,
+            device_class: fluxor_abi::registry::gpio::ID as u8,
             access_mode: 0,
             instance: 0xFF,
             selector: ClaimSelector::Default,
@@ -4993,7 +4858,7 @@ mod tests {
             when: Vec::new(),
         }); // GPIO
         m.resources.push(ResourceClaim {
-            device_class: 0x04,
+            device_class: fluxor_abi::registry::pio::ID as u8,
             access_mode: 2,
             instance: 0xFF,
             selector: ClaimSelector::Default,
@@ -5014,8 +4879,21 @@ mod tests {
         }); // highest representable position
         assert_eq!(
             m.required_caps_mask().unwrap(),
-            (1u64 << 1) | (1u64 << 4) | (1u64 << 0x3F)
+            (1u64 << fluxor_abi::registry::gpio::ID)
+                | (1u64 << fluxor_abi::registry::pio::ID)
+                | (1u64 << 0x3F)
         );
+    }
+
+    /// A top-level key written below a `[[resources]]` header is that
+    /// entry's in TOML; the entry refuses it rather than dropping it.
+    #[test]
+    fn a_top_level_key_under_a_resources_header_is_refused() {
+        let toml = "version = \"1.0.0\"\n[[resources]]\nrequires_contract = \"fs\"\naccess = \"read\"\ntimer_class = \"wall_clock\"\n";
+        let e = Manifest::from_toml_str_for_target(toml, None).unwrap_err();
+        assert!(e.to_string().contains("timer_class"), "{e}");
+        let ok = "version = \"1.0.0\"\ntimer_class = \"wall_clock\"\n[[resources]]\nrequires_contract = \"fs\"\naccess = \"read\"\n";
+        Manifest::from_toml_str_for_target(ok, None).unwrap();
     }
 
     #[test]

@@ -12,7 +12,7 @@ Flash Module — BOOTSEL Button + Blob Serving + Runtime Parameter Store + Data 
 ```toml
 version = "1.0.0"
 hardware_targets = ["rp2350"]
-permissions = ["flash_raw", "backing_provider"]
+permissions = ["flash_raw"]
 
 [[ports]]
 name = "events"

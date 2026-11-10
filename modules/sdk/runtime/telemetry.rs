@@ -3,17 +3,22 @@
 // ============================================================================
 
 /// Query the calling module's own scheduler index.
-/// See `kernel_abi::SELF_INDEX` (0x0C42). Returns 0..MAX_MODULES-1 on
+/// See `kernel_abi::SELF_INDEX` (`kernel::SELF_INDEX`). Returns 0..MAX_MODULES-1 on
 /// success, negative errno on failure (e.g. called outside step). Used
 /// by anchors / workers / directories to render the `mod=` field of
 /// `MON_SESSION` telemetry lines.
 #[inline(always)]
 unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        -1,
+        abi::registry::kernel::SELF_INDEX,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Query the calling module's owner slot (`owner_tag`). See
-/// `kernel_abi::OWNER_TAG` (0x0C4B). Returns the module's owner slot as a
+/// `kernel_abi::OWNER_TAG` (`kernel::OWNER_TAG`). Returns the module's owner slot as a
 /// `u16`: slot 0 (`OWNER_SYSTEM`) for a base-graph / host-owned module — the
 /// legitimate host / wildcard tag — or the workload's owner slot (>= 1) for a
 /// module `apply_add` staged for a `net=own` workload. A negative errno
@@ -23,7 +28,12 @@ unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
 /// on its `NET_CMD_BIND` / `DG_CMD_BIND`.
 #[inline(always)]
 unsafe fn dev_owner_tag(sys: &SyscallTable) -> u16 {
-    let rc = (sys.provider_call)(-1, 0x0C4B, core::ptr::null_mut(), 0);
+    let rc = (sys.provider_call)(
+        -1,
+        abi::registry::kernel::OWNER_TAG,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         0
     } else {
@@ -607,169 +617,4 @@ unsafe fn dev_tlm_maybe_emit(
     tlm.bp_steps = 0;
     tlm.last_emit_step = step_count;
     pos
-}
-
-/// Register a backing-store arena for the calling module. Returns
-/// arena_id (>=0) or negative errno. `backing_type`: 0=None,
-/// 1=RamDisk, 2=External. `writeback`: 0=Deferred, 1=WriteThrough.
-/// When backing_type=External, a driver module (NVMe, SD, …) must be
-/// loaded and have registered its `backing_provider_dispatch` via
-/// `BACKING_PROVIDER_ENABLE` — otherwise later read/write calls
-/// return ENODEV.
-#[inline(always)]
-unsafe fn dev_backing_arena_register(
-    sys: &SyscallTable,
-    virtual_pages: u32,
-    resident_max: u32,
-    backing_type: u8,
-    writeback: u8,
-) -> i32 {
-    let mut buf = [0u8; 10];
-    let bp = buf.as_mut_ptr();
-    let vp = virtual_pages.to_le_bytes();
-    *bp = vp[0];
-    *bp.add(1) = vp[1];
-    *bp.add(2) = vp[2];
-    *bp.add(3) = vp[3];
-    let rm = resident_max.to_le_bytes();
-    *bp.add(4) = rm[0];
-    *bp.add(5) = rm[1];
-    *bp.add(6) = rm[2];
-    *bp.add(7) = rm[3];
-    *bp.add(8) = backing_type;
-    *bp.add(9) = writeback;
-    (sys.provider_call)(-1, 0x0CEE, bp, 10)
-}
-
-/// Write one 4 KB page from `buf` to a registered backing arena.
-/// `buf` must point to at least 4096 bytes of readable memory.
-#[inline(always)]
-unsafe fn dev_backing_arena_write(
-    sys: &SyscallTable,
-    arena_id: u8,
-    vpage_idx: u32,
-    buf: *const u8,
-) -> i32 {
-    let mut a = [0u8; 14];
-    let bp = a.as_mut_ptr();
-    *bp = arena_id;
-    *bp.add(1) = 0;
-    let vp = vpage_idx.to_le_bytes();
-    *bp.add(2) = vp[0];
-    *bp.add(3) = vp[1];
-    *bp.add(4) = vp[2];
-    *bp.add(5) = vp[3];
-    let pb = (buf as u64).to_le_bytes();
-    *bp.add(6) = pb[0];
-    *bp.add(7) = pb[1];
-    *bp.add(8) = pb[2];
-    *bp.add(9) = pb[3];
-    *bp.add(10) = pb[4];
-    *bp.add(11) = pb[5];
-    *bp.add(12) = pb[6];
-    *bp.add(13) = pb[7];
-    (sys.provider_call)(-1, 0x0CFE, bp, 14)
-}
-
-/// Read one 4 KB page from a registered backing arena into `buf`.
-/// `buf` must point to at least 4096 bytes of writable memory.
-#[inline(always)]
-unsafe fn dev_backing_arena_read(
-    sys: &SyscallTable,
-    arena_id: u8,
-    vpage_idx: u32,
-    buf: *mut u8,
-) -> i32 {
-    let mut a = [0u8; 14];
-    let bp = a.as_mut_ptr();
-    *bp = arena_id;
-    *bp.add(1) = 0;
-    let vp = vpage_idx.to_le_bytes();
-    *bp.add(2) = vp[0];
-    *bp.add(3) = vp[1];
-    *bp.add(4) = vp[2];
-    *bp.add(5) = vp[3];
-    let pb = (buf as u64).to_le_bytes();
-    *bp.add(6) = pb[0];
-    *bp.add(7) = pb[1];
-    *bp.add(8) = pb[2];
-    *bp.add(9) = pb[3];
-    *bp.add(10) = pb[4];
-    *bp.add(11) = pb[5];
-    *bp.add(12) = pb[6];
-    *bp.add(13) = pb[7];
-    (sys.provider_call)(-1, 0x0CEF, bp, 14)
-}
-
-/// Flush any pending writes for a backing arena.
-#[inline(always)]
-unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
-    let mut a = [arena_id];
-    (sys.provider_call)(-1, 0x0CFF, a.as_mut_ptr(), 1)
-}
-
-/// Write `count` contiguous 4 KB pages from `buf` to a registered
-/// backing arena. `buf` must point to `count * 4096` readable bytes.
-/// Drivers that support multi-block transfers (NVMe with PRP-lists)
-/// translate this to a single device command — far higher sustained
-/// throughput than per-page writes.
-#[inline(always)]
-unsafe fn dev_backing_arena_write_pages(
-    sys: &SyscallTable,
-    arena_id: u8,
-    vpage_start: u32,
-    count: u32,
-    buf: *const u8,
-) -> i32 {
-    dev_backing_arena_bulk(sys, arena_id, 0, vpage_start, count, buf as u64)
-}
-
-/// Read `count` contiguous 4 KB pages from a registered backing arena
-/// into `buf`. `buf` must point to `count * 4096` writable bytes.
-#[inline(always)]
-unsafe fn dev_backing_arena_read_pages(
-    sys: &SyscallTable,
-    arena_id: u8,
-    vpage_start: u32,
-    count: u32,
-    buf: *mut u8,
-) -> i32 {
-    dev_backing_arena_bulk(sys, arena_id, 1, vpage_start, count, buf as u64)
-}
-
-/// Internal helper — both bulk read and bulk write share one syscall
-/// (ARENA_BULK = 0x0CE9) with `op` in arg byte 1 (0=WRITE, 1=READ).
-#[inline(always)]
-unsafe fn dev_backing_arena_bulk(
-    sys: &SyscallTable,
-    arena_id: u8,
-    op: u8,
-    vpage_start: u32,
-    count: u32,
-    buf_u64: u64,
-) -> i32 {
-    let mut a = [0u8; 18];
-    let bp = a.as_mut_ptr();
-    *bp = arena_id;
-    *bp.add(1) = op;
-    let vp = vpage_start.to_le_bytes();
-    *bp.add(2) = vp[0];
-    *bp.add(3) = vp[1];
-    *bp.add(4) = vp[2];
-    *bp.add(5) = vp[3];
-    let c = count.to_le_bytes();
-    *bp.add(6) = c[0];
-    *bp.add(7) = c[1];
-    *bp.add(8) = c[2];
-    *bp.add(9) = c[3];
-    let pb = buf_u64.to_le_bytes();
-    *bp.add(10) = pb[0];
-    *bp.add(11) = pb[1];
-    *bp.add(12) = pb[2];
-    *bp.add(13) = pb[3];
-    *bp.add(14) = pb[4];
-    *bp.add(15) = pb[5];
-    *bp.add(16) = pb[6];
-    *bp.add(17) = pb[7];
-    (sys.provider_call)(-1, 0x0CE9, bp, 18)
 }

@@ -3,7 +3,7 @@ name              = "fluxor-contracts"
 version.workspace = true
 edition           = "2021"
 license           = "Apache-2.0"
-description       = "Public Fluxor storage-surface contracts (Fence, StorageHandle, content types)"
+description       = "Public Fluxor contracts: content types, isolation planner, boot map, owner-log ring"
 
 [lib]
 name = "fluxor_contracts"
@@ -11,17 +11,10 @@ path = "src/lib.rs"
 
 [features]
 default = ["alloc"]
-# The types that own heap memory: the storage fence witness and the decoded
-# owner-log records. Off for a consumer with no allocator (an RP kernel,
-# which needs only the isolation planner and the vocabulary).
+# The types that own heap memory: the decoded owner-log records. Off for a
+# consumer with no allocator (an RP kernel, which needs only the isolation
+# planner and the vocabulary).
 alloc = []
-# Derive serde::{Serialize, Deserialize} on every public type. Off by
-# default so embedded consumers don't pull in serde.
-serde = ["dep:serde", "alloc"]
-
-[dependencies]
-serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"], optional = true }
-
 # Public contract crate — pure type definitions. The workspace
 # `unsafe_code = "forbid"` is the right level here; nothing in this
 # crate needs unsafe and we want a compile error if that ever changes.

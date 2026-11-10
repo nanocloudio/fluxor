@@ -321,7 +321,7 @@ handle still answers `ENOTSOCK`; a tag mismatch is only ever reported for a
 slot that really holds an endpoint.
 
 The tag a consumer presents is its own owner slot, read from the kernel
-(`OWNER_TAG`, 0x0C4B — a module can only read its own). Every in-tree datagram
+(`OWNER_TAG` — a module can only read its own). Every in-tree datagram
 consumer reaches this surface through `sdk/cores/datagram_endpoint.rs`, which
 stamps that slot on `CMD_DG_BIND` and presents it on every `CMD_DG_SEND_TO`.
 It is the same axis, and the same value, that `NET_CMD_BIND` already carries

@@ -78,7 +78,7 @@ mod action;
 mod midi;
 
 // DOM terminal — kernel-log-ring scrollback rendered into the page.
-// Drains via the same LOG_RING_DRAIN opcode (0x0C64) that
+// Drains via the same LOG_RING_DRAIN opcode (`diag::LOG_RING_DRAIN`) that
 // `log_net` uses on bcm2712/rp; multi-consumer-safe, so wiring a
 // terminal alongside `log_net` doesn't steal bytes.
 #[path = "wasm/terminal.rs"]

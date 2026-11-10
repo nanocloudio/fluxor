@@ -83,8 +83,7 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
-#[path = "../../sdk/contracts/net/mux.rs"]
-mod mux;
+use abi::contracts::net::mux;
 
 /// Frame scratch. One mux frame carries at most a QUIC stream's worth of data
 /// per delivery; 8 KiB matches the port's declared ring so a whole frame always

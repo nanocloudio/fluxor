@@ -310,7 +310,7 @@ mod reboot_flags {
     /// Do not return if the reboot was successfully initiated. The watchdog
     /// is asynchronous, so without this the call returns and the caller runs
     /// on for an indeterminate time before the reset lands.
-    pub const NO_RETURN_ON_SUCCESS: u32 = 0x100;
+    pub const NO_RETURN_ON_SUCCESS: u32 = crate::abi::registry::gpio::CLAIM;
     /// How long the bootrom is asked to wait before the reset lands.
     ///
     /// **Not zero.** The SDK passes 10 ms and that is the only value with

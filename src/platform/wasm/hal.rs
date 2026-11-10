@@ -268,12 +268,11 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     protection_release_module: |_| {},
     protection_gateway_table: crate::kernel::sys::hal::no_gateway_table,
     protected_call: crate::kernel::sys::hal::protected_call_unavailable,
-    protection_map_page: |_, _, _, _| {},
-    protection_unmap_page: |_, _| {},
     // The wasm runtime owns the stack and traps on its overflow.
     stack_fence_arm: |_| {},
     stack_fence_intact: || true,
     // No serial sink in the browser host — telemetry export uses a network
     // carrier on wasm. Report nothing accepted so a carrier stays dormant.
     serial_write: |_| 0,
+    metal_device: None,
 };

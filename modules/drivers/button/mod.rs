@@ -191,9 +191,9 @@ pub unsafe extern "C" fn module_new(
 // Contract id + opcodes mirror `abi::kernel::module::provider::contract::HAL_GPIO`
 // and `abi::contracts::hal::gpio::*`. Pinned here to keep the PIC
 // module self-contained (no imports into kernel paths).
-const GPIO_CONTRACT: u32 = 0x0001;
-const GPIO_SET_INPUT: u32 = 0x0107;
-const GPIO_GET_LEVEL: u32 = 0x0105;
+const GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
+const GPIO_SET_INPUT: u32 = abi::registry::gpio::SET_INPUT;
+const GPIO_GET_LEVEL: u32 = abi::registry::gpio::GET_LEVEL;
 
 #[no_mangle]
 #[link_section = ".text.module_step"]

@@ -26,19 +26,19 @@
 //      every subscription it opens. The store signals it; it never writes
 //      a byte into any channel of the module, so no self-wired port and
 //      no sink exist.
-//   2. Subscribe — `SUBSCRIBE (0x1305)` on the prefix with that event.
+//   2. Subscribe — `SUBSCRIBE` on the prefix with that event.
 //      `EAGAIN` is asked again next step, any other refusal after a
 //      backoff; the subscription is opened *before* the first read, so
 //      every change after it rings. A new subscription is *pending* with
 //      the token it holds — empty on a cold start, so its first read is
 //      the relist: a cold start is a recovery.
 //   3. Take — each step `event::POLL`s, and when the event fired asks
-//      `TAKE_RUNG (0x1309)` which subscriptions rang, marking each one
+//      `TAKE_RUNG` which subscriptions rang, marking each one
 //      named *pending* ([`take_rung`]). A take that fails, or answers
 //      `more`, is owed: the next step takes again whether or not the event
 //      fired, since `POLL` consumed the signal and a set rung bit sends no
 //      other.
-//   4. Read — a pending consumer reads `CHANGES (0x1307)` from its token,
+//   4. Read — a pending consumer reads `CHANGES` from its token,
 //      one bounded page per call, applying each page by key as it lands.
 //      *Pending* is cleared only by a page whose `more` is clear; that
 //      page carries the 8-byte revision token kept at rest. Any failure
@@ -451,7 +451,7 @@ unsafe fn take_into<'a>(
     take::decode(out.get(..n as usize)?)
 }
 
-/// Encode + issue `SUBSCRIBE (0x1305)` on `prefix` with the caller's
+/// Encode + issue `SUBSCRIBE` on `prefix` with the caller's
 /// `event` (`namespace::subscribe`) at the store `store` names. Returns the
 /// subscription handle (a routed one through a selector) or a negative
 /// errno.
@@ -478,7 +478,7 @@ pub unsafe fn subscribe(
     store_call(sys, store, ns::SUBSCRIBE, &mut arg, len)
 }
 
-/// Encode + issue one `CHANGES (0x1307)` page read into `out`
+/// Encode + issue one `CHANGES` page read into `out`
 /// (`namespace::changes`) at the store `store` names, writing the encoded
 /// fence into `fence`
 /// (>= `fence::WIRE_MAX_LEN`). `sub` is the subscription the read serves

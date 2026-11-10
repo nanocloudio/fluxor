@@ -9,7 +9,7 @@ wrong layer = redraw before coding.
 | `kernel_abi` | `modules/sdk/abi/kernel_abi.rs` | Every module (implicit) | Primitives the kernel owns: `SyscallTable`, channel, timer, buffer, event, log, random, arena, poll/errno, query keys, BIND_IRQ, STREAM_TIME |
 | `hal` | `modules/sdk/contracts/hal/*.rs` | Modules that claim the hardware contract in their manifest | Privileged hardware contracts — portable abstraction of peripherals (GPIO, SPI, I2C, PIO, UART, ADC, PWM, PCIe) |
 | stable module contracts | `modules/sdk/contracts/` (net, storage, key_vault, workload, input, telemetry, …) | Any consumer module | Portable module-provided contracts. Channel-served protocols live here too. |
-| `internal` | `modules/sdk/internal/*.rs`, `src/kernel/internal/*.rs` | Kernel and first-party orchestrator modules only | Kernel-private orchestration: bridge, fault monitor, reconfigure, flash raw, backing-provider registration, paged-arena registration, platform MMIO/DMA/PCIe. Not public; not an extension point. |
+| `internal` | `modules/sdk/internal/*.rs`, `src/kernel/internal/*.rs` | Kernel and first-party orchestrator modules only | Kernel-private orchestration: bridge, fault monitor, reconfigure, flash raw, platform MMIO/DMA/PCIe. Not public; not an extension point. |
 | `platform` | `modules/sdk/platform/{rp,bcm2712,linux}/*.rs`, `src/platform/*.rs` | Chip-specific drivers in `modules/drivers/`, plus the owning platform | Chip- and host-specific raw register bridges and layout constants. Not public; not portable. |
 
 Adding a new chip is a new `platform/<chip>/*` tree plus its hardware
@@ -52,13 +52,13 @@ that defines its opcodes, arg payloads, and response semantics.
 
 | Contract | Id | Provider | Notes |
 |----------|----|----------|-------|
-| `HAL_GPIO` | `0x0001` | Kernel (RP) | Claim, set direction, drive level, watch edge |
-| `HAL_SPI` | `0x0002` | PIC (`spi_pl022`) | Open with freq/mode/cs, async transfers |
-| `HAL_I2C` | `0x0003` | PIC (`i2c_dw`) | Write / read / write-read with slave addr |
-| `HAL_PIO` | `0x0004` | PIC (`pio_rp`) | Stream alloc, register bridge, cmd transfer |
-| `HAL_UART` | `0x000D` | PIC (`uart_pl011`) | Open / configure / write / read / poll |
-| `HAL_ADC` | `0x000E` | PIC (`adc_rp`) | Open / configure / read / poll |
-| `HAL_PWM` | `0x000F` | PIC (`pwm_rp`) | Open / configure / set duty |
+| `HAL_GPIO` | `0x0006` | Kernel (RP) | Claim, set direction, drive level, watch edge |
+| `HAL_SPI` | `0x0007` | PIC (`spi_pl022`) | Open with freq/mode/cs, async transfers |
+| `HAL_I2C` | `0x0008` | PIC (`i2c_dw`) | Write / read / write-read with slave addr |
+| `HAL_PIO` | `0x0009` | PIC (`pio_rp`) | Stream alloc, register bridge, cmd transfer |
+| `HAL_UART` | `0x000A` | PIC (`uart_pl011`) | Open / configure / write / read / poll |
+| `HAL_ADC` | `0x000B` | PIC (`adc_rp`) | Open / configure / read / poll |
+| `HAL_PWM` | `0x000C` | PIC (`pwm_rp`) | Open / configure / set duty |
 
 HAL contracts describe *what* the peripheral does, not *how* the chip
 implements it. A PIC provider module owns the per-chip implementation;
@@ -71,11 +71,11 @@ can reach them without declaring anything in its manifest.
 
 | Contract | Id | Contents |
 |----------|----|----------|
-| `CHANNEL` | `0x0005` | `open`, `close`, `connect`, `bind`, `listen`, `accept`, `port`, `ioctl` |
-| `TIMER` | `0x0006` | `millis`, `micros`, `create`, `set`, `cancel`, `destroy` |
-| `BUFFER` | `0x000A` | Zero-copy slot acquisition for in-place writers |
-| `EVENT` | `0x000B` | Signalable/pollable flags + IRQ binding |
-| `KEY_VAULT` | `0x0010` | P-256 + Ed25519 slots — ECDH, sign, verify, generate; raw material stays backend-side. Backend is platform-overridable (see below). |
+| `CHANNEL` | `0x0001` | `open`, `close`, `connect`, `bind`, `listen`, `accept`, `port`, `ioctl` |
+| `TIMER` | `0x0002` | `millis`, `micros`, `create`, `set`, `cancel`, `destroy` |
+| `BUFFER` | `0x0003` | Zero-copy slot acquisition for in-place writers |
+| `EVENT` | `0x0004` | Signalable/pollable flags + IRQ binding |
+| `KEY_VAULT` | `0x0005` | P-256 + Ed25519 slots — ECDH, sign, verify, generate; raw material stays backend-side. Backend is platform-overridable (see below). |
 
 #### Kernel service backends — platform-overridable
 
@@ -116,19 +116,20 @@ platform) implements the vtable, and consumers reach it through
 
 | Contract | Id | Provider | Notes |
 |----------|----|----------|-------|
-| `FS` | `0x0009` | PIC (`fat32`, `linux_fs_dispatch`) | Filesystem dispatch: open/read/write/seek/stat/close. |
-| `PLATFORM_NIC_RING` | `0x0007` | Kernel (platform) | NIC DMA ring management: `NIC_RING_CREATE` / `INFO` / `DESTROY`. Also requires `platform_raw` permission. |
-| `PLATFORM_DMA` | `0x0008` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. |
-| `PLATFORM_DMA_FD` | `0x0011` | Kernel (platform) | Async DMA fd with ping-pong queuing. Handle = tagged fd. Opcodes under `dma_raw::fd::*`. Separate contract from `PLATFORM_DMA`; see the DMA section below. |
-| `PCIE_DEVICE` | `0x0012` | Kernel (platform) | Handle-scoped PCIe device binding; also requires the `pcie_device` permission. |
-| `STORAGE_NAMESPACE` | `0x0013` | PIC / platform | Directory-like name-keyed storage surface (opcode class 0x13xx). See [storage_capability_surface.md](storage_capability_surface.md). |
-| `STORAGE_OBJECT` | `0x0014` | PIC / platform | Whole-blob byte-addressed storage surface (opcode class 0x14xx). See [storage_capability_surface.md](storage_capability_surface.md). |
-| `USB_HOST` | `0x0015` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding. The id is reserved and no platform serves it. |
-| `WORKLOAD` | `0x001A` | Kernel (platform backends) | Platform-neutral isolated-workload surface (opcode class 0x1Axx): run an isolated workload with a declared capability envelope. |
-| `STREAM_CLOCK` | `0x001C` | Kernel (platform) | Generic stream-clock capability (opcode class 0x1Cxx) answering the `STREAM_TIME` audio-clock query independently of PIO hardware. |
-| `TRUST` | `0x001D` | Kernel (platform) | Platform certificate-chain verification (opcode class 0x1Dxx): the platform answers for a chain, or refuses every chain. Registered where a system trust store exists and absent otherwise, which is why a graph names it in `[[requires_when]]`. |
-| `NET_POLICY` | `0x001E` | Kernel (platform) | Packet policy and service NAT (opcode class 0x1Exx): a consumer states what traffic is allowed and where a virtual address leads, and the platform decides how — the host's packet filter on Linux, the in-graph packet filter on bare metal. Tables are replaced whole and atomically, each REPLACE advancing the table's generation. A provider that records a table it cannot act on leaves the `ENFORCED` capability bit clear rather than implying enforcement. |
-| `NET_ROUTE` | `0x0020` | Kernel (platform), realized by the platform or by a registered net-identity module | Node reachability (opcode class 0x20xx): the node's segments (each a local network whose gateway the node holds), peer routes (another node's segment, reached through that node) and held addresses (answered for the node with no workload owning them). Each table is replaced whole and atomically by a single bound writer and persists across that writer's exit and graph rebuilds; `READ` reports each entry as realized, pending, fenced, refused (with a reason) or unknown, so a realization the host defeats is reported rather than lost. |
+| `FS` | `0x000D` | PIC (`fat32`, `linux_fs_dispatch`) | Filesystem dispatch: open/read/write/seek/stat/close. |
+| `PLATFORM_NIC_RING` | `0x001D` | Kernel (platform) | NIC DMA ring management: `NIC_RING_CREATE` / `INFO` / `DESTROY`. Also requires `platform_raw` permission. |
+| `PLATFORM_DMA` | `0x001E` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. |
+| `PLATFORM_DMA_FD` | `0x001F` | Kernel (platform) | Async DMA fd with ping-pong queuing. Handle = tagged fd. Opcodes under `dma_raw::fd::*`. Separate contract from `PLATFORM_DMA`; see the DMA section below. |
+| `PCIE_DEVICE` | `0x001C` | Kernel (platform) | Handle-scoped PCIe device binding; also requires the `pcie_device` permission. |
+| `METAL_DEVICE` | `0x0028` | Kernel (bcm2712, uefi) | Device registers, DMA memory and cache maintenance for bare-metal drivers; register access requires `platform_raw`, DMA and cache ops `dma`. |
+| `STORAGE_NAMESPACE` | `0x000E` | PIC / platform | Directory-like name-keyed storage surface (opcode class 0x0Exx). See [storage_capability_surface.md](storage_capability_surface.md). |
+| `STORAGE_OBJECT` | `0x000F` | PIC / platform | Whole-blob byte-addressed storage surface (opcode class 0x0Fxx). See [storage_capability_surface.md](storage_capability_surface.md). |
+| `USB_HOST` | `0x001B` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding. The id is reserved and no platform serves it. |
+| `WORKLOAD` | `0x0017` | Kernel (platform backends) | Platform-neutral isolated-workload surface (opcode class 0x17xx): run an isolated workload with a declared capability envelope. |
+| `STREAM_CLOCK` | `0x0013` | Kernel (platform) | Generic stream-clock capability (opcode class 0x13xx) answering the `STREAM_TIME` audio-clock query independently of PIO hardware. |
+| `TRUST` | `0x0014` | Kernel (platform) | Platform certificate-chain verification (opcode class 0x14xx): the platform answers for a chain, or refuses every chain. Registered where a system trust store exists and absent otherwise, which is why a graph names it in `[[requires_when]]`. |
+| `NET_POLICY` | `0x0015` | Kernel (platform) | Packet policy and service NAT (opcode class 0x15xx): a consumer states what traffic is allowed and where a virtual address leads, and the platform decides how — the host's packet filter on Linux, the in-graph packet filter on bare metal. Tables are replaced whole and atomically, each REPLACE advancing the table's generation. A provider that records a table it cannot act on leaves the `ENFORCED` capability bit clear rather than implying enforcement. |
+| `NET_ROUTE` | `0x0016` | Kernel (platform), realized by the platform or by a registered net-identity module | Node reachability (opcode class 0x16xx): the node's segments (each a local network whose gateway the node holds), peer routes (another node's segment, reached through that node) and held addresses (answered for the node with no workload owning them). Each table is replaced whole and atomically by a single bound writer and persists across that writer's exit and graph rebuilds; `READ` reports each entry as realized, pending, fenced, refused (with a reason) or unknown, so a realization the host defeats is reported rather than lost. |
 
 `FS` STAT output is 8 bytes, `[size:u32 LE, mtime:u32 LE]`. The
 contract serves random-access file I/O; streaming workloads use channel
@@ -220,7 +221,7 @@ module, so an orchestrator pins a workload against what the node holds.
 bare-metal RP the clock is a property of the active PIO stream, so no
 provider is registered and the query falls back to `HAL_PIO`.
 
-`HOST_PROCESS` (`0x001B`) is host-scoped, not stable: Linux
+`HOST_PROCESS` (`0x0018`) is host-scoped, not stable: Linux
 host-process mechanics (exec, PTY, read, the host-process source),
 registered only by
 the Linux platform, with semantic constants at
@@ -230,7 +231,7 @@ module that opened it, under that module's owner: any other caller is
 answered `EACCES`, and the session closes when its opener's owner is
 released or its workload destroyed.
 
-`HOST_MOUNT` (`0x001F`) is host-scoped the same way: mounting a block
+`HOST_MOUNT` (`0x0019`) is host-scoped the same way: mounting a block
 device onto a directory under the operator's mount root
 (`FLUXOR_MOUNT_ROOT`) and unmounting it, with semantic constants at
 `abi::platform::linux::host_mount`. The platform holds the policy — the
@@ -262,7 +263,6 @@ dispatch, just message formats):
   each call site
 - `contracts/storage/graph_slot.rs` — OTA reconfigure FMP protocol
 - `contracts/storage/runtime_params.rs` — per-module-scoped `STORE` / `DELETE` / `CLEAR_ALL`
-- `contracts/storage/paged_arena.rs` — kernel-pager ↔ backing-store protocol
 
 Networking has no kernel-side contract — all of it is channel-based.
 Drivers (`cyw43`, `ch9120`, `rp1_gem`, `virtio_net`) exchange Ethernet
@@ -279,8 +279,8 @@ need:
 
 | Contract | Id | Opener → handle | Opcodes | Import path |
 |----------|----|-----------------|---------|-------------|
-| `PLATFORM_DMA` | `0x0008` | `channel::ALLOC` → raw DMA channel number | `ALLOC` / `FREE` / `START` / `BUSY` / `ABORT` | `abi::platform::rp::dma_raw::channel` |
-| `PLATFORM_DMA_FD` | `0x0011` | `fd::CREATE` → FD_TAG_DMA-tagged fd | `CREATE` / `START` / `RESTART` / `QUEUE` / `FREE` | `abi::platform::rp::dma_raw::fd` |
+| `PLATFORM_DMA` | `0x001E` | `channel::ALLOC` → raw DMA channel number | `ALLOC` / `FREE` / `START` / `BUSY` / `ABORT` | `abi::platform::rp::dma_raw::channel` |
+| `PLATFORM_DMA_FD` | `0x001F` | `fd::CREATE` → FD_TAG_DMA-tagged fd | `CREATE` / `START` / `RESTART` / `QUEUE` / `FREE` | `abi::platform::rp::dma_raw::fd` |
 
 Manifest:
 ```toml
@@ -323,7 +323,6 @@ sub-surface they need via the manifest `permissions = [...]` list.
 |------------|---------|----------------|
 | `reconfigure` | Graph slot commit, boot counter, FMP routing | `reconfigure` |
 | `flash_raw` | Flash ERASE, PROGRAM (bounded to declared sectors) | `flash_rp`, `graph_slot` |
-| `backing_provider` | Paged-arena / backing-store registration | `flash_rp`, `nvme` |
 | `platform_raw` | MMIO, NIC ring create, raw peripheral register bridges, workload spawn | `pwm_rp`, `nvme`, `e810`, `rp1_gem` |
 | `monitor` | Fault monitor BIND / WAIT / ACK / REPORT / RAISE, step histograms | `reconfigure`, `monitor` |
 | `bridge` | Cross-domain / cross-core dispatch | kernel-internal |
@@ -525,32 +524,24 @@ Chip-specific register bridges and layout constants (`platform::rp::*`,
 not portable, and there is no stability promise — a new chip port
 rewrites this layer.
 
-## Appendix — the 0x0Cxx opcode range
+## Appendix — numbers and class routing
 
-Kernel primitives (LOG_WRITE, HANDLE_POLL, ARENA_GET, RANDOM_FILL,
-BIND_IRQ, STREAM_TIME, …) and internal orchestration opcodes share
-the 0x0Cxx opcode namespace under the routing-only contract id
-`0x000C`. This is a transport detail of the dispatch plumbing, not a
-public contract category.
+Every ABI number is declared once, in
+[`modules/sdk/abi/registry.toml`](../../modules/sdk/abi/registry.toml), and
+generated into `abi::registry` by `fluxor abi-regen`. A contract's id is its
+opcode class byte, its vtable index, its `required_caps` bit and, when it
+mints handles, their fd tag; ids are dense from `0x00`.
 
-- Primitives in 0x0Cxx are documented in [`kernel_abi`](../../modules/sdk/abi/kernel_abi.rs).
-- Orchestration opcodes in 0x0Cxx are documented in [`internal`](../../modules/sdk/internal).
-- The opcode → permission mapping is authoritatively defined by
-  `privileged_op_permission` in [`src/kernel/module/syscalls.rs`](../../src/kernel/module/syscalls.rs).
-  New opcodes must be classified there explicitly; unknowns fall
-  through to the strictest `platform_raw` bucket.
-- The dispatch-bucket id `0x000C` is exposed in the kernel only as
-  `contract::INTERNAL_DISPATCH_BUCKET` — a routing constant, not a
-  public contract. `syscall_provider_open` **rejects** modules passing
-  this id with `ENOSYS`. Modules that need ring/DMA handle allocation
-  go through the first-class contracts in the stable-module-contracts
-  table above (`PLATFORM_NIC_RING`, `PLATFORM_DMA`).
-
-No new public API may land in 0x0Cxx unless it is promoted into
-`kernel_abi` (implicit for every module) or given its own contract id
-with a vtable. The long-term move is to split each orchestration
-sub-surface into its own contract so the 0x0Cxx transport goes away
-entirely.
+- Contract `kernel` (id `0x00`) carries the kernel primitives (LOG_WRITE,
+  HANDLE_POLL, ARENA_GET, RANDOM_FILL, STREAM_TIME, …), documented in
+  [`kernel_abi`](../../modules/sdk/abi/kernel_abi.rs). Modules may not
+  `provider_open` it.
+- Contracts marked `route = "class"` in the registry (the kernel and the
+  orchestration, telemetry, resource and raw-bridge surfaces) reach the kernel
+  by their opcode class ahead of any handle and are granted as the kernel's.
+- The opcode → permission mapping is the registry's (`abi::registry::op_permission`);
+  an opcode the registry does not list in a class that names an `unlisted`
+  permission requires that permission.
 
 ## Provider registration
 
@@ -561,7 +552,7 @@ well-known functions:
 #[no_mangle]
 #[link_section = ".text.module_provides_contract"]
 pub extern "C" fn module_provides_contract() -> u32 {
-    0x000F  // the contract id this module provides
+    abi::registry::pwm::ID as u32 // the contract id this module provides
 }
 
 #[no_mangle]
@@ -612,7 +603,7 @@ Access control has two distinct gates, and both are enforced on every
    bitmap of permitted contracts in `CAP_CONTRACT_MASK`.
 2. **Manifest grants** — a module's `required_caps` bitmap grants
    access beyond the infra allow-list (CHANNEL, TIMER, BUFFER, EVENT,
-   KEY_VAULT, plus the 0x0Cxx transport bucket). Contracts outside
+   KEY_VAULT, plus the kernel contract). Contracts outside
    the allow-list that the module doesn't hold → `ENOSYS`.
 
 **Permission gate** — `check_privileged_internal_op` in the same file:
@@ -625,7 +616,7 @@ kernel-trusted).
 
 There is no "`required_caps == 0` skips the check" shortcut. A module
 that declares nothing gets nothing: no HAL contracts (tier mask
-still applies), no privileged 0x0Cxx opcodes (permission gate
+still applies), no privileged class-routed opcodes (permission gate
 refuses). This is what forces over-privilege to be declared
 explicitly rather than inherited by default.
 
@@ -747,7 +738,7 @@ the mechanism that keeps kernel-resident drivers accountable.
 ## Vocabulary admission
 
 Fluxor owns every shared naming and numeric namespace — `CONTENT_TYPES`
-wire bytes, `CAPABILITY_NAMES`, `PROVIDER_CONTRACTS`, contract ids,
+wire bytes, `CAPABILITY_NAMES`, the ABI registry's contract names and ids,
 permission bits, fd tags. Centrality is what makes cross-repo wiring
 and drift-guarding possible, so the tables stay here; the question is
 only what earns an entry. Apply this two-question test to every

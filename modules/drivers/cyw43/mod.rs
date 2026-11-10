@@ -84,8 +84,8 @@ use abi::contracts::hal::gpio as dev_gpio;
 use abi::platform::rp::pio as dev_pio;
 
 // Provider contract ids (mirror kernel::module::provider::contract::*).
-const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_PIO_CONTRACT: u32 = 0x0004;
+const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
+const HAL_PIO_CONTRACT: u32 = abi::registry::pio::ID as u32;
 
 // ============================================================================
 // Firmware Blobs (in .rodata, read from flash XIP)

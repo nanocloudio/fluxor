@@ -1,6 +1,6 @@
 //! log_net — netconsole-style log forwarding.
 //!
-//! Drains the kernel log ring (via LOG_RING_DRAIN (diag) 0x0C64) and
+//! Drains the kernel log ring (via LOG_RING_DRAIN (diag) `diag::LOG_RING_DRAIN`) and
 //! forwards chunks as UDP datagrams through the IP module using the
 //! datagram surface
 //! (see `modules/sdk/contracts/net/datagram.rs`). Use this when the
@@ -70,7 +70,7 @@ const CHUNK_SIZE: usize = 512;
 
 /// LOG_RING_DRAIN (diag) opcode. Kept local to avoid bumping the SDK
 /// include surface for a single constant.
-const LOG_RING_DRAIN: u32 = 0x0C64;
+const LOG_RING_DRAIN: u32 = abi::registry::diag::LOG_RING_DRAIN;
 
 // ============================================================================
 // State

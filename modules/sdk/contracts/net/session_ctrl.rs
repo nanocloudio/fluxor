@@ -23,14 +23,9 @@
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto, datagram, and packet so the shared SDK
-// helpers (net_read_frame, net_write_frame) serve all four. Opcode
-// ranges are disjoint from the other three contracts:
-//
-//     net_proto     0x01..0x19   (stream surface)
-//     datagram      0x20..0x43   (datagram surface)
-//     packet        0x50..0x69   (packet surface)
-//     session_ctrl  0x70..0x9F   (this file)
-//
+// helpers (net_read_frame, net_write_frame) serve all four, and
+// the ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives every
+// message type of every surface sharing this header a distinct value,
 // so a single channel pair may carry multiple contracts without
 // ambiguity. In practice session control flows over its own channels
 // between anchor/worker/directory modules — often over remote channels
@@ -206,7 +201,7 @@ pub const STATUS_CURSOR_MISMATCH: u8 = 7;
 ///   [role: u8] [self_id: 8 bytes] [flags: u8]
 /// Where `self_id` is the sender's `anchor_id` / `worker_id` depending
 /// on role. `flags` is reserved and must be 0 on the wire.
-pub const CMD_SC_HELLO: u8 = 0x70;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_HELLO;
 
 /// Anchor → directory (or anchor → worker) attach notification.
 /// Payload:
@@ -215,14 +210,14 @@ pub const CMD_SC_HELLO: u8 = 0x70;
 ///   [epoch:       4 LE]
 ///   [cc:          1]                  continuity class (CC_*)
 ///   [worker_id:   8 BE or zero]       suggested worker or all-zero
-pub const CMD_SC_ATTACH: u8 = 0x71;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_ATTACH;
 
 /// Detach notification (session removed).
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [reason:      1]                  DETACH_*
-pub const CMD_SC_DETACH: u8 = 0x72;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DETACH;
 
 /// Begin draining outbound delivery for a session. Anchor may still
 /// service wire-liveness traffic (keepalive) while drain is active.
@@ -230,7 +225,7 @@ pub const CMD_SC_DETACH: u8 = 0x72;
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [deadline_ms: 4 LE]               max ms before forced timeout
-pub const CMD_SC_DRAIN: u8 = 0x73;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DRAIN;
 
 /// Begin opaque state export. Starts a multi-chunk transfer of worker-
 /// owned session state for handoff, and states where in the session's
@@ -241,7 +236,7 @@ pub const CMD_SC_DRAIN: u8 = 0x73;
 ///   [total_len:     4 LE]             total blob bytes to follow
 ///   [in_consumed:   8 LE]             inbound bytes folded into the blob
 ///   [out_produced:  8 LE]             outbound bytes the blob has emitted
-pub const CMD_SC_EXPORT_BEGIN: u8 = 0x74;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EXPORT_BEGIN;
 
 /// Payload bytes of CMD_SC_EXPORT_BEGIN.
 pub const EXPORT_BEGIN_LEN: usize =
@@ -253,14 +248,14 @@ pub const EXPORT_BEGIN_LEN: usize =
 ///   [epoch:       4 LE]
 ///   [offset:      4 LE]               byte offset in the blob
 ///   [data: ...]                        chunk bytes
-pub const CMD_SC_EXPORT_CHUNK: u8 = 0x75;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EXPORT_CHUNK;
 
 /// End of export. Confirms total_len was delivered.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [crc32:       4 LE]               CRC32 of the concatenated blob
-pub const CMD_SC_EXPORT_END: u8 = 0x76;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EXPORT_END;
 
 /// Mark a new worker ready to take over. Paired with the directory
 /// advancing the session binding. Anchor flips its forwarding target
@@ -273,14 +268,14 @@ pub const CMD_SC_EXPORT_END: u8 = 0x76;
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [new_epoch:   4 LE]
-pub const CMD_SC_RESUME: u8 = 0x77;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RESUME;
 
 /// Epoch bump (generation advance). Used to invalidate stale writers.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [old_epoch:   4 LE]
 ///   [new_epoch:   4 LE]
-pub const CMD_SC_EPOCH_BUMP: u8 = 0x78;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EPOCH_BUMP;
 
 /// Directory → anchor notification that the session's worker binding
 /// has moved. Anchor re-resolves the forwarding channel.
@@ -288,74 +283,74 @@ pub const CMD_SC_EPOCH_BUMP: u8 = 0x78;
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [new_worker:  8 BE]
-pub const CMD_SC_RELOCATE: u8 = 0x79;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RELOCATE;
 
 // ─── Opcodes: events / acknowledgements (peer → peer) ──────────────
 
 /// Acknowledge CMD_SC_HELLO.
 /// Payload:
 ///   [role: u8] [peer_id: 8 BE]
-pub const MSG_SC_HELLO_ACK: u8 = 0x90;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_HELLO_ACK;
 
 /// Acknowledge CMD_SC_ATTACH.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [status:      1]                  STATUS_*
-pub const MSG_SC_ATTACHED: u8 = 0x91;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_ATTACHED;
 
 /// Acknowledge CMD_SC_DETACH.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
-pub const MSG_SC_DETACHED: u8 = 0x92;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_DETACHED;
 
 /// Drain completed (outbound queue empty, no new frames until resume).
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
-pub const MSG_SC_DRAINED: u8 = 0x93;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_DRAINED;
 
 /// Acknowledge CMD_SC_EXPORT_BEGIN; importer is ready to receive.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [status:      1]                  STATUS_*
-pub const MSG_SC_IMPORT_BEGIN: u8 = 0x94;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_IMPORT_BEGIN;
 
 /// Per-chunk acknowledgement (optional; implementations may batch).
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [offset:      4 LE]
-pub const MSG_SC_IMPORT_CHUNK: u8 = 0x95;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_IMPORT_CHUNK;
 
 /// Import completed; state committed on the receiving worker.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [status:      1]                  STATUS_* (CORRUPT if CRC mismatched)
-pub const MSG_SC_IMPORT_END: u8 = 0x96;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_IMPORT_END;
 
 /// Worker has declared ready for the new epoch. Anchor may now flip
 /// its forwarding target.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [new_epoch:   4 LE]
-pub const MSG_SC_RESUMED: u8 = 0x97;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_RESUMED;
 
 /// Directory confirms epoch advance.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [new_epoch:   4 LE]
-pub const MSG_SC_EPOCH_CONFIRMED: u8 = 0x98;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_EPOCH_CONFIRMED;
 
 /// Acknowledge CMD_SC_RELOCATE.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [status:      1]                  STATUS_*
-pub const MSG_SC_RELOCATED: u8 = 0x99;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_RELOCATED;
 
 // ─── Transport continuity (TRANSPORT_CONTINUITY) ──────────────────
 //
@@ -553,7 +548,7 @@ pub const ABORT_HORIZON_BUDGET: u8 = 7;
 ///   [codec_digest: 32]                 SHA-256 of the codec layout the
 ///                                      primary will emit; mismatch is
 ///                                      refused before any bytes move
-pub const CMD_SC_PAIR_PREPARE: u8 = 0x7A;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_PAIR_PREPARE;
 
 /// Open a checkpoint transfer into a prepared shadow. A generation the
 /// shadow already holds is idempotent; a lower generation is refused.
@@ -563,7 +558,7 @@ pub const CMD_SC_PAIR_PREPARE: u8 = 0x7A;
 ///   [ckpt_gen:      4 LE]              checkpoint generation
 ///   [total_len:     4 LE]              record bytes to follow
 ///   [record_digest:32]                 SHA-256 of the whole record
-pub const CMD_SC_CHECKPOINT_BEGIN: u8 = 0x7B;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CHECKPOINT_BEGIN;
 
 /// One chunk of the checkpoint record, in offset order.
 /// Payload:
@@ -572,7 +567,7 @@ pub const CMD_SC_CHECKPOINT_BEGIN: u8 = 0x7B;
 ///   [ckpt_gen:      4 LE]
 ///   [offset:        4 LE]
 ///   [data: ...]
-pub const CMD_SC_CHECKPOINT_NEXT: u8 = 0x7C;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CHECKPOINT_NEXT;
 
 /// Close the checkpoint transfer. The shadow verifies length, CRC32 and
 /// the record digest, decodes the record, opens the sealed continuity
@@ -583,7 +578,7 @@ pub const CMD_SC_CHECKPOINT_NEXT: u8 = 0x7C;
 ///   [epoch:         4 LE]
 ///   [ckpt_gen:      4 LE]
 ///   [crc32:         4 LE]
-pub const CMD_SC_CHECKPOINT_COMMIT: u8 = 0x7D;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CHECKPOINT_COMMIT;
 
 /// Ordered delta against a committed checkpoint.
 /// Payload:
@@ -595,7 +590,7 @@ pub const CMD_SC_CHECKPOINT_COMMIT: u8 = 0x7D;
 ///                                      (zero for delta 1)
 ///   [kind:          1]                 DELTA_*
 ///   [data: ...]
-pub const CMD_SC_DELTA_APPLY: u8 = 0x7E;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DELTA_APPLY;
 
 /// The standby has applied `delta_no` into the shadow — the horizon
 /// the primary may now cross.
@@ -604,7 +599,7 @@ pub const CMD_SC_DELTA_APPLY: u8 = 0x7E;
 ///   [epoch:         4 LE]
 ///   [ckpt_gen:      4 LE]
 ///   [delta_no:      4 LE]
-pub const CMD_SC_DELTA_ACK: u8 = 0x7F;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DELTA_ACK;
 
 /// Stop admitting new application delivery on the primary and drain
 /// in-flight work so a byte-exact cut can be taken.
@@ -612,13 +607,13 @@ pub const CMD_SC_DELTA_ACK: u8 = 0x7F;
 ///   [flow_id:      16 BE]
 ///   [epoch:         4 LE]
 ///   [deadline_ms:   4 LE]
-pub const CMD_SC_QUIESCE_BEGIN: u8 = 0x80;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_QUIESCE_BEGIN;
 
 /// Ask whether the quiesce has completed.
 /// Payload:
 ///   [flow_id:      16 BE]
 ///   [epoch:         4 LE]
-pub const CMD_SC_QUIESCE_STATUS: u8 = 0x81;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_QUIESCE_STATUS;
 
 /// Produce the full checkpoint now. The provider emits
 /// CHECKPOINT_BEGIN / NEXT* / COMMIT on `cont_out`, then
@@ -626,7 +621,7 @@ pub const CMD_SC_QUIESCE_STATUS: u8 = 0x81;
 /// Payload:
 ///   [flow_id:      16 BE]
 ///   [epoch:         4 LE]
-pub const CMD_SC_CUT_EXPORT: u8 = 0x82;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CUT_EXPORT;
 
 /// Publish the committed shadow as the eligible import for `flow_id`:
 /// the manifest digest must match what CHECKPOINT_COMMIT verified.
@@ -635,14 +630,14 @@ pub const CMD_SC_CUT_EXPORT: u8 = 0x82;
 ///   [epoch:         4 LE]
 ///   [ckpt_gen:      4 LE]
 ///   [manifest_digest: 32]
-pub const CMD_SC_CUT_IMPORT: u8 = 0x83;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CUT_IMPORT;
 
 /// Prove the import is ready to emit — timers converted, secrets
 /// open, route identity present — without enabling transmission.
 /// Payload:
 ///   [flow_id:      16 BE]
 ///   [epoch:         4 LE]
-pub const CMD_SC_EMISSION_ARM: u8 = 0x84;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EMISSION_ARM;
 
 /// Make the armed shadow the live connection under a strictly higher
 /// epoch. `fence_gen` is the fence generation the coordinator observed
@@ -658,21 +653,21 @@ pub const CMD_SC_EMISSION_ARM: u8 = 0x84;
 ///                                      provider reported in its own
 ///                                      CR_ACTIVATED. Absent, the id the
 ///                                      checkpoint was taken under.
-pub const CMD_SC_ACTIVATE: u8 = 0x85;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_ACTIVATE;
 
 /// Destroy the old connection's keys and replicated buffers after the
 /// new anchor's stability horizon.
 /// Payload:
 ///   [flow_id:      16 BE]
 ///   [epoch:         4 LE]
-pub const CMD_SC_RETIRE: u8 = 0x86;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RETIRE;
 
 /// Discard a shadow or an in-progress export.
 /// Payload:
 ///   [flow_id:      16 BE]
 ///   [epoch:         4 LE]
 ///   [reason:        1]                 ABORT_*
-pub const CMD_SC_ABORT: u8 = 0x87;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_ABORT;
 
 /// A reservation grant from a `session.reservation` provider for a flow's
 /// egress counter: a block of counter values the transport may emit from.
@@ -694,7 +689,7 @@ pub const CMD_SC_ABORT: u8 = 0x87;
 ///   [epoch:         4 LE]              fencing epoch; only ever advances
 ///   [start:         8 LE]              first counter value in the block
 ///   [len:           8 LE]              values in the block
-pub const CMD_SC_RESERVATION_GRANT: u8 = 0x88;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RESERVATION_GRANT;
 
 /// A tombstone for a flow this provider never held: until it expires a
 /// segment for the flow that finds no connection here is dropped silently,
@@ -704,7 +699,7 @@ pub const CMD_SC_RESERVATION_GRANT: u8 = 0x88;
 ///   [flow_id:      16 BE]
 ///   [epoch:         4 LE]
 ///   [ttl_ms:        4 LE]
-pub const CMD_SC_TOMBSTONE: u8 = 0x89;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_TOMBSTONE;
 
 /// Vault-to-vault transfer of a flow's continuity key (`custody`): the
 /// standby's vault attests a fresh recipient key, the primary's vault checks
@@ -723,7 +718,7 @@ pub const CMD_SC_TOMBSTONE: u8 = 0x89;
 ///   [body: ...]                        ATTEST: [challenge:32]
 ///                                      WRAP:   [challenge:32][evidence]
 ///                                      UNWRAP: [name:16][wrapped]
-pub const CMD_SC_CUSTODY: u8 = 0x8A;
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CUSTODY;
 
 /// The custody exchange's operations and bytes (`CMD_SC_CUSTODY`).
 pub mod custody {
@@ -780,7 +775,7 @@ pub const GRANT_STATUS_OK: u8 = 0;
 ///   [record:        1]                 CR_*
 ///   [status:        1]                 STATUS_*
 ///   [body: ...]                        per record type, below
-pub const MSG_SC_CONTINUITY: u8 = 0x9A;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_CONTINUITY;
 
 /// `CONTINUITY` record types and their bodies.
 /// Body: [transport:1][profile:1][shadow_slot:2 LE], and from a provider
@@ -850,7 +845,7 @@ pub const CHECKPOINT_CHUNK_MAX: usize = 1024;
 ///   [session_id: 16 BE]
 ///   [epoch:       4 LE]
 ///   [errno:       i8]
-pub const MSG_SC_ERROR: u8 = 0x9F;
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_ERROR;
 
 // ─── Payload layout helpers ────────────────────────────────────────
 

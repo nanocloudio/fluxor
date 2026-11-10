@@ -1,22 +1,17 @@
 // ============================================================================
-// Device access: DMA arena, PCIe config/BAR, and BCM2712 PCIe1 MSI helpers
+// Device access: DMA memory, cache maintenance and PCIe config/BAR helpers
 // ============================================================================
 //
-// Thin SDK wrappers over the platform device-access opcodes (DMA arena,
-// `pcie_device` contract, and the BCM2712 PCIe1 MSI controller). Consumed by
-// storage/NIC drivers (NVMe, rp1_gem) via the flattened `runtime` namespace.
+// Thin SDK wrappers over the `metal_device` and `pcie_device` contracts.
+// Consumed by storage/NIC drivers (NVMe, rp1_gem) via the flattened
+// `runtime` namespace.
 // Kept out of `telemetry.rs` — device access is not telemetry.
 
-/// Allocate `size` bytes of DMA-coherent memory with `align`-byte alignment
-/// from the kernel's non-cacheable DMA arena. Returns the physical address
-/// (== virtual address under identity mapping) or 0 on failure.
+/// Allocate `size` bytes of DMA memory a device reaches coherently, with
+/// `align`-byte alignment (`metal_device::DMA_ALLOC_CONTIG`). Returns the
+/// address (the CPU and the device see the same one) or 0 on failure.
 ///
-/// Buffers returned here are Normal Non-cacheable memory — safe for device
-/// DMA without explicit cache maintenance. See
-/// `src/platform/bcm2712/net.rs` (the arena implementation) and
-/// `src/platform/bcm2712.rs` `init_page_tables()` (MAIR attr2 = 0x44).
-///
-/// Bump-only for v1 — there is no matching `dev_dma_free`.
+/// There is no matching `dev_dma_free`: the arena is bump-allocated.
 #[inline(always)]
 unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     let mut buf = [0u8; 16];
@@ -31,7 +26,7 @@ unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     *bp.add(5) = ab[1];
     *bp.add(6) = ab[2];
     *bp.add(7) = ab[3];
-    let rc = (sys.provider_call)(-1, 0x0CE6, bp, 16);
+    let rc = (sys.provider_call)(-1, abi::registry::metal_device::DMA_ALLOC_CONTIG, bp, 16);
     if rc != 0 {
         return 0;
     }
@@ -68,7 +63,7 @@ unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> 
     *bp.add(5) = ab[1];
     *bp.add(6) = ab[2];
     *bp.add(7) = ab[3];
-    let rc = (sys.provider_call)(-1, 0x0CEC, bp, 16);
+    let rc = (sys.provider_call)(-1, abi::registry::metal_device::DMA_ALLOC_STREAMING, bp, 16);
     if rc != 0 {
         return 0;
     }
@@ -105,7 +100,7 @@ unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     *bp.add(9) = sb[1];
     *bp.add(10) = sb[2];
     *bp.add(11) = sb[3];
-    (sys.provider_call)(-1, 0x0CEA, bp, 12)
+    (sys.provider_call)(-1, abi::registry::metal_device::DMA_FLUSH, bp, 12)
 }
 
 /// Invalidate a VA range from the data cache (`dc ivac` + `dsb sy`).
@@ -130,7 +125,7 @@ unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     *bp.add(9) = sb[1];
     *bp.add(10) = sb[2];
     *bp.add(11) = sb[3];
-    (sys.provider_call)(-1, 0x0CEB, bp, 12)
+    (sys.provider_call)(-1, abi::registry::metal_device::DMA_INVALIDATE, bp, 12)
 }
 
 /// PCIE_DEVICE contract: open a device by selector.
@@ -265,7 +260,7 @@ unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u
     let ob = offset.to_le_bytes();
     *bp.add(2) = ob[0];
     *bp.add(3) = ob[1];
-    let rc = (sys.provider_call)(-1, 0x0CF6, bp, 8);
+    let rc = (sys.provider_call)(-1, abi::registry::metal_device::PCIE_CFG_READ32, bp, 8);
     if rc != 0 {
         return 0xFFFF_FFFF;
     }
@@ -288,59 +283,7 @@ unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val
     *bp.add(5) = vb[1];
     *bp.add(6) = vb[2];
     *bp.add(7) = vb[3];
-    (sys.provider_call)(-1, 0x0CF7, bp, 8)
-}
-
-/// Initialise the brcmstb PCIe1 MSI controller behind GIC SPI
-/// `spi_irq`. Idempotent. Returns 0 on success, negative errno otherwise.
-#[inline(always)]
-unsafe fn dev_pcie1_msi_init(sys: &SyscallTable, spi_irq: u32) -> i32 {
-    let mut buf = spi_irq.to_le_bytes();
-    (sys.provider_call)(
-        -1,
-        abi::platform::bcm2712::msi::PCIE1_MSI_INIT,
-        buf.as_mut_ptr(),
-        4,
-    )
-}
-
-/// Allocate an MSI vector for `event_handle` and retrieve the
-/// (target_addr, data) the caller writes into its MSI-X table entry.
-/// Returns `Some((vector, target_addr, data))` on success.
-#[inline(always)]
-unsafe fn dev_pcie1_msi_alloc_vector(
-    sys: &SyscallTable,
-    event_handle: i32,
-) -> Option<(u8, u64, u32)> {
-    let mut buf = [0u8; 20];
-    let bp = buf.as_mut_ptr();
-    let eb = event_handle.to_le_bytes();
-    *bp = eb[0];
-    *bp.add(1) = eb[1];
-    *bp.add(2) = eb[2];
-    *bp.add(3) = eb[3];
-    let rc = (sys.provider_call)(
-        -1,
-        abi::platform::bcm2712::msi::PCIE1_MSI_ALLOC_VECTOR,
-        bp,
-        20,
-    );
-    if rc != 0 {
-        return None;
-    }
-    let vec = *bp.add(4);
-    let addr = u64::from_le_bytes([
-        *bp.add(8),
-        *bp.add(9),
-        *bp.add(10),
-        *bp.add(11),
-        *bp.add(12),
-        *bp.add(13),
-        *bp.add(14),
-        *bp.add(15),
-    ]);
-    let data = u32::from_le_bytes([*bp.add(16), *bp.add(17), *bp.add(18), *bp.add(19)]);
-    Some((vec, addr, data))
+    (sys.provider_call)(-1, abi::registry::metal_device::PCIE_CFG_WRITE32, bp, 8)
 }
 
 /// The device window the graph granted this module (config tag 0xFD), as

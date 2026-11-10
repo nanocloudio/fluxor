@@ -1,9 +1,7 @@
-//! Lattice KV — key-value store backed by a paged arena (E10-S8).
+//! Lattice KV — key-value store in the module's resident arena.
 //!
-//! Demonstrates transparent demand paging: the module uses plain pointer
-//! arithmetic into its arena memory. On BCM2712 with an MMU, pages are
-//! loaded on demand from backing store. On RP2350 (no MMU), the arena
-//! is resident memory and all data must fit in RAM.
+//! The module uses plain pointer arithmetic into its arena memory, which
+//! is resident: all data must fit in it.
 //!
 //! # Data structure
 //!
@@ -92,7 +90,7 @@ struct State {
     sys: *const SyscallTable,
     in_ch: i32,
     out_ch: i32,
-    /// Pointer to arena memory (paged or resident).
+    /// Pointer to the module's resident arena.
     arena_ptr: *mut u8,
     /// Arena size in bytes.
     arena_size: u32,
@@ -385,21 +383,10 @@ pub unsafe extern "C" fn module_new(
     (*s).max_entries = 0;
     (*s).initialized = false;
 
-    // Try paged arena first (BCM2712 with MMU)
-    let (pa_ptr, pa_size, pa_status) = dev_paged_arena_get(&*sys);
-    if pa_status == 1 && !pa_ptr.is_null() && pa_size > 0 {
-        (*s).arena_ptr = pa_ptr;
-        (*s).arena_size = pa_size as u32;
-
-        // Prefault the hash table page
-        dev_paged_arena_prefault(&*sys, 0, 1);
-    } else {
-        // Fall back to resident arena (RP2350 or no paged arena configured)
-        let (a_ptr, a_size) = dev_arena_get(&*sys);
-        if !a_ptr.is_null() && a_size > 0 {
-            (*s).arena_ptr = a_ptr;
-            (*s).arena_size = a_size;
-        }
+    let (a_ptr, a_size) = dev_arena_get(&*sys);
+    if !a_ptr.is_null() && a_size > 0 {
+        (*s).arena_ptr = a_ptr;
+        (*s).arena_size = a_size;
     }
 
     if (*s).arena_ptr.is_null() || (*s).arena_size < (ENTRIES_BASE + ENTRY_SIZE) as u32 {
@@ -501,8 +488,7 @@ declare_module_arena_bytes!(65536);
 
 #[no_mangle]
 pub extern "C" fn module_arena_size() -> u32 {
-    // Request 64KB resident arena as fallback (RP2350 without paged arena)
-    // On BCM2712, the paged arena is used instead.
+    // The 64 KiB resident arena the store lives in.
     65536
 }
 

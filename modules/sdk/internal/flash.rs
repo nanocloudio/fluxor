@@ -7,13 +7,13 @@
 
 /// Raw flash erase: erase 4KB sector (restricted to runtime store bounds).
 /// handle=-1, arg=[offset:u32 LE] (4 bytes). Returns 0 or negative errno.
-pub const RAW_ERASE: u32 = 0x0C38;
+pub use super::super::registry::flash::RAW_ERASE;
 /// Raw flash program: program 256B page (restricted to runtime store bounds).
 /// handle=-1, arg=[offset:u32 LE, data:256 bytes] (260 bytes). Returns 0 or negative errno.
-pub const RAW_PROGRAM: u32 = 0x0C39;
+pub use super::super::registry::flash::RAW_PROGRAM;
 /// Flash sideband operation (internally acquires FLASH_XIP).
 /// handle=-1, arg[0]=operation kind. Returns result or EAGAIN.
-pub const SIDEBAND: u32 = 0x0C10;
+pub use super::super::registry::flash::SIDEBAND;
 
 /// Flash sideband operation kinds.
 pub mod sideband_op {

@@ -447,7 +447,7 @@ fn linux_init_providers() {
     provider::register_owner_release_hook(linux_owner_released);
     provider::register(dev_class::STREAM_CLOCK, linux_stream_time_dispatch);
     // The platform's verdict on a certificate chain. Registered only where
-    // the verifier is built in; without it nothing answers class 0x1D and a
+    // the verifier is built in; without it nothing answers class `trust` and a
     // graph naming `trust = "system"` is refused at compose rather than
     // quietly composing against some other trust source.
     #[cfg(feature = "trust-system")]
@@ -507,10 +507,6 @@ fn linux_init_providers() {
     provider::register(
         fluxor::abi::platform::linux::host_process::PROC_CLASS,
         linux_proc_dispatch,
-    );
-    provider::register_fd_tag_route(
-        fluxor::abi::platform::linux::host_process::FD_TAG_PROC,
-        fluxor::abi::platform::linux::host_process::PROC_CLASS,
     );
     // Platform-neutral isolated-workload surface: parses the Tier-1 spec, binds
     // to a plan-allocated owner + lease, enforces the Tier-2 options envelope
@@ -627,8 +623,6 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     protection_release_module: |_| {},
     protection_gateway_table: fluxor::kernel::sys::hal::no_gateway_table,
     protected_call: fluxor::kernel::sys::hal::protected_call_unavailable,
-    protection_map_page: |_, _, _, _| {},
-    protection_unmap_page: |_, _| {},
     // Modules step on a host thread's stack, which the OS guards.
     stack_fence_arm: |_| {},
     stack_fence_intact: || true,
@@ -642,6 +636,7 @@ static LINUX_HAL_OPS: HalOps = HalOps {
             n as usize
         }
     },
+    metal_device: None,
 };
 
 fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {

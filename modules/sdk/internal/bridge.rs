@@ -2,18 +2,18 @@
 //
 // Layer: internal (unstable, kernel-private).
 
-/// Write data to a bridge channel.
-/// handle=bridge_fd, arg=data bytes. Returns 0 on success, -EAGAIN if ring full.
-pub const WRITE: u32 = 0x0CE0;
-/// Read data from a bridge channel.
-/// handle=bridge_fd, arg=output buffer. Returns bytes read, -EAGAIN if empty/no new.
-pub const READ: u32 = 0x0CE1;
-/// Poll bridge readiness. handle=bridge_fd. Returns 1 if readable, 0 if not.
-pub const POLL: u32 = 0x0CE2;
 /// Get bridge info. handle=bridge_fd, arg=16-byte output buffer.
 /// Returns: [type:u8, 0:u8, from:u16 LE, to:u16 LE, 0:u16, drops:u32 LE,
 /// seq:u32 LE]
-pub const INFO: u32 = 0x0CE3;
+pub use super::super::registry::bridge::INFO;
+/// Poll bridge readiness. handle=bridge_fd. Returns 1 if readable, 0 if not.
+pub use super::super::registry::bridge::POLL;
+/// Read data from a bridge channel.
+/// handle=bridge_fd, arg=output buffer. Returns bytes read, -EAGAIN if empty/no new.
+pub use super::super::registry::bridge::READ;
+/// Write data to a bridge channel.
+/// handle=bridge_fd, arg=data bytes. Returns 0 on success, -EAGAIN if ring full.
+pub use super::super::registry::bridge::WRITE;
 
 /// Enumerate the *calling* module's own bridge endpoints. handle is ignored
 /// (pass -1); `arg` is an output buffer of at least `SELF_BRIDGES_BUF_LEN`
@@ -33,9 +33,9 @@ pub const INFO: u32 = 0x0CE3;
 /// data through them with the bridge ops above — all of which are exempt from
 /// the §D7 ISR-context syscall deny because the underlying ring operations are
 /// lock-free and allocation-free. Lives in the kernel-primitive opcode range
-/// (not 0x0CExx) because it is a "self" query like `SELF_INDEX`, not a
+/// because it is a "self" query like `SELF_INDEX`, not a
 /// per-handle bridge operation.
-pub const SELF_BRIDGES: u32 = 0x0C44;
+pub use super::super::registry::bridge::SELF_BRIDGES;
 
 /// Maximum bridge endpoints per ISR-tier module (matches the kernel's
 /// `isr_tier::MODULE_MAX_BRIDGES`); sizes the `SELF_BRIDGES` output buffer.

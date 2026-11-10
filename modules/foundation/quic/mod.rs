@@ -194,6 +194,7 @@ const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 use abi::contracts::key_vault as kv;
 use abi::contracts::net::mux;
 use abi::contracts::net::net_proto::Target;
+use abi::contracts::net::peer_identity;
 const MAX_CERT_LEN: usize = 1024;
 /// Matches the tls module's ceiling so a `key_file` a graph shares between
 /// them packs identically; quic signs in-module with P-256 only, and any
@@ -2778,22 +2779,19 @@ unsafe fn mux_pump_downstream(s: &mut QuicState, idx: usize) {
 
     // 2. Peer identity, for every session — the authenticated binding is
     //    a property of the secure transport, not of any one protocol
-    //    that runs over it. Minimal form: no client cert → verified=0.
+    //    that runs over it.
     if s.conns[idx].handshake_confirmed && !s.conns[idx].peer_identity_sent {
-        // The full record, reporting NO_CREDENTIAL. This provider does
-        // not request a client certificate, so there is nothing to
-        // verify and no check ran — which is what the zeroed
-        // `verification_flags` says. An application reading this
-        // learns "no identity was established here", not "an identity
-        // was established and it is anonymous"; the previous
-        // `verified=0` byte could not tell those apart from a
-        // credential that failed.
+        // The full `peer_identity` record, reporting NO_CREDENTIAL. This
+        // provider does not request a client certificate, so there is
+        // nothing to verify and no check ran — which is what the zeroed
+        // `verification_flags` says. An application reading this learns
+        // "no identity was established here", not "an identity was
+        // established and it is anonymous".
         //
         // `mux_emit` writes the session id, so the body starts at the
         // record's second field.
-        const RESULT_NO_CREDENTIAL: u8 = 1;
-        let mut body = [0u8; mux::PEER_IDENTITY_FIXED_LEN - 4];
-        body[0] = RESULT_NO_CREDENTIAL;
+        let mut body = [0u8; peer_identity::PAYLOAD_FIXED - 4];
+        body[0] = peer_identity::result::NO_CREDENTIAL;
         if !mux_emit(
             sys,
             s.app_out,

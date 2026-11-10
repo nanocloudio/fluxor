@@ -50,11 +50,6 @@ use crate::kernel::sys::hal;
 
 const E_INVAL: i32 = errno::EINVAL;
 const E_NOSYS: i32 = errno::ENOSYS;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const E_NOMEM: i32 = errno::ENOMEM;
 
 // ============================================================================
 // Syscall Table
@@ -130,7 +125,7 @@ unsafe extern "C" fn syscall_provider_open(
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_open") {
         return crate::kernel::sys::errno::EACCES;
     }
-    // INTERNAL_DISPATCH_BUCKET (0x000C) is kernel-internal only — module
+    // INTERNAL_DISPATCH_BUCKET (the `kernel` contract) is kernel-internal only — module
     // code must use the public platform contracts (PLATFORM_NIC_RING,
     // PLATFORM_DMA, PLATFORM_DMA_FD) for handle-returning platform ops.
     if contract as u16 == crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET {
@@ -177,20 +172,20 @@ unsafe extern "C" fn syscall_provider_call(
     // fds. Non-channel contracts hand out tagged fds so `contract_of`
     // produces an unambiguous result per handle.
     //
-    // A kernel primitive (the 0x0Cxx class) is routed by its opcode ahead of
+    // A kernel primitive (a class-routed contract) is routed by its opcode ahead of
     // any handle (`provider::provider_call`), so it is granted by its class
     // too: LOG_WRITE carries a log level in the handle slot, and checking a
     // level-3 log against whatever handle happens to be number 3 refuses it.
     let class = ((op >> 8) & 0xFF) as u16;
-    let contract = if class == crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET {
-        class
+    let contract = if crate::abi::registry::op_routes_to_kernel(op) {
+        crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET
     } else {
         crate::kernel::module::provider::contract_of(handle).unwrap_or(class)
     };
     if let Some(rc) = check_contract_grant(contract) {
         return rc;
     }
-    // Privileged 0x0Cxx opcodes also require the matching permission bit.
+    // Privileged opcodes also require the matching permission bit.
     if let Some(rc) = check_privileged_internal_op(op) {
         return rc;
     }
@@ -219,7 +214,12 @@ unsafe extern "C" fn syscall_provider_call_sel(
     // The contract is the opcode's class byte (same rule as the handle=-1
     // path); grant-check the caller against it, then apply the same
     // open-class admission gate `provider_call` uses.
-    let c = ((op >> 8) & 0xFF) as u16;
+    let class = ((op >> 8) & 0xFF) as u16;
+    let c = if crate::abi::registry::op_routes_to_kernel(op) {
+        crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET
+    } else {
+        class
+    };
     if let Some(rc) = check_contract_grant(c) {
         return rc;
     }
@@ -255,7 +255,7 @@ unsafe extern "C" fn syscall_provider_query(
     if let Some(rc) = check_contract_grant(contract) {
         return rc;
     }
-    // Queries against privileged 0x0Cxx keys require the same permission
+    // Queries against privileged keys require the same permission
     // bit as `provider_call` for those opcodes.
     if let Some(rc) = check_privileged_internal_op(key) {
         return rc;
@@ -293,18 +293,6 @@ fn syscall_table() -> &'static SyscallTable {
 
 /// Get a reference to the full (unfiltered) syscall table for passing to PIC modules
 pub fn get_syscall_table() -> &'static SyscallTable {
-    syscall_table()
-}
-
-// ============================================================================
-// Capability-Filtered Syscall Tables
-// ============================================================================
-
-/// Get the syscall table for a given module type.
-///
-/// All modules get the same table; per-contract capability enforcement
-/// happens at `provider_*` dispatch time (see `check_contract_grant`).
-pub fn get_table_for_module_type(_module_type: u8) -> &'static SyscallTable {
     syscall_table()
 }
 
@@ -367,21 +355,7 @@ fn admission_closed(surface: &'static str) -> bool {
 /// buffer-acquire on open channels) are deliberately absent: a draining
 /// owner must still flush in-flight work to completion.
 fn admission_class_op(op: u32) -> bool {
-    use crate::abi::contracts::storage::fs;
-    use crate::abi::kernel_abi::{channel, event, timer};
-    matches!(
-        op,
-        // New channels / endpoints (accept = new connection admission).
-        channel::OPEN | channel::CONNECT | channel::BIND | channel::LISTEN | channel::ACCEPT
-        // Timer create + arm: cancelling timers plus this gate is the
-        // operational definition of "autonomous producers stop".
-        | timer::CREATE | timer::SET
-        // New wake sources.
-        | event::CREATE | event::BIND_IRQ
-        // Filesystem opens (read tier and write tier — both admit a new
-        // held resource; established fds keep working).
-        | fs::OPEN | fs::OPENDIR | fs::OPEN_CREATE
-    )
+    crate::abi::registry::op_admits(op)
 }
 
 pub fn channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
@@ -476,6 +450,16 @@ pub fn init_providers() {
     // holds its key. Consumers never name a platform — they read
     // PROBE/TIER/DESCRIBE.
     provider::register(dev_class::KEY_VAULT, key_vault_provider_dispatch);
+    provider::register(
+        crate::abi::registry::metal_device::ID,
+        crate::kernel::module::metal_device::dispatch,
+    );
+    // The vault's durable store is the same router's other surface; its ops
+    // require the `vault_store` permission.
+    provider::register(
+        crate::abi::registry::vault_store::ID,
+        key_vault_provider_dispatch,
+    );
 
     // Handle-scoped vtables for the kernel-owned contracts. Tracked
     // handles route through the vtable; handle=-1 globals fall through
@@ -772,9 +756,74 @@ unsafe fn key_vault_provider_dispatch(
 // Generic Device Call / Query
 // ============================================================================
 
-/// Generic device call — dispatches to per-class implementations via opcode.
+/// The `required_caps` bit of a contract.
+const fn bit(contract: u16) -> u64 {
+    1u64 << contract
+}
+
+// Storage family: a service-tier module may reach the storage contracts
+// on the same footing as FS (already in the masks below) when — and only
+// when — it declares them in `[[resources]]` (the manifest gate in
+// `check_contract_grant` remains authoritative). This lets a service-tier
+// backend (e.g. an emulator asset bank) resolve an object
+// handle via `storage.object`/`storage.namespace` without being
+// mis-typed as a CAP_FULL `Protocol` module just to get the grant.
+const STORAGE_FAMILY: u64 = {
+    use crate::kernel::module::provider::contract as ct;
+    bit(ct::STORAGE_NAMESPACE) | bit(ct::STORAGE_OBJECT)
+};
+
+/// What every service tier may reach. PLATFORM_NIC_RING, PLATFORM_DMA,
+/// PLATFORM_DMA_FD, PCIE_DEVICE and USB_HOST are permitted at every service
+/// tier so a driver's `[[resources]]` declaration is what actually grants
+/// access; the per-opcode permission then gates the individual ops on top —
+/// `platform_raw` for the raw register surfaces, and `usb_host` for the
+/// kernel-mediated USB host ops, which carry their own grant. PROC, WORKLOAD,
+/// TRUST, NET_POLICY, HOST_MOUNT and NET_ROUTE are in the ceiling so the
+/// modules that serve a node (sector's `do`, the workload manager, `tls`, an
+/// applier, a mount actuator, the node agent) can declare them; their
+/// privileged ops additionally require `platform_raw` (see
+/// `privileged_op_permission`). The manifest `[[resources]]` gate still
+/// grants per module: these are ceilings, not grants.
+const SERVICE_CONTRACTS: u64 = {
+    use crate::kernel::module::provider::contract as ct;
+    bit(ct::INTERNAL_DISPATCH_BUCKET)
+        | bit(ct::CHANNEL)
+        | bit(ct::TIMER)
+        | bit(ct::BUFFER)
+        | bit(ct::EVENT)
+        | bit(ct::KEY_VAULT)
+        | bit(crate::abi::registry::vault_store::ID)
+        | bit(ct::FS)
+        | bit(ct::PLATFORM_NIC_RING)
+        | bit(ct::PLATFORM_DMA)
+        | bit(ct::PLATFORM_DMA_FD)
+        | bit(ct::PCIE_DEVICE)
+        | bit(crate::abi::registry::metal_device::ID)
+        | bit(ct::USB_HOST)
+        | STORAGE_FAMILY
+        | bit(crate::abi::registry::proc::ID)
+        | bit(ct::WORKLOAD)
+        | bit(ct::TRUST)
+        | bit(ct::NET_POLICY)
+        | bit(ct::HOST_MOUNT)
+        | bit(ct::NET_ROUTE)
+};
+
+/// Per-cap-class contract ceiling. Indexed by
+/// `scheduler::current_module_cap_class()`. This is a ceiling, NOT a grant:
+/// `check_contract_grant`'s manifest gate still requires each non-infra
+/// contract to be declared.
 ///
-/// The opcode's upper byte identifies the device class, the lower byte
+/// `pub` so the cap-class policy can be pinned by the harness test
+/// `tests/harness/tests/kernel_permissions.rs`.
+pub const CAP_CONTRACT_MASK: [u64; 4] = [
+    SERVICE_CONTRACTS, // CAP_SERVICE
+    SERVICE_CONTRACTS | bit(crate::kernel::module::provider::contract::HAL_PIO), // CAP_SERVICE_PIO
+    SERVICE_CONTRACTS | bit(crate::kernel::module::provider::contract::HAL_GPIO), // CAP_SERVICE_GPIO
+    u64::MAX, // CAP_FULL: any contract
+];
+
 /// Per-contract capability enforcement.
 ///
 /// Returns `Some(E_NOSYS)` when the calling module is not permitted to
@@ -796,110 +845,21 @@ unsafe fn key_vault_provider_dispatch(
 ///    allow-list (below) or in the module's declared `required_caps`
 ///    set. Modules that declare nothing get nothing beyond infra +
 ///    whatever the tier mask opens.
-// Storage family: a service-tier module may reach the storage contracts
-// on the same footing as FS (already in the masks below) when — and only
-// when — it declares them in `[[resources]]` (the manifest gate in
-// `check_contract_grant` remains authoritative). This lets a service-tier
-// backend (e.g. an emulator asset bank) resolve an object
-// handle via `storage.object`/`storage.namespace` without being
-// mis-typed as a CAP_FULL `Protocol` module just to get the grant.
-// STORAGE_NAMESPACE = 0x13, STORAGE_OBJECT = 0x14 — both read-only.
-const STORAGE_FAMILY: u64 = (1u64
-    << crate::kernel::module::provider::contract::STORAGE_NAMESPACE as u64)
-    | (1u64 << crate::kernel::module::provider::contract::STORAGE_OBJECT as u64);
-
-/// Per-cap-class contract ceiling. Indexed by
-/// `scheduler::current_module_cap_class()`. Bits 7 / 8 / 17 / 18 / 21
-/// (PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, PCIE_DEVICE,
-/// USB_HOST) are permitted at every service tier so a driver's
-/// `[[resources]]` declaration is what actually grants access; the
-/// per-opcode permission then gates the individual ops on top —
-/// `platform_raw` for the raw register surfaces, and `usb_host` for the
-/// kernel-mediated USB host ops, which carry their own grant.
-/// This is a ceiling, NOT a grant: `check_contract_grant`'s manifest gate
-/// still requires each non-infra contract to be declared.
-///
-/// `pub` so the cap-class policy can be pinned by an out-of-tree harness
-/// test (`tests/harness/tests/kernel_permissions.rs`) — production `src/`
-/// keeps no inline tests (enforced by `tools/tests/src_shape_no_inline_tests`).
-/// PROC (0x16, bit 22) — the host process-executor contract. In the service-tier
-/// ceilings so an app/Source/Transformer module (e.g. sector's `do`) CAN declare it; this
-/// is a ceiling only, the manifest `[[resources]]` gate still grants per-module.
-const PROC_CONTRACT: u64 = 1u64 << 0x16;
-/// WORKLOAD (0x1A, bit 26) — the platform-neutral isolated-workload surface,
-/// the sole host-isolation contract. Service-tier ceiling so a node module (the workload manager) CAN declare
-/// it; the manifest `[[resources]]` gate still grants per-module, AND every
-/// 0x1Axx op additionally requires the `platform_raw` permission (spawning
-/// isolated workloads is privileged). Ceiling only.
-const WORKLOAD_CONTRACT: u64 = 1u64 << 0x1A;
-/// TRUST (0x1D, bit 29) — the platform's certificate-chain verdict. In the
-/// service-tier ceilings so a foundation module (`tls`) can declare it; the
-/// manifest `[[resources]]` gate still grants per-module. No `platform_raw`
-/// companion: asking whether a chain is good is not a privileged act, and
-/// nothing crosses the boundary that a caller did not already hold.
-const TRUST_CONTRACT: u64 = 1u64 << 0x1D;
-/// NET_POLICY (0x1E, bit 30) — packet policy and service NAT. In the
-/// service-tier ceilings so an applier module can declare it; REPLACE and
-/// CLEAR additionally require `platform_raw` (see `privileged_op_permission`),
-/// because rewriting the host's packet policy is not a lesser privilege than
-/// spawning a workload. CAPS / READ / PROBE are not privileged: an in-graph
-/// enforcer reads the table it enforces.
-const NET_POLICY_CONTRACT: u64 = 1u64 << 0x1E;
-/// HOST_MOUNT (0x1F, bit 31) — a Linux node mounting a block device under the
-/// operator's mount root for its workloads. In the service-tier ceilings so a
-/// node's mount actuator can declare it; MOUNT and UMOUNT additionally require
-/// `platform_raw`, PRIV and ROOT are reads.
-const HOST_MOUNT_CONTRACT: u64 = 1u64 << 0x1F;
-/// NET_ROUTE (0x20, bit 32) — the node's segments, peer routes and held
-/// addresses. In the service-tier ceilings so the node agent can declare it;
-/// its table ops additionally require `platform_raw` (see
-/// `privileged_op_permission`) and every op the node's authority (the
-/// provider checks it). REPORT and TAKE are the node's network-stack module's
-/// side and are admitted by the provider from that module alone.
-const NET_ROUTE_CONTRACT: u64 = 1u64 << 0x20;
-pub const CAP_CONTRACT_MASK: [u64; 4] = [
-    0x0027_1FE1
-        | STORAGE_FAMILY
-        | PROC_CONTRACT
-        | WORKLOAD_CONTRACT
-        | TRUST_CONTRACT
-        | NET_POLICY_CONTRACT
-        | HOST_MOUNT_CONTRACT
-        | NET_ROUTE_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST + NET_POLICY + HOST_MOUNT + NET_ROUTE
-    0x0027_1FF1
-        | STORAGE_FAMILY
-        | PROC_CONTRACT
-        | WORKLOAD_CONTRACT
-        | TRUST_CONTRACT
-        | NET_POLICY_CONTRACT
-        | HOST_MOUNT_CONTRACT
-        | NET_ROUTE_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
-    0x0027_1FE3
-        | STORAGE_FAMILY
-        | PROC_CONTRACT
-        | WORKLOAD_CONTRACT
-        | TRUST_CONTRACT
-        | NET_POLICY_CONTRACT
-        | HOST_MOUNT_CONTRACT
-        | NET_ROUTE_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
-    u64::MAX, // CAP_FULL: any contract
-];
-
 unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     use crate::kernel::module::provider::contract as ct;
 
-    // host_process (0x1B) is the workload contract's Linux host-class companion:
+    // host_process is the workload contract's Linux host-class companion:
     // the READ/EXEC/TTY ops act
     // on a workload the module already created, so they carry the SAME
     // `requires_contract = "workload"` grant (see provider::contract::HOST_PROCESS).
-    // Without this the opcode-class-byte gate would demand a separate 0x1B bit
-    // that no manifest can declare — `tools/src/manifest.rs` has no name mapping
-    // to 0x1B — so every host-process op fails ENOSYS.
+    // Without this the opcode-class-byte gate would demand a separate
+    // host_process bit that no manifest can declare (the registry does not
+    // let a manifest name it), so every host-process op would fail ENOSYS.
     //
     // The remap covers the CONTRACT grant only. `platform_raw` is required for
-    // this class by its own arm in `privileged_op_permission` (0x1B00..=0x1BFF),
-    // which must stay in step with the 0x1A arm: executing a process and opening
-    // a PTY on the host is not a lesser privilege than creating the workload.
+    // this class by the registry (`unlisted = "platform_raw"` on both):
+    // executing a process and opening a PTY on the host is not a lesser
+    // privilege than creating the workload.
     let contract = if contract == ct::HOST_PROCESS {
         ct::WORKLOAD
     } else {
@@ -926,25 +886,24 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     }
 
     // Infra contracts are implicit grants — kernel services (channel,
-    // timer, buffer, event, key_vault) plus the kernel-primitive 0x0Cxx
-    // transport bucket (LOG_WRITE, HANDLE_POLL, RANDOM_FILL, ARENA_GET,
-    // BIND_IRQ, …) are available to any module regardless of manifest.
-    // Privileged 0x0Cxx opcodes (bridge, monitor, reconfigure, flash
-    // raw, backing-provider registration, platform MMIO/DMA/PCIe, …)
-    // are gated separately by `check_privileged_internal_op` against
-    // the manifest's `permissions = [...]` bitmap. Bit 12 below is the
-    // dispatch bucket for 0x0Cxx routing, not a public contract id.
+    // timer, buffer, event, key_vault) plus the kernel's own contract,
+    // which every class-routed op reaches (LOG_WRITE, HANDLE_POLL,
+    // RANDOM_FILL, ARENA_GET, …) — are available to any module regardless
+    // of manifest. Privileged class-routed ops (bridge, monitor,
+    // reconfigure, flash raw, platform MMIO/DMA/PCIe, …) are gated
+    // separately by `check_privileged_internal_op` against the manifest's
+    // `permissions = [...]` bitmap.
     //
     // PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, and PCIE_DEVICE
     // are public contracts subject to the same declare-to-use rule as
     // HAL_* — they are NOT in this list.
-    const INFRA_CONTRACTS: u64 = (1u64 << 0)              |  // COMMON / cross-class
-        (1u64 << ct::CHANNEL)    |
-        (1u64 << ct::TIMER)      |
-        (1u64 << ct::BUFFER)     |
-        (1u64 << ct::EVENT)      |
-        (1u64 << 0x0C)           |  // 0x0Cxx transport bucket (implicit routing)
-        (1u64 << ct::KEY_VAULT);
+    const INFRA_CONTRACTS: u64 = bit(ct::INTERNAL_DISPATCH_BUCKET)
+        | bit(ct::CHANNEL)
+        | bit(ct::TIMER)
+        | bit(ct::BUFFER)
+        | bit(ct::EVENT)
+        | bit(ct::KEY_VAULT)
+        | bit(crate::abi::registry::vault_store::ID);
 
     // Manifest gate: every non-infra contract must be declared in the
     // module's `[[resources]]` list. Channel-only consumers and app
@@ -961,238 +920,26 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     None
 }
 
-/// Fine-grained permission categories. Each privileged 0x0Cxx opcode
+/// Fine-grained permission categories. Each privileged opcode
 /// maps to exactly one category; a module must carry the corresponding
 /// bit in its manifest `permissions = [...]` list to reach that opcode.
-///
-/// Bit layout is shared with `tools/src/manifest.rs` — keep in sync.
 pub mod permission {
-    // 16-bit bitmap, bits 11.. free. Bit layout is shared with
-    // `tools/src/manifest.rs` — keep the two in sync.
-    pub const RECONFIGURE: u16 = 1 << 0;
-    pub const FLASH_RAW: u16 = 1 << 1;
-    pub const BACKING_PROVIDER: u16 = 1 << 2;
-    pub const PLATFORM_RAW: u16 = 1 << 3;
-    pub const MONITOR: u16 = 1 << 4;
-    pub const BRIDGE: u16 = 1 << 5;
-    /// Kernel-mediated PCIe device binding (bind/config/BAR/MSI/info on a
-    /// validated device handle) — distinct from raw MMIO/DMA (`platform_raw`).
-    pub const PCIE_DEVICE: u16 = 1 << 6;
-    /// DMA-buffer allocation from the kernel's bounded DMA arena + the cache
-    /// maintenance on those buffers — narrower than raw register poke
-    /// (`platform_raw` still gates `MMIO_READ32`/`MMIO_WRITE32`).
-    pub const DMA: u16 = 1 << 7;
-    /// Read-only telemetry-ring drain (`TLM_SUBSCRIBE`/`DRAIN`/`STATS`). Strictly
-    /// read-only — deliberately NOT `monitor`, which also grants `FAULT_RAISE`.
-    pub const OBSERVE: u16 = 1 << 8;
-    /// Kernel-mediated USB host binding (`BIND`, `OPEN_ENDPOINT`, the transfer
-    /// ops, `RELEASE`) on a validated controller handle.
-    ///
-    /// Deliberately distinct from `platform_raw`.
-    /// A USB host driver needs a controller handle the kernel validated, not
-    /// the ability to poke arbitrary MMIO — and granting the latter to get the
-    /// former hands every such driver the whole address space. The same
-    /// separation `pcie_device` already makes.
-    pub const USB_HOST: u16 = 1 << 9;
-    /// Keep the key vault's durable image (`abi::internal::vault_store`):
-    /// the module holding it sees every persisted record, sealed or (under
-    /// seal mode `none`) not, and decides what reaches the medium.
-    pub const VAULT_STORE: u16 = 1 << 10;
+    pub use crate::abi::registry::permission::*;
 
+    /// The manifest name of one permission bit, for the log.
     pub fn name(bit: u16) -> &'static str {
-        match bit {
-            RECONFIGURE => "reconfigure",
-            FLASH_RAW => "flash_raw",
-            BACKING_PROVIDER => "backing_provider",
-            PLATFORM_RAW => "platform_raw",
-            MONITOR => "monitor",
-            BRIDGE => "bridge",
-            PCIE_DEVICE => "pcie_device",
-            DMA => "dma",
-            OBSERVE => "observe",
-            USB_HOST => "usb_host",
-            VAULT_STORE => "vault_store",
-            _ => "<unknown>",
-        }
+        crate::abi::registry::permission::name(bit).unwrap_or("<unknown>")
     }
 }
 
-/// Classify a 0x0Cxx opcode into its required permission category.
+/// Classify an opcode into its required permission category.
 /// Returns `None` for implicit primitives (every module may call them).
 /// Opcode → category is authoritative: when a new opcode is added in
 /// `modules/sdk/internal/*` or `modules/sdk/platform/*`, it must be
 /// classified here or it falls through to `PLATFORM_RAW` (most
 /// restrictive, avoiding accidental privilege leakage).
 fn privileged_op_permission(op: u32) -> Option<u16> {
-    use permission::*;
-    // USB host (0x15xx). These are kernel-mediated ops on a controller
-    // handle the kernel validated — BIND, OPEN_ENDPOINT, the transfer ops,
-    // RELEASE — so they carry their own grant rather than falling through to
-    // `platform_raw`.
-    // A `platform_raw` fallback would be too wide: a USB host driver needs a
-    // validated handle, not arbitrary MMIO, and granting the latter to obtain
-    // the former hands every such driver the entire address space.
-    // `pcie_device` already draws this line for the same reason.
-    if (0x1500..=0x15FF).contains(&op) {
-        return Some(USB_HOST);
-    }
-    // The key vault's durable store (0x1040..): only its keeper.
-    if crate::abi::internal::vault_store::is_store_op(op) {
-        return Some(VAULT_STORE);
-    }
-    // Isolated-workload surface (workload, 0x1Axx) — spawning owner-bound
-    // isolated workloads is privileged; gated by the same
-    // platform_raw bit as raw DMA/MMIO/PCIe.
-    //
-    // Except the network provider's side of a workload's net lanes
-    // (NET_PROVIDE / NET_LANE_TAKE / NET_LANE_ADMIT / NET_RESOLVER), which
-    // `ip` calls on bare metal — a parser of untrusted frames that must not
-    // hold platform_raw. They create nothing: the first claimant becomes the
-    // lane provider (EBUSY while another holds the role), only it may take a
-    // queued lane, ask an admission or read an owner's name-service context,
-    // and the caller still needs the declared workload contract grant.
-    {
-        use crate::abi::contracts::workload as wl;
-        if op == wl::NET_PROVIDE
-            || op == wl::NET_LANE_TAKE
-            || op == wl::NET_LANE_ADMIT
-            || op == wl::NET_RESOLVER
-        {
-            return None;
-        }
-    }
-    if (0x1A00..=0x1AFF).contains(&op) {
-        return Some(PLATFORM_RAW);
-    }
-    // Host-process mechanics (host_process, 0x1Bxx) — EXEC / TTY_* / READ run
-    // and drive a real process on the Linux host, so they carry the same
-    // platform_raw bar as the 0x1A ops that created the workload. The contract
-    // grant for this class is the workload one (see `check_contract_grant`);
-    // this is the permission half, and dropping it would leave process
-    // execution reachable with a strictly weaker declaration than workload
-    // creation.
-    if (0x1B00..=0x1BFF).contains(&op) {
-        return Some(PLATFORM_RAW);
-    }
-    // net.policy (0x1Exx) REPLACE / CLEAR rewrite the host's packet policy:
-    // platform_raw, like the workload ops. PROBE / CAPS / READ are reads.
-    if op == 0x1E02 || op == 0x1E03 {
-        return Some(PLATFORM_RAW);
-    }
-    // timer::DISCIPLINE anchors the wall clock every credential validity
-    // window is judged against: platform_raw, unlike the timer reads.
-    if op == 0x060A {
-        return Some(PLATFORM_RAW);
-    }
-    // host_mount (0x1Fxx) MOUNT / UMOUNT / PROJECT / REMOVE_TREE /
-    // GROUP_TREE / MKDIR_MODE change the host's mounts and files:
-    // platform_raw. PRIV and ROOT are reads.
-    if matches!(op, 0x1F01 | 0x1F02 | 0x1F04 | 0x1F05 | 0x1F06 | 0x1F07) {
-        return Some(PLATFORM_RAW);
-    }
-    // net.route (0x20xx) SEGMENTS / ROUTES / HOLD rewrite how the node
-    // forwards and what it answers for, and READ reports it: platform_raw.
-    // PROBE and CAPS are not privileged. REPORT and TAKE are the node's
-    // network-stack module's side (a parser of untrusted frames that must not
-    // hold platform_raw): the provider admits them from the registered
-    // net-identity provider alone.
-    {
-        use crate::abi::contracts::net::route as nr;
-        if matches!(op, nr::SEGMENTS | nr::ROUTES | nr::HOLD | nr::READ) {
-            return Some(PLATFORM_RAW);
-        }
-    }
-    if !(0x0C00..=0x0CFF).contains(&op) {
-        return None;
-    }
-    match op {
-        // ── Implicit primitives (no permission needed) ──────────────────
-        // kernel_abi primitives: STREAM_TIME, GRAPH queries, ISR metrics,
-        // runtime-params store/delete/clear (per-module-scoped),
-        // ARENA_GET / BIND_IRQ / REPORT_LATENCY family, LOG_WRITE,
-        // HANDLE_POLL, RANDOM_FILL, SYS_CLOCK_HZ, paged-arena GET/PREFAULT,
-        // BOOT_INCARNATION.
-        // LEDGER_DENY — admitted by provider identity, not a permission:
-        // only the module serving the pool may charge refusals to it.
-        0x0C24
-        | 0x0C2A..=0x0C2E // FLASH_LAYOUT / PROGRAM_INFO / PROGRAM_READ / SLOT_SIGNING_ROOT / SLOT_ADMITTED
-        | 0x0C2F // BOOT_INCARNATION
-        | 0x0C30
-        | 0x0C31
-        | 0x0C33
-        | 0x0C34
-        | 0x0C35
-        | 0x0C36
-        | 0x0C3A..=0x0C3D
-        | 0x0C3E // TLM_EMIT — implicit primitive like LOG_WRITE (any module emits)
-        | 0x0C3F // ELASTIC_ALLOC — Tier B chunk grant (denial is the gate)
-        | 0x0C40
-        | 0x0C41
-        | 0x0C42
-        | 0x0C43
-        | 0x0C44
-        | 0x0C45
-        | 0x0C46
-        | 0x0C4B
-        | 0x0C4C
-        | 0x0C50
-        | 0x0C51
-        | 0x0C65
-        | 0x0CE8
-        | 0x0CF8
-        | 0x0CFA => None,
-
-        // ── flash_raw: flash ERASE / PROGRAM / sideband / store enable ──
-        0x0C10 | 0x0C37 | 0x0C38 | 0x0C39 => Some(FLASH_RAW),
-
-        // ── observe: read-only telemetry-ring drain (TLM_SUBSCRIBE/DRAIN/STATS).
-        //    TLM_EMIT is above in the implicit-primitives arm. Strictly
-        //    read-only — NOT `monitor` (which also grants FAULT_RAISE). ──
-        0x0C4D..=0x0C4F => Some(OBSERVE),
-
-        // ── monitor: FAULT_MONITOR_*, STEP_HISTOGRAM, PAGED_ARENA_STATS ─
-        0x0C52..=0x0C5F | 0x0CF9 => Some(MONITOR),
-
-        // ── reconfigure: graph slot commit, boot counter, FMP routing ──
-        //    SLOT_CAPACITY (0x0C23) sits outside the full block, beside it in
-        //    kind: the module-slot count reconfigure and monitor size by. ──
-        0x0C23 | 0x0C67..=0x0C6F => Some(RECONFIGURE),
-
-        // ── live-mutation block (APPLY_ADD/FREE_OWNER + owner PAUSE/
-        //    RESUME, 0x0C47..=0x0C4A): dispatched by the reconfigure kernel
-        //    arms in system_provider_dispatch. Classified PLATFORM_RAW via the
-        //    catch-all below — no dedicated arm needed. Deliberately OUTSIDE
-        //    the peripheral range (0x0C70..) so they never shadow rp PIO. ──
-
-        // ── bridge: cross-domain WRITE/READ/POLL/INFO ──────────────────
-        0x0CE0..=0x0CE3 => Some(BRIDGE),
-
-        // ── dma: DMA-buffer alloc (contig/streaming) + cache maintenance on
-        //    those buffers (0x0CE6/0x0CE7/0x0CEA/0x0CEB/0x0CEC). MMIO_READ32/
-        //    WRITE32 (0x0CE4/0x0CE5) stay platform_raw — arbitrary register
-        //    access, not a bounded arena. ──
-        0x0CE6 | 0x0CE7 | 0x0CEA | 0x0CEB | 0x0CEC => Some(DMA),
-
-        // ── pcie_device: kernel-mediated device binding. BIND/CLOSE/
-        //    CFG_READ32/CFG_WRITE32/BAR_MAP/MSI_ALLOC/INFO on a validated
-        //    handle (0x0CA0..0x0CA6) — the kernel mediates every access, so
-        //    this is a narrower grant than raw MMIO/DMA (`platform_raw`). ──
-        0x0CA0..=0x0CA6 => Some(PCIE_DEVICE),
-
-        // ── backing_provider: ARENA_BULK, BACKING_PROVIDER_ENABLE, ─────
-        //     ARENA_REGISTER, ARENA_READ, ARENA_WRITE, ARENA_FLUSH. ─────
-        0x0CE9 | 0x0CED | 0x0CEE | 0x0CEF | 0x0CFE | 0x0CFF => Some(BACKING_PROVIDER),
-
-        // ── platform_raw: everything else in 0x0Cxx ────────────────────
-        // Explicit coverage for clarity:
-        //   0x0C60..0x0C63  PWM raw pin/slice bridges
-        //   0x0C64..0x0C66  log ring drain / raw UART / raw USB writes
-        //   0x0C70..0x0CCF  raw peripheral register bridges (I2C, SPI, ADC, UART, PIO)
-        //   0x0CD0..0x0CDF  PCIe MSI controller
-        //   0x0CE4..0x0CE5  MMIO_READ32/WRITE32 (raw register access)
-        //   0x0CF0..0x0CF7  NIC bar/ring/cfg, PCIE_RESCAN
-        _ => Some(PLATFORM_RAW),
-    }
+    crate::abi::registry::op_permission(op)
 }
 
 /// Enforce privileged-opcode gating by fine-grained permission category.
@@ -1238,24 +985,6 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
         dev_channel::CLOSE => {
             channel::syscall_channel_close(handle);
             0
-        }
-        dev_channel::READ => {
-            if arg.is_null() {
-                return E_INVAL;
-            }
-            channel::syscall_channel_read(handle, arg, arg_len)
-        }
-        dev_channel::WRITE => {
-            if arg.is_null() {
-                return E_INVAL;
-            }
-            channel::syscall_channel_write(handle, arg as *const u8, arg_len)
-        }
-        dev_channel::POLL => {
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            channel::syscall_channel_poll(handle, *arg as u32)
         }
         dev_channel::PORT => {
             if arg.is_null() || arg_len < 2 {
@@ -1399,9 +1128,7 @@ fn discipline_wall_clock(unix_us: u64, mono_us: u64, err_us: u64) -> i32 {
         all(feature = "rp", not(feature = "chip-rp2040"))
     ))]
     {
-        // SAFETY: takes no pointers; the kernel timer is initialised before
-        // any module runs.
-        let now = unsafe { syscall_micros() };
+        let now = hal::now_micros();
         let rc = crate::kernel::sys::time_sync::discipline(unix_us, mono_us, err_us, now);
         if rc == 0 {
             log::info!(
@@ -1429,9 +1156,7 @@ fn discipline_wall_clock(unix_us: u64, mono_us: u64, err_us: u64) -> i32 {
 pub(crate) fn trusted_unix_record() -> [u8; crate::abi::kernel_abi::trusted_time::LEN] {
     use crate::abi::kernel_abi::trusted_time as tt;
     let unix_ms = hal::now_unix_millis();
-    // SAFETY: takes no pointers; the kernel timer is initialised before any
-    // module or provider runs.
-    let monotonic_us = unsafe { syscall_micros() };
+    let monotonic_us = hal::now_micros();
 
     // What this platform can honestly claim.
     //
@@ -1540,7 +1265,7 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             if arg.is_null() || arg_len < 8 {
                 return E_INVAL;
             }
-            let ms = syscall_millis();
+            let ms = hal::now_millis();
             core::ptr::write_unaligned(arg as *mut u64, ms);
             0
         }
@@ -1548,7 +1273,7 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             if arg.is_null() || arg_len < 8 {
                 return E_INVAL;
             }
-            let us = syscall_micros();
+            let us = hal::now_micros();
             core::ptr::write_unaligned(arg as *mut u64, us);
             0
         }
@@ -1652,47 +1377,6 @@ pub fn register_dev_query_extension(f: ExtensionFn) {
     }
 }
 
-/// Shared helper for *_ENABLE registration syscalls. Validates that
-/// `arg` carries a 4-byte export hash, resolves the hash to a function
-/// address in the calling module, and returns `(fn_addr, state_ptr)`.
-/// Returns `None` on any validation failure.
-unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize, *mut u8)> {
-    use crate::kernel::exec::scheduler;
-    if arg.is_null() || arg_len < 4 {
-        return None;
-    }
-    let hash = core::ptr::read_unaligned(arg as *const u32);
-    let module_idx = scheduler::current_module_index();
-    let resolved =
-        crate::kernel::module::loader::resolve_export_for_module(module_idx, hash).unwrap_or(0);
-    if resolved == 0 {
-        // Diagnostic: log details once-per-hash so provider/store
-        // registration failures aren't silent. Gated by a static
-        // bit so the log ring doesn't flood on retry loops.
-        static mut LOGGED: u64 = 0;
-        let bit = (hash as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
-        let mask = 1u64 << (bit & 63);
-        if (LOGGED & mask) == 0 {
-            LOGGED |= mask;
-            let (_code, tbl, cnt) = scheduler::get_module_exports(module_idx);
-            log::warn!(
-                "[reg] resolve_export failed: hash={hash:#x} mod={module_idx} exp_tbl={tbl:?} exp_cnt={cnt}",
-            );
-        }
-        return None;
-    }
-    let state = scheduler::get_module_state(module_idx);
-    if state.is_null() {
-        static mut LOGGED_NULL_STATE: bool = false;
-        if !LOGGED_NULL_STATE {
-            LOGGED_NULL_STATE = true;
-            log::warn!("[reg] state-null: hash={hash:#x} mod={module_idx} resolved={resolved:#x}",);
-        }
-        return None;
-    }
-    Some((resolved, state))
-}
-
 /// `PROGRAM_INFO`, `PROGRAM_READ`, `SLOT_SIGNING_ROOT` and `SLOT_ADMITTED`:
 /// the calling module's own programs, the root graph slots are signed
 /// against, and the slots this boot admitted. A module names a program only
@@ -1776,20 +1460,44 @@ unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     n as i32
 }
 
+/// `kernel_abi::SIGNAL_CORE`: raise an SGI on one core.
+///
+/// # Safety
+/// `arg` holds `arg_len` readable bytes.
+unsafe fn signal_core(arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 2 {
+        return E_INVAL;
+    }
+    let (core, sgi) = (*arg, *arg.add(1));
+    #[cfg(feature = "aarch64-metal")]
+    {
+        if usize::from(core) >= crate::arch::aarch64::exception::MAX_CORES || sgi > 15 {
+            return E_INVAL;
+        }
+        crate::arch::aarch64::gic::send_sgi(u32::from(core), u32::from(sgi));
+        0
+    }
+    #[cfg(not(feature = "aarch64-metal"))]
+    {
+        let _ = (core, sgi);
+        E_NOSYS
+    }
+}
+
 unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::contracts::resource;
     use crate::abi::contracts::telemetry;
     use crate::abi::internal::diag;
-    use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
+    use crate::abi::internal::{bridge, monitor, reconfigure};
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
         ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, PAGED_ARENA_GET,
-        PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
-        SERIAL_WRITE,
+        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, RANDOM_FILL,
+        REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE, SIGNAL_CORE,
     };
     use crate::kernel::exec::scheduler;
     match opcode {
+        SIGNAL_CORE => signal_core(arg, arg_len),
         // ── Core primitives ──
         SELF_INDEX
         | OWNER_TAG
@@ -1845,10 +1553,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             }
             crate::kernel::bridge::bridge_dispatch(slot as usize, bridge_op, arg, arg_len)
         }
-        // ── Paged arena ──
-        PAGED_ARENA_GET | monitor::PAGED_ARENA_STATS | PAGED_ARENA_PREFAULT => {
-            handle_paged_arena_op(opcode, arg, arg_len)
-        }
         // ── Fault monitor ──
         monitor::FAULT_MONITOR_SUBSCRIBE
         | monitor::FAULT_MONITOR_POP
@@ -1858,8 +1562,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg, arg_len),
 
         // ── Live Reconfigure primitives (consumed by modules/reconfigure) ──
-        reconfigure::SELF_INDEX
-        | reconfigure::SET_PHASE
+        reconfigure::SET_PHASE
         | reconfigure::CALL_DRAIN
         | reconfigure::MARK_FINISHED
         | reconfigure::MODULE_COUNT
@@ -1867,10 +1570,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | reconfigure::MODULE_UPSTREAM
         | reconfigure::MODULE_DONE
         | reconfigure::SLOT_CAPACITY => handle_reconfigure_op(opcode, arg, arg_len),
-        // ── NVMe paged-arena backing registration (kernel-private
-        //    dispatch registry for a private backing interface) ──
-        provider_registry::BACKING_PROVIDER_ENABLE => handle_service_register(opcode, arg, arg_len),
-
         reconfigure::TRIGGER_REBUILD => {
             // arg = [config_ptr:usize, config_len:usize] (platform pointer size)
             let ptr_size = core::mem::size_of::<usize>();
@@ -1928,11 +1627,11 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         }
         // Owner pause/resume. Arms are cfg-gated OUT (not ENOSYS-stubbed) on
         // non-multitenant builds so the opcodes fall through to the platform
-        // extension. They live in the 0x0C47..=0x0C4A live-mutation block
+        // extension. They live in the `reconfigure::APPLY_ADD`..=`reconfigure::OWNER_RESUME` live-mutation block
         // (well clear of the peripheral register-bridge range), so on an rp
-        // build 0x0C49/0x0C4A reach the platform extension and are simply
+        // build `reconfigure::OWNER_PAUSE`/`reconfigure::OWNER_RESUME` reach the platform extension and are simply
         // unknown there, clear of the rp PIO SM_READ_REG/SM_ENABLE bridges at
-        // 0x0C72/0x0C73.
+        // `rp_raw::PIO_SM_READ_REG`/`rp_raw::PIO_SM_ENABLE`.
         #[cfg(feature = "multitenant")]
         reconfigure::OWNER_PAUSE => {
             // SAFETY: `arg`/`arg_len` describe a readable handle record.
@@ -1985,7 +1684,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // system_provider_dispatch category handlers
 // ============================================================================
 //
-// The 0x0Cxx opcode range is split across small category handlers below
+// The class-routed opcodes are split across small category handlers below
 // so the top-level match stays readable and each concern is local.
 
 /// Telemetry ring ops. `TLM_EMIT` is an implicit primitive (any module);
@@ -2269,12 +1968,9 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // pi5 `STATE_ARENA` (.bss) is linked sub-4GiB so this never trips;
             // a hosted (PIE) Linux process can place .bss above 4GiB, where
             // truncation would corrupt the module's arena base. Fail closed
-            // with a hard check. (PAGED_ARENA_GET carries a u64 base for
-            // callers that genuinely need >4GiB.)
+            // with a hard check.
             if (ptr as usize) > u32::MAX as usize {
-                log::error!(
-                    "[syscall] ARENA_GET: arena ptr {ptr:p} exceeds u32; use PAGED_ARENA_GET"
-                );
+                log::error!("[syscall] ARENA_GET: arena ptr {ptr:p} exceeds u32");
                 return E_INVAL;
             }
             if !arg.is_null() && arg_len >= 4 {
@@ -2401,7 +2097,6 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
     use crate::abi::internal::reconfigure;
     use crate::kernel::exec::scheduler;
     match opcode {
-        reconfigure::SELF_INDEX => scheduler::current_module_index() as i32,
         reconfigure::SET_PHASE => {
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
@@ -2561,65 +2256,6 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
     }
 }
 
-unsafe fn handle_paged_arena_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::internal::monitor::PAGED_ARENA_STATS;
-    use crate::abi::kernel_abi::{PAGED_ARENA_GET, PAGED_ARENA_PREFAULT};
-    use crate::kernel::exec::scheduler;
-    match opcode {
-        PAGED_ARENA_GET => {
-            let idx = scheduler::current_module_index();
-            let config = crate::kernel::pager::get_config(idx);
-            if !arg.is_null() && arg_len >= 20 {
-                let base = if config.active {
-                    config.base_vaddr as u64
-                } else {
-                    0
-                };
-                let size = if config.active {
-                    config.virtual_size as u64
-                } else {
-                    0
-                };
-                let status: u32 = if config.active { 1 } else { 0 };
-                let p = arg;
-                let base_bytes = base.to_le_bytes();
-                let size_bytes = size.to_le_bytes();
-                let status_bytes = status.to_le_bytes();
-                core::ptr::copy_nonoverlapping(base_bytes.as_ptr(), p, 8);
-                core::ptr::copy_nonoverlapping(size_bytes.as_ptr(), p.add(8), 8);
-                core::ptr::copy_nonoverlapping(status_bytes.as_ptr(), p.add(16), 4);
-            }
-            if config.active {
-                0
-            } else {
-                E_NOSYS
-            }
-        }
-        PAGED_ARENA_STATS => {
-            let idx = scheduler::current_module_index();
-            let stats = crate::kernel::pager::build_stats(idx);
-            let stats_size = core::mem::size_of::<crate::kernel::pager::PagedArenaStats>();
-            if !arg.is_null() && arg_len >= stats_size {
-                let src = &stats as *const _ as *const u8;
-                core::ptr::copy_nonoverlapping(src, arg, stats_size);
-                0
-            } else {
-                E_INVAL
-            }
-        }
-        PAGED_ARENA_PREFAULT => {
-            if arg.is_null() || arg_len < 8 {
-                return E_INVAL;
-            }
-            let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let idx = scheduler::current_module_index();
-            crate::kernel::pager::prefault(idx, offset, count) as i32
-        }
-        _ => E_NOSYS,
-    }
-}
-
 unsafe fn handle_diag_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::internal::diag;
     if arg.is_null() || arg_len == 0 {
@@ -2656,43 +2292,6 @@ pub static FAN_DIAG_HANDLER: core::sync::atomic::AtomicPtr<()> =
 
 pub fn register_fan_diag_handler(f: unsafe fn(*mut u8, usize) -> i32) {
     FAN_DIAG_HANDLER.store(f as *mut (), core::sync::atomic::Ordering::Release);
-}
-
-unsafe fn handle_service_register(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::internal::provider_registry;
-    let (f, state) = match resolve_register_target(arg, arg_len) {
-        Some(v) => v,
-        None => return E_INVAL,
-    };
-    match opcode {
-        provider_registry::BACKING_PROVIDER_ENABLE => {
-            let dispatch: crate::kernel::backing_provider::BackingProviderDispatchFn =
-                core::mem::transmute(f);
-            crate::kernel::backing_provider::register(dispatch, state);
-            0
-        }
-        _ => E_NOSYS,
-    }
-}
-
-// ============================================================================
-// Timer (millis / micros) — delegates to platform
-// ============================================================================
-
-/// # Safety
-/// `extern "C"` syscall ABI shim: takes no pointers and is safe to call
-/// from any context that has the kernel timer initialised. Marked
-/// `unsafe` only to match the `SyscallTable` signature.
-pub unsafe extern "C" fn syscall_millis() -> u64 {
-    hal::now_millis()
-}
-
-/// # Safety
-/// `extern "C"` syscall ABI shim: takes no pointers and is safe to call
-/// from any context that has the kernel timer initialised. Marked
-/// `unsafe` only to match the `SyscallTable` signature.
-pub unsafe extern "C" fn syscall_micros() -> u64 {
-    hal::now_micros()
 }
 
 // ============================================================================
@@ -2732,8 +2331,23 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
     use crate::kernel::ipc::fd;
     use crate::kernel::module::provider::contract as dev_class;
 
-    // Handle cross-class common queries (0x0000-0x00FF)
-    if key < 0x0100 {
+    // Cross-class common queries (`query_key::*`) apply to any handle; any
+    // other key is its contract's, by class.
+    let common = matches!(
+        key,
+        dev_query_key::CLASS
+            | dev_query_key::NAME
+            | dev_query_key::CAPABILITIES
+            | dev_query_key::STATE
+            | dev_query_key::ERROR_COUNT
+            | dev_query_key::HEAP_STATS
+            | dev_query_key::LAST_FENCE
+            | dev_query_key::CALLER_OWNER
+            | dev_query_key::CALLER_MODULE
+            | dev_query_key::MODULE_LIVE
+            | dev_query_key::EVENT_OWNER
+    );
+    if common {
         return match key {
             dev_query_key::CLASS => {
                 if out.is_null() || out_len < 1 {
@@ -2770,25 +2384,6 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
                     copy_len,
                 );
                 copy_len as i32
-            }
-            dev_query_key::FAULT_STATS => {
-                use crate::kernel::exec::step_guard::FaultStats;
-                let stats_size = core::mem::size_of::<FaultStats>();
-                if out.is_null() || out_len < stats_size {
-                    return E_INVAL;
-                }
-                let module_idx = if handle == -1 {
-                    crate::kernel::exec::scheduler::current_module_index()
-                } else {
-                    handle as usize
-                };
-                let stats = crate::kernel::exec::scheduler::get_fault_stats(module_idx);
-                core::ptr::copy_nonoverlapping(
-                    &stats as *const FaultStats as *const u8,
-                    out,
-                    stats_size,
-                );
-                stats_size as i32
             }
             dev_query_key::LAST_FENCE => last_fence_query(handle, out, out_len),
             dev_query_key::CALLER_OWNER => {
@@ -2899,15 +2494,7 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
             use crate::abi::kernel_abi::{DOWNSTREAM_LATENCY, GRAPH_SAMPLE_RATE};
             use crate::kernel::exec::scheduler;
             match key {
-                0x0C00 => {
-                    // Get kernel ABI version
-                    if out.is_null() || out_len < 4 {
-                        return E_INVAL;
-                    }
-                    *(out as *mut u32) = ABI_VERSION;
-                    0
-                }
-                0x0C30 => {
+                crate::abi::kernel_abi::STREAM_TIME => {
                     // STREAM_TIME: prefer a dedicated STREAM_CLOCK provider
                     // (hosts register one — the audio sink's clock — without
                     // any PIO hardware). If none is registered (bare-metal RP),
@@ -2915,9 +2502,9 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
                     // clock genuinely is a property of the PIO stream. handle=-1
                     // resolves to the first active stream (see
                     // `kernel_abi::STREAM_TIME`).
+                    use crate::abi::registry::pio::STREAM_TIME as PIO_STREAM_TIME;
+                    use crate::abi::registry::stream_clock::QUERY as STREAM_CLOCK_QUERY;
                     use crate::kernel::module::provider;
-                    const STREAM_CLOCK_QUERY: u32 = 0x1C00;
-                    const PIO_STREAM_TIME: u32 = 0x0407;
                     let rc = provider::dispatch(
                         provider::contract::STREAM_CLOCK,
                         handle,

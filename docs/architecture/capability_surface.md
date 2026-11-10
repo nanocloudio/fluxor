@@ -51,7 +51,7 @@ Source: `tools/src/manifest.rs`, `contracts/src/vocabulary.rs`.
 A module's `manifest.toml` separates four concerns into four fields:
 
 - top-level `provides = [...]` — services or storage surfaces this module
-  offers to consumers. Validated against `PROVIDER_CONTRACTS` plus
+  offers to consumers. Validated against the registry's manifest contracts plus
   `PROVIDER_SURFACES`; an unknown name fails the build with a
   did-you-mean hint.
 - top-level `capabilities = [...]` — role and surface capabilities the
@@ -59,7 +59,7 @@ A module's `manifest.toml` separates four concerns into four fields:
   Validated against `CAPABILITY_NAMES` and canonicalised to lowercase.
 - `[[resources]].requires_contract = "..."` — kernel or provider contracts
   the module needs at runtime (GPIO, SPI, PIO, channel, FS, timer,
-  platform DMA, and the rest of `PROVIDER_CONTRACTS`), with an `access`
+  platform DMA, and the rest of the registry's manifest contracts), with an `access`
   mode of `read`, `write`, `exclusive`, or `chain`. A claim on a contract
   with instance-keyed providers may name the provider it reaches, with at
   most one of `selector = "<volume>"` (one fixed volume),
@@ -327,7 +327,7 @@ Target-provided:
 | Capability | Meaning |
 |------------|---------|
 | `time.wall` | Calendar time (seconds since the Unix epoch) the platform can vouch for, as `timer::TRUSTED_UNIX` reports it. Fact `source`: `rtc`, `network_sync` or `signed_authority` — the strongest class the HAL reports `TRUSTED` for |
-| `trust.system` | Whether the platform will verify a certificate chain and answer for it — the `trust` contract (class `0x001D`). Carries no facts: a verifier either answers or it does not. True of the TARGET, not of the machine — a linux host whose root bundle is missing still answers, by refusing every chain |
+| `trust.system` | Whether the platform will verify a certificate chain and answer for it — the `trust` contract (class `0x0014`). Carries no facts: a verifier either answers or it does not. True of the TARGET, not of the machine — a linux host whose root bundle is missing still answers, by refusing every chain |
 
 Replication and streaming:
 
@@ -492,12 +492,12 @@ number.
 
 ## Provider Contracts and Surfaces
 
-Source: `contracts/src/vocabulary.rs`, `tools/src/config/generate.rs`,
+Source: `modules/sdk/abi/registry.toml`, `contracts/src/vocabulary.rs`, `tools/src/config/generate.rs`,
 `tools/src/config/validate.rs`.
 
-`PROVIDER_CONTRACTS` names the privileged operation families accepted in
-`[[resources]].requires_contract` and, for service providers, in
-`provides`:
+The ABI registry's contracts marked `manifest = true` name the privileged
+operation families accepted in `[[resources]].requires_contract` and, for
+service providers, in `provides`:
 
 ```
 gpio  spi  i2c  pio  channel  timer  platform_nic_ring  platform_dma
@@ -508,8 +508,8 @@ net_policy  host_mount  net_route
 
 Naming is lowercase `snake_case`, with the two storage contracts in their
 dotted spelling because they mirror the public semantic storage surfaces.
-The numeric dispatch IDs live in `fluxor-tools`
-(`manifest::contract_id_from_name`).
+Their numeric ids live beside them in the registry and reach the tools
+through the generated `abi::registry::contract_of_name`.
 
 `PROVIDER_SURFACES` extends the `provides` vocabulary with the storage
 surface family that providers advertise but that is not class-byte

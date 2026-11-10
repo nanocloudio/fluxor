@@ -38,16 +38,16 @@ pub const MODE_UDP_CLIENT: u8 = 3;
 // ============================================================================
 
 // GPIO
-pub const DEV_GPIO_CLAIM: u32 = 0x0100;
-pub const DEV_GPIO_SET_MODE: u32 = 0x0102;
-pub const DEV_GPIO_SET_LEVEL: u32 = 0x0104;
+pub const DEV_GPIO_CLAIM: u32 = super::abi::registry::gpio::CLAIM;
+pub const DEV_GPIO_SET_MODE: u32 = super::abi::registry::gpio::SET_MODE;
+pub const DEV_GPIO_SET_LEVEL: u32 = super::abi::registry::gpio::SET_LEVEL;
 
 // UART
-pub const DEV_UART_OPEN: u32 = 0x0D00;
-pub const DEV_UART_CLOSE: u32 = 0x0D01;
-pub const DEV_UART_WRITE: u32 = 0x0D02;
-pub const DEV_UART_READ: u32 = 0x0D03;
-pub const DEV_UART_POLL: u32 = 0x0D04;
+pub const DEV_UART_OPEN: u32 = super::abi::registry::uart::OPEN;
+pub const DEV_UART_CLOSE: u32 = super::abi::registry::uart::CLOSE;
+pub const DEV_UART_WRITE: u32 = super::abi::registry::uart::WRITE;
+pub const DEV_UART_READ: u32 = super::abi::registry::uart::READ;
+pub const DEV_UART_POLL: u32 = super::abi::registry::uart::POLL;
 
 // ============================================================================
 // Timing

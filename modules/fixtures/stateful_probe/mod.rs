@@ -2,7 +2,8 @@
 //!
 //! Block 0 of the source holds `[magic:4][epoch:4]`. Every start reads it,
 //! takes the epoch (0 when the magic is absent), adds one, writes the block
-//! back, flushes, and logs:
+//! back, flushes, reads it again to check the device returns what it was
+//! given, and logs:
 //!
 //! ```text
 //! [stateful_probe] epoch=<n>
@@ -54,10 +55,11 @@ const MAGIC: u32 = 0x5354_464C;
 const PH_READ: u8 = 0;
 const PH_WRITE: u8 = 1;
 const PH_FLUSH: u8 = 2;
-const PH_DONE: u8 = 3;
-const PH_FAILED: u8 = 4;
+const PH_VERIFY: u8 = 3;
+const PH_DONE: u8 = 4;
+const PH_FAILED: u8 = 5;
 
-name_table!(PHASE_NAMES = [b"read", b"write", b"flush", b"done", b"failed"]);
+name_table!(PHASE_NAMES = [b"read", b"write", b"flush", b"verify", b"done", b"failed"]);
 
 #[repr(C)]
 struct ProbeState {
@@ -249,6 +251,24 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             if rc < 0 {
                 fail(s, rc);
+                return 0;
+            }
+            s.phase = PH_VERIFY;
+            0
+        }
+        PH_VERIFY => {
+            let rc = s.blk.read(sys, 0, 1, s.block.as_mut_ptr());
+            if rc == E_AGAIN {
+                return 0;
+            }
+            if rc < 0 {
+                fail(s, rc);
+                return 0;
+            }
+            let magic = u32::from_le_bytes([s.block[0], s.block[1], s.block[2], s.block[3]]);
+            let epoch = u32::from_le_bytes([s.block[4], s.block[5], s.block[6], s.block[7]]);
+            if magic != MAGIC || epoch != s.epoch {
+                fail(s, E_IO);
                 return 0;
             }
             s.phase = PH_DONE;

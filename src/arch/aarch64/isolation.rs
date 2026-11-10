@@ -300,37 +300,13 @@ pub fn set_enabled(enabled: bool) {
 const EL0_FAIL_CLOSED: i32 = -14;
 
 // ========================================================================
-// Paged arenas: per-module L3 tables mapped page by page by the pager
+// L3 page tables
 // ========================================================================
 
 /// L3 page table (512 entries, each maps a 4KB page).
 #[derive(Clone, Copy)]
 #[repr(C, align(4096))]
 struct L3PageTable([u64; TABLE_ENTRIES]);
-
-/// Maximum L3 tables per module (each covers 2MB = 512 x 4KB pages).
-/// 4 tables = 8MB paged arena range per module.
-const MAX_L3_PER_MODULE: usize = 4;
-
-/// Per-module L3 page tables for paged arena regions.
-static mut MODULE_L3: [[L3PageTable; MAX_L3_PER_MODULE]; MAX_MODULES] = {
-    const EMPTY_L3: L3PageTable = L3PageTable([0; TABLE_ENTRIES]);
-    const EMPTY_MODULE_L3: [L3PageTable; MAX_L3_PER_MODULE] = [EMPTY_L3; MAX_L3_PER_MODULE];
-    [EMPTY_MODULE_L3; MAX_MODULES]
-};
-
-/// Per-module: base VA of paged arena (0 = no paged arena).
-static mut MODULE_PAGED_BASE: [u64; MAX_MODULES] = [0; MAX_MODULES];
-/// Per-module: size of paged arena in bytes.
-static mut MODULE_PAGED_SIZE: [u64; MAX_MODULES] = [0; MAX_MODULES];
-/// Per-module: number of L3 tables allocated.
-static mut MODULE_L3_COUNT: [u8; MAX_MODULES] = [0; MAX_MODULES];
-
-/// L3 index for a given address (bits [20:12]).
-#[inline]
-const fn l3_index(addr: u64) -> usize {
-    ((addr >> 12) & 0x1FF) as usize
-}
 
 /// Make a 4KB page descriptor.
 fn make_page_desc(phys: u64, attr_idx: u64, ap: u64, xn_el0: bool, xn_el1: bool) -> u64 {
@@ -346,105 +322,6 @@ fn make_page_desc(phys: u64, attr_idx: u64, ap: u64, xn_el0: bool, xn_el1: bool)
         | _NG
         | pxn
         | uxn
-}
-
-/// Set up the paged arena L3 tables for a module.
-///
-/// Called once during module instantiation. Creates invalid L3 entries
-/// (fault-on-access) and wires L2 entries to point to L3 tables.
-///
-/// `base_va`: base virtual address of the paged arena (must be 2MB-aligned).
-/// `size`: virtual size in bytes (rounded up to 2MB).
-pub fn setup_paged_arena(module_idx: usize, base_va: u64, size: u64) {
-    if module_idx >= MAX_MODULES {
-        return;
-    }
-    // SAFETY: paged-arena setup runs during instantiation; module_idx
-    // bounded above; MODULE_PAGED_* and MODULE_L3 entries are per-module.
-    unsafe {
-        MODULE_PAGED_BASE[module_idx] = base_va;
-        MODULE_PAGED_SIZE[module_idx] = size;
-
-        // Compute number of L3 tables needed (each covers 2MB)
-        let l3_count = size.div_ceil(L2_BLOCK_SIZE) as usize;
-        let l3_count = l3_count.min(MAX_L3_PER_MODULE);
-        MODULE_L3_COUNT[module_idx] = l3_count as u8;
-
-        // Initialize all L3 entries as invalid (unmapped)
-        let module_l3_p = &raw mut MODULE_L3;
-        for table in (*module_l3_p)[module_idx].iter_mut().take(l3_count) {
-            for e in table.0.iter_mut() {
-                *e = 0; // Invalid = fault
-            }
-        }
-
-        // Wire L2 entries to point to L3 tables instead of 2MB blocks
-        let l2 = &mut MODULE_L2[module_idx];
-        for (t, table) in (*module_l3_p)[module_idx].iter().enumerate().take(l3_count) {
-            let va = base_va + (t as u64) * L2_BLOCK_SIZE;
-            let idx = l2_index(va);
-            if idx < TABLE_ENTRIES {
-                let l3_addr = table as *const _ as u64;
-                // L2 table descriptor pointing to L3 table
-                l2.0[idx] = (l3_addr & !0xFFF) | DESC_VALID | DESC_TABLE;
-            }
-        }
-    }
-}
-
-/// Map a single 4KB page in a module's paged arena.
-///
-/// `vaddr`: virtual address (must be page-aligned and within the paged arena).
-/// `phys`: physical address of the page.
-/// `writable`: whether the page is writable by the module (EL0).
-pub fn map_4k_page_impl(module_idx: usize, vaddr: u64, phys: u64, writable: bool) {
-    if module_idx >= MAX_MODULES {
-        return;
-    }
-    // SAFETY: pager-thread per-module mutation; module_idx bounded.
-    unsafe {
-        let base = MODULE_PAGED_BASE[module_idx];
-        let size = MODULE_PAGED_SIZE[module_idx];
-        if base == 0 || vaddr < base || vaddr >= base + size {
-            return;
-        }
-
-        // Which L3 table?
-        let offset = vaddr - base;
-        let l3_table_idx = (offset / L2_BLOCK_SIZE) as usize;
-        if l3_table_idx >= MODULE_L3_COUNT[module_idx] as usize {
-            return;
-        }
-
-        let l3_entry_idx = l3_index(vaddr);
-        let ap = if writable { AP_EL0_RW } else { AP_EL0_RO };
-        MODULE_L3[module_idx][l3_table_idx].0[l3_entry_idx] =
-            make_page_desc(phys, ATTR_IDX_NORMAL, ap, true, true); // XN for both (data only)
-    }
-}
-
-/// Unmap a single 4KB page (set PTE to invalid).
-pub fn unmap_4k_page_impl(module_idx: usize, vaddr: u64) {
-    if module_idx >= MAX_MODULES {
-        return;
-    }
-    // SAFETY: pager-thread per-module mutation; module_idx bounded.
-    unsafe {
-        let base = MODULE_PAGED_BASE[module_idx];
-        let size = MODULE_PAGED_SIZE[module_idx];
-        if base == 0 || vaddr < base || vaddr >= base + size {
-            return;
-        }
-
-        let offset = vaddr - base;
-        let l3_table_idx = (offset / L2_BLOCK_SIZE) as usize;
-        if l3_table_idx >= MODULE_L3_COUNT[module_idx] as usize {
-            return;
-        }
-
-        let l3_entry_idx = l3_index(vaddr);
-        MODULE_L3[module_idx][l3_table_idx].0[l3_entry_idx] = 0; // Invalid
-    }
 }
 
 // ========================================================================
@@ -668,8 +545,7 @@ pub mod el0 {
         [Z; MAX_CORES]
     };
 
-    // ---- Per-isolated-module page tables (separate from the
-    //      demand-pager pools so the two never alias) -------------------
+    // ---- Per-isolated-module page tables ------------------------------
     #[repr(C, align(4096))]
     struct IsoL2([u64; TABLE_ENTRIES]);
 
@@ -2116,14 +1992,4 @@ pub unsafe fn protected_call(
     deadline_us: u32,
 ) -> i32 {
     el0::call(module_idx, entry, args, params, deadline_us)
-}
-
-/// Map a 4KB page in a module's paged arena.
-pub fn map_4k_page(module_idx: usize, vaddr: u64, phys: u64, writable: bool) {
-    map_4k_page_impl(module_idx, vaddr, phys, writable);
-}
-
-/// Unmap a 4KB page in a module's paged arena.
-pub fn unmap_4k_page(module_idx: usize, vaddr: u64) {
-    unmap_4k_page_impl(module_idx, vaddr);
 }

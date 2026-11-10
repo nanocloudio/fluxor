@@ -82,4 +82,4 @@ flash_size = "0x00000000"
 # otherwise answer ENOSYS at run time. `workload`, where present, is what the
 # platform answers a workload's modules; absent, the same as `platform`.
 [providers]
-platform = ["net_policy", "net_route", "pcie_device"]
+platform = ["metal_device", "net_policy", "net_route", "pcie_device"]

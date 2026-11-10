@@ -39,7 +39,7 @@
 //! ## Cycle budgeting
 //!
 //! Each ISR module declares a cycle budget. The handler measures actual cycles
-//! and tracks overruns. The ISR_METRICS syscall (0x0CE8) exposes per-module stats.
+//! and tracks overruns. The ISR_METRICS syscall (`monitor::ISR_METRICS`) exposes per-module stats.
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -731,7 +731,7 @@ pub fn poll_tier1b() {
 }
 
 // ============================================================================
-// ISR_METRICS Syscall Handler (0x0CE8)
+// ISR_METRICS Syscall Handler (`monitor::ISR_METRICS`)
 // ============================================================================
 
 /// Handle the ISR_METRICS syscall.

@@ -185,12 +185,12 @@ unsafe fn poll_uart_transfer(s: &mut UartState, idx: usize) {
     }
 }
 
-const UART_OPEN: u32 = 0x0D00;
-const UART_CLOSE: u32 = 0x0D01;
-const UART_WRITE: u32 = 0x0D02;
-const UART_READ: u32 = 0x0D03;
-const UART_POLL: u32 = 0x0D04;
-const UART_CONFIGURE: u32 = 0x0D05;
+const UART_OPEN: u32 = abi::registry::uart::OPEN;
+const UART_CLOSE: u32 = abi::registry::uart::CLOSE;
+const UART_WRITE: u32 = abi::registry::uart::WRITE;
+const UART_READ: u32 = abi::registry::uart::READ;
+const UART_POLL: u32 = abi::registry::uart::POLL;
+const UART_CONFIGURE: u32 = abi::registry::uart::CONFIGURE;
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this

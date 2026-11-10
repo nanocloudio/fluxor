@@ -56,154 +56,43 @@ use crate::kernel::sys::errno;
 pub type ContractId = u16;
 
 pub mod contract {
-    //! Contract ids — the public, stable dispatch surface. Each id
-    //! below maps 1:1 to a contract file under `modules/sdk/contracts/`
-    //! and to a row in the inventory tables in
-    //! `docs/architecture/abi_layers.md`.
-    //!
-    //! The value `0x000C` is intentionally NOT a public contract.
-    //! It is the kernel-internal dispatch bucket for the 0x0Cxx opcode
-    //! range (kernel_abi primitives plus permission-gated orchestration
-    //! ops). Modules must not `provider_open` against it; the kernel
-    //! uses it only for routing. See `INTERNAL_DISPATCH_BUCKET` below.
-    pub const COMMON: u16 = 0x0000;
-    pub const HAL_GPIO: u16 = 0x0001;
-    pub const HAL_SPI: u16 = 0x0002;
-    pub const HAL_I2C: u16 = 0x0003;
-    pub const HAL_PIO: u16 = 0x0004;
-    pub const CHANNEL: u16 = 0x0005;
-    pub const TIMER: u16 = 0x0006;
-    pub const FS: u16 = 0x0009;
-    pub const BUFFER: u16 = 0x000A;
-    pub const EVENT: u16 = 0x000B;
-    /// NIC ring management (create/destroy/info). Drivers declare
-    /// `requires_contract = "platform_nic_ring"` in their manifest;
-    /// the `platform_raw` permission gates the specific opcodes in
-    /// addition to the contract claim.
-    pub const PLATFORM_NIC_RING: u16 = 0x0007;
-    /// Raw DMA channel allocation. Handle returned by `channel::ALLOC`
-    /// is a raw DMA channel number. Used by drivers that manage their
-    /// own transfer lifecycle (e.g. `spi_pl022`, `pio_rp` CMD
-    /// transfers). The `platform_raw` permission gates the opcodes in
-    /// addition to the contract claim. Kernel-side handle-type
-    /// enforcement is in `is_dma_channel_handle` in
-    /// `src/platform/rp/providers.rs`.
-    pub const PLATFORM_DMA: u16 = 0x0008;
-    /// Async DMA fd with ping-pong queuing. Handle returned by
-    /// `fd::CREATE` is an FD_TAG_DMA-tagged fd. Used by drivers that
-    /// want kernel-managed async DMA (e.g. `pio_rp` streams,
-    /// `st7701s`). Distinct contract from `PLATFORM_DMA` — drivers
-    /// that use both families declare both in `[[resources]]`. The
-    /// `platform_raw` permission gates the opcodes in addition to the
-    /// contract claim. Kernel-side handle-type enforcement is in
-    /// `is_dma_fd_handle` in `src/platform/rp/providers.rs`.
-    pub const PLATFORM_DMA_FD: u16 = 0x0011;
-    /// Handle-scoped PCIe device binding. `provider_open` takes a
-    /// selector string (board alias like `"m2_primary"` or
-    /// `"@class=nvme"`) and returns a handle that carries all
-    /// subsequent config-space, BAR-map, and MSI-X ops. Drivers
-    /// declare `requires_contract = "pcie_device"`; the
-    /// `platform_raw` permission gates the underlying opcodes.
-    pub const PCIE_DEVICE: u16 = 0x0012;
-    pub const HAL_UART: u16 = 0x000D;
-    pub const HAL_ADC: u16 = 0x000E;
-    pub const HAL_PWM: u16 = 0x000F;
-    pub const KEY_VAULT: u16 = 0x0010;
+    //! Contract ids, as the kernel's dispatchers name them. Every value is
+    //! the ABI registry's (`abi::registry`, from `abi/registry.toml`); see
+    //! the contract files under `modules/sdk/contracts/` for what each serves.
 
-    /// Kernel-internal dispatch bucket for 0x0Cxx opcodes. NOT a
-    /// public contract. `syscall_provider_open` rejects this id from
-    /// module code; it is only reachable from intra-kernel paths
-    /// (vtable registration, primitive routing).
-    pub const INTERNAL_DISPATCH_BUCKET: u16 = 0x000C;
+    /// The kernel's own contract: primitives routed by opcode class ahead of
+    /// any handle. Not a provider contract: `syscall_provider_open` refuses
+    /// it from module code.
+    pub const INTERNAL_DISPATCH_BUCKET: u16 = crate::abi::registry::kernel::ID;
+    pub const HAL_GPIO: u16 = crate::abi::registry::gpio::ID;
+    pub const HAL_SPI: u16 = crate::abi::registry::spi::ID;
+    pub const HAL_I2C: u16 = crate::abi::registry::i2c::ID;
+    pub const HAL_PIO: u16 = crate::abi::registry::pio::ID;
+    pub const HAL_UART: u16 = crate::abi::registry::uart::ID;
+    pub const HAL_ADC: u16 = crate::abi::registry::adc::ID;
+    pub const HAL_PWM: u16 = crate::abi::registry::pwm::ID;
+    pub const CHANNEL: u16 = crate::abi::registry::channel::ID;
+    pub const TIMER: u16 = crate::abi::registry::timer::ID;
+    pub const BUFFER: u16 = crate::abi::registry::buffer::ID;
+    pub const EVENT: u16 = crate::abi::registry::event::ID;
+    pub const FS: u16 = crate::abi::registry::fs::ID;
+    pub const STORAGE_NAMESPACE: u16 = crate::abi::registry::storage_namespace::ID;
+    pub const STORAGE_OBJECT: u16 = crate::abi::registry::storage_object::ID;
+    pub const KEY_VAULT: u16 = crate::abi::registry::key_vault::ID;
+    pub const PLATFORM_NIC_RING: u16 = crate::abi::registry::platform_nic_ring::ID;
+    pub const PLATFORM_DMA: u16 = crate::abi::registry::platform_dma::ID;
+    pub const PLATFORM_DMA_FD: u16 = crate::abi::registry::platform_dma_fd::ID;
+    pub const PCIE_DEVICE: u16 = crate::abi::registry::pcie_device::ID;
+    pub const USB_HOST: u16 = crate::abi::registry::usb_host::ID;
+    pub const STREAM_CLOCK: u16 = crate::abi::registry::stream_clock::ID;
+    pub const TRUST: u16 = crate::abi::registry::trust::ID;
+    pub const NET_POLICY: u16 = crate::abi::registry::net_policy::ID;
+    pub const NET_ROUTE: u16 = crate::abi::registry::net_route::ID;
+    pub const WORKLOAD: u16 = crate::abi::registry::workload::ID;
+    pub const HOST_PROCESS: u16 = crate::abi::registry::host_process::ID;
+    pub const HOST_MOUNT: u16 = crate::abi::registry::host_mount::ID;
 
-    /// Directory-like name-keyed storage surface — opcode class 0x13xx.
-    /// See `modules/sdk/contracts/storage/namespace.rs` and
-    /// `docs/architecture/storage_capability_surface.md`.
-    pub const STORAGE_NAMESPACE: u16 = 0x0013;
-    /// Whole-blob byte-addressed storage surface — opcode class 0x14xx.
-    /// See `modules/sdk/contracts/storage/object.rs` and
-    /// `docs/architecture/storage_capability_surface.md`.
-    pub const STORAGE_OBJECT: u16 = 0x0014;
-
-    /// USB host controller binding — opcode class 0x15xx.
-    ///
-    /// **Status: allocated, unserved.** The id and the per-side drift
-    /// guards exist so a USB-host foundation module can declare
-    /// `requires_contract = "usb_host"` and be admitted. No platform
-    /// registers a vtable for it, so `provider_open(USB_HOST, …)`
-    /// answers `-ENOSYS` on every target: a module may hold the
-    /// declaration, and gets nothing back until a host-controller
-    /// driver serves it.
-    pub const USB_HOST: u16 = 0x0015;
-
-    // 0x0016 reserved (host process executor — host-scoped class; semantic
-    // constant lives at `abi::platform::linux::host_process::PROC_CLASS`, its
-    // fd tag routes via `register_fd_tag_route`).
-
-    // 0x0017 unused (reserved — do not reassign): a versioned watchable KV is
-    // distributed-state logic, not a fluxor primitive; it lives in lattice, and
-    // nanocloud consumes it there.
-
-    // 0x0018 and 0x0019 unused (reserved — do not reassign): host isolation is
-    // expressed through WORKLOAD (0x1A). How a host process is isolated is
-    // WORKLOAD's Linux host-process backend (`hp_spawn` in
-    // `src/platform/linux/host_backend.rs`).
-
-    /// Generic stream-clock capability — opcode class 0x1Cxx. Answers the
-    /// `STREAM_TIME` (0x0C30) syscall's audio-clock query independently of any
-    /// PIO hardware: hosts (linux/wasm) register a dedicated clock provider
-    /// here instead of impersonating a PIO provider. On bare-metal RP the clock
-    /// is a property of the active PIO stream, so no STREAM_CLOCK provider is
-    /// registered and the syscall falls back to HAL_PIO's per-stream time.
-    pub const STREAM_CLOCK: u16 = 0x001C;
-
-    /// The platform's verdict on a certificate chain — opcode class 0x1Dxx.
-    /// A VERIFY contract rather than an anchor-reading one: the provider
-    /// applies the platform's policy and answers yes-or-no plus what it
-    /// actually checked, so no anchor DER crosses a syscall and a consumer's
-    /// claim about provenance is one it was told. Registered by the linux
-    /// host platform; `bcm2712`, `rp` and `wasm` register nothing here, and a
-    /// graph asking for `trust = "system"` on those refuses at build.
-    /// Semantic constants live at `abi::contracts::trust`.
-    pub const TRUST: u16 = 0x001D;
-
-    /// Packet policy and service NAT enforced by the platform — opcode class
-    /// 0x1Exx. Named tables of neutral rules (allow/drop/isolate/dnat) that
-    /// the linux platform realizes with the host's packet filter, bare metal as the in-graph
-    /// packet filter's table, and wasm records without enforcing — the
-    /// provider's CAPS say which. Semantic constants live at
-    /// `abi::contracts::net::policy`.
-    pub const NET_POLICY: u16 = 0x001E;
-
-    /// Platform-neutral isolated-workload surface — opcode class 0x1Axx. One
-    /// contract for "run an isolated workload with a declared capability
-    /// envelope," realized by two placement-resolved backends: an fmod-graph
-    /// backend (MPU/EL0 + owner/lease, bare metal) and a host-process backend
-    /// (a host process in a domain of its own, Linux). The consumer never names
-    /// a platform.
-    /// Gated by `requires_contract = "workload"` AND `platform_raw`; handles are
-    /// `FD_TAG_WORKLOAD`-tagged.
-    pub const WORKLOAD: u16 = 0x001A;
-    /// Linux host-process mechanics (exec/PTY/read/bundles) — the host-scoped
-    /// class beside the stable 0x1A workload surface. Registered
-    /// only by the linux host platform; semantic constants live at
-    /// `abi::platform::linux::host_process`.
-    pub const HOST_PROCESS: u16 = 0x001B;
-    /// Linux host mounts of block devices under the operator's mount root —
-    /// a host-scoped class, registered only by the linux host platform;
-    /// semantic constants live at `abi::platform::linux::host_mount`.
-    pub const HOST_MOUNT: u16 = 0x001F;
-    /// How the node's workloads reach each other and the outside world —
-    /// opcode class 0x20xx: segments, peer routes and held addresses, held by
-    /// the kernel (`kernel::net_route`) and realized by the platform (Linux)
-    /// or by the node's network-stack module. Gated by
-    /// `requires_contract = "net_route"`, `platform_raw` and the node's
-    /// authority. Semantic constants live at `abi::contracts::net::route`.
-    pub const NET_ROUTE: u16 = 0x0020;
-
-    // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
-    // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
-    // constants — the alias just drops the prefix for callsite brevity.
+    // Short names the kernel-side dispatchers use.
     pub const GPIO: u16 = HAL_GPIO;
     pub const SPI: u16 = HAL_SPI;
     pub const I2C: u16 = HAL_I2C;
@@ -463,38 +352,13 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
     // channels via tag would clash with e.g. DMA channel numbers
     // (0..15) that share the same bit pattern. Keep channel handles
     // on the opcode-class-byte dispatch path — CHANNEL ops all carry
-    // 0x05 in the opcode's high byte so routing is unambiguous. The
-    // explicit tags below (2, 3, 7) have high bits set, so no
-    // collision with raw small integers.
+    // 0x05 in the opcode's high byte so routing is unambiguous. Every
+    // other tag sets high bits, so none collides with a small integer.
+    // A minting contract tags its handles with its own id.
     let (tag, _slot) = fd::untag_fd(handle);
-    match tag {
-        _t if _t == fd::FD_TAG_EVENT => Some(contract::EVENT),
-        _t if _t == fd::FD_TAG_TIMER => Some(contract::TIMER),
-        _t if _t == fd::FD_TAG_DMA => Some(contract::PLATFORM_DMA_FD),
-        _t if _t == fd::FD_TAG_KEY_VAULT => Some(contract::KEY_VAULT),
-        _t if _t == fd::FD_TAG_PCIE_DEVICE => Some(contract::PCIE_DEVICE),
-        _t if _t == fd::FD_TAG_NIC_RING => Some(contract::PLATFORM_NIC_RING),
-        _t if _t == fd::FD_TAG_DMA_CHANNEL => Some(contract::PLATFORM_DMA),
-        _t if _t == fd::FD_TAG_FS => Some(contract::FS),
-        _t if _t == fd::FD_TAG_BUFFER => Some(contract::BUFFER),
-        _t if _t == fd::FD_TAG_HAL_GPIO => Some(contract::HAL_GPIO),
-        _t if _t == fd::FD_TAG_HAL_SPI => Some(contract::HAL_SPI),
-        _t if _t == fd::FD_TAG_HAL_I2C => Some(contract::HAL_I2C),
-        _t if _t == fd::FD_TAG_HAL_UART => Some(contract::HAL_UART),
-        _t if _t == fd::FD_TAG_HAL_ADC => Some(contract::HAL_ADC),
-        _t if _t == fd::FD_TAG_HAL_PWM => Some(contract::HAL_PWM),
-        _t if _t == fd::FD_TAG_STORAGE_NAMESPACE => Some(contract::STORAGE_NAMESPACE),
-        _t if _t == fd::FD_TAG_STORAGE_OBJECT => Some(contract::STORAGE_OBJECT),
-        _t if _t == fd::FD_TAG_HAL_PIO => Some(contract::HAL_PIO),
-        _t if _t == fd::FD_TAG_WORKLOAD => Some(contract::WORKLOAD),
-        // USB host: allocated but unserved (see `contract::USB_HOST`), so
-        // `provider_open(USB_HOST, ...)` returns no tagged handle; the tag
-        // resolves here so a registered vtable would be reachable unchanged.
-        _t if _t == fd::FD_TAG_USB_HOST => Some(contract::USB_HOST),
-        // Platform-registered routes (host-scoped tags the generic kernel
-        // does not know by name — see `register_fd_tag_route`).
-        t => dyn_tag_route(t),
-    }
+    let id = u16::try_from(tag).ok()?;
+    (tag != crate::abi::registry::fd::UNTAGGED && crate::abi::registry::contract_mints(id))
+        .then_some(id)
 }
 
 fn lookup_contract(handle: i32) -> Option<ContractId> {
@@ -541,29 +405,7 @@ fn release_handle(handle: i32) {
 /// that matches `fd_tag_contract`'s inverse lookup. Contracts
 /// returning `None` don't use tagged fds (CHANNEL is the only one).
 fn contract_to_tag(contract: ContractId) -> Option<i32> {
-    match contract {
-        c if c == contract::EVENT => Some(fd::FD_TAG_EVENT),
-        c if c == contract::TIMER => Some(fd::FD_TAG_TIMER),
-        c if c == contract::PLATFORM_DMA_FD => Some(fd::FD_TAG_DMA),
-        c if c == contract::KEY_VAULT => Some(fd::FD_TAG_KEY_VAULT),
-        c if c == contract::PCIE_DEVICE => Some(fd::FD_TAG_PCIE_DEVICE),
-        c if c == contract::PLATFORM_NIC_RING => Some(fd::FD_TAG_NIC_RING),
-        c if c == contract::PLATFORM_DMA => Some(fd::FD_TAG_DMA_CHANNEL),
-        c if c == contract::FS => Some(fd::FD_TAG_FS),
-        c if c == contract::BUFFER => Some(fd::FD_TAG_BUFFER),
-        c if c == contract::HAL_GPIO => Some(fd::FD_TAG_HAL_GPIO),
-        c if c == contract::HAL_SPI => Some(fd::FD_TAG_HAL_SPI),
-        c if c == contract::HAL_I2C => Some(fd::FD_TAG_HAL_I2C),
-        c if c == contract::HAL_UART => Some(fd::FD_TAG_HAL_UART),
-        c if c == contract::HAL_ADC => Some(fd::FD_TAG_HAL_ADC),
-        c if c == contract::HAL_PWM => Some(fd::FD_TAG_HAL_PWM),
-        c if c == contract::HAL_PIO => Some(fd::FD_TAG_HAL_PIO),
-        c if c == contract::WORKLOAD => Some(fd::FD_TAG_WORKLOAD),
-        c if c == contract::STORAGE_NAMESPACE => Some(fd::FD_TAG_STORAGE_NAMESPACE),
-        c if c == contract::STORAGE_OBJECT => Some(fd::FD_TAG_STORAGE_OBJECT),
-        c if c == contract::USB_HOST => Some(fd::FD_TAG_USB_HOST),
-        _ => None,
-    }
+    crate::abi::registry::contract_mints(contract).then_some(i32::from(contract))
 }
 
 /// Open a handle on the named contract. The caller chooses the
@@ -700,15 +542,15 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
         return errno::EACCES;
     }
     let class = ((op >> 8) & 0xFF) as u16;
-    // A kernel primitive (the 0x0Cxx class — HANDLE_POLL above all) is a
+    // A kernel primitive (the kernel's class, and every class-routed contract — HANDLE_POLL above all) is a
     // question about a handle, not a request to its provider: `fd_poll` on a
     // timer or event fd asks the KERNEL whether the fd is ready, and the
     // handle's own provider has no opinion to offer. So the primitive is
     // routed by its opcode class ahead of the handle's contract; a contract's
     // vtable sees only the opcodes it defines.
-    if class == contract::INTERNAL_DISPATCH_BUCKET {
+    if crate::abi::registry::op_routes_to_kernel(op) {
         // SAFETY: dispatch routes to the kernel-internal bucket handler.
-        return unsafe { dispatch(class, handle, op, arg, arg_len) };
+        return unsafe { dispatch(contract::INTERNAL_DISPATCH_BUCKET, handle, op, arg, arg_len) };
     }
     // A handle minted through a selector belongs to the provider that minted
     // it, not to whichever layer is the default now.
@@ -727,11 +569,18 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
         // SAFETY: dispatch routes to the chain-registered handler.
         return unsafe { dispatch(contract, handle, op, arg, arg_len) };
     }
-    // Every provider of `fs` hands out handles carrying `FD_TAG_FS`, which
-    // resolve above. An untagged handle on an `fs` op is not one of them:
-    // a descriptor field never opened (0) or a raw slot number, which would
-    // otherwise reach whatever file holds that slot now — another module's.
-    if class == contract::FS && handle >= 0 {
+    // Every provider of `fs`, `storage.object` and `storage.namespace` hands
+    // out handles carrying its contract's fd tag, which resolve above. A
+    // non-negative handle here is not one of theirs: a descriptor field never
+    // opened, a raw slot number that would reach whatever object holds that
+    // slot now (another module's), or a handle minted at a tag this kernel
+    // does not know. It names nothing.
+    if handle >= 0
+        && matches!(
+            class,
+            contract::FS | contract::STORAGE_OBJECT | contract::STORAGE_NAMESPACE
+        )
+    {
         return EBADF;
     }
     // SAFETY: as above; class-byte dispatch fallback.
@@ -903,7 +752,7 @@ pub const MAX_CHAIN_DEPTH: usize = 4; // rp2350
 pub const MAX_CHAIN_DEPTH: usize = 8; // bcm2712 / host
 
 /// Flag ORed onto opcode to dispatch to the next provider below the caller.
-pub const CHAIN_NEXT: u32 = 0x0001_0000;
+pub use crate::abi::registry::CHAIN_NEXT;
 
 /// A single layer in a provider chain.
 struct ProviderLayer {
@@ -2062,8 +1911,9 @@ pub const PLATFORM_SELECTOR: u32 =
     crate::abi::kernel_abi::provider_selector::hash(PLATFORM_SELECTOR_NAME);
 
 /// Slot bit marking a routed handle. Providers mint small slots (their table
-/// indices); the kernel owns this bit of the 26-bit slot field.
-const ROUTED_SLOT_BIT: i32 = 1 << 25;
+/// indices, below `SLOT_FIELD_BITS`); the kernel owns the slot field's top
+/// bit.
+const ROUTED_SLOT_BIT: i32 = 1 << crate::abi::registry::fd::SLOT_FIELD_BITS;
 /// Slot bits carrying the route index; the bits above it (below
 /// [`ROUTED_SLOT_BIT`]) carry the entry's generation, so a handle kept past
 /// its close does not resolve onto whatever reused the entry.
@@ -2412,37 +2262,4 @@ pub fn routed_handles_in_use() -> usize {
         let p = &raw const ROUTES;
         (*p).iter().filter(|r| r.in_use).count()
     }
-}
-
-// ── Platform-registered fd-tag routes ────────────────────────────────────────
-// Host-scoped handle tags (e.g. the linux process-executor tag) route to their
-// class via registration at platform init, so the generic kernel carries no
-// platform vocabulary in its routing table.
-
-const MAX_DYN_TAG_ROUTES: usize = 4;
-static mut DYN_TAG_ROUTES: [(i32, u16); MAX_DYN_TAG_ROUTES] = [(0, 0); MAX_DYN_TAG_ROUTES];
-
-/// Register a handle-tag → contract-class route. Boot-time (single mutator on
-/// core 0, before any module runs). Silently ignores overflow past
-/// `MAX_DYN_TAG_ROUTES` (a platform registering that many tags is a bug caught
-/// by its own tests).
-pub fn register_fd_tag_route(tag: i32, class: u16) {
-    // SAFETY: boot-time single-threaded registration; read-only afterwards.
-    unsafe {
-        let t = &mut *core::ptr::addr_of_mut!(DYN_TAG_ROUTES);
-        for slot in t.iter_mut() {
-            if slot.1 == 0 {
-                *slot = (tag, class);
-                return;
-            }
-        }
-    }
-}
-
-fn dyn_tag_route(tag: i32) -> Option<u16> {
-    // SAFETY: read-only after boot registration.
-    let t = unsafe { &*core::ptr::addr_of!(DYN_TAG_ROUTES) };
-    t.iter()
-        .find(|(g, c)| *c != 0 && *g == tag)
-        .map(|(_, c)| *c)
 }

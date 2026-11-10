@@ -306,7 +306,6 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
     crate::kernel::ipc::buffer_pool::reset_all();
     crate::kernel::ipc::buffer_pool::reset_buffer_arena();
     NameArena::reset();
-    crate::kernel::backing_provider::unregister();
     crate::kernel::module::provider::reset_handle_tracking();
     crate::kernel::module::provider::reset_module_layers();
     // The old graph's slots no longer name net.route writers; the tables stay.

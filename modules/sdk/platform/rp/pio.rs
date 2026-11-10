@@ -15,45 +15,45 @@
 // `platform/rp/pio_raw.rs`.
 
 // Streaming (unidirectional, continuous DMA — I2S, LED strips, etc.)
-pub const STREAM_ALLOC: u32 = 0x0400;
-pub const STREAM_LOAD_PROGRAM: u32 = 0x0401;
-pub const STREAM_GET_BUFFER: u32 = 0x0402;
-pub const STREAM_CONFIGURE: u32 = 0x0403;
-pub const STREAM_CAN_PUSH: u32 = 0x0404;
-pub const STREAM_PUSH: u32 = 0x0405;
-pub const STREAM_FREE: u32 = 0x0406;
-pub const STREAM_TIME: u32 = 0x0407;
-pub const DIRECT_BUFFER: u32 = 0x0408;
-pub const DIRECT_PUSH: u32 = 0x0409;
+pub use super::super::super::registry::pio::DIRECT_BUFFER;
+pub use super::super::super::registry::pio::DIRECT_PUSH;
 /// Program load status: 0=none, 1=pending, 2=loaded, 3=error.
-pub const PROGRAM_STATUS: u32 = 0x040A;
+pub use super::super::super::registry::pio::PROGRAM_STATUS;
+pub use super::super::super::registry::pio::STREAM_ALLOC;
+pub use super::super::super::registry::pio::STREAM_CAN_PUSH;
+pub use super::super::super::registry::pio::STREAM_CONFIGURE;
+pub use super::super::super::registry::pio::STREAM_FREE;
+pub use super::super::super::registry::pio::STREAM_GET_BUFFER;
+pub use super::super::super::registry::pio::STREAM_LOAD_PROGRAM;
+pub use super::super::super::registry::pio::STREAM_PUSH;
 /// Set consumption rate (units/sec, Q16.16 fixed point). arg = &u32.
-pub const STREAM_SET_RATE: u32 = 0x040B;
+pub use super::super::super::registry::pio::STREAM_SET_RATE;
+pub use super::super::super::registry::pio::STREAM_TIME;
 
 // Command/response (bidirectional, discrete transfers — gSPI, etc.)
-pub const CMD_ALLOC: u32 = 0x0410;
-pub const CMD_LOAD_PROGRAM: u32 = 0x0411;
-pub const CMD_CONFIGURE: u32 = 0x0412;
-/// Synchronous transfer: executes PIO DMA inline (PAC-level busy-wait).
-/// Returns total bytes on success, negative errno on error.
-pub const CMD_TRANSFER: u32 = 0x0413;
-pub const CMD_POLL: u32 = 0x0414;
-pub const CMD_FREE: u32 = 0x0415;
+pub use super::super::super::registry::pio::CMD_ALLOC;
+pub use super::super::super::registry::pio::CMD_CONFIGURE;
+pub use super::super::super::registry::pio::CMD_FREE;
 /// The slot's data pin level while no transfer is in flight: 1 high,
 /// 0 low, `EBUSY` during a transfer. A bus peripheral that raises its
 /// data line when it has something to say is asked this before it is
 /// asked anything over the bus.
-pub const CMD_LEVEL: u32 = 0x0416;
+pub use super::super::super::registry::pio::CMD_LEVEL;
+pub use super::super::super::registry::pio::CMD_LOAD_PROGRAM;
+pub use super::super::super::registry::pio::CMD_POLL;
+/// Synchronous transfer: executes PIO DMA inline (PAC-level busy-wait).
+/// Returns total bytes on success, negative errno on error.
+pub use super::super::super::registry::pio::CMD_TRANSFER;
 
 // RX Stream (unidirectional input, continuous DMA capture — mic, ADC streams, etc.)
-pub const RX_STREAM_ALLOC: u32 = 0x0420;
-pub const RX_STREAM_LOAD_PROGRAM: u32 = 0x0421;
-pub const RX_STREAM_CONFIGURE: u32 = 0x0422;
-pub const RX_STREAM_CAN_PULL: u32 = 0x0423;
-pub const RX_STREAM_PULL: u32 = 0x0424;
-pub const RX_STREAM_FREE: u32 = 0x0425;
-pub const RX_STREAM_GET_BUFFER: u32 = 0x0426;
-pub const RX_STREAM_SET_RATE: u32 = 0x0427;
+pub use super::super::super::registry::pio::RX_STREAM_ALLOC;
+pub use super::super::super::registry::pio::RX_STREAM_CAN_PULL;
+pub use super::super::super::registry::pio::RX_STREAM_CONFIGURE;
+pub use super::super::super::registry::pio::RX_STREAM_FREE;
+pub use super::super::super::registry::pio::RX_STREAM_GET_BUFFER;
+pub use super::super::super::registry::pio::RX_STREAM_LOAD_PROGRAM;
+pub use super::super::super::registry::pio::RX_STREAM_PULL;
+pub use super::super::super::registry::pio::RX_STREAM_SET_RATE;
 
 /// Arguments for `STREAM_LOAD_PROGRAM` via `provider_call`.
 #[repr(C)]

@@ -4,6 +4,6 @@
 //
 // Used by the adc_rp PIC provider module.
 
-pub const REG_WRITE: u32 = 0x0CD0;
-pub const REG_READ: u32 = 0x0CD1;
-pub const PIN_INIT: u32 = 0x0CD2;
+pub use super::super::super::registry::rp_raw::ADC_PIN_INIT as PIN_INIT;
+pub use super::super::super::registry::rp_raw::ADC_REG_READ as REG_READ;
+pub use super::super::super::registry::rp_raw::ADC_REG_WRITE as REG_WRITE;

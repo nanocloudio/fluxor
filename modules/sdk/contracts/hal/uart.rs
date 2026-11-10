@@ -2,9 +2,9 @@
 //
 // Layer: contracts/hal (public, stable).
 
-pub const OPEN: u32 = 0x0D00;
-pub const CLOSE: u32 = 0x0D01;
-pub const WRITE: u32 = 0x0D02;
-pub const READ: u32 = 0x0D03;
-pub const POLL: u32 = 0x0D04;
-pub const CONFIGURE: u32 = 0x0D05;
+pub use super::super::super::registry::uart::CLOSE;
+pub use super::super::super::registry::uart::CONFIGURE;
+pub use super::super::super::registry::uart::OPEN;
+pub use super::super::super::registry::uart::POLL;
+pub use super::super::super::registry::uart::READ;
+pub use super::super::super::registry::uart::WRITE;

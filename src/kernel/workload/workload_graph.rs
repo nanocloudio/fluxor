@@ -1,5 +1,5 @@
 // ============================================================================
-// Metal module-graph `workload` backend (contract class 0x1A).
+// Metal module-graph `workload` backend (contract class `workload`).
 // ============================================================================
 //
 // The bare-metal realization of the `workload` contract: a workload is an owned
@@ -1089,7 +1089,7 @@ unsafe fn begin_create(
     // modules may hold a node privilege. `platform_raw` reads any register
     // (the seal key's OTP rows among them), `dma` and `pcie_device` reach
     // memory behind the kernel, `reconfigure`/`monitor`/`bridge`/`flash_raw`/
-    // `backing_provider`/`usb_host` act on the node itself. Only `observe` —
+    // `usb_host` act on the node itself. Only `observe` —
     // a read-only telemetry drain — is admitted. Checked before any owner is
     // allocated, against the modules the node would instantiate.
     let Some(perms) = live::module_permissions(flxa) else {

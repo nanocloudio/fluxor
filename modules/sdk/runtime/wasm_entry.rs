@@ -48,7 +48,7 @@ mod __wasm_entry {
 
     /// MODULE_INSTANCE_PARAMS opcode; mirrors
     /// `modules/sdk/kernel_abi.rs::MODULE_INSTANCE_PARAMS`.
-    const OP_MODULE_INSTANCE_PARAMS: u32 = 0x0C43;
+    const OP_MODULE_INSTANCE_PARAMS: u32 = super::abi::registry::kernel::MODULE_INSTANCE_PARAMS;
 
     static mut STATE_PTR: *mut u8 = core::ptr::null_mut();
 

@@ -12,8 +12,8 @@
 // GET_DUTY: returns current duty cycle value
 // CLOSE: release PWM handle and reset pin
 
-pub const OPEN: u32 = 0x0F00;
-pub const CLOSE: u32 = 0x0F01;
-pub const CONFIGURE: u32 = 0x0F02;
-pub const SET_DUTY: u32 = 0x0F03;
-pub const GET_DUTY: u32 = 0x0F04;
+pub use super::super::super::registry::pwm::CLOSE;
+pub use super::super::super::registry::pwm::CONFIGURE;
+pub use super::super::super::registry::pwm::GET_DUTY;
+pub use super::super::super::registry::pwm::OPEN;
+pub use super::super::super::registry::pwm::SET_DUTY;

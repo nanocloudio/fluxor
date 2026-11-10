@@ -50,7 +50,7 @@ UART even if the log_net module isn't running yet.
   (kernel-owned non-cacheable arena).
 - **Inputs:** `requests` channel — the channel write pipeline.
 - **Outputs:** `blocks` channel — `storage.block` v1 (`CAPS`, `EXEC`,
-  `SUBMIT`, `REAP`, `READ_STREAM`) from an 8-slot request table on I/O
+  `SUBMIT`, `REAP`, `READ_STREAM`) from a 16-slot request table on I/O
   queue 0, with a truthful fence per completion: FUA, flush and
   no-volatile-cache writes are `LocalDurable`, other writes `Volatile`.
 
@@ -69,10 +69,6 @@ stay claimed until the completion lands.
 | Admin | `0x0001..` | one command at a time, issued once |
 | Stream read | `0x0005` | one at a time |
 | Channel writes | `0x0100 + (queue << CID_SLOT_BITS) + slot` | ring slot, freed in order |
-| Single-page pager read / write | `0x0200` / `0x0201` | share one DMA page; a call first waits out either |
-| Barrier Flush | `0x0202` | a call waits out an earlier Flush, then submits its own |
-| Bulk read | `0x0300 + slot` | a call waits for every slot before reusing any |
-| Bulk write | `0x0400 + slot` | ring slot, freed in order |
 | v1 request | `0x0500 + slot` (16 slots) | slot freed when its completion is reaped (or abandoned and then landed) |
 | v1 preflush Flush | `0x0510 + slot` (4 slots) | rotating allocation; a slot is free only after its completion; `EAGAIN` when all are outstanding |
 

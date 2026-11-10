@@ -20,10 +20,10 @@ Source: `modules/sdk/contracts/net/`.
 | `net_proto.rs` | stream | `0x01..0x19` | live: `ip`, `tls`, `ota_registry`, `linux_net`, downstream `http` |
 | `datagram.rs` | datagram | `0x20..0x43` | live: `ip`, `linux_net`, `dns`, `log_net`, `quic`, `tls` (DTLS mode) |
 | `packet.rs` | packet | `0x50..0x69` | decision seam live: `ip`, `seam_shard`, `fwd_split`, `packet_echo_director` fixture; endpoint verbs (`0x50..0x52`, `0x60..0x63`) an envelope with no provider |
-| `identity.rs` | address control | `0x60..0x63`, `0x70..0x73`, `0x7A..0x7B` | live: net identity self-registration; `ADDR_ADD`/`DEL`/`ARM`/`FENCE` in, `MSG_ADDR_ADDED`/`ARMED`/`FENCED`/`REFUSED` out, the VIP authority's check and verdict |
+| `identity.rs` | address control | `0xA0..0xA3`, `0xA8..0xAD` | live: net identity self-registration; `ADDR_ADD`/`DEL`/`ARM`/`FENCE` in, `MSG_ADDR_ADDED`/`ARMED`/`FENCED`/`REFUSED` out, the VIP authority's check and verdict |
 | `session_ctrl.rs` | session control | `0x70..0x9F` | live: `echo_anchor` / `echo_worker` fixtures; downstream `http` as a multi-session anchor with `ws_echo_worker` behind it |
 | `mux.rs` | multiplexed session | `0xB0..0xCF` | live: `quic`, `mux_echo` fixture |
-| `offload.rs` | hardware flow-decision offload | `0x70..0x7A` | contract only: no provider |
+| `peer_identity.rs` | peer identity | `0xC8` (also `mux`'s peer-identity record) | live: `tls`, `quic` |
 
 The exchange contract (`modules/sdk/contracts/exchange.rs`, see
 `exchange.md`) carries no row and holds no opcodes. It is an
@@ -43,17 +43,10 @@ deliberately carries no row: it defines a connection-addressed envelope
 message-type range, so it holds no opcodes and the TLV helpers do not apply
 to it.
 
-Opcode ranges are disjoint across the
-files that can share a channel, so a misconfigured channel fails
-loudly rather than silently misparsing. The numeric overlaps are on
-dedicated ports. `identity.rs`'s commands (`ADDR_ADD` 0x60 through
-`ADDR_FENCE` 0x63) sit inside the packet range and its events
-(`MSG_ADDR_ADDED` 0x70 through `MSG_ADDR_REFUSED` 0x73) and the VIP
-authority's check and verdict (0x7A, 0x7B) inside the session-control
-range; they travel only on the single-writer `addr_ctl` port and its
-event and authority ports, never on a channel with packet or session
-frames. `offload.rs` shares `session_ctrl.rs`'s range the same way: its
-records travel only between a director and its offload provider.
+Every message type of every surface in the table is declared once, in the
+ABI registry's `net_tlv` msgset (`modules/sdk/abi/registry.toml`), and the
+generator refuses two members taking one value: a channel that carries
+several surfaces, or a mis-wired one, cannot misparse.
 
 ## The Protocol Surfaces
 

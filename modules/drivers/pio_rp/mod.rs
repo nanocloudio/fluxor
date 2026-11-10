@@ -6,14 +6,14 @@
 //!   - **RX Stream** (mode 2): continuous DMA capture from PIO RX FIFO
 //!
 //! Consumers (i2s, cyw43, st7701s, mic_source) call through the HAL_PIO
-//! contract (0x04, opcodes 0x0400-0x0427). This module registers as
+//! contract (0x04, opcodes `pio::STREAM_ALLOC`-`pio::RX_STREAM_SET_RATE`). This module registers as
 //! the HAL_PIO provider and dispatches to internal slot management.
 //!
 //! All hardware access goes through kernel bridges:
-//!   - PIO register bridge (`pio_raw::*`, 0x0C70-0x0C7B): SM config,
+//!   - PIO register bridge (`pio_raw::*`, `rp_raw::PIO_SM_EXEC`-`rp_raw::PIO_SM_RESTART`): SM config,
 //!     instruction memory
-//!   - PLATFORM_DMA_FD `fd::*` (0x0C85-0x0C89): DMA fd lifecycle + transfers
-//!   - HANDLE_POLL (0x0C41): non-blocking DMA completion check
+//!   - PLATFORM_DMA_FD `fd::*` (`platform_dma_fd::CREATE`-`platform_dma_fd::QUEUE`): DMA fd lifecycle + transfers
+//!   - HANDLE_POLL (`kernel::HANDLE_POLL`): non-blocking DMA completion check
 
 #![no_std]
 #![allow(
@@ -106,35 +106,35 @@ const SLOT_READY: u8 = 2;
 const SLOT_BUSY: u8 = 3;
 
 // PIO provider opcodes (from abi.rs dev_pio)
-const STREAM_ALLOC: u32 = 0x0400;
-const STREAM_LOAD_PROGRAM: u32 = 0x0401;
-const STREAM_GET_BUFFER: u32 = 0x0402;
-const STREAM_CONFIGURE: u32 = 0x0403;
-const STREAM_CAN_PUSH: u32 = 0x0404;
-const STREAM_PUSH: u32 = 0x0405;
-const STREAM_FREE: u32 = 0x0406;
-const STREAM_TIME: u32 = 0x0407;
-const DIRECT_BUFFER: u32 = 0x0408;
-const DIRECT_PUSH: u32 = 0x0409;
-const PROGRAM_STATUS: u32 = 0x040A;
-const STREAM_SET_RATE: u32 = 0x040B;
+const STREAM_ALLOC: u32 = abi::registry::pio::STREAM_ALLOC;
+const STREAM_LOAD_PROGRAM: u32 = abi::registry::pio::STREAM_LOAD_PROGRAM;
+const STREAM_GET_BUFFER: u32 = abi::registry::pio::STREAM_GET_BUFFER;
+const STREAM_CONFIGURE: u32 = abi::registry::pio::STREAM_CONFIGURE;
+const STREAM_CAN_PUSH: u32 = abi::registry::pio::STREAM_CAN_PUSH;
+const STREAM_PUSH: u32 = abi::registry::pio::STREAM_PUSH;
+const STREAM_FREE: u32 = abi::registry::pio::STREAM_FREE;
+const STREAM_TIME: u32 = abi::registry::pio::STREAM_TIME;
+const DIRECT_BUFFER: u32 = abi::registry::pio::DIRECT_BUFFER;
+const DIRECT_PUSH: u32 = abi::registry::pio::DIRECT_PUSH;
+const PROGRAM_STATUS: u32 = abi::registry::pio::PROGRAM_STATUS;
+const STREAM_SET_RATE: u32 = abi::registry::pio::STREAM_SET_RATE;
 
-const CMD_ALLOC: u32 = 0x0410;
-const CMD_LOAD_PROGRAM: u32 = 0x0411;
-const CMD_CONFIGURE: u32 = 0x0412;
-const CMD_TRANSFER: u32 = 0x0413;
-const CMD_POLL: u32 = 0x0414;
-const CMD_FREE: u32 = 0x0415;
-const CMD_LEVEL: u32 = 0x0416;
+const CMD_ALLOC: u32 = abi::registry::pio::CMD_ALLOC;
+const CMD_LOAD_PROGRAM: u32 = abi::registry::pio::CMD_LOAD_PROGRAM;
+const CMD_CONFIGURE: u32 = abi::registry::pio::CMD_CONFIGURE;
+const CMD_TRANSFER: u32 = abi::registry::pio::CMD_TRANSFER;
+const CMD_POLL: u32 = abi::registry::pio::CMD_POLL;
+const CMD_FREE: u32 = abi::registry::pio::CMD_FREE;
+const CMD_LEVEL: u32 = abi::registry::pio::CMD_LEVEL;
 
-const RX_STREAM_ALLOC: u32 = 0x0420;
-const RX_STREAM_LOAD_PROGRAM: u32 = 0x0421;
-const RX_STREAM_CONFIGURE: u32 = 0x0422;
-const RX_STREAM_CAN_PULL: u32 = 0x0423;
-const RX_STREAM_PULL: u32 = 0x0424;
-const RX_STREAM_FREE: u32 = 0x0425;
-const RX_STREAM_GET_BUFFER: u32 = 0x0426;
-const RX_STREAM_SET_RATE: u32 = 0x0427;
+const RX_STREAM_ALLOC: u32 = abi::registry::pio::RX_STREAM_ALLOC;
+const RX_STREAM_LOAD_PROGRAM: u32 = abi::registry::pio::RX_STREAM_LOAD_PROGRAM;
+const RX_STREAM_CONFIGURE: u32 = abi::registry::pio::RX_STREAM_CONFIGURE;
+const RX_STREAM_CAN_PULL: u32 = abi::registry::pio::RX_STREAM_CAN_PULL;
+const RX_STREAM_PULL: u32 = abi::registry::pio::RX_STREAM_PULL;
+const RX_STREAM_FREE: u32 = abi::registry::pio::RX_STREAM_FREE;
+const RX_STREAM_GET_BUFFER: u32 = abi::registry::pio::RX_STREAM_GET_BUFFER;
+const RX_STREAM_SET_RATE: u32 = abi::registry::pio::RX_STREAM_SET_RATE;
 
 // Kernel bridge opcodes imported from the layered ABI.
 #[allow(
@@ -420,7 +420,7 @@ unsafe fn pio_txf_write(sys: &SyscallTable, pio_num: u8, sm: u8, value: u32) {
     (sys.provider_call)(-1, PIO_TXF_WRITE, p, 6);
 }
 
-// DMA FD helpers — open against PLATFORM_DMA_FD (0x0011).
+// DMA FD helpers — open against PLATFORM_DMA_FD.
 unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
     const PLATFORM_DMA_FD: u32 = 0x0011;
     (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)

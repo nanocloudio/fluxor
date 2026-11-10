@@ -494,7 +494,7 @@ fn generate_config_impl(
                 // run under.
                 if !manifest.requires_when.is_empty() {
                     let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-                    let param_schema = schema::load_schema_for_module(mtype, loc)?;
+                    let param_schema = schema::load_schema_for_entry(m, mtype, loc)?;
                     let facts = crate::target_facts::TargetFacts::for_runtime(runtime);
                     for rw in &manifest.requires_when {
                         let resolutions: Vec<crate::target_facts::ParamResolution> = rw
@@ -1410,7 +1410,7 @@ fn base_demand(
         let tlv = entry.get(MODULE_ENTRY_HEADER_SIZE..).unwrap_or(&[]);
         let integers = if manifest.is_some_and(|m| !m.demand_from_params.is_empty()) {
             let ty = module.get("type").and_then(Value::as_str).unwrap_or(name);
-            integer_params(schema::load_schema_for_module(ty, loc)?.as_ref())
+            integer_params(schema::load_schema_for_entry(module, ty, loc)?.as_ref())
         } else {
             Vec::new()
         };
@@ -1731,7 +1731,7 @@ fn schema_param_is_one_of(
     loc: schema::ModuleLocation<'_>,
 ) -> impl Fn(&str, &Value, &str, &[String]) -> Result<Option<Option<bool>>> + '_ {
     move |mtype, entry, param, values| {
-        Ok(schema::load_schema_for_module(mtype, loc)?
+        Ok(schema::load_schema_for_entry(entry, mtype, loc)?
             .map(|ps| schema::param_is_one_of(entry, &ps, param, values)))
     }
 }
@@ -1790,10 +1790,18 @@ pub(crate) fn refuse_credential_forms(
         };
         if let Some(path) = crate::trust_anchors::file_source(spec) {
             if runtime == "linux" {
+                // A runtime path must be absolute (`validate` refuses a relative one), so the
+                // suggestion is too.
+                let abs = if path.starts_with('/') {
+                    path.to_string()
+                } else {
+                    format!("/…/{path}")
+                };
                 return Err(Error::Config(format!(
                     "{label}: {key} \"{spec}\" embeds a build-host file, and a Linux image takes \
-                     its credentials at runtime: write the path bare (`{key}: {path}`) for the \
-                     module to read where it runs, or bind it (`{key}: {{env: NAME}}`)"
+                     its credentials at runtime: name the absolute path the module reads where it \
+                     runs (`{key}: {abs}`, or `{key}: ${{param:NAME}}` so each run supplies it), \
+                     or bind it in a workload (`{key}: {{env: NAME}}`)"
                 )));
             }
             continue;
@@ -1976,7 +1984,7 @@ fn build_workloads_counted(
             }
             // Inline-TLV params — identical packing to base modules, so the kernel
             // reads them via `params_ptr` exactly the same way.
-            let param_schema = schema::load_schema_for_module(mtype, loc)?;
+            let param_schema = schema::load_schema_for_entry(m, mtype, loc)?;
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
             let integers = integer_params(param_schema.as_ref());
             let params = if let Some(param_schema) = param_schema {

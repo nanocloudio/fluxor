@@ -98,7 +98,7 @@ not export it is never notified, so a provider holding nothing per consumer pays
 nothing.
 
 The kernel then calls `module_provider_dispatch` with opcode `OWNER_RELEASED`
-(`0x0C22`) and an 8-byte argument:
+(`0x2022`) and an 8-byte argument:
 
 ```
 [slot: u16 LE][reserved: u16 = 0][generation: u32 LE]
@@ -156,7 +156,7 @@ and drops it with the module's provider layers. The node's server of the pool
 is the system owner's top-most unkeyed layer of its contract.
 
 In each PSTATUS round (`resource_ledger::emit_all`) the kernel calls that
-provider's `module_provider_dispatch` with `resource::POOL_SAMPLE` (`0x0C25`),
+provider's `module_provider_dispatch` with `resource::POOL_SAMPLE` (`0x1125`),
 `handle = -1`, `arg = [pool: u16 LE]`. Answer the pool's in-use figure in its
 own unit (`>= 0`), or a negative errno when you cannot say (the pool then reads
 from its kernel table until a later answer). The handler runs on
@@ -166,7 +166,7 @@ stats read between rounds never calls back into the provider.
 
 Count each refusal of the pool (a request answered `ENOMEM` for want of
 capacity) with `provider_call(-1, resource::LEDGER_DENY, [pool: u16 LE])`
-(`0x0C24`). The kernel admits it only from the pool's current server
+(`0x1124`). The kernel admits it only from the pool's current server
 (`EACCES` from anyone else, `EINVAL` for a pool no module provides); it counts
 the denial and pushes the pool's `POOL` record like one of its own.
 

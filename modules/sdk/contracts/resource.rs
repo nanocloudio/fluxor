@@ -138,7 +138,7 @@ pub const fn decode_entry(pool: u16, n: u32) -> u64 {
 /// chunk a module holds is reclaimed when its owner is torn down.
 /// EL0-isolated modules are denied: their page tables map state, heap and
 /// channels only, and a grant lies outside all three.
-pub const ELASTIC_ALLOC: u32 = 0x0C3F;
+pub use super::super::registry::resource::ELASTIC_ALLOC;
 
 // ── Module-provided pools ─
 //
@@ -169,7 +169,7 @@ pub const ELASTIC_ALLOC: u32 = 0x0C3F;
 /// negative errno when it cannot say — the ledger then reads the pool from
 /// its kernel owner until a later round's answer. The handler must be
 /// bounded: a count it keeps, not a walk.
-pub const POOL_SAMPLE: u32 = 0x0C25;
+pub use super::super::registry::resource::POOL_SAMPLE;
 
 /// Byte length of the `POOL_SAMPLE` argument.
 pub const POOL_SAMPLE_ARG_LEN: usize = 2;
@@ -182,14 +182,14 @@ pub const POOL_SAMPLE_ARG_LEN: usize = 2;
 /// the default (unkeyed) provider of the pool's contract
 /// ([`module_provided_pool_contract`]): `EACCES` from any other caller,
 /// `EINVAL` for a pool no module provides. Answers 0.
-pub const LEDGER_DENY: u32 = 0x0C24;
+pub use super::super::registry::resource::LEDGER_DENY;
 
 /// The contract whose module provider serves `pool`, as a contract id
 /// (`requires_contract` class byte), or `None` for a pool only the kernel
-/// serves. `POOL_STORE_SUBS` → `storage.namespace` (0x13).
+/// serves. `POOL_STORE_SUBS` → `storage.namespace`.
 pub const fn module_provided_pool_contract(pool: u16) -> Option<u16> {
     match pool {
-        POOL_STORE_SUBS => Some(0x0013),
+        POOL_STORE_SUBS => Some(super::super::registry::storage_namespace::ID),
         _ => None,
     }
 }

@@ -73,7 +73,7 @@ include!("../../sdk/runtime/params.rs");
 /// Rescan PCIe on the kernel-managed root complex. `handle = -1`,
 /// arg empty. Used as a retry nudge when `PCIE_DEVICE::BIND` fails
 /// because the downstream card hasn't trained yet.
-const PCIE_RESCAN: u32 = 0x0CF5;
+const PCIE_RESCAN: u32 = abi::registry::metal_device::PCIE_RESCAN;
 
 /// PCI-bus address offset into BAR1's inbound window on BCM7712 PCIe1, the
 /// `dma_window_gib` default (64 GiB). BAR1 covers PCI bus
@@ -165,89 +165,6 @@ pub const MAX_NLB: u16 = 8;
 /// nsid:u32. Producers (fat32, future block consumers) stage 20 B before
 /// the payload; nsid=0 falls back to `s.namespace`.
 const REQ_HDR_SIZE: usize = 20;
-
-/// CIDs for synchronous pager I/O. Outside all other
-/// ranges (admin 0x0001..=0x000F, block-read CID_READ_LBA0=0x0005,
-/// inflight writes 0x0100..=0x017F on aarch64 / 0x0100..=0x011F on
-/// embedded — see `CID_IO_WRITE_BASE` / `CID_SLOT_BITS`) so
-/// `poll_io_cqe` routines can't mistake them.
-pub const CID_PAGER_READ: u16 = 0x0200;
-/// Synchronous single-page pager-write CID. One in-flight at a time;
-/// used by the per-page `PAGER_OP_WRITE` dispatch path.
-pub const CID_PAGER_WRITE: u16 = 0x0201;
-/// Synchronous Flush CID. One in-flight at a time, issued by
-/// `PAGER_OP_FLUSH` after the bulk-write drain. Deliberately outside
-/// every write/read/bulk CID range so `is_write_cid` / `is_bulk_*_cid`
-/// never mistake its CQE for a data completion.
-pub const CID_PAGER_FLUSH: u16 = 0x0202;
-
-/// Number of in-flight async bulk-write slots. Each slot owns
-/// `MAX_BULK_PAGES` DMA pages plus a 4 KB PRP-list page. With
-/// MAX_BULK_PAGES=32 and ASYNC_BULK_SLOTS=8, the total coherent-DMA
-/// footprint is 8 × (32+1) × 4 KB ≈ 1 MB — within the 2 MB PCIe1
-/// arena, with headroom for other consumers. Pipelining multiple
-/// bulks at once hides the per-command device latency on drives
-/// whose controller can dispatch multiple commands in parallel.
-pub const ASYNC_BULK_SLOTS: usize = 8;
-
-/// Total pre-allocated coherent DMA pages: one set of MAX_BULK_PAGES
-/// per async-bulk slot. Layout is flat — slot `i`'s pages live at
-/// `pager_write_bufs[i*MAX_BULK_PAGES .. (i+1)*MAX_BULK_PAGES]`.
-const PAGER_WRITE_SLOTS: usize = ASYNC_BULK_SLOTS * (MAX_BULK_PAGES as usize);
-
-/// Base CID for async bulk writes. CIDs occupy
-/// `CID_BULK_WRITE_BASE..(BASE + ASYNC_BULK_SLOTS)` — currently
-/// 0x0400..=0x0407 (8 slots) — disjoint from every other CID
-/// range. The completion path uses `cid - BASE` to identify the
-/// slot. Bumping ASYNC_BULK_SLOTS widens this range; the pairwise-
-/// disjointness invariant is pinned by the harness CID test.
-pub const CID_BULK_WRITE_BASE: u16 = 0x0400;
-
-/// Budget for the pager's synchronous spin-poll (ms). Generous —
-/// the fault handler blocks for this long on slow-media worst case.
-const PAGER_SUBMIT_BUDGET_MS: u64 = 2000;
-
-/// Opcodes the kernel's `backing_provider::dispatch` forwards to us.
-/// Must match `src/kernel/internal/backing_provider.rs::op`.
-const PAGER_OP_READ: u32 = 0x0001;
-const PAGER_OP_WRITE: u32 = 0x0002;
-const PAGER_OP_FLUSH: u32 = 0x0003;
-const PAGER_OP_READ_BULK: u32 = 0x0004;
-const PAGER_OP_WRITE_BULK: u32 = 0x0005;
-
-/// Async bulk-read CID base. Reads pipeline like writes: up to
-/// `ASYNC_BULK_SLOTS` in flight, each carrying CID
-/// `CID_PAGER_READ_BULK + slot_idx`. Single-chunk reads still use
-/// slot 0 (CID == CID_PAGER_READ_BULK); multi-chunk reads stripe
-/// across slots so a 1024-page transfer at MAX_BULK_PAGES = 32
-/// pipelines 32 commands instead of executing them serially.
-pub const CID_PAGER_READ_BULK: u16 = 0x0300;
-
-/// Maximum pages per bulk transfer. Bounded by the count of pre-
-/// allocated DMA buffers (`PAGER_WRITE_SLOTS = ASYNC_BULK_SLOTS *
-/// MAX_BULK_PAGES`), by the 2 MB PCIE1 coherent-DMA arena, and by
-/// the controller's MDTS. 32 pages = 128 KB per command. 8 slots ×
-/// 32 pages = 256 pages = 1 MB DMA footprint — fits the 2 MB arena
-/// with room for the per-slot PRP-list pages and the smaller sync
-/// buffers. NVMe NLB field caps at 65536 LBAs (≈32 MB at 4 KB
-/// pages) — well above any realistic value.
-pub const MAX_BULK_PAGES: u32 = 32;
-
-/// Generic backing-provider registration syscall.
-const BACKING_PROVIDER_ENABLE: u32 = 0x0CED;
-
-/// FNV-1a 32-bit hash of the export symbol name. The kernel
-/// `resolve_register_target` resolves this back to the function
-/// address inside our module image.
-const BACKING_PROVIDER_DISPATCH_HASH: u32 = fnv1a(b"backing_provider_dispatch");
-
-/// NVMe-specific: the LBA where the paged-arena region starts on
-/// namespace 1. Kernel-side backing_offset is page-granular and
-/// starts at 0 — this driver adds its own device offset when
-/// converting to LBA. Keeps NVMe specifics out of the kernel.
-/// The low LBA range 0..NVME_ARENA_LBA_BASE is left free for a FAT32
-/// partition header (typical shared-media configuration).
-const NVME_ARENA_LBA_BASE: u64 = 0x0020_0000;
 
 // ============================================================================
 // State machine
@@ -535,49 +452,6 @@ struct NvmeState {
     /// (1..=MAX_NLB). Controls payload accumulation size in phase 1.
     req_nlb: u16,
 
-    /// DMA page used for the single-page pager READ/WRITE path
-    /// (`PAGER_OP_READ` / `PAGER_OP_WRITE`). Lazy-allocated in
-    /// `step_ready` so the foreign caller's permission scope is
-    /// irrelevant — the allocation lands in our own module context.
-    pager_buf: u64,
-    /// Async bulk-write slot pool. Slot `i` owns DMA pages
-    /// `pager_write_bufs[i*MAX_BULK_PAGES..(i+1)*MAX_BULK_PAGES]` and
-    /// PRP-list page `bulk_prp_list_bufs[i]`. `bulk_head` / `bulk_tail`
-    /// form a circular ring across `ASYNC_BULK_SLOTS` slots;
-    /// `bulk_count` is the in-flight depth. When the ring fills,
-    /// the next submit spin-polls the oldest slot's CQE.
-    /// `bulk_drain_writes` waits until `bulk_count == 0` for FLUSH.
-    pager_write_bufs: [u64; PAGER_WRITE_SLOTS],
-    bulk_prp_list_bufs: [u64; ASYNC_BULK_SLOTS],
-    bulk_head: u8,
-    bulk_tail: u8,
-    bulk_count: u8,
-    bulk_depth_peak: u8,
-    /// Peak in-flight depth observed inside `pager_read_pipelined`.
-    /// Mirrors `bulk_depth_peak` but for the async-bulk-READ side
-    /// so the heartbeat can tell us whether reads are actually
-    /// pipelining (`rd >= 2` ⇒ multiple commands in flight, `rd=1`
-    /// ⇒ effectively QD=1 even with a multi-slot caller).
-    read_depth_peak: u8,
-    _pad_rdp: [u8; 7],
-    /// Per-section microsecond accumulators for the pipelined-read
-    /// hot path. Heartbeat emits `[nvme] rperf calls=N sub=AVG
-    /// poll=AVG copy=AVG total=AVG` so a drop into Linux-style
-    /// throughput can pinpoint whether SQE submit, CQE poll, or
-    /// the post-CQE memcpy is dominating.
-    read_call_count: u64,
-    read_submit_us: u64,
-    read_poll_us: u64,
-    read_copy_us: u64,
-    read_total_us: u64,
-    /// Latched on async-bulk CQE failure so the next FLUSH (or
-    /// next bulk submit) can surface the error to the caller. The
-    /// original async submit has already returned 0 by the time the
-    /// CQE arrives, so propagating sync is the only option.
-    bulk_err: i32,
-    /// Pager bulk writes retired so far. A Flush records the count it was
-    /// submitted against, so a later barrier knows whether it is covered.
-    write_complete_seq: u64,
     /// Identify Controller byte 525 bit 0 (VWC): the controller holds
     /// completed writes in a volatile write cache, so a write CQE alone
     /// does not mean the data survives power loss and every durability
@@ -585,19 +459,6 @@ struct NvmeState {
     /// that commits to non-volatile media on completion, where a Flush
     /// is unnecessary.
     needs_flush: bool,
-    /// `write_complete_seq` an in-flight Flush will cover once its CQE
-    /// retires. One barrier Flush at a time (`pager_out & PO_FLUSH`): its
-    /// CID is claimed until the completion lands, and a later barrier waits
-    /// that out before submitting its own.
-    flush_inflight_for: u64,
-    /// Highest `write_complete_seq` proven on non-volatile media by a
-    /// completed Flush. Only meaningful when `needs_flush`; a fence is
-    /// durable at `flush_complete_seq >= ticket`.
-    flush_complete_seq: u64,
-    /// Latched Flush failure. A barrier that cannot prove its writes
-    /// flushed reports error forever rather than downgrading to the
-    /// write-completion rule.
-    flush_err: i32,
     /// `storage.block` v1 requests in flight or finished and not yet reaped.
     v1: [V1Slot; V1_SLOTS],
     /// State of each preflush slot (`PF_*`), and the slot the next preflush
@@ -606,12 +467,6 @@ struct NvmeState {
     v1_flush: [u8; V1_FLUSH_SLOTS],
     v1_flush_next: u8,
     _pad_pf: [u8; 3],
-    /// Pager commands on queue 0 the controller still owns: `PO_*` bits.
-    pager_out: u8,
-    /// Bulk-read slots whose command the controller still owns, one bit per
-    /// slot.
-    bulk_read_out: u8,
-    _pad_out: [u8; 2],
     /// Completions that named no outstanding command, dropped.
     stale_cqes: u32,
     /// Identity every `LocalDurable` fence names: FNV-1a 64 over the
@@ -630,9 +485,6 @@ struct NvmeState {
     /// power loss.
     atomic_blocks: u16,
     _pad_v1: [u8; 4],
-    /// 1 once `BACKING_PROVIDER_ENABLE` has succeeded, so S_READY
-    /// entry only registers once.
-    pager_registered: u8,
     /// 1 once the PCIe capability walk has cached `msix_cap_offset`.
     msix_walked: u8,
 
@@ -662,11 +514,10 @@ struct NvmeState {
     /// on a full `blk_out` channel.
     tlm: TlmCounters,
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
-    /// Who holds the I/O queue: 0 nobody, 1 this module's step, 2 a backing
-    /// dispatch (the kernel pager, the key vault's store). The two run on
-    /// whichever cores call them, and both drive one SQ/CQ pair; a dispatch
-    /// arriving while the step holds it answers `E_AGAIN` (the kernel's
-    /// patient dispatch waits it out), and a step arriving while a dispatch
+    /// Who holds the I/O queue: 0 nobody, 1 this module's step, 2 a
+    /// `storage.block` ioctl from a consumer. The two run on whichever cores
+    /// call them, and both drive one SQ/CQ pair; an ioctl arriving while the
+    /// step holds it answers `E_AGAIN`, and a step arriving while an ioctl
     /// holds it yields. Accessed as an `AtomicU8`.
     io_owner: u8,
 }
@@ -809,8 +660,7 @@ unsafe fn write_sqe(sq_base: u64, slot: u32, cdw: [u32; 16]) {
     // is NOT buffered on ARM64; without DSB, the SQE writes could
     // still be in PCIe write buffers when the doorbell rings,
     // letting the controller race ahead and fetch a partial SQE /
-    // stale PRP-list. Cross-queue async-bulk reads on bcm2712
-    // PCIe1 silently dropped ~75% of pages under the weaker DMB.
+    // stale PRP-list. A DMB here is not enough on bcm2712 PCIe1.
     core::arch::asm!("dsb sy", options(nostack));
 }
 
@@ -960,92 +810,14 @@ unsafe fn heartbeat(s: &mut NvmeState) {
     pos += q.len();
     write_dec3(p, &mut pos, s.io_q_count as u32);
 
-    // `pg` = pager dispatch registered; `mx` = MSI-X enabled;
-    // `bd` = peak async-bulk pipeline depth observed since boot
-    // (ASYNC_BULK_SLOTS is the ceiling).
-    let pg = b" pg=";
-    core::ptr::copy_nonoverlapping(pg.as_ptr(), p.add(pos), pg.len());
-    pos += pg.len();
-    *p.add(pos) = b'0' + s.pager_registered;
-    pos += 1;
+    // `mx` = MSI-X enabled.
     let mx = b" mx=";
     core::ptr::copy_nonoverlapping(mx.as_ptr(), p.add(pos), mx.len());
     pos += mx.len();
     *p.add(pos) = b'0' + s.msix_enabled;
     pos += 1;
-    let bd = b" bd=";
-    core::ptr::copy_nonoverlapping(bd.as_ptr(), p.add(pos), bd.len());
-    pos += bd.len();
-    write_dec3(p, &mut pos, s.bulk_depth_peak as u32);
-
-    // `rd` = peak in-flight depth observed inside the async-bulk
-    // READ path. A baseline `rd=001` even with a multi-slot caller
-    // means the read pipeline is collapsing to QD=1 somewhere
-    // (controller scheduling, single-thread spin-poll, …).
-    let rd = b" rd=";
-    core::ptr::copy_nonoverlapping(rd.as_ptr(), p.add(pos), rd.len());
-    pos += rd.len();
-    write_dec3(p, &mut pos, s.read_depth_peak as u32);
 
     dev_log(&*s.syscalls, 3, p, pos);
-
-    // Read-path latency breakdown: per-call averages of submit /
-    // CQE-poll-wait / DMA-memcpy / total time. Reveals which stage
-    // dominates the 6x gap vs Linux at QD=1.
-    if s.state == S_READY && s.read_call_count > 0 {
-        let n = s.read_call_count;
-        let mut rb = [0u8; 128];
-        let rp = rb.as_mut_ptr();
-        let prefix = b"[nvme] rperf calls=";
-        core::ptr::copy_nonoverlapping(prefix.as_ptr(), rp, prefix.len());
-        let mut rpos = prefix.len();
-        // 4-digit decimal helper inline (calls can climb past 1000).
-        fn write_dec_u32(out: *mut u8, pos: &mut usize, mut v: u32) {
-            if v == 0 {
-                unsafe {
-                    *out.add(*pos) = b'0';
-                }
-                *pos += 1;
-                return;
-            }
-            let mut d = [0u8; 10];
-            let mut n = 0usize;
-            while v > 0 {
-                d[n] = b'0' + (v % 10) as u8;
-                v /= 10;
-                n += 1;
-            }
-            while n > 0 {
-                n -= 1;
-                unsafe {
-                    *out.add(*pos) = d[n];
-                }
-                *pos += 1;
-            }
-        }
-        write_dec_u32(rp, &mut rpos, n as u32);
-        let sub_avg = (s.read_submit_us / n) as u32;
-        let poll_avg = (s.read_poll_us / n) as u32;
-        let copy_avg = (s.read_copy_us / n) as u32;
-        let total_avg = (s.read_total_us / n) as u32;
-        let tag = b" sub_us=";
-        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
-        rpos += tag.len();
-        write_dec_u32(rp, &mut rpos, sub_avg);
-        let tag = b" poll_us=";
-        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
-        rpos += tag.len();
-        write_dec_u32(rp, &mut rpos, poll_avg);
-        let tag = b" copy_us=";
-        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
-        rpos += tag.len();
-        write_dec_u32(rp, &mut rpos, copy_avg);
-        let tag = b" total_us=";
-        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
-        rpos += tag.len();
-        write_dec_u32(rp, &mut rpos, total_avg);
-        dev_log(&*s.syscalls, 3, rp, rpos);
-    }
 
     // Re-emit the identification / capability / namespace lines once
     // per heartbeat while we're READY. These are printed once at boot
@@ -1714,30 +1486,11 @@ unsafe fn submit_io_write(
     // by the caller; wait_start_ms must stay owned by the read path.
 }
 
-/// Durability fence: ensure every submitted write is on non-volatile media,
-/// then report durable. Drains the async bulk-write queue (each synchronous
-/// write already spin-polls to completion). Serves `PAGER_OP_FLUSH`.
-///
-/// An explicit NVM Flush (opcode 0x00) is issued only when the
-/// controller reports a volatile write cache (`needs_flush`, Identify
-/// byte 525). A controller that commits on completion needs none, and
-/// issuing one there is unsafe.
-unsafe fn device_flush(s: &mut NvmeState) -> i32 {
-    let drain = bulk_drain_writes(s);
-    if drain != 0 {
-        return drain;
-    }
-    if s.state != S_READY {
-        return E_AGAIN;
-    }
-    flush_barrier_sync(s)
-}
-
 /// Submit an NVMe Flush (NVM command set, opcode 0x00) on I/O queue
 /// `q_idx` for `nsid`. No data transfer, no PRP, no LBA — the command
 /// directs the controller to commit its volatile write cache to
-/// non-volatile media. The caller polls completion via
-/// `pager_spin_poll_cqe(s, cid)`. Flush with a given NSID covers that
+/// non-volatile media. The caller retires its completion by `cid`.
+/// Flush with a given NSID covers that
 /// namespace regardless of which I/O queue submitted it, so queue 0 is
 /// always a valid choice.
 unsafe fn submit_io_flush(s: &mut NvmeState, q_idx: usize, cid: u16, nsid: u32) {
@@ -1794,9 +1547,8 @@ pub fn clamp_nlb(nlb: u16) -> u16 {
 #[cfg(feature = "host-test")]
 pub mod limits {
     pub use super::{
-        awupf_blocks, clamp_nlb, device_id_of, dsm_range, encode_write_cid, is_bulk_read_cid,
-        is_bulk_write_cid, is_v1_cid, is_write_cid, slot_page_addr, v1_caps, v1_fence, v1_rw_cdw12,
-        write_cid_queue, write_cid_slot,
+        awupf_blocks, clamp_nlb, device_id_of, dsm_range, encode_write_cid, is_v1_cid,
+        is_write_cid, v1_caps, v1_fence, v1_rw_cdw12, write_cid_queue, write_cid_slot,
     };
     pub use super::{is_v1_slot_cid, CID_V1_FLUSH_BASE, V1_FLUSH_SLOTS};
     pub use super::{CDW12_FUA, CID_V1_BASE, ONCS_DSM, V1_SLOTS};
@@ -1804,9 +1556,8 @@ pub mod limits {
     pub type DriverCaps = super::Caps;
     pub type DriverFence = super::Fence;
     pub use super::{
-        ASYNC_BULK_SLOTS, CID_BULK_WRITE_BASE, CID_IO_WRITE_BASE, CID_NONE, CID_PAGER_READ,
-        CID_PAGER_READ_BULK, CID_PAGER_WRITE, CID_SLOT_BITS, CID_SLOT_MASK, IO_Q_ENTRIES,
-        MAX_BULK_PAGES, MAX_INFLIGHT, MAX_IO_QUEUES, MAX_NLB, PAGE,
+        CID_IO_WRITE_BASE, CID_NONE, CID_SLOT_BITS, CID_SLOT_MASK, IO_Q_ENTRIES, MAX_INFLIGHT,
+        MAX_IO_QUEUES, MAX_NLB, PAGE,
     };
 }
 
@@ -1818,12 +1569,6 @@ pub mod limits {
 pub mod sim {
     use super::*;
 
-    pub const PAGER_READ: u32 = PAGER_OP_READ;
-    pub const PAGER_WRITE: u32 = PAGER_OP_WRITE;
-    pub const PAGER_FLUSH: u32 = PAGER_OP_FLUSH;
-    pub const PAGER_READ_BULK: u32 = PAGER_OP_READ_BULK;
-    pub const PAGER_WRITE_BULK: u32 = PAGER_OP_WRITE_BULK;
-    pub const PAGER_SUBMIT_BUDGET: u64 = PAGER_SUBMIT_BUDGET_MS;
     pub const IO_READ_BUDGET: u64 = IO_READ_BUDGET_MS;
     pub const IO_SQ_DOORBELL: u64 = REG_SQ0TDBL + ((2 * IO_QID as u64) << 2);
     pub const DMA_WINDOW: u64 = PCI_DMA_OFFSET;
@@ -2074,42 +1819,6 @@ unsafe fn hold_io_cqe(s: &mut NvmeState, q: usize, cid: u16, sc: u16) -> bool {
     true
 }
 
-/// The next completion on queue `q` that some loop other than the stream
-/// read's owner may act on, consumed. The stream read's completion
-/// (`CID_READ_LBA0`) belongs to the step loop's `poll_io_cqe`: it is held,
-/// in order, and skipped, so it is neither dropped nor left at the head
-/// blocking the completions behind it. `None` when nothing else is ready,
-/// or the held ring is full.
-unsafe fn next_owned_cqe(s: &mut NvmeState, q: usize) -> Option<(u16, u16)> {
-    if s.held_len > 0 && s.held_q as usize == q {
-        let n = s.held_len as usize;
-        let mut i = 0;
-        while i < n {
-            let h = s.held[i];
-            if (h >> 16) as u16 != CID_READ_LBA0 {
-                let mut j = i + 1;
-                while j < n {
-                    s.held[j - 1] = s.held[j];
-                    j += 1;
-                }
-                s.held_len -= 1;
-                return Some(((h >> 16) as u16, h as u16));
-            }
-            i += 1;
-        }
-    }
-    while let Some((cid, sc)) = peek_hw_cqe(s, q) {
-        if cid != CID_READ_LBA0 {
-            consume_hw_cqe(s, q);
-            return Some((cid, sc));
-        }
-        if !hold_io_cqe(s, q, cid, sc) {
-            return None;
-        }
-    }
-    None
-}
-
 /// Peek at the controller's CQ head of queue `q`: `Some((cid, sc))` if a
 /// CQE with the current phase is present (does NOT consume it), `None` if
 /// not.
@@ -2209,18 +1918,6 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
                     consume_io_cqe(s, q);
                     made_progress = true;
                     retire_v1_cqe(s, cid, sc);
-                    continue;
-                }
-                if is_pager_sync_cid(cid) {
-                    consume_io_cqe(s, q);
-                    made_progress = true;
-                    retire_pager_orphan(s, cid);
-                    continue;
-                }
-                if cid == CID_PAGER_FLUSH {
-                    consume_io_cqe(s, q);
-                    made_progress = true;
-                    retire_flush_cqe(s, sc);
                     continue;
                 }
                 let is_write = is_write_cid(cid);
@@ -2833,86 +2530,12 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
 unsafe fn step_ready(s: &mut NvmeState) -> i32 {
     log_once(s, b"[nvme] Ready\0");
 
-    // Register the paged-arena backing-store provider BEFORE the first
-    // `Ready` (3) signal so consumers gated on `module_deferred_ready`
-    // see a fully-armed dispatcher on their first step. Without this
-    // ordering, a `BackingType::External` arena registered downstream
-    // hits `backing_provider::ready() == false` for one or more ticks
-    // and returns ENODEV — surfacing as `err=19` in the consumer's
-    // heartbeat and inflating any wall-clock perf measurement that
-    // anchors its start before the retry succeeds.
-    //
-    // A configuration without any `BackingType::External` arena never
-    // triggers the dispatch, so this registration is free on the hot
-    // path. The kernel resolves the FNV-1a hash to the function
-    // address in our module image.
-    if s.pager_registered == 0 {
-        let sys = &*s.syscalls;
-        let mut arg = BACKING_PROVIDER_DISPATCH_HASH.to_le_bytes();
-        let rc = (sys.provider_call)(-1, BACKING_PROVIDER_ENABLE, arg.as_mut_ptr(), arg.len());
-        if rc == 0 {
-            s.pager_registered = 1;
-            dev_log(
-                sys,
-                3,
-                c"[nvme] pager dispatch registered".as_ptr().cast(),
-                31,
-            );
-        }
-        // On failure: leave `pager_registered = 0` and retry on the
-        // next step. This lets us recover from transient issues (e.g.
-        // scheduler calling before our module's export table is
-        // resolvable) and also makes the failure visible in the log —
-        // the `pager_registered` flag stays 0, heartbeat will echo it
-        // indirectly through the lack of a "dispatch registered" line.
-
-        // Allocate every DMA buffer the backing-provider dispatch
-        // path can need, in our own module's step context. The
-        // dispatch is invoked from the caller's permission scope
-        // (e.g. a probe with only `backing_provider` permission)
-        // which would be denied DMA_ALLOC_CONTIG — pre-allocating
-        // here side-steps that.
-        //
-        // - `pager_buf`            : single-page sync pager scratch
-        // - `v1[..].dma`           : one page per `storage.block` slot,
-        //                            for requests arriving in a
-        //                            consumer's dispatch
-        // - `pager_write_bufs[..]` : ASYNC_BULK_SLOTS slots × one
-        //                            contiguous MAX_BULK_PAGES * PAGE
-        //                            DMA region per slot; per-page
-        //                            addresses derived from the slot
-        //                            base so the bulk memcpy is sound.
-        // - `bulk_prp_list_bufs[]` : one PRP-list page per async slot
-    }
-
-    // Gate `Ready` on registration + DMA allocations. The original
-    // ordering swallowed both failures and still returned Ready 3,
-    // letting consumers observe a half-armed driver: a downstream
-    // `BackingType::External` arena would dispatch into us and find
-    // either no provider or unallocated slot buffers. Now: any
-    // failure here returns 0, leaving the module below Ready until
-    // the next tick retries (lazy alloc helpers are idempotent on
-    // success).
-    if s.pager_registered == 0 {
-        return 0;
-    }
-    if !pager_ensure_buf(s) {
-        return 0;
-    }
+    // Give every `storage.block` slot its DMA page here, in this module's
+    // own step: requests arrive in a consumer's ioctl, whose permission
+    // scope would be denied the allocation. `Ready` waits until every page
+    // is in hand; the allocation retries next tick and is idempotent.
     if !v1_ensure_pages(s) {
         return 0;
-    }
-    {
-        let mut s_idx: usize = 0;
-        while s_idx < ASYNC_BULK_SLOTS {
-            if !pager_ensure_slot_bufs(s, s_idx) {
-                return 0;
-            }
-            if !pager_ensure_prp_list(s, s_idx) {
-                return 0;
-            }
-            s_idx += 1;
-        }
     }
 
     if s.returned_ready == 0 {
@@ -3123,11 +2746,11 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
         return E_INVAL;
     }
     // Every command but CAPS drives the I/O queue, from the consumer's
-    // core: it holds the queue as a dispatch does (see `io_owner`).
+    // core: it holds the queue against this module's step (see `io_owner`).
     if cmd == blk::ioctl::CAPS {
         return blocks_ioctl_body(s, cmd, arg);
     }
-    if !io_claim(s, IO_DISPATCH) {
+    if !io_claim(s, IO_IOCTL) {
         return E_AGAIN;
     }
     let rc = blocks_ioctl_body(&mut *(state as *mut NvmeState), cmd, arg);
@@ -3170,27 +2793,6 @@ unsafe fn blocks_ioctl_body(s: &mut NvmeState, cmd: u32, arg: *mut u8) -> i32 {
         _ => E_NOSYS,
     }
 }
-
-// ============================================================================
-// Pager backing-store dispatch
-// ============================================================================
-//
-// Called SYNCHRONOUSLY from the kernel pager (a page-fault-handler
-// invocation of `backing_store::backing_read/write` for arenas
-// registered with `BackingType::External`). We submit one SQE on the
-// shared I/O SQ and spin-poll `io_cq` for the matching CID. On a
-// single-core cooperative design where the faulting module itself
-// has called into the pager, `step_ready` is not mid-step, so
-// nothing else is racing on `io_cq` during this call — any write
-// CQEs that land get absorbed into the in-flight ring, matching
-// what `poll_io_cqe(s, CID_NONE)` does.
-//
-// Caller's arg layout (see src/kernel/internal/backing_provider.rs):
-//   offset 0..4   arena_base_page: u32 LE — kernel's page counter
-//   offset 4..8   vpage_idx:       u32 LE
-//   offset 8..16  buf_ptr:         u64 LE (caller's page buffer)
-// This driver converts to the device's LBA space using its own
-// NVME_ARENA_LBA_BASE offset.
 
 // ============================================================================
 // storage.block v1
@@ -3415,13 +3017,36 @@ unsafe fn v1_harvest(s: &mut NvmeState) {
             if is_v1_cid(cid) {
                 consume_hw_cqe(s, q);
                 retire_v1_cqe(s, cid, sc);
-            } else if is_pager_sync_cid(cid) {
-                consume_hw_cqe(s, q);
-                retire_pager_orphan(s, cid);
-            } else if cid == CID_PAGER_FLUSH {
-                consume_hw_cqe(s, q);
-                retire_flush_cqe(s, sc);
             } else if !hold_io_cqe(s, q, cid, sc) {
+                break;
+            }
+        }
+    }
+}
+
+/// Non-blocking single pass over every I/O completion queue: retire
+/// whatever v1 and write-pipeline completions are ready, and return. A
+/// completion that belongs to neither (e.g. an in-flight
+/// `BLK_PHASE_READING` batch read on `CID_READ_LBA0`) is left unconsumed
+/// for its owner — same rule as `poll_io_cqe` — and stops the harvest of
+/// that queue; completions queued behind it are picked up on a later pass.
+unsafe fn harvest_writes(s: &mut NvmeState) {
+    let n = s.io_q_count as usize;
+    for q in 0..n {
+        while let Some((cid, sc)) = peek_io_cqe(s, q) {
+            if is_v1_cid(cid) {
+                consume_io_cqe(s, q);
+                retire_v1_cqe(s, cid, sc);
+            } else if is_write_cid(cid) {
+                consume_io_cqe(s, q);
+                let cnt = *s.inflight_count.as_ptr().add(q);
+                if cnt > 0 {
+                    let head = *s.inflight_head.as_ptr().add(q) as usize;
+                    let new_head = (head + 1) % MAX_INFLIGHT;
+                    *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
+                    *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
+                }
+            } else {
                 break;
             }
         }
@@ -3714,1225 +3339,6 @@ unsafe fn v1_exec(s: &mut NvmeState, arg: *mut u8) -> i32 {
     c.status
 }
 
-const PAGE_BYTES: u32 = 4096;
-const PAGE_LBAS: u16 = 8; // 4 KB page = 8 × 512 B LBAs
-
-/// `pager_out` bits: the synchronous pager commands the controller may still
-/// own after the wait that issued them gave up.
-const PO_READ: u8 = 1 << 0;
-const PO_WRITE: u8 = 1 << 1;
-const PO_FLUSH: u8 = 1 << 2;
-/// The single-page read and write share one DMA page, so each waits out the
-/// other.
-const PO_PAGE: u8 = PO_READ | PO_WRITE;
-
-/// The `pager_out` bit of a synchronous pager CID, or 0.
-#[inline(always)]
-fn pager_out_bit(cid: u16) -> u8 {
-    match cid {
-        CID_PAGER_READ => PO_READ,
-        CID_PAGER_WRITE => PO_WRITE,
-        CID_PAGER_FLUSH => PO_FLUSH,
-        _ => 0,
-    }
-}
-
-/// Mark a pager command as the controller's. Its CID stays claimed until its
-/// completion is consumed, wherever that happens.
-#[inline(always)]
-unsafe fn pager_claim(s: &mut NvmeState, cid: u16) {
-    if is_bulk_read_cid(cid) {
-        s.bulk_read_out |= 1 << (cid - CID_PAGER_READ_BULK);
-    } else {
-        s.pager_out |= pager_out_bit(cid);
-    }
-}
-
-/// Release a pager CID on its completion. False when the driver had no such
-/// command outstanding: the completion is counted as stale and the caller
-/// must not act on it.
-#[inline(always)]
-unsafe fn pager_release(s: &mut NvmeState, cid: u16) -> bool {
-    let held = if is_bulk_read_cid(cid) {
-        let bit = 1u8 << (cid - CID_PAGER_READ_BULK);
-        let held = s.bulk_read_out & bit != 0;
-        s.bulk_read_out &= !bit;
-        held
-    } else {
-        let bit = pager_out_bit(cid);
-        let held = s.pager_out & bit != 0;
-        s.pager_out &= !bit;
-        held
-    };
-    if !held {
-        s.stale_cqes = s.stale_cqes.wrapping_add(1);
-    }
-    held
-}
-
-/// True for the CIDs of the synchronous pager commands whose completion no
-/// harvest loop but the issuing wait is waiting for: single-page read and
-/// write, and bulk reads.
-#[inline(always)]
-fn is_pager_sync_cid(cid: u16) -> bool {
-    cid == CID_PAGER_READ || cid == CID_PAGER_WRITE || is_bulk_read_cid(cid)
-}
-
-/// Retire a completion for a synchronous pager command whose wait is over
-/// (it timed out, or returned on an earlier error): free its CID. Called by
-/// every loop that is not itself waiting on a pager CID, so the completion
-/// of a command nobody waits on is consumed instead of left at a queue head.
-#[inline(always)]
-unsafe fn retire_pager_orphan(s: &mut NvmeState, cid: u16) {
-    let _ = pager_release(s, cid);
-}
-
-/// Spin-poll the I/O CQs until a CQE with `expected_cid` arrives.
-/// Scans all `io_q_count` queues each pass so a write CQE that lands
-/// on queue 2 while the pager issued on queue 0 doesn't starve. Any
-/// write CQEs observed along the way are absorbed into the per-queue
-/// inflight ring. Pager CIDs (CID_PAGER_READ, CID_PAGER_WRITE) always
-/// live on queue 0 — the pager uses queue 0 exclusively for simplicity
-/// (single-vector shared synchronous path).
-unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
-    pager_spin(s, expected_cid, 0, 0)
-}
-
-/// Wait until the controller has returned every pager command in
-/// `pager_mask` (`PO_*`) and `bulk_read_mask` (bulk-read slots). A command
-/// whose wait gave up is still the controller's, and so is its CID and the
-/// DMA memory behind it: a new command must not take either before the
-/// completion lands. `EAGAIN` when it has not within the budget.
-unsafe fn pager_await_idle(s: &mut NvmeState, pager_mask: u8, bulk_read_mask: u8) -> i32 {
-    pager_spin(s, CID_NONE, pager_mask, bulk_read_mask)
-}
-
-/// Shared body of [`pager_spin_poll_cqe`] and [`pager_await_idle`]: with a
-/// concrete `expected_cid`, return its status; with [`CID_NONE`], return 0
-/// once the masked commands are all back.
-unsafe fn pager_spin(
-    s: &mut NvmeState,
-    expected_cid: u16,
-    pager_mask: u8,
-    bulk_read_mask: u8,
-) -> i32 {
-    let start = now_ms(s);
-    loop {
-        if expected_cid == CID_NONE
-            && s.pager_out & pager_mask == 0
-            && s.bulk_read_out & bulk_read_mask == 0
-        {
-            return 0;
-        }
-        let mut made_progress = false;
-        let n = s.io_q_count as usize;
-        for q in 0..n {
-            while let Some((cid, sc)) = next_owned_cqe(s, q) {
-                made_progress = true;
-                if is_v1_cid(cid) {
-                    retire_v1_cqe(s, cid, sc);
-                    continue;
-                }
-
-                if cid == expected_cid {
-                    // Only a command the driver has outstanding completes
-                    // a wait.
-                    if pager_release(s, cid) {
-                        return if sc == 0 { 0 } else { E_INVAL };
-                    }
-                    continue;
-                }
-
-                if is_pager_sync_cid(cid) {
-                    retire_pager_orphan(s, cid);
-                    continue;
-                }
-
-                if is_write_cid(cid) {
-                    // Retire per-queue inflight head.
-                    let cnt = *s.inflight_count.as_ptr().add(q);
-                    if cnt > 0 {
-                        let head = *s.inflight_head.as_ptr().add(q) as usize;
-                        let new_head = (head + 1) % MAX_INFLIGHT;
-                        *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
-                        *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
-                    }
-                    continue;
-                }
-
-                if is_bulk_write_cid(cid) {
-                    // Async bulk-write completion. The caller has
-                    // already returned 0 to its consumer; we just
-                    // advance the ring head and latch any error so
-                    // the next FLUSH (or submit) can surface it.
-                    retire_bulk_write_cqe(s, sc);
-                    continue;
-                }
-
-                if cid == CID_PAGER_FLUSH {
-                    // A Flush an earlier barrier gave up on. Retire it
-                    // here or its completion is lost and every barrier
-                    // waiting on it stays pending forever.
-                    retire_flush_cqe(s, sc);
-                    continue;
-                }
-
-                // Any other CID names nothing this driver submitted: count
-                // it and keep spinning.
-                s.stale_cqes = s.stale_cqes.wrapping_add(1);
-                dev_log(
-                    &*s.syscalls,
-                    2,
-                    c"[nvme] pager: stray cqe".as_ptr().cast(),
-                    22,
-                );
-            }
-        }
-        if !made_progress && now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-            return E_AGAIN;
-        }
-    }
-}
-
-/// True iff `cid` belongs to the async bulk-write CID range.
-#[inline(always)]
-pub fn is_bulk_write_cid(cid: u16) -> bool {
-    cid >= CID_BULK_WRITE_BASE && cid < CID_BULK_WRITE_BASE + (ASYNC_BULK_SLOTS as u16)
-}
-
-/// True iff `cid` belongs to the async bulk-read CID range
-/// (`CID_PAGER_READ_BULK..CID_PAGER_READ_BULK + ASYNC_BULK_SLOTS`).
-/// Pipelined reads use one CID per in-flight slot, mirroring the
-/// write-side encoding.
-#[inline(always)]
-pub fn is_bulk_read_cid(cid: u16) -> bool {
-    cid >= CID_PAGER_READ_BULK && cid < CID_PAGER_READ_BULK + (ASYNC_BULK_SLOTS as u16)
-}
-
-/// Acquire the next free async bulk-write slot. If the ring is full,
-/// spin-polls CQEs until at least one in-flight slot retires. Returns
-/// the slot index, or a negative errno on timeout. A stream read's
-/// completion (`BLK_PHASE_READING`) is held for its owner and skipped
-/// (`next_owned_cqe`), so it never starves the acquisition; the budget
-/// expires with `E_AGAIN` only when the device itself is slow.
-unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
-    if (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
-        let start = now_ms(s);
-        while (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
-            let mut progress = false;
-            let n = s.io_q_count as usize;
-            for q in 0..n {
-                while let Some((cid, sc)) = next_owned_cqe(s, q) {
-                    if is_bulk_write_cid(cid) {
-                        progress = true;
-                        retire_bulk_write_cqe(s, sc);
-                    } else if is_v1_cid(cid) {
-                        progress = true;
-                        retire_v1_cqe(s, cid, sc);
-                    } else if is_pager_sync_cid(cid) {
-                        progress = true;
-                        retire_pager_orphan(s, cid);
-                    } else if cid == CID_PAGER_FLUSH {
-                        progress = true;
-                        retire_flush_cqe(s, sc);
-                    } else if is_write_cid(cid) {
-                        progress = true;
-                        let cnt = *s.inflight_count.as_ptr().add(q);
-                        if cnt > 0 {
-                            let head = *s.inflight_head.as_ptr().add(q) as usize;
-                            let new_head = (head + 1) % MAX_INFLIGHT;
-                            *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
-                            *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
-                        }
-                    } else {
-                        progress = true;
-                        s.stale_cqes = s.stale_cqes.wrapping_add(1);
-                    }
-                }
-            }
-            if !progress && now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-                return Err(E_AGAIN);
-            }
-        }
-    }
-    Ok(s.bulk_tail as usize)
-}
-
-/// Retire one async bulk-write CQE: advance the ring head, count the
-/// completion toward the durability fence, and latch any device error.
-/// This is the single accounting point for `write_complete_seq` — every
-/// site that consumes a bulk-write CQE MUST route through here so a
-/// fence never under-counts (which would falsely report durable) nor
-/// over-counts (which would stall a fence forever).
-#[inline]
-unsafe fn retire_bulk_write_cqe(s: &mut NvmeState, sc: u16) {
-    if s.bulk_count > 0 {
-        s.bulk_count -= 1;
-        s.bulk_head = (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
-    }
-    s.write_complete_seq = s.write_complete_seq.wrapping_add(1);
-    if sc != 0 && s.bulk_err == 0 {
-        s.bulk_err = E_INVAL;
-    }
-}
-
-/// Non-blocking single pass over every I/O completion queue: harvest
-/// whatever write CQEs are ready (retiring bulk-write and sync-write
-/// completions) and return. The async counterpart of
-/// `bulk_drain_writes`' inner loop with no wait — it advances
-/// `write_complete_seq` so a fence poll can observe durability without
-/// blocking the caller's step. A CQE that belongs to neither write
-/// family (e.g. an in-flight `BLK_PHASE_READING` batch read on
-/// `CID_READ_LBA0`) is left un-consumed for its owner — same rule as
-/// `poll_io_cqe` — and stops the harvest of that queue; write CQEs
-/// queued behind it are picked up on a later pass, which only delays
-/// (never falsifies) a fence.
-unsafe fn harvest_writes(s: &mut NvmeState) {
-    let n = s.io_q_count as usize;
-    for q in 0..n {
-        while let Some((cid, sc)) = peek_io_cqe(s, q) {
-            if cid == CID_PAGER_FLUSH {
-                consume_io_cqe(s, q);
-                retire_flush_cqe(s, sc);
-            } else if is_bulk_write_cid(cid) {
-                consume_io_cqe(s, q);
-                retire_bulk_write_cqe(s, sc);
-            } else if is_v1_cid(cid) {
-                consume_io_cqe(s, q);
-                retire_v1_cqe(s, cid, sc);
-            } else if is_pager_sync_cid(cid) {
-                consume_io_cqe(s, q);
-                retire_pager_orphan(s, cid);
-            } else if is_write_cid(cid) {
-                consume_io_cqe(s, q);
-                let cnt = *s.inflight_count.as_ptr().add(q);
-                if cnt > 0 {
-                    let head = *s.inflight_head.as_ptr().add(q) as usize;
-                    let new_head = (head + 1) % MAX_INFLIGHT;
-                    *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
-                    *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-}
-
-/// Retire a Flush CQE: on success every write completed before the
-/// Flush was submitted is on non-volatile media; on failure the barrier
-/// is unprovable and latches an error.
-unsafe fn retire_flush_cqe(s: &mut NvmeState, sc: u16) {
-    if !pager_release(s, CID_PAGER_FLUSH) {
-        return;
-    }
-    if sc == 0 {
-        if s.flush_inflight_for > s.flush_complete_seq {
-            s.flush_complete_seq = s.flush_inflight_for;
-        }
-    } else if s.flush_err == 0 {
-        s.flush_err = E_INVAL;
-    }
-    s.flush_inflight_for = 0;
-}
-
-/// Submit a Flush covering everything completed so far and wait for it.
-/// No-op on a controller that commits on completion. Returns 0 when the
-/// covered writes are durable.
-///
-/// A Flush an earlier call gave up on is still the controller's and
-/// still holds CID_PAGER_FLUSH. It covers only what had completed when it
-/// was submitted, so this call waits it out and then submits its own,
-/// rather than attaching to it or queueing a second Flush under the same CID.
-unsafe fn flush_barrier_sync(s: &mut NvmeState) -> i32 {
-    if !s.needs_flush {
-        return 0;
-    }
-    if s.flush_err != 0 {
-        return s.flush_err;
-    }
-    if s.pager_out & PO_FLUSH != 0 {
-        let rc = pager_await_idle(s, PO_FLUSH, 0);
-        if rc != 0 {
-            return rc;
-        }
-        if s.flush_err != 0 {
-            return s.flush_err;
-        }
-    }
-    s.flush_inflight_for = s.write_complete_seq;
-    pager_claim(s, CID_PAGER_FLUSH);
-    submit_io_flush(s, 0, CID_PAGER_FLUSH, s.namespace);
-    let target = s.flush_inflight_for;
-    let rc = pager_spin_poll_cqe(s, CID_PAGER_FLUSH);
-    if rc != 0 {
-        // The Flush never proved durable (device error or poll budget
-        // exhausted). A timed-out Flush stays outstanding: harvest retires
-        // it if the CQE lands later, and until then no barrier reports
-        // durable.
-        if rc != E_AGAIN {
-            s.flush_inflight_for = 0;
-            if s.flush_err == 0 {
-                s.flush_err = rc;
-            }
-        }
-        return if s.flush_err != 0 { s.flush_err } else { rc };
-    }
-    if target > s.flush_complete_seq {
-        s.flush_complete_seq = target;
-    }
-    s.flush_inflight_for = 0;
-    0
-}
-
-/// Drain every in-flight async bulk-write slot. Used by PAGER_OP_FLUSH
-/// so a caller's "all writes durable" contract is honoured even when
-/// individual writes returned 0 (queued, not yet completed). Returns
-/// any latched error from a previous failed CQE; clears it on read.
-unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
-    let start = now_ms(s);
-    // Drain BOTH write paths: the async bulk-pager queue (`bulk_count`) and the
-    // channel write path (per-queue `inflight_count`, retired in the
-    // `is_write_cid` arm below). A flush that returns durable must have waited
-    // on every submitted write, not just the bulk ones.
-    while s.bulk_count > 0 || total_inflight(s) > 0 {
-        let mut progress = false;
-        let n = s.io_q_count as usize;
-        for q in 0..n {
-            while let Some((cid, sc)) = next_owned_cqe(s, q) {
-                if is_bulk_write_cid(cid) {
-                    progress = true;
-                    retire_bulk_write_cqe(s, sc);
-                } else if is_v1_cid(cid) {
-                    progress = true;
-                    retire_v1_cqe(s, cid, sc);
-                } else if is_pager_sync_cid(cid) {
-                    progress = true;
-                    retire_pager_orphan(s, cid);
-                } else if cid == CID_PAGER_FLUSH {
-                    // Retire an async-fence Flush rather than treating it
-                    // as foreign: left at the queue head it blocks every
-                    // write completion behind it.
-                    progress = true;
-                    retire_flush_cqe(s, sc);
-                } else if is_write_cid(cid) {
-                    progress = true;
-                    let cnt = *s.inflight_count.as_ptr().add(q);
-                    if cnt > 0 {
-                        let head = *s.inflight_head.as_ptr().add(q) as usize;
-                        let new_head = (head + 1) % MAX_INFLIGHT;
-                        *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
-                        *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
-                    }
-                } else {
-                    progress = true;
-                    s.stale_cqes = s.stale_cqes.wrapping_add(1);
-                }
-            }
-        }
-        if !progress && now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-            return E_AGAIN;
-        }
-    }
-    let err = s.bulk_err;
-    s.bulk_err = 0;
-    err
-}
-
-/// Ensure the async-bulk slot at index `slot` has its
-/// `MAX_BULK_PAGES * PAGE` contiguous DMA region allocated, and seed
-/// `pager_write_bufs[base..base+MAX_BULK_PAGES]` with the per-page
-/// addresses carved from that single region. Lazy so a graph that
-/// never writes pays no arena cost.
-///
-/// Per-page allocations were not safe to bulk-memcpy across: the DMA
-/// arena allocator only guarantees each individual allocation is
-/// physically contiguous, not that two separate calls produce
-/// adjacent addresses (any other consumer can interleave). The
-/// `pager_read_pipelined` post-CQE memcpy and `handle_pager_bulk`'s
-/// write-stage memcpy both copy `count * PAGE_BYTES` from
-/// `pager_write_bufs[base]`, which only works if all of a slot's
-/// pages live in one contiguous run — enforced here by allocating
-/// the whole slot at once.
-///
-/// Coherent (Non-Cacheable Normal) arena — the device DMAs to and
-/// from these pages without CPU cache snooping; reads use the
-/// NEON-paired memcpy (`nc_to_c_memcpy_aligned`) to extract
-/// throughput from the Non-Cacheable bus on Cortex-A76.
-unsafe fn pager_ensure_slot_bufs(s: &mut NvmeState, slot: usize) -> bool {
-    if slot >= ASYNC_BULK_SLOTS {
-        return false;
-    }
-    let base = slot * (MAX_BULK_PAGES as usize);
-    if s.pager_write_bufs[base] != 0 {
-        return true;
-    }
-    let bytes = MAX_BULK_PAGES * PAGE;
-    let p = dev_dma_alloc(&*s.syscalls, bytes, PAGE);
-    if p == 0 {
-        return false;
-    }
-    let mut i: usize = 0;
-    while i < (MAX_BULK_PAGES as usize) {
-        s.pager_write_bufs[base + i] = slot_page_addr(p, i);
-        i += 1;
-    }
-    true
-}
-
-/// Per-page DMA address inside a slot's contiguous DMA region.
-/// `slot_base` is the address returned by `dev_dma_alloc(MAX_BULK_PAGES
-/// * PAGE, PAGE)`; the bulk memcpy that follows assumes the resulting
-///   per-page addresses are PAGE-strided, which is what this function
-///   guarantees. Exposed so the harness can pin the contiguity invariant
-///   without instantiating a full driver state.
-#[inline(always)]
-pub fn slot_page_addr(slot_base: u64, page_idx: usize) -> u64 {
-    slot_base + (page_idx as u64) * (PAGE as u64)
-}
-
-/// Ensure `pager_buf` has a 4 KB DMA page allocated. Uses the
-/// coherent (Non-Cacheable) arena so the spin-poll path doesn't
-/// have to issue DC CVAC / DC IVAC around each I/O — simpler and
-/// paging is never the latency-critical path anyway.
-unsafe fn pager_ensure_buf(s: &mut NvmeState) -> bool {
-    if s.pager_buf != 0 {
-        return true;
-    }
-    let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
-    if p == 0 {
-        return false;
-    }
-    s.pager_buf = p;
-    true
-}
-
-/// Ensure the PRP-list page for async bulk slot `slot` is allocated.
-/// One per slot — the slot's outstanding command points at it while
-/// in flight, so they cannot share.
-unsafe fn pager_ensure_prp_list(s: &mut NvmeState, slot: usize) -> bool {
-    if slot >= ASYNC_BULK_SLOTS {
-        return false;
-    }
-    if s.bulk_prp_list_bufs[slot] != 0 {
-        return true;
-    }
-    let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
-    if p == 0 {
-        return false;
-    }
-    s.bulk_prp_list_bufs[slot] = p;
-    true
-}
-
-/// Build and submit a bulk read or write SQE on queue 0 spanning
-/// `count` 4 KB pages, using slot `slot`'s DMA buffers and PRP-list.
-/// PRP setup follows NVMe 1.4 §4.3:
-///   - PRP1 = slot's first DMA page bus addr
-///   - count == 1: PRP2 = 0
-///   - count == 2: PRP2 = slot's second DMA page bus addr
-///   - count >= 3: PRP2 = slot's PRP-list bus addr; list = pages 1..count-1
-///
-/// Slot `slot`'s DMA pages live at
-/// `pager_write_bufs[slot*MAX_BULK_PAGES..(slot+1)*MAX_BULK_PAGES]`
-/// and PRP-list at `bulk_prp_list_bufs[slot]`. Caller is responsible
-/// for populating the DMA pages (writes) before calling.
-/// Returns 0 on submit OK; caller must spin-poll for the CQE (sync
-/// reads) or rely on async harvest (writes).
-unsafe fn submit_bulk_op(
-    s: &mut NvmeState,
-    is_write: bool,
-    lba: u64,
-    count: u32,
-    cid: u16,
-    slot: usize,
-) -> i32 {
-    // Stripe both reads and writes across I/O queues. Cross-queue
-    // reads were unstable until SQE+PRP visibility was tightened
-    // with a DSB before each doorbell (see `write_sqe`); striping
-    // them now gives the same depth-across-queues win that writes
-    // already enjoy.
-    let pager_q: usize = if s.io_q_count > 0 {
-        slot % (s.io_q_count as usize)
-    } else {
-        0
-    };
-    let opcode = if is_write { OPC_WRITE } else { OPC_READ };
-
-    // Total LBAs across all pages. NLB field is zero-based.
-    let nlb = count * (PAGE_LBAS as u32);
-    if nlb == 0 || nlb > 65536 {
-        return E_INVAL;
-    }
-    if slot >= ASYNC_BULK_SLOTS {
-        return E_INVAL;
-    }
-
-    let base = slot * (MAX_BULK_PAGES as usize);
-    let prp1_pci = s.pager_write_bufs[base] | s.dma_offset;
-    let (prp2_lo, prp2_hi): (u32, u32) = if count == 1 {
-        (0, 0)
-    } else if count == 2 {
-        let p2 = s.pager_write_bufs[base + 1] | s.dma_offset;
-        (p2 as u32, (p2 >> 32) as u32)
-    } else {
-        // Build PRP-list with pages 1..count-1 (count-1 entries).
-        let list = s.bulk_prp_list_bufs[slot] as *mut u64;
-        let mut i: u32 = 1;
-        let mut idx: usize = 0;
-        while i < count {
-            let entry = s.pager_write_bufs[base + i as usize] | s.dma_offset;
-            write_volatile(list.add(idx), entry);
-            idx += 1;
-            i += 1;
-        }
-        let plist = s.bulk_prp_list_bufs[slot] | s.dma_offset;
-        (plist as u32, (plist >> 32) as u32)
-    };
-
-    let cdw = [
-        ((cid as u32) << 16) | (opcode as u32),
-        s.namespace,
-        0,
-        0,
-        0,
-        0,
-        prp1_pci as u32,
-        (prp1_pci >> 32) as u32,
-        prp2_lo,
-        prp2_hi,
-        lba as u32,
-        (lba >> 32) as u32,
-        nlb - 1,
-        0,
-        0,
-        0,
-    ];
-    let sq_base = *s.io_sq.as_ptr().add(pager_q);
-    let tail = *s.io_sq_tail.as_ptr().add(pager_q);
-    write_sqe(sq_base, tail, cdw);
-    let new_tail = (tail + 1) % IO_Q_ENTRIES;
-    *s.io_sq_tail.as_mut_ptr().add(pager_q) = new_tail;
-    reg_w32(s, sq_doorbell(s, IO_QID as u32 + pager_q as u32), new_tail);
-    0
-}
-
-/// Bulk pager handler. Writes are async (submit-don't-wait): the
-/// data is staged into a free slot's DMA buffers and a CQE is left
-/// for `bulk_drain_writes` (FLUSH) or the next slot acquisition to
-/// harvest. Reads are sync: they drain any outstanding writes first
-/// (so the read sees a coherent device state) then issue a single
-/// blocking command. Returns 0 on success, negative errno on failure.
-unsafe fn handle_pager_bulk(
-    s: &mut NvmeState,
-    is_write: bool,
-    arena_base_page: u32,
-    vpage_start: u32,
-    count: u32,
-    user_buf: *mut u8,
-) -> i32 {
-    if count == 0 {
-        return E_INVAL;
-    }
-    if count > MAX_BULK_PAGES {
-        return E_INVAL;
-    }
-
-    let lba = NVME_ARENA_LBA_BASE
-        + ((arena_base_page as u64) + (vpage_start as u64)) * (PAGE_LBAS as u64);
-
-    if is_write {
-        // Acquire next free async-bulk slot (drains an in-flight one
-        // if the ring is full). Buffers + PRP-list are pre-alloc'd in
-        // `step_ready`; `pager_ensure_*` is a fast-path no-op here.
-        let slot = match bulk_acquire_slot(s) {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-        // A read this slot's memory is still the target of must land before
-        // the staged write overwrites it.
-        let idle = pager_await_idle(s, 0, 1 << slot);
-        if idle != 0 {
-            return idle;
-        }
-        if !pager_ensure_prp_list(s, slot) {
-            return E_INVAL;
-        }
-        if !pager_ensure_slot_bufs(s, slot) {
-            return E_INVAL;
-        }
-        let base = slot * (MAX_BULK_PAGES as usize);
-        // Stage every page from caller's buffer into the slot's DMA
-        // region. DMA pages are coherent so no flush needed before
-        // the device-bound submit. The slot's MAX_BULK_PAGES pages
-        // are carved from one `dev_dma_alloc` and therefore physically
-        // contiguous, so one bulk memcpy covers the full chunk span.
-        core::ptr::copy_nonoverlapping(
-            user_buf as *const u8,
-            s.pager_write_bufs[base] as *mut u8,
-            (count as usize) * (PAGE_BYTES as usize),
-        );
-        let cid = CID_BULK_WRITE_BASE + (slot as u16);
-        let rc = submit_bulk_op(s, true, lba, count, cid, slot);
-        if rc != 0 {
-            return rc;
-        }
-        // Update ring before returning so the next call sees the
-        // slot as in-flight even before the CQE arrives.
-        s.bulk_tail = (s.bulk_tail + 1) % (ASYNC_BULK_SLOTS as u8);
-        s.bulk_count += 1;
-        if s.bulk_count > s.bulk_depth_peak {
-            s.bulk_depth_peak = s.bulk_count;
-        }
-        // Surface any error that landed on a previous async submit.
-        let err = s.bulk_err;
-        s.bulk_err = 0;
-        return err;
-    }
-
-    // READ — drain any in-flight writes so the device state is
-    // coherent before we read it. Then borrow slot 0's buffers and
-    // PRP-list (no async writes can be using them post-drain).
-    let drain_rc = bulk_drain_writes(s);
-    if drain_rc != 0 {
-        return drain_rc;
-    }
-    let slot: usize = 0;
-    let idle = pager_await_idle(s, 0, 1 << slot);
-    if idle != 0 {
-        return idle;
-    }
-    if !pager_ensure_prp_list(s, slot) {
-        return E_INVAL;
-    }
-    if !pager_ensure_slot_bufs(s, slot) {
-        return E_INVAL;
-    }
-    let base = slot * (MAX_BULK_PAGES as usize);
-    pager_claim(s, CID_PAGER_READ_BULK);
-    let rc = submit_bulk_op(s, false, lba, count, CID_PAGER_READ_BULK, slot);
-    if rc != 0 {
-        pager_release(s, CID_PAGER_READ_BULK);
-        return rc;
-    }
-    let pr = pager_spin_poll_cqe(s, CID_PAGER_READ_BULK);
-    if pr != 0 {
-        return pr;
-    }
-    // DMA pages are coherent and physically contiguous. Use the
-    // NEON-paired memcpy: see `nc_to_c_memcpy_aligned` — copying
-    // from Non-Cacheable memory with 128-bit register pairs keeps
-    // the LSU's outstanding-load queue saturated and avoids the
-    // ~67 MB/s ceiling of the default 8-byte-load lowering.
-    nc_to_c_memcpy_aligned(
-        user_buf,
-        s.pager_write_bufs[base] as *const u8,
-        (count as usize) * (PAGE_BYTES as usize),
-    );
-    0
-}
-
-/// Per-in-flight slot state for `pager_read_pipelined`. `chunk == 0`
-/// marks the slot free. `user_page_offset` is the page index in the
-/// caller's destination buffer where the slot's DMA pages will land
-/// once the CQE retires.
-#[derive(Clone, Copy)]
-struct ReadSlot {
-    user_page_offset: u32,
-    chunk: u16,
-}
-
-/// Optimized memcpy for the Non-Cacheable DMA arena → cacheable user
-/// buffer path. The default `core::ptr::copy_nonoverlapping` lowers to
-/// an inline loop with 8-byte general-register loads, which serialises
-/// at ~67 MB/s against the Non-Cacheable bus on bcm2712. The NEON
-/// 128-bit `ldp q,q`/`stp q,q` form gives the LSU enough outstanding
-/// loads (4 pairs × 32 B = 128 B per iteration) to keep the AXI read
-/// pipeline saturated even without burst-merging.
-///
-/// Caller guarantees `len` is a multiple of 128 and both pointers are
-/// 16-byte aligned (4 KB DMA page is both). Returns early without
-/// touching the tail if `len == 0`.
-#[inline(always)]
-unsafe fn nc_to_c_memcpy_aligned(dst: *mut u8, src: *const u8, len: usize) {
-    if len == 0 {
-        return;
-    }
-    debug_assert!(len.is_multiple_of(128));
-    debug_assert!((src as usize).is_multiple_of(16));
-    debug_assert!((dst as usize).is_multiple_of(16));
-    let iters = len / 128;
-    core::arch::asm!(
-        "1:",
-        "ldp q0, q1, [{s}, #0]",
-        "ldp q2, q3, [{s}, #32]",
-        "ldp q4, q5, [{s}, #64]",
-        "ldp q6, q7, [{s}, #96]",
-        "stp q0, q1, [{d}, #0]",
-        "stp q2, q3, [{d}, #32]",
-        "stp q4, q5, [{d}, #64]",
-        "stp q6, q7, [{d}, #96]",
-        "add {s}, {s}, #128",
-        "add {d}, {d}, #128",
-        "subs {n}, {n}, #1",
-        "b.ne 1b",
-        s = inout(reg) src => _,
-        d = inout(reg) dst => _,
-        n = inout(reg) iters => _,
-        out("q0") _, out("q1") _, out("q2") _, out("q3") _,
-        out("q4") _, out("q5") _, out("q6") _, out("q7") _,
-        options(nostack),
-    );
-}
-
-/// Pipelined bulk read across `MAX_IO_QUEUES` and `ASYNC_BULK_SLOTS`.
-/// Submits up to `ASYNC_BULK_SLOTS` MAX_BULK_PAGES-sized read
-/// commands at once (one per slot, slot index picks the queue via
-/// `submit_bulk_op`'s `slot % io_q_count` rule), then refills each
-/// slot as its CQE retires. Throughput approaches the PCIe link
-/// rather than the per-command sync latency a serial reader would
-/// see.
-///
-/// Each slot's CID is `CID_PAGER_READ_BULK + slot_idx`, and stays
-/// distinct from the write-side `CID_BULK_WRITE_BASE..` range, so
-/// the CQE-drain loop can route absorbed writes (from a prior async
-/// pipeline) into the write ring without confusing them with reads.
-///
-/// Writes are drained before the first submission so the device
-/// sees a coherent snapshot for the entire read window — same
-/// post-write barrier the single-command read path enforces.
-unsafe fn pager_read_pipelined(
-    s: &mut NvmeState,
-    arena_base_page: u32,
-    vpage_start: u32,
-    count: u32,
-    user_buf: *mut u8,
-) -> i32 {
-    if count == 0 {
-        return E_INVAL;
-    }
-    if user_buf.is_null() {
-        return E_INVAL;
-    }
-
-    let t_enter = dev_micros(&*s.syscalls);
-    let drain_rc = bulk_drain_writes(s);
-    if drain_rc != 0 {
-        return drain_rc;
-    }
-    // A slot's CID and DMA memory are free only once its completion has been
-    // consumed, so a read an earlier call gave up on lands before any slot
-    // is reused.
-    let idle = pager_await_idle(s, 0, 0xFF);
-    if idle != 0 {
-        return idle;
-    }
-    let t_submit_start = dev_micros(&*s.syscalls);
-    let mut copy_us_local: u64 = 0;
-
-    let mut slots: [ReadSlot; ASYNC_BULK_SLOTS] = [ReadSlot {
-        user_page_offset: 0,
-        chunk: 0,
-    }; ASYNC_BULK_SLOTS];
-
-    let base_lba = NVME_ARENA_LBA_BASE
-        + ((arena_base_page as u64) + (vpage_start as u64)) * (PAGE_LBAS as u64);
-
-    let mut submitted_pages: u32 = 0;
-    let mut completed_pages: u32 = 0;
-    let mut in_flight: u32 = 0;
-
-    // Prime the pipeline.
-    let mut slot_idx: usize = 0;
-    while slot_idx < ASYNC_BULK_SLOTS && submitted_pages < count {
-        let chunk = (count - submitted_pages).min(MAX_BULK_PAGES);
-        if !pager_ensure_prp_list(s, slot_idx) {
-            return E_INVAL;
-        }
-        if !pager_ensure_slot_bufs(s, slot_idx) {
-            return E_INVAL;
-        }
-        let cid = CID_PAGER_READ_BULK + (slot_idx as u16);
-        let lba = base_lba + (submitted_pages as u64) * (PAGE_LBAS as u64);
-        pager_claim(s, cid);
-        let rc = submit_bulk_op(s, false, lba, chunk, cid, slot_idx);
-        if rc != 0 {
-            pager_release(s, cid);
-            return rc;
-        }
-        *slots.as_mut_ptr().add(slot_idx) = ReadSlot {
-            user_page_offset: submitted_pages,
-            chunk: chunk as u16,
-        };
-        submitted_pages += chunk;
-        in_flight += 1;
-        if in_flight as u8 > s.read_depth_peak {
-            s.read_depth_peak = in_flight as u8;
-        }
-        slot_idx += 1;
-    }
-
-    let t_poll_start = dev_micros(&*s.syscalls);
-
-    // Pump completions in arrival order; refill any slot that still
-    // has work to do.
-    let start = now_ms(s);
-    while completed_pages < count {
-        let mut made_progress = false;
-        let n = s.io_q_count as usize;
-        for q in 0..n {
-            while let Some((cid, sc)) = next_owned_cqe(s, q) {
-                made_progress = true;
-                if is_v1_cid(cid) {
-                    retire_v1_cqe(s, cid, sc);
-                    continue;
-                }
-
-                if is_bulk_read_cid(cid) {
-                    let slot = (cid - CID_PAGER_READ_BULK) as usize;
-                    if slot >= ASYNC_BULK_SLOTS {
-                        return E_INVAL;
-                    }
-                    // Only a read this driver has outstanding completes.
-                    if !pager_release(s, cid) {
-                        continue;
-                    }
-                    if sc != 0 {
-                        return E_INVAL;
-                    }
-                    let info = *slots.as_ptr().add(slot);
-                    if info.chunk == 0 {
-                        // CQE for a slot we don't think is in flight —
-                        // shouldn't happen; surface as a fault rather
-                        // than silently mis-copy.
-                        return E_INVAL;
-                    }
-                    let chunk = info.chunk as u32;
-                    let base = slot * (MAX_BULK_PAGES as usize);
-                    // DMA pages are coherent (Non-Cacheable Normal)
-                    // and physically contiguous. Use the NEON-paired
-                    // memcpy: the default `copy_nonoverlapping` lowers
-                    // to 8-byte general-register loads (~67 MB/s on
-                    // the bcm2712 Non-Cacheable bus), while four
-                    // pairs of 128-bit `ldp q,q` per iteration keep
-                    // enough outstanding loads in flight to saturate
-                    // the AXI read pipeline.
-                    let t_copy_start = dev_micros(&*s.syscalls);
-                    let src = s.pager_write_bufs[base] as *const u8;
-                    let dst =
-                        user_buf.add((info.user_page_offset as usize) * (PAGE_BYTES as usize));
-                    nc_to_c_memcpy_aligned(dst, src, (chunk as usize) * (PAGE_BYTES as usize));
-                    copy_us_local += dev_micros(&*s.syscalls).saturating_sub(t_copy_start);
-                    completed_pages += chunk;
-                    in_flight -= 1;
-                    // Refill this slot if more pages remain.
-                    if submitted_pages < count {
-                        let next_chunk = (count - submitted_pages).min(MAX_BULK_PAGES);
-                        // Slot's contiguous DMA region was allocated
-                        // on the prime pass; `pager_ensure_slot_bufs`
-                        // here is a fast-path no-op.
-                        if !pager_ensure_slot_bufs(s, slot) {
-                            return E_INVAL;
-                        }
-                        let next_cid = CID_PAGER_READ_BULK + (slot as u16);
-                        let next_lba = base_lba + (submitted_pages as u64) * (PAGE_LBAS as u64);
-                        pager_claim(s, next_cid);
-                        let rc = submit_bulk_op(s, false, next_lba, next_chunk, next_cid, slot);
-                        if rc != 0 {
-                            pager_release(s, next_cid);
-                            return rc;
-                        }
-                        *slots.as_mut_ptr().add(slot) = ReadSlot {
-                            user_page_offset: submitted_pages,
-                            chunk: next_chunk as u16,
-                        };
-                        submitted_pages += next_chunk;
-                        in_flight += 1;
-                        if in_flight as u8 > s.read_depth_peak {
-                            s.read_depth_peak = in_flight as u8;
-                        }
-                    } else {
-                        *slots.as_mut_ptr().add(slot) = ReadSlot {
-                            user_page_offset: 0,
-                            chunk: 0,
-                        };
-                    }
-                    continue;
-                }
-
-                if is_bulk_write_cid(cid) {
-                    // Stale write CQE absorbed (drain-before-read
-                    // should have already retired these — log and
-                    // continue rather than wedge).
-                    retire_bulk_write_cqe(s, sc);
-                    continue;
-                }
-
-                if is_write_cid(cid) {
-                    let cnt = *s.inflight_count.as_ptr().add(q);
-                    if cnt > 0 {
-                        let head = *s.inflight_head.as_ptr().add(q) as usize;
-                        let new_head = (head + 1) % MAX_INFLIGHT;
-                        *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
-                        *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
-                    }
-                    continue;
-                }
-
-                if is_pager_sync_cid(cid) {
-                    retire_pager_orphan(s, cid);
-                    continue;
-                }
-
-                if cid == CID_PAGER_FLUSH {
-                    retire_flush_cqe(s, sc);
-                    continue;
-                }
-
-                // Stray CID: count it and keep pumping.
-                s.stale_cqes = s.stale_cqes.wrapping_add(1);
-                dev_log(
-                    &*s.syscalls,
-                    2,
-                    c"[nvme] pager read: stray cqe".as_ptr().cast(),
-                    28,
-                );
-            }
-        }
-        if !made_progress {
-            if in_flight == 0 {
-                // Nothing in flight but completion is not yet count —
-                // hit only if submit failed before reaching count, which
-                // would have returned above. Belt-and-braces guard.
-                return E_INVAL;
-            }
-            if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-                return E_AGAIN;
-            }
-        }
-    }
-    let t_exit = dev_micros(&*s.syscalls);
-    s.read_call_count = s.read_call_count.wrapping_add(1);
-    s.read_submit_us = s
-        .read_submit_us
-        .wrapping_add(t_poll_start.saturating_sub(t_submit_start));
-    // Poll = from end-of-submit to end-of-call MINUS the time the
-    // memcpy used. Captures CQE-wait time minus copy time.
-    s.read_poll_us = s.read_poll_us.wrapping_add(
-        t_exit
-            .saturating_sub(t_poll_start)
-            .saturating_sub(copy_us_local),
-    );
-    s.read_copy_us = s.read_copy_us.wrapping_add(copy_us_local);
-    s.read_total_us = s.read_total_us.wrapping_add(t_exit.saturating_sub(t_enter));
-    0
-}
-
-/// # Safety
-/// Kernel provider-dispatch entry point: `state` is the instance block this
-/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
-/// (may be null when `arg_len` is 0) valid for the call.
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.backing_provider_dispatch"]
-pub unsafe extern "C" fn backing_provider_dispatch(
-    state: *mut u8,
-    opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
-    if state.is_null() {
-        return E_INVAL;
-    }
-    let s = &mut *(state as *mut NvmeState);
-    if !io_claim(s, IO_DISPATCH) {
-        return E_AGAIN; // the step holds the queue; the caller waits it out
-    }
-    let rc = dispatch_body(state, opcode, arg, arg_len);
-    io_release(&mut *(state as *mut NvmeState));
-    rc
-}
-
-unsafe fn dispatch_body(state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    let s = &mut *(state as *mut NvmeState);
-
-    if opcode == PAGER_OP_FLUSH {
-        return device_flush(s);
-    }
-    if opcode != PAGER_OP_READ
-        && opcode != PAGER_OP_WRITE
-        && opcode != PAGER_OP_READ_BULK
-        && opcode != PAGER_OP_WRITE_BULK
-    {
-        return E_NOSYS;
-    }
-
-    // The module must be in S_READY before pager I/O is legal — the
-    // I/O queue pair isn't live until CreateIoCQ/CreateIoSQ complete.
-    if s.state != S_READY {
-        return E_AGAIN;
-    }
-
-    // Bulk multi-page transfers. Arg layout (24 bytes):
-    //   [arena_base_page: u32][vpage_start: u32][count: u32][_pad: u32][buf_ptr: u64]
-    if opcode == PAGER_OP_READ_BULK || opcode == PAGER_OP_WRITE_BULK {
-        if arg.is_null() || arg_len < 24 {
-            return E_INVAL;
-        }
-        let arena_base_page = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-        let vpage_start = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-        let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-        let buf_ptr = u64::from_le_bytes([
-            *arg.add(16),
-            *arg.add(17),
-            *arg.add(18),
-            *arg.add(19),
-            *arg.add(20),
-            *arg.add(21),
-            *arg.add(22),
-            *arg.add(23),
-        ]) as *mut u8;
-        if buf_ptr.is_null() {
-            return E_INVAL;
-        }
-        if opcode == PAGER_OP_READ_BULK {
-            // Pipelined read: submits up to ASYNC_BULK_SLOTS
-            // MAX_BULK_PAGES-sized commands across all I/O queues,
-            // pumps completions out-of-order, and memcpy-s each
-            // slot's DMA pages into the caller's buffer as they
-            // retire. Throughput tracks the link rather than the
-            // per-command sync latency a serial reader would see.
-            return pager_read_pipelined(s, arena_base_page, vpage_start, count, buf_ptr);
-        }
-        // Writes still go through the per-chunk path: each call
-        // submits one async-bulk command into the slot ring and
-        // returns immediately. The next call drains an in-flight
-        // slot if the ring is full, so the kernel pager's outer loop
-        // implicitly pipelines the entire `count`.
-        let mut done: u32 = 0;
-        while done < count {
-            let chunk = (count - done).min(MAX_BULK_PAGES);
-            let user = buf_ptr.add((done as usize) * (PAGE_BYTES as usize));
-            let rc = handle_pager_bulk(s, true, arena_base_page, vpage_start + done, chunk, user);
-            if rc != 0 {
-                return rc;
-            }
-            done += chunk;
-        }
-        return 0;
-    }
-
-    // Arg layout (16 bytes): [arena_base_page: u32][vpage_idx: u32][buf_ptr: u64].
-    // The kernel's backing_offset is abstract page-granular; this
-    // driver converts to the device's LBA space using its own
-    // NVME_ARENA_LBA_BASE offset.
-    if arg.is_null() || arg_len < 16 {
-        return E_INVAL;
-    }
-    let arena_base_page = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-    let vpage_idx = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-    let buf_ptr = u64::from_le_bytes([
-        *arg.add(8),
-        *arg.add(9),
-        *arg.add(10),
-        *arg.add(11),
-        *arg.add(12),
-        *arg.add(13),
-        *arg.add(14),
-        *arg.add(15),
-    ]) as *mut u8;
-    if buf_ptr.is_null() {
-        return E_INVAL;
-    }
-
-    if !pager_ensure_buf(s) {
-        return E_INVAL;
-    }
-
-    let lba =
-        NVME_ARENA_LBA_BASE + ((arena_base_page as u64) + (vpage_idx as u64)) * (PAGE_LBAS as u64);
-
-    if opcode == PAGER_OP_WRITE {
-        // Single-page synchronous WRITE — submit then spin for
-        // completion. Throughput is capped at the device's QD=1
-        // latency floor; multi-page producers should use
-        // `PAGER_OP_WRITE_BULK` (async, multiple in flight) for the
-        // high-throughput path. This branch serves the kernel's
-        // demand-page writeback, which is intrinsically per-page.
-        if !pager_ensure_buf(s) {
-            return E_INVAL;
-        }
-        // The page is still the target of a read this driver gave up on
-        // until that read's completion lands.
-        let idle = pager_await_idle(s, PO_PAGE, 0);
-        if idle != 0 {
-            return idle;
-        }
-        core::ptr::copy_nonoverlapping(buf_ptr, s.pager_buf as *mut u8, PAGE_BYTES as usize);
-        pager_claim(s, CID_PAGER_WRITE);
-        submit_io_write(
-            s,
-            0,
-            lba,
-            PAGE_LBAS,
-            CID_PAGER_WRITE,
-            s.namespace,
-            s.pager_buf,
-        );
-        let rc = pager_spin_poll_cqe(s, CID_PAGER_WRITE);
-        return rc;
-    }
-
-    // READ
-    // submit_io_read sources into s.read_buf, not an arbitrary target.
-    // Build the SQE inline so DMA lands directly in pager_buf and we
-    // avoid a read-buf-vs-pager-buf aliasing risk (pager_buf is fixed,
-    // read_buf is fast-path for step_ready). Pager pinned to queue 0.
-    let pager_q: usize = 0;
-    let idle = pager_await_idle(s, PO_PAGE, 0);
-    if idle != 0 {
-        return idle;
-    }
-    pager_claim(s, CID_PAGER_READ);
-    let prp1_pci = s.pager_buf | s.dma_offset;
-    let cdw = [
-        ((CID_PAGER_READ as u32) << 16) | (OPC_READ as u32),
-        s.namespace,
-        0,
-        0,
-        0,
-        0,
-        prp1_pci as u32,
-        (prp1_pci >> 32) as u32,
-        0,
-        0,
-        lba as u32,
-        (lba >> 32) as u32,
-        (PAGE_LBAS as u32) - 1,
-        0,
-        0,
-        0,
-    ];
-    let sq_base = *s.io_sq.as_ptr().add(pager_q);
-    let tail = *s.io_sq_tail.as_ptr().add(pager_q);
-    write_sqe(sq_base, tail, cdw);
-    let new_tail = (tail + 1) % IO_Q_ENTRIES;
-    *s.io_sq_tail.as_mut_ptr().add(pager_q) = new_tail;
-    reg_w32(s, sq_doorbell(s, IO_QID as u32 + pager_q as u32), new_tail);
-    let rc = pager_spin_poll_cqe(s, CID_PAGER_READ);
-    if rc == 0 {
-        // Copy DMA page into caller's buffer.
-        let mut i = 0usize;
-        while i < PAGE_BYTES as usize {
-            write_volatile(
-                buf_ptr.add(i),
-                read_volatile((s.pager_buf as *const u8).add(i)),
-            );
-            i += 1;
-        }
-    }
-    rc
-}
-
 // ============================================================================
 // Module ABI
 // ============================================================================
@@ -5064,7 +3470,7 @@ pub unsafe extern "C" fn module_new(
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut NvmeState);
     if !io_claim(s, IO_STEP) {
-        return 0; // a dispatch holds the queue; next step
+        return 0; // an ioctl holds the queue; next step
     }
     let rc = step_body(state);
     io_release(&mut *(state as *mut NvmeState));
@@ -5072,7 +3478,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 const IO_STEP: u8 = 1;
-const IO_DISPATCH: u8 = 2;
+const IO_IOCTL: u8 = 2;
 
 unsafe fn io_owner(s: &mut NvmeState) -> &core::sync::atomic::AtomicU8 {
     // SAFETY: AtomicU8 has u8's size and alignment; the field is only ever

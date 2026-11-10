@@ -67,25 +67,25 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
 // ── FS contract opcodes (storage/fs.rs) ─────────────────────────────────────
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPENDIR: u32 = 0x0907;
-const FS_READDIR: u32 = 0x0908;
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_UNLINK: u32 = 0x090A;
-const FS_MKDIR: u32 = 0x090B;
-const FS_TRUNCATE: u32 = 0x090C;
-const FS_RENAME: u32 = 0x090D;
-const FS_FSYNC_NAME: u32 = 0x0912;
-const FS_LINK: u32 = 0x0913;
-const FS_RMDIR: u32 = 0x0915;
-const FS_CAPS: u32 = 0x09FF;
-const CONTRACT_FS: u32 = 0x0009;
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_SEEK: u32 = abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_STAT: u32 = abi::registry::fs::STAT;
+const FS_FSYNC: u32 = abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = abi::registry::fs::WRITE;
+const FS_OPENDIR: u32 = abi::registry::fs::OPENDIR;
+const FS_READDIR: u32 = abi::registry::fs::READDIR;
+const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
+const FS_UNLINK: u32 = abi::registry::fs::UNLINK;
+const FS_MKDIR: u32 = abi::registry::fs::MKDIR;
+const FS_TRUNCATE: u32 = abi::registry::fs::TRUNCATE;
+const FS_RENAME: u32 = abi::registry::fs::RENAME;
+const FS_FSYNC_NAME: u32 = abi::registry::fs::FSYNC_NAME;
+const FS_LINK: u32 = abi::registry::fs::LINK;
+const FS_RMDIR: u32 = abi::registry::fs::RMDIR;
+const FS_CAPS: u32 = abi::registry::fs::CAPS;
+const CONTRACT_FS: u32 = abi::registry::fs::ID as u32;
 
 // errno
 const EINVAL: i32 = -22;

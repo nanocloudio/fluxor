@@ -36,8 +36,8 @@ use fluxor::platform::multicore;
 // first interrupt.
 //
 // Submodules that hold shared kernel state (PCIe enumeration,
-// runtime MMU isolation, cross-domain channels, NIC DMA arena, paged
-// memory) are declared in `src/kernel/mod.rs` and reachable as
+// runtime MMU isolation, cross-domain channels, NIC DMA arena) are
+// declared in `src/kernel/mod.rs` and reachable as
 // `fluxor::kernel::{pcie, mmu, multicore, nic_ring, …}`. They are
 // **not** redeclared here — a loaded module's kernel-facing surface
 // is the `fluxor::kernel` namespace, never `src/platform/*`.
@@ -1118,8 +1118,8 @@ fn bcm_sleep_until(_deadline_us: u64) -> u32 {
 
 /// Monotonic milliseconds since boot. Reads the ARM generic timer
 /// (`CNTPCT_EL0`) and scales by `cntfrq_el0 / 1000`. Backs
-/// `dev_millis` / `syscall_millis` for module-side timing such as
-/// NVMe arena probe perf measurement and TCP RTT estimation.
+/// `dev_millis` for module-side timing such as
+/// NVMe perf measurement and TCP RTT estimation.
 fn bcm_now_millis() -> u64 {
     let counter = bcm_read_counter();
     let freq = bcm_counter_freq();
@@ -1586,188 +1586,8 @@ unsafe fn bcm_system_extension_dispatch(
     arg_len: usize,
 ) -> i32 {
     use fluxor::abi::contracts::hal::pcie_device;
-    use fluxor::abi::contracts::storage::paged_arena;
-    use fluxor::abi::platform::bcm2712::{mmio_dma, msi, nic_ring, pcie_config};
+    use fluxor::abi::platform::bcm2712::nic_ring;
     match opcode {
-        mmio_dma::MMIO_READ32 => {
-            if arg.is_null() || arg_len < 12 {
-                return -22;
-            }
-            let addr = u64::from_le_bytes([
-                *arg,
-                *arg.add(1),
-                *arg.add(2),
-                *arg.add(3),
-                *arg.add(4),
-                *arg.add(5),
-                *arg.add(6),
-                *arg.add(7),
-            ]);
-            if !mmio_target_ok(addr) {
-                return fluxor::kernel::sys::errno::EFAULT;
-            }
-            let val = core::ptr::read_volatile(addr as *const u32);
-            let vb = val.to_le_bytes();
-            *arg.add(8) = vb[0];
-            *arg.add(9) = vb[1];
-            *arg.add(10) = vb[2];
-            *arg.add(11) = vb[3];
-            0
-        }
-        mmio_dma::MMIO_WRITE32 => {
-            if arg.is_null() || arg_len < 12 {
-                return -22;
-            }
-            let addr = u64::from_le_bytes([
-                *arg,
-                *arg.add(1),
-                *arg.add(2),
-                *arg.add(3),
-                *arg.add(4),
-                *arg.add(5),
-                *arg.add(6),
-                *arg.add(7),
-            ]);
-            let val = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            if !mmio_target_ok(addr) {
-                return fluxor::kernel::sys::errno::EFAULT;
-            }
-            core::ptr::write_volatile(addr as *mut u32, val);
-            0
-        }
-        mmio_dma::CACHE_FLUSH_RANGE => {
-            if arg.is_null() || arg_len < 12 {
-                return -22;
-            }
-            let addr = u64::from_le_bytes([
-                *arg,
-                *arg.add(1),
-                *arg.add(2),
-                *arg.add(3),
-                *arg.add(4),
-                *arg.add(5),
-                *arg.add(6),
-                *arg.add(7),
-            ]);
-            let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            if !dma_range_ok(addr, size) {
-                return fluxor::kernel::sys::errno::EFAULT;
-            }
-            // Clean + invalidate data cache by VA range
-            let mut ptr = (addr as usize) & !63;
-            let end = ((addr as usize) + size as usize + 63) & !63;
-            while ptr < end {
-                core::arch::asm!("dc civac, {}", in(reg) ptr, options(nostack));
-                ptr += 64;
-            }
-            core::arch::asm!("dsb sy");
-            0
-        }
-        mmio_dma::DMA_ALLOC_CONTIG => {
-            if arg.is_null() || arg_len < 16 {
-                return -22;
-            }
-            let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            // From the PCIe1 DMA arena, a BSS static the boot tables map
-            // Normal Non-cacheable; a device behind PCIe1 reaches it through
-            // the inbound BAR1 window (`pcie::enumerate`). See
-            // `platform::nic_ring::pcie1_dma_alloc_contig`.
-            let phys =
-                fluxor::platform::nic_ring::pcie1_dma_alloc_contig(size as usize, align as usize);
-            if phys == 0 {
-                return -38;
-            }
-            let pb = (phys as u64).to_le_bytes();
-            core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
-            0
-        }
-        mmio_dma::DMA_ALLOC_STREAMING => {
-            if arg.is_null() || arg_len < 16 {
-                return -22;
-            }
-            let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            // Streaming arena stays WB-cacheable. Callers must pair writes
-            // with DMA_FLUSH before device-reads and DMA_INVALIDATE before
-            // CPU-reads of device-written regions.
-            let phys = fluxor::platform::nic_ring::pcie1_dma_alloc_streaming(
-                size as usize,
-                align as usize,
-            );
-            if phys == 0 {
-                return -38;
-            }
-            let pb = (phys as u64).to_le_bytes();
-            core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
-            0
-        }
-        mmio_dma::DMA_FLUSH => {
-            if arg.is_null() || arg_len < 12 {
-                return -22;
-            }
-            let addr = u64::from_le_bytes([
-                *arg,
-                *arg.add(1),
-                *arg.add(2),
-                *arg.add(3),
-                *arg.add(4),
-                *arg.add(5),
-                *arg.add(6),
-                *arg.add(7),
-            ]);
-            let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            if !dma_range_ok(addr, size) {
-                return fluxor::kernel::sys::errno::EFAULT;
-            }
-            // Clean (but do not invalidate) by VA range. Caller has just
-            // written to a streaming DMA buffer and is about to hand it
-            // to the device. `dc cvac` pushes dirty lines to PoC so the
-            // device reads the up-to-date data; CPU's copy stays valid.
-            let mut ptr = (addr as usize) & !63;
-            let end = ((addr as usize) + size as usize + 63) & !63;
-            while ptr < end {
-                core::arch::asm!("dc cvac, {}", in(reg) ptr, options(nostack));
-                ptr += 64;
-            }
-            core::arch::asm!("dsb sy");
-            0
-        }
-        mmio_dma::DMA_INVALIDATE => {
-            if arg.is_null() || arg_len < 12 {
-                return -22;
-            }
-            let addr = u64::from_le_bytes([
-                *arg,
-                *arg.add(1),
-                *arg.add(2),
-                *arg.add(3),
-                *arg.add(4),
-                *arg.add(5),
-                *arg.add(6),
-                *arg.add(7),
-            ]);
-            let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            if !dma_range_ok(addr, size) {
-                return fluxor::kernel::sys::errno::EFAULT;
-            }
-            // Invalidate by VA range. Device has just DMA'd into the
-            // region; drop any speculatively-loaded stale CPU lines so
-            // the next CPU load returns DMA data. `dc ivac` is the
-            // inverse of cvac — it discards without writeback. Use
-            // `dc civac` semantics if the caller can't guarantee the
-            // buffer was clean (we pick invalidate-only deliberately:
-            // streaming DMA buffers are either wholly CPU-owned or
-            // wholly device-owned at handoff).
-            let mut ptr = (addr as usize) & !63;
-            let end = ((addr as usize) + size as usize + 63) & !63;
-            while ptr < end {
-                core::arch::asm!("dc ivac, {}", in(reg) ptr, options(nostack));
-                ptr += 64;
-            }
-            core::arch::asm!("dsb sy");
-            0
-        }
         nic_ring::NIC_BAR_MAP => fluxor::platform::pcie::syscall_bar_map(arg, arg_len),
         nic_ring::NIC_BAR_UNMAP => fluxor::platform::pcie::syscall_bar_unmap(arg, arg_len),
         nic_ring::NIC_RING_CREATE => fluxor::platform::nic_ring::syscall_ring_create(arg, arg_len),
@@ -1776,48 +1596,6 @@ unsafe fn bcm_system_extension_dispatch(
         }
         nic_ring::NIC_RING_INFO => {
             fluxor::platform::nic_ring::syscall_ring_info(_handle, arg, arg_len)
-        }
-        pcie_config::PCIE_RESCAN => {
-            let _ = arg;
-            let _ = arg_len;
-            fluxor::platform::pcie::enumerate() as i32
-        }
-        pcie_config::PCIE_CFG_READ32 => fluxor::platform::pcie::syscall_cfg_read32(arg, arg_len),
-        pcie_config::PCIE_CFG_WRITE32 => fluxor::platform::pcie::syscall_cfg_write32(arg, arg_len),
-        msi::PCIE1_MSI_INIT => {
-            // arg = [spi_irq: u32 LE]
-            if arg.is_null() || arg_len < 4 {
-                return -22;
-            }
-            let spi_irq = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            if !fluxor::platform::pcie::pcie1_msi_init() {
-                return fluxor::kernel::sys::errno::ENODEV;
-            }
-            register_pcie1_msi_spi(spi_irq)
-        }
-        msi::PCIE1_MSI_ALLOC_VECTOR => {
-            if arg.is_null() || arg_len < 20 {
-                return -22;
-            }
-            let event_handle = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            match fluxor::platform::pcie::pcie1_msi_alloc_vector(event_handle) {
-                None => -12, // ENOMEM
-                Some((vec, addr, data)) => {
-                    *arg.add(4) = vec;
-                    *arg.add(5) = 0;
-                    *arg.add(6) = 0;
-                    *arg.add(7) = 0;
-                    let ab = addr.to_le_bytes();
-                    for (i, byte) in ab.iter().enumerate() {
-                        *arg.add(8 + i) = *byte;
-                    }
-                    let db = data.to_le_bytes();
-                    for (i, byte) in db.iter().enumerate() {
-                        *arg.add(16 + i) = *byte;
-                    }
-                    0
-                }
-            }
         }
         // ── PCIE_DEVICE contract ──────────────────────────────────
         pcie_device::BIND => {
@@ -1885,109 +1663,42 @@ unsafe fn bcm_system_extension_dispatch(
             }
         }
         pcie_device::INFO => fluxor::platform::pcie::syscall_device_info(_handle, arg, arg_len),
-        paged_arena::ARENA_REGISTER => {
-            if arg.is_null() || arg_len < 10 {
-                return -22;
-            }
-            let vpages = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let rmax = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let bt = match *arg.add(8) {
-                0 => fluxor::kernel::backing_store::BackingType::None,
-                1 => fluxor::kernel::backing_store::BackingType::RamDisk,
-                2 => fluxor::kernel::backing_store::BackingType::External,
-                _ => return -22,
-            };
-            let wb = match *arg.add(9) {
-                0 => fluxor::kernel::backing_store::WritebackPolicy::Deferred,
-                1 => fluxor::kernel::backing_store::WritebackPolicy::WriteThrough,
-                _ => return -22,
-            };
-            let idx = fluxor::kernel::exec::scheduler::current_module_id();
-            fluxor::kernel::backing_store::backing_register(idx, vpages, rmax, bt, wb)
-        }
-        paged_arena::ARENA_READ => {
-            if arg.is_null() || arg_len < 14 {
-                return -22;
-            }
-            let arena_id = *arg as usize;
-            let vpage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            let buf = u64::from_le_bytes([
-                *arg.add(6),
-                *arg.add(7),
-                *arg.add(8),
-                *arg.add(9),
-                *arg.add(10),
-                *arg.add(11),
-                *arg.add(12),
-                *arg.add(13),
-            ]) as *mut u8;
-            fluxor::kernel::backing_store::backing_read(arena_id, vpage, buf)
-        }
-        paged_arena::ARENA_WRITE => {
-            if arg.is_null() || arg_len < 14 {
-                return -22;
-            }
-            let arena_id = *arg as usize;
-            let vpage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            let buf = u64::from_le_bytes([
-                *arg.add(6),
-                *arg.add(7),
-                *arg.add(8),
-                *arg.add(9),
-                *arg.add(10),
-                *arg.add(11),
-                *arg.add(12),
-                *arg.add(13),
-            ]) as *const u8;
-            fluxor::kernel::backing_store::backing_write(arena_id, vpage, buf)
-        }
-        paged_arena::ARENA_FLUSH => {
-            if arg.is_null() || arg_len < 1 {
-                return -22;
-            }
-            let arena_id = *arg as usize;
-            fluxor::kernel::backing_store::backing_flush(arena_id)
-        }
-        paged_arena::ARENA_BULK => {
-            if arg.is_null() || arg_len < 18 {
-                return -22;
-            }
-            let arena_id = *arg as usize;
-            let op = *arg.add(1);
-            let vpage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            let count = u32::from_le_bytes([*arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9)]);
-            let buf_u64 = u64::from_le_bytes([
-                *arg.add(10),
-                *arg.add(11),
-                *arg.add(12),
-                *arg.add(13),
-                *arg.add(14),
-                *arg.add(15),
-                *arg.add(16),
-                *arg.add(17),
-            ]);
-            match op {
-                paged_arena::ARENA_BULK_OP_WRITE => {
-                    fluxor::kernel::backing_store::backing_write_pages(
-                        arena_id,
-                        vpage,
-                        count,
-                        buf_u64 as *const u8,
-                    )
-                }
-                paged_arena::ARENA_BULK_OP_READ => {
-                    fluxor::kernel::backing_store::backing_read_pages(
-                        arena_id,
-                        vpage,
-                        count,
-                        buf_u64 as *mut u8,
-                    )
-                }
-                _ => -22,
-            }
-        }
         _ => -38, // E_NOSYS
     }
+}
+
+/// The `metal_device` table: device apertures, the PCIe1 DMA arenas and the
+/// brcmstb scan-before-bind PCI operations.
+static METAL_DEVICE: fluxor::kernel::module::metal_device::MetalDeviceOps =
+    fluxor::kernel::module::metal_device::MetalDeviceOps {
+        mmio_ok: mmio_target_ok,
+        dma_alloc: bcm_dma_alloc,
+        dma_range_ok,
+        pci: Some(&METAL_PCI),
+    };
+
+static METAL_PCI: fluxor::kernel::module::metal_device::PciOps =
+    fluxor::kernel::module::metal_device::PciOps {
+        rescan: || fluxor::platform::pcie::enumerate() as i32,
+        cfg_read32: fluxor::platform::pcie::syscall_cfg_read32,
+        cfg_write32: fluxor::platform::pcie::syscall_cfg_write32,
+    };
+
+/// DMA memory from the PCIe1 arenas: the coherent one is mapped Normal
+/// Non-cacheable by the boot tables, the streaming one write-back
+/// cacheable; a device behind PCIe1 reaches both through the inbound BAR1
+/// window (`pcie::enumerate`).
+fn bcm_dma_alloc(
+    kind: fluxor::kernel::module::metal_device::DmaKind,
+    size: usize,
+    align: usize,
+) -> Option<u64> {
+    use fluxor::kernel::module::metal_device::DmaKind;
+    let phys = match kind {
+        DmaKind::Coherent => fluxor::platform::nic_ring::pcie1_dma_alloc_contig(size, align),
+        DmaKind::Streaming => fluxor::platform::nic_ring::pcie1_dma_alloc_streaming(size, align),
+    };
+    (phys != 0).then_some(phys as u64)
 }
 
 /// Protection impls (HalOps seam). On BCM2712 module protection is the EL0
@@ -2013,12 +1724,6 @@ fn bcm_protection_register_module(
         heap_ptr,
         heap_size,
     )
-}
-fn bcm_protection_map_page(module_idx: usize, vaddr: usize, phys: usize, writable: bool) {
-    isolation::map_4k_page(module_idx, vaddr as u64, phys as u64, writable);
-}
-fn bcm_protection_unmap_page(module_idx: usize, vaddr: usize) {
-    isolation::unmap_4k_page(module_idx, vaddr as u64);
 }
 
 // ── VideoCore property mailbox: the TRANSPORT half ──────────────────────
@@ -2451,14 +2156,13 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     protection_release_module: isolation::release_module,
     protection_gateway_table: isolation::gateway_table,
     protected_call: isolation::protected_call,
-    protection_map_page: bcm_protection_map_page,
-    protection_unmap_page: bcm_protection_unmap_page,
     // An isolated module's stack sits above an unmapped guard page; the
     // composer admits every other module against that same figure.
     stack_fence_arm: |_| {},
     stack_fence_intact: || true,
     // Binary-safe debug-UART write (PL011) — the telemetry `transport_buffer` sink.
     serial_write: |b| uart::uart_nonblocking_write(b),
+    metal_device: Some(&METAL_DEVICE),
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000
@@ -2481,7 +2185,7 @@ const RNG200_FIFO_DATA: *const u32 = (RNG200_BASE + 0x20) as *const u32;
 const RNG200_FIFO_COUNT: *const u32 = (RNG200_BASE + 0x24) as *const u32;
 /// `RNG_CTRL` generator-enable field.
 #[cfg(feature = "board-pi5")]
-const RNG200_RBGEN_MASK: u32 = 0x1FFF;
+const RNG200_RBGEN_MASK: u32 = (1 << 13) - 1;
 #[cfg(feature = "board-pi5")]
 const RNG200_RBGEN_ENABLE: u32 = 0x1;
 /// `RNG_INT_STATUS`: the generator locked itself out after a health-test

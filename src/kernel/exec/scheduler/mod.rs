@@ -40,7 +40,7 @@ use crate::kernel::module::loader::{
     reset_state_arena, DynamicModule, ModuleLoader, PortCapacities, StartNewResult,
 };
 use crate::kernel::module::syscalls;
-use crate::kernel::module::syscalls::{get_table_for_module_type, is_spi_initialized};
+use crate::kernel::module::syscalls::{get_syscall_table, is_spi_initialized};
 use crate::kernel::sys::hal;
 use crate::kernel::workload::bitmask::ModuleMask;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerTable, MAX_OWNERS, OWNER_SYSTEM};

@@ -59,8 +59,7 @@ include!("../../sdk/crypto/hmac.rs");
 include!("../../sdk/crypto/p256.rs");
 include!("../../sdk/crypto/ed25519.rs");
 
-#[path = "../../sdk/contracts/net/net_proto.rs"]
-mod net_proto;
+use abi::contracts::net::net_proto;
 use net_proto::{
     write_connect_to, Target, AF_INET, AF_INET6, CMD_CLOSE as NET_CMD_CLOSE,
     CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX,

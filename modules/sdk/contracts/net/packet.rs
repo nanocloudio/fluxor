@@ -18,9 +18,10 @@
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto and datagram so the shared SDK helpers
-// (net_read_frame, net_write_frame) work unchanged. Opcode ranges are
-// disjoint from net_proto (0x01..0x1F) and datagram (0x20..0x4F) so
-// misconfigured channels fail loudly.
+// (net_read_frame, net_write_frame) work unchanged, and
+// the ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives every
+// message type of every surface sharing this header a distinct value,
+// so misconfigured channels fail loudly.
 //
 // Relationship to datagram: the packet surface subsumes the datagram
 // envelope and adds ingress/egress metadata (timestamp, lane, ECN/DSCP,
@@ -68,7 +69,7 @@ pub const TX_FLAG_URGENT: u8 = 1 << 2;
 /// Payload: [port: u16 LE] [flags: u8].
 /// Port 0 requests ephemeral allocation. Provider responds with
 /// MSG_PKT_BOUND carrying the allocated ep_id and local_port.
-pub const CMD_PKT_BIND: u8 = 0x50;
+pub use super::super::super::registry::msg::packet::CMD_PKT_BIND;
 
 /// Send a packet from `ep_id` to the given destination.
 ///
@@ -86,16 +87,16 @@ pub const CMD_PKT_BIND: u8 = 0x50;
 ///
 /// On TX, `ts_us` is a caller-supplied desired transmit timestamp (0 = send
 /// now). `lane_hint = 0` means the provider chooses.
-pub const CMD_PKT_TX: u8 = 0x51;
+pub use super::super::super::registry::msg::packet::CMD_PKT_TX;
 
 /// Close an endpoint and release its resources.
 /// Payload: [ep_id: u8].
-pub const CMD_PKT_CLOSE: u8 = 0x52;
+pub use super::super::super::registry::msg::packet::CMD_PKT_CLOSE;
 
 // ─── Downstream: provider → consumer ───────────────────────────────
 
 /// Bind completed. Payload: [ep_id: u8] [local_port: u16 LE].
-pub const MSG_PKT_BOUND: u8 = 0x60;
+pub use super::super::super::registry::msg::packet::MSG_PKT_BOUND;
 
 /// Received packet with full ingress metadata.
 ///
@@ -113,13 +114,13 @@ pub const MSG_PKT_BOUND: u8 = 0x60;
 ///
 /// `ts_us` is monotonic microseconds at ingress (from `TIMER_MICROS`) when
 /// `RX_FLAG_HAS_TIMESTAMP` is set; approximate otherwise.
-pub const MSG_PKT_RX: u8 = 0x61;
+pub use super::super::super::registry::msg::packet::MSG_PKT_RX;
 
 /// Endpoint closed. Payload: [ep_id: u8].
-pub const MSG_PKT_CLOSED: u8 = 0x62;
+pub use super::super::super::registry::msg::packet::MSG_PKT_CLOSED;
 
 /// Endpoint error. Payload: [ep_id: u8] [errno: i8].
-pub const MSG_PKT_ERROR: u8 = 0x63;
+pub use super::super::super::registry::msg::packet::MSG_PKT_ERROR;
 
 // ─── Pre-transport decision seam ───────────────────────────────────
 //
@@ -153,12 +154,12 @@ pub const MSG_PKT_ERROR: u8 = 0x63;
 /// `[pkt_id: u32 LE] [disposition: u8] [args...]` — see `DISP_*` for the
 /// argument bytes each disposition carries. A second disposition for the
 /// same `pkt_id` is a stale reference and is ignored.
-pub const CMD_PKT_DISPOSE: u8 = 0x53;
+pub use super::super::super::registry::msg::packet::CMD_PKT_DISPOSE;
 
 /// Consumer → provider: hold a second copy of a held packet under a new
 /// `pkt_id`, so one copy can be forwarded and the other delivered or
 /// mirrored. Payload: `[pkt_id: u32 LE]`. Answered by `MSG_PKT_CLONED`.
-pub const CMD_PKT_CLONE: u8 = 0x54;
+pub use super::super::super::registry::msg::packet::CMD_PKT_CLONE;
 
 /// Provider → consumer: a packet awaits disposition. Payload
 /// (`DECIDE_LEN` bytes):
@@ -175,7 +176,7 @@ pub const CMD_PKT_CLONE: u8 = 0x54;
 /// Ports are 0 for a protocol that has none. `frag` is 0: the provider
 /// refuses fragments before the seam and counts them. `l4_off` is the
 /// transport header's offset from the frame start.
-pub const MSG_PKT_DECIDE: u8 = 0x64;
+pub use super::super::super::registry::msg::packet::MSG_PKT_DECIDE;
 
 /// Provider → consumer, on the forward port: a packet disposed TUNNEL,
 /// DSR or CHAIN, or a MIRROR's copy, whole. Payload: `[pkt_id: u32 LE]
@@ -184,16 +185,16 @@ pub const MSG_PKT_DECIDE: u8 = 0x64;
 /// disposition, one record of the base and one of `MIRROR`, each with its
 /// own block), then the Ethernet frame. The buffer is the consumer's from
 /// here on.
-pub const MSG_PKT_FORWARD: u8 = 0x65;
+pub use super::super::super::registry::msg::packet::MSG_PKT_FORWARD;
 
 /// Provider → consumer: answer to `CMD_PKT_CLONE`. Payload:
 /// `[pkt_id: u32 LE] [clone_id: u32 LE]`, `clone_id = PKT_ID_NONE` when
 /// no hold slot was free.
-pub const MSG_PKT_CLONED: u8 = 0x66;
+pub use super::super::super::registry::msg::packet::MSG_PKT_CLONED;
 
 /// Provider → consumer: a held packet reached its hold deadline with no
 /// disposition and was released. Payload: `[pkt_id: u32 LE]`.
-pub const MSG_PKT_EXPIRED: u8 = 0x67;
+pub use super::super::super::registry::msg::packet::MSG_PKT_EXPIRED;
 
 /// Provider → consumer: the copy a `MIRROR` disposition asked for was not
 /// made — the mirror budget was spent, or the forward port was unwired or
@@ -201,7 +202,7 @@ pub const MSG_PKT_EXPIRED: u8 = 0x67;
 /// `[pkt_id: u32 LE] [lost_total: u32 LE]`, the second the provider's
 /// running count of copies lost, so a consumer that misses a report still
 /// sees how many it missed. A mirror never holds or delays the original.
-pub const MSG_PKT_MIRROR_LOST: u8 = 0x68;
+pub use super::super::super::registry::msg::packet::MSG_PKT_MIRROR_LOST;
 
 /// `MSG_PKT_MIRROR_LOST` payload length.
 pub const MIRROR_LOST_LEN: usize = 8;
@@ -226,7 +227,7 @@ pub const MIRROR_LOST_LEN: usize = 8;
 /// transport: `ip` delivers TCP and UDP to an IPv6 address it terminates
 /// (`seam_v6`'s are) on a build with its IPv6 transport (the aarch64
 /// profile), and releases any other such packet counted (`v6_no_local`).
-pub const MSG_PKT_DECIDE6: u8 = 0x69;
+pub use super::super::super::registry::msg::packet::MSG_PKT_DECIDE6;
 
 /// Length of a `MSG_PKT_DECIDE6` payload.
 pub const DECIDE6_LEN: usize = 4 + 1 + 1 + 16 + 16 + 2 + 2 + 1 + 1 + 1 + 1 + 8 + 2 + 2;

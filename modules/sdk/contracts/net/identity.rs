@@ -33,11 +33,10 @@
 // net_proto / datagram / packet / session_ctrl, so the shared SDK framing
 // helpers (`net_read_frame` / `net_write_frame`) work unchanged.
 //
-// Unlike the multiplexed stream/datagram/packet surfaces, these opcodes ride a
-// **dedicated single-writer control port** (`addr_ctl`) that never carries other
-// contracts. Their opcode space is therefore port-local: `ADDR_ADD` (0x60) /
-// `ADDR_DEL` (0x61) overlap the `packet` range (0x50..0x63) by number, but a
-// shared channel never carries both, so there is no ambiguity.
+// These opcodes ride a dedicated single-writer control port (`addr_ctl`), and
+// the ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives every
+// message type of every surface sharing this header a distinct value,
+// so a mis-wire cannot misparse.
 
 /// Frame header size (`msg_type` + `len`), identical to the other net contracts.
 pub const FRAME_HDR: usize = 3;
@@ -49,11 +48,11 @@ pub const FRAME_HDR: usize = 3;
 /// (`addr` is a 16-byte address slot, IPv4 in bytes 0..4 in network order — the
 /// provider's `LocalAddr` layout, so it copies in with no re-order; `owner_tag`
 /// is the workload's owner slot). The address is live before the workload runs.
-pub const ADDR_ADD: u8 = 0x60;
+pub use super::super::super::registry::msg::identity::ADDR_ADD;
 
 /// Remove a workload's secondary local address.
 /// Payload: `[addr: 16]`.
-pub const ADDR_DEL: u8 = 0x61;
+pub use super::super::super::registry::msg::identity::ADDR_DEL;
 
 // ─── Emission control ───────────────────────────────────────────────
 //
@@ -74,14 +73,14 @@ pub const ADDR_DEL: u8 = 0x61;
 /// Arm emission from an installed address.
 /// Payload: `[addr: 16][token: 16]`. Answered by `MSG_ADDR_ARMED` or
 /// `MSG_ADDR_REFUSED`; a gratuitous ARP announces the address on arming.
-pub const ADDR_ARM: u8 = 0x62;
+pub use super::super::super::registry::msg::identity::ADDR_ARM;
 
 /// Fence an installed address: no frame sourced from it enters the driver
 /// ring after the answer, and ARP for it is not answered. Payload:
 /// `[addr: 16][token: 16]`. Answered by `MSG_ADDR_FENCED`, which carries
 /// the cutoff boundary, or `MSG_ADDR_REFUSED`. The primary address cannot
 /// be fenced.
-pub const ADDR_FENCE: u8 = 0x63;
+pub use super::super::super::registry::msg::identity::ADDR_FENCE;
 
 // ─── Two providers, one surface ─────────────────────────────────────
 //
@@ -159,10 +158,10 @@ pub mod install {
 
 /// An address was installed and its token minted.
 /// Payload: `[addr: 16][token: 16][generation: u32 LE]`.
-pub const MSG_ADDR_ADDED: u8 = 0x70;
+pub use super::super::super::registry::msg::identity::MSG_ADDR_ADDED;
 
 /// Emission is armed. Payload: `[addr: 16][generation: u32 LE]`.
-pub const MSG_ADDR_ARMED: u8 = 0x71;
+pub use super::super::super::registry::msg::identity::MSG_ADDR_ARMED;
 
 /// Emission is fenced. Payload: `[addr: 16][generation: u32 LE]
 /// [cutoff: u64 LE][cutoff_kind: u8][pending_discarded: u8]`. `cutoff` is
@@ -174,12 +173,12 @@ pub const MSG_ADDR_ARMED: u8 = 0x71;
 /// worth (see `cutoff`); `pending_discarded` is 1 when a frame from the
 /// address staged for the ring was discarded rather than sent, and 0 from
 /// a provider with no ring to stage into.
-pub const MSG_ADDR_FENCED: u8 = 0x72;
+pub use super::super::super::registry::msg::identity::MSG_ADDR_FENCED;
 
 /// An install, arm or fence was refused.
 /// Payload: `[addr: 16][op: u8][reason: u8]` — `op` the refused opcode,
 /// `reason` per `refusal`.
-pub const MSG_ADDR_REFUSED: u8 = 0x73;
+pub use super::super::super::registry::msg::identity::MSG_ADDR_REFUSED;
 
 /// The transmit-drain query a NIC driver answers on the frame channel it
 /// reads from the ip module, over `channel_ioctl` (`dev_channel_ioctl`
@@ -260,13 +259,13 @@ pub mod refusal {
 pub const ARM_AUTH_MAX: usize = 160;
 /// How long an arm waits for the authority's verdict (ms).
 pub const ARM_AUTH_WAIT_MS: u32 = 2000;
-/// Provider → authority (`auth_req`): `[addr:16][generation:u32 LE]
-/// [boot_incarnation:16][auth_len:u16 LE][auth]`.
-pub const MSG_ARM_AUTH_CHECK: u8 = 0x7A;
 /// Authority → provider (`auth_rsp`): `[addr:16][generation:u32 LE]
 /// [sha256(auth):32][verdict:u8]`, verdict 0 accepting, anything else the
 /// authority's refusal code.
-pub const ARM_AUTH_VERDICT: u8 = 0x7B;
+pub use super::super::super::registry::msg::identity::ARM_AUTH_VERDICT;
+/// Provider → authority (`auth_req`): `[addr:16][generation:u32 LE]
+/// [boot_incarnation:16][auth_len:u16 LE][auth]`.
+pub use super::super::super::registry::msg::identity::MSG_ARM_AUTH_CHECK;
 pub const ARM_AUTH_VERDICT_LEN: usize = 16 + 4 + 32 + 1;
 
 // ─── Payload layout ─────────────────────────────────────────────────

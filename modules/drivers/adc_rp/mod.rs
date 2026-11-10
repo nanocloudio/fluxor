@@ -104,10 +104,10 @@ unsafe fn adc_init(sys: &SyscallTable) {
     adc_reg_write(sys, ADC_FCS, 0);
 }
 
-const ADC_OPEN: u32 = 0x0E00;
-const ADC_CLOSE: u32 = 0x0E01;
-const ADC_READ: u32 = 0x0E02;
-const ADC_POLL: u32 = 0x0E03;
+const ADC_OPEN: u32 = abi::registry::adc::OPEN;
+const ADC_CLOSE: u32 = abi::registry::adc::CLOSE;
+const ADC_READ: u32 = abi::registry::adc::READ;
+const ADC_POLL: u32 = abi::registry::adc::POLL;
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this

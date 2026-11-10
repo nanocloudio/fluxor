@@ -645,8 +645,9 @@ pub fn instantiate_one_module(
         return InstantiateResult::Error(-1);
     }
 
-    // Select capability-filtered syscall table based on module type
-    let syscalls = get_table_for_module_type(found_module.header.module_type);
+    // Every module gets the same table; per-contract enforcement happens at
+    // `provider_*` dispatch time (`check_contract_grant`).
+    let syscalls = get_syscall_table();
 
     // Record capability class and manifest metadata for enforcement
     // SAFETY: instantiate_one_module runs on the scheduler thread.

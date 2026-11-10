@@ -114,7 +114,7 @@ path widens the supply chain that must be reviewed. The field arithmetic
 ports the 16-limb signed-radix representation from TweetNaCl (public
 domain); the implementation conforms to RFC 8032.
 
-## KEY_VAULT (contract id `0x0010`)
+## KEY_VAULT (contract id `0x0005`)
 
 Source: `modules/sdk/contracts/key_vault.rs` (contract),
 `src/kernel/security/key_vault.rs` (software backend).
@@ -134,33 +134,33 @@ and how big each answer is. Opcodes:
 
 | Opcode | Name | Semantics |
 |--------|------|-----------|
-| `0x1000` | `PROBE` | Returns 1 if a backend is present. Callers detect at `module_new`. |
-| `0x1001` | `STORE` | Import a raw private key of the named suite. Returns an opaque handle. |
-| `0x1002` | `ECDH` | Compute scalar mult against a caller-supplied public key. |
-| `0x1003` | `SIGN` | Sign under the slot's suite, in the sign mode that suite uses. |
-| `0x1004` | `VERIFY` | Verify — takes a caller-supplied public key. |
-| `0x1005` | `DESTROY` | Zeroise and free the slot. |
-| `0x1006` | `GENERATE` | Generate a key in-backend; the private half never exists outside it. |
-| `0x1007` | `PUBLIC` | Export the public half of a slot's key. |
-| `0x1008` | `TIER` | Report the backend tier (software vs hardware-backed). |
-| `0x1009` | `OPEN_OR_GENERATE` | Open the slot filed under a label, generating it if absent. |
-| `0x100A` | `OPEN` | Open the slot filed under a label. |
-| `0x100B` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label, and remove its sealed record. |
-| `0x100C` | `DESCRIBE` | Report a slot's suite, usage mask, tier and whether it is persisted. |
-| `0x100D` | `SUITE_QUERY` | Report a suite's usage mask and its private, public and signature lengths. |
-| `0x100E` | `SUITE_ENUM` | Enumerate the suites this backend supports. |
-| `0x100F` | `ATTEST_COMPOSITION` | Sign the running-composition record (§ Composition Attestation). |
-| `0x1010` | `KEY_WRAP` | Wrap a slot's key for one destination composition. |
-| `0x1011` | `KEY_UNWRAP` | Unwrap into a new slot, only as the composition it was wrapped for. |
-| `0x1012` | `AEAD_SEAL` | Seal under an `AEAD_KEY` slot. |
-| `0x1013` | `AEAD_OPEN` | Open under an `AEAD_KEY` slot. |
-| `0x1014` | `DERIVE` | Make a purpose key from a `KDF_KEY`: HKDF-SHA256 over a label and context, never persisted. |
-| `0x1015` | `AEAD_SEAL_UNITS` | Seal up to 32 buffers in place, each under the nonce its caller names. |
-| `0x1016` | `AEAD_OPEN_UNITS` | Open up to 32 buffers in place; a buffer that fails is zeroed and reported. |
-| `0x1017` | `SHARE_SPLIT` | Split a 32-byte symmetric key 2-of-3 and seal each share to its own recipient. |
-| `0x1018` | `SHARE_REWRAP` | Open one share envelope and seal the share to a new recipient under a new grant. |
-| `0x1019` | `SHARE_COMBINE` | Open two share envelopes and reconstruct their key into a new, never-persisted handle. |
-| `0x101A` | `ATTEST_KEY` | Sign challenge-bound evidence of a key's suite, uses, owner and tier, and a commitment to it. |
+| `0x0500` | `PROBE` | Returns 1 if a backend is present. Callers detect at `module_new`. |
+| `0x0501` | `STORE` | Import a raw private key of the named suite. Returns an opaque handle. |
+| `0x0502` | `ECDH` | Compute scalar mult against a caller-supplied public key. |
+| `0x0503` | `SIGN` | Sign under the slot's suite, in the sign mode that suite uses. |
+| `0x0504` | `VERIFY` | Verify — takes a caller-supplied public key. |
+| `0x0505` | `DESTROY` | Zeroise and free the slot. |
+| `0x0506` | `GENERATE` | Generate a key in-backend; the private half never exists outside it. |
+| `0x0507` | `PUBLIC` | Export the public half of a slot's key. |
+| `0x0508` | `TIER` | Report the backend tier (software vs hardware-backed). |
+| `0x0509` | `OPEN_OR_GENERATE` | Open the slot filed under a label, generating it if absent. |
+| `0x050A` | `OPEN` | Open the slot filed under a label. |
+| `0x050B` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label, and remove its sealed record. |
+| `0x050C` | `DESCRIBE` | Report a slot's suite, usage mask, tier and whether it is persisted. |
+| `0x050D` | `SUITE_QUERY` | Report a suite's usage mask and its private, public and signature lengths. |
+| `0x050E` | `SUITE_ENUM` | Enumerate the suites this backend supports. |
+| `0x050F` | `ATTEST_COMPOSITION` | Sign the running-composition record (§ Composition Attestation). |
+| `0x0510` | `KEY_WRAP` | Wrap a slot's key for one destination composition. |
+| `0x0511` | `KEY_UNWRAP` | Unwrap into a new slot, only as the composition it was wrapped for. |
+| `0x0512` | `AEAD_SEAL` | Seal under an `AEAD_KEY` slot. |
+| `0x0513` | `AEAD_OPEN` | Open under an `AEAD_KEY` slot. |
+| `0x0514` | `DERIVE` | Make a purpose key from a `KDF_KEY`: HKDF-SHA256 over a label and context, never persisted. |
+| `0x0515` | `AEAD_SEAL_UNITS` | Seal up to 32 buffers in place, each under the nonce its caller names. |
+| `0x0516` | `AEAD_OPEN_UNITS` | Open up to 32 buffers in place; a buffer that fails is zeroed and reported. |
+| `0x0517` | `SHARE_SPLIT` | Split a 32-byte symmetric key 2-of-3 and seal each share to its own recipient. |
+| `0x0518` | `SHARE_REWRAP` | Open one share envelope and seal the share to a new recipient under a new grant. |
+| `0x0519` | `SHARE_COMBINE` | Open two share envelopes and reconstruct their key into a new, never-persisted handle. |
+| `0x051A` | `ATTEST_KEY` | Sign challenge-bound evidence of a key's suite, uses, owner and tier, and a commitment to it. |
 
 `AEAD_SEAL` draws a random nonce per call, which suits a record now and then.
 The unit operations take the caller's nonces, which is what a storage device

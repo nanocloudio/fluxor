@@ -84,18 +84,18 @@ const TXF_OFFSET: u32 = 0x010;
 // dev_system opcodes (raw PIO + DMA bridge)
 // ============================================================================
 
-const PIO_SM_EXEC: u32 = 0x0C70;
-const PIO_SM_WRITE_REG: u32 = 0x0C71;
-const PIO_SM_READ_REG: u32 = 0x0C72;
-const PIO_SM_ENABLE: u32 = 0x0C73;
-const PIO_INSTR_ALLOC: u32 = 0x0C74;
-const PIO_INSTR_WRITE: u32 = 0x0C75;
-const PIO_INSTR_FREE: u32 = 0x0C76;
-const PIO_PIN_SETUP: u32 = 0x0C77;
-const PIO_GPIOBASE: u32 = 0x0C78;
-const PIO_TXF_WRITE: u32 = 0x0C79;
-const PIO_FSTAT_READ: u32 = 0x0C7A;
-const PIO_SM_RESTART: u32 = 0x0C7B;
+const PIO_SM_EXEC: u32 = abi::registry::rp_raw::PIO_SM_EXEC;
+const PIO_SM_WRITE_REG: u32 = abi::registry::rp_raw::PIO_SM_WRITE_REG;
+const PIO_SM_READ_REG: u32 = abi::registry::rp_raw::PIO_SM_READ_REG;
+const PIO_SM_ENABLE: u32 = abi::registry::rp_raw::PIO_SM_ENABLE;
+const PIO_INSTR_ALLOC: u32 = abi::registry::rp_raw::PIO_INSTR_ALLOC;
+const PIO_INSTR_WRITE: u32 = abi::registry::rp_raw::PIO_INSTR_WRITE;
+const PIO_INSTR_FREE: u32 = abi::registry::rp_raw::PIO_INSTR_FREE;
+const PIO_PIN_SETUP: u32 = abi::registry::rp_raw::PIO_PIN_SETUP;
+const PIO_GPIOBASE: u32 = abi::registry::rp_raw::PIO_GPIOBASE;
+const PIO_TXF_WRITE: u32 = abi::registry::rp_raw::PIO_TXF_WRITE;
+const PIO_FSTAT_READ: u32 = abi::registry::rp_raw::PIO_FSTAT_READ;
+const PIO_SM_RESTART: u32 = abi::registry::rp_raw::PIO_SM_RESTART;
 
 // DMA fd family — st7701s uses async DMA for display scan-out. See
 // `dma_raw::fd` in the platform ABI; handles are tagged DMA fds, kernel
@@ -103,9 +103,9 @@ const PIO_SM_RESTART: u32 = 0x0C7B;
 use abi::platform::rp::dma_raw::fd as dma_fd;
 
 // 9-bit SPI bit-bang (kernel raw PAC GPIO)
-const SPI9_SEND: u32 = 0x0C90;
-const SPI9_RESET: u32 = 0x0C91;
-const SPI9_CS_SET: u32 = 0x0C92;
+const SPI9_SEND: u32 = abi::registry::rp_raw::SPI9_SEND;
+const SPI9_RESET: u32 = abi::registry::rp_raw::SPI9_RESET;
+const SPI9_CS_SET: u32 = abi::registry::rp_raw::SPI9_CS_SET;
 
 // PIO SM register indices
 const REG_CLKDIV: u8 = 0;
@@ -372,22 +372,27 @@ unsafe fn spi9_cs_set(s: &St7701sState, level: u8) {
 // ============================================================================
 
 // Contract ids (mirror kernel::module::provider::contract::*).
-const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const TIMER_CONTRACT: u32 = 0x0006;
+const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
+const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
 
 unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.provider_open)(HAL_GPIO_CONTRACT, 0x0106, arg.as_mut_ptr(), 1)
+    (sys.provider_open)(
+        HAL_GPIO_CONTRACT,
+        abi::registry::gpio::SET_OUTPUT,
+        arg.as_mut_ptr(),
+        1,
+    )
 }
 
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {
     let mut lvl = [level];
-    (sys.provider_call)(handle, 0x0104, lvl.as_mut_ptr(), 1);
+    (sys.provider_call)(handle, abi::registry::gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
 }
 
 unsafe fn timer_set(sys: &SyscallTable, timer_fd: i32, delay_ms: u32) -> i32 {
     let mut ms_buf = delay_ms.to_le_bytes();
-    (sys.provider_call)(timer_fd, 0x0605, ms_buf.as_mut_ptr(), 4)
+    (sys.provider_call)(timer_fd, abi::registry::timer::SET, ms_buf.as_mut_ptr(), 4)
 }
 
 unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
@@ -462,7 +467,7 @@ unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) -> i
 // ============================================================================
 
 unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
-    // fd::CREATE opens against PLATFORM_DMA_FD (0x0011). The kernel
+    // fd::CREATE opens against PLATFORM_DMA_FD. The kernel
     // tracks the returned tagged fd against this contract; follow-up
     // fd::* ops route through PLATFORM_DMA_FD's vtable and reject
     // handles from the sibling PLATFORM_DMA (channel) surface.
@@ -834,7 +839,12 @@ pub unsafe extern "C" fn module_new(
     unsafe {
         let sys = &*s.syscalls;
 
-        s.timer_fd = (sys.provider_open)(TIMER_CONTRACT, 0x0604, core::ptr::null_mut(), 0);
+        s.timer_fd = (sys.provider_open)(
+            TIMER_CONTRACT,
+            abi::registry::timer::CREATE,
+            core::ptr::null_mut(),
+            0,
+        );
         if s.timer_fd < 0 {
             return -12;
         }

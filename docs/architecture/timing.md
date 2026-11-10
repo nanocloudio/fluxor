@@ -23,7 +23,7 @@ Do not try to achieve precise A/V sync using wall clock alone.
 For audio pipelines, the authority is the I2S DMA consumption rate.
 
 The kernel exposes timing via `StreamTime`, available through
-`provider_query` with key `kernel_abi::STREAM_TIME` (0x0C30):
+`provider_query` with key `kernel_abi::STREAM_TIME` (0x0030):
 
 ```c
 struct StreamTime {
@@ -143,7 +143,7 @@ If LEDs are not tied to the audio sample clock, they will still have their own o
 ## 10) Instrumentation the stream service provides
 
 The PIO stream service already exposes `StreamTime` via `provider_query(-1, kernel_abi::STREAM_TIME, …)`
-(key 0x0C30). It provides everything needed for sync:
+(key 0x0030). It provides everything needed for sync:
 
 | Field | Meaning |
 |-------|---------|

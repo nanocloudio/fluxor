@@ -272,12 +272,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Contract ids + opcodes (mirror kernel::module::provider::contract + abi paths).
-const HAL_ADC_CONTRACT: u32 = 0x000E;
-const TIMER_CONTRACT: u32 = 0x0006;
-const ADC_OPEN: u32 = 0x0E00;
-const ADC_READ: u32 = 0x0E02;
-const TIMER_CREATE: u32 = 0x0604;
-const TIMER_SET: u32 = 0x0605;
+const HAL_ADC_CONTRACT: u32 = abi::registry::adc::ID as u32;
+const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
+const ADC_OPEN: u32 = abi::registry::adc::OPEN;
+const ADC_READ: u32 = abi::registry::adc::READ;
+const TIMER_CREATE: u32 = abi::registry::timer::CREATE;
+const TIMER_SET: u32 = abi::registry::timer::SET;
 
 // ============================================================================
 // Panic Handler

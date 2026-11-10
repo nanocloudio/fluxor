@@ -369,7 +369,7 @@ pub const WIRE_MAX_LEN: usize = 62;
 /// Class byte 0x00 (COMMON) is intentional — fence query is
 /// cross-cutting and the contract is resolved from the handle's FD
 /// tag rather than from the opcode class byte.
-pub const QUERY_OP: u32 = 0x00FE;
+pub use super::registry::kernel::QUERY_OP;
 
 impl Fence {
     /// Encode the fence into `buf`. Returns the number of bytes

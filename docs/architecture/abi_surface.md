@@ -13,23 +13,19 @@ whole idea; everything below is mechanism.
 Source: `modules/sdk/abi_surface.rs`, `tools/src/hash.rs`.
 
 ```
-digest = sha256( every ABI constant, as name\0value pairs
+digest = sha256( "semantic_epoch"\0 SEMANTIC_EPOCH
                + "contracts_platform_src"\0
                + CONTRACTS_PLATFORM_SRC_HASH )
 ```
 
-Two inputs, because the two halves of the surface are knowable in different
-ways:
-
-- **The constants** — contract ids, opcodes, permission bits, wire sizes, fd
-  tags — are enumerated by `for_each_field` in `modules/sdk/abi_surface.rs`.
-  Names are hashed alongside values, so two constants swapping values changes
-  the digest. That list is **append-only**: a retired allocation keeps its
-  entry rather than being deleted, or every later digest would shift.
-- **`CONTRACTS_PLATFORM_SRC_HASH`** — a hash of the source files under
-  `modules/sdk/` and `contracts/src/`. Wire-struct layouts and opcode
-  name-hashes exist only as source; no walk over constants can see them, so
-  that half is folded in as a source hash.
+Every ABI number — contract ids, opcodes, permission bits, errno, poll bits,
+ioctl commands, fd tags — is declared once, in
+`modules/sdk/abi/registry.toml`. `fluxor abi-regen` generates
+`modules/sdk/abi/registry_gen.rs` from it, and that generated file is one of
+the sources `CONTRACTS_PLATFORM_SRC_HASH` covers, so a number change moves the
+digest exactly as a layout change does. A retired number is simply gone.
+`SEMANTIC_EPOCH`, also in the registry, moves the digest when a meaning
+changes without a number changing.
 
 The source hash is token-based (`canonicalize_source` in
 `tools/src/hash.rs`): each file is tokenised and the token stream is hashed,

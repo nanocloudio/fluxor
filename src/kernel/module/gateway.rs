@@ -10,7 +10,8 @@
 //!   its code/rodata for anything the kernel only reads.
 //! - **Channel handles** must be one of the caller's own ports.
 //! - **Provider handles** must be ones the gateway minted for this caller.
-//! - **Opcodes** must appear in [`RULES`]; everything else is refused.
+//! - **Opcodes** must have a gate rule in the registry (`rule_for`);
+//!   everything else is refused.
 //!
 //! The mechanism that traps (SVC on Arm, a host import on wasm) is the
 //! platform's; the decision is made here, once, for every target.
@@ -219,27 +220,7 @@ mod handles {
 
 // ── Operation rules ──────────────────────────────────────────────────
 
-/// What a rule lets the caller name as the handle.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HandleUse {
-    /// A global operation: the handle must be -1.
-    Global,
-    /// The handle carries a small value, not a handle (`LOG_WRITE`'s level).
-    Value,
-    /// One of the caller's channel ports.
-    Channel,
-    /// A provider handle minted for the caller.
-    Minted,
-    /// Global, and a non-negative result is a new handle minted for the
-    /// caller.
-    Mints,
-    /// Global, or run under a handle minted for the caller (a storage op
-    /// under the grant it presented).
-    Scoped,
-    /// [`HandleUse::Scoped`], and a non-negative result is a new handle
-    /// minted for the caller.
-    ScopedMints,
-}
+pub use crate::abi::registry::gate::{HandleUse, Walker};
 
 /// How the kernel uses the argument buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -254,30 +235,8 @@ pub enum Arg {
     InOut(usize),
 }
 
-/// An argument struct that carries pointers the provider follows: how to
-/// find each of them in it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Walker {
-    /// `storage.object` PUT: key, content type, body (in), etag, key
-    /// reference, retention, hold, fence out.
-    StoragePut,
-    /// `storage.object` HEAD: key, record out, fence out.
-    StorageHead,
-    /// `storage.object` DELETE: key, etag, fence out.
-    StorageDelete,
-    /// `storage.object` RANGE_GET: offset, length, out (`length` bytes).
-    StorageRangeGet,
-    /// `storage.object` LIST: prefix, cursor, max keys, page out, fence out.
-    StorageList,
-    /// `storage.object` RETAIN: key, retention, hold, fence out.
-    StorageRetain,
-    /// `channel::IOCTL`: `[cmd: u32]` then the command's own argument. Only
-    /// the kernel's built-in commands and the `storage.block` requests are
-    /// admitted; a block request's buffer is the pointer walked.
-    ChannelIoctl,
-}
-
-/// One opcode a gated module may use.
+/// One opcode a gated module may use: the registry's rule
+/// (`abi::registry::gate::op_rule`) with its bound resolved to bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct Rule {
     pub op: u32,
@@ -291,115 +250,9 @@ pub struct Rule {
     pub closes: bool,
 }
 
-const fn rule(op: u32, handle: HandleUse, arg: Arg) -> Rule {
-    Rule {
-        op,
-        handle,
-        arg,
-        walk: None,
-        closes: false,
-    }
-}
-
-const fn walked(op: u32, handle: HandleUse, max: usize, walker: Walker) -> Rule {
-    Rule {
-        op,
-        handle,
-        arg: Arg::In(max),
-        walk: Some(walker),
-        closes: false,
-    }
-}
-
-/// A walked struct the provider also writes results into. The kernel's
-/// checked copy is handed over and copied back to the caller afterwards.
-const fn walked_inout(op: u32, handle: HandleUse, max: usize, walker: Walker) -> Rule {
-    Rule {
-        op,
-        handle,
-        arg: Arg::InOut(max),
-        walk: Some(walker),
-        closes: false,
-    }
-}
-
-const fn closing(op: u32) -> Rule {
-    Rule {
-        op,
-        handle: HandleUse::Minted,
-        arg: Arg::None,
-        walk: None,
-        closes: true,
-    }
-}
-
 /// `usize::MAX` as a length bound: bounded by the caller's own region, which
 /// the pointer check enforces.
 const ANY: usize = usize::MAX;
-
-/// The provider operations served to gated modules. Default deny: an opcode
-/// not listed here is refused with `EACCES`, whatever the caller's grants.
-///
-/// None of these operations registers code for the kernel to call. The one
-/// that keeps a pointer past its call is a `storage.block` `SUBMIT`, whose
-/// buffer is lent to the source until the completion is reaped. An operation
-/// whose argument struct carries pointers is listed with the walker that
-/// finds them, and every one is checked.
-pub static RULES: &[Rule] = &[
-    // Time.
-    rule(0x0602, HandleUse::Global, Arg::Out(8)), // timer::MILLIS
-    rule(0x0603, HandleUse::Global, Arg::Out(8)), // timer::MICROS
-    rule(0x0608, HandleUse::Global, Arg::Out(8)), // timer::UNIX_MILLIS
-    rule(0x0609, HandleUse::Global, Arg::Out(36)), // timer::TRUSTED_UNIX
-    rule(0x060A, HandleUse::Global, Arg::In(20)), // timer::DISCIPLINE
-    // Identity and entropy.
-    rule(0x0C2F, HandleUse::Global, Arg::Out(16)), // BOOT_INCARNATION
-    // The board's flash partition, a module's own programs, the public slot
-    // root and the admitted-slot mask. A program request (slot, and for a
-    // read the offset) rides in the buffer it is answered in, so it carries
-    // no pointer.
-    rule(0x0C2A, HandleUse::Global, Arg::Out(20)), // FLASH_LAYOUT
-    rule(0x0C2B, HandleUse::Global, Arg::InOut(64)), // PROGRAM_INFO
-    rule(0x0C2C, HandleUse::Global, Arg::InOut(ANY)), // PROGRAM_READ
-    rule(0x0C2D, HandleUse::Global, Arg::Out(32)), // SLOT_SIGNING_ROOT
-    rule(0x0C2E, HandleUse::Global, Arg::None),    // SLOT_ADMITTED
-    rule(0x0C3C, HandleUse::Global, Arg::Out(ANY)), // CSPRNG_FILL
-    // Log and telemetry.
-    rule(0x0C40, HandleUse::Value, Arg::In(ANY)), // LOG_WRITE (level in handle)
-    rule(0x0C3E, HandleUse::Global, Arg::In(ANY)), // telemetry::TLM_EMIT
-    // Scheduling reports and budgets.
-    rule(0x0C45, HandleUse::Global, Arg::In(1)), // REPORT_STEP_EFFECT
-    rule(0x0C46, HandleUse::Global, Arg::InOut(ANY)), // MODULE_FLOW_BUDGET
-    rule(0x0C50, HandleUse::Global, Arg::In(4)), // REPORT_LATENCY
-    // Handles the caller holds.
-    rule(0x0C41, HandleUse::Channel, Arg::InOut(1)), // HANDLE_POLL on a port
-    // Channels: port discovery, the kernel's built-in ioctls and the
-    // `storage.block` requests. Registering a handler (REGISTER_IOCTL,
-    // 0x0507) is not served: it hands the kernel code to call.
-    rule(0x050C, HandleUse::Global, Arg::InOut(2)), // channel::PORT
-    walked_inout(0x0506, HandleUse::Channel, WALK_MAX, Walker::ChannelIoctl),
-    // Events.
-    rule(0x0B00, HandleUse::Mints, Arg::None), // event::CREATE
-    rule(0x0B01, HandleUse::Minted, Arg::None), // event::SIGNAL
-    rule(0x0B02, HandleUse::Minted, Arg::None), // event::POLL
-    closing(0x0B03),                           // event::DESTROY
-    // The caller's own heap arena.
-    rule(0x0C3A, HandleUse::Global, Arg::Out(4)), // ARENA_GET
-    // storage.object — persistence. Synchronous: no provider keeps a pointer
-    // past the call (the contract's write path takes the bytes and returns).
-    // A guarded store admits each op under a grant `PRESENT` minted, passed
-    // as the handle; an unguarded one takes `-1`.
-    walked(0x1420, HandleUse::Scoped, WALK_MAX, Walker::StoragePut),
-    rule(0x1421, HandleUse::ScopedMints, Arg::In(ANY)), // GET: arg is the key
-    walked(0x1422, HandleUse::Scoped, WALK_MAX, Walker::StorageHead),
-    walked(0x1423, HandleUse::Minted, WALK_MAX, Walker::StorageRangeGet),
-    walked(0x1424, HandleUse::Scoped, WALK_MAX, Walker::StorageDelete),
-    walked(0x142A, HandleUse::Scoped, WALK_MAX, Walker::StorageList),
-    walked(0x142C, HandleUse::Scoped, WALK_MAX, Walker::StorageRetain),
-    // PRESENT: no pointers; the refusal is written into the request.
-    rule(0x142B, HandleUse::Mints, Arg::InOut(ANY)),
-    closing(0x1425), // CLOSE
-];
 
 /// Longest argument struct the gateway copies to walk, sized to the largest
 /// request a gated caller makes: a `storage.object` `PUT` carrying a key and a
@@ -613,17 +466,30 @@ pub fn channel_ioctl_admitted(cmd: u32) -> bool {
     )
 }
 
-/// Query keys served to gated modules; each writes at most the given bytes.
-pub static QUERIES: &[(u32, usize)] = &[
-    (0x0C30, 24), // STREAM_TIME
-    (0x0C31, 4),  // GRAPH_SAMPLE_RATE
-    (0x0C33, 4),  // DOWNSTREAM_LATENCY
-    (0x0C3B, 4),  // SYS_CLOCK_HZ
-];
-
-/// The rule for `op`, if gated modules may use it.
-pub fn rule_for(op: u32) -> Option<&'static Rule> {
-    RULES.iter().find(|r| r.op == op)
+/// The rule for `op`, if gated modules may use it. Default deny: an opcode
+/// the registry does not serve to gated modules is refused with `EACCES`,
+/// whatever the caller's grants.
+pub fn rule_for(op: u32) -> Option<Rule> {
+    use crate::abi::registry::gate::{op_rule, ArgDir, Bound};
+    let r = op_rule(op)?;
+    let max = match r.bound {
+        Bound::Bytes(n) => n,
+        Bound::Any => ANY,
+        Bound::Walk => WALK_MAX,
+    };
+    let arg = match r.dir {
+        ArgDir::None => Arg::None,
+        ArgDir::In => Arg::In(max),
+        ArgDir::Out => Arg::Out(max),
+        ArgDir::InOut => Arg::InOut(max),
+    };
+    Some(Rule {
+        op,
+        handle: r.handle,
+        arg,
+        walk: r.walk,
+        closes: r.closes,
+    })
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
@@ -757,7 +623,7 @@ pub fn authorise(
         }
         op::PROVIDER_CALL => {
             let rule = rule_for(a[1] as u32).ok_or(Refusal::Opcode)?;
-            check_handle(module, rule, h)?;
+            check_handle(module, &rule, h)?;
             check_arg(&g, rule.arg, a[2], a[3])?;
             if let Some(w) = rule.walk {
                 let arg = walked.ok_or(Refusal::Pointer)?;
@@ -779,11 +645,7 @@ pub fn authorise(
         }
         op::PROVIDER_QUERY => {
             let key = a[1] as u32;
-            let max = QUERIES
-                .iter()
-                .find(|q| q.0 == key)
-                .map(|q| q.1)
-                .ok_or(Refusal::Opcode)?;
+            let max = crate::abi::registry::gate::query_max(key).ok_or(Refusal::Opcode)?;
             if h != -1 {
                 return Err(Refusal::Handle);
             }

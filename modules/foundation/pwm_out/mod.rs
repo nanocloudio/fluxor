@@ -41,13 +41,13 @@ mod params_def;
 
 // ============================================================================
 // HAL_PWM contract id (mirrors `kernel::module::provider::contract::HAL_PWM`).
-const HAL_PWM_CONTRACT: u32 = 0x000F;
+const HAL_PWM_CONTRACT: u32 = abi::registry::pwm::ID as u32;
 
 // PWM opcodes (mirror abi::contracts::hal::pwm)
 // ============================================================================
 
-const PWM_OPEN: u32 = 0x0F00;
-const PWM_SET_DUTY: u32 = 0x0F03;
+const PWM_OPEN: u32 = abi::registry::pwm::OPEN;
+const PWM_SET_DUTY: u32 = abi::registry::pwm::SET_DUTY;
 
 // ============================================================================
 // State

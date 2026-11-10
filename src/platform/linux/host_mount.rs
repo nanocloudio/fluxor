@@ -1,4 +1,4 @@
-//! Linux host mounts (contract class 0x1F, `abi::platform::linux::host_mount`).
+//! Linux host mounts (contract class `host_mount`, `abi::platform::linux::host_mount`).
 //!
 //! Mounts a block device onto a directory under the operator's mount root,
 //! and unmounts it. The platform holds the policy: every mount point lies

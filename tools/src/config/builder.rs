@@ -2855,7 +2855,7 @@ fn build_module_entry_in(
     // error (sibling of `assert_pinned_manifests_resolvable`). "No `.fmod`
     // schema" stays `Ok(None)` and falls through to the built-in path — a
     // built-in is never pinned and has no `.fmod`.
-    let pic_schema = schema::load_schema_for_module(type_name, loc)?;
+    let pic_schema = schema::load_schema_for_entry(module, type_name, loc)?;
     // On a module whose schema declares `trust` (tls, quic) the key is a
     // trust-anchor source spec: validated against the schema with the
     // other keys, then lifted out, since its value is resolved to a bundle

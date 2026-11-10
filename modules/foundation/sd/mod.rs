@@ -63,9 +63,9 @@ use abi::contracts::hal::spi::{
 use abi::SyscallTable;
 
 // Provider contract ids (mirror kernel::module::provider::contract::*).
-const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_SPI_CONTRACT: u32 = 0x0002;
-const TIMER_CONTRACT: u32 = 0x0006;
+const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
+const HAL_SPI_CONTRACT: u32 = abi::registry::spi::ID as u32;
+const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
 
 // ============================================================================
 // Module Parameters
@@ -593,7 +593,13 @@ macro_rules! wait_timer {
 macro_rules! try_start_timer {
     ($s:expr, $delay_ms:expr, $timer_state:expr, $retry_state:expr) => {{
         let mut ms_buf = ($delay_ms as u32).to_le_bytes();
-        if ($s.sys().provider_call)($s.timer_fd, 0x0605, ms_buf.as_mut_ptr(), 4) == 0 {
+        if ($s.sys().provider_call)(
+            $s.timer_fd,
+            abi::registry::timer::SET,
+            ms_buf.as_mut_ptr(),
+            4,
+        ) == 0
+        {
             $s.init_state = $timer_state;
             return 0;
         }
@@ -643,12 +649,22 @@ unsafe fn millis(s: &SdState) -> u64 {
 #[inline(always)]
 unsafe fn deselect(s: &SdState) {
     let mut lvl = [1u8];
-    (s.sys().provider_call)(s.spi_handle, 0x0204, lvl.as_mut_ptr(), 1);
+    (s.sys().provider_call)(
+        s.spi_handle,
+        abi::registry::spi::SET_CS,
+        lvl.as_mut_ptr(),
+        1,
+    );
 }
 
 #[inline(always)]
 unsafe fn release(s: &SdState) {
-    (s.sys().provider_call)(s.spi_handle, 0x0203, core::ptr::null_mut(), 0);
+    (s.sys().provider_call)(
+        s.spi_handle,
+        abi::registry::spi::END,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 #[inline(always)]
@@ -660,12 +676,29 @@ unsafe fn log_info(s: &SdState, msg: &[u8]) {
 /// Returns: 1 = success, 0 = pending, -1 = timeout/error
 unsafe fn claim_begin_select(s: &mut SdState, start_ms: u64) -> i32 {
     let mut timeout = 0u32.to_le_bytes();
-    if (s.sys().provider_call)(s.spi_handle, 0x0205, timeout.as_mut_ptr(), 4) == 0 {
-        if (s.sys().provider_call)(s.spi_handle, 0x0202, core::ptr::null_mut(), 0) < 0 {
+    if (s.sys().provider_call)(
+        s.spi_handle,
+        abi::registry::spi::CLAIM,
+        timeout.as_mut_ptr(),
+        4,
+    ) == 0
+    {
+        if (s.sys().provider_call)(
+            s.spi_handle,
+            abi::registry::spi::BEGIN,
+            core::ptr::null_mut(),
+            0,
+        ) < 0
+        {
             return -1;
         }
         let mut lvl = [0u8];
-        (s.sys().provider_call)(s.spi_handle, 0x0204, lvl.as_mut_ptr(), 1);
+        (s.sys().provider_call)(
+            s.spi_handle,
+            abi::registry::spi::SET_CS,
+            lvl.as_mut_ptr(),
+            1,
+        );
         return 1;
     }
     if millis(s).wrapping_sub(start_ms) >= CLAIM_TIMEOUT_MS {
@@ -688,7 +721,7 @@ unsafe fn spi_transfer_start(s: &mut SdState, tx: *const u8, rx: *mut u8, len: u
     };
     if (s.sys().provider_call)(
         s.spi_handle,
-        0x0207,
+        abi::registry::spi::TRANSFER_START,
         &mut args as *mut _ as *mut u8,
         core::mem::size_of::<SpiTransferStartArgs>(),
     ) < 0
@@ -711,7 +744,12 @@ unsafe fn spi_transfer_poll(s: &mut SdState) -> i32 {
     }
     // Bounded tight polling
     for _ in 0..8 {
-        let res = (s.sys().provider_call)(s.spi_handle, 0x0208, core::ptr::null_mut(), 0);
+        let res = (s.sys().provider_call)(
+            s.spi_handle,
+            abi::registry::spi::TRANSFER_POLL,
+            core::ptr::null_mut(),
+            0,
+        );
         if res < 0 {
             s.spi_state = SpiXfer::Idle;
             return -1;
@@ -732,7 +770,12 @@ unsafe fn spi_poll_byte(s: &mut SdState) -> i32 {
         return -1;
     }
     for _ in 0..8 {
-        let res = (s.sys().provider_call)(s.spi_handle, 0x0209, core::ptr::null_mut(), 0);
+        let res = (s.sys().provider_call)(
+            s.spi_handle,
+            abi::registry::spi::POLL_BYTE,
+            core::ptr::null_mut(),
+            0,
+        );
         if res < 0 {
             s.spi_state = SpiXfer::Idle;
             return res;
@@ -1678,11 +1721,19 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
             SdInitPhase::Claiming => {
                 let start_ms = load_ms(s.init_start_ms_lo, s.init_start_ms_hi);
                 let mut timeout = 0u32.to_le_bytes();
-                let claim_rc =
-                    (s.sys().provider_call)(s.spi_handle, 0x0205, timeout.as_mut_ptr(), 4);
+                let claim_rc = (s.sys().provider_call)(
+                    s.spi_handle,
+                    abi::registry::spi::CLAIM,
+                    timeout.as_mut_ptr(),
+                    4,
+                );
                 if claim_rc == 0 {
-                    let begin_rc =
-                        (s.sys().provider_call)(s.spi_handle, 0x0202, core::ptr::null_mut(), 0);
+                    let begin_rc = (s.sys().provider_call)(
+                        s.spi_handle,
+                        abi::registry::spi::BEGIN,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if begin_rc < 0 {
                         log_info(s, b"[sd] spi_begin failed");
                         fail!(s);
@@ -1691,7 +1742,12 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
                     let mut cfg = [0u8; 5];
                     cfg[0..4].copy_from_slice(&INIT_FREQ.to_le_bytes());
                     cfg[4] = 0;
-                    (s.sys().provider_call)(s.spi_handle, 0x0206, cfg.as_mut_ptr(), 5);
+                    (s.sys().provider_call)(
+                        s.spi_handle,
+                        abi::registry::spi::CONFIGURE,
+                        cfg.as_mut_ptr(),
+                        5,
+                    );
                     s.init_preclk_count = 0;
                     s.init_state = SdInitPhase::Preclocking;
                     continue;
@@ -1959,7 +2015,12 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
                     0u8,
                 ];
                 let sys = &*s.syscalls;
-                let _ = (sys.provider_call)(s.spi_handle, 0x0206, cfg_arg.as_mut_ptr(), 5);
+                let _ = (sys.provider_call)(
+                    s.spi_handle,
+                    abi::registry::spi::CONFIGURE,
+                    cfg_arg.as_mut_ptr(),
+                    5,
+                );
                 s.init_state = SdInitPhase::Done;
                 return 1;
             }
@@ -2048,13 +2109,22 @@ pub unsafe extern "C" fn module_new(
         // Open a GPIO output handle for CS — tracked against HAL_GPIO.
         let cs_pin = s.cs_pin;
         let mut gpio_arg = [cs_pin];
-        let cs_handle =
-            (s.sys().provider_open)(HAL_GPIO_CONTRACT, 0x0106, gpio_arg.as_mut_ptr(), 1);
+        let cs_handle = (s.sys().provider_open)(
+            HAL_GPIO_CONTRACT,
+            abi::registry::gpio::SET_OUTPUT,
+            gpio_arg.as_mut_ptr(),
+            1,
+        );
         if cs_handle < 0 {
             return -10;
         }
         let mut lvl = [1u8];
-        (s.sys().provider_call)(cs_handle, 0x0104, lvl.as_mut_ptr(), 1);
+        (s.sys().provider_call)(
+            cs_handle,
+            abi::registry::gpio::SET_LEVEL,
+            lvl.as_mut_ptr(),
+            1,
+        );
 
         // Open SPI — tracked against HAL_SPI.
         let spi_bus = s.spi_bus;
@@ -2067,7 +2137,7 @@ pub unsafe extern "C" fn module_new(
         };
         s.spi_handle = (s.sys().provider_open)(
             HAL_SPI_CONTRACT,
-            0x0200,
+            abi::registry::spi::OPEN,
             &mut spi_args as *mut _ as *mut u8,
             core::mem::size_of::<SpiOpenArgs>(),
         );
@@ -2075,8 +2145,13 @@ pub unsafe extern "C" fn module_new(
             return -12;
         }
 
-        // Open a timer fd for init retry delays (TIMER::CREATE = 0x0604).
-        s.timer_fd = (s.sys().provider_open)(TIMER_CONTRACT, 0x0604, core::ptr::null_mut(), 0);
+        // Open a timer fd for init retry delays (`timer::CREATE`).
+        s.timer_fd = (s.sys().provider_open)(
+            TIMER_CONTRACT,
+            abi::registry::timer::CREATE,
+            core::ptr::null_mut(),
+            0,
+        );
         if s.timer_fd < 0 {
             return -13;
         }

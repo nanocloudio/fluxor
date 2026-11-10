@@ -192,39 +192,53 @@ unsafe fn setup_write(s: &mut Gt911State, reg: u16, data: &[u8]) -> usize {
 // ============================================================================
 
 // Provider contract ids (mirror kernel::module::provider::contract::*).
-const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_I2C_CONTRACT: u32 = 0x0003;
-const TIMER_CONTRACT: u32 = 0x0006;
-const EVENT_CONTRACT: u32 = 0x000B;
+const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
+const HAL_I2C_CONTRACT: u32 = abi::registry::i2c::ID as u32;
+const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
+const EVENT_CONTRACT: u32 = abi::registry::event::ID as u32;
 
 unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.provider_open)(HAL_GPIO_CONTRACT, 0x0106, arg.as_mut_ptr(), 1) // GPIO_SET_OUTPUT
+    (sys.provider_open)(
+        HAL_GPIO_CONTRACT,
+        abi::registry::gpio::SET_OUTPUT,
+        arg.as_mut_ptr(),
+        1,
+    ) // GPIO_SET_OUTPUT
 }
 
 unsafe fn claim_gpio_input(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.provider_open)(HAL_GPIO_CONTRACT, 0x0107, arg.as_mut_ptr(), 1) // GPIO_SET_INPUT
+    (sys.provider_open)(
+        HAL_GPIO_CONTRACT,
+        abi::registry::gpio::SET_INPUT,
+        arg.as_mut_ptr(),
+        1,
+    ) // GPIO_SET_INPUT
 }
 
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {
     let mut lvl = [level];
-    (sys.provider_call)(handle, 0x0104, lvl.as_mut_ptr(), 1); // GPIO_SET_LEVEL
+    (sys.provider_call)(handle, abi::registry::gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+    // GPIO_SET_LEVEL
 }
 
 unsafe fn gpio_set_mode_output(sys: &SyscallTable, handle: i32) {
     let mut mode = [1u8]; // 1 = output
-    (sys.provider_call)(handle, 0x0102, mode.as_mut_ptr(), 1); // GPIO_SET_MODE
+    (sys.provider_call)(handle, abi::registry::gpio::SET_MODE, mode.as_mut_ptr(), 1);
+    // GPIO_SET_MODE
 }
 
 unsafe fn gpio_set_mode_input(sys: &SyscallTable, handle: i32) {
     let mut mode = [0u8]; // 0 = input
-    (sys.provider_call)(handle, 0x0102, mode.as_mut_ptr(), 1); // GPIO_SET_MODE
+    (sys.provider_call)(handle, abi::registry::gpio::SET_MODE, mode.as_mut_ptr(), 1);
+    // GPIO_SET_MODE
 }
 
 unsafe fn timer_set(sys: &SyscallTable, timer_fd: i32, delay_ms: u32) -> i32 {
     let mut ms_buf = delay_ms.to_le_bytes();
-    (sys.provider_call)(timer_fd, 0x0605, ms_buf.as_mut_ptr(), 4) // TIMER_SET
+    (sys.provider_call)(timer_fd, abi::registry::timer::SET, ms_buf.as_mut_ptr(), 4)
+    // TIMER_SET
 }
 
 unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
@@ -295,7 +309,12 @@ pub unsafe extern "C" fn module_new(
         let sys = &*s.syscalls;
 
         // Create timer — tracked against TIMER contract.
-        s.timer_fd = (sys.provider_open)(TIMER_CONTRACT, 0x0604, core::ptr::null_mut(), 0);
+        s.timer_fd = (sys.provider_open)(
+            TIMER_CONTRACT,
+            abi::registry::timer::CREATE,
+            core::ptr::null_mut(),
+            0,
+        );
         if s.timer_fd < 0 {
             return -12;
         }
@@ -385,7 +404,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             arg[6] = fb[3];
 
             let handle = unsafe {
-                (sys.provider_open)(HAL_I2C_CONTRACT, 0x0300, arg.as_mut_ptr(), 7)
+                (sys.provider_open)(
+                    HAL_I2C_CONTRACT,
+                    abi::registry::i2c::OPEN,
+                    arg.as_mut_ptr(),
+                    7,
+                )
                 // I2C_OPEN
             };
             if handle < 0 {
@@ -403,7 +427,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = unsafe {
                 (sys.provider_call)(
                     s.i2c_handle,
-                    0x0304, // I2C_WRITE_READ
+                    abi::registry::i2c::WRITE_READ, // I2C_WRITE_READ
                     s.xfer_buf.as_mut_ptr(),
                     arg_len,
                 )
@@ -423,7 +447,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = unsafe {
                 (sys.provider_call)(
                     s.i2c_handle,
-                    0x0304, // I2C_WRITE_READ
+                    abi::registry::i2c::WRITE_READ, // I2C_WRITE_READ
                     s.xfer_buf.as_mut_ptr(),
                     arg_len,
                 )
@@ -446,7 +470,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             // Create event for INT pin edge detection
             unsafe {
-                s.event_fd = (sys.provider_open)(EVENT_CONTRACT, 0x0B00, core::ptr::null_mut(), 0); // EVENT_CREATE
+                s.event_fd = (sys.provider_open)(
+                    EVENT_CONTRACT,
+                    abi::registry::event::CREATE,
+                    core::ptr::null_mut(),
+                    0,
+                ); // EVENT_CREATE
                 if s.event_fd < 0 {
                     s.phase = Gt911Phase::Error;
                     return s.event_fd;
@@ -461,7 +490,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 watch_arg[2] = efd_bytes[1];
                 watch_arg[3] = efd_bytes[2];
                 watch_arg[4] = efd_bytes[3];
-                let wrc = (sys.provider_call)(s.int_handle, 0x010A, watch_arg.as_mut_ptr(), 5); // WATCH_EDGE
+                let wrc = (sys.provider_call)(
+                    s.int_handle,
+                    abi::registry::gpio::WATCH_EDGE,
+                    watch_arg.as_mut_ptr(),
+                    5,
+                ); // WATCH_EDGE
                 if wrc < 0 {
                     s.phase = Gt911Phase::Error;
                     return wrc;
@@ -480,7 +514,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             // Consume the event signal
             unsafe {
-                (sys.provider_call)(s.event_fd, 0x0B02, core::ptr::null_mut(), 0);
+                (sys.provider_call)(
+                    s.event_fd,
+                    abi::registry::event::POLL,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 // EVENT_POLL (clears)
             }
             // Read status register
@@ -492,7 +531,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Read status: reg 0x814E, 1 byte
             let arg_len = unsafe { setup_write_read(s, REG_STATUS, 1) };
             let rc = unsafe {
-                (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
+                (sys.provider_call)(
+                    s.i2c_handle,
+                    abi::registry::i2c::WRITE_READ,
+                    s.xfer_buf.as_mut_ptr(),
+                    arg_len,
+                )
             };
             if rc < 0 && rc != E_INPROGRESS {
                 return rc;
@@ -504,7 +548,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         Gt911Phase::ReadStatusPoll => {
             let arg_len = unsafe { setup_write_read(s, REG_STATUS, 1) };
             let rc = unsafe {
-                (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
+                (sys.provider_call)(
+                    s.i2c_handle,
+                    abi::registry::i2c::WRITE_READ,
+                    s.xfer_buf.as_mut_ptr(),
+                    arg_len,
+                )
             };
             if rc == 0 {
                 return 0;
@@ -557,7 +606,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rx_len = (s.touch_count as usize) * POINT_SIZE;
             let arg_len = unsafe { setup_write_read(s, REG_POINT1, rx_len) };
             let rc = unsafe {
-                (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
+                (sys.provider_call)(
+                    s.i2c_handle,
+                    abi::registry::i2c::WRITE_READ,
+                    s.xfer_buf.as_mut_ptr(),
+                    arg_len,
+                )
             };
             if rc < 0 && rc != E_INPROGRESS {
                 return rc;
@@ -570,7 +624,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rx_len = (s.touch_count as usize) * POINT_SIZE;
             let arg_len = unsafe { setup_write_read(s, REG_POINT1, rx_len) };
             let rc = unsafe {
-                (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
+                (sys.provider_call)(
+                    s.i2c_handle,
+                    abi::registry::i2c::WRITE_READ,
+                    s.xfer_buf.as_mut_ptr(),
+                    arg_len,
+                )
             };
             if rc == 0 {
                 return 0;
@@ -620,7 +679,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Write 0 to status register (0x814E) to acknowledge
             let arg_len = unsafe { setup_write(s, REG_STATUS, &[0x00]) };
             let rc = unsafe {
-                (sys.provider_call)(s.i2c_handle, 0x0302, s.xfer_buf.as_mut_ptr(), arg_len)
+                (sys.provider_call)(
+                    s.i2c_handle,
+                    abi::registry::i2c::WRITE,
+                    s.xfer_buf.as_mut_ptr(),
+                    arg_len,
+                )
                 // I2C_WRITE
             };
             if rc < 0 && rc != E_INPROGRESS {
@@ -633,7 +697,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         Gt911Phase::ClearStatusPoll => {
             let arg_len = unsafe { setup_write(s, REG_STATUS, &[0x00]) };
             let rc = unsafe {
-                (sys.provider_call)(s.i2c_handle, 0x0302, s.xfer_buf.as_mut_ptr(), arg_len)
+                (sys.provider_call)(
+                    s.i2c_handle,
+                    abi::registry::i2c::WRITE,
+                    s.xfer_buf.as_mut_ptr(),
+                    arg_len,
+                )
             };
             if rc == 0 {
                 return 0;

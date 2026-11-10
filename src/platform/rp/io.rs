@@ -745,7 +745,7 @@ pub mod pio {
     //! PIO utility functions for register bridges and pin setup.
     //!
     //! These are used by the
-    //! PIO register bridges (0x0C70-0x0C7B) in providers.rs and by
+    //! PIO register bridges (`rp_raw::PIO_SM_EXEC`-`rp_raw::PIO_SM_RESTART`) in providers.rs and by
     //! boot-time PIO pin configuration.
 
     use portable_atomic::{AtomicU32, Ordering};

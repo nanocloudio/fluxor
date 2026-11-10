@@ -279,10 +279,6 @@ pub struct Gated<'a> {
 pub const BEYOND_GATEWAY: &[(u16, &str)] = &[
     (crate::manifest::permission::RECONFIGURE, "reconfigure"),
     (crate::manifest::permission::FLASH_RAW, "flash_raw"),
-    (
-        crate::manifest::permission::BACKING_PROVIDER,
-        "backing_provider",
-    ),
     (crate::manifest::permission::PLATFORM_RAW, "platform_raw"),
     (crate::manifest::permission::MONITOR, "monitor"),
     (crate::manifest::permission::BRIDGE, "bridge"),

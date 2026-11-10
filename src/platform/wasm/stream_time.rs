@@ -17,9 +17,9 @@
 
 use crate::kernel::sys::errno;
 
-/// PIO-side `STREAM_TIME` opcode that the `0x0C30` (`STREAM_TIME`) syscall
+/// PIO-side `STREAM_TIME` opcode that the `kernel::STREAM_TIME` syscall
 /// delegates to (`src/kernel/syscalls.rs`). Kept in sync with `linux_audio.rs`.
-const STREAM_CLOCK_QUERY: u32 = 0x1C00;
+use crate::abi::registry::stream_clock::QUERY as STREAM_CLOCK_QUERY;
 
 extern "C" {
     /// Fill a 24-byte `StreamTime { consumed_units u64, queued_units u32,

@@ -381,7 +381,7 @@ use fluxor::platform::linux::providers::{
 };
 include!("linux/object.rs");
 include!("linux/namespace.rs");
-// The `workload` provider (class 0x1A) and its host-process backend (the
+// The `workload` provider (class `workload`) and its host-process backend (the
 // `host_backend` namespace/cgroup mechanism) compile into the fluxor library at
 // `fluxor::platform::linux::{workload, host_backend}` so the host test harness can
 // exercise them directly. Bring the binary-facing entry points into scope so

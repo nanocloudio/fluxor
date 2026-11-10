@@ -4,7 +4,7 @@
 //! declared `irq:` to `isr_tier2_trampoline`, so the module's `module_isr_entry`
 //! is dispatched straight from interrupt context (never the cooperative
 //! `module_step`). Each dispatch increments a private counter and exercises the
-//! ISR-safe bridge ABI by calling `SELF_BRIDGES` (0x0C44) — proving on real
+//! ISR-safe bridge ABI by calling `SELF_BRIDGES` (`bridge::SELF_BRIDGES`) — proving on real
 //! silicon that (a) Tier-2 dispatch reaches `module_isr_entry`, and (b) the
 //! §D7-exempt bridge syscalls are reachable from ISR context. The kernel's
 //! global `tier2_dispatch_count` (surfaced on the `[therm]` line as `t2disp=`)
@@ -43,7 +43,7 @@ include!("../../sdk/runtime.rs");
 /// `bridge::SELF_BRIDGES` opcode — enumerate this module's own bridge fds.
 /// ISR-safe (exempt from the §D7 provider_call deny). Mirrors
 /// `modules/sdk/internal/bridge.rs::SELF_BRIDGES`.
-const SELF_BRIDGES: u32 = 0x0C44;
+const SELF_BRIDGES: u32 = abi::registry::bridge::SELF_BRIDGES;
 
 #[repr(C)]
 struct Tier2ProbeState {

@@ -34,24 +34,24 @@ pub mod channel {
 
     /// Allocate a DMA channel. Returns channel number (i32 >= 0) or <0.
     /// Issued via `provider_open(PLATFORM_DMA, channel::ALLOC, null, 0)`.
-    pub const ALLOC: u32 = 0x0C80;
+    pub use super::super::super::super::registry::platform_dma::ALLOC;
 
     /// Free a DMA channel. `handle = ch`, arg = empty.
-    pub const FREE: u32 = 0x0C81;
+    pub use super::super::super::super::registry::platform_dma::FREE;
 
     /// Start a DMA transfer (non-blocking).
     /// `handle = ch`, arg = [read_addr:u32 LE, write_addr:u32 LE,
     /// count:u32 LE, dreq:u8, flags:u8] (14 bytes).
     /// flags: bit0=incr_read, bit1=incr_write, bit2=data_size (0=16-bit, 1=32-bit).
-    pub const START: u32 = 0x0C82;
+    pub use super::super::super::super::registry::platform_dma::START;
 
     /// Poll DMA channel busy status.
     /// `handle = ch`, arg = empty. Returns 1 if busy, 0 if done.
-    pub const BUSY: u32 = 0x0C83;
+    pub use super::super::super::super::registry::platform_dma::BUSY;
 
     /// Abort a DMA transfer.
     /// `handle = ch`, arg = empty.
-    pub const ABORT: u32 = 0x0C84;
+    pub use super::super::super::super::registry::platform_dma::ABORT;
 }
 
 pub mod fd {
@@ -60,26 +60,26 @@ pub mod fd {
     /// Create a DMA fd: allocates two underlying channels, returns
     /// tagged fd. Issued via `provider_open(PLATFORM_DMA_FD,
     /// fd::CREATE, null, 0)`.
-    pub const CREATE: u32 = 0x0C85;
+    pub use super::super::super::super::registry::platform_dma_fd::CREATE;
 
     /// Start a DMA transfer on a DMA fd (full configuration).
     /// `handle = fd`, arg = [read_addr:u32 LE, write_addr:u32 LE,
     /// count:u32 LE, dreq:u8, flags:u8] (14 bytes).
     /// flags: bit0=incr_read, bit1=incr_write, bit2=data_size (0=16-bit, 1=32-bit).
-    pub const START: u32 = 0x0C86;
+    pub use super::super::super::super::registry::platform_dma_fd::START;
 
     /// Fast DMA re-trigger via AL3 registers (preserves
     /// write_addr/dreq/flags from CREATE).
     /// `handle = fd`, arg = [read_addr:u32 LE, count:u32 LE] (8 bytes).
-    pub const RESTART: u32 = 0x0C87;
+    pub use super::super::super::super::registry::platform_dma_fd::RESTART;
 
     /// Free a DMA fd: frees both DMA channels, releases slot.
     /// `handle = fd`, arg = empty.
-    pub const FREE: u32 = 0x0C88;
+    pub use super::super::super::super::registry::platform_dma_fd::FREE;
 
     /// Queue next DMA transfer (ping-pong). Configures the inactive
     /// channel and sets CHAIN_TO on the active channel for zero-gap
     /// hardware handoff.
     /// `handle = fd`, arg = [read_addr:u32 LE, count:u32 LE] (8 bytes).
-    pub const QUEUE: u32 = 0x0C89;
+    pub use super::super::super::super::registry::platform_dma_fd::QUEUE;
 }

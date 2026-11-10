@@ -243,8 +243,8 @@ mod params_def {
 // Provider helpers — opens via provider_open (tracked); rest via provider_call.
 // ============================================================================
 
-const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_UART_CONTRACT: u32 = 0x000D;
+const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
+const HAL_UART_CONTRACT: u32 = abi::registry::uart::ID as u32;
 
 unsafe fn dev_gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];

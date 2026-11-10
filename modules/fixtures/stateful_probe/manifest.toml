@@ -1,13 +1,13 @@
 name = "stateful_probe"
 version = "1.0.0"
-hardware_targets = ["bcm2712", "linux"]
+hardware_targets = ["bcm2712", "uefi", "linux"]
 
 # The smallest stateful workload: on its block source's first block it
 # keeps a magic and an epoch; every start reads the epoch back, adds one,
-# writes it, flushes, and logs it. Staged as a workload's subgraph over a
-# volume that outlives it (loam's `loam_volume`, say), two consecutive starts
-# logging epoch=1 then epoch=2 prove the workload's state lived in the
-# volume between them.
+# writes it, flushes, reads it back to compare, and logs it. Staged as a
+# workload's subgraph over a volume that outlives it (loam's
+# `loam_volume`, say), two consecutive starts logging epoch=1 then epoch=2
+# prove the workload's state lived in the volume between them.
 #
 #   [stateful_probe] epoch=<n>
 #   [stateful_probe] FAIL <phase> rc=-<errno>

@@ -284,7 +284,7 @@ On BCM2712, `kernel::boot::dtb::read_ethernet_mac()` walks the
 firmware-provided flattened device tree for the `local-mac-address`
 property.
 The rp1_gem driver calls this via a kernel-primitive syscall
-(`GET_HW_ETHERNET_MAC`, `0x0C3D`) and programs the returned MAC into
+(`GET_HW_ETHERNET_MAC`, `0x003D`) and programs the returned MAC into
 the GEM's SA1 register. On silicon without DTB plumbing the syscall
 returns `ENODEV`, and drivers fall back to a locally-administered
 default.
@@ -338,7 +338,7 @@ The kernel owns:
 - **Scheduling** — cooperative dispatch, deferred-ready chain,
   event-driven wake, fault recovery
 - **Memory** — module state arenas, channel buffer arena, optional
-  per-module heap, optional demand-paged arenas
+  per-module heap
 - **IPC** — channels (FIFO and mailbox), buffer pool, event flags
 - **Bus primitives** — GPIO, SPI, I2C, PIO, UART, timers, DMA
 - **Loader** — module validation, code/rodata layout, syscall table

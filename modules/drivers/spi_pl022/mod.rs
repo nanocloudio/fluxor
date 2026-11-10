@@ -421,17 +421,17 @@ unsafe fn poll_transfer(s: &mut SpiState, handle_idx: usize) {
 // ============================================================================
 
 // Must match the HAL_SPI contract opcodes in abi::contracts::hal::spi.
-const SPI_OPEN: u32 = 0x0200;
-const SPI_CLOSE: u32 = 0x0201;
-const SPI_BEGIN: u32 = 0x0202;
-const SPI_END: u32 = 0x0203;
-const SPI_SET_CS: u32 = 0x0204;
-const SPI_CLAIM: u32 = 0x0205;
-const SPI_CONFIGURE: u32 = 0x0206;
-const SPI_TRANSFER_START: u32 = 0x0207;
-const SPI_TRANSFER_POLL: u32 = 0x0208;
-const SPI_POLL_BYTE: u32 = 0x0209;
-const SPI_GET_CAPS: u32 = 0x020A;
+const SPI_OPEN: u32 = abi::registry::spi::OPEN;
+const SPI_CLOSE: u32 = abi::registry::spi::CLOSE;
+const SPI_BEGIN: u32 = abi::registry::spi::BEGIN;
+const SPI_END: u32 = abi::registry::spi::END;
+const SPI_SET_CS: u32 = abi::registry::spi::SET_CS;
+const SPI_CLAIM: u32 = abi::registry::spi::CLAIM;
+const SPI_CONFIGURE: u32 = abi::registry::spi::CONFIGURE;
+const SPI_TRANSFER_START: u32 = abi::registry::spi::TRANSFER_START;
+const SPI_TRANSFER_POLL: u32 = abi::registry::spi::TRANSFER_POLL;
+const SPI_POLL_BYTE: u32 = abi::registry::spi::POLL_BYTE;
+const SPI_GET_CAPS: u32 = abi::registry::spi::GET_CAPS;
 
 /// Resolve an incoming handle to a live slot index. Returns `Some(idx)`
 /// only if the handle is in range AND the slot is currently in use.

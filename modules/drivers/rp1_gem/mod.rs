@@ -121,8 +121,8 @@ const DMACFG_RXBUF_SIZE_SHIFT: u32 = 16;
 const DMACFG_ADDR64: u32 = 1 << 30; // 64-bit address bus
 
 // NIC syscall opcodes
-const NIC_RING_CREATE: u32 = 0x0CF2;
-const NIC_RING_INFO: u32 = 0x0CF4;
+const NIC_RING_CREATE: u32 = abi::registry::platform_nic_ring::NIC_RING_CREATE;
+const NIC_RING_INFO: u32 = abi::registry::platform_nic_ring::NIC_RING_INFO;
 
 // ============================================================================
 // GEM RX descriptor (Cadence native, 64-bit addressing)
@@ -138,7 +138,7 @@ const NIC_RING_INFO: u32 = 0x0CF4;
 
 const RX_DESC_OWNERSHIP: u32 = 1 << 0; // set by GEM when frame stored
 const RX_DESC_WRAP: u32 = 1 << 1; // last descriptor in ring
-const RX_DESC_LEN_MASK: u32 = 0x1FFF; // bits [12:0] of word 1
+const RX_DESC_LEN_MASK: u32 = (1 << 13) - 1; // bits [12:0] of word 1
 
 // ============================================================================
 // GEM TX descriptor (Cadence native, 64-bit addressing)
@@ -581,7 +581,7 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     // Ask the kernel for the hardware-provisioned MAC (sourced from the
     // firmware-provided DTB). Fall back to DEFAULT_MAC — a locally-
     // administered address — if the kernel has nothing for us.
-    const SYS_GET_HW_ETHERNET_MAC: u32 = 0x0C3D;
+    const SYS_GET_HW_ETHERNET_MAC: u32 = abi::registry::kernel::GET_HW_ETHERNET_MAC;
     let mut probed = [0u8; 6];
     s.mac = if (sys.provider_call)(-1, SYS_GET_HW_ETHERNET_MAC, probed.as_mut_ptr(), 6) == 6 {
         probed
@@ -1085,7 +1085,14 @@ pub unsafe extern "C" fn module_new(
         // SAFETY: `syscalls` is the kernel table handed to `module_new`;
         // the registration payload is the 16-byte layout `REGISTER_IOCTL`
         // documents.
-        let _ = unsafe { ((*syscalls).provider_call)(in_chan, 0x0507, reg.as_mut_ptr(), 16) };
+        let _ = unsafe {
+            ((*syscalls).provider_call)(
+                in_chan,
+                abi::registry::channel::REGISTER_IOCTL,
+                reg.as_mut_ptr(),
+                16,
+            )
+        };
     }
     s.link_poll_counter = 0;
     s.rx_resource_total = 0;

@@ -65,7 +65,7 @@ include!("../../sdk/runtime.rs");
 // ============================================================================
 
 /// Re-enumerate a controller (`pcie_config::PCIE_RESCAN`).
-const PCIE_RESCAN: u32 = 0x0CF5;
+const PCIE_RESCAN: u32 = abi::registry::metal_device::PCIE_RESCAN;
 
 /// Devices reported, at most.
 const MAX_DEVICES: usize = 8;

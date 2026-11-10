@@ -80,14 +80,14 @@
 
 /// Provider class id (opcode class 0x1Exx). Mirrors
 /// `kernel::module::provider::contract::NET_POLICY`.
-pub const CLASS: u16 = 0x001E;
+pub const CLASS: u16 = super::super::super::registry::net_policy::ID;
 
 /// Returns 1 when a net.policy provider is present. handle=-1, arg=null.
-pub const PROBE: u32 = 0x1E00;
+pub use super::super::super::registry::net_policy::PROBE;
 
 /// Capability bitmap. handle=-1, arg = `[caps_out:u32 LE]` (4 bytes, written).
 /// Returns 0.
-pub const CAPS: u32 = 0x1E01;
+pub use super::super::super::registry::net_policy::CAPS;
 
 /// Replace a table atomically. handle=-1, arg:
 /// ```text
@@ -104,7 +104,7 @@ pub const CAPS: u32 = 0x1E01;
 /// node's authority), `EAGAIN` (another REPLACE or CLEAR is being applied),
 /// or the platform's error applying it — in which case the stored table is
 /// as it was.
-pub const REPLACE: u32 = 0x1E02;
+pub use super::super::super::registry::net_policy::REPLACE;
 
 /// Delete a table. handle=-1, arg = `[name_len:u8][name bytes]`. Idempotent;
 /// returns 0, or `EACCES` (not the node's authority), `EAGAIN` (another
@@ -112,7 +112,7 @@ pub const REPLACE: u32 = 0x1E02;
 /// table that exists consumes a generation (the
 /// store-wide one [`READ`] reports for a zero-length name), so one poll of
 /// that value notices a deletion as it notices a replace.
-pub const CLEAR: u32 = 0x1E03;
+pub use super::super::super::registry::net_policy::CLEAR;
 
 /// Read a table back: its state and rules. handle=-1, arg:
 /// ```text
@@ -132,7 +132,7 @@ pub const CLEAR: u32 = 0x1E03;
 /// any REPLACE or CLEAR, nothing is copied to `out`, and the call returns 0.
 /// An enforcer polls that one value, and re-reads its tables only when it
 /// moved.
-pub const READ: u32 = 0x1E04;
+pub use super::super::super::registry::net_policy::READ;
 
 /// An in-graph enforcer (the bare-metal packet filter, `ip`) declares the
 /// tables it applies, and reports what it applied. handle=-1, arg: one or
@@ -163,7 +163,7 @@ pub const READ: u32 = 0x1E04;
 /// policy is in force on a node with no filter in the path. A platform whose
 /// provider realizes tables itself (Linux) is that table's enforcer the
 /// moment a REPLACE it applied lands.
-pub const ATTACH: u32 = 0x1E05;
+pub use super::super::super::registry::net_policy::ATTACH;
 
 /// Bytes after an ATTACH entry's name: its `applied_gen`.
 pub const ATTACH_TAIL: usize = 8;

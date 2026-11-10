@@ -13,9 +13,9 @@
 /// of the return value are the payload length; the next 15 bits are
 /// the overflow-dropped byte count since the last drain (saturating at
 /// 0x7FFF). The top bit is always 0.
-pub const LOG_RING_DRAIN: u32 = 0x0C64;
+pub use super::super::registry::diag::LOG_RING_DRAIN;
 
 /// Snapshot fan-out / fan-in pump counters as ASCII into a caller buffer.
 /// Returns bytes written. Read-only — no permission required.
 /// handle=-1, arg=output buffer, arg_len=capacity.
-pub const FAN_DIAG_SNAPSHOT: u32 = 0x0C65;
+pub use super::super::registry::diag::FAN_DIAG_SNAPSHOT;

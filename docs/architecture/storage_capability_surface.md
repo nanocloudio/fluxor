@@ -43,14 +43,10 @@ itself stays narrow so substitutability holds.
 Append-log behaviour is deliberately not a new surface: it is an
 Event-stream content-type pattern over the mesh Event primitive (§4).
 
-Page-backing for arenas is deliberately not a public surface: it is an
-internal cache concern of `storage.block` / `file.data` providers (see
-`modules/sdk/contracts/storage/paged_arena.rs`).
-
 ### Where this is enforced
 
 - `provides` in `manifest.toml` is validated against the provider
-  vocabulary in `contracts/src/vocabulary.rs` (`PROVIDER_CONTRACTS` plus
+  vocabulary (the ABI registry's manifest-nameable contracts plus
   `PROVIDER_SURFACES`); an unknown name fails manifest parsing.
   Consumers reach a provider through `[[resources]].requires_contract`
   (by contract, substitutable) or by naming the provider's ports directly
@@ -60,7 +56,7 @@ internal cache concern of `storage.block` / `file.data` providers (see
   taxonomy.
 - The opcode constants live in `modules/sdk/contracts/storage/`
   (`fs.rs`, `namespace.rs`, `object.rs`, plus the kernel-private
-  `graph_slot.rs`, `paged_arena.rs`, `runtime_params.rs`).
+  `graph_slot.rs`, `runtime_params.rs`).
 
 ### Declared providers and consumers
 
@@ -314,12 +310,12 @@ contract id, so every dispatched surface needs its own class byte:
 
 | Class byte | Contract id (`kernel::provider::contract`) | Opcode range |
 |-----------:|---------------------------------------------|--------------|
-| `0x09`     | `FS`                                        | `0x0900..0x09FF` — random-access file I/O (`fs.rs`) |
-| `0x13`     | `STORAGE_NAMESPACE`                         | `0x1300..0x13FF` — directory-like name-keyed surface (`namespace.rs`) |
-| `0x14`     | `STORAGE_OBJECT`                            | `0x1400..0x14FF` — whole-blob byte-addressed surface (`object.rs`) |
+| `0x0D`     | `FS`                                        | `0x0D00..0x0DFF` — random-access file I/O (`fs.rs`) |
+| `0x0E`     | `STORAGE_NAMESPACE`                         | `0x0E00..0x0EFF` — directory-like name-keyed surface (`namespace.rs`) |
+| `0x0F`     | `STORAGE_OBJECT`                            | `0x0F00..0x0FFF` — whole-blob byte-addressed surface (`object.rs`) |
 
 `storage.block` has no class byte. Its requests are channel ioctls on the
-source's `blocks` channel (§1.1). Class byte `0x0A` is `BUFFER`, not a
+source's `blocks` channel (§1.1). Class byte `0x03` is `BUFFER`, not a
 storage surface — namespace and object opcodes sit in their own class bytes
 to avoid the collision.
 
@@ -738,7 +734,7 @@ A module reaches a guarded store through `provider_call`, which has no
 session for the mesh's `MSG_CAP_PRESENT` to ride. So `storage.object` has
 its own presentation op:
 
-1. `PRESENT` (`0x142B`) names a scope and carries a capability chain. A
+1. `PRESENT` (`0x0F2B`) names a scope and carries a capability chain. A
    scope is a key prefix ending `/` (`photos/`). The chain's leaf names the
    scope's object, `grant::scope_object`: SHA-256 over a domain tag and the
    scope, truncated to an `ObjectId`. `fluxor modules cap mint --scope
@@ -864,7 +860,7 @@ bytes; the store keeps and returns it and never interprets it.
 is retained or held, a `DELETE` of it and a `PUT` or `PUT_STREAMED_COMMIT` over
 it are refused `ERETAINED`, decided at the write's linearization point.
 
-`object::RETAIN` (`0x142C`) changes a live object's retention and hold in the
+`object::RETAIN` (`0x0F2C`) changes a live object's retention and hold in the
 same log order as writes: retention only extends, and a hold can be set and
 cleared. A grant authorizes it with the write permission.
 
@@ -1295,9 +1291,6 @@ Out of scope (deliberately):
   decoded via `Fence::decode`.
 - `storage.append_log` as a public surface — covered by the `event.log`
   pattern.
-- `storage.page_backing` as a public surface — internal cache concern of
-  `storage.block` / `file.data` providers; lives in
-  `modules/sdk/contracts/storage/paged_arena.rs`.
 - Cross-provider rename / delete. `RENAME` is atomic within one provider;
   moving an entry between providers is a higher-level orchestration
   concern.

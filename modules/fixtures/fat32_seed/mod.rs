@@ -56,11 +56,11 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
-const FS_CLOSE: u32 = 0x0903;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_FSYNC: u32 = abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = abi::registry::fs::WRITE;
+const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
+const FS_FSYNC_NAME: u32 = abi::registry::fs::FSYNC_NAME;
 
 /// Longest path this fixture will address.
 const MAX_PATH: usize = 96;

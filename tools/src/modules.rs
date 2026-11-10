@@ -257,23 +257,13 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Layouts the kernel reads, mounted from the SDK so the packer writes the
+/// Layouts the kernel reads, from the SDK through `fluxor-abi`, so the packer writes the
 /// one definition the kernel and modules compile against: the program
 /// section (`kernel_abi::program`) and the graph-image header
 /// (`flash_layout::GRAPH_SLOT_*`).
-#[allow(
-    dead_code,
-    reason = "the packer reads a few constants of each mounted file"
-)]
 pub mod sdk_layout {
-    /// `kernel_abi.rs` names `super::wire`.
-    pub(crate) use crate::wire;
-    pub mod kernel_abi {
-        include!("../../modules/sdk/abi/kernel_abi.rs");
-    }
-    pub mod flash_layout {
-        include!("../../modules/sdk/platform/rp/flash_layout.rs");
-    }
+    pub use fluxor_abi::kernel_abi;
+    pub use fluxor_abi::platform::rp::flash_layout;
 }
 
 use sdk_layout::kernel_abi::program as pg;
@@ -1760,8 +1750,6 @@ pub fn pack_fmod(
         // Absent from the export table, the pool reads as the host's.
         "module_samples_pool",
         "module_flash_store_dispatch",
-        // Backing-provider dispatch (resolved by BACKING_PROVIDER_ENABLE)
-        "backing_provider_dispatch",
     ];
 
     let mut exports: Vec<(String, u32, u32)> = Vec::new();

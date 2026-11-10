@@ -48,20 +48,20 @@ const NUM_SLICES: usize = 12;
 const DEFAULT_TOP: u16 = 0xFFFE;
 
 // PWM opcodes (dev_pwm)
-const PWM_OPEN: u32 = 0x0F00;
-const PWM_CLOSE: u32 = 0x0F01;
-const PWM_CONFIGURE: u32 = 0x0F02;
-const PWM_SET_DUTY: u32 = 0x0F03;
-const PWM_GET_DUTY: u32 = 0x0F04;
+const PWM_OPEN: u32 = abi::registry::pwm::OPEN;
+const PWM_CLOSE: u32 = abi::registry::pwm::CLOSE;
+const PWM_CONFIGURE: u32 = abi::registry::pwm::CONFIGURE;
+const PWM_SET_DUTY: u32 = abi::registry::pwm::SET_DUTY;
+const PWM_GET_DUTY: u32 = abi::registry::pwm::GET_DUTY;
 
 // GPIO opcodes
-const GPIO_CLAIM: u32 = 0x0100;
-const GPIO_RELEASE: u32 = 0x0104;
+const GPIO_CLAIM: u32 = abi::registry::gpio::CLAIM;
+const GPIO_RELEASE: u32 = abi::registry::gpio::SET_LEVEL;
 
 // System raw PWM bridge opcodes
-const SYS_PWM_PIN_ENABLE: u32 = 0x0C60;
-const SYS_PWM_PIN_DISABLE: u32 = 0x0C61;
-const SYS_PWM_SLICE_WRITE: u32 = 0x0C62;
+const SYS_PWM_PIN_ENABLE: u32 = abi::registry::rp_raw::PWM_PIN_ENABLE;
+const SYS_PWM_PIN_DISABLE: u32 = abi::registry::rp_raw::PWM_PIN_DISABLE;
+const SYS_PWM_SLICE_WRITE: u32 = abi::registry::rp_raw::PWM_SLICE_WRITE;
 
 // PWM slice register indices
 const REG_CSR: u8 = 0;
@@ -71,7 +71,7 @@ const REG_CC: u8 = 3;
 const REG_TOP: u8 = 4;
 
 // Contract id (HAL_PWM).
-const HAL_PWM_CONTRACT: u32 = 0x000F;
+const HAL_PWM_CONTRACT: u32 = abi::registry::pwm::ID as u32;
 
 // ============================================================================
 // State
@@ -119,7 +119,7 @@ unsafe fn raw_pin_disable(sys: &SyscallTable, pin: u8) -> i32 {
 unsafe fn gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
     // GPIO claim returns a handle; route through provider_open so
     // the kernel binds it to the HAL_GPIO contract.
-    const HAL_GPIO_CONTRACT: u32 = 0x0001;
+    const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
     let arg = [pin];
     (sys.provider_open)(HAL_GPIO_CONTRACT, GPIO_CLAIM, arg.as_ptr(), 1)
 }

@@ -1,3 +1,8 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
 permissions = ["dma"]
+
+# Device registers, DMA memory and cache maintenance.
+[[resources]]
+requires_contract = "metal_device"
+access = "write"

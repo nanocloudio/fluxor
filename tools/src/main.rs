@@ -20,6 +20,7 @@
 //!     fluxor modules pack module.o -o module.fmod  # Pack ELF into .fmod
 
 mod abi_pin;
+mod abi_registry;
 mod add_subgraph;
 mod agent_cli;
 mod asset_bank;

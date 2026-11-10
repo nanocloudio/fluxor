@@ -122,7 +122,7 @@ unsafe fn net_read_frame_sized(
 /// Returns 0 on success, negative errno on failure.
 #[inline(always)]
 unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
-    (sys.provider_call)(-1, 0x0C3C, buf, len)
+    (sys.provider_call)(-1, abi::registry::kernel::RANDOM_FILL, buf, len)
 }
 
 /// Build + emit a `MSG_TRACE_CTX` frame carrying a connection's W3C trace

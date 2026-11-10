@@ -1,29 +1,20 @@
 //! Public Fluxor contracts and shared vocabulary.
 //!
-//! Fluxor owns the storage-surface vocabulary, the typed `Fence` enum
-//! that operations return, and the wire-byte content-type table used
-//! by every module manifest. Downstream implementers — storage
-//! providers, sibling projects authoring module manifests — depend on
-//! this crate and use these names directly instead of duplicating
-//! string constants.
+//! Fluxor owns the wire-byte content-type table used by every module
+//! manifest, its rate classes and framing, the isolation planner, the
+//! boot memory map and the owner-log ring format. Downstream
+//! implementers — sibling projects authoring module manifests, host
+//! tools — depend on this crate and use these names directly instead of
+//! duplicating them.
 //!
 //! This crate is deliberately small and dependency-free so it can be
 //! pulled in by anything that needs the vocabulary without dragging in
-//! the kernel, platform code, or any chip/host feature. Enable the
-//! `serde` feature to get `Serialize`/`Deserialize` on every type.
+//! the kernel, platform code, or any chip/host feature.
 
 #![no_std]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
-
-#[cfg(feature = "alloc")]
-use alloc::string::String;
-#[cfg(feature = "alloc")]
-use alloc::vec::Vec;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
 
 pub mod boot;
 pub mod isolation;
@@ -31,16 +22,6 @@ pub mod isolation;
 pub mod log_ring;
 pub mod observability;
 pub mod vocabulary;
-
-/// Canonical content-type identifiers for the four storage surfaces
-/// Fluxor publishes. Implementers expose themselves on the mesh under
-/// one of these strings.
-pub mod content_type {
-    pub const STORAGE_BLOCK: &str = "storage.block";
-    pub const FILE_DATA: &str = "file.data";
-    pub const STORAGE_NAMESPACE: &str = "storage.namespace";
-    pub const STORAGE_OBJECT: &str = "storage.object";
-}
 
 // ── Content type string→u8 mapping (single source of truth) ─────────────────
 //
@@ -478,112 +459,5 @@ pub fn rate_class_floor(class: RateClass, embedded: bool) -> Option<u32> {
         (Audio, true) => Some(256 * 1024),
         (Transaction, true) => Some(256 * 1024),
         (Video, true) | (Bulk, true) => None,
-    }
-}
-
-/// Per-operation fence: the actual guarantee a returning operation
-/// achieved. Operations MUST NOT advertise a fence stronger than the
-/// underlying graph produced.
-#[cfg(feature = "alloc")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
-pub enum Fence {
-    Volatile,
-    LocalDurable,
-    ReplicatedDurable {
-        quorum: u32,
-        epoch: u64,
-        witness: FenceWitness,
-    },
-    ContentHashed {
-        algo: HashAlgo,
-        digest: Vec<u8>,
-    },
-    RevisionMonotone {
-        revision: u64,
-    },
-    ViewConsistent {
-        view_epoch: u64,
-    },
-}
-
-#[cfg(feature = "alloc")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum HashAlgo {
-    Sha256,
-    Blake3,
-}
-
-/// Externally observable proof that a replicated-durable fence
-/// completed. Constructed by the replicating provider the operation
-/// went through; carried on `Fence::ReplicatedDurable` so downstream
-/// consumers can verify the fence was real.
-#[cfg(feature = "alloc")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct FenceWitness {
-    pub fence_epoch: u64,
-    pub manifest_id: String,
-    pub quorum: u32,
-    pub acked_participants: Vec<String>,
-}
-
-#[cfg(feature = "alloc")]
-impl FenceWitness {
-    pub fn new(
-        fence_epoch: u64,
-        manifest_id: impl Into<String>,
-        quorum: u32,
-        acked: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        let mut acked: Vec<String> = acked.into_iter().map(Into::into).collect();
-        acked.sort();
-        Self {
-            fence_epoch,
-            manifest_id: manifest_id.into(),
-            quorum,
-            acked_participants: acked,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.acked_participants.is_empty()
-    }
-}
-
-/// A leased handle into the mesh, returned when a caller opens a
-/// namespace or object.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct StorageHandle {
-    pub surface: StorageSurface,
-    pub content_type: &'static str,
-    pub mesh_handle_id: u64,
-    pub lease_epoch: u64,
-}
-
-/// Identifier for which of the four Fluxor-owned surfaces a handle or
-/// descriptor refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum StorageSurface {
-    Block,
-    FileData,
-    Namespace,
-    Object,
-}
-
-impl StorageSurface {
-    pub fn content_type(&self) -> &'static str {
-        match self {
-            Self::Block => content_type::STORAGE_BLOCK,
-            Self::FileData => content_type::FILE_DATA,
-            Self::Namespace => content_type::STORAGE_NAMESPACE,
-            Self::Object => content_type::STORAGE_OBJECT,
-        }
     }
 }
