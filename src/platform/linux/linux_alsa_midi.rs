@@ -4,7 +4,7 @@
 // seq client (`snd_seq_open`), publish input and/or output ports
 // based on the `mode` param, decode incoming `SND_SEQ_EVENT_*` into
 // the `input::midi` 4-byte frame shape (per
-// `modules/sdk/contracts/input/midi.rs`), and re-encode outgoing
+// `crates/fluxor-abi/src/contracts/input/midi.rs`), and re-encode outgoing
 // frames back to ALSA events on the output side.
 //
 // Params declared in

@@ -21,16 +21,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -42,11 +32,10 @@
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Cadence GEM Register Offsets
@@ -70,8 +59,6 @@ const GEM_SA1B: usize = 0x088; // Specific addr 1 bottom (MAC lo)
 const GEM_SA1T: usize = 0x08C; // Specific addr 1 top (MAC hi)
 const GEM_USRIO: usize = 0x0C0; // User IO (RGMII mode select)
 const GEM_MID: usize = 0x0FC; // Module ID (RO)
-const GEM_DCFG1: usize = 0x280; // Design config 1
-const GEM_DCFG2: usize = 0x284; // Design config 2
 
 // Hardware statistics counters. Each is RW1C (read, auto-clear) on
 // most Cadence GEM revisions; treat reads as monotonic deltas between
@@ -177,9 +164,6 @@ const MAX_FRAME: usize = 1514;
 
 // Default MAC address (locally administered)
 const DEFAULT_MAC: [u8; 6] = [0x02, 0xCA, 0xDE, 0x00, 0x00, 0x01];
-
-// Expected GEM Module ID (verified via devmem on running Pi 5)
-const EXPECTED_MID: u32 = 0x0007_0109;
 
 /// PCIe inbound window identity-maps ARM physical addresses.
 /// DMA addresses equal ARM physical addresses.
@@ -1241,6 +1225,6 @@ pub unsafe extern "C" fn module_post_tick_flush(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

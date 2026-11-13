@@ -1,8 +1,7 @@
 use super::p_u8;
 use super::PwmOutState;
-use super::SCHEMA_MAX;
 
-define_params! {
+fluxor_rt::define_params! {
     PwmOutState;
 
     1, pin, u8, 25

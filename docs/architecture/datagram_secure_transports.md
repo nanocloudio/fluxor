@@ -46,7 +46,7 @@ modules/
 
 ## SDK primitives
 
-Source: `modules/sdk/crypto/`, `modules/sdk/wire/varint.rs`.
+Source: `crates/fluxor-sdk/src/crypto/`, `crates/fluxor-abi/src/wire/varint.rs`.
 
 The TLS-1.3-grade primitives:
 
@@ -61,11 +61,11 @@ The TLS-1.3-grade primitives:
   (`ScalarMulState`) so a single handshake cannot block a concurrent
   one.
 
-Modules that consume these include them with `include!`:
+Modules that consume these import them from `fluxor-sdk`:
 
 ```rust
-include!("../../sdk/crypto/aes_gcm.rs");
-include!("../../sdk/crypto/hmac.rs");
+use fluxor_sdk::crypto::aes_gcm::*;
+use fluxor_sdk::crypto::hmac::*;
 ```
 
 Every primitive is `no_std` and allocation-free, and the signing,
@@ -76,7 +76,7 @@ discipline in code that touches crypto state. Constant tables are plain
 relocation (see [module_architecture.md](module_architecture.md),
 "Position-independent data").
 
-`modules/sdk/wire/varint.rs` implements RFC 9000 §16 variable-length
+`crates/fluxor-abi/src/wire/varint.rs` implements RFC 9000 §16 variable-length
 integers (1, 2, 4, or 8 bytes; maximum value 2^62 − 1). The same
 encoding is used by the QUIC frame layer and the HTTP/3 preamble
 codecs. API: `varint_encode`, `varint_decode`, `varint_size`,
@@ -85,14 +85,14 @@ codecs. API: `varint_encode`, `varint_decode`, `varint_size`,
 ## Channel contracts
 
 QUIC and DTLS bind through the **datagram** surface
-(`modules/sdk/contracts/net/datagram.rs`, opcodes `0x20..0x43`).
+(`crates/fluxor-abi/src/contracts/net/datagram.rs`, opcodes `0x20..0x43`).
 Endpoints carry their source address on every RX, so a connection can
 survive peer migration. The same surface is consumed by DNS, log_net,
 and transport_buffer, and is provided by `linux_net` (host `SOCK_DGRAM`
 sockets) and the bare-metal `ip` module.
 
 QUIC publishes its application surface over the **mux** contract
-(`modules/sdk/contracts/net/mux.rs`, opcodes `0xB0..0xCF`), so a
+(`crates/fluxor-abi/src/contracts/net/mux.rs`, opcodes `0xB0..0xCF`), so a
 consumer sees QUIC streams as a multiplexed-session channel without
 knowing anything about packet protection. Every application stream is
 surfaced this way; the transport does not speak the protocols carried

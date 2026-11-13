@@ -43,7 +43,7 @@ pub mod vocabulary;
 // are generic (AudioEncoded / VideoEncoded): a content type names a
 // substitution surface, not an implementation enumeration, so per-codec
 // forks are rejected at review. Codec identity travels in-band, in the
-// stream's `STREAM` record (`modules/sdk/contracts/encoded.rs`), drawn from
+// stream's `STREAM` record (`crates/fluxor-abi/src/contracts/encoded.rs`), drawn from
 // `vocabulary::CODECS`; a port that can carry only some codecs declares
 // which in `[ports.facts]`, and the composer checks each edge. Whole encoded
 // images ride OctetStream (magic-byte self-describing). See the vocabulary
@@ -105,7 +105,7 @@ pub const CONTENT_TYPES: &[&str] = &[
     // Per-class input event surfaces (see
     // docs/architecture/input_capability_surface.md). Each carries a
     // packed C-repr record on the wire — pointer/key/gamepad shapes
-    // documented in `modules/sdk/contracts/input/*.rs`. The generic
+    // documented in `crates/fluxor-abi/src/contracts/input/*.rs`. The generic
     // "InputEvent" carries a driver's own record shape for a device
     // whose events fit none of the per-class surfaces; a graph wires
     // one of the per-class names below wherever one applies, so the
@@ -114,18 +114,18 @@ pub const CONTENT_TYPES: &[&str] = &[
     "KeyEvents",
     "GamepadEvents",
     // Pre-decoded MIDI channel-voice events — fixed 4-byte frame per
-    // `modules/sdk/contracts/input/midi.rs`. Carries
+    // `crates/fluxor-abi/src/contracts/input/midi.rs`. Carries
     // `[event_kind, channel, data1, data2]`. Producers: browser Web
     // MIDI, Linux ALSA seq, class-compliant USB-MIDI hosts.
     "MidiEvents",
     // Observability telemetry envelope — fixed-layout `TelemetryRecord`
-    // (`modules/sdk/contracts/telemetry.rs`) carrying one metric or span
+    // (`crates/fluxor-abi/src/contracts/telemetry.rs`) carrying one metric or span
     // signal. Module-scope telemetry flows on this content type to the
     // `observe` collector; logs ride `log_ring` separately. See
     // `standards/observability.md`.
     "Telemetry",
     // Runtime environment-plane descriptor — fixed 24-byte `MSG_TRAITS`
-    // record per `modules/sdk/contracts/input/surface_traits.rs`. The
+    // record per `crates/fluxor-abi/src/contracts/input/surface_traits.rs`. The
     // host platform adapter publishes viewport / orientation / size-class
     // / input-modality / audio-config snapshots on this content type; a
     // module that wants to adapt to its surface wires an input port to
@@ -143,7 +143,7 @@ pub const CONTENT_TYPES: &[&str] = &[
     // Exchange records, request direction: a request HEAD (method, target,
     // headers, peer, response credit, the first body bytes), further BODY
     // records, CREDIT, ABORT and DATAGRAM — the layout in
-    // `modules/sdk/contracts/exchange.rs`. Every record names its exchange by
+    // `crates/fluxor-abi/src/contracts/exchange.rs`. Every record names its exchange by
     // a 14-byte id the requester chooses. Carried on a port where a requester
     // asks a provider anything: an HTTP server handing a route to an
     // application, a pipeline calling an endpoint, a producer publishing to a
@@ -161,7 +161,7 @@ pub const CONTENT_TYPES: &[&str] = &[
     // routes on this byte to tell a store change from every other event
     // sharing its sink.
     "NamespaceChange",
-    // Generic GPU work — the request stream of `modules/sdk/wire/gpu_wire.rs`
+    // Generic GPU work — the request stream of `crates/fluxor-abi/src/contracts/gpu.rs`
     // (query, resource, program, transfer, submission, fence, control and
     // surface records) flowing from a producer to a GPU provider.
     //
@@ -177,7 +177,7 @@ pub const CONTENT_TYPES: &[&str] = &[
     // A measured physical quantity — one reading per record, fixed layout:
     // `{sensor_id u16, flags u8, scale i8, seq u32, t_micros u64, value i64}`,
     // little-endian, value scaled by `10^scale`. The layout and the reasoning
-    // behind it live with the contract, `modules/sdk/contracts/sensor.rs`;
+    // behind it live with the contract, `crates/fluxor-abi/src/contracts/sensor.rs`;
     // fixed point rather than float so a reading evaluates identically on a die
     // with no FPU and in a deterministic expression VM.
     //

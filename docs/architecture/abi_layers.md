@@ -6,11 +6,11 @@ wrong layer = redraw before coding.
 
 | Layer | Source | Who may reach it | Contents |
 |-------|--------|------------------|----------|
-| `kernel_abi` | `modules/sdk/abi/kernel_abi.rs` | Every module (implicit) | Primitives the kernel owns: `SyscallTable`, channel, timer, buffer, event, log, random, arena, poll/errno, query keys, BIND_IRQ, STREAM_TIME |
-| `hal` | `modules/sdk/contracts/hal/*.rs` | Modules that claim the hardware contract in their manifest | Privileged hardware contracts — portable abstraction of peripherals (GPIO, SPI, I2C, PIO, UART, ADC, PWM, PCIe) |
-| stable module contracts | `modules/sdk/contracts/` (net, storage, key_vault, workload, input, telemetry, …) | Any consumer module | Portable module-provided contracts. Channel-served protocols live here too. |
-| `internal` | `modules/sdk/internal/*.rs`, `src/kernel/internal/*.rs` | Kernel and first-party orchestrator modules only | Kernel-private orchestration: bridge, fault monitor, reconfigure, flash raw, platform MMIO/DMA/PCIe. Not public; not an extension point. |
-| `platform` | `modules/sdk/platform/{rp,bcm2712,linux}/*.rs`, `src/platform/*.rs` | Chip-specific drivers in `modules/drivers/`, plus the owning platform | Chip- and host-specific raw register bridges and layout constants. Not public; not portable. |
+| `kernel_abi` | `crates/fluxor-abi/src/kernel_abi.rs` | Every module (implicit) | Primitives the kernel owns: `SyscallTable`, channel, timer, buffer, event, log, random, arena, poll/errno, query keys, BIND_IRQ, STREAM_TIME |
+| `hal` | `crates/fluxor-abi/src/contracts/hal/*.rs` | Modules that claim the hardware contract in their manifest | Privileged hardware contracts — portable abstraction of peripherals (GPIO, SPI, I2C, PIO, UART, ADC, PWM, PCIe) |
+| stable module contracts | `crates/fluxor-abi/src/contracts/` (net, storage, key_vault, workload, input, telemetry, …) | Any consumer module | Portable module-provided contracts. Channel-served protocols live here too. |
+| `internal` | `crates/fluxor-abi/src/internal/*.rs`, `src/kernel/internal/*.rs` | Kernel and first-party orchestrator modules only | Kernel-private orchestration: bridge, fault monitor, reconfigure, flash raw, platform MMIO/DMA/PCIe. Not public; not an extension point. |
+| `platform` | `crates/fluxor-abi/src/platform/`, `src/platform/*.rs` | Chip-specific drivers in `modules/drivers/`, plus the owning platform | Chip- and host-specific raw register bridges and layout constants. Not public; not portable. |
 
 Adding a new chip is a new `platform/<chip>/*` tree plus its hardware
 drivers — no changes to the upper layers. Keep new APIs in the narrowest
@@ -19,7 +19,7 @@ contracts to portable application modules.
 
 ## Kernel primitives — `kernel_abi`
 
-Source: `modules/sdk/abi/kernel_abi.rs`.
+Source: `crates/fluxor-abi/src/kernel_abi.rs`.
 
 Every PIC module receives a `SyscallTable` at init. It holds exactly:
 
@@ -45,7 +45,7 @@ module is built against the current shape.
 ## Contracts
 
 Contract ids are 16-bit values in `src/kernel/module/provider.rs::contract`.
-Each id corresponds to a contract file under `modules/sdk/contracts/`
+Each id corresponds to a contract file under `crates/fluxor-abi/src/contracts/`
 that defines its opcodes, arg payloads, and response semantics.
 
 ### HAL contracts — portable hardware transport
@@ -312,7 +312,7 @@ special-case fallback.
 
 ## Internal orchestration — `internal` layer
 
-Source: `modules/sdk/internal/`, `src/kernel/module/syscalls.rs`.
+Source: `crates/fluxor-abi/src/internal/`, `src/kernel/module/syscalls.rs`.
 
 The `internal` layer is kernel-private. It holds orchestration
 opcodes that are part of kernel plumbing, not a public extension
@@ -473,7 +473,7 @@ there is nothing in the YAML to check it against.
 
 ## Capacity profiles — `abi::config`
 
-Source: `modules/sdk/abi/config.rs`.
+Source: `crates/fluxor-abi/src/config.rs`.
 
 Module-facing capacity tunables live in one Rust file, re-exported
 through `abi::config::*` so every PIC module reads one source. The file
@@ -506,7 +506,7 @@ arena: the kernel borrows them from the config blob in place.) It lives in
 (`profile_linux`, `profile_bcm2712`, `profile_wasm`, `profile_rp`),
 selected by the platform feature; the RP arenas come from the silicon
 TOMLs through `build.rs` → `chip_generated.rs` → `platform::chip`.
-Everything under `modules/sdk` is hashed into the ABI-surface digest, so
+Everything in `crates/fluxor-abi` is hashed into the ABI-surface digest, so
 a kernel size stated here would make raising it an ABI epoch and a
 workspace republish though no module reads it.
 
@@ -527,14 +527,14 @@ rewrites this layer.
 ## Appendix — numbers and class routing
 
 Every ABI number is declared once, in
-[`modules/sdk/abi/registry.toml`](../../modules/sdk/abi/registry.toml), and
+[`crates/fluxor-abi/registry/registry.toml`](../../crates/fluxor-abi/registry/registry.toml), and
 generated into `abi::registry` by `fluxor abi-regen`. A contract's id is its
 opcode class byte, its vtable index, its `required_caps` bit and, when it
 mints handles, their fd tag; ids are dense from `0x00`.
 
 - Contract `kernel` (id `0x00`) carries the kernel primitives (LOG_WRITE,
   HANDLE_POLL, ARENA_GET, RANDOM_FILL, STREAM_TIME, …), documented in
-  [`kernel_abi`](../../modules/sdk/abi/kernel_abi.rs). Modules may not
+  [`kernel_abi`](../../crates/fluxor-abi/src/kernel_abi.rs). Modules may not
   `provider_open` it.
 - Contracts marked `route = "class"` in the registry (the kernel and the
   orchestration, telemetry, resource and raw-bridge surfaces) reach the kernel
@@ -807,7 +807,7 @@ alone, and the `tenancy-vocabulary` hygiene rule refuses them elsewhere. The
 same rule holds the portable surface, `src/kernel/` and these architecture
 docs to neutral words for host mechanisms (`MECHANISM_WORDS` in
 `tools/src/hygiene.rs`): they say what is guaranteed, and only
-`src/platform/<p>/` and `modules/sdk/platform/<p>/` say how one host realizes
+`src/platform/<p>/` and `crates/fluxor-abi/src/platform/<p>/` say how one host realizes
 it. A ruling that must name a backend sits inside a reasoned exempt block
 (`VOCABULARY_EXEMPT_BEGIN` / `VOCABULARY_EXEMPT_END` in the same file: an HTML
 comment in Markdown, a line comment in Rust).
@@ -825,7 +825,7 @@ directories (kernel: `boot exec ipc mem module security sys workload`;
 SDK: `abi contracts cores crypto internal platform runtime wire
 assets`) — not one directory per file, and not flat-until-forced.
 Named exceptions, each justified as an entry point or generated
-artefact that other files path-mount: `modules/sdk/abi.rs` (the
+artefact that other files path-mount: `crates/fluxor-abi/src/lib.rs` (the
 assembler), `abi_surface.rs` / `abi_surface_srcpin.rs` (the pin
 machinery, path-referenced by `tools/src/abi_pin.rs` — see
 [abi_surface.md](abi_surface.md)), `runtime.rs` (the module-side

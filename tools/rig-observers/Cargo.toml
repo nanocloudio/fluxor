@@ -24,6 +24,8 @@ name = "observe-tls_load"
 path = "src/bin/observe_tls_load.rs"
 
 [dependencies]
+# Base64 from the SDK, the encoder the CLI and modules use.
+fluxor-sdk = { path = "../../crates/fluxor-sdk" }
 # The probes drive raw TCP + TLS so the timing is per-stage and honest — no
 # client library between us and the rig hiding overhead in `Client::new()` or
 # connection-pool bookkeeping. Invalid certs are accepted: the rig fixture's

@@ -5,7 +5,7 @@
 # emits / consumes the `input::midi` contract on `events` ports
 # (output for `in`, input for `out`, both for `duplex`).
 #
-# Contract wire shape: `modules/sdk/contracts/input/midi.rs` —
+# Contract wire shape: `crates/fluxor-abi/src/contracts/input/midi.rs` —
 # pre-decoded 4-byte channel-voice messages.
 #
 # **Implementation status: every variant currently resolves to a

@@ -20,7 +20,7 @@ This document is the storage peer of `av_capability_surface.md` (AV),
 
 ## 1. Canonical surface family
 
-Source: `modules/sdk/contracts/storage/`, `contracts/src/vocabulary.rs`.
+Source: `crates/fluxor-abi/src/contracts/storage/`, `contracts/src/vocabulary.rs`.
 
 Storage pipelines move data on channels typed by `content_type` and
 exchange leased handles through the mesh Handle primitive. Four surfaces
@@ -54,7 +54,7 @@ Event-stream content-type pattern over the mesh Event primitive (§4).
   route multi-volume graphs through `mount`).
 - The four surfaces appear in `capability_surface.md`'s canonical
   taxonomy.
-- The opcode constants live in `modules/sdk/contracts/storage/`
+- The opcode constants live in `crates/fluxor-abi/src/contracts/storage/`
   (`fs.rs`, `namespace.rs`, `object.rs`, plus the kernel-private
   `graph_slot.rs`, `runtime_params.rs`).
 
@@ -321,8 +321,8 @@ to avoid the collision.
 
 ### 1.1 `storage.block` v1
 
-Source: `modules/sdk/contracts/storage/block.rs`; consumer client:
-`modules/sdk/runtime/block.rs`.
+Source: `crates/fluxor-abi/src/contracts/storage/block.rs`; consumer client:
+`crates/fluxor-rt/src/block.rs`.
 
 A block source is the channel wired to a consumer's `blocks` input. A
 consumer port that declares `requires_capability = "storage.block"` must be
@@ -402,7 +402,7 @@ consume the same records and replace only the transport.
 
 ## 2. Fence — the orthogonal axis
 
-Source: `modules/sdk/fence.rs` (exposed as `abi::fence`).
+Source: `crates/fluxor-abi/src/fence.rs` (exposed as `abi::fence`).
 
 Two providers may both satisfy `storage.object` and yet differ wildly in
 what `PUT` means:
@@ -421,7 +421,7 @@ that completes successfully returns the strongest `Fence` it actually
 achieved.
 
 ```rust
-// modules/sdk/fence.rs
+// crates/fluxor-abi/src/fence.rs
 pub enum Fence {
     Volatile,
     LocalDurable      { device_id: DeviceId },
@@ -677,14 +677,14 @@ self-describing artefact, or refuse to run on that volume.
 
 ## 3. Leased mesh Handles
 
-Source: `modules/sdk/contracts/storage/handle.rs`.
+Source: `crates/fluxor-abi/src/contracts/storage/handle.rs`.
 
 Opening a namespace prefix, an object, or an event stream produces a
 *handle*: the value the caller subsequently uses to read, watch, or
 close. Storage handles compose the mesh primitives (`mesh.md`):
 
 ```rust
-// modules/sdk/contracts/storage/handle.rs
+// crates/fluxor-abi/src/contracts/storage/handle.rs
 pub struct StorageHandle {
     pub object: ObjectId,        // mesh primitive #1
     pub kind: HandleKind,        // Object | Namespace | Stream
@@ -727,7 +727,7 @@ Lifecycle rules:
 
 ### 3.1 Presenting a grant to a store
 
-Source: `modules/sdk/contracts/storage/object.rs` (`PRESENT`, `grant`),
+Source: `crates/fluxor-abi/src/contracts/storage/object.rs` (`PRESENT`, `grant`),
 `src/platform/linux/store.rs`.
 
 A module reaches a guarded store through `provider_call`, which has no
@@ -812,7 +812,7 @@ stream-kind handle whose Events carry the `event.log` content type.
 
 `object::PUT` is single-shot — the body fits in a single arg pointer.
 Larger writes compose through four `storage.object` opcodes
-(`modules/sdk/contracts/storage/object.rs`):
+(`crates/fluxor-abi/src/contracts/storage/object.rs`):
 
 ```
 PUT_STREAMED_OPEN   (handle = -1)  →  stream handle
@@ -1070,8 +1070,8 @@ a caller must not conclude a write outlived a power cut.
 
 ### Subscriptions
 
-Source: `modules/sdk/contracts/storage/namespace.rs` (`SUBSCRIBE`,
-`TAKE_RUNG`, `CHANGES` and their codecs), `modules/sdk/cores/table_consumer.rs`
+Source: `crates/fluxor-abi/src/contracts/storage/namespace.rs` (`SUBSCRIBE`,
+`TAKE_RUNG`, `CHANGES` and their codecs), `crates/fluxor-sdk/src/cores/table_consumer.rs`
 (the consumer every table follows), `modules/fixtures/mem_ns` (a provider
 small enough to read whole).
 

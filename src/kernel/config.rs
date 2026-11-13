@@ -9,7 +9,7 @@
 //! consumes the constants from here.
 //!
 //! **Kernel capacity is not ABI.** Nothing here is part of the module ABI, and
-//! nothing under `modules/sdk` restates it: the SDK is hashed into the
+//! nothing in `fluxor-abi` restates it: that crate is hashed into the
 //! ABI-surface digest, so a size stated there would turn raising it into an
 //! ABI epoch and a workspace republish although no module reads it. A module
 //! that needs one of these figures asks the kernel at runtime (the module slot

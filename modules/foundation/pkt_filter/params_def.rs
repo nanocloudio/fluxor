@@ -1,4 +1,3 @@
-use super::SCHEMA_MAX;
 use super::{flows, p_u16, p_u8, FilterState, MAX_RULES};
 
 /// Apply static rule `idx` from its six bytes
@@ -18,7 +17,7 @@ unsafe fn set_rule(s: &mut FilterState, idx: usize, d: *const u8, len: usize) {
     }
 }
 
-define_params! {
+fluxor_rt::define_params! {
     FilterState;
 
     // Static mode: the rules in force (at most eight), and what a frame no

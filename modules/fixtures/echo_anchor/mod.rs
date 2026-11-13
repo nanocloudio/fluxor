@@ -71,20 +71,10 @@
 //!
 //! # Wire format
 //!
-//! See `modules/sdk/contracts/net/session_ctrl.rs` for session control
-//! and `modules/sdk/contracts/net/net_proto.rs` for the stream surface.
+//! See `crates/fluxor-abi/src/contracts/net/session_ctrl.rs` for session control
+//! and `crates/fluxor-abi/src/contracts/net/net_proto.rs` for the stream surface.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 #![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
@@ -96,16 +86,14 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
 // Delivery-cursor admission (§Delivery cursors). The anchor mounts the
 // handoff core for this alone — the blob itself stays opaque to it.
-include!("../../sdk/cores/session_handoff.rs");
+pub use fluxor_sdk::cores::session_handoff::*;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Stream-surface (net_proto) opcodes (subset we use — see net_proto.rs)
@@ -401,9 +389,8 @@ mod params_def {
     use super::p_u16;
     use super::p_u32;
     use super::AnchorState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         AnchorState;
 
         1, listen_port, u16, 9000
@@ -1166,7 +1153,7 @@ unsafe fn enforce_handoff_deadline(s: &mut AnchorState) {
 // Module interface
 // ============================================================================
 
-declare_module_state_bytes!(AnchorState);
+fluxor_rt::declare_module_state_bytes!(AnchorState);
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -1306,6 +1293,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

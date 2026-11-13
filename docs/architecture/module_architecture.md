@@ -363,7 +363,7 @@ symbol, and the module does not link.
 | `f64` arithmetic | does not link | does not link | native | scaled integers (fixed-point) |
 | `a / b`, `a % b` on any integer type, divisor not provably non-zero | does not link | does not link | does not link | a `NonZero*` divisor, or `checked_div` / `checked_rem` |
 | signed `a / b`, `a % b` with zero ruled out | does not link | does not link | does not link | `checked_div` / `checked_rem`, or divide the magnitudes unsigned and restore the sign |
-| `copy_from_slice` with lengths it cannot prove equal | does not link | does not link | does not link | a length the compiler can see, or a `zip` loop |
+| `copy_from_slice` with lengths it cannot prove equal | links; a mismatch **hangs** | links; a mismatch **hangs** | links; a mismatch **hangs** | a length the compiler can see, or a `zip` loop |
 | `split_at` (and other panics that format a message) | does not link | does not link | does not link | `split_at_checked`, `get(..)` |
 | slice index it cannot prove in bounds | links; a miss **hangs** | links; a miss **hangs** | links; a miss **hangs** | `get(..)`, handling the miss |
 
@@ -467,37 +467,39 @@ with the variables it holds (`-C llvm-args=-no-stack-coloring` separates
 slots that share storage). A value built by `new()` and assigned into state is
 staged on the stack first; assigning from a `const` copies it in place.
 
-Module sources include the SDK via the standard pattern:
+A module links three crates, built once per module ABI by `fluxor modules
+build` and passed to every module compile with `--extern`:
 
 ```rust
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
+use fluxor_abi as abi;
 use abi::SyscallTable;
-
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::sha256::*; // only what the module calls
 ```
 
-`modules/sdk/abi.rs` is the assembler for the layered ABI. The
-actual content lives under `modules/sdk/abi/kernel_abi.rs` (core
-primitives), `modules/sdk/contracts/` (portable domain contracts such
-as `hal/`, `net/`, `storage/`, `key_vault.rs`),
-`modules/sdk/internal/` (kernel-private orchestration), and
-`modules/sdk/platform/` (chip-specific raw register bridges). The
-assembler composes them into the `abi` namespace; every opcode lives
-in exactly one layer file and consumers import it by its real path.
-[abi_layers.md](abi_layers.md) is the public reference for the
-layering rules.
+- `fluxor_abi` is the ABI and nothing else: `kernel_abi` (core primitives),
+  `contracts/` (portable domain contracts such as `hal/`, `net/`,
+  `storage/`, `key_vault`), `internal/` (kernel-private orchestration),
+  `platform/` (chip-specific raw register bridges), `wire`, `config` and the
+  generated `registry`. Every opcode lives in exactly one layer file and
+  consumers import it by its real path; it alone is hashed into the
+  ABI-surface digest. [abi_layers.md](abi_layers.md) is the public
+  reference for the layering rules.
+- `fluxor_rt` is the module runtime: the syscall wrappers, the PIC compiler
+  intrinsics, the panic handler, and the macros a module invokes by path —
+  `fluxor_rt::define_params!` (parameter schema and TLV reader),
+  `fluxor_rt::name_table!`, `fluxor_rt::declare_module_state_bytes!` and
+  `fluxor_rt::wasm_entry!()` (the wasm entry glue, at the end of the root).
+- `fluxor_sdk` is library code: crypto, DNSSEC validation, the GPU device
+  model and the cores more than one module runs.
 
-`runtime.rs` contains compiler intrinsics and helper functions every
-PIC module needs. `runtime/params.rs` provides the `define_params!`
-macro and parameter schema encoding. External modules can include the
-same SDK files via a relative path through their checked-out Fluxor
-SDK.
+No module mounts their source with `#[path]` or `include!`; the `sdk-mount`
+hygiene rule refuses it. A module elsewhere links the same crates, built
+from the trees `fluxor sync` stages under `target/fluxor/`.
 
 **Built-in modules** (`builtin = true` in their `manifest.toml`) are
 compiled directly into the kernel binary rather than shipped as
@@ -519,7 +521,7 @@ See [abi_layers.md](abi_layers.md) for the schema, validation rules
 the full module-categories layout. The kernel itself sees only the
 resulting TLV bytes; built-in vs PIC is invisible at the wire layer.
 
-See `src/kernel/module/loader.rs`, `modules/sdk/module.ld`, and
+See `src/kernel/module/loader.rs`, `crates/fluxor-rt/module.ld`, and
 `tools/src/modules.rs` for the loader, linker script, and pack tool.
 
 ### Programs

@@ -34,25 +34,13 @@
 //! - `max_request`: largest read or write accepted, in bytes.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::storage::block::{self as blk, Cpl, Req};
 
@@ -321,9 +309,8 @@ mod params_def {
     use super::p_u32;
     use super::p_u8;
     use super::NbdState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         NbdState;
 
         1, port, u16, 10809
@@ -1534,7 +1521,7 @@ unsafe fn service_net(s: &mut NbdState) {
 
 // ── Module ABI ───────────────────────────────────────────────────────────
 
-declare_module_state_bytes!(NbdState);
+fluxor_rt::declare_module_state_bytes!(NbdState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]

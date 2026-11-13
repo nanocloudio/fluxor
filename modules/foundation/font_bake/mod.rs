@@ -12,27 +12,15 @@
 //! file.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 use core::ptr;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
-include!("../../sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+pub use fluxor_sdk::crypto::sha256::*;
 
 use abi::contracts::glyph_pack as gp;
 use abi::contracts::storage::fs;
@@ -98,8 +86,8 @@ pub struct State {
     diag_len: usize,
 }
 
-declare_module_state_bytes!(State);
-declare_module_arena_bytes!(ARENA_BYTES);
+fluxor_rt::declare_module_state_bytes!(State);
+fluxor_rt::declare_module_arena_bytes!(ARENA_BYTES);
 
 fn copy_param(dst: &mut [u8], len: &mut usize, d: *const u8, n: usize) {
     if n == 0 || n > dst.len() {
@@ -114,7 +102,7 @@ fn copy_param(dst: &mut [u8], len: &mut usize, d: *const u8, n: usize) {
 mod params_def {
     use super::*;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, input, str, 0
@@ -130,7 +118,7 @@ mod params_def {
     }
 }
 
-name_table!(
+fluxor_rt::name_table!(
     OPTION_ERRORS = [
         b"`format` is a glyph pack format: `a8` or `a1`",
         b"`sizes` lists whole pixel sizes, 1 to 1024, separated by commas",
@@ -141,7 +129,7 @@ name_table!(
     ]
 );
 
-name_table!(TABLES = [b"head", b"maxp", b"hhea", b"hmtx", b"loca", b"glyf", b"cmap"]);
+fluxor_rt::name_table!(TABLES = [b"head", b"maxp", b"hhea", b"hmtx", b"loca", b"glyf", b"cmap"]);
 
 fn put(s: &mut State, b: &[u8]) {
     for &c in b {
@@ -471,4 +459,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

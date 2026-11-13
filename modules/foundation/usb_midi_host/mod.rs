@@ -3,7 +3,7 @@
 //! Enumerates a class-compliant USB-MIDI device on a host-mode USB
 //! controller, claims its MIDI Streaming interface, and bridges its
 //! virtual cables to the `input::midi` 4-byte frame surface (see
-//! `modules/sdk/contracts/input/midi.rs`).
+//! `crates/fluxor-abi/src/contracts/input/midi.rs`).
 //!
 //! `mode: in` emits frames on `events_out`; `mode: out` consumes
 //! frames on `events_in`; `mode: duplex` does both. The stack
@@ -37,7 +37,7 @@
 //!      a byte across would put every event one channel low and leave
 //!      notes sounding forever.
 //!
-//! **Params** (declared via `define_params!` below — PIC modules
+//! **Params** (declared via `fluxor_rt::define_params!` below — PIC modules
 //! embed schema in Rust, not TOML `[[params]]`):
 //!
 //!   1. `mode` (enum, default `in`) — `in` | `out` | `duplex`
@@ -47,16 +47,6 @@
 //!      first device claiming the MIDI Streaming class.
 
 #![no_std]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 #![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
@@ -68,12 +58,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // State
@@ -114,9 +102,8 @@ mod params_def {
     use super::p_u8;
     use super::UsbMidiHostState;
     use super::MAX_DEVICE_FILTER;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         UsbMidiHostState;
 
         1, mode, u8, 0, enum { in=0, out=1, duplex=2 }
@@ -139,7 +126,7 @@ mod params_def {
 // Module ABI
 // ============================================================================
 
-declare_module_state_bytes!(UsbMidiHostState);
+fluxor_rt::declare_module_state_bytes!(UsbMidiHostState);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]

@@ -3,7 +3,7 @@
 The input system turns hardware interactions into stable, routable control
 actions without embedding board-specific behaviour in application modules.
 
-Source: `modules/sdk/contracts/input/`, `modules/foundation/gesture/`,
+Source: `crates/fluxor-abi/src/contracts/input/`, `modules/foundation/gesture/`,
 `modules/drivers/button/`.
 
 ## System model
@@ -18,7 +18,7 @@ control channels. Target modules read the FMP messages and act on them.
 The kernel has no concept of "actions": control flow is ordinary
 module-to-module channel traffic.
 
-The contract layer under `modules/sdk/contracts/input/` fixes the wire
+The contract layer under `crates/fluxor-abi/src/contracts/input/` fixes the wire
 shapes: button transitions, pointer, key, gamepad, MIDI and surface-traits
 records each have one stable contract, and every platform's driver for a
 given source produces the same shape. Modules therefore consume actions,

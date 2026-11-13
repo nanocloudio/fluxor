@@ -377,8 +377,8 @@ The kernel does NOT provide:
 |------|-------------|
 | `src/kernel/ipc/event.rs` | Event pool, create/signal/poll/destroy; IRQ binding stored per-event |
 | `src/kernel/ipc/fd.rs` | Tagged fd table, unified `fd_poll`, timer slots and `timer_pump()` |
-| `modules/sdk/abi/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
-| `modules/sdk/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
+| `crates/fluxor-abi/src/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
+| `crates/fluxor-abi/src/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
 | `src/kernel/module/syscalls.rs` | Event contract dispatch |
 | `src/platform/rp/io.rs` | `poll_gpio_edges()` and the per-pin edge bindings (RP) |
 | `src/kernel/exec/scheduler/` | wake handling, `step_woken_modules()` |

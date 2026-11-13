@@ -3,7 +3,7 @@ hardware_targets = ["wasm"]
 builtin = true
 
 # The browser as an HTTP exchange provider: the page's `fetch()` behind the
-# exchange contract (`modules/sdk/contracts/exchange.rs`). Request records
+# exchange contract (`crates/fluxor-abi/src/contracts/exchange.rs`). Request records
 # arrive on `request_in`; each request is collected whole, performed, and
 # answered on `response_out` under its own exchange id — a response HEAD with
 # the status, the content type, the other response header fields and the first

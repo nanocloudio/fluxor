@@ -51,10 +51,10 @@ wire-format break.
 
 ## 2. Payload contracts
 
-Source: `modules/sdk/contracts/input/`. Each file is the wire contract
+Source: `crates/fluxor-abi/src/contracts/input/`. Each file is the wire contract
 its producers and consumers both include, so the two cannot drift.
 
-### `KeyEvents` — `modules/sdk/contracts/input/key.rs`
+### `KeyEvents` — `crates/fluxor-abi/src/contracts/input/key.rs`
 
 Fixed 8-byte frame modelled on the W3C UIEvents `KeyboardEvent` spec:
 
@@ -69,7 +69,7 @@ key on `scan_code` (layout-independent); terminals and text editors
 key on `key_code`. Autorepeat-generated key-downs set the `repeat`
 byte.
 
-### `PointerEvents` — `modules/sdk/contracts/input/pointer.rs`
+### `PointerEvents` — `crates/fluxor-abi/src/contracts/input/pointer.rs`
 
 Fixed 16-byte frame modelled on the W3C Pointer Events spec: one
 unified surface for mouse, touch, and stylus.
@@ -84,7 +84,7 @@ Event kinds: down, up, move, cancel, enter, leave. Coordinates are
 device-pixel integers. `pointer_id` lets multiple pointers coexist on
 one channel.
 
-### `GamepadEvents` — `modules/sdk/contracts/input/gamepad.rs`
+### `GamepadEvents` — `crates/fluxor-abi/src/contracts/input/gamepad.rs`
 
 Fixed 16-byte frame modelled on the W3C Gamepad API: up to 16 digital
 buttons plus up to 4 analogue axes per device, delivered as full state
@@ -92,14 +92,14 @@ snapshots. The canonical producer pattern is one snapshot per step
 when state has changed, plus an idle snapshot roughly every 16 ms so
 consumers can distinguish a held button from a stale channel.
 
-### `MidiEvents` — `modules/sdk/contracts/input/midi.rs`
+### `MidiEvents` — `crates/fluxor-abi/src/contracts/input/midi.rs`
 
 Fixed 4-byte frame carrying pre-decoded MIDI 1.0 channel-voice
 messages: `[event_kind, channel, data1, data2]`. Producers include
 browser Web MIDI, Linux ALSA seq, and class-compliant USB-MIDI hosts;
 symmetric output drivers consume the same shape.
 
-### Button wire — `modules/sdk/contracts/input/button.rs`
+### Button wire — `crates/fluxor-abi/src/contracts/input/button.rs`
 
 One byte per debounced state transition (`0x01` pressed, `0x00`
 released), carried on `OctetStream` so untyped sinks can also tap a
@@ -107,7 +107,7 @@ button stream. Producers emit only debounced transitions, never
 duplicates, so the timing logic (click counting, long-press dwell)
 lives in exactly one place: `modules/foundation/gesture`.
 
-### Action wire — `modules/sdk/contracts/input/action.rs`
+### Action wire — `crates/fluxor-abi/src/contracts/input/action.rs`
 
 A pure conduit for application-chosen semantic verbs. A control
 carries an opaque action id string (`next`, `prev`, `toggle`, or any
@@ -117,7 +117,7 @@ consumer matches the same hash of the same string, so the two sides
 agree without a shared vocabulary table. Fluxor carries no verb
 vocabulary of its own.
 
-### `SurfaceTraits` — `modules/sdk/contracts/input/surface_traits.rs`
+### `SurfaceTraits` — `crates/fluxor-abi/src/contracts/input/surface_traits.rs`
 
 Fixed 24-byte environment-plane record: viewport geometry, derived
 orientation and size class, present input modalities, and audio output

@@ -39,16 +39,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -59,23 +49,15 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ── FS contract opcodes (storage/fs.rs) ─────────────────────────────────────
 const FS_OPEN: u32 = abi::registry::fs::OPEN;
-const FS_READ: u32 = abi::registry::fs::READ;
-const FS_SEEK: u32 = abi::registry::fs::SEEK;
 const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
-const FS_STAT: u32 = abi::registry::fs::STAT;
-const FS_FSYNC: u32 = abi::registry::fs::FSYNC;
-const FS_WRITE: u32 = abi::registry::fs::WRITE;
 const FS_OPENDIR: u32 = abi::registry::fs::OPENDIR;
-const FS_READDIR: u32 = abi::registry::fs::READDIR;
 const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
 const FS_UNLINK: u32 = abi::registry::fs::UNLINK;
 const FS_MKDIR: u32 = abi::registry::fs::MKDIR;
@@ -394,9 +376,8 @@ unsafe fn service_ctl(s: &mut MountState) {
 
 mod params_def {
     use super::MountState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         MountState;
 
         1, mounts, str, 0
@@ -668,7 +649,7 @@ unsafe fn mount_dispatch(
 
 // ── Exported PIC module interface ───────────────────────────────────────────
 
-declare_module_state_bytes!(MountState);
+fluxor_rt::declare_module_state_bytes!(MountState);
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
@@ -817,4 +798,4 @@ pub fn test_apply_ctl(state: *mut u8, msg: &[u8]) {
 }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "host-test")))]
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

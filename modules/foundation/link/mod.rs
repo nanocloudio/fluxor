@@ -27,16 +27,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -47,12 +37,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 mod params_def;
 
@@ -399,7 +387,6 @@ const BEACON_INTERVAL_MS: u64 = 10;
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Init = 0,
-    WaitUart = 1,
     Filling = 2, // RX: filling jitter buffer
     Running = 3,
     Error = 4,
@@ -466,7 +453,7 @@ struct LinkState {
 // PIC Module Interface
 // ============================================================================
 
-declare_module_state_bytes!(LinkState);
+fluxor_rt::declare_module_state_bytes!(LinkState);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -548,7 +535,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         match s.phase {
             Phase::Init => step_init(s),
-            Phase::WaitUart => step_wait_uart(s),
             Phase::Filling => step_filling(s),
             Phase::Running => step_running(s),
             Phase::Error => -1,
@@ -590,10 +576,6 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
     (dev_call)(tx_h, DEV_UART_CONFIGURE, baud_arg.as_mut_ptr(), 4);
 
     dev_log(&*s.syscalls, 3, b"[link] uart ok".as_ptr(), 14);
-    enter_service(s)
-}
-
-unsafe fn step_wait_uart(s: &mut LinkState) -> i32 {
     enter_service(s)
 }
 
@@ -1181,6 +1163,6 @@ pub extern "C" fn module_deferred_ready() -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -39,7 +39,7 @@ pub const STAGE_CAPACITY: usize = 8 * 1024 * 1024;
 
 // The graph-image header: the format `fluxor build --emit=image` writes
 // (tools/src/cli/commands_a.rs::cmd_graph_image) and an RP flash slot
-// holds, defined once in `modules/sdk/platform/rp/flash_layout.rs`
+// holds, defined once in `crates/fluxor-abi/src/platform/rp/flash_layout.rs`
 // (`GRAPH_SLOT_*`). The RAM stage holds the same image unpadded.
 use crate::abi::platform::rp::flash_layout as image_layout;
 const IMAGE_MAGIC: u32 = image_layout::GRAPH_SLOT_MAGIC;

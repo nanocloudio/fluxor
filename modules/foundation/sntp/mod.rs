@@ -7,16 +7,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -27,14 +17,12 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::kernel_abi::{timer, trusted_time as tt};
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
-include!("../../sdk/cores/datagram_endpoint.rs");
+pub use fluxor_rt::datagram_endpoint::*;
+use fluxor_rt::*;
 
 pub const MAX_SERVERS: usize = 4;
 const NTP_PORT: u16 = 123;
@@ -124,10 +112,10 @@ struct State {
 
 mod params_def {
     use super::State;
-    use super::SCHEMA_MAX;
+
     use super::{p_u32, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, server0, u32, 0
@@ -159,7 +147,7 @@ mod params_def {
     }
 }
 
-declare_module_state_bytes!(State);
+fluxor_rt::declare_module_state_bytes!(State);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
@@ -683,4 +671,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -38,17 +38,17 @@ impl PinPlan {
 }
 
 /// Walk up from `start` to the repo root (the dir holding
-/// `modules/sdk/abi_surface.rs`).
+/// `crates/fluxor-abi/src/abi_surface.rs`).
 pub fn repo_root_from(start: &Path) -> Result<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
-        if dir.join("modules/sdk/abi_surface.rs").is_file() {
+        if dir.join("crates/fluxor-abi/src/abi_surface.rs").is_file() {
             return Ok(dir);
         }
         if !dir.pop() {
             return Err(Error::Config(
                 "repo root not found — run from within the fluxor tree (no \
-                 modules/sdk/abi_surface.rs above the start path)"
+                 crates/fluxor-abi/src/abi_surface.rs above the start path)"
                     .into(),
             ));
         }
@@ -58,7 +58,8 @@ pub fn repo_root_from(start: &Path) -> Result<PathBuf> {
 /// True if `repo` carries the ABI-surface sources this pin governs (the fluxor
 /// kernel tree). Downstream projects don't, and skip the gate.
 pub fn has_abi_surface(repo: &Path) -> bool {
-    repo.join("modules/sdk/abi_surface_srcpin.rs").is_file()
+    repo.join("crates/fluxor-abi/src/abi_surface/srcpin.rs")
+        .is_file()
 }
 
 /// Recompute the pin from source and build the expected content of all sites.
@@ -84,7 +85,7 @@ pub fn compute(repo: &Path) -> Result<PinPlan> {
     // tripwire. The harness lock asserts the kernel mount against
     // `ABI_SURFACE_DIGEST` rather than restating the digest, so the tripwire
     // is the only spelled-out copy in the tree.
-    let srcpin_file = repo.join("modules/sdk/abi_surface_srcpin.rs");
+    let srcpin_file = repo.join("crates/fluxor-abi/src/abi_surface/srcpin.rs");
     let hash_file = repo.join("tools/src/hash.rs");
 
     let mut sp = std::fs::read_to_string(&srcpin_file)?;

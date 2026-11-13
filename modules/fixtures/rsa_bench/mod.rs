@@ -32,16 +32,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -52,17 +42,15 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/crypto/sha384.rs");
-include!("../../sdk/crypto/hmac.rs");
-include!("../../sdk/crypto/p256.rs");
-include!("../../sdk/crypto/rsa.rs");
+use fluxor_rt::*;
+pub use fluxor_sdk::crypto::hmac::*;
+pub use fluxor_sdk::crypto::p256::*;
+pub use fluxor_sdk::crypto::rsa::*;
+pub use fluxor_sdk::crypto::sha256::*;
+pub use fluxor_sdk::crypto::sha384::*;
 
 /// Units of preparation per step: doublings and squaring rows alike.
 const PREP_CHUNK: usize = 32;
@@ -389,7 +377,7 @@ unsafe fn advance(s: &mut BenchState) -> bool {
     }
 }
 
-declare_module_state_bytes!(BenchState);
+fluxor_rt::declare_module_state_bytes!(BenchState);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]

@@ -22,25 +22,13 @@
 //! call per step.
 
 #![no_std]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 const FS_CLOSE: u32 = abi::contracts::storage::fs::CLOSE;
 const FS_OPENDIR: u32 = abi::contracts::storage::fs::OPENDIR;
@@ -99,9 +87,8 @@ struct CleanState {
 
 mod params_def {
     use super::CleanState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         CleanState;
 
         // Comma-separated name endings to remove, matched without case.
@@ -252,7 +239,7 @@ unsafe fn take_batch(s: &mut CleanState, n: usize) {
     }
 }
 
-declare_module_state_bytes!(CleanState);
+fluxor_rt::declare_module_state_bytes!(CleanState);
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -414,4 +401,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

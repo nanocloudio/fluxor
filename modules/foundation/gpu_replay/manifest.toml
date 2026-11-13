@@ -3,7 +3,7 @@ hardware_targets = ["bcm2712", "linux", "wasm"]
 
 # Replay GPU provider — the GPU contract with no GPU.
 #
-# It executes the entire contract (`modules/sdk/wire/gpu_wire.rs`): admission,
+# It executes the entire contract (`crates/fluxor-abi/src/contracts/gpu.rs`): admission,
 # opaque generational handles, bounded views, immutable sealing, residency,
 # dependency-ordered fences, candidate-output commit, cancellation, drain and
 # device epochs. What it does not do is run shaders. A dispatch performs a

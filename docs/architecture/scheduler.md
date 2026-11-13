@@ -176,7 +176,7 @@ packed params bytes with the same walk the kernel uses.
 
 ### A workload's environment
 
-Source: `modules/sdk/contracts/workload.rs` (`env`),
+Source: `crates/fluxor-abi/src/contracts/workload.rs` (`env`),
 `src/kernel/workload/workload_graph.rs` (`bind_env`), `tools/src/schema.rs`
 (`env_bind`, `with_env_binds`)
 
@@ -241,7 +241,7 @@ to construct on one that breaks it, rather than truncating or dropping it.
 
 ### Volumes lent to a workload
 
-Source: `modules/sdk/contracts/workload.rs` (`volume`),
+Source: `crates/fluxor-abi/src/contracts/workload.rs` (`volume`),
 `src/platform/linux/owner_root.rs` (`lend`)
 
 A `CREATE` lends a workload a host directory with the Tier-2 entry
@@ -257,7 +257,7 @@ the entry in `CAPS`, and a required entry it does not list fails the
 
 ### A workload's own vault
 
-Source: `modules/sdk/contracts/workload.rs` (`vault`),
+Source: `crates/fluxor-abi/src/contracts/workload.rs` (`vault`),
 `src/platform/linux/owner_root.rs` (`set_vault`),
 `src/kernel/security/key_vault.rs` (`Scope`, `Keeper`)
 
@@ -360,7 +360,7 @@ module-entry domain byte (alongside the domain id bits) so
 
 ## ISR-tier I/O contract
 
-Source: `modules/sdk/internal/bridge.rs`, `src/kernel/exec/isr_tier.rs`
+Source: `crates/fluxor-abi/src/internal/bridge.rs`, `src/kernel/exec/isr_tier.rs`
 
 ISR-tier modules (Tier 1b and Tier 2) communicate with cooperative
 tiers exclusively via bridge rings:

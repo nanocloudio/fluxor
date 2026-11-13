@@ -1036,7 +1036,7 @@ fn main() {
 
     // The module ABI, under the name the module build uses.
     //
-    // `modules/sdk/abi/config.rs` is mounted by BOTH the kernel and every PIC
+    // `crates/fluxor-abi/src/config.rs` is mounted by BOTH the kernel and every PIC
     // module, and its `profile_embedded` block picks connection ceilings and
     // `TARGET_CLASS` by `fluxor_abi`: the RP parts differ by 3.75x and
     // `target_arch` cannot tell thumbv6m from thumbv8m. The kernel's own

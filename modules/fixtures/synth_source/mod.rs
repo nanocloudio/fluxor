@@ -35,16 +35,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -55,12 +45,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -116,10 +104,10 @@ struct SynthState {
 
 mod params_def {
     use super::SynthState;
-    use super::SCHEMA_MAX;
+
     use super::{p_u16, p_u32};
 
-    define_params! {
+    fluxor_rt::define_params! {
         SynthState;
 
         1, size, u32, 0
@@ -143,63 +131,11 @@ mod params_def {
 // Pattern generator
 // ============================================================================
 
-/// Same formula as `fat32::seed_byte_at` so a verifier reading bytes
-/// from either path computes the same expected value.
-#[inline(always)]
-const fn byte_at(off: u32) -> u8 {
-    (off ^ (off >> 8)) as u8
-}
-
-/// Fill `dst[..len]` with the pattern starting at offset `off`.
-///
-/// Generates 8 bytes at a time from the deterministic generator,
-/// then `core::ptr::copy_nonoverlapping`s the trailing bytes. The
-/// underlying formula is per-byte (`byte_at(off + i)`), but
-/// computing 8 bytes via a single u64 shift/xor pattern lets the
-/// CPU's wide ALU stay busy and cuts the per-MSS fill cost from
-/// ~5 µs (the original byte-loop) to under 1 µs on Cortex-A76.
-#[inline(always)]
-unsafe fn fill_pattern(dst: *mut u8, off: u32, len: usize) {
-    // 8-bytes-at-a-time core. We synthesize 8 successive
-    // `byte_at(off + k)` values into a u64 little-endian word, then
-    // store with a single unaligned write. The byte values for the
-    // 8 indices i, i+1, ..., i+7 are
-    //   byte_at(off+i+k) = ((off+i+k) ^ ((off+i+k) >> 8)) as u8
-    // so the high byte (k=7) and low byte (k=0) differ only by
-    // simple arithmetic on `off+i`.
-    let mut i = 0usize;
-    while i + 8 <= len {
-        let p = off.wrapping_add(i as u32);
-        let p0 = (p ^ (p >> 8)) as u64;
-        let p1 = ((p + 1) ^ ((p + 1) >> 8)) as u64;
-        let p2 = ((p + 2) ^ ((p + 2) >> 8)) as u64;
-        let p3 = ((p + 3) ^ ((p + 3) >> 8)) as u64;
-        let p4 = ((p + 4) ^ ((p + 4) >> 8)) as u64;
-        let p5 = ((p + 5) ^ ((p + 5) >> 8)) as u64;
-        let p6 = ((p + 6) ^ ((p + 6) >> 8)) as u64;
-        let p7 = ((p + 7) ^ ((p + 7) >> 8)) as u64;
-        let word = (p0 & 0xFF)
-            | ((p1 & 0xFF) << 8)
-            | ((p2 & 0xFF) << 16)
-            | ((p3 & 0xFF) << 24)
-            | ((p4 & 0xFF) << 32)
-            | ((p5 & 0xFF) << 40)
-            | ((p6 & 0xFF) << 48)
-            | ((p7 & 0xFF) << 56);
-        core::ptr::write_unaligned(dst.add(i) as *mut u64, word);
-        i += 8;
-    }
-    while i < len {
-        *dst.add(i) = byte_at(off.wrapping_add(i as u32));
-        i += 1;
-    }
-}
-
 // ============================================================================
 // Module ABI
 // ============================================================================
 
-declare_module_state_bytes!(SynthState);
+fluxor_rt::declare_module_state_bytes!(SynthState);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -376,4 +312,4 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
     2
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -880,13 +880,13 @@ mod tests {
         // A consumer's `tests/` mount — one level up into target/.
         assert!(lexical_join(
             &root.join("tests"),
-            "../target/fluxor/fluxor-abi/sdk/abi.rs"
+            "../target/fluxor/fluxor-abi/src/lib.rs"
         )
         .starts_with(&staged));
         // wave/spectra's `tests/harness/src/lib.rs` shape — three levels up.
         assert!(lexical_join(
             &root.join("tests/harness/src"),
-            "../../../target/fluxor/fluxor-abi/sdk/abi.rs"
+            "../../../target/fluxor/fluxor-abi/src/lib.rs"
         )
         .starts_with(&staged));
         // fluxor's own `tools/src/hygiene.rs` carries that exact literal
@@ -894,7 +894,7 @@ mod tests {
         // escapes the checkout entirely, so it is not a mount here.
         assert!(!lexical_join(
             &root.join("tools/src"),
-            "../../../target/fluxor/fluxor-abi/sdk/abi.rs"
+            "../../../target/fluxor/fluxor-abi/src/lib.rs"
         )
         .starts_with(&staged));
     }

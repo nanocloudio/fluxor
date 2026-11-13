@@ -117,7 +117,8 @@ impl ConnArena {
         }
     }
 
-    /// Iterate the backed slots.
+    /// Iterate the backed slots, for the host tests' table walks.
+    #[cfg(feature = "host-test")]
     pub fn iter(&self) -> impl Iterator<Item = &tcp::TcpConn> {
         // SAFETY: `i < len()`.
         (0..self.len()).map(move |i| unsafe { &*self.ptr(i) })

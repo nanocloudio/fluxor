@@ -1686,7 +1686,7 @@ pub(crate) fn expand_routes(
     data_section: Option<&Value>,
 ) -> Result<(), String> {
     // The http module's TLV table (`define_params!`, host profile
-    // `http::MAX_ROUTES` in `modules/sdk/abi/config.rs`) carries 8 routes
+    // `http::MAX_ROUTES` in `crates/fluxor-abi/src/config.rs`) carries 8 routes
     // (tags 10..89). A route past that has no TLV tag and would vanish
     // silently at runtime — so overflow is a compile error here, not
     // headroom. Raising the ceiling means extending the module-side TLV

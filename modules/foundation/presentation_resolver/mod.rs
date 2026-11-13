@@ -23,16 +23,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -43,12 +33,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::input::surface_traits as st;
 
@@ -77,9 +65,6 @@ const AFFINITY_CONTENT: u8 = 1; // [Content]
 const AFFINITY_CHROME_CONTENT: u8 = 2; // [Chrome, Content]
 const AFFINITY_CONTENT_CHROME: u8 = 3; // [Content, Chrome]
 
-// Priority codes (match the host `Priority` discriminant order).
-const PRIO_OPTIONAL: u8 = 0;
-const PRIO_STANDARD: u8 = 1;
 const PRIO_ESSENTIAL: u8 = 2;
 
 // Intent flags-byte bit (mirror host INTENT_FLAG_VIRTUAL): a virtual gameplay
@@ -125,10 +110,10 @@ struct State {
 mod params_def {
     use super::p_u32;
     use super::State;
-    use super::SCHEMA_MAX;
-    use super::{parse_intents, MAX_BTN_LEN, MAX_CONTROLS};
 
-    define_params! {
+    use super::parse_intents;
+
+    fluxor_rt::define_params! {
         State;
 
         // Serialized control-intent table (see host `encode_intents`).
@@ -426,7 +411,7 @@ fn encode_layout(s: &State, r: &Resolution, epoch: u32) -> ([u8; OUT_BUF], usize
     (buf, o)
 }
 
-declare_module_state_bytes!(State);
+fluxor_rt::declare_module_state_bytes!(State);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -589,4 +574,4 @@ fn try_emit(s: &mut State, sys: &SyscallTable) -> bool {
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

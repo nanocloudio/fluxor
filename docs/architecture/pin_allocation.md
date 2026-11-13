@@ -168,7 +168,7 @@ pin assignments in the kernel — everything flows from the validated
 config blob.
 
 Modules then access hardware exclusively through HAL contracts
-(`modules/sdk/contracts/hal/`), dispatched via `provider_open` /
+(`crates/fluxor-abi/src/contracts/hal/`), dispatched via `provider_open` /
 `provider_call`; see [abi_layers.md](abi_layers.md) for the contract
 inventory and [hal_architecture.md](hal_architecture.md) for the backend
 model. A module's parameters carry logical references (`spi_bus`,

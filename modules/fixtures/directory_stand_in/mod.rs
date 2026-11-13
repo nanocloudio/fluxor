@@ -4,16 +4,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -24,11 +14,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
+use fluxor_rt::*;
 
 use abi::contracts::net::session_ctrl as sc;
 
@@ -386,7 +375,7 @@ unsafe fn service(s: &mut DirState) {
     }
 }
 
-declare_module_state_bytes!(DirState);
+fluxor_rt::declare_module_state_bytes!(DirState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]

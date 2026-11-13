@@ -38,16 +38,6 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![cfg_attr(not(feature = "host-test"), no_main)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -56,42 +46,40 @@
               does not fire"
 )]
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 // Bound-endpoint bind lifecycle + addressed send, shared with dns / dtls /
 // log_net / transport_buffer. quic keeps its own connection-id demux on the
 // inbound path; the core owns bind + send only.
-include!("../../sdk/cores/datagram_endpoint.rs");
-include!("../../sdk/cores/ticket_replay.rs");
+pub use fluxor_rt::datagram_endpoint::*;
+include!("ticket_replay.rs");
 // Windowed 1-RTT send packet-number reservation with epoch fencing
 //: QUIC is this core's first on-wire-sequence consumer.
-include!("../../sdk/cores/nonce_reservation.rs");
+pub use fluxor_sdk::cores::nonce_reservation::*;
 // CRC32 chunking reused for continuity checkpoint chunks.
-include!("../../sdk/cores/session_handoff.rs");
-include!("../../sdk/wire/varint.rs");
+use fluxor_abi::wire::varint::*;
+pub use fluxor_sdk::cores::session_handoff::*;
 
 // Crypto primitives (also used by tls/dtls modules — duplicated PIC
 // inclusion is the convention since each module compiles standalone).
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/crypto/sha384.rs");
-include!("../../sdk/crypto/hmac.rs");
-include!("../../sdk/crypto/aes_gcm.rs");
+pub use fluxor_sdk::crypto::aes_gcm::*;
+pub use fluxor_sdk::crypto::hmac::*;
+pub use fluxor_sdk::crypto::sha256::*;
+pub use fluxor_sdk::crypto::sha384::*;
 // Routable connection IDs (`cores/cid_route.rs`).
-include!("../../sdk/cores/cid_route.rs");
-include!("../../sdk/crypto/chacha20.rs");
-include!("../../sdk/crypto/p256.rs");
-include!("../../sdk/crypto/p384.rs");
-include!("../../sdk/crypto/sha3.rs");
+include!("cid_route.rs");
+pub use fluxor_sdk::crypto::chacha20::*;
+pub use fluxor_sdk::crypto::p256::*;
+pub use fluxor_sdk::crypto::p384::*;
+pub use fluxor_sdk::crypto::sha3::*;
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; x509.rs needs ml_dsa.rs for
 // post-quantum certificate suites. Order matters for all three.
-include!("../../sdk/crypto/ml_dsa.rs");
-include!("../../sdk/crypto/rsa.rs");
+pub use fluxor_sdk::crypto::ml_dsa::*;
+pub use fluxor_sdk::crypto::rsa::*;
 // The handshake driver carries the X25519 ladder every transport shares.
-include!("../../sdk/crypto/ed25519.rs");
+pub use fluxor_sdk::crypto::ed25519::*;
 // The TLS driver mounted below steps Ed25519 with this job.
 include!("../tls/ed25519_job.rs");
 
@@ -235,7 +223,7 @@ const MAX_TICKETS: usize = 4;
 /// survives a re-instantiation and would let the replacement re-open every
 /// ticket its predecessor had already spent (RFC 8446 §8, RFC 9001 §9.2).
 const TICKET_AAD: &[u8] = b"quic-ticket";
-name_table!(TICKET_LABEL = [b"quic-resume-0", b"quic-resume-1"]);
+fluxor_rt::name_table!(TICKET_LABEL = [b"quic-resume-0", b"quic-resume-1"]);
 /// `TICKET_AAD` + parity + this instance's replay domain. Derived from the
 /// label rather than written out, so changing the label cannot leave a
 /// stale length behind that still compiles.
@@ -519,7 +507,7 @@ pub(crate) struct QuicState {
     disable_migration: u8,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     QuicState;
 
     1, port, u16, 4443
@@ -807,14 +795,14 @@ fn authority_of(s: &QuicState) -> &[u8] {
     &s.authority[..s.authority_len as usize]
 }
 
-declare_module_state_bytes!(QuicState);
+fluxor_rt::declare_module_state_bytes!(QuicState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<QuicState>() as u32
 }
 
-declare_module_arena_bytes!(65536);
+fluxor_rt::declare_module_arena_bytes!(65536);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_arena_size() -> u32 {
@@ -4042,20 +4030,6 @@ unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 16], port: u16) -
     None
 }
 
-fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 #[cfg(feature = "host-test")]
 pub mod test_helpers {
     //! Helpers for host-side test harnesses. Not compiled into PIC firmware
@@ -5452,6 +5426,6 @@ pub mod test_helpers {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

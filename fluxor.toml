@@ -16,7 +16,7 @@ runtimes = ["fluxor-linux", "wasm32-unknown-unknown/fluxor.wasm"]
 
 [required]
 # Wire-ABI pin checked by `fluxor ci`'s version-skew phase: it equals
-# `modules/sdk/wire/wire.rs::ABI_VERSION`, the module-header /
+# `crates/fluxor-abi/src/wire.rs::ABI_VERSION`, the module-header /
 # channel-hint / contract-id layout. The running CLI's compiled-in ABI
 # must equal this value.
 fluxor = { abi = 1 }
@@ -118,25 +118,48 @@ dir = "examples"
 
 # Workspace-lints opt-in: every workspace member declares
 # `[lints] workspace = true`, or is listed under `[[ci.lints.exemption]]`
-# (`crate`, `reason`). None is exempt.
+# (`crate`, `reason`).
+
+[[ci.lints.exemption]]
+crate = "fluxor-abi"
+reason = """A crate every module links: the tree is also published and staged in other projects, where there is \
+no fluxor workspace to inherit from, so it states the workspace's lint tables \
+itself; tools/tests/module_crates_lint_as_the_workspace.rs holds them equal."""
+
+[[ci.lints.exemption]]
+crate = "fluxor-sdk"
+reason = """A crate every module links: the tree is also published and staged in other projects, where there is \
+no fluxor workspace to inherit from, so it states the workspace's lint tables \
+itself; tools/tests/module_crates_lint_as_the_workspace.rs holds them equal."""
+
+[[ci.lints.exemption]]
+crate = "fluxor-rt"
+reason = """A crate every module links: the tree is also published and staged in other projects, where there is \
+no fluxor workspace to inherit from, so it states the workspace's lint tables \
+itself; tools/tests/module_crates_lint_as_the_workspace.rs holds them equal."""
 
 # Crate-root `#![allow(...)]` is banned. Each row below declares a prefix
 # where it is permitted and the reason it is. A file outside these prefixes
 # fails the gate.
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/"
-reason = """PIC modules mount the whole of modules/sdk/* via include!, so every \
-module's compile sees the entire ABI surface while using a subset, and the \
-unreachable_patterns arms are deliberate defensive branches guarding against a \
-new variant slipping past the error path. The first is the SDK's textual \
-mounting showing through: it is a property of how a PIC module is built, not of \
-any one module."""
+reason = """PIC module roots relax unreachable_patterns: the `_ => Error` arms \
+in exhaustive state-machine matches are deliberate defensive branches guarding \
+against a new variant slipping past the error path, and the lint fires exactly \
+because the match is exhaustive."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "crates/fluxor-sdk/"
-reason = """The cargo-shaped façade over modules/sdk/*: it mounts the whole tree \
-so every #[path] consumer agrees on one surface, and consumers use a subset. \
-Same cause as modules/, same fix."""
+reason = """The SDK's crypto and cores read and write caller buffers by pointer \
+and parse records in place: unsafe_code is what the crate is, not an exception \
+within it."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "crates/fluxor-rt/"
+reason = """The module runtime is the module side of the syscall table — raw \
+pointers in, raw pointers out — so unsafe_code is what it is; and every one of \
+its unsafe fns has the one contract its crate docs state once, so \
+missing_safety_doc is relaxed in favour of that statement."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "src/"
@@ -157,8 +180,7 @@ one."""
 prefix = "crates/fluxor-abi/"
 reason = """The ABI surface is raw register addresses, pointer-based syscall types \
 and chip-specific BAR maps: unsafe_code is what the crate IS, not an exception \
-within it. It also mounts modules/sdk/* and so carries the same dead_code cause \
-as modules/."""
+within it."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "crates/fluxor-launcher/"

@@ -20,6 +20,8 @@ use std::time::SystemTime;
 use crate::error::{Error, Result};
 use crate::modules::{pack_fmod, pack_fmod_wasm};
 
+mod sdk_rlibs;
+
 /// Per-ABI compile recipe — target triple, extra rustflags, and linker
 /// invocation. One recipe per buildable module ABI
 /// (`crate::runtime_abi::ABIS`); every runtime that loads the ABI loads
@@ -70,7 +72,7 @@ const ABI_SPECS: &[AbiSpec] = &[
     AbiSpec {
         abi_id: "aarch64",
         // The ABI floor: AES + SHA2 + NEON, so the inline-asm crypto
-        // paths in `modules/sdk/crypto/aes_gcm.rs` activate.
+        // paths in `crates/fluxor-sdk/src/crypto/aes_gcm.rs` activate.
         //
         // `-strict-align`: `aarch64-unknown-none` assumes the MMU may be
         // off, where every access is Device memory and an unaligned one
@@ -808,6 +810,21 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
         jobs.push((cand, target, spec, rmeta));
     }
 
+    // The crates the modules link, once per ABI the jobs need. Built
+    // strictly: a warning in them is a warning in every module.
+    let mut sdks: std::collections::BTreeMap<&str, sdk_rlibs::SdkLibs> = Default::default();
+    for (_, _, spec, _) in &jobs {
+        if !sdks.contains_key(spec.abi_id) {
+            let libs = sdk_rlibs::ensure(
+                project_root,
+                &project_root.join("target/fluxor"),
+                spec,
+                true,
+                verbose,
+            )?;
+            sdks.insert(spec.abi_id, libs);
+        }
+    }
     let results = parallel_map(&jobs, |(cand, target, spec, rmeta)| {
         if verbose {
             eprintln!("[modules] clippy-driver {} ({target})", cand.name);
@@ -827,6 +844,7 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
             .args(spec.extra_rustflags)
             .args(cfg_abi_args(spec))
             .args(cfg_feature_args(cand))
+            .args(sdks[spec.abi_id].extern_args())
             .arg("-A")
             .arg("clippy::empty_loop")
             .arg("-D")
@@ -983,6 +1001,19 @@ fn build_one_target(
     // Per-item progress, so a multi-minute build is not silent. On a terminal
     // this redraws in place; piped to a log it emits one line per module,
     // because a log full of carriage returns is worse than no progress.
+    // The crates every module links, built (or found current) once for the
+    // target's ABI before any module compiles against them.
+    let sdk = if pending.is_empty() {
+        None
+    } else {
+        Some(sdk_rlibs::ensure(
+            &opts.project_root,
+            &opts.out_root,
+            spec,
+            opts.strict,
+            opts.verbose,
+        )?)
+    };
     let total = pending.len();
     let done = std::sync::atomic::AtomicUsize::new(0);
     let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -993,10 +1024,11 @@ fn build_one_target(
         } else if opts.verbose {
             eprintln!("     [{n:>3}/{total}] {target} {}", cand.name);
         }
+        let sdk = sdk.as_ref().expect("built above for a non-empty batch");
         let r = if spec.linker.is_none() {
-            compile_module_wasm(cand, spec, &out_dir, opts)
+            compile_module_wasm(cand, spec, &out_dir, opts, sdk)
         } else {
-            compile_module_pic(cand, spec, &out_dir, opts)
+            compile_module_pic(cand, spec, &out_dir, opts, sdk)
         };
         (cand.name.clone(), out_path.clone(), r)
     });
@@ -1095,21 +1127,12 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 /// same question answered about a different artefact. Keeping one walk means
 /// a sweep cannot disagree with the build about what "unchanged" means.
 fn sources_older_than(cand: &Candidate, stamp: SystemTime, project_root: &Path) -> bool {
-    let inputs = [
-        cand.manifest.clone(),
-        project_root.join("modules/sdk/abi.rs"),
-        project_root.join("modules/sdk/runtime.rs"),
-        project_root.join("modules/sdk/runtime/params.rs"),
-        // Linker script. Lives under modules/sdk/ so it ships in the
-        // fluxor-abi source artifact for downstream consumers.
-        project_root.join("modules/sdk/module.ld"),
-    ];
-    for input in &inputs {
-        if let Some(im) = mtime(input) {
-            if im > stamp {
-                return false;
-            }
-        }
+    if mtime(&cand.manifest).is_some_and(|m| m > stamp) {
+        return false;
+    }
+    // The crates every module links, `module.ld` among them.
+    if sdk_rlibs::newest_source(project_root).is_some_and(|m| m > stamp) {
+        return false;
     }
     // Source tree under the module dir — any .rs newer than the artefact
     // invalidates it.
@@ -1488,6 +1511,7 @@ fn compile_module_pic(
     spec: &AbiSpec,
     out_dir: &Path,
     opts: &BuildOpts,
+    sdk: &sdk_rlibs::SdkLibs,
 ) -> Result<BuildOutcome> {
     let obj_path = out_dir.join(format!("{}.o", cand.name));
     let asm_path = out_dir.join(format!("{}.s", cand.name));
@@ -1515,7 +1539,8 @@ fn compile_module_pic(
         .arg(format!("relocation-model={PIC_RELOCATION_MODEL}"))
         .args(spec.extra_rustflags)
         .args(cfg_abi_args(spec))
-        .args(cfg_feature_args(cand));
+        .args(cfg_feature_args(cand))
+        .args(sdk.extern_args());
     if opts.strict {
         // `-D warnings` upgrades unfulfilled `#[expect(...)]` and
         // every other warning into a hard error, which is what a
@@ -1555,7 +1580,11 @@ fn compile_module_pic(
     // each of these is an artefact that reads a wrong address at run time.
     relocation_refusals(&obj)?.into_result(&cand.name)?;
 
-    let stack = measure_stack(&asm_path, spec.module_target);
+    // The walk reads the module and the crates it links as one call graph:
+    // the module's own assembly calls into them by name.
+    let mut asm_set = vec![asm_path.clone()];
+    asm_set.extend(sdk.asm().iter().cloned());
+    let stack = measure_stack(&asm_set, spec.module_target);
     // The object is what links; the assembly has been read.
     let _ = std::fs::remove_file(&asm_path);
     let measured_stack = match stack {
@@ -1594,9 +1623,15 @@ fn compile_module_pic(
         .arg("--gc-sections")
         .arg("--no-undefined")
         .arg("--undefined=module_arena_size")
+        // The runtime's ABI attestation: rooting it keeps the runtime's
+        // object (its panic handler and intrinsics) in every module.
+        .arg("--undefined=FLUXOR_ABI_SURFACE")
         .arg("-o")
         .arg(&elf_path)
-        .arg(&obj_path);
+        .arg(&obj_path)
+        .arg("--start-group")
+        .args(sdk.rlibs())
+        .arg("--end-group");
     if opts.verbose {
         eprintln!("[modules] link  {cand_name}", cand_name = cand.name);
     }
@@ -1624,14 +1659,20 @@ fn compile_module_pic(
 /// wrote. `Err` says why the call graph has no bound (recursion, a frame
 /// sized at run time); such a module must declare its depth.
 fn measure_stack(
-    asm_path: &Path,
+    asm_paths: &[PathBuf],
     triple: &str,
 ) -> std::result::Result<crate::stack_depth::Depth, String> {
     let isa = crate::stack_depth::Isa::for_target(triple)
         .ok_or_else(|| format!("no stack reading for {triple}"))?;
-    let asm =
-        std::fs::read_to_string(asm_path).map_err(|e| format!("{}: {e}", asm_path.display()))?;
-    let roots = crate::stack_depth::entry_points(&asm);
+    let mut asm = String::new();
+    for p in asm_paths {
+        asm.push_str(&std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?);
+        asm.push('\n');
+    }
+    // Entry points are the module's own: the first file.
+    let module_asm = std::fs::read_to_string(&asm_paths[0])
+        .map_err(|e| format!("{}: {e}", asm_paths[0].display()))?;
+    let roots = crate::stack_depth::entry_points(&module_asm);
     let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
     crate::stack_depth::worst_case(&asm, isa, &roots)
 }
@@ -2017,6 +2058,7 @@ fn compile_module_wasm(
     spec: &AbiSpec,
     out_dir: &Path,
     opts: &BuildOpts,
+    sdk: &sdk_rlibs::SdkLibs,
 ) -> Result<BuildOutcome> {
     let wasm_path = out_dir.join(format!("{}.wasm", cand.name));
     let out_path = out_dir.join(format!("{}.fmod", cand.name));
@@ -2045,7 +2087,10 @@ fn compile_module_wasm(
             .arg("-C")
             .arg(format!("target-feature={}", plus.join(",")));
     }
-    rustc.args(cfg_abi_args(spec)).args(cfg_feature_args(cand));
+    rustc
+        .args(cfg_abi_args(spec))
+        .args(cfg_feature_args(cand))
+        .args(sdk.extern_args());
     if opts.strict {
         rustc.arg("-D").arg("warnings");
     } else {
@@ -2114,30 +2159,10 @@ fn pick_linker_script(cand: &Candidate, project_root: &Path) -> PathBuf {
     if local.exists() {
         return local;
     }
-    // 2. Project-local default at `modules/sdk/module.ld` — shipped in
-    //    the `fluxor-abi` source artifact (`sdk/**`). Also accept
-    //    `modules/module.ld` as a fallback location.
-    for cand_path in [
-        project_root.join("modules/sdk/module.ld"),
-        project_root.join("modules/module.ld"),
-    ] {
-        if cand_path.exists() {
-            return cand_path;
-        }
-    }
-    // 3. Downstream consumers materialise fluxor's SDK source into
-    //    `target/fluxor/fluxor-abi/sdk/` via `fluxor sync`. Pick that
-    //    up so PIC builds in a downstream project find the script
-    //    without an explicit copy.
-    {
-        let cand_path = project_root.join("target/fluxor/fluxor-abi/sdk/module.ld");
-        if cand_path.exists() {
-            return cand_path;
-        }
-    }
-    // Fall back to a conventional path so the error message points at
-    // the familiar location.
-    project_root.join("modules/module.ld")
+    // 2. The runtime's, from `crates/fluxor-rt` here or the synced tree in
+    //    any other project. Absent both, the conventional path, so the
+    //    link error names a place to look.
+    sdk_rlibs::module_ld(project_root).unwrap_or_else(|| project_root.join("modules/module.ld"))
 }
 
 /// Run a compile or link step, capturing its diagnostics into the error.
@@ -2775,7 +2800,17 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
                 strict,
                 verbose: false,
             };
-            let err = match compile_module_pic(&cand, spec, dir.path(), &opts) {
+            // The crates a module links, cached across runs: the stamp keeps
+            // them current.
+            let sdk = sdk_rlibs::ensure(
+                &repo_root(),
+                &repo_root().join("target/fluxor-tests"),
+                spec,
+                true,
+                false,
+            )
+            .expect("the crates build");
+            let err = match compile_module_pic(&cand, spec, dir.path(), &opts, &sdk) {
                 Ok(_) => panic!("strict={strict}: a writable static built"),
                 Err(e) => e.to_string(),
             };

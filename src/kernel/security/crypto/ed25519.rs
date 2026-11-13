@@ -507,7 +507,7 @@ fn is_small_order(p: &Point) -> bool {
 /// Verify a 64-byte signature `R ‖ S` over `msg` (RFC 8032 §5.1.7, the
 /// unbatched equation [S]B = R + [k]A). Variable-time: every input is
 /// public. Strict, with the same rules as the SDK verifier
-/// (`modules/sdk/crypto/ed25519.rs`), so a signature verifies in the kernel
+/// (`crates/fluxor-sdk/src/crypto/ed25519.rs`), so a signature verifies in the kernel
 /// exactly when it verifies in a module. It is refused when:
 ///   - S ≥ L (a second encoding of the same signature),
 ///   - A's y is not canonical (≥ p), A is off the curve, or A encodes x = 0

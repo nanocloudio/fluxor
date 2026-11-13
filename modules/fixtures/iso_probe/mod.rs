@@ -31,16 +31,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -51,12 +41,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Module State
@@ -88,10 +76,10 @@ struct IsoProbeState {
     window_size: u32,
 }
 
-declare_module_state_bytes!(IsoProbeState);
+fluxor_rt::declare_module_state_bytes!(IsoProbeState);
 // The recursion in `overflow` has no bound the build can measure; this is
 // the stack every other mode needs, which `overflow` then runs past.
-declare_module_stack_bytes!(512);
+fluxor_rt::declare_module_stack_bytes!(512);
 
 const SENTINEL_MAGIC: u32 = 0x5130_B0E0; // "iso probe"
 
@@ -107,9 +95,8 @@ mod params_def {
     use super::p_u16;
     use super::p_u8;
     use super::IsoProbeState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         IsoProbeState;
 
         1, mode, u8, 0,
@@ -356,4 +343,4 @@ fn deeper(n: u32) -> u32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

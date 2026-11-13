@@ -1,7 +1,7 @@
 //! mem_ns — RAM-backed `storage.namespace` fixture provider.
 //!
 //! The contract-proving provider for the namespace surface
-//! (`modules/sdk/contracts/storage/namespace.rs`), and the implementor of
+//! (`crates/fluxor-abi/src/contracts/storage/namespace.rs`), and the implementor of
 //! `BIND` that proves it. Exists so the surface — and the
 //! `mount` routing tier above it — is testable with **no on-disk
 //! format in the loop**: a repo that owns a contract holds an in-repo
@@ -48,16 +48,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -68,13 +58,12 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
+use fluxor_rt::*;
 
-// Namespace contract opcodes (modules/sdk/contracts/storage/namespace.rs).
+// Namespace contract opcodes (crates/fluxor-abi/src/contracts/storage/namespace.rs).
 const NS_LOOKUP: u32 = abi::registry::storage_namespace::LOOKUP;
 const NS_STAT: u32 = abi::registry::storage_namespace::STAT;
 const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
@@ -235,7 +224,7 @@ struct MemNsState {
     log_len: u16,
 }
 
-declare_module_state_bytes!(MemNsState);
+fluxor_rt::declare_module_state_bytes!(MemNsState);
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
@@ -1161,4 +1150,4 @@ pub unsafe extern "C" fn mem_ns_dispatch(
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

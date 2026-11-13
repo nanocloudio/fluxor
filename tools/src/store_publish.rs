@@ -18,9 +18,8 @@ use std::collections::BTreeMap;
 
 /// Walk a directory into sorted `(rel_path, bytes)` pairs, skipping
 /// VCS/build residue. The optional `prefix` maps the tree under a path
-/// prefix in the artifact (e.g. `modules/sdk/**` shipped as `sdk/**`,
-/// preserving the extraction contract
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`). The walked trees are real
+/// prefix in the artifact (e.g. `contracts/src/**` shipped as `src/**`).
+/// The walked trees are real
 /// directories — no symlink dereference is needed. The result
 /// satisfies `canonical_tar`'s ordering contract and reproduces the
 /// shape `fluxor sync` extracts.
@@ -85,9 +84,9 @@ pub(crate) fn input_digest_hex(files: &[(String, Vec<u8>)]) -> String {
 /// Token-canonical content digest of a MATERIALISED source tree, computed
 /// the same way `input_digest_hex` computes a publisher's.
 ///
-/// The publish side walks `modules/sdk` under the `sdk` tar prefix; the
-/// consumer side walks the extracted `target/fluxor/fluxor-abi/`, whose
-/// entries already carry that prefix. Both therefore present the same
+/// The publish side walks the published tree under its tar prefix, if
+/// any; the consumer side walks the extracted `target/fluxor/<name>/`,
+/// whose entries already carry that prefix. Both therefore present the same
 /// `(rel_path, bytes)` set, so the two digests are equal exactly when the
 /// extracted tree still holds the bytes that were published. Dotfiles are
 /// skipped by `collect_tree`, so the stamp does not hash itself.
@@ -120,20 +119,21 @@ fn read_ci_stamp(project_root: &Path) -> BTreeMap<String, String> {
 }
 
 /// Source-artifact candidates for a project, as
-/// `(name, dir, tar prefix)`. Fluxor publishes `fluxor-abi` =
-/// `modules/sdk/**` under a `sdk/` prefix (extraction to
-/// `target/fluxor/fluxor-abi/` preserves the `#[path]` mount contract
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`) and `fluxor-contracts` =
-/// `contracts/src/**` under `src/`. A sibling publishes
-/// `modules/common/**` as `<project>-common`, unprefixed. No crate
-/// facades ship — consumers mount staged source, never cargo-link.
+/// `(name, dir, tar prefix)`. Fluxor publishes the three crates every
+/// module links — `fluxor-abi`, `fluxor-sdk`, `fluxor-rt`, each its
+/// `crates/<name>` tree unprefixed, so `fluxor sync` stages it at
+/// `target/fluxor/<name>/` where the module build compiles it to an rlib —
+/// and `fluxor-contracts` = `contracts/src/**` under `src/`. A sibling
+/// publishes `modules/common/**` as `<project>-common`, unprefixed.
 fn source_candidates(
     pr: &Path,
     project_name: &str,
 ) -> Vec<(String, PathBuf, Option<&'static str>)> {
     if project_name == "fluxor" {
         [
-            ("fluxor-abi", pr.join("modules/sdk"), Some("sdk")),
+            ("fluxor-abi", pr.join("crates/fluxor-abi"), None),
+            ("fluxor-sdk", pr.join("crates/fluxor-sdk"), None),
+            ("fluxor-rt", pr.join("crates/fluxor-rt"), None),
             ("fluxor-contracts", pr.join("contracts/src"), Some("src")),
         ]
         .into_iter()
@@ -339,9 +339,10 @@ pub fn publish_project_into(
         (input_hex.map(str::to_string), ci_hex)
     };
 
-    // Source trees: fluxor publishes `fluxor-abi` (modules/sdk/** under
-    // `sdk/`) and `fluxor-contracts` (contracts/src/** under `src/`);
-    // siblings publish modules/common/** as `<name>-common`.
+    // Source trees: fluxor publishes `fluxor-abi`, `fluxor-sdk` and
+    // `fluxor-rt` (each its `crates/` tree) and `fluxor-contracts`
+    // (contracts/src/** under `src/`); siblings publish modules/common/**
+    // as `<name>-common`.
     if want("source") {
         for (name, dir, prefix) in source_candidates(&pr, &identity.name) {
             let files = collect_tree(&dir, prefix)?;
@@ -1322,24 +1323,22 @@ mod tests {
         assert_eq!(&tar[257..262], b"ustar");
     }
 
-    /// Fluxor's source artifacts follow the decided convention:
-    /// `fluxor-abi` = modules/sdk/** under a `sdk/` tar prefix (so
-    /// extraction to `target/fluxor/fluxor-abi/` preserves the mount
-    /// contract `…/fluxor-abi/sdk/abi.rs`), `fluxor-contracts` =
-    /// contracts/src/** under `src/`, and no `fluxor-sdk` crate-facade
-    /// artifact ships.
+    /// Fluxor publishes the three module crates as their own trees,
+    /// unprefixed, and `fluxor-contracts` = contracts/src/** under `src/`.
     #[test]
-    fn fluxor_publishes_abi_and_contracts_with_path_prefixes() {
+    fn fluxor_publishes_the_module_crates_and_contracts() {
         let scratch = tempfile::tempdir().unwrap();
         let pr = scratch.path().join("fluxor");
-        std::fs::create_dir_all(pr.join("modules/sdk")).unwrap();
+        for c in ["fluxor-abi", "fluxor-sdk", "fluxor-rt"] {
+            std::fs::create_dir_all(pr.join("crates").join(c).join("src")).unwrap();
+            std::fs::write(pr.join("crates").join(c).join("src/lib.rs"), "#![no_std]\n").unwrap();
+        }
         std::fs::create_dir_all(pr.join("contracts/src")).unwrap();
         std::fs::write(
             pr.join("fluxor.toml"),
             "[project]\nname = \"fluxor\"\nversion = \"0.0.1\"\n",
         )
         .unwrap();
-        std::fs::write(pr.join("modules/sdk/abi.rs"), "pub struct SyscallTable;\n").unwrap();
         std::fs::write(pr.join("contracts/src/lib.rs"), "pub mod contracts {}\n").unwrap();
 
         let store_dir = scratch.path().join("store");
@@ -1348,18 +1347,16 @@ mod tests {
         let tags = publish_project_to_store(&pr, &["source"], false).unwrap();
         std::env::remove_var("FLUXOR_STORE");
 
-        assert!(
-            tags.iter().any(|t| t == "fluxor/src/fluxor-abi:latest"),
-            "{tags:?}"
-        );
+        for c in ["fluxor-abi", "fluxor-sdk", "fluxor-rt"] {
+            assert!(
+                tags.iter().any(|t| *t == format!("fluxor/src/{c}:latest")),
+                "{c}: {tags:?}"
+            );
+        }
         assert!(
             tags.iter()
                 .any(|t| t == "fluxor/src/fluxor-contracts:latest"),
             "{tags:?}"
-        );
-        assert!(
-            !tags.iter().any(|t| t.contains("fluxor-sdk")),
-            "the fluxor-sdk artifact was dropped: {tags:?}"
         );
 
         let store = crate::oci_store::OciStore::open(&store_dir).unwrap();
@@ -1374,7 +1371,7 @@ mod tests {
         };
         assert_eq!(
             first_entry_name("fluxor/src/fluxor-abi:latest"),
-            "sdk/abi.rs"
+            "src/lib.rs"
         );
         assert_eq!(
             first_entry_name("fluxor/src/fluxor-contracts:latest"),

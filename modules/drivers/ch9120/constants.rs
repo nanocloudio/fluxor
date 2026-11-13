@@ -11,7 +11,6 @@ pub const CMD_PREFIX: [u8; 2] = [0x57, 0xAB];
 
 // Configuration command codes (sent after CMD_PREFIX)
 pub const CMD_GET_VERSION: u8 = 0x01;
-pub const CMD_RESET: u8 = 0x02;
 pub const CMD_SET_MODE: u8 = 0x10; // arg: 1 byte (0-3)
 pub const CMD_SET_LOCAL_IP: u8 = 0x11; // arg: 4 bytes
 pub const CMD_SET_SUBNET: u8 = 0x12; // arg: 4 bytes
@@ -29,9 +28,7 @@ pub const CMD_EXEC: u8 = 0x0E; // Execute config and soft-reset
 // ============================================================================
 
 pub const MODE_TCP_SERVER: u8 = 0;
-pub const MODE_TCP_CLIENT: u8 = 1;
 pub const MODE_UDP_SERVER: u8 = 2;
-pub const MODE_UDP_CLIENT: u8 = 3;
 
 // ============================================================================
 // HAL_UART contract opcodes
@@ -57,8 +54,6 @@ pub const DEV_UART_POLL: u32 = super::abi::registry::uart::POLL;
 pub const RESET_PULSE_MS: u64 = 50;
 /// Wait after releasing reset before entering config mode.
 pub const RESET_SETTLE_MS: u64 = 200;
-/// Configuration mode baud rate (fixed by CH9120 datasheet).
-pub const CONFIG_BAUD: u32 = 9600;
 
 // ============================================================================
 // Buffer Sizes

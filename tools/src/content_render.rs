@@ -70,7 +70,7 @@ pub fn icon_code(icon: Icon) -> u8 {
 }
 
 /// FNV-1a 32-bit hash — the verb-hash form the on-device `msg_write_empty` /
-/// `bank` consume (mirrors `modules/sdk/runtime.rs::fnv1a`).
+/// `bank` consume (mirrors `crates/fluxor-rt/src/lib.rs::fnv1a`).
 pub fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in bytes {
@@ -299,11 +299,9 @@ fn draw_play(fb: &mut [u16], stride: u16, ox: u16, oy: u16, w: u16, h: u16, flip
 
 // ── Bitmap text (5×7 glyphs) ─────────────────────────────────────────
 //
-// The font itself lives in `modules/sdk/assets/font5x7.rs` (no_std-safe) and is shared
-// verbatim with the on-device `content_controls` module via `include!`, so the
-// two can never drift. It defines `glyph` / `draw_glyph` / `draw_text` +
-// `GLYPH_W` / `GLYPH_H`.
-include!("../../modules/sdk/assets/font5x7.rs");
+// The font is the SDK's (`fluxor_sdk::assets::font5x7`), the same one the
+// on-device `content_controls` module links, so the two cannot drift.
+pub use fluxor_sdk::assets::font5x7::*;
 
 /// Hit-test a point against the laid-out rects → control index.
 pub fn hit_test(rects: &[Rect], x: u16, y: u16) -> Option<usize> {

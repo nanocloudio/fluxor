@@ -1,6 +1,6 @@
 //! The agent protocol's semantics: one request and its answer between a
 //! controller and a target's node agent. The records are
-//! `modules/sdk/contracts/agent.rs`; the rules are
+//! `crates/fluxor-abi/src/contracts/agent.rs`; the rules are
 //! `docs/architecture/agent_protocol.md`.
 //!
 //! [`handle`] takes a record and the peer its transport vouches for and answers
@@ -22,12 +22,9 @@ use crate::node_agent::{
     AgentError, RuntimePhase, WorkloadStatus,
 };
 
-/// The wire contract, `include!`d verbatim from the module SDK so a controller,
-/// an agent and a module compile the same bytes.
-pub mod wire {
-    #![allow(dead_code, reason = "tools use a subset of the contract")]
-    include!("../../modules/sdk/contracts/agent.rs");
-}
+/// The wire contract, from the ABI, so a controller, an agent and a module
+/// compile the same bytes.
+pub use fluxor_abi::contracts::agent as wire;
 
 use wire::{op, phase, result, DecodeError, Request, Response};
 

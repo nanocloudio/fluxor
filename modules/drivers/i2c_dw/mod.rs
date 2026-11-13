@@ -8,16 +8,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -28,11 +18,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -49,16 +38,11 @@ const IC_SS_SCL_HCNT: u8 = 0x14;
 const IC_SS_SCL_LCNT: u8 = 0x18;
 const IC_FS_SCL_HCNT: u8 = 0x1C;
 const IC_FS_SCL_LCNT: u8 = 0x20;
-const IC_INTR_STAT: u8 = 0x2C;
 const IC_INTR_MASK: u8 = 0x30;
-const IC_CLR_INTR: u8 = 0x40;
 const IC_CLR_TX_ABRT: u8 = 0x54;
-const IC_ENABLE: u8 = 0x6C;
 const IC_STATUS: u8 = 0x70;
 const IC_TXFLR: u8 = 0x74;
-const IC_RXFLR: u8 = 0x78;
 const IC_TX_ABRT_SRC: u8 = 0x80;
-const IC_ENABLE_STATUS: u8 = 0x9C;
 
 // IC_STATUS bits
 const STAT_RFNE: u32 = 1 << 3; // RX FIFO not empty
@@ -494,7 +478,7 @@ pub extern "C" fn module_state_size() -> usize {
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-declare_module_state_bytes!(I2cState);
+fluxor_rt::declare_module_state_bytes!(I2cState);
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -582,6 +566,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

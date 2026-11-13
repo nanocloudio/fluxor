@@ -400,7 +400,7 @@ pub const RTO_GRANULARITY_MS: u32 = 50;
 /// Tiered with the rest of the system: see `abi::config::ip` for
 /// the per-board profile. Tied to `http::MAX_CONCURRENT_CONNS` —
 /// the http module's slot count must not exceed this (compile-time
-/// invariant in `modules/sdk/config.rs`).
+/// invariant in `crates/fluxor-abi/src/config.rs`).
 #[cfg(not(feature = "small_table"))]
 pub use super::abi::config::ip::MAX_TCP_CONNS;
 /// The `small_table` variant's table: four slots — three datagram endpoints

@@ -667,7 +667,7 @@ fn is_small_order(enc: &[u8; 32]) -> bool {
 }
 
 /// Verify an Ed25519 signature strictly: the same rules the module verifier in
-/// `modules/sdk/crypto/ed25519.rs` applies. `S` must be below the group
+/// `crates/fluxor-sdk/src/crypto/ed25519.rs` applies. `S` must be below the group
 /// order, the encodings of the key and of `R` must be canonical points on the
 /// curve, and neither may have small order. A signature this refuses is one a
 /// device refuses, so the tool never reports a chain or module as good that a

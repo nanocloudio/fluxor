@@ -175,20 +175,20 @@ Source: `contracts/src/lib.rs`.
 | 23 | `EventTimelineVideo` | Frame-aligned event stream, video flavour |
 | 24 | `EventTimelineAudio` | Frame-aligned event stream, audio flavour |
 | 25 | `NetProto` | Net protocol framing `[msg_type:u8][len:u16 LE][payload]`, delivered atomically on a byte-stream channel |
-| 26 | `PointerEvents` | Packed pointer event records (`modules/sdk/contracts/input/`) |
+| 26 | `PointerEvents` | Packed pointer event records (`crates/fluxor-abi/src/contracts/input/`) |
 | 27 | `KeyEvents` | Packed key event records |
 | 28 | `GamepadEvents` | Packed gamepad event records |
-| 29 | `MidiEvents` | Fixed 4-byte MIDI channel-voice events (`modules/sdk/contracts/input/midi.rs`) |
-| 30 | `Telemetry` | Fixed-layout `TelemetryRecord` (`modules/sdk/contracts/telemetry.rs`) |
-| 31 | `SurfaceTraits` | Fixed 24-byte environment-plane descriptor (`modules/sdk/contracts/input/surface_traits.rs`) |
+| 29 | `MidiEvents` | Fixed 4-byte MIDI channel-voice events (`crates/fluxor-abi/src/contracts/input/midi.rs`) |
+| 30 | `Telemetry` | Fixed-layout `TelemetryRecord` (`crates/fluxor-abi/src/contracts/telemetry.rs`) |
+| 31 | `SurfaceTraits` | Fixed 24-byte environment-plane descriptor (`crates/fluxor-abi/src/contracts/input/surface_traits.rs`) |
 | 32 | `PresentationLayout` | Resolved presentation-layout records (`tools/src/presentation_resolver.rs`) |
-| 33 | `ExchangeRequest` | Exchange records, request direction: request HEAD, BODY, CREDIT, ABORT, DATAGRAM, each naming its exchange by a 14-byte id the requester chooses (`modules/sdk/contracts/exchange.rs`, `exchange.md`) |
+| 33 | `ExchangeRequest` | Exchange records, request direction: request HEAD, BODY, CREDIT, ABORT, DATAGRAM, each naming its exchange by a 14-byte id the requester chooses (`crates/fluxor-abi/src/contracts/exchange.rs`, `exchange.md`) |
 | 34 | `ExchangeResponse` | Exchange records, response direction: response HEAD, BODY, CREDIT, ABORT, DATAGRAM, and LINK for the provider's link to its backend; each echoes its request's id |
 | 35 | `NamespaceChange` | Control-plane store change surface, one record per key mutation: `{revision u64, kind u8, key_len u16, val_len u32}` + key and value bytes, inside a mesh Event envelope |
-| 36 | `GpuCommand` | Generic GPU work — the request stream of `modules/sdk/wire/gpu_wire.rs` (query, resource, program, transfer, submission, fence, control, surface) |
+| 36 | `GpuCommand` | Generic GPU work — the request stream of `crates/fluxor-abi/src/contracts/gpu.rs` (query, resource, program, transfer, submission, fence, control, surface) |
 | 37 | `GpuOutcome` | Generic GPU outcomes — the reply half: acceptance, handles, capabilities, readback bytes, surface leases, and exactly one terminal outcome per accepted request |
-| 38 | `SensorSample` | A measured physical quantity, one fixed 24-byte reading per record (`modules/sdk/contracts/sensor.rs`). The quantity and its unit are capability facts on the producing port, not bytes in the record |
-| 39 | `MeasurementStream` | A block of samples per acquisition — a radar chirp set, a microphone window, an IMU burst (`modules/sdk/contracts/measurement.rs`). Fixed 16-byte header then the block; the sample encoding, channel count and samples per channel are capability facts, while `block_len` is per-frame because a final or drained block is legitimately short |
+| 38 | `SensorSample` | A measured physical quantity, one fixed 24-byte reading per record (`crates/fluxor-abi/src/contracts/sensor.rs`). The quantity and its unit are capability facts on the producing port, not bytes in the record |
+| 39 | `MeasurementStream` | A block of samples per acquisition — a radar chirp set, a microphone window, an IMU burst (`crates/fluxor-abi/src/contracts/measurement.rs`). Fixed 16-byte header then the block; the sample encoding, channel count and samples per channel are capability facts, while `block_len` is per-frame because a final or drained block is legitimately short |
 
 Codec identity is deliberately not part of this table. Encoded surfaces are
 generic (`AudioEncoded` / `VideoEncoded`): a content type names a
@@ -334,7 +334,7 @@ Replication and streaming:
 | Capability | Meaning |
 |------------|---------|
 | `replication.state_machine` | Replicated commit-and-apply surface: per-entry committed stream, accepted-into-WAL index echo, quorum-durability notice, snapshot install / export, apply-pipeline reset |
-| `stream.ordered_ack` | A provider of the exchange contract that durably accepts records in order: a 200 answer means durable acceptance, LINK records report its backend link; the parent a requester requires when it only publishes, satisfied by either role below. Wire contract: `modules/sdk/contracts/exchange.rs` |
+| `stream.ordered_ack` | A provider of the exchange contract that durably accepts records in order: a 200 answer means durable acceptance, LINK records report its backend link; the parent a requester requires when it only publishes, satisfied by either role below. Wire contract: `crates/fluxor-abi/src/contracts/exchange.rs` |
 | `stream.ordered_ack.sink` | A provider that accepts records and does not answer with data: an MQTT topic, a Kafka partition, an INSERT |
 | `stream.ordered_ack.exchange` | A provider that additionally answers each request with data on the same exchange: an HTTP GET, a SELECT |
 | `stream.line` | Line- or byte-delimited text stream: one command's output feeding the next command's input, unidirectional, backpressured by the channel, with no correlation and no acks |
@@ -492,7 +492,7 @@ number.
 
 ## Provider Contracts and Surfaces
 
-Source: `modules/sdk/abi/registry.toml`, `contracts/src/vocabulary.rs`, `tools/src/config/generate.rs`,
+Source: `crates/fluxor-abi/registry/registry.toml`, `contracts/src/vocabulary.rs`, `tools/src/config/generate.rs`,
 `tools/src/config/validate.rs`.
 
 The ABI registry's contracts marked `manifest = true` name the privileged

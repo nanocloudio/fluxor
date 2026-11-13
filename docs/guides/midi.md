@@ -7,7 +7,7 @@ MIDI transport surface; the synthesis and sequencing modules that
 consume it (synths, sequencers, MIDI routers) live in the grove
 repository.
 
-Source: `stacks/midi.toml`, `modules/sdk/contracts/input/midi.rs`,
+Source: `stacks/midi.toml`, `crates/fluxor-abi/src/contracts/input/midi.rs`,
 `modules/foundation/usb_midi_host/`,
 `modules/platform/linux/linux_alsa_midi/`,
 `modules/platform/wasm/wasm_browser_midi_in/` and

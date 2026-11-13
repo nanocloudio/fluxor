@@ -25,16 +25,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -46,11 +36,10 @@
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -61,10 +50,7 @@ const NET_HDR_SIZE: usize = 10;
 const MAX_FRAME_SIZE: usize = 1514;
 const BUF_SIZE: usize = 1536; // >= NET_HDR + MAX_FRAME, rounded for alignment
 
-// virtio-mmio register offsets
-const MAGIC_VALUE: usize = 0x000;
 const VERSION: usize = 0x004;
-const DEVICE_ID: usize = 0x008;
 const DEVICE_FEATURES: usize = 0x010;
 const DEVICE_FEATURES_SEL: usize = 0x014;
 const DRIVER_FEATURES: usize = 0x020;
@@ -77,8 +63,6 @@ const QUEUE_ALIGN_REG: usize = 0x03c;
 const QUEUE_PFN: usize = 0x040;
 const QUEUE_READY: usize = 0x044;
 const QUEUE_NOTIFY: usize = 0x050;
-const INTERRUPT_STATUS: usize = 0x060;
-const INTERRUPT_ACK: usize = 0x064;
 const STATUS_REG: usize = 0x070;
 const QUEUE_DESC_LOW: usize = 0x080;
 const QUEUE_DESC_HIGH: usize = 0x084;
@@ -101,7 +85,6 @@ const VRING_DESC_F_WRITE: u16 = 2;
 //   Driver (avail) ring: 6 + 2*16 = 38 bytes (2-aligned)
 //   Device (used) ring: 6 + 8*16 = 134 bytes (4-aligned)
 const VQ_DESC_SIZE: usize = QUEUE_SIZE * 16; // 256
-const VQ_AVAIL_SIZE: usize = 6 + 2 * QUEUE_SIZE; // 38
 const VQ_USED_SIZE: usize = 6 + 8 * QUEUE_SIZE; // 134
                                                 // Per virtqueue (v1 legacy): page-aligned, desc+avail in first page, used at +4096.
                                                 // Needs 4096 + VQ_USED_SIZE = 4230 bytes, plus page-alignment overhead (~4096).
@@ -555,7 +538,7 @@ pub extern "C" fn module_deferred_ready() -> u32 {
     1
 }
 
-declare_module_state_bytes!([u8; STATE_SIZE]);
+fluxor_rt::declare_module_state_bytes!([u8; STATE_SIZE]);
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -704,6 +687,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

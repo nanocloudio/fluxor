@@ -11,9 +11,7 @@
 /// Handshake message types
 const HT_CLIENT_HELLO: u8 = 1;
 const HT_SERVER_HELLO: u8 = 2;
-const HT_HELLO_RETRY_REQUEST: u8 = 2; // Same type as ServerHello, distinguished by random
 const HT_NEW_SESSION_TICKET: u8 = 4;
-const HT_END_OF_EARLY_DATA: u8 = 5;
 const HT_ENCRYPTED_EXTENSIONS: u8 = 8;
 const HT_CERTIFICATE: u8 = 11;
 const HT_CERTIFICATE_REQUEST: u8 = 13;
@@ -31,7 +29,6 @@ const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
 const EXT_SUPPORTED_GROUPS: u16 = 10;
-const EXT_COOKIE: u16 = 44;
 const EXT_ALPN: u16 = 16;
 const EXT_SERVER_NAME: u16 = 0;
 /// QUIC transport_parameters extension (RFC 9001 §8.2). Carried in

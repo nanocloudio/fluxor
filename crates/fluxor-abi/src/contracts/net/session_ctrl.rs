@@ -1,0 +1,1044 @@
+// Contract: session_ctrl — the session control-plane sideband.
+//
+// Layer: contracts/net (public, stable).
+//
+// See docs/architecture/protocol_surfaces.md §Session Control Sideband.
+//
+// The session control sideband is the control-plane exchange exchanged between
+// **transport anchors**, **session workers**, and **session
+// directories** to coordinate session attach, detach, drain,
+// export/import handoff, resume, epoch advancement, worker
+// relocation, and — for the transport providers — checkpoint, delta
+// and cut-over of the transport itself (§Transport continuity). It is
+// the scaffolding every continuity class above `drain_only` rests on
+// (see protocol_surfaces.md §Continuity Classes).
+//
+// Status: LIVE. Consumers: `echo_anchor` + `echo_worker` exercise the
+// full surface — HELLO/ATTACH/DETACH/DRAIN plus the handoff half
+// (EXPORT_BEGIN/CHUNK/END → IMPORT_BEGIN/END → RESUME/RESUMED with
+// epoch bump). An anchor wired to an active and a standby worker gives
+// an anchor-preserved worker swap on a live TCP session. The chunking
+// and CRC logic is the reusable `session_handoff` core in
+// `crates/fluxor-sdk/src/cores/`.
+//
+// Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
+// header as net_proto, datagram, and packet so the shared SDK
+// helpers (net_read_frame, net_write_frame) serve all four, and
+// the ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives every
+// message type of every surface sharing this header a distinct value,
+// so a single channel pair may carry multiple contracts without
+// ambiguity. In practice session control flows over its own channels
+// between anchor/worker/directory modules — often over remote channels
+// when those three roles are on different nodes.
+//
+// ─── Session identity ────────────────────────────────────────────
+//
+// The identity model has three distinct identifiers:
+//
+//   session_id     16 bytes (128-bit opaque)  stable logical session
+//   anchor_id       8 bytes ( 64-bit opaque)  stable front-door anchor
+//   session_epoch   4 bytes LE                monotonic per session_id
+//
+// `session_id` is minted by the protocol owner at the continuity
+// boundary (anchor at first attach; resumption layer on reconnect).
+// It is scoped to a tenant or cluster continuity domain, not globally
+// unique across deployments. It does not have to appear on the public
+// wire.
+//
+// `anchor_id` identifies the anchor currently serving the session.
+// When the anchor itself moves (rare; usually only for anchor
+// HA or QUIC-class migration) the directory binds the new anchor_id.
+//
+// `session_epoch` advances on every authoritative rebind. Messages
+// carrying a stale epoch are rejected by the directory and the
+// receiving worker.
+//
+// All identity bytes travel **big-endian** (wire order) so raw byte
+// comparison matches the cluster's canonical identity representation.
+// Ports / lengths / status codes remain little-endian for consistency
+// with the other net contracts.
+//
+// ─── Delivery cursors ─────────────────────────────────────────────
+//
+// A worker's exported state is opaque, but its *position* is not. Two
+// counters place the blob in the session's streams, both counted from
+// the session's first unit and carried on EXPORT_BEGIN:
+//
+//   in_consumed    inbound the anchor forwarded that the blob accounts
+//                  for
+//   out_produced   outbound the blob has already emitted toward the
+//                  client
+//
+// The unit is the anchor's, fixed by the binding rather than by this
+// contract, and an anchor and its workers must agree on it: bytes of the
+// client stream where the anchor forwards a stream, whole envelopes
+// where it forwards records. What the contract requires is that both
+// sides count the same thing, because all it does with the numbers is
+// compare them. A pairing that disagrees does not corrupt a session — it
+// fails every handoff at the equality test, which is the safe direction.
+//
+// The anchor keeps the same two counters for the worker it is feeding:
+// what it has forwarded, and what it has relayed onto the client
+// transport. At export both pairs must be equal. Equality is what makes
+// a handoff lossless — it says the blob accounts for every byte the
+// anchor delivered and claims no byte it did not, and it gives the
+// importing worker the exact offsets to resume from.
+//
+// Inequality is a real fault, not a race to retry:
+//
+//   in_consumed < forwarded    the worker exported before its inbound
+//                              tail ran dry; those bytes are in no blob
+//   in_consumed > forwarded    the worker is accounting for a stream it
+//                              was not fed — a misbound session
+//   out_produced != relayed    the drain did not finish; the client has
+//                              seen a different prefix than the blob
+//                              believes
+//
+// So an anchor validates the cursors on the EXPORT_BEGIN it relays and,
+// on any mismatch, refuses the handoff with STATUS_CURSOR_MISMATCH and
+// leaves the session on the exporting worker. Refusing costs a
+// maintenance window; proceeding costs the client bytes it will never
+// learn were dropped, or a request served twice. The sequencing that
+// keeps the cursors equal — the anchor holding new client bytes from
+// the moment it issues DRAIN, and the worker consuming its inbound tail
+// to dry before it declares DRAINED — is the anchor's and worker's
+// side of the same obligation.
+//
+// "Leaves the session on the exporting worker" has a wire shape. A
+// worker that has declared DRAINED consumes nothing until told to; the
+// anchor returns it to service with CMD_SC_RESUME carrying the
+// session's CURRENT epoch. No blob was committed anywhere, so nothing
+// advanced, and the worker still holds the state it exported: it
+// answers MSG_SC_RESUMED at that epoch and resumes consuming from where
+// the drain left it. The standby that half-imported is detached and
+// discards the partial blob. The same return path serves a drain that
+// outlives the deadline DRAIN carried and an import the standby
+// rejected. A RESUME at an epoch that is neither the current one (a
+// refusal) nor above the imported one (a handoff) is refused
+// STATUS_STALE_EPOCH.
+//
+// ─── Many sessions, one control channel ──────────────────────────
+//
+// Every session-scoped message names its session, so one anchor↔worker
+// channel pair carries as many sessions as the anchor serves; each is
+// attached, drained, exported and resumed on its own, under its own
+// epoch. What the contract does not carry is the data-plane address:
+// CMD_SC_ATTACH has no field for the connection an envelope will name.
+// An anchor serving many sessions therefore mints `session_id` so that
+// correlation is recoverable from the identity itself (the fixtures
+// use `[anchor_id:8][counter:8]`; a connection-addressed anchor puts
+// its connection id and a generation in the low bytes), and a worker
+// keeps the map from data-plane address to session, rebuilt from the
+// identities it imports.
+
+/// Frame header size (msg_type + len).
+pub const FRAME_HDR: usize = 3;
+
+// ─── Identity field sizes ──────────────────────────────────────────
+
+/// Bytes of `session_id` carried on every session-scoped message.
+pub const SESSION_ID_BYTES: usize = 16;
+/// Bytes of `anchor_id`.
+pub const ANCHOR_ID_BYTES: usize = 8;
+/// Bytes of `worker_id` (symmetric with `anchor_id`).
+pub const WORKER_ID_BYTES: usize = 8;
+/// Bytes of `session_epoch` (little-endian u32).
+pub const EPOCH_BYTES: usize = 4;
+/// Bytes of a delivery cursor (little-endian u64).
+pub const CURSOR_BYTES: usize = 8;
+
+// ─── Roles (HELLO) ─────────────────────────────────────────────────
+
+/// Transport anchor role: owns the client-visible transport attachment.
+pub const ROLE_ANCHOR: u8 = 1;
+/// Session worker role: owns movable application session state.
+pub const ROLE_WORKER: u8 = 2;
+/// Session directory role: owns placement metadata.
+pub const ROLE_DIRECTORY: u8 = 3;
+
+// ─── Continuity classes (on the wire) ──────────────────────────────
+
+/// Corresponds to `reroutable` in protocol_surfaces.md.
+pub const CC_REROUTABLE: u8 = 1;
+/// Corresponds to `drain_only`.
+pub const CC_DRAIN_ONLY: u8 = 2;
+/// Corresponds to `resumable`.
+pub const CC_RESUMABLE: u8 = 3;
+/// Corresponds to `edge_anchored`.
+pub const CC_EDGE_ANCHORED: u8 = 4;
+/// Corresponds to `transport_migratable`.
+pub const CC_TRANSPORT_MIGRATABLE: u8 = 5;
+
+// ─── Detach reasons ────────────────────────────────────────────────
+
+pub const DETACH_NORMAL: u8 = 0;
+pub const DETACH_DRAIN_TIMEOUT: u8 = 1;
+pub const DETACH_STALE_EPOCH: u8 = 2;
+pub const DETACH_ERROR: u8 = 3;
+pub const DETACH_CLIENT_GONE: u8 = 4;
+
+// ─── Status codes (IMPORT_END / ATTACHED / RELOCATED / etc.) ───────
+
+pub const STATUS_OK: u8 = 0;
+pub const STATUS_STALE_EPOCH: u8 = 1;
+pub const STATUS_UNKNOWN_SESSION: u8 = 2;
+pub const STATUS_NO_CAPACITY: u8 = 3;
+pub const STATUS_CORRUPT: u8 = 4;
+pub const STATUS_NOT_READY: u8 = 5;
+/// The provider cannot offer what was asked on this composition — a
+/// profile it cannot make safe here, as opposed to one it cannot make
+/// safe yet. Retrying does not change the answer.
+pub const STATUS_UNSUPPORTED: u8 = 6;
+/// The exported state does not account for exactly what the anchor
+/// delivered: the cursors on EXPORT_BEGIN disagree with the anchor's
+/// own counters (see §Delivery cursors). The handoff is refused and the
+/// session stays on the exporting worker.
+pub const STATUS_CURSOR_MISMATCH: u8 = 7;
+
+// ─── Opcodes: commands (peer → peer) ───────────────────────────────
+
+/// Role discovery handshake. Payload:
+///   [role: u8] [self_id: 8 bytes] [flags: u8]
+/// Where `self_id` is the sender's `anchor_id` / `worker_id` depending
+/// on role. `flags` is reserved and must be 0 on the wire.
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_HELLO;
+
+/// Anchor → directory (or anchor → worker) attach notification.
+/// Payload:
+///   [session_id: 16 BE]
+///   [anchor_id:   8 BE]
+///   [epoch:       4 LE]
+///   [cc:          1]                  continuity class (CC_*)
+///   [worker_id:   8 BE or zero]       suggested worker or all-zero
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_ATTACH;
+
+/// Detach notification (session removed).
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [reason:      1]                  DETACH_*
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DETACH;
+
+/// Begin draining outbound delivery for a session. Anchor may still
+/// service wire-liveness traffic (keepalive) while drain is active.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [deadline_ms: 4 LE]               max ms before forced timeout
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DRAIN;
+
+/// Begin opaque state export. Starts a multi-chunk transfer of worker-
+/// owned session state for handoff, and states where in the session's
+/// two byte streams that state sits (§Delivery cursors).
+/// Payload:
+///   [session_id:   16 BE]
+///   [epoch:         4 LE]
+///   [total_len:     4 LE]             total blob bytes to follow
+///   [in_consumed:   8 LE]             inbound bytes folded into the blob
+///   [out_produced:  8 LE]             outbound bytes the blob has emitted
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EXPORT_BEGIN;
+
+/// Payload bytes of CMD_SC_EXPORT_BEGIN.
+pub const EXPORT_BEGIN_LEN: usize =
+    SESSION_ID_BYTES + EPOCH_BYTES + 4 + CURSOR_BYTES + CURSOR_BYTES;
+
+/// A single chunk of exported state.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [offset:      4 LE]               byte offset in the blob
+///   [data: ...]                        chunk bytes
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EXPORT_CHUNK;
+
+/// End of export. Confirms total_len was delivered.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [crc32:       4 LE]               CRC32 of the concatenated blob
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EXPORT_END;
+
+/// Mark a new worker ready to take over. Paired with the directory
+/// advancing the session binding. Anchor flips its forwarding target
+/// to the new worker after MSG_SC_RESUMED is received.
+///
+/// Sent to the EXPORTING worker at the session's current epoch, it
+/// instead returns that worker to service after a refused handoff
+/// (§Delivery cursors): the worker leaves its drained state and resumes
+/// consuming, and MSG_SC_RESUMED echoes the unchanged epoch.
+/// Payload:
+///   [session_id: 16 BE]
+///   [new_epoch:   4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RESUME;
+
+/// Epoch bump (generation advance). Used to invalidate stale writers.
+/// Payload:
+///   [session_id: 16 BE]
+///   [old_epoch:   4 LE]
+///   [new_epoch:   4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EPOCH_BUMP;
+
+/// Directory → anchor notification that the session's worker binding
+/// has moved. Anchor re-resolves the forwarding channel.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [new_worker:  8 BE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RELOCATE;
+
+// ─── Opcodes: events / acknowledgements (peer → peer) ──────────────
+
+/// Acknowledge CMD_SC_HELLO.
+/// Payload:
+///   [role: u8] [peer_id: 8 BE]
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_HELLO_ACK;
+
+/// Acknowledge CMD_SC_ATTACH.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [status:      1]                  STATUS_*
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_ATTACHED;
+
+/// Acknowledge CMD_SC_DETACH.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_DETACHED;
+
+/// Drain completed (outbound queue empty, no new frames until resume).
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_DRAINED;
+
+/// Acknowledge CMD_SC_EXPORT_BEGIN; importer is ready to receive.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [status:      1]                  STATUS_*
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_IMPORT_BEGIN;
+
+/// Per-chunk acknowledgement (optional; implementations may batch).
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [offset:      4 LE]
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_IMPORT_CHUNK;
+
+/// Import completed; state committed on the receiving worker.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [status:      1]                  STATUS_* (CORRUPT if CRC mismatched)
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_IMPORT_END;
+
+/// Worker has declared ready for the new epoch. Anchor may now flip
+/// its forwarding target.
+/// Payload:
+///   [session_id: 16 BE]
+///   [new_epoch:   4 LE]
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_RESUMED;
+
+/// Directory confirms epoch advance.
+/// Payload:
+///   [session_id: 16 BE]
+///   [new_epoch:   4 LE]
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_EPOCH_CONFIRMED;
+
+/// Acknowledge CMD_SC_RELOCATE.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [status:      1]                  STATUS_*
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_RELOCATED;
+
+// ─── Transport continuity (TRANSPORT_CONTINUITY) ──────────────────
+//
+// The checkpoint, delta and cut-over surface a transport provider
+// (ip for TCP, tls for the record layer, quic for the mux) answers on
+// its `cont_in` / `cont_out` port pair. A mirror and a failover
+// coordinator drive it; the provider owns the codec, the
+// buffers, the vault bridge and the emission gate. Key bytes never
+// cross this surface: a checkpoint carries vault-sealed continuity
+// objects, and only a vault that holds the same labelled sealing key
+// (`security.key_wrap`) opens them.
+//
+// Every message names the flow (16-byte opaque `flow_id`, the
+// provider's identity for one connection) and the ownership epoch it
+// was issued under. A command carrying an epoch below the provider's
+// current one is refused `STATUS_STALE_EPOCH`; a future epoch is
+// refused too — epochs advance only through ACTIVATE.
+//
+// Records and deltas bind: flow, epoch, checkpoint generation, ordered
+// delta number, previous digest, length and a content digest (CRC32 on
+// the chunk stream, SHA-256 over the whole record in the manifest). A
+// retry of an identical record is idempotent; a gap, a conflicting
+// duplicate, an oversized record or an unsupported layout is refused
+// before anything is mutated. Import stages into a non-emitting shadow
+// and becomes eligible atomically at CUT_IMPORT; EMISSION_ARM proves
+// the shadow is ready and leaves transmission disabled; ACTIVATE
+// requires a strictly higher epoch and a fence generation.
+//
+// Lifecycle (planned migration):
+//
+//   PAIR_PREPARE(standby)      → CONTINUITY{PAIR_PREPARED}
+//   QUIESCE_BEGIN(primary)     → CONTINUITY{QUIESCED} when drained
+//   CUT_EXPORT(primary)        → primary emits CHECKPOINT_BEGIN /
+//                                CHECKPOINT_NEXT* / CHECKPOINT_COMMIT
+//                                on cont_out, then CONTINUITY{CUT}
+//   (coordinator relays the checkpoint frames to the standby's cont_in;
+//    the standby answers CONTINUITY{CHECKPOINT_ACK|CHECKPOINT_COMMITTED})
+//   CUT_IMPORT(standby)        → CONTINUITY{IMPORTED}: the shadow is
+//                                validated and published, still silent
+//   EMISSION_ARM(standby)      → CONTINUITY{ARMED}
+//   fence the primary: ADDR_FENCE on the out-of-band fence agent
+//     (net::identity §Two providers, one surface), whose MSG_ADDR_FENCED
+//     generation is `fence_gen` below — or RETIRE, when the primary is
+//     reachable and cooperating
+//   ACTIVATE(standby, epoch+1, fence_gen) → CONTINUITY{ACTIVATED}
+//   RETIRE(primary)            → CONTINUITY{RETIRED}: keys and buffers
+//                                destroyed
+//
+// Mirroring (between checkpoint and cut): the primary emits DELTA_APPLY
+// on cont_out for every externally visible transition; the standby
+// applies it into the shadow and answers DELTA_ACK. In the strict
+// (crash-continuous) profile the primary withholds the transition —
+// the TCP ACK advance, the TLS record hand-off, the QUIC packet — until
+// the DELTA_ACK covering it has returned; that is the receive / send
+// horizon, and the relayed CHECKPOINT_COMMITTED that starts it also ends
+// a quiesce the checkpoint was taken under. In the planned profile deltas
+// are asynchronous and the synchronous cut at CUT_EXPORT is what makes the
+// standby exact.
+
+/// Transport codes carried by PAIR_PREPARE and the checkpoint manifest.
+pub const CT_TCP: u8 = 1;
+pub const CT_TLS: u8 = 2;
+pub const CT_QUIC: u8 = 3;
+
+/// Continuity profile carried by PAIR_PREPARE.
+/// Deltas are asynchronous; the cut at CUT_EXPORT is exact.
+pub const PROFILE_PLANNED: u8 = 1;
+/// Every externally visible transition waits for its DELTA_ACK.
+pub const PROFILE_CRASH_CONTINUOUS: u8 = 2;
+
+/// What a crash-continuous pair's provider holds of one connection: the
+/// canonical record's bounds (`TRANSPORT_CONTINUITY`'s `TS_*`, which its
+/// provider holds equal to these). A layer under the strict profile keeps
+/// each of its own within them, so a full table is back-pressure at the
+/// layer, never a delta its provider cannot apply.
+///
+/// Outbound records written or held and not yet acknowledged by the peer's
+/// transport: `tls` holds the next record while this many stand.
+pub const STRICT_TX_RECORDS: usize = 32;
+/// Unacknowledged outbound bytes (`tls`'s retransmit window).
+pub const STRICT_SEND_BYTES: usize = 32 * 1024;
+/// In-order received bytes not yet a record (`tls`'s partial record).
+pub const STRICT_RECV_BYTES: usize = 16_704;
+/// Out-of-order segments held, and the bytes of each (`ip`'s reorder
+/// slots).
+pub const STRICT_OOO_SEGS: usize = 4;
+pub const STRICT_OOO_SEG: usize = 512;
+/// The plaintext one delivery carries (`tls`'s RECORD_IN).
+pub const STRICT_DELIVERY_BYTES: usize = 16 * 1024;
+
+/// Delta kinds (`DELTA_APPLY` `kind`).
+/// TCP: a send-side transition — bytes allocated to sequence space,
+/// with the segment bytes so retransmission is byte-identical.
+pub const DELTA_TCP_SEND: u8 = 1;
+/// TCP: a receive-side transition — bytes accepted in order, and the
+/// acknowledgement the peer is about to be shown.
+pub const DELTA_TCP_RECV: u8 = 2;
+/// TCP: acknowledgement from the peer reclaimed send bytes / window.
+pub const DELTA_TCP_ACKED: u8 = 3;
+/// TCP: a state change without bytes — its timers and congestion state as
+/// they stand after it. `ip`'s payload:
+///   [state:1][rto:2 LE][srtt:2 LE][rttvar:2 LE][cwnd:2 LE][ssthresh:2 LE]
+///   [retx_rem_ms:4 LE][idle_ms:4 LE][idle_rem_ms:4 LE]
+///   [closewait_rem_ms:4 LE][closing_rem_ms:4 LE][timewait_rem_ms:4 LE]
+/// `state` is `ip`'s record code (`FXTC`, TIME-WAIT included); each
+/// remainder is what is left of a timer the new state runs, 0 when it runs
+/// none, 1 when it is due (`TRANSPORT_CONTINUITY`'s `TS_TIMER_DUE`).
+pub const DELTA_TCP_TIMERS: u8 = 4;
+/// TLS: a record is about to be handed to the transport — its
+/// ciphertext, write epoch and sequence, so the standby retransmits the
+/// same bytes and never re-encrypts under the same counter.
+pub const DELTA_TLS_RECORD_OUT: u8 = 5;
+/// TLS: inbound record consumed — read sequence advanced, partial
+/// record bytes retained. Under the strict profile the record is opened
+/// first, and the delta also carries its inner content type and plaintext
+/// (`[type:1][plain_len:2 LE][plain]` after the partial bytes, type 0xFF
+/// with none when the plaintext is longer than `tls` carries), which is
+/// held undelivered until acknowledged.
+pub const DELTA_TLS_RECORD_IN: u8 = 6;
+/// TLS: key update barrier — new secret installed (sealed) and the
+/// counters reset; the primary does not emit in the new epoch until
+/// this is acknowledged.
+pub const DELTA_TLS_KEY_UPDATE: u8 = 7;
+/// QUIC: packet-number allocation from the reservation and the
+/// packet's ciphertext.
+pub const DELTA_QUIC_SEND: u8 = 8;
+/// QUIC: inbound packet consumed — ACK state, stream offsets, flow
+/// control credit.
+pub const DELTA_QUIC_RECV: u8 = 9;
+/// QUIC: key-phase flip (RFC 9001 §6) — barrier like the TLS one.
+pub const DELTA_QUIC_KEY_PHASE: u8 = 10;
+/// TLS: the peer acknowledged the primary's TCP stream up to a sequence,
+/// so the retransmit window slid. Mirrored so the standby's window is the
+/// primary's and a replay after takeover sends the right bytes. `isn` is
+/// the sequence of the stream's first byte, which anchors the window.
+///   [acked_seq: 4 LE][isn: 4 LE]
+pub const DELTA_TLS_RETX_ACK: u8 = 11;
+/// TLS, strict profile: inbound bytes received but not yet forming a whole
+/// record. Mirrored on arrival so a takeover between two records does not
+/// lose the head of the next one.
+///   [recv_len: 4 LE][bytes: recv_len]
+pub const DELTA_TLS_RECV_BYTES: u8 = 12;
+/// TLS, strict profile: what the clear-side consumer has consumed, a
+/// cumulative count of records handed up — those whose plaintext ends at or
+/// before the clear byte the consumer acknowledged (`net_proto` 0x19 under
+/// `tls`'s `delivery_ack`), or counted as handed up — and the cursor and
+/// clear byte its last acknowledgement carried (0 for none), kept with the
+/// count so a takeover redelivers from that byte and hands both to the next
+/// consumer (`net_proto::MSG_RESUMED`).
+///   [consumed: 8 LE][consumer_cursor: 8 LE][cursor_at: 8 LE]
+pub const DELTA_TLS_DELIVERED: u8 = 0x81;
+/// TCP: the connection ended by a reset — the peer's, accepted
+/// (RFC 5961 rules), or ours. The provider hears it before the connection
+/// is released; ours goes on the wire only once this delta is acknowledged
+/// (a strict pair: held at the send horizon like a FIN).
+///   [dir:1][seq:4 LE][ack:4 LE]     dir 1 the peer's, 2 ours
+pub const DELTA_TCP_RESET: u8 = 13;
+/// TCP: the connection completed its close and is released — our FIN
+/// acknowledged in LAST-ACK, TIME-WAIT over, or a closing state's bound
+/// spent. No payload. Nothing more of the connection follows.
+pub const DELTA_TCP_CLOSED: u8 = 14;
+/// `tls`'s own close: the consumer closed and our close_notify is sealed
+/// (no payload). The alert's ciphertext is the RECORD_OUT before it; the
+/// transport FIN that follows is `ip`'s SEND with its FIN flag. A session
+/// that sent it stays exportable (CT_TLS `close_notify` bit 0).
+pub const DELTA_TLS_CLOSE_SENT: u8 = 0x82;
+// Other kinds 0x80 and up are a provider's own, as are commands 0x8B and up
+// on `cont_in`.
+
+/// Abort reasons (`ABORT` `reason`, `CONTINUITY{ABORTED}` body).
+pub const ABORT_COORDINATOR: u8 = 1;
+pub const ABORT_IMPORT_FAILED: u8 = 2;
+/// The mirror could not carry a transition (its channel refused a delta,
+/// the standby answered out of order, a delta was past what it represents).
+pub const ABORT_MIRROR_LOST: u8 = 3;
+pub const ABORT_UNSUPPORTED_STATE: u8 = 4;
+/// A strict layer abandoned its pairing because the peer acknowledged none
+/// of the outbound records held at the record ceiling (`STRICT_TX_RECORDS`)
+/// within its horizon budget (`tls`'s `txrec_cap_abandoned`).
+pub const ABORT_TXREC_CAP: u8 = 5;
+/// ... because its consumer consumed nothing while the redelivery caps held
+/// within the horizon budget (`tls`'s `redeliver_cap_abandoned`).
+pub const ABORT_REDELIVER_CAP: u8 = 6;
+/// ... because its standby left a horizon unanswered past the budget.
+pub const ABORT_HORIZON_BUDGET: u8 = 7;
+
+/// Prepare a standby slot for `flow_id` — reserves the shadow and its
+/// buffers before the connection is promised migration. Refused
+/// `STATUS_NO_CAPACITY` when no shadow slot is free.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [transport:     1]                 CT_*
+///   [profile:       1]                 PROFILE_*
+///   [codec_digest: 32]                 SHA-256 of the codec layout the
+///                                      primary will emit; mismatch is
+///                                      refused before any bytes move
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_PAIR_PREPARE;
+
+/// Open a checkpoint transfer into a prepared shadow. A generation the
+/// shadow already holds is idempotent; a lower generation is refused.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]              checkpoint generation
+///   [total_len:     4 LE]              record bytes to follow
+///   [record_digest:32]                 SHA-256 of the whole record
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CHECKPOINT_BEGIN;
+
+/// One chunk of the checkpoint record, in offset order.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [offset:        4 LE]
+///   [data: ...]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CHECKPOINT_NEXT;
+
+/// Close the checkpoint transfer. The shadow verifies length, CRC32 and
+/// the record digest, decodes the record, opens the sealed continuity
+/// objects and answers `CHECKPOINT_COMMITTED` — or `STATUS_CORRUPT`, in
+/// which case the shadow is discarded whole.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [crc32:         4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CHECKPOINT_COMMIT;
+
+/// Ordered delta against a committed checkpoint.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [delta_no:      4 LE]              1-based, strictly consecutive
+///   [prev_digest:  32]                 SHA-256 of the previous delta
+///                                      (zero for delta 1)
+///   [kind:          1]                 DELTA_*
+///   [data: ...]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DELTA_APPLY;
+
+/// The standby has applied `delta_no` into the shadow — the horizon
+/// the primary may now cross.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [delta_no:      4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_DELTA_ACK;
+
+/// Stop admitting new application delivery on the primary and drain
+/// in-flight work so a byte-exact cut can be taken.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [deadline_ms:   4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_QUIESCE_BEGIN;
+
+/// Ask whether the quiesce has completed.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_QUIESCE_STATUS;
+
+/// Produce the full checkpoint now. The provider emits
+/// CHECKPOINT_BEGIN / NEXT* / COMMIT on `cont_out`, then
+/// `CONTINUITY{CUT}` carrying the manifest.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CUT_EXPORT;
+
+/// Publish the committed shadow as the eligible import for `flow_id`:
+/// the manifest digest must match what CHECKPOINT_COMMIT verified.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [manifest_digest: 32]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CUT_IMPORT;
+
+/// Prove the import is ready to emit — timers converted, secrets
+/// open, route identity present — without enabling transmission.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_EMISSION_ARM;
+
+/// Make the armed shadow the live connection under a strictly higher
+/// epoch. `fence_gen` is the fence generation the coordinator observed
+/// confirmed for the old emitter; zero is refused.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [new_epoch:     4 LE]
+///   [fence_gen:     4 LE]
+///   [conn_id:       2 LE]              optional: the live connection id
+///                                      a layered provider (tls over the
+///                                      standby's ip) binds the imported
+///                                      session to — the id the lower
+///                                      provider reported in its own
+///                                      CR_ACTIVATED. Absent, the id the
+///                                      checkpoint was taken under.
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_ACTIVATE;
+
+/// Destroy the old connection's keys and replicated buffers after the
+/// new anchor's stability horizon.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RETIRE;
+
+/// Discard a shadow or an in-progress export.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [reason:        1]                 ABORT_*
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_ABORT;
+
+/// A reservation grant from a `session.reservation` provider for a flow's
+/// egress counter: a block of counter values the transport may emit from.
+///
+/// The grant is what makes a takeover safe. A transport emits only values
+/// from a block it holds, and a takeover resumes past the end of every
+/// block the dead host was ever granted — so no counter value is ever put
+/// on the wire twice under one key. Making a grant durable across hosts is
+/// the provider's job; the record below is all the transport needs to see.
+///
+/// Payload:
+///   [flow_id:      16 BE]
+///   [grant:        38]                 the record below
+///
+/// Grant record:
+///   [op:            1]                 GRANT_OP_RESERVE
+///   [status:        1]                 GRANT_STATUS_OK, or a refusal
+///   [session_id:   16]                 the provider's name for the flow
+///   [epoch:         4 LE]              fencing epoch; only ever advances
+///   [start:         8 LE]              first counter value in the block
+///   [len:           8 LE]              values in the block
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_RESERVATION_GRANT;
+
+/// A tombstone for a flow this provider never held: until it expires a
+/// segment for the flow that finds no connection here is dropped silently,
+/// never reset (`ip`). Answered CONTINUITY{RETIRED}; `STATUS_NO_CAPACITY`
+/// with every slot holding a live tombstone, which is never evicted early.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ttl_ms:        4 LE]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_TOMBSTONE;
+
+/// Vault-to-vault transfer of a flow's continuity key (`custody`): the
+/// standby's vault attests a fresh recipient key, the primary's vault checks
+/// that evidence and wraps the key that seals the flow's secret set to it,
+/// and the standby's vault unwraps it. No key is ever in a frame: what
+/// crosses is the evidence (public material and a signature) and the
+/// wrapped key (`key_vault` `FXKW`, sealed to the recipient and bound to its
+/// composition). Answered CONTINUITY{CUSTODY}.
+/// Payload:
+///   [flow_id:      16 BE]              ATTEST: the name the standby's
+///                                      recipient is kept under until its
+///                                      UNWRAP; WRAP and UNWRAP: the flow
+///                                      the key seals
+///   [epoch:         4 LE]              the ownership epoch it seals under
+///   [op:            1]                 custody::ATTEST / WRAP / UNWRAP
+///   [body: ...]                        ATTEST: [challenge:32]
+///                                      WRAP:   [challenge:32][evidence]
+///                                      UNWRAP: [name:16][wrapped]
+pub use super::super::super::registry::msg::session_ctrl::CMD_SC_CUSTODY;
+
+/// The custody exchange's operations and bytes (`CMD_SC_CUSTODY`).
+pub mod custody {
+    pub const ATTEST: u8 = 1;
+    pub const WRAP: u8 = 2;
+    pub const UNWRAP: u8 = 3;
+    /// Evidence: `[record][recipient_pub:65][signer_pub:65][sig_len:2 LE]
+    /// [sig]`, where `record` is `key_vault` `ATTEST_KEY`'s (`FXHA`) for the
+    /// recipient, over the caller's challenge, and `sig` the signer's P-256
+    /// signature over its SHA-256 (`r‖s`).
+    pub const RECORD_LEN: usize = 148;
+    pub const PUB_LEN: usize = 65;
+    pub const RECIPIENT: usize = RECORD_LEN;
+    pub const SIGNER: usize = RECIPIENT + PUB_LEN;
+    pub const SIG_LEN: usize = SIGNER + PUB_LEN;
+    pub const SIG: usize = SIG_LEN + 2;
+    pub const SIG_MAX: usize = 64;
+    pub const EVIDENCE_MAX: usize = SIG + SIG_MAX;
+    /// A wrapped 32-byte key: `key_vault` `wrap`'s `FXKW` blob.
+    pub const WRAPPED_LEN: usize = 4 + 65 + 32 + 12 + 7 + 32 + 16;
+    /// Why a custody operation was refused (`CR_CUSTODY` `reason`).
+    pub mod why {
+        /// The evidence does not parse, or is not a P-256 recipient's.
+        pub const EVIDENCE: u8 = 1;
+        /// The evidence answers another challenge.
+        pub const CHALLENGE: u8 = 2;
+        /// The evidence's signature does not verify under its signer.
+        pub const SIGNATURE: u8 = 3;
+        /// The recipient is not an ephemeral agreement key: persisted, or
+        /// without `AGREE`, or its thumbprint is not its public key's.
+        pub const RECIPIENT: u8 = 4;
+        /// No recipient is held under that name.
+        pub const NO_RECIPIENT: u8 = 5;
+        /// The vault refused (no key to wrap, a slot, a wrap or an unwrap:
+        /// a blob for another recipient or composition does not open).
+        pub const VAULT: u8 = 6;
+        /// No session or shadow holds that flow.
+        pub const NO_FLOW: u8 = 7;
+    }
+}
+
+/// Bytes in a reservation-grant record.
+pub const GRANT_LEN: usize = 1 + 1 + 16 + 4 + 8 + 8;
+/// Grant opcode: a block of counter values reserved for one flow.
+pub const GRANT_OP_RESERVE: u8 = 3;
+/// Grant status: the block that follows is the caller's to emit from.
+pub const GRANT_STATUS_OK: u8 = 0;
+
+/// Every continuity reply. The reply space has five opcodes left, so
+/// one carries a discriminated record.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [record:        1]                 CR_*
+///   [status:        1]                 STATUS_*
+///   [body: ...]                        per record type, below
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_CONTINUITY;
+
+/// `CONTINUITY` record types and their bodies.
+/// Body: [transport:1][profile:1][shadow_slot:2 LE], and from a provider
+/// pairing a connection it holds live (the primary half) a trailing
+/// [conn_id:2 LE] where it numbers connections — the id a layered provider
+/// above it (tls) names the same connection by.
+pub const CR_PAIR_PREPARED: u8 = 1;
+/// Body: [ckpt_gen:4 LE][offset:4 LE] — bytes accepted so far.
+pub const CR_CHECKPOINT_ACK: u8 = 2;
+/// Body: [ckpt_gen:4 LE][record_digest:32]
+pub const CR_CHECKPOINT_COMMITTED: u8 = 3;
+/// Body: [ckpt_gen:4 LE][delta_no:4 LE] — the shadow's horizon.
+pub const CR_DELTA_APPLIED: u8 = 4;
+/// Body: [drained:1][pending_out:4 LE][pending_in:4 LE]
+pub const CR_QUIESCED: u8 = 5;
+/// Body — the cut manifest:
+///   [ckpt_gen:4 LE][record_len:4 LE][record_digest:32]
+///   [transport:1][sealed_len:2 LE][sealed: ...]
+/// where `sealed` is the vault-sealed continuity object (the traffic
+/// secrets) the record refers to, never the secrets themselves.
+pub const CR_CUT: u8 = 6;
+/// Body: [ckpt_gen:4 LE][delta_no:4 LE] — the generation published.
+pub const CR_IMPORTED: u8 = 7;
+/// Body: [expired_timers:1]
+pub const CR_ARMED: u8 = 8;
+/// Body: [new_epoch:4 LE][conn_id:2 LE] — the live connection id.
+pub const CR_ACTIVATED: u8 = 9;
+/// Body: empty.
+pub const CR_RETIRED: u8 = 10;
+/// Body: [reason:1]
+pub const CR_ABORTED: u8 = 11;
+/// Body: [op:1][reason:1][bytes]: ATTEST the evidence, WRAP the wrapped
+/// key, UNWRAP nothing; `reason` is `custody::why` when `status` is not
+/// STATUS_OK.
+pub const CR_CUSTODY: u8 = 12;
+/// Unsolicited, from a layer whose paired session ended with its
+/// connection (the transport reset or closed it, `net_proto::CLOSED_GONE`)
+/// rather than being abandoned: the flow is over, which is no loss of the
+/// pairing (`CR_ABORTED`). Sent after every delta the session emitted.
+/// Body: [why:1] — `END_RESET`, `END_CLOSED`, or `END_TRANSPORT` when the
+/// layer cannot tell (the transport below names it).
+pub const CR_ENDED: u8 = 13;
+pub const END_TRANSPORT: u8 = 0;
+pub const END_RESET: u8 = 1;
+pub const END_CLOSED: u8 = 2;
+
+/// Fixed-size continuity payload lengths.
+pub const FLOW_ID_BYTES: usize = 16;
+pub const PAIR_PREPARE_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 1 + 1 + 32;
+pub const CHECKPOINT_BEGIN_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4 + 32;
+pub const CHECKPOINT_NEXT_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4;
+pub const CHECKPOINT_COMMIT_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4;
+pub const DELTA_APPLY_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4 + 32 + 1;
+pub const DELTA_ACK_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4;
+pub const QUIESCE_BEGIN_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4;
+pub const FLOW_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES;
+pub const CUT_IMPORT_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 32;
+pub const ACTIVATE_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4;
+pub const ABORT_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 1;
+pub const CONTINUITY_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 1 + 1;
+/// Largest checkpoint chunk a provider emits on `cont_out`.
+pub const CHECKPOINT_CHUNK_MAX: usize = 1024;
+
+/// Generic session-scoped error. Mirror of MSG_DG_ERROR for the
+/// control-plane surface.
+/// Payload:
+///   [session_id: 16 BE]
+///   [epoch:       4 LE]
+///   [errno:       i8]
+pub use super::super::super::registry::msg::session_ctrl::MSG_SC_ERROR;
+
+// ─── Payload layout helpers ────────────────────────────────────────
+
+/// Byte offset of the epoch field after the session_id prefix on any
+/// session-scoped message:
+///   `[session_id:16] [epoch:4] ...`
+pub const SESSION_HEADER: usize = SESSION_ID_BYTES + EPOCH_BYTES;
+
+/// Fixed-size ATTACH payload length: session_id + anchor_id + epoch +
+/// cc + suggested worker_id.
+pub const ATTACH_PAYLOAD_LEN: usize =
+    SESSION_ID_BYTES + ANCHOR_ID_BYTES + EPOCH_BYTES + 1 + WORKER_ID_BYTES;
+
+/// Fixed-size DETACH payload length: session_id + epoch + reason.
+pub const DETACH_PAYLOAD_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES + 1;
+
+/// Fixed-size DRAIN payload length: session_id + epoch + deadline_ms.
+pub const DRAIN_PAYLOAD_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES + 4;
+
+/// Fixed-size RESUME / RESUMED payload length: session_id + new_epoch.
+pub const RESUME_PAYLOAD_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES;
+
+/// Fixed-size EPOCH_BUMP payload length: session_id + old_epoch + new_epoch.
+pub const EPOCH_BUMP_PAYLOAD_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES + EPOCH_BYTES;
+
+/// Fixed-size RELOCATE payload length: session_id + epoch + new_worker_id.
+pub const RELOCATE_PAYLOAD_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES + WORKER_ID_BYTES;
+
+// ─── Typed accessors ───────────────────────────────────────────────
+//
+// The one place the session-scoped layouts are decoded and encoded. A
+// consumer that hand-rolls `from_le_bytes` against a literal offset is
+// invisible to review when a field widens, so anchors and workers read
+// and write these fields through the contract, never by offset. Every
+// accessor is bounds-checked: a short payload reads as zero, and a
+// short output buffer writes nothing.
+
+/// The `session_id` at the head of any session-scoped payload.
+#[inline]
+pub fn session_id(payload: &[u8]) -> &[u8] {
+    if payload.len() < SESSION_ID_BYTES {
+        &payload[..0]
+    } else {
+        &payload[..SESSION_ID_BYTES]
+    }
+}
+
+/// The epoch that follows the session id (`new_epoch` on RESUME).
+#[inline]
+pub fn epoch(payload: &[u8]) -> u32 {
+    if payload.len() < SESSION_HEADER {
+        return 0;
+    }
+    u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]])
+}
+
+/// The status byte on ATTACHED / IMPORT_BEGIN / IMPORT_END / RELOCATED /
+/// ERROR, or `STATUS_OK` on a payload too short to carry one.
+#[inline]
+pub fn status(payload: &[u8]) -> u8 {
+    if payload.len() <= SESSION_HEADER {
+        STATUS_OK
+    } else {
+        payload[SESSION_HEADER]
+    }
+}
+
+/// The epoch ATTACH carries, after the anchor id.
+#[inline]
+pub fn attach_epoch(payload: &[u8]) -> u32 {
+    let at = SESSION_ID_BYTES + ANCHOR_ID_BYTES;
+    if payload.len() < at + EPOCH_BYTES {
+        return 0;
+    }
+    u32::from_le_bytes([
+        payload[at],
+        payload[at + 1],
+        payload[at + 2],
+        payload[at + 3],
+    ])
+}
+
+/// The anchor id ATTACH carries.
+#[inline]
+pub fn attach_anchor_id(payload: &[u8]) -> &[u8] {
+    if payload.len() < SESSION_ID_BYTES + ANCHOR_ID_BYTES {
+        &payload[..0]
+    } else {
+        &payload[SESSION_ID_BYTES..SESSION_ID_BYTES + ANCHOR_ID_BYTES]
+    }
+}
+
+/// The `u32 LE` field after the session header: `total_len` on
+/// EXPORT_BEGIN, `offset` on EXPORT_CHUNK, `crc32` on EXPORT_END,
+/// `deadline_ms` on DRAIN.
+#[inline]
+pub fn u32_after_header(payload: &[u8]) -> u32 {
+    let at = SESSION_HEADER;
+    if payload.len() < at + 4 {
+        return 0;
+    }
+    u32::from_le_bytes([
+        payload[at],
+        payload[at + 1],
+        payload[at + 2],
+        payload[at + 3],
+    ])
+}
+
+/// The delivery cursors on EXPORT_BEGIN as their wire bytes (16, in
+/// field order), or `None` on a payload too short to carry them.
+#[inline]
+pub fn export_cursors(payload: &[u8]) -> Option<&[u8]> {
+    let at = SESSION_HEADER + 4;
+    if payload.len() < at + CURSOR_BYTES * 2 {
+        None
+    } else {
+        Some(&payload[at..at + CURSOR_BYTES * 2])
+    }
+}
+
+/// The chunk bytes on EXPORT_CHUNK.
+#[inline]
+pub fn export_chunk_data(payload: &[u8]) -> &[u8] {
+    let at = SESSION_HEADER + 4;
+    if payload.len() < at {
+        &payload[..0]
+    } else {
+        &payload[at..]
+    }
+}
+
+/// Write `[session_id:16][epoch:4 LE]` at the head of `out`. Returns the
+/// bytes written: `SESSION_HEADER`, or 0 when `out` is too short.
+#[inline]
+pub fn put_session_header(
+    out: &mut [u8],
+    session_id: &[u8; SESSION_ID_BYTES],
+    epoch: u32,
+) -> usize {
+    if out.len() < SESSION_HEADER {
+        return 0;
+    }
+    out[..SESSION_ID_BYTES].copy_from_slice(session_id);
+    out[SESSION_ID_BYTES..SESSION_HEADER].copy_from_slice(&epoch.to_le_bytes());
+    SESSION_HEADER
+}
+
+/// Write a `u32 LE` field after the session header (see `u32_after_header`).
+/// Returns the total payload length, or 0 when `out` is too short.
+#[inline]
+pub fn put_u32_after_header(out: &mut [u8], value: u32) -> usize {
+    let at = SESSION_HEADER;
+    if out.len() < at + 4 {
+        return 0;
+    }
+    out[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    at + 4
+}
+
+/// Write a status byte after the session header. Returns the total
+/// payload length, or 0 when `out` is too short.
+#[inline]
+pub fn put_status(out: &mut [u8], status: u8) -> usize {
+    if out.len() <= SESSION_HEADER {
+        return 0;
+    }
+    out[SESSION_HEADER] = status;
+    SESSION_HEADER + 1
+}
+
+/// Write a complete ATTACH payload. Returns `ATTACH_PAYLOAD_LEN`, or 0
+/// when `out` is too short.
+#[inline]
+pub fn put_attach(
+    out: &mut [u8],
+    session_id: &[u8; SESSION_ID_BYTES],
+    anchor_id: &[u8; ANCHOR_ID_BYTES],
+    epoch: u32,
+    cc: u8,
+    worker_hint: &[u8; WORKER_ID_BYTES],
+) -> usize {
+    if out.len() < ATTACH_PAYLOAD_LEN {
+        return 0;
+    }
+    out[..SESSION_ID_BYTES].copy_from_slice(session_id);
+    let mut at = SESSION_ID_BYTES;
+    out[at..at + ANCHOR_ID_BYTES].copy_from_slice(anchor_id);
+    at += ANCHOR_ID_BYTES;
+    out[at..at + EPOCH_BYTES].copy_from_slice(&epoch.to_le_bytes());
+    at += EPOCH_BYTES;
+    out[at] = cc;
+    at += 1;
+    out[at..at + WORKER_ID_BYTES].copy_from_slice(worker_hint);
+    ATTACH_PAYLOAD_LEN
+}

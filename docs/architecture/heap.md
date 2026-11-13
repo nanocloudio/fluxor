@@ -1,6 +1,6 @@
 # Per-Module Heap Allocation
 
-Source: `src/kernel/mem/heap.rs`, `modules/sdk/runtime/heap.rs`
+Source: `src/kernel/mem/heap.rs`, `crates/fluxor-rt/src/heap.rs`
 
 ## Overview
 
@@ -330,7 +330,7 @@ Three entries in the SyscallTable:
 
 ## SDK Helpers
 
-In `modules/sdk/runtime/heap.rs`:
+In `crates/fluxor-rt/src/heap.rs`:
 
 ```rust
 // Allocate from this module's heap

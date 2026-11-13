@@ -11,11 +11,7 @@
               tooling; the CLI uses the pack half"
 )]
 
-include!("../../modules/sdk/crypto/sha256.rs");
-include!("../../modules/sdk/wire/gpu_wire.rs");
-include!("../../modules/sdk/cores/gpu_pack.rs");
-include!("../../modules/sdk/cores/gpu_device.rs");
-include!("../../modules/sdk/cores/gpu_replay.rs");
+pub use fluxor_sdk::gpu::*;
 
 /// The replay provider's capability record, built from the same
 /// `encode_caps` the running provider answers with, over the same profile it

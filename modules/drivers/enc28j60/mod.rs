@@ -20,16 +20,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -40,15 +30,13 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::contracts::hal::spi::{
     OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs,
 };
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 mod constants;
 use constants::*;
@@ -65,7 +53,6 @@ enum Phase {
     Reset = 1,
     Configure = 2,
     Running = 3,
-    Error = 255,
 }
 
 #[repr(C)]
@@ -125,9 +112,8 @@ impl Enc28State {
 mod params_def {
     use super::p_u8;
     use super::Enc28State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         Enc28State;
 
         1, spi_bus, u8, 0
@@ -214,11 +200,6 @@ unsafe fn dev_spi_transfer_poll(sys: &SyscallTable, handle: i32) -> i32 {
     (sys.provider_call)(handle, DEV_SPI_TRANSFER_POLL, core::ptr::null_mut(), 0)
 }
 
-/// Poll SPI byte.
-unsafe fn dev_spi_poll_byte(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.provider_call)(handle, DEV_SPI_POLL_BYTE, core::ptr::null_mut(), 0)
-}
-
 // ============================================================================
 // ENC28J60 SPI helpers
 // ============================================================================
@@ -258,55 +239,6 @@ unsafe fn spi_write_byte(s: &Enc28State, byte: u8) -> i32 {
     }
 }
 
-/// Read a single byte via SPI (blocking)
-unsafe fn spi_read_byte(s: &Enc28State) -> i32 {
-    let sys = s.sys();
-    let result = dev_spi_poll_byte(sys, s.spi_handle);
-    if result >= 0x100 {
-        return result - 0x100;
-    }
-    if result == 0 {
-        let r = dev_spi_transfer_start(
-            sys,
-            s.spi_handle,
-            core::ptr::null(),
-            core::ptr::null_mut(),
-            1,
-            0xFF,
-        );
-        if r < 0 {
-            return r;
-        }
-        loop {
-            let poll = dev_spi_poll_byte(sys, s.spi_handle);
-            if poll >= 0x100 {
-                return poll - 0x100;
-            }
-            if poll < 0 {
-                return poll;
-            }
-        }
-    }
-    result
-}
-
-/// Write control register
-unsafe fn write_reg(s: &mut Enc28State, addr: u8, value: u8) {
-    cs_low(s);
-    spi_write_byte(s, ENC_WRITE_CTRL_REG | (addr & 0x1F));
-    spi_write_byte(s, value);
-    cs_high(s);
-}
-
-/// Read control register
-unsafe fn read_reg(s: &Enc28State, addr: u8) -> u8 {
-    cs_low(s);
-    spi_write_byte(s, ENC_READ_CTRL_REG | (addr & 0x1F));
-    let val = spi_read_byte(s);
-    cs_high(s);
-    val as u8
-}
-
 /// Soft reset the chip
 unsafe fn soft_reset(s: &Enc28State) {
     cs_low(s);
@@ -326,7 +258,7 @@ pub extern "C" fn module_state_size() -> u32 {
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-declare_module_state_bytes!(Enc28State);
+fluxor_rt::declare_module_state_bytes!(Enc28State);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -467,10 +399,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
             }
-
-            Phase::Error => {
-                return -1;
-            }
         }
 
         0
@@ -478,6 +406,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

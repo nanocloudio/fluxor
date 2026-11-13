@@ -1,6 +1,6 @@
 //! Preset loading for the sequencer.
 
-use super::{Sequencer, MAX_PRESETS, MAX_PRESET_LEN, MAX_SEQUENCE_LEN};
+use super::{Sequencer, MAX_SEQUENCE_LEN};
 
 /// Load presets from params into preset storage.
 pub unsafe fn load_preset(seq: &mut Sequencer, preset_index: u8) {

@@ -11,73 +11,15 @@
 //! a few milliseconds on bcm2712, run at most once per module load, which is
 //! well within the boot budget.
 
-// ChaCha20-Poly1305, mounted from the SDK's implementation rather than
-// copied.
-//
-// The kernel needs an AEAD for key sealing, and the SDK already has a
-// tested one — `no_std`, no external crates, with its own KATs. Copying it
-// would produce two implementations of the same primitive that could
-// diverge, and the one that diverged silently would be whichever had fewer
-// tests. Mounting the source keeps one implementation and one set of
-// vectors.
-//
-// `//` rather than `///`: the included file carries its own inner doc, and
-// an outer doc here would collide with it.
-#[allow(
-    dead_code,
-    reason = "the SDK file is one implementation shared by PIC modules and the \
-              kernel; the kernel uses the AEAD entry points and not every \
-              helper the module builds reach for"
-)]
-pub mod chacha20 {
-    //! ChaCha20 and ChaCha20-Poly1305 (RFC 8439).
-    //!
-    //! The SDK file expects `zeroize` in scope — the flat-`include!`
-    //! convention every PIC module uses, where `p256.rs` supplies it. This
-    //! wrapper provides it and includes the source, so the kernel gets the
-    //! same implementation without mounting a second P-256 beside its own.
-
-    /// Overwrite `buf`, volatile so the writes survive optimisation.
-    fn zeroize(buf: &mut [u8]) {
-        for b in buf.iter_mut() {
-            // SAFETY: `b` is a live, exclusively-borrowed byte.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-    }
-
-    include!("../../../../modules/sdk/crypto/chacha20.rs");
-}
-
-// AES-256-GCM, mounted from the SDK for the same reason as ChaCha20: one
-// implementation and one set of vectors. The vault offers it only where the
-// block cipher is constant-time (`AES_IS_CONSTANT_TIME`).
-#[allow(
-    dead_code,
-    reason = "the SDK file is one implementation shared by PIC modules and the \
-              kernel; the kernel uses the AEAD entry points and not every \
-              helper the module builds reach for"
-)]
-pub mod aes_gcm {
-    //! AES-128/256-GCM.
-
-    /// Overwrite `buf`, volatile so the writes survive optimisation.
-    fn zeroize(buf: &mut [u8]) {
-        for b in buf.iter_mut() {
-            // SAFETY: `b` is a live, exclusively-borrowed byte.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-    }
-
-    include!("../../../../modules/sdk/crypto/aes_gcm.rs");
-}
+// The AEADs, the hashes, ML-DSA and RSA are the SDK's, linked as a crate:
+// one implementation and one set of vectors for the kernel and every module.
+// P-256 and Ed25519 are the kernel's own until the SDK's fit RP2040 flash.
+#[cfg(feature = "rsa-vault")]
+pub use fluxor_sdk::crypto::rsa;
+/// SHA-512, from the SDK's SHA-384 file, which carries both (they differ
+/// only in IV and output truncation).
+pub use fluxor_sdk::crypto::sha384 as sha512;
+pub use fluxor_sdk::crypto::{aes_gcm, chacha20, ml_dsa, sha256, sha3};
 
 pub mod ed25519;
-// ml_dsa mounts the shared source with `sha3`'s SHAKE in scope, so it must
-// come after that module is declared.
-pub mod ml_dsa;
 pub mod p256;
-#[cfg(feature = "rsa-vault")]
-pub mod rsa;
-pub mod sha256;
-pub mod sha3;
-pub mod sha512;

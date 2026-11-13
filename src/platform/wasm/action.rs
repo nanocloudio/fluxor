@@ -35,7 +35,7 @@ extern "C" {
 /// One host action record: hash + value, little-endian.
 const RECORD_LEN: usize = 8;
 /// FMP message header: `[type: u32 LE][payload_len: u16 LE]` — matches
-/// `modules/sdk/runtime.rs::MSG_HDR_SIZE`.
+/// `crates/fluxor-rt/src/lib.rs::MSG_HDR_SIZE`.
 const FMP_HDR_LEN: usize = 6;
 
 #[repr(C)]

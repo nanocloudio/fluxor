@@ -1,6 +1,6 @@
 //! object_exchange — the exchange front of `storage.object`.
 //!
-//! An exchange PROVIDER (`modules/sdk/contracts/exchange.rs`): it answers
+//! An exchange PROVIDER (`crates/fluxor-abi/src/contracts/exchange.rs`): it answers
 //! each request on `request_in` by reading or writing objects through the
 //! `storage.object` provider the graph binds, and writes the answers to
 //! `response_out`. A graph that wires its requester to this module reaches
@@ -42,25 +42,13 @@
 //! The surface — targets, headers, statuses, limits — is in `README.md`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::exchange as ex;
 use abi::contracts::mesh::capability as cap;
@@ -195,7 +183,12 @@ enum Phase {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum Authority {
-    /// No capability was given: every call names no grant (`-1`).
+    /// No capability was given: every call names no grant (`-1`). The
+    /// zeroed state block is this value, so nothing constructs it by name.
+    #[allow(
+        dead_code,
+        reason = "the zeroed state block holds it; no code names it"
+    )]
     None = 0,
     /// The capability is presented and the store has not decided: asked
     /// again, with the same request, on every step until it does. Requests
@@ -370,10 +363,10 @@ struct State {
 
 mod params_def {
     use super::State;
-    use super::SCHEMA_MAX;
+
     use super::{cap, SCOPE_MAX};
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
         // The key prefix the capability grants, ending `/`.
         1, scope, str, 0 => |s, d, len| {
@@ -686,7 +679,7 @@ fn status_of(rc: i32, write: bool) -> u16 {
 
 // ── Entry points ──────────────────────────────────────────────────────────
 
-declare_module_state_bytes!(State);
+fluxor_rt::declare_module_state_bytes!(State);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]

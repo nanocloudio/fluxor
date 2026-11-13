@@ -6,7 +6,7 @@
 //! `pointer_id` and the shim emits events for all active pointers.
 //!
 //! Wire shape on `pointer.events`:
-//!   `modules/sdk/contracts/input/pointer.rs::MSG_EVENT` —
+//!   `crates/fluxor-abi/src/contracts/input/pointer.rs::MSG_EVENT` —
 //!   16-byte records (msg_type / pointer_id / event_kind / buttons /
 //!   modifiers / pressure / x:i16 / y:i16).
 //!

@@ -10,7 +10,7 @@ whole idea; everything below is mechanism.
 
 ## What goes into it
 
-Source: `modules/sdk/abi_surface.rs`, `tools/src/hash.rs`.
+Source: `crates/fluxor-abi/src/abi_surface.rs`, `tools/src/hash.rs`.
 
 ```
 digest = sha256( "semantic_epoch"\0 SEMANTIC_EPOCH
@@ -20,8 +20,8 @@ digest = sha256( "semantic_epoch"\0 SEMANTIC_EPOCH
 
 Every ABI number — contract ids, opcodes, permission bits, errno, poll bits,
 ioctl commands, fd tags — is declared once, in
-`modules/sdk/abi/registry.toml`. `fluxor abi-regen` generates
-`modules/sdk/abi/registry_gen.rs` from it, and that generated file is one of
+`crates/fluxor-abi/registry/registry.toml`. `fluxor abi-regen` generates
+`crates/fluxor-abi/src/registry.rs` from it, and that generated file is one of
 the sources `CONTRACTS_PLATFORM_SRC_HASH` covers, so a number change moves the
 digest exactly as a layout change does. A retired number is simply gone.
 `SEMANTIC_EPOCH`, also in the registry, moves the digest when a meaning
@@ -30,8 +30,8 @@ changes without a number changing.
 The source hash is token-based (`canonicalize_source` in
 `tools/src/hash.rs`): each file is tokenised and the token stream is hashed,
 so comments and formatting do not move it, but every identifier, literal, and
-punctuation token does. This over-approximates: adding a private helper under
-`modules/sdk/` moves the digest even though no wire byte changed. That trade
+punctuation token does. This over-approximates: adding a private helper in
+`crates/fluxor-abi/` moves the digest even though no wire byte changed. That trade
 is deliberate: a narrower hash over public API shape would add
 false-negative risk to the one mechanism that stops an incompatible module
 loading, and the cost of an over-wide move is one re-sync per sibling, not
@@ -39,7 +39,7 @@ one per change.
 
 ## The two constants are not two copies
 
-Source: `modules/sdk/abi_surface_srcpin.rs`.
+Source: `crates/fluxor-abi/src/abi_surface/srcpin.rs`.
 
 `CONTRACTS_PLATFORM_SRC_HASH` and `ABI_SURFACE_DIGEST` live adjacent in
 `abi_surface_srcpin.rs`, which makes them look like a pair. They are an input
@@ -62,7 +62,7 @@ artefacts that attest a surface nobody has.
 ## Where the digest ends up
 
 ```
-                    modules/sdk/abi_surface.rs
+                    crates/fluxor-abi/src/abi_surface.rs
                     (constants + src hash)
                               │
                       fluxor abi-regen
@@ -139,7 +139,7 @@ different questions. Confusing two of them is the usual source of surprise:
 | Digest | Question it answers | Moves when |
 |---|---|---|
 | ABI surface digest (`io.fluxor.abi-surface`, "the epoch") | Can these bytes interoperate? | the module↔kernel interface changes |
-| `CONTRACTS_PLATFORM_SRC_HASH` | — (an input to the epoch, never consulted alone) | any token under `modules/sdk/` or `contracts/src/` |
+| `CONTRACTS_PLATFORM_SRC_HASH` | — (an input to the epoch, never consulted alone) | any token under `crates/fluxor-abi/src/` or `contracts/src/` (`fluxor-sdk` and `fluxor-rt` are library code and are not hashed) |
 | input digest (`io.fluxor.input-digest`) | Are these bytes current? | any source the artefact is built from changes |
 | content address (lock `content` field) | Do two manifests deliver the same artefact? | the layer bytes change |
 | provenance record (store `provenance/` table) | Where did these bytes come from? | never — it is appended to, and lives BESIDE the manifest so re-stamping it cannot move the digest |
@@ -164,7 +164,7 @@ changed.
 ## How a change propagates
 
 ```
-edit modules/sdk/** or contracts/src/**
+edit crates/fluxor-abi/** or contracts/src/**
   → fluxor abi-regen            (rewrites the two pin sites)
   → cargo build                 (tools pick up the new constant)
   → fluxor publish              (artefacts stamped at the new epoch)

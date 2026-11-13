@@ -832,7 +832,9 @@ dependencies = [
  "critical-section",
  "cryptoki",
  "env_logger",
+ "fluxor-abi",
  "fluxor-contracts",
+ "fluxor-sdk",
  "image",
  "libc",
  "log",
@@ -869,6 +871,7 @@ dependencies = [
 name = "fluxor-rig-observers"
 version = "0.0.1"
 dependencies = [
+ "fluxor-sdk",
  "futures-util",
  "rustls",
  "serde",
@@ -878,8 +881,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxor-rt"
+version = "0.0.1"
+dependencies = [
+ "fluxor-abi",
+ "fluxor-sdk",
+]
+
+[[package]]
 name = "fluxor-sdk"
 version = "0.0.1"
+dependencies = [
+ "fluxor-abi",
+]
 
 [[package]]
 name = "fluxor-tools"
@@ -888,6 +902,7 @@ dependencies = [
  "clap",
  "fluxor-abi",
  "fluxor-contracts",
+ "fluxor-rt",
  "fluxor-sdk",
  "libc",
  "log",

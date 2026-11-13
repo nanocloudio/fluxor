@@ -8,7 +8,6 @@ use super::abi::kernel_abi::timer as dev_timer;
 use super::constants::*;
 use super::gspi;
 use super::Cyw43State;
-use super::SyscallTable;
 
 /// Get monotonic time in milliseconds via provider_call.
 unsafe fn get_millis(s: &Cyw43State) -> u64 {

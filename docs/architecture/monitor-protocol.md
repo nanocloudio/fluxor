@@ -6,7 +6,7 @@ on RP targets, UART on Pi 5). A host-side parser tails those lines,
 aggregates them into per-module rows, and renders an ANSI table.
 
 Source: `tools/src/monitor.rs` (host parser), `src/kernel/exec/step_guard.rs`
-(fault emission), `modules/sdk/runtime/telemetry.rs` (session emission).
+(fault emission), `crates/fluxor-rt/src/telemetry.rs` (session emission).
 
 ## Transport
 
@@ -134,7 +134,7 @@ directories at every `SessionCtrlV1` state transition (see
 [protocol_surfaces.md](protocol_surfaces.md)) so operators can see attach,
 rebind, drain, epoch bump, relocation, and stale-generation rejection on
 the same telemetry channel as the rest of monitor output. The emission
-helpers live in `modules/sdk/runtime/telemetry.rs`; `echo_anchor` and
+helpers live in `crates/fluxor-rt/src/telemetry.rs`; `echo_anchor` and
 `echo_worker` are the in-tree emitters.
 
 ```
@@ -177,7 +177,7 @@ session across emitters.
 | `error`      | any                   | `MSG_SC_ERROR` emitted. `status=<code>`.                            |
 
 Reasons (from the `DETACH_*` constants in
-`modules/sdk/contracts/net/session_ctrl.rs`): `normal`, `drain_timeout`,
+`crates/fluxor-abi/src/contracts/net/session_ctrl.rs`): `normal`, `drain_timeout`,
 `stale_epoch`, `error`, `client_gone`.
 
 Status codes (from the `STATUS_*` constants): `ok`, `stale_epoch`,
@@ -284,7 +284,7 @@ Status codes: `ok`, `underflow`, `overflow`, `missed_present`,
 
 ## Kernel support
 
-Source: `modules/sdk/internal/monitor.rs`.
+Source: `crates/fluxor-abi/src/internal/monitor.rs`.
 
 - `FAULT_MONITOR_SUBSCRIBE` (`0x2152`) — bind an event handle that the
   kernel signals on every fault.

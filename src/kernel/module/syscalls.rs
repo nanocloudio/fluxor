@@ -55,7 +55,7 @@ const E_NOSYS: i32 = errno::ENOSYS;
 // Syscall Table
 // ============================================================================
 
-static mut SYSCALL_TABLE: SyscallTable = SyscallTable::empty();
+static mut SYSCALL_TABLE: SyscallTable = empty_syscall_table();
 
 pub fn set_syscall_table(table: SyscallTable) {
     // SAFETY: called once during boot (kernel::boot -> init_syscall_table)
@@ -935,7 +935,7 @@ pub mod permission {
 /// Classify an opcode into its required permission category.
 /// Returns `None` for implicit primitives (every module may call them).
 /// Opcode → category is authoritative: when a new opcode is added in
-/// `modules/sdk/internal/*` or `modules/sdk/platform/*`, it must be
+/// `crates/fluxor-abi/src/internal/*` or `crates/fluxor-abi/src/platform/*`, it must be
 /// classified here or it falls through to `PLATFORM_RAW` (most
 /// restrictive, avoiding accidental privilege leakage).
 fn privileged_op_permission(op: u32) -> Option<u16> {
@@ -2543,28 +2543,27 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
 }
 
 // ============================================================================
-// Syscall Table Stubs (for SyscallTable::empty())
+// Syscall Table Stubs (for `empty_syscall_table`)
 // ============================================================================
 
-impl SyscallTable {
-    pub const fn empty() -> Self {
-        Self {
-            version: ABI_VERSION,
-            telemetry_enabled: core::ptr::null(),
-            channel_read: stub_channel_read,
-            channel_write: stub_channel_write,
-            channel_poll: stub_channel_poll,
-            heap_alloc: stub_heap_alloc,
-            heap_free: stub_heap_free,
-            heap_realloc: stub_heap_realloc,
-            provider_open: stub_provider_open,
-            provider_call: stub_provider_call,
-            provider_query: stub_provider_query,
-            provider_close: stub_provider_close,
-            channel_peek: stub_channel_peek,
-            provider_call_sel: stub_provider_call_sel,
-            channel_discard: stub_channel_discard,
-        }
+/// The table before boot installs the real one: every entry refuses.
+pub const fn empty_syscall_table() -> SyscallTable {
+    SyscallTable {
+        version: ABI_VERSION,
+        telemetry_enabled: core::ptr::null(),
+        channel_read: stub_channel_read,
+        channel_write: stub_channel_write,
+        channel_poll: stub_channel_poll,
+        heap_alloc: stub_heap_alloc,
+        heap_free: stub_heap_free,
+        heap_realloc: stub_heap_realloc,
+        provider_open: stub_provider_open,
+        provider_call: stub_provider_call,
+        provider_query: stub_provider_query,
+        provider_close: stub_provider_close,
+        channel_peek: stub_channel_peek,
+        provider_call_sel: stub_provider_call_sel,
+        channel_discard: stub_channel_discard,
     }
 }
 

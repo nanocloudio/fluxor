@@ -5,11 +5,10 @@
 // IMPORTANT: sample_rate must be first — step_ms depends on it for
 // computing step_frames.
 
-use super::SCHEMA_MAX;
-use super::{p_u16, p_u32, p_u8, read_u16_at};
+use super::{p_u16, p_u32, p_u8};
 use super::{SeqMode, Sequencer, MAX_PRESETS, MAX_PRESET_LEN};
 
-define_params! {
+fluxor_rt::define_params! {
     Sequencer;
 
     1, sample_rate, u32, 8000

@@ -11,16 +11,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -31,12 +21,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 /// Maximum line length before forcing a flush.
 const LINE_MAX: usize = 128;
@@ -80,9 +68,8 @@ struct FsTapState {
 
 mod params_def {
     use super::FsTapState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         FsTapState;
 
         1, path, str, 0
@@ -129,7 +116,7 @@ unsafe fn flush_line(s: &mut FsTapState) {
     s.fill = 0;
 }
 
-declare_module_state_bytes!(FsTapState);
+fluxor_rt::declare_module_state_bytes!(FsTapState);
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -320,4 +307,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

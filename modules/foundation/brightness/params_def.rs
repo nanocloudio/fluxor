@@ -1,8 +1,7 @@
 use super::BrightnessState;
-use super::SCHEMA_MAX;
 use super::{p_u16, p_u8};
 
-define_params! {
+fluxor_rt::define_params! {
     BrightnessState;
 
     1, mode, u8, 0, enum { sequencer=0, audio=1 }

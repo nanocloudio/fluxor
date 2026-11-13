@@ -106,7 +106,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "trust.system",
     "replication.state_machine",
     // The ordered-ack terms of the exchange contract
-    // (`modules/sdk/contracts/exchange.rs`): publish requests in order, each
+    // (`crates/fluxor-abi/src/contracts/exchange.rs`): publish requests in order, each
     // answered 200 once durably accepted, and — for a provider that answers
     // with data — a response body on the same exchange.
     //
@@ -129,7 +129,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // `stream.publish` generalises `stream.ordered_ack`. The narrower name
     // is a capability of its own rather than a fact on this one, because it
     // additionally promises the durable-acceptance terms in
-    // `modules/sdk/contracts/exchange.rs` — LINK records and re-issue after
+    // `crates/fluxor-abi/src/contracts/exchange.rs` — LINK records and re-issue after
     // LINK DOWN, which is NOT a plain call. `stream.publish` is
     // the substitutable fire-and-collect surface a pipeline stage or a
     // program binds. A provider may declare both.
@@ -483,7 +483,7 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
         // `PORT_SCOPED_CAPABILITIES`.
         //
         // What flows is described in-band by the stream's own `STREAM` record
-        // (`modules/sdk/contracts/encoded.rs`) — a demuxer's codec is whatever
+        // (`crates/fluxor-abi/src/contracts/encoded.rs`) — a demuxer's codec is whatever
         // the file holds. These facts are the BUILD-time half: a port that can
         // only carry some codecs says which, and the composer refuses a
         // producer that may send one the consumer cannot take.
@@ -514,7 +514,7 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
 //
 // The codec and packing names of the encoded surfaces. Both tables are
 // POSITIONAL: an entry's index is the byte a `STREAM` record carries
-// (`modules/sdk/contracts/encoded.rs`, whose constants are pinned against
+// (`crates/fluxor-abi/src/contracts/encoded.rs`, whose constants are pinned against
 // these tables). Appending is safe; reordering or removing is a wire break.
 //
 // A codec is admitted when an implementation in the ecosystem produces or
@@ -551,7 +551,7 @@ pub const AUDIO_PACKINGS: FactValues = &["raw", "framed"];
 pub const VIDEO_PACKINGS: FactValues = &["raw", "annexb", "length_prefixed"];
 
 // The glyph pack formats: how a pack's strikes encode glyph bitmaps
-// (`modules/sdk/contracts/glyph_pack.rs`, whose `FORMAT_*` bytes are pinned
+// (`crates/fluxor-abi/src/contracts/glyph_pack.rs`, whose `FORMAT_*` bytes are pinned
 // against this table). POSITIONAL, like `CODECS`: a pack carries its format
 // byte in band and a consumer refuses a variant it cannot draw. Admitted as
 // codecs are: `font_bake` produces both, and a text producer consumes them.

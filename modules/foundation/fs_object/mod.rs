@@ -100,30 +100,18 @@
 //! subscription, and of the namespace surface only `LIST` and `CAPS`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::contracts::storage::fs;
 use abi::contracts::storage::namespace as ns;
 use abi::contracts::storage::object as obj;
 use abi::fence::Fence;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
-include!("../../sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+pub use fluxor_sdk::crypto::sha256::*;
 
 // ── errno ─────────────────────────────────────────────────────────────
 
@@ -308,7 +296,7 @@ struct State {
 
 mod params_def {
     use super::*;
-    define_params! {
+    fluxor_rt::define_params! {
         State;
         1, root, str, 0 => |s, d, len| {
             if len > ROOT_MAX {
@@ -1546,7 +1534,7 @@ fn op_ns_list(s: &mut State, a: &[u8]) -> i32 {
 
 // ── module ABI ────────────────────────────────────────────────────────
 
-declare_module_state_bytes!(State);
+fluxor_rt::declare_module_state_bytes!(State);
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
@@ -1692,4 +1680,4 @@ pub unsafe extern "C" fn fs_object_dispatch(
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

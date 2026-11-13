@@ -88,15 +88,7 @@ pub(crate) struct SvcCopy {
     pub n_be: u16,
 }
 
-impl SvcCopy {
-    pub(crate) const EMPTY: SvcCopy = SvcCopy {
-        svcs: core::ptr::null_mut(),
-        backends: core::ptr::null_mut(),
-        index: core::ptr::null_mut(),
-        n_svc: 0,
-        n_be: 0,
-    };
-}
+impl SvcCopy {}
 
 /// Size both copies from the tables this instance holds.
 pub(crate) unsafe fn size(s: &mut IpState) -> bool {

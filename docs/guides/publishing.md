@@ -44,7 +44,7 @@ project index (`fluxor/meta`) lists:
 
 | Artefact | Content | Tag |
 |---|---|---|
-| SDK source tree | canonical tar of `modules/sdk/**` mapped under a `sdk/` path prefix — everything a `#[path]`/`include!` consumer reads; extraction preserves `target/fluxor/fluxor-abi/sdk/abi.rs` | `fluxor/src/fluxor-abi:<ver>` |
+| Module crate source trees | canonical tars of `crates/fluxor-abi/**`, `crates/fluxor-sdk/**` and `crates/fluxor-rt/**`, unprefixed; `fluxor sync` extracts each to `target/fluxor/<name>/`, where `fluxor modules build` compiles it to the rlib every module links | `fluxor/src/fluxor-abi:<ver>`, `fluxor/src/fluxor-sdk:<ver>`, `fluxor/src/fluxor-rt:<ver>` |
 | Contracts source tree | canonical tar of `contracts/src/**` mapped under a `src/` path prefix | `fluxor/src/fluxor-contracts:<ver>` |
 | fmod palette | compiled `.fmod` + manifest for every module this repo owns (every tier under `modules/`), per declared module ABI shelf | `<abi>/<name>:<ver>` |
 | Runtimes | `fluxor-linux` and the `fluxor` CLI itself, one binary layer per host triple | `fluxor/run/<name>-<triple>:<ver>` |
@@ -304,7 +304,7 @@ make build && make publish  # fluxor build, then fluxor publish
   `fluxor update`, which also pins every stack and bundle the project
   references by name.
 - **SDK edits flow the same way.** Source trees are artefacts:
-  editing `modules/sdk/abi.rs` and publishing repoints
+  editing `crates/fluxor-abi/src/lib.rs` and publishing repoints
   `fluxor/src/fluxor-abi:latest`; the consumer's next sync
   re-materialises `target/fluxor/fluxor-abi/` from the new digest.
 

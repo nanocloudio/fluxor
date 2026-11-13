@@ -324,12 +324,7 @@ fn parse(asm: &str, isa: Isa) -> HashMap<String, Function> {
                     }
                 }
                 "mov" if operands.starts_with("pc,") => pending_register_branch = true,
-                "b" | "cbz" | "cbnz" => {
-                    let tgt = target(&operands);
-                    if names.contains(tgt.as_str()) {
-                        f.tail_calls.push(tgt);
-                    }
-                }
+                "b" | "cbz" | "cbnz" => tail_call(f, &operands),
                 _ => {}
             },
             Isa::Aarch64 => match op {
@@ -353,12 +348,7 @@ fn parse(asm: &str, isa: Isa) -> HashMap<String, Function> {
                 "bl" => call(f, &operands),
                 "blr" => f.indirect = true,
                 "br" => pending_register_branch = true,
-                "b" | "cbz" | "cbnz" | "tbz" | "tbnz" => {
-                    let tgt = target(&operands);
-                    if names.contains(tgt.as_str()) {
-                        f.tail_calls.push(tgt);
-                    }
-                }
+                "b" | "cbz" | "cbnz" | "tbz" | "tbnz" => tail_call(f, &operands),
                 _ => {}
             },
         }
@@ -376,6 +366,25 @@ fn call(f: &mut Function, operands: &str) {
     if !tgt.starts_with(".L") {
         f.calls.push(tgt);
     }
+}
+
+/// A branch out of the function is a tail call, wherever it lands: a target
+/// the walk cannot find is refused as an unknown call is, never skipped, so
+/// a callee missing from the assembly cannot take its depth with it. A
+/// branch to a local label (`.L…`, or an inline-asm `1b` / `2f`) stays in
+/// the function.
+fn tail_call(f: &mut Function, operands: &str) {
+    let tgt = target(operands);
+    if !is_local_label(&tgt) {
+        f.tail_calls.push(tgt);
+    }
+}
+
+fn is_local_label(label: &str) -> bool {
+    label.starts_with(".L")
+        || label
+            .strip_suffix(['b', 'f'])
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A branch through a register leaves the function unless it is the

@@ -20,16 +20,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -40,17 +30,15 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
+use fluxor_rt::*;
 
 // A module's run state, as the verdict line names it; 3 and beyond are
 // terminated.
-name_table!(STATE_NAMES = [b"running", b"faulted", b"recovering", b"terminated"]);
-name_table!(PROTECTION_NAMES = [b"none", b"guarded", b"contained", b"isolated"]);
-include!("../../sdk/runtime/params.rs");
+fluxor_rt::name_table!(STATE_NAMES = [b"running", b"faulted", b"recovering", b"terminated"]);
+fluxor_rt::name_table!(PROTECTION_NAMES = [b"none", b"guarded", b"contained", b"isolated"]);
 
 // Opcodes imported from the layered ABI — no hardcoded numbers here.
 use abi::internal::monitor::{
@@ -106,9 +94,8 @@ impl MonitorState {
 mod params_def {
     use super::p_u32;
     use super::MonitorState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         MonitorState;
 
         1, interval_ms, u32, 5000
@@ -290,7 +277,7 @@ pub extern "C" fn module_state_size() -> u32 {
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-declare_module_state_bytes!(MonitorState);
+fluxor_rt::declare_module_state_bytes!(MonitorState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -416,6 +403,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

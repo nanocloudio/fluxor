@@ -6,7 +6,7 @@
 //! queue; this module drains that queue into the configured output channel.
 //!
 //! Wire shape on the output port:
-//!   `modules/sdk/contracts/input/surface_traits.rs::MSG_TRAITS` —
+//!   `crates/fluxor-abi/src/contracts/input/surface_traits.rs::MSG_TRAITS` —
 //!   24-byte records (content type `SurfaceTraits`).
 //!
 //! Host shim contract: `host_surface_traits_pop(buf, len)` returns one

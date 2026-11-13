@@ -22,16 +22,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -42,12 +32,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::telemetry as tlm;
 
@@ -58,15 +46,23 @@ use abi::contracts::telemetry as tlm;
 /// `encoding` param at `module_new` rather than silently falling back. Host
 /// tests always compile the full surface.
 #[cfg(any(feature = "otlp", feature = "host-test"))]
+#[allow(
+    dead_code,
+    reason = "the encoder core is held whole to its host tests; this module sends metrics documents, not spans"
+)]
 mod otlp {
-    include!("../../sdk/cores/otlp_json.rs");
+    include!("otlp_json.rs");
 }
 
 /// OTLP/protobuf encoder core — the binary sibling of `otlp`, for the
 /// `otlp-proto` encoding (a gRPC/HTTP client posts these bytes to `/v1/metrics`).
 #[cfg(any(feature = "otlp", feature = "host-test"))]
+#[allow(
+    dead_code,
+    reason = "the encoder core is held whole to its host tests; this module sends metrics documents, not spans"
+)]
 mod otlp_pb {
-    include!("../../sdk/cores/otlp_proto.rs");
+    include!("otlp_proto.rs");
 }
 
 /// Raw records staged between flushes.
@@ -218,10 +214,10 @@ impl OtelState {
 
 mod params_def {
     use super::OtelState;
-    use super::SCHEMA_MAX;
+
     use super::{p_u32, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         OtelState;
         3, flush_ms, u32, 1000 => |s, d, len| { s.flush_ms = p_u32(d, len, 0, 1000); };
         4, encoding, u8, 2 => |s, d, len| { s.encoding = p_u8(d, len, 0, 2); };
@@ -305,6 +301,7 @@ fn parse_bounds_blob(s: &mut OtelState, raw: &[u8]) {
 
 /// Copyable view of the bounds table, so the encode fns can take it alongside
 /// a `&mut` borrow of the output buffer (disjoint from the state fields).
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 #[derive(Clone, Copy)]
 struct BoundsView<'a> {
     rows: u8,
@@ -314,17 +311,8 @@ struct BoundsView<'a> {
     us: &'a [[u32; BOUNDS_MAX]; BOUNDS_ROWS],
 }
 
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 impl<'a> BoundsView<'a> {
-    fn of(s: &'a OtelState) -> Self {
-        BoundsView {
-            rows: s.bounds_rows,
-            modules: &s.bounds_mod,
-            ids: &s.bounds_id,
-            ns: &s.bounds_n,
-            us: &s.bounds_us,
-        }
-    }
-
     /// Declared bounds (µs, ascending) for `(module, id)`, or `None`.
     fn find(&self, module: u16, id: u16) -> Option<&'a [u32]> {
         let mut r = 0usize;
@@ -339,6 +327,7 @@ impl<'a> BoundsView<'a> {
 }
 
 /// Write `v` as decimal digits into `out`. Returns the byte length.
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 fn write_u16_dec(mut v: u16, out: &mut [u8]) -> usize {
     let mut tmp = [0u8; 5];
     let mut n = 0;
@@ -362,6 +351,7 @@ fn write_u16_dec(mut v: u16, out: &mut [u8]) -> usize {
 /// Format a synthetic metric name `m<module>.<id>` into `out`. The device holds
 /// no id-table; a host collector resolves `(module, id) -> name`. Returns the
 /// byte length.
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 fn synthetic_name(module: u16, id: u16, out: &mut [u8]) -> usize {
     let mut pos = 0usize;
     if pos < out.len() {
@@ -804,7 +794,7 @@ fn write_frame_header(buf: &mut [u8], payload_len: usize) {
     buf[2] = len[1];
 }
 
-declare_module_state_bytes!(OtelState);
+fluxor_rt::declare_module_state_bytes!(OtelState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
@@ -893,4 +883,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

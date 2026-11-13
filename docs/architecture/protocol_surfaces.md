@@ -8,12 +8,12 @@ directory) that sit above them. It is the reference that modules,
 manifests, and graph configs use for protocol-surface vocabulary.
 
 Every surface is a channel contract under
-`modules/sdk/contracts/net/`. The kernel does not learn any of them:
+`crates/fluxor-abi/src/contracts/net/`. The kernel does not learn any of them:
 protocol state lives entirely in modules.
 
 ## The Contract Files
 
-Source: `modules/sdk/contracts/net/`.
+Source: `crates/fluxor-abi/src/contracts/net/`.
 
 | File | Surface | Opcodes | Status |
 |------|---------|---------|--------|
@@ -25,7 +25,7 @@ Source: `modules/sdk/contracts/net/`.
 | `mux.rs` | multiplexed session | `0xB0..0xCF` | live: `quic`, `mux_echo` fixture |
 | `peer_identity.rs` | peer identity | `0xC8` (also `mux`'s peer-identity record) | live: `tls`, `quic` |
 
-The exchange contract (`modules/sdk/contracts/exchange.rs`, see
+The exchange contract (`crates/fluxor-abi/src/contracts/exchange.rs`, see
 `exchange.md`) carries no row and holds no opcodes. It is an
 application-effect surface rather than a transport — one request and its
 answer between any requester and any provider — and its records are not
@@ -35,7 +35,7 @@ in the table and needs no disjoint range.
 
 Every row in the table shares the 3-byte TLV header `[msg_type: u8][len: u16 LE]`,
 so the `net_read_frame` / `net_write_frame` helpers in
-`modules/sdk/runtime/net.rs` work unchanged on all of them.
+`crates/fluxor-rt/src/net.rs` work unchanged on all of them.
 
 `contracts/net/ws_frame.rs` lives in that directory too and
 deliberately carries no row: it defines a connection-addressed envelope
@@ -44,7 +44,7 @@ message-type range, so it holds no opcodes and the TLV helpers do not apply
 to it.
 
 Every message type of every surface in the table is declared once, in the
-ABI registry's `net_tlv` msgset (`modules/sdk/abi/registry.toml`), and the
+ABI registry's `net_tlv` msgset (`crates/fluxor-abi/registry/registry.toml`), and the
 generator refuses two members taking one value: a channel that carries
 several surfaces, or a mis-wired one, cannot misparse.
 
@@ -52,7 +52,7 @@ several surfaces, or a mis-wired one, cannot misparse.
 
 ### Stream Surface
 
-Contract: `modules/sdk/contracts/net/net_proto.rs`. Full opcode and
+Contract: `crates/fluxor-abi/src/contracts/net/net_proto.rs`. Full opcode and
 payload reference: `network.md`.
 
 Ordered byte streams: TCP, TLS-over-TCP, HTTP/1.x, MQTT, WebSocket
@@ -82,7 +82,7 @@ dials.
 
 ### Datagram Surface
 
-Contract: `modules/sdk/contracts/net/datagram.rs`.
+Contract: `crates/fluxor-abi/src/contracts/net/datagram.rs`.
 
 Message-oriented transports: UDP, DTLS, DNS, telemetry. Endpoints are
 provider-allocated one-byte handles (`ep_id`), and the source address
@@ -117,7 +117,7 @@ consumer sharing the channel.
 
 ### Packet Surface
 
-Contract: `modules/sdk/contracts/net/packet.rs`.
+Contract: `crates/fluxor-abi/src/contracts/net/packet.rs`.
 
 Packet-preserving flows with richer metadata: packet classifiers,
 policy modules, NIC fast paths. The endpoint verbs are an envelope no
@@ -247,7 +247,7 @@ that consumer itself.
 
 ### Multiplexed Session Surface
 
-Contract: `modules/sdk/contracts/net/mux.rs`.
+Contract: `crates/fluxor-abi/src/contracts/net/mux.rs`.
 
 Transports exposing many logical streams over one association. This
 keeps QUIC-class transports off a false TCP-shaped abstraction: a
@@ -294,7 +294,7 @@ not take whole is left unacknowledged, so the peer sends it again.
 
 ### Session Control Sideband
 
-Contract: `modules/sdk/contracts/net/session_ctrl.rs`. See
+Contract: `crates/fluxor-abi/src/contracts/net/session_ctrl.rs`. See
 §SessionCtrl Envelope for the opcode table.
 
 The control plane between transport anchors, session workers, and
@@ -310,7 +310,7 @@ it owns — see `network.md` §Transport Continuity.
 
 Sources: `tools/src/config/validate.rs`,
 `tools/src/config/manifest.rs` (`CONTINUITY_CLASSES`),
-`modules/sdk/contracts/net/session_ctrl.rs` (`CC_*` wire constants).
+`crates/fluxor-abi/src/contracts/net/session_ctrl.rs` (`CC_*` wire constants).
 
 Session continuity is a declared, validated graph property. A graph
 declares the class its workload requires in a top-level `continuity`
@@ -468,8 +468,8 @@ provisional binding), never competing durable ownership.
 
 ## Session Identity Model
 
-Source: `modules/sdk/contracts/net/session_ctrl.rs`,
-`modules/sdk/contracts/net/net_proto.rs`.
+Source: `crates/fluxor-abi/src/contracts/net/session_ctrl.rs`,
+`crates/fluxor-abi/src/contracts/net/net_proto.rs`.
 
 Four identifiers at three scopes:
 
@@ -506,7 +506,7 @@ as a continuity record stream, are typed `OctetStream`.
 
 ## SessionCtrl Envelope
 
-Source: `modules/sdk/contracts/net/session_ctrl.rs`.
+Source: `crates/fluxor-abi/src/contracts/net/session_ctrl.rs`.
 
 The session-scoped layouts are read and written through the contract's
 typed accessors (`session_id`, `epoch`, `status`, `export_cursors`,
@@ -564,7 +564,7 @@ other per-module visibility. The line format is specified in
 `monitor-protocol.md`: one line per transition, with `session=`
 rendered as 32 big-endian hex characters so a single grep follows a
 session across all emitters. The fixtures emit via the
-`dev_mon_session` SDK helper (`modules/sdk/runtime/telemetry.rs`) and
+`dev_mon_session` SDK helper (`crates/fluxor-rt/src/telemetry.rs`) and
 the `SELF_INDEX` syscall.
 
 Event constants for replicated-state failover (`fence_initiated` /
@@ -754,7 +754,7 @@ quiet is admitted only when it is declared on another one.
 
 ## Shared Continuity Cores
 
-Source: `modules/sdk/cores/`.
+Source: `crates/fluxor-sdk/src/cores/`.
 
 Reusable continuity logic lives in cores that modules mount with
 `include!`:

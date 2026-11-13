@@ -1566,7 +1566,7 @@ fn cmd_graph_image(
     verbose: bool,
 ) -> Result<()> {
     // The graph-image header, as the kernel and `graph_slot` read it
-    // (`modules/sdk/platform/rp/flash_layout.rs`, `GRAPH_SLOT_*`; an RP
+    // (`crates/fluxor-abi/src/platform/rp/flash_layout.rs`, `GRAPH_SLOT_*`; an RP
     // flash A/B slot holds exactly this format).
     use crate::modules::sdk_layout::flash_layout as fl;
     const HEADER_SIZE: usize = fl::GRAPH_SLOT_HEADER_SIZE;

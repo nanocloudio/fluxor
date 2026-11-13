@@ -18,7 +18,7 @@ Two delivery paths exist:
 ## The Graph Image
 
 Source: `tools/src/cli/commands_a.rs` (writer),
-`modules/sdk/platform/rp/flash_layout.rs` (layout),
+`crates/fluxor-abi/src/platform/rp/flash_layout.rs` (layout),
 `src/kernel/module/ota_stage.rs`, `src/kernel/boot/config.rs` and
 `modules/foundation/graph_slot/` (readers).
 
@@ -239,7 +239,7 @@ zero.
 ## Kernel Staging Surface
 
 Source: `src/kernel/module/ota_stage.rs`,
-`modules/sdk/internal/reconfigure.rs` (opcodes).
+`crates/fluxor-abi/src/internal/reconfigure.rs` (opcodes).
 
 Staging is a kernel surface reached through two `dev_system` opcodes,
 available to modules with the `platform_raw` permission:
@@ -279,7 +279,7 @@ than a live handoff.
 
 Source: `modules/foundation/ota_ingest/`,
 `modules/foundation/graph_slot/`,
-`modules/sdk/platform/rp/flash_layout.rs`.
+`crates/fluxor-abi/src/platform/rp/flash_layout.rs`.
 
 RP2040/RP2350 targets stage into two on-flash A/B graph slots instead
 of RAM.

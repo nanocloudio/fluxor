@@ -205,7 +205,7 @@ pub const FRAME_KIND_ETH: u8 = 1;
 /// byte 0, little-endian length at bytes 1..3.
 pub const FRAME_KIND_NET: u8 = 2;
 /// `[signal:u8][kind:u8]…` — content_type `Telemetry`. A
-/// `TelemetryRecord` (`modules/sdk/contracts/telemetry.rs`) is
+/// `TelemetryRecord` (`crates/fluxor-abi/src/contracts/telemetry.rs`) is
 /// self-sizing: its total length is derived from `signal`+`kind`
 /// (no explicit length prefix), so a tee/merge fan must peek those two
 /// bytes and transfer the whole record. Without this, a fan splits a

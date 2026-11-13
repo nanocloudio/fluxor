@@ -26,16 +26,6 @@
 // PIC library code must not panic; surface errors through the ABI.
 #![deny(clippy::unwrap_used)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -44,36 +34,32 @@
               does not fire"
 )]
 
-use core::ffi::c_void;
-
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::contracts::net::net_proto;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
 // PIC runtime (syscalls, helpers, intrinsics)
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 // Bound-endpoint bind lifecycle + addressed send, shared across the datagram
 // modules. DTLS keeps its own per-peer (4-tuple) demux on the inbound path.
-include!("../../sdk/cores/datagram_endpoint.rs");
+pub use fluxor_rt::datagram_endpoint::*;
 
 // Crypto primitives
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/crypto/sha384.rs");
-include!("../../sdk/crypto/hmac.rs");
-include!("../../sdk/crypto/chacha20.rs");
-include!("../../sdk/crypto/aes_gcm.rs");
-include!("../../sdk/crypto/p256.rs");
-include!("../../sdk/crypto/p384.rs");
-include!("../../sdk/crypto/ed25519.rs");
+pub use fluxor_sdk::crypto::aes_gcm::*;
+pub use fluxor_sdk::crypto::chacha20::*;
+pub use fluxor_sdk::crypto::ed25519::*;
+pub use fluxor_sdk::crypto::hmac::*;
+pub use fluxor_sdk::crypto::p256::*;
+pub use fluxor_sdk::crypto::p384::*;
+pub use fluxor_sdk::crypto::sha256::*;
+pub use fluxor_sdk::crypto::sha384::*;
 // The stepped Ed25519 verifier, over the helpers just mounted.
 include!("ed25519_job.rs");
-include!("../../sdk/crypto/sha3.rs");
+pub use fluxor_sdk::crypto::sha3::*;
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; x509.rs needs ml_dsa.rs for
 // post-quantum certificate suites. Order matters for all three.
-include!("../../sdk/crypto/ml_dsa.rs");
-include!("../../sdk/crypto/rsa.rs");
+pub use fluxor_sdk::crypto::ml_dsa::*;
+pub use fluxor_sdk::crypto::rsa::*;
 include!("x509.rs");
 // `cert_file` / `key_file` / `trust` named by path and read at runtime.
 include!("cred_file.rs");
@@ -88,7 +74,7 @@ include!("handshake_pump.rs");
 include!("dtls_record.rs");
 include!("dtls_state.rs");
 // Checkpoint chunking and CRC32, shared with the session-handoff surface.
-include!("../../sdk/cores/session_handoff.rs");
+pub use fluxor_sdk::cores::session_handoff::*;
 // Transport continuity: CT_TLS codec, shadow lifecycle, emission horizons.
 include!("continuity.rs");
 include!("identity.rs");
@@ -611,8 +597,6 @@ impl DtlsAuthority {
 enum SessionState {
     Idle,
     Allocated,
-    Connecting,
-    AcceptPending,
     Handshaking,
     Ready,
     Closing,
@@ -878,7 +862,6 @@ enum DtlsPhase {
     Idle,
     Handshaking,
     Ready,
-    Closed,
     Errored,
 }
 
@@ -901,9 +884,6 @@ impl PeerAddr {
             && self.ip[2] == ip[2]
             && self.ip[3] == ip[3]
             && self.port == port
-    }
-    fn is_unset(&self) -> bool {
-        self.port == 0
     }
 }
 
@@ -1509,7 +1489,7 @@ const TLS_INBOUND_DRAIN_BUDGET: u32 = 8;
 // Parameter definitions
 // ============================================================================
 
-define_params! {
+fluxor_rt::define_params! {
     TlsState;
 
     1, mode, u8, 0
@@ -1756,7 +1736,7 @@ const LOCAL_CLOSE_FWD: u8 = 2;
 // Module ABI exports
 // ============================================================================
 
-declare_module_state_bytes!(TlsState);
+fluxor_rt::declare_module_state_bytes!(TlsState);
 
 #[no_mangle]
 pub extern "C" fn module_state_size() -> u32 {
@@ -4757,7 +4737,7 @@ unsafe fn log_peer_auth_failure(s: &mut TlsState, conn_id: u16, rc: u32) {
     dev_log(sys, 1, buf.as_ptr(), pos);
 }
 
-name_table!(
+fluxor_rt::name_table!(
     PEER_AUTH_NAMES = [
         b"none",
         b"pinned",
@@ -6666,7 +6646,7 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
 /// `key_fingerprint` is the SHA-256 of the peer leaf's raw subjectPublicKey.
 ///
 /// Every constant below is the contract's
-/// (`modules/sdk/contracts/net/peer_identity.rs`), re-exported under this
+/// (`crates/fluxor-abi/src/contracts/net/peer_identity.rs`), re-exported under this
 /// module's names rather than restated: the writer and its readers must
 /// agree byte for byte, and two declarations of one wire is how they stop
 /// agreeing.
@@ -8141,9 +8121,9 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();
 
 // ============================================================================
 // Test helpers (host-test feature only)
@@ -8474,8 +8454,9 @@ pub mod test_helpers {
     }
 
     /// Move a slot on: `0` resets it, `1` puts it in its ready phase, `2`
-    /// closed, `3` errored — leaving the driver untouched — and `4` keeps
-    /// it handshaking with its driver in `Error`.
+    /// closed (a DTLS peer has no closed phase: closing frees the slot, so
+    /// it resets), `3` errored — leaving the driver untouched — and `4`
+    /// keeps it handshaking with its driver in `Error`.
     ///
     /// # Safety
     /// `state` must point to an initialised `TlsState`; `idx` names a slot.
@@ -8484,9 +8465,8 @@ pub mod test_helpers {
         if dtls {
             let peer = &mut s.peer_sessions[idx];
             match how {
-                0 => peer.reset(),
+                0 | 2 => peer.reset(),
                 1 => peer.phase = super::DtlsPhase::Ready,
-                2 => peer.phase = super::DtlsPhase::Closed,
                 3 => peer.phase = super::DtlsPhase::Errored,
                 _ => peer.endpoint.driver.hs_state = super::HandshakeState::Error,
             }

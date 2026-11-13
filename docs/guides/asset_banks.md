@@ -5,7 +5,7 @@ selected one to the rest of the graph. Selection changes through
 commands, not rewiring, so playback, sequencing, and UI flows keep a
 stable topology while the content varies at runtime.
 
-Source: `modules/sdk/cores/bank_stream.rs` (shared navigation and
+Source: `crates/fluxor-rt/src/bank_stream.rs` (shared navigation and
 streaming core), `modules/foundation/fs_bank/`,
 `modules/foundation/object_bank/`.
 

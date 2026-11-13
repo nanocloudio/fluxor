@@ -1434,7 +1434,7 @@ pub(crate) fn derive_key(master: &[u8], label: &[u8], context: &[u8], out: &mut 
 }
 
 // The key-wrap KEK and the wrapped object are the SDK core's
-// (`security::custody_wrap`, `modules/sdk/cores/custody_wrap.rs`):
+// (`security::custody_wrap`, `src/kernel/security/custody_wrap.rs`):
 // HKDF-SHA256 with `salt = attest_digest`, `ikm = ECDH shared secret`,
 // `info = KW_INFO || dest_pub || 0x01`, then ChaCha20-Poly1305 with the
 // object's header (magic, ephemeral key, digest, nonce) as AAD. Salting
@@ -2667,8 +2667,9 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             // The blob was wrapped for a composition; it opens only while
             // this one still IS that composition.
-            let mut attest = [0u8; 32];
-            attest.copy_from_slice(&blob[w::ATTEST_OFF..w::ATTEST_OFF + 32]);
+            let Some(attest) = cw::kw_attest(blob) else {
+                return EINVAL;
+            };
             let rec_ptr = &raw mut ATTEST_RECORD;
             let rec = &mut *rec_ptr;
             let Some(ours) = crate::kernel::exec::scheduler::attest::composition_digest(
@@ -2686,7 +2687,9 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if diff != 0 {
                 return EACCES;
             }
-            let eph_pub = &blob[4..4 + w::EPH_PUB_LEN];
+            let Some(eph_pub) = cw::kw_eph_pub(blob) else {
+                return EINVAL;
+            };
             let mut my_priv = [0u8; 32];
             my_priv.copy_from_slice(&slot.data[..32]);
             let shared = p256::ecdh_shared_secret(&my_priv, eph_pub);

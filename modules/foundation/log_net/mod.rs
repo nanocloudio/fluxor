@@ -3,7 +3,7 @@
 //! Drains the kernel log ring (via LOG_RING_DRAIN (diag) `diag::LOG_RING_DRAIN`) and
 //! forwards chunks as UDP datagrams through the IP module using the
 //! datagram surface
-//! (see `modules/sdk/contracts/net/datagram.rs`). Use this when the
+//! (see `crates/fluxor-abi/src/contracts/net/datagram.rs`). Use this when the
 //! UART is unavailable (HAT blocking GPIO14/15, remote bring-up, etc.).
 //!
 //! # Wiring
@@ -26,16 +26,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -46,21 +36,19 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 // Shared UDP datagram-endpoint lifecycle + send (also used by `transport_buffer`).
-include!("../../sdk/cores/datagram_endpoint.rs");
+pub use fluxor_rt::datagram_endpoint::*;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
-// modules/sdk/runtime.rs (shared across consumers).
+// crates/fluxor-rt/src/lib.rs (shared across consumers).
 
 /// Frame buffer: FRAME_HDR + DG_V4_PREFIX + log chunk.
 const NET_BUF_SIZE: usize = 600;
@@ -149,9 +137,8 @@ mod params_def {
     use super::p_u16;
     use super::p_u32;
     use super::LogNetState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         LogNetState;
 
         1, dst_ip, u32, 0
@@ -295,7 +282,7 @@ pub extern "C" fn module_state_size() -> u32 {
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-declare_module_state_bytes!(LogNetState);
+fluxor_rt::declare_module_state_bytes!(LogNetState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -477,6 +464,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

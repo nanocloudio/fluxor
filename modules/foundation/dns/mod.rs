@@ -119,7 +119,7 @@
 //! # Architecture
 //!
 //! Uses the datagram surface
-//! (see `modules/sdk/contracts/net/datagram.rs` and
+//! (see `crates/fluxor-abi/src/contracts/net/datagram.rs` and
 //! `docs/architecture/protocol_surfaces.md`) over the shared `net_in`/
 //! `net_out` channel pair on the IP module:
 //!
@@ -159,16 +159,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -179,16 +169,14 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 // Bound-endpoint bind lifecycle + addressed send, shared with log_net /
 // transport_buffer / quic / dtls. dns composes two: server (port 53) + upstream
 // (ephemeral), demuxed by ep_id on one channel.
-include!("../../sdk/cores/datagram_endpoint.rs");
+pub use fluxor_rt::datagram_endpoint::*;
 
 // RFC 6052 address embedding, shared with the NAT64 translator so the two
 // synthesise one address for one IPv4 address under one prefix.
@@ -197,13 +185,12 @@ include!("../../sdk/cores/datagram_endpoint.rs");
     reason = "the core is mounted whole; DNS64 uses its RFC 6052 half"
 )]
 mod nat_core {
-    include!("../../sdk/cores/nat.rs");
+    pub use fluxor_sdk::cores::nat::*;
 }
 // The DNS message codec — header, names, question, resource records —
 // shared with the `ip` stub resolver.
-#[path = "../../sdk/contracts/net/dns_wire.rs"]
-mod dns_wire;
 use dns_wire::*;
+use fluxor_abi::contracts::net::dns_wire;
 
 // The stream surface, for DNS-over-TLS: the same `CMD_CONNECT_TO` every
 // other connector dials with, so a DoT upstream is named the way every
@@ -212,23 +199,23 @@ use abi::contracts::net::net_proto;
 
 // DNSSEC validation. Mounted flat, as the crypto it calls is: the validator
 // answers a verdict and this module decides what to do about one.
-include!("../../sdk/crypto/b64.rs");
-include!("../../sdk/crypto/hmac.rs");
-include!("../../sdk/crypto/sha1.rs");
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/crypto/sha384.rs");
-include!("../../sdk/crypto/p256.rs");
-include!("../../sdk/crypto/p384.rs");
-include!("../../sdk/crypto/ed25519.rs");
-include!("../../sdk/crypto/rsa.rs");
-include!("../../sdk/contracts/net/dnssec.rs");
+pub use fluxor_sdk::crypto::b64::*;
+pub use fluxor_sdk::crypto::ed25519::*;
+pub use fluxor_sdk::crypto::hmac::*;
+pub use fluxor_sdk::crypto::p256::*;
+pub use fluxor_sdk::crypto::p384::*;
+pub use fluxor_sdk::crypto::rsa::*;
+pub use fluxor_sdk::crypto::sha1::*;
+pub use fluxor_sdk::crypto::sha256::*;
+pub use fluxor_sdk::crypto::sha384::*;
+pub use fluxor_sdk::dnssec::*;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
-// modules/sdk/runtime.rs (shared across consumers).
+// crates/fluxor-rt/src/lib.rs (shared across consumers).
 
 /// Net buffer size (frame header + ep_id + addressing + DNS packet)
 const NET_BUF_SIZE: usize = 600;
@@ -270,16 +257,7 @@ struct TrustAnchor {
     rdata_len: u16,
 }
 
-impl TrustAnchor {
-    const fn new() -> Self {
-        Self {
-            zone: [0; MAX_NAME_LEN + 1],
-            zone_len: 0,
-            rdata: [0; MAX_ANCHOR_RDATA],
-            rdata_len: 0,
-        }
-    }
-}
+impl TrustAnchor {}
 /// Reassembly room for the stream leg: two whole messages and their length
 /// prefixes, so a frame carrying the tail of one and the head of the next
 /// never has to be refused.
@@ -437,9 +415,8 @@ mod params_def {
     use super::p_u32;
     use super::p_u8;
     use super::DnsState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         DnsState;
 
         1, upstream, u32, 0x08080808
@@ -588,17 +565,7 @@ struct HostEntry {
     name: [u8; MAX_NAME_LEN + 1],
 }
 
-impl HostEntry {
-    const fn empty() -> Self {
-        Self {
-            name_hash: 0,
-            ip: 0,
-            name_len: 0,
-            _pad: [0; 3],
-            name: [0; MAX_NAME_LEN + 1],
-        }
-    }
-}
+impl HostEntry {}
 
 /// One forwarded query awaiting its upstream answer.
 ///
@@ -3494,9 +3461,12 @@ fn dns64_excluded(s: &DnsState, ip: u32) -> bool {
         && !nat_core::nat_v4_is_global(ip.to_be_bytes())
 }
 
-/// Publish a new prefix generation. Pending work keeps the generation it
-/// was accepted under and completes without synthesis.
-unsafe fn dns64_set_prefix(s: &mut DnsState, prefix: &[u8; DNS64_PREFIX_BYTES], bits: u8) {
+/// Host-test entry that publishes a new prefix generation, so a gate can
+/// move the generation beneath a query in flight. Pending work keeps the
+/// generation it was accepted under and completes without synthesis.
+#[cfg(feature = "host-test")]
+pub fn dns64_publish_prefix(state: *mut u8, prefix: &[u8; DNS64_PREFIX_BYTES], bits: u8) {
+    let s = unsafe { &mut *(state as *mut DnsState) };
     if !nat_core::nat64_prefix_valid(prefix, bits) {
         return;
     }
@@ -3505,16 +3475,6 @@ unsafe fn dns64_set_prefix(s: &mut DnsState, prefix: &[u8; DNS64_PREFIX_BYTES], 
     s.dns64_wkp = u8::from(bits == 96 && s.dns64_prefix == DNS64_WELL_KNOWN_PREFIX);
     s.dns64_enabled = 1;
     s.dns64_generation = s.dns64_generation.wrapping_add(1);
-}
-
-/// Host-test entry to the prefix publication path, so a gate can move the
-/// generation beneath a query in flight.
-#[cfg(feature = "host-test")]
-pub fn dns64_publish_prefix(state: *mut u8, prefix: &[u8; DNS64_PREFIX_BYTES], bits: u8) {
-    unsafe {
-        let s = &mut *(state as *mut DnsState);
-        dns64_set_prefix(s, prefix, bits);
-    }
 }
 
 /// True when the query carries an OPT record with DO set. A query whose
@@ -5746,7 +5706,7 @@ pub extern "C" fn module_state_size() -> u32 {
 // Same figure as data, so `pack` records it and a resolver-bearing graph's arena
 // demand is summable at compose time. It matters here more than most: `dns` is
 // the second-largest term in a Pico W graph after the wireless stack.
-declare_module_state_bytes!(DnsState);
+fluxor_rt::declare_module_state_bytes!(DnsState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -6017,6 +5977,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

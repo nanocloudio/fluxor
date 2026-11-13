@@ -110,33 +110,18 @@ pub mod trust_anchors;
 pub mod workload;
 pub mod workspace;
 
-/// Wire-format constants (ABI version byte, channel-hint stride,
-/// `fnv1a32`). Path-mounted from `modules/sdk/wire/wire.rs` so the host
-/// tools agree byte-for-byte with the kernel and the module SDK.
-/// `#[allow(dead_code)]` because integration tests reach only a
-/// subset of the constants.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-#[path = "../../modules/sdk/wire/wire.rs"]
-pub mod wire;
+/// Wire-format constants shared byte-for-byte with the kernel and modules.
+pub use fluxor_abi::wire;
 
-/// The `.fmod` container's signed region — path-mounted from
-/// `modules/sdk/wire/fmod.rs`, the definition the kernel loader verifies
-/// against, so the signer hashes exactly the bytes the loader does.
-#[path = "../../modules/sdk/wire/fmod.rs"]
-pub mod fmod;
+/// The `.fmod` container's signed region, the definition the kernel loader
+/// verifies against, so the signer hashes exactly the bytes the loader does.
+pub use fluxor_abi::wire::fmod;
 
-/// Canonical ABI wire-surface encoding — path-mounted from
-/// `modules/sdk/abi_surface.rs` so host tools and the kernel fold the
-/// exact same byte stream into the ABI-surface digest that pins graph
-/// generations to a compatible substrate.
-#[path = "../../modules/sdk/abi_surface.rs"]
-pub mod abi_surface;
+/// The ABI wire-surface encoding the kernel folds into the same digest.
+pub use fluxor_abi::abi_surface;
 
 /// Reusable continuity/protocol cores — path-mounted from
-/// `modules/sdk/cores/` so the host test suite exercises the exact
+/// `crates/fluxor-sdk/src/cores/` so the host test suite exercises the exact
 /// logic modules `include!`. `nonce_reservation` carries the epoch
 /// fencing rule that no egress counter value is ever emitted twice
 /// across a takeover: a forced (unsafe) quorum recovery voids every

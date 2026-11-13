@@ -2092,8 +2092,8 @@ impl Manifest {
         // Per-root manifest layouts, targeting a fluxor source tree
         // (modules/ at the root). Downstream projects reach these via
         // the install-root / sibling-checkout search roots below — the
-        // published `fluxor-abi` source artifact ships `modules/sdk/**`
-        // only, no per-platform manifests.
+        // published crate source artifacts ship no per-platform
+        // manifests.
         const SOURCE_TREE_DIRS: &[&str] = MODULE_TIERS;
 
         // Search roots are walked in order:

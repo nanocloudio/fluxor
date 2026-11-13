@@ -67,7 +67,7 @@ The kernel's own capacity — `STATE_ARENA_SIZE`, `BUFFER_ARENA_SIZE`,
 is stated in `src/kernel/config.rs`, one profile per kernel platform
 (`profile_linux`, `profile_bcm2712`, `profile_uefi`, `profile_wasm`, `profile_rp`; the RP
 arenas come from the silicon TOML through `platform::chip`). It is never
-restated under `modules/sdk` or `contracts/src`: those trees are hashed into
+restated in `crates/fluxor-abi` or `contracts/src`: those trees are hashed into
 the ABI-surface digest, so a kernel size there turns raising it into an ABI
 epoch and a workspace republish although no module reads it. Raising one of
 these is a kernel rebuild and a row edit here — nothing more: the composer
@@ -108,12 +108,12 @@ Two forms:
   the inequality it stands in for.
 
 ```limit-constraints
-tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS | modules/sdk/abi/config.rs
-http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS | modules/sdk/abi/config.rs
-ip::MAX_DG_ENDPOINTS <= ip::MAX_TCP_CONNS | modules/sdk/abi/config.rs
-ip::MAX_TCP_CONNS <= 65536 | modules/sdk/abi/config.rs
-ip::MAX_LOCAL_ADDRS <= 4096 | modules/sdk/abi/config.rs
-http::ARENA_WORKING_SET_CONNS <= http::MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs
+tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs
+http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs
+ip::MAX_DG_ENDPOINTS <= ip::MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs
+ip::MAX_TCP_CONNS <= 65536 | crates/fluxor-abi/src/config.rs
+ip::MAX_LOCAL_ADDRS <= 4096 | crates/fluxor-abi/src/config.rs
+http::ARENA_WORKING_SET_CONNS <= http::MAX_CONCURRENT_CONNS | crates/fluxor-abi/src/config.rs
 tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE | modules/foundation/ip/mod.rs
 PACKET_HOLDS_DEFAULT as usize <= PACKET_HOLDS_MAX | modules/foundation/ip/mod.rs
 HO_SRC_ENTRIES >= tcp::SYN_COOKIE_WATERMARK as usize * 2 | modules/foundation/ip/mod.rs
@@ -134,43 +134,43 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 
 | Id | Width | Ceiling | Symbol | Source | Value | Binds instead / notes |
 |---|---|---|---|---|---|---|
-| TCP/HTTP `conn_id` (net-proto wire) | u16 LE | 65535 | `MAX_TCP_CONNS` | modules/sdk/abi/config.rs | 65536 | The host table is exactly the id space (ids 0..65535); 256 on wasm, 8 on embedded. A record is ~2.2 KiB, most of it the bounded reorder buffer. The host table is backed lazily (`ip/conn_arena.rs`): the first 512 records live inline in module state (~1.1 MiB) and further records come in 256-record chunks from the kernel elastic region as connections arrive, so a slot number is bounded by the records backed, never by the ceiling, and the whole table is never committed. Lookup is by hash index (`ip/index.rs`) whose removals close their holes and whose hash is seeded per instance, so a packet pays for the cluster it lands in rather than for the table — a miss included — and the timer sweep is sliced across its 50 ms window |
-| datagram/packet `ep_id` (DG/PKT wire) | u8 | 256 | `MAX_DG_ENDPOINTS` | modules/sdk/abi/config.rs | 256 | Endpoints are allocated only from the first `MAX_DG_ENDPOINTS` connection slots, so the u8 id binds the endpoint count, not the table. TCP prefers the slots beyond that window and takes it only when the rest is full |
-| local-address slot (`TcpConn::local_slot`) | u16 | 65535 | `MAX_LOCAL_ADDRS` | modules/sdk/abi/config.rs | 4096 | `0xFFFF` is the wildcard slot. Demux is by hash index; 8 on wasm and embedded |
-| decision-seam hold (`pkt_id` slot) | `PKT_SLOT_BITS` (8) | 256 | `MAX_PACKET_HOLD` | modules/sdk/abi/config.rs | 32 | The DEFAULT of `ip`'s declared capacity `packet_holds` (8 on wasm, 4 on embedded): a graph declares more, up to the 256 slots a `pkt_id` names (refused at construction past it), held in `ip`'s heap at one full frame a slot. An arrival with every slot taken is refused and counted (`hold_refused`), never displaces a held packet |
+| TCP/HTTP `conn_id` (net-proto wire) | u16 LE | 65535 | `MAX_TCP_CONNS` | crates/fluxor-abi/src/config.rs | 65536 | The host table is exactly the id space (ids 0..65535); 256 on wasm, 8 on embedded. A record is ~2.2 KiB, most of it the bounded reorder buffer. The host table is backed lazily (`ip/conn_arena.rs`): the first 512 records live inline in module state (~1.1 MiB) and further records come in 256-record chunks from the kernel elastic region as connections arrive, so a slot number is bounded by the records backed, never by the ceiling, and the whole table is never committed. Lookup is by hash index (`ip/index.rs`) whose removals close their holes and whose hash is seeded per instance, so a packet pays for the cluster it lands in rather than for the table — a miss included — and the timer sweep is sliced across its 50 ms window |
+| datagram/packet `ep_id` (DG/PKT wire) | u8 | 256 | `MAX_DG_ENDPOINTS` | crates/fluxor-abi/src/config.rs | 256 | Endpoints are allocated only from the first `MAX_DG_ENDPOINTS` connection slots, so the u8 id binds the endpoint count, not the table. TCP prefers the slots beyond that window and takes it only when the rest is full |
+| local-address slot (`TcpConn::local_slot`) | u16 | 65535 | `MAX_LOCAL_ADDRS` | crates/fluxor-abi/src/config.rs | 4096 | `0xFFFF` is the wildcard slot. Demux is by hash index; 8 on wasm and embedded |
+| decision-seam hold (`pkt_id` slot) | `PKT_SLOT_BITS` (8) | 256 | `MAX_PACKET_HOLD` | crates/fluxor-abi/src/config.rs | 32 | The DEFAULT of `ip`'s declared capacity `packet_holds` (8 on wasm, 4 on embedded): a graph declares more, up to the 256 slots a `pkt_id` names (refused at construction past it), held in `ip`'s heap at one full frame a slot. An arrival with every slot taken is refused and counted (`hold_refused`), never displaces a held packet |
 | workload lane (`ip` provider, `workload::NET_PROVIDE`) | u8 | 255 | `LANE_CEILING` | src/kernel/workload/net_attach.rs | 255 | The provider states its lane capacity when it claims the role (`ip` param `lanes`), and the kernel sizes its lane tables to it — carved on bcm2712 and uefi, allocated on Linux — keeping `max(previous, stated)` across rebuilds; an attach past it is `ENOSPC`. The `u8` lane id is the ceiling; the static profiles (wasm, RP) hold `STATIC_LANES` |
 | contract class (`required_caps` bitmask, fmod header) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the header's `required_caps`. Registration past the ceiling is refused EINVAL, and a dispatch id at or past it is refused ENOSYS by `check_contract_grant` before either capability gate |
-| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | modules/sdk/abi/registry_gen.rs | 41 | Generated from `modules/sdk/abi/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the header's `required_caps` and of the kernel's vtable registry; the generator refuses an id at or past it |
+| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | crates/fluxor-abi/src/registry.rs | 41 | Generated from `crates/fluxor-abi/registry/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the header's `required_caps` and of the kernel's vtable registry; the generator refuses an id at or past it |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
 | module index (`ModuleId`: exec order, owners, fault ids, wire fields) | u16 | 65535 | `MAX_MODULES` | src/kernel/config.rs | 4096 | `0xFFFF` is `NO_MODULE`, the no-owner sentinel. On Linux this is the module-index DOMAIN, format-bound: the config blob carries a module id in 12 bits (low byte plus four spare bits of entry byte 9) and a `ModuleMask` holds one bit per index, while the scheduler's per-module tables are sized at boot from the graph — its modules, fans and resident workloads plus the `module_slots` reserve (`resource_ledger::plan`) — and grown a segment at a time by live adds; a plan past the domain is refused at boot naming `module_slots`. On bcm2712, uefi and RP the same domain, with the tables sized from the plan within it (1024 on bcm2712 and uefi, carved from the DRAM zone the machine describes; 32 on RP, from the kernel's static pool); on wasm, the static table, 48. The telemetry ring holds one PSTATUS round of it. Kernel capacity, not ABI: modules read the live slot count at runtime (`internal::reconfigure::SLOT_CAPACITY`). Asserts: `src/kernel/boot/config.rs` and `src/kernel/config.rs` (fits the blob's 12 bits), `src/kernel/exec/scheduler/mod.rs` (below the sentinel) |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | — | Derived, not chosen: one slot per channel (`MAX_CHANNELS`), so the two cannot drift. `ChannelSlot.buffer_slot` holds a single id and every allocation takes its owning channel, so a slot past the channel table is unreachable and a pool short of it leaves the table's upper range unallocatable — `channel_open` refusing while slots are free. The buffer arena binds first by orders of magnitude |
 | owner slot | u16 | 65535 | `MAX_OWNERS` | src/kernel/workload/owner.rs | 4096 | The owner-slot DOMAIN, one on every kernel: the owner table and every per-owner table beside it (log rings on Linux — one 64 KiB ring allocated when its owner is created and released with it, held until the platform's next flush has written it —, code-pack regions, graph-workload slots, host-process sandboxes and workload slots, and, at one entry per owner slot and execution domain, the graph-local pacers and the resident-graph index) are sized at boot to the `owners` ceiling, the system slot plus the resident workloads plus the owner reserve (`resource_ledger::plan`, `size_kernel_tables`), carved from the DRAM zone on bcm2712 and uefi and from the static pool on RP; a plan past the domain is refused at boot naming `owners`. The domain is bound by the host-process workload index, which shares the workload fd slot space with the graph backend's above `0x0500` (`GRAPH_SLOT_BASE`), not by the `u16` slot every wire field carries. The default owner reserve (63 on Linux, bcm2712 and uefi; 0 on RP) takes only what the domain leaves beside the system slot and the resident workloads, so a graph that fits the domain boots on the default; an explicit `capacity: { owners }` past it is refused (the composer runs the boot plan and refuses it at build). wasm's owner table is its static profile's one slot (`OWNER_TABLE_SLOTS`). Const-asserted ≤ `u16::MAX` |
-| HTTP request path length | u16 | 65535 | `MAX_PATH` | modules/sdk/abi/config.rs | 200 | The wire field is u16; the 200-byte budget is pure memory policy |
+| HTTP request path length | u16 | 65535 | `MAX_PATH` | crates/fluxor-abi/src/config.rs | 200 | The wire field is u16; the 200-byte budget is pure memory policy |
 | content-type position | u8 append-only | 256 | — | contracts/src/lib.rs | — | Vocabulary discipline; parallel tables are locked together by const asserts |
 
 ## Deliberate caps
 
 | Cap | Symbol | Source | Value | Reason |
 |---|---|---|---|---|
-| Exchange record | `RECORD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the largest record either side of an exchange writes, and so one channel record — what an `ExchangeRequest` or `ExchangeResponse` port declares as `max_record`. A body of any size crosses as many records under credit, so this bounds a reader's buffer, never a request or an answer |
-| Exchange collected body | `PAYLOAD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the largest body a provider that takes requests whole collects, and the one ceiling every provider of `stream.ordered_ack` derives from, so a requester has a number it can hold itself to. A per-provider ceiling is undiscoverable by the requester that must stay under it. A provider whose backend cannot take the full size declares the smaller number as its `max_payload` capability fact, which the build checks against the requester's own `max_payload` fact |
-| Exchange ordering key | `KEY_MAX` | modules/sdk/contracts/exchange.rs | 512 | Policy: the largest `target` a publish carries — a table or topic identifier plus a 256-byte natural key, with room for requesters whose ordering unit is wider. The key is the ordering unit and is opaque to the provider |
+| Exchange record | `RECORD_MAX` | crates/fluxor-abi/src/contracts/exchange.rs | 8192 | Policy: the largest record either side of an exchange writes, and so one channel record — what an `ExchangeRequest` or `ExchangeResponse` port declares as `max_record`. A body of any size crosses as many records under credit, so this bounds a reader's buffer, never a request or an answer |
+| Exchange collected body | `PAYLOAD_MAX` | crates/fluxor-abi/src/contracts/exchange.rs | 8192 | Policy: the largest body a provider that takes requests whole collects, and the one ceiling every provider of `stream.ordered_ack` derives from, so a requester has a number it can hold itself to. A per-provider ceiling is undiscoverable by the requester that must stay under it. A provider whose backend cannot take the full size declares the smaller number as its `max_payload` capability fact, which the build checks against the requester's own `max_payload` fact |
+| Exchange ordering key | `KEY_MAX` | crates/fluxor-abi/src/contracts/exchange.rs | 512 | Policy: the largest `target` a publish carries — a table or topic identifier plus a 256-byte natural key, with room for requesters whose ordering unit is wider. The key is the ordering unit and is opaque to the provider |
 | Telemetry ring capacity | `TELEMETRY_RING_CAPACITY` | src/kernel/config.rs | — | Policy, per capacity profile: 4 KiB on RP2040, 8 KiB on RP2350 (from the silicon TOML's `[kernel] telemetry_ring_kb`, which `profile_rp` re-exports), and elsewhere one PSTATUS round rounded up to a power of two and never under 32 KiB (512 KiB on the 4096-index module domain of linux, 128 KiB on the 1024 module slots of bcm2712 and uefi). A const assert holds it at or above one whole PSTATUS round — the scheduler emits a round as one uninterrupted burst, so a ring under that size drops the tail of *every* round and the high-index modules never report at all |
 | Block buffers lent at once | `MAX_LENDS` | src/kernel/module/block_lend.rs | 128 | Policy: the kernel's ledger of buffers lent to `storage.block` sources, across every consumer. Deeper than any source's queue (nvme holds 8 per queue) so it only binds on a runaway consumer; a `SUBMIT` past it is `EAGAIN` before the source sees it |
 | Torn-down modules awaiting their lends | `MAX_QUARANTINED` | src/kernel/module/block_lend.rs | 8 | Policy: modules torn down while a source still holds a buffer lent from them, whose memory is kept until the source returns it. Past it the memory stays lent and is not released (a leak, never a corruption) |
 | Channels closed on a quarantine's behalf | `MAX_ADOPTED` | src/kernel/module/block_lend.rs | 16 | Policy: channels carrying a lend of a torn-down module, closed once the lends are back. Past it a channel stays open |
-| Telemetry drain slots | `RING_CONSUMERS` | modules/sdk/contracts/telemetry.rs | 4 | Policy: the console exporter, one `otel` engine per export destination, and a spare. It is wire-visible — a `TLM_STATS` reply is `[head][dropped × RING_CONSUMERS]` — so a caller sizes its buffer from it and widening is an ABI change, not a tuning knob |
+| Telemetry drain slots | `RING_CONSUMERS` | crates/fluxor-abi/src/contracts/telemetry.rs | 4 | Policy: the console exporter, one `otel` engine per export destination, and a spare. It is wire-visible — a `TLM_STATS` reply is `[head][dropped × RING_CONSUMERS]` — so a caller sizes its buffer from it and widening is an ABI change, not a tuning knob |
 | Telemetry record | `TELEMETRY_MAX_RECORD` | src/kernel/exec/scheduler/module_types.rs | 144 | Derived, not chosen: the widest record kind, a 16-bucket histogram metric. The ring reserves atomically at this size and rejects anything larger whole, so a value below the true maximum silently bounces every wider emit at the syscall rather than failing loudly |
-| Instrument dimension cardinality | `DIM_MAX_PRODUCT` | modules/sdk/contracts/telemetry.rs | 65534 | Policy: the product of one instrument's declared dimension domains, enforced at build so every composite index stays below the reserved `DIM_OTHER` (`0xFFFF`). Cardinality is a declared resource bound — an instrument that would exceed it shrinks a domain rather than discovering the ceiling at runtime |
+| Instrument dimension cardinality | `DIM_MAX_PRODUCT` | crates/fluxor-abi/src/contracts/telemetry.rs | 65534 | Policy: the product of one instrument's declared dimension domains, enforced at build so every composite index stays below the reserved `DIM_OTHER` (`0xFFFF`). Cardinality is a declared resource bound — an instrument that would exceed it shrinks a domain rather than discovering the ceiling at runtime |
 | Single module code segment | `MAX_MODULE_CODE_SIZE` | src/kernel/config.rs | 1048576 | Sanity bound: catches a corrupt or runaway blob, not a budget; 393216 on RP2040. Code runs in place from flash on RP parts, so it is set by the part's flash; `module_code_kb` in the silicon TOML mirrors it and the packer refuses a module over it |
 | Whole modules blob | `MAX_MODULES_BLOB_SIZE` | src/kernel/module/loader.rs | 8388608 | Sanity bound: a boot-image module table past this is refused at load |
 | OTA staging area (per A/B stage) | `STAGE_CAPACITY` | src/kernel/module/ota_stage.rs | 8388608 | Policy: a graph image larger than one stage is refused ENOSPC at stage write |
 | Module state arena | `STATE_ARENA_SIZE` | src/kernel/config.rs | 1073741824 | Policy: it must hold every module of the busiest graph at once, with headroom. A node hosts workload subgraphs beside its own graph in the same pool: a bare-metal node's control plane seats ~253 MiB, and one key-value workload's state worker asks 15-23 MiB. On bcm2712 this is the figure the graph builder plans against (a 2 GB Pi 5's DRAM above 1 GB, QEMU's upper GB at `-m 2G`); the arena itself is sized at boot from the device tree — the largest reservation-free DRAM zone above the boot image (above 1 GB on the Pi 5, clear of the firmware's top-of-first-GB reservation and the DTB and initramfs near 0x2E00_0000), less the kernel tables carved from its top — so a larger board gets a larger arena, all of its DRAM above the floor (the arena's free lists hold `usize` offsets, and an envelope's arena entry is exact bytes below 2 GiB and KiB past it, `resource::decode_entry`); the `ip` connection table holds its first 512 records inline (~1.1 MiB) and backs the rest from the elastic region, so no single module approaches the arena. On uefi it is 512 MiB, what a 2 GiB cloud instance spares beside the firmware and the kernel, and the arena itself is the largest free stretch of the firmware's memory map less the kernel tables carved from its top. On RP (240 KiB on rp2350, 64 KiB on rp2040, from the silicon TOML) it is the figure the composer admits a graph's module state against; the arena itself is what the kernel's static pool (`KERNEL_POOL_SIZE`) holds beside the graph's tables and buffer arena, at least this for every graph the composer admits, and a `capacity: { state_arena }` entry past it is refused at boot naming `state_arena`. It costs no image bytes and is never zeroed whole: on Linux a freed region is returned to zero as it is freed, so no allocation zeroes; on wasm and RP an allocation zeroes only what lies below the arena's clean mark; on bcm2712 and uefi a zeroed frontier advanced in the domains' slack (`ZERO_AHEAD_BYTES`) keeps zeroing off the module step. Exhaustion is refused at module load, not at the allocation that overruns |
 | Single channel ring | `MAX_RING_BYTES` | src/kernel/ipc/ring_size.rs | 4194304 | Sanity bound on one ring's share of the buffer arena. A request above it is refused, never clamped — by the composer at build, the scheduler at graph preparation and `channel_open` at runtime, all from this one definition — since a producer sized for a ring it does not get wedges under load |
-| QUIC endpoint connections | `MAX_CONNS` | modules/sdk/abi/config.rs | 64 | Policy: ~58 KiB of state per slot on a bcm2712-only module — ~3.6 MiB for the table, the dominant term in the module's footprint and paid resident, since the table is a field of the module state rather than an elastic pool. ~13 KiB of a slot is handshake scratch idle once the connection is established; the remaining ~45 KiB is state a live connection needs, so unlike the TLS ceiling this one is not mostly scratch. A connection past the ceiling receives a stateless CONNECTION_REFUSED so it fails in one round trip rather than hanging, and a Closed slot recycles with a fresh ephemeral |
-| TLS sessions | `MAX_SESSIONS` | modules/sdk/abi/config.rs | 512 | Policy: the ceiling on concurrent TLS connections and so on HTTPS concurrency — an accept the tls module cannot seat is closed before http sees it. A seat is ~13 KiB, of which ~12 KiB is handshake scratch resident for the session's whole life; 512 seats are 63 granted chunks ≈ 7.9 MiB, drawn in 8-session chunks from the oversubscribable elastic region, so an idle stack pays only for the inline chunk. 1 inline on embedded: what the rp2350 arena holds beside the wifi stack. This bounds ONE instance and instances do not add up the way the number invites: a chunk asks ~104 KiB and rounds up to the 64 KiB grant quantum, so it takes 128 KiB, and the 16 MiB region holds 128 chunks — the same depth as the kernel's chunk table — for about 1,024 seats shared across every elastic pool on the host. Two saturated instances are already the region. Published in the profile so a consumer reads the envelope it has; `tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS` is asserted at compile time |
-| HTTP/2 streams per conn | `MAX_STREAMS` | modules/sdk/abi/config.rs | 4 | Policy: bounds per-connection stream state on every profile |
-| HTTP route table | `MAX_ROUTES` | modules/sdk/abi/config.rs | 8 | Policy: a config declaring more routes is a compose-time error |
+| QUIC endpoint connections | `MAX_CONNS` | crates/fluxor-abi/src/config.rs | 64 | Policy: ~58 KiB of state per slot on a bcm2712-only module — ~3.6 MiB for the table, the dominant term in the module's footprint and paid resident, since the table is a field of the module state rather than an elastic pool. ~13 KiB of a slot is handshake scratch idle once the connection is established; the remaining ~45 KiB is state a live connection needs, so unlike the TLS ceiling this one is not mostly scratch. A connection past the ceiling receives a stateless CONNECTION_REFUSED so it fails in one round trip rather than hanging, and a Closed slot recycles with a fresh ephemeral |
+| TLS sessions | `MAX_SESSIONS` | crates/fluxor-abi/src/config.rs | 512 | Policy: the ceiling on concurrent TLS connections and so on HTTPS concurrency — an accept the tls module cannot seat is closed before http sees it. A seat is ~13 KiB, of which ~12 KiB is handshake scratch resident for the session's whole life; 512 seats are 63 granted chunks ≈ 7.9 MiB, drawn in 8-session chunks from the oversubscribable elastic region, so an idle stack pays only for the inline chunk. 1 inline on embedded: what the rp2350 arena holds beside the wifi stack. This bounds ONE instance and instances do not add up the way the number invites: a chunk asks ~104 KiB and rounds up to the 64 KiB grant quantum, so it takes 128 KiB, and the 16 MiB region holds 128 chunks — the same depth as the kernel's chunk table — for about 1,024 seats shared across every elastic pool on the host. Two saturated instances are already the region. Published in the profile so a consumer reads the envelope it has; `tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS` is asserted at compile time |
+| HTTP/2 streams per conn | `MAX_STREAMS` | crates/fluxor-abi/src/config.rs | 4 | Policy: bounds per-connection stream state on every profile |
+| HTTP route table | `MAX_ROUTES` | crates/fluxor-abi/src/config.rs | 8 | Policy: a config declaring more routes is a compose-time error |
 | Provider chain depth per contract | `MAX_CHAIN_DEPTH` | src/kernel/module/provider.rs | — | Policy, per-profile (3 RP2040 / 4 RP2350 / 8 aarch64-host); registration past the ceiling is refused EBUSY |
 | Routed provider handles | `MAX_ROUTES` | src/kernel/module/provider.rs | — | Policy, per-profile (16 RP2040 / 32 RP2350 / 128 aarch64-host): handles minted through `provider_call_sel` that are open at once (one per file `mount` holds on a keyed volume, one per `file_block` image on `platform`). An open past it is closed at its provider and refused ENOMEM; at most 256, the width of the route index in the handle's slot |
 | KEY_VAULT key slots | `MAX_SLOTS` | src/kernel/security/key_vault.rs | — | Policy, per-profile (64 aarch64 / 8 elsewhere): a slot is held per TLS session key, per mounted encrypted volume's data key, per attaching volume's recipient key, and per replicated-log WAL or snapshot master key. Segment subkeys are derived inside the operation that uses them and take no slot. Generate or import with no free slot is refused ENOMEM, and a consumer refuses its attach rather than falling back |
@@ -179,8 +179,8 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | Linux link-name stem | `STEM_MAX` | src/platform/linux/instance.rs | 6 | Host fact: a link name has 15 characters (IFNAMSIZ less its NUL), and `fx` + stem + `w` + a two-digit sandbox slot must fit with room for a wider slot table. Two live tags may not share a stem (`EBUSY` at go-live), so the stem is what keeps their link names apart |
 | Linux instance rule priorities | `RULE_PRIORITY_MAIN` | src/platform/linux/instance.rs | 32766 | Host fact: the host's `main` rule sits at 32766 and an instance's rule must come before it, so priorities are handed out from `RULE_PRIORITY_FIRST` (20000) up to it: 12766 live-or-uncollected instances on one host, then `ENOSPC` |
 | KEY_VAULT RSA entries | `RSA_ENTRIES` | src/kernel/security/key_vault.rs | 2 | Policy: an RSA key is kilobytes of CRT material and Montgomery constants rather than the 64 bytes a slot carries, so RSA slots name one of two backend entries — an identity and its successor during a rotation. A third `STORE` is refused ENOMEM until one is destroyed. Behind the `rsa-vault` feature, about 22 KB of `.bss` with the signing job |
-| RSA modulus width | `RSA_MODULUS_BITS_MAX` | modules/sdk/crypto/rsa.rs | 4096 | Policy: the widest key the core verifies or signs with. It sizes every buffer in the core and every job's step cost; no public issuer signs with more, and 8192 would double both for a key nothing presents |
-| RSA public exponent width | `RSA_EXPONENT_BITS_MAX` | modules/sdk/crypto/rsa.rs | 32 | Policy: the exponent a public operation walks; 65537 needs 17 bits, and a key whose exponent is wider is refused rather than exponentiated at length |
+| RSA modulus width | `RSA_MODULUS_BITS_MAX` | crates/fluxor-sdk/src/crypto/rsa.rs | 4096 | Policy: the widest key the core verifies or signs with. It sizes every buffer in the core and every job's step cost; no public issuer signs with more, and 8192 would double both for a key nothing presents |
+| RSA public exponent width | `RSA_EXPONENT_BITS_MAX` | crates/fluxor-sdk/src/crypto/rsa.rs | 32 | Policy: the exponent a public operation walks; 65537 needs 17 bits, and a key whose exponent is wider is refused rather than exponentiated at length |
 | fat32 open files | `MAX_OPEN_FILES` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (256 aarch64 / 8 elsewhere): a multi-tenant node runs several independent consumers against one volume at once, where a microcontroller's consumer set is fixed and each handle costs a scratch buffer. An open past the table is refused ENFILE, with a log line naming the handles that hold it. The `max_open_per_owner` parameter adds a per-owner ceiling on top, refusing the owner that is over its share while the table still has room, so the failure lands on the workload at fault rather than on whoever asks next |
 | fat32 directory-walk budget | `DIR_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (32 aarch64 / 6 elsewhere, a quarter of `CACHE_SLOTS`): cached directory sectors one `provider_call` walks before returning EAGAIN with its position saved; a sector not cached parks the walk on it while its read lands. A walk pins the slots it touched for the rest of its call, so the budget leaves the rest of the cache to the commit that follows. A directory with thousands of entries is not exotic — a WAL that segments per snapshot fills one — so an unbounded walk is a latent stall of every module sharing the lane, not a slow path |
 | fat32 parked directory walks | `DIR_CURSOR_POOL` | modules/foundation/fat32/mod.rs | 4 | Policy: walks that ran out of budget kept beside the working cursor, so a lookup of another name in between does not restart them. With one cursor, two callers looking up different names in a directory larger than the budget restart each other on every call and neither finishes — a volume root holding a store's runs and a log's segments is such a directory. A walk that finds no free slot is not parked and restarts when asked again: a rescan, never a wrong answer. Evicting a parked walk instead would let more walkers than slots evict each other every round, while the parked ones here finish and free their slots |
@@ -263,9 +263,9 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | DNSSEC signed-form buffer | `DNSSEC_SIGNED_MAX` | modules/foundation/dns/mod.rs | 4096 | Derived: the RRSIG RDATA without its signature, plus the RRset in canonical form. An answer whose signed form exceeds it cannot be checked and is not claimed as checked |
 | DNSSEC trust anchors | `MAX_ANCHORS` | modules/foundation/dns/mod.rs | 4 | Policy: `dnssec_anchor` entries past the table are dropped at parse. Only the first anchor for a zone is consulted, so the table sizes distinct zones, not keys per zone |
 | DNSSEC anchor RDATA | `MAX_ANCHOR_RDATA` | modules/foundation/dns/mod.rs | 1028 | Policy: flags, protocol and algorithm plus the key itself — wide enough for the RSA moduli in use; a longer anchor is dropped at parse |
-| DNS domain name length | `MAX_NAME_LEN` | modules/sdk/contracts/net/dns_wire.rs | 255 | The RFC 1035 full-name ceiling; a longer QNAME is refused at parse. Distinct from the 63-byte per-label ceiling (`MAX_LABEL_LEN`) |
-| DNS compression-pointer hops per name | `MAX_NAME_PTR_HOPS` | modules/sdk/contracts/net/dns_wire.rs | 16 | Sanity: pointers must also point backwards, so a cycle is refused by direction first; the hop bound is the second line. A name past it is malformed |
-| DNS records examined per section | `MAX_SECTION_RRS` | modules/sdk/contracts/net/dns_wire.rs | 32 | Sanity: an upstream answer or UPDATE section claiming more is refused rather than walked |
+| DNS domain name length | `MAX_NAME_LEN` | crates/fluxor-abi/src/contracts/net/dns_wire.rs | 255 | The RFC 1035 full-name ceiling; a longer QNAME is refused at parse. Distinct from the 63-byte per-label ceiling (`MAX_LABEL_LEN`) |
+| DNS compression-pointer hops per name | `MAX_NAME_PTR_HOPS` | crates/fluxor-abi/src/contracts/net/dns_wire.rs | 16 | Sanity: pointers must also point backwards, so a cycle is refused by direction first; the hop bound is the second line. A name past it is malformed |
+| DNS records examined per section | `MAX_SECTION_RRS` | crates/fluxor-abi/src/contracts/net/dns_wire.rs | 32 | Sanity: an upstream answer or UPDATE section claiming more is refused rather than walked |
 | DNS64 alias hops | `MAX_CNAME_HOPS` | modules/foundation/dns/mod.rs | 4 | Policy: a CNAME chain past it is refused SERVFAIL; loops are detected within it |
 | DNS64 alias-chain bytes per pending slot | `MAX_CHAIN_BYTES` | modules/foundation/dns/mod.rs | 384 | Policy: the re-encoded chain preserved into the synthesized answer; a chain that does not fit is refused SERVFAIL |
 | DNS64 synthesized addresses per answer | `MAX_SYNTH_ADDRS` | modules/foundation/dns/mod.rs | 8 | Policy: A records of the terminal owner past it are not translated |
@@ -294,7 +294,7 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | fan frames per step | `FAN_FRAMES_PER_STEP` | src/kernel/exec/scheduler/module_types.rs | 64 | Policy: whole frames a framed `_tee` or `_merge` moves in one step. A fan sits between a producer and its consumers, so this times the tick rate is the ceiling on every fanned port — `debug: to: net` fans the ip module's consumer ports, and every accept, delivery and send on that graph crosses one |
 | free-slot rebuild slice | `ALLOC_SCAN_SLICE` | modules/foundation/ip/mod.rs | 256 | Policy: slots one step examines to rebuild the free stack when it is empty — the table is full, or a slot was released by a path that did not push it. Allocation is a pop; a SYN at the ceiling costs this slice once per step and is refused, never a walk of the table per SYN |
 | timer-sweep slice | `SWEEP_SLICE_MAX` | modules/foundation/ip/mod.rs | 1024 | Policy: most connections one step of the sliced TCP timer sweep visits. The proportional slice visits a few hundred; after a stall the whole window is owed and this is the ceiling it meets — a full 65,536-record sweep in one step is a multi-millisecond, cache-missing step the guard would end the module for. The sweep lags a stall by at most 64 steps, and needs that many steps per 50 ms window to keep the timers on time: a tick of 780 µs or faster on the 65,536-record profile (the Pi 5 runs 100 µs) |
-| TCP continuity shadow slots | `MAX_TCP_SHADOWS` | modules/sdk/abi/config.rs | 8 | Policy: connections a transport-continuity pair holds in flight on one ip instance — shadows staged for import plus flows being mirrored out. Each shadow is a connection record plus its checkpoint bytes, and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY`. 2 on wasm, 1 on embedded |
+| TCP continuity shadow slots | `MAX_TCP_SHADOWS` | crates/fluxor-abi/src/config.rs | 8 | Policy: connections a transport-continuity pair holds in flight on one ip instance — shadows staged for import plus flows being mirrored out. Each shadow is a connection record plus its checkpoint bytes, and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY`. 2 on wasm, 1 on embedded |
 | fence wire wait | `FENCE_WIRE_WAIT_MS` | modules/foundation/ip/mod.rs | 500 | Policy: how long a fence holds its event for the driver's drain answer before reporting the ring hand-off instead. Longer than any transmit ring takes to empty at line rate; short enough that a coordinator waiting on the fence is not waiting on a hung driver |
 | queued control frame | `NET_OUT_FRAME_MAX` | modules/foundation/ip/mod.rs | — | Derived: the largest frame an event queue holds, the peer report (`MSG_PEER`: the header and `net_proto::PEER_LEN`, 24 bytes). A larger frame is refused, never truncated |
 | TLS continuity shadow slots | `MAX_TLS_SHADOWS` | modules/foundation/tls/continuity.rs | 2 | Policy: sessions under CT_TLS takeover at once on one instance, one per slot (1 on wasm, 0 on the MCU-class targets, which hold no standby). A shadow is a staging record plus the decoded checkpoint — about twice `TLS_CKPT_RECORD_MAX`, resident in module state — and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
@@ -305,16 +305,16 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | QUIC 1-RTT self-grant block | `LOCAL_PN_BLOCK` | modules/foundation/quic/connection.rs | 4096 | Policy: the send packet-number block a connection self-grants in local (non-durable) mode, refilled `LOCAL_PN_REFILL_LOW` (512) values ahead of exhaustion so the reservation never stalls a healthy sender. In durable mode the `session.reservation` provider chooses the block |
 | declared step cost (`[execution] max_step_us`) | `STEP_BUDGET_DEFAULT_TICK_US` | tools/src/target_facts.rs | 1000 | Policy: the scheduler's default pass budget (`DEFAULT_TICK_US`, one tick) on every silicon; a manifest whose step cannot fit one default pass on a target it names is refused at parse. Per-target in shape so a slower part can publish a smaller budget |
 | early-boot log ring | `LOG_RING_CAPACITY` | src/kernel/config.rs | 65536 | Sized to cover boot until a consumer reaches its transport, and NOT raised past it: the whole ring is replayed in one burst when the consumer attaches, and on the Pi 5 rig a 256 KiB ring outran the collector's socket buffer, losing the oldest datagrams — the exact ones the replay exists to deliver. Growing this needs a paced replay first. Then per-profile because the ring is static `.bss` charged against the whole SRAM: 16 KiB on wasm, 8 KiB on the RP parts (the smallest that still holds a whole boot until a host opens the USB console), where a host-class ring is a quarter of an RP2040's linker RAM region and an eighth of an RP2350's, and on both pushes `.bss` past that region once the state and buffer arenas are placed beside it. The RP kernels take the figure from their silicon TOML (`[kernel] log_ring_kb`), which `profile_rp` re-exports, so there is one figure. A full ring drops new records rather than overwriting unread ones, and counts the drops |
-| Capability chain length | `MAX_CHAIN_LINKS` | modules/sdk/contracts/mesh/capability.rs | 8 | Policy: the root's grant plus seven delegations. Every link is one Ed25519 verification and a chain is verified on every presentation, so this is what one presentation can cost a verifier. A longer chain is refused (`ChainTooLong`), never truncated |
-| Capability chain bytes | `MAX_CHAIN_BYTES` | modules/sdk/contracts/mesh/capability.rs | 1026 | Derived, not chosen: `CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN` — the largest chain a receiver must be able to hold |
-| Capability roots per verifier | `MAX_ROOTS` | modules/sdk/contracts/mesh/capability.rs | 2 | Policy: the deployment's root and its successor during a rotation; a chain signed by either verifies |
-| Grants per session | `MAX_SESSION_GRANTS` | modules/sdk/contracts/mesh/capability.rs | 8 | Policy: the verified grants one session holds at once. A presentation past it is refused (`GRANTS_FULL`) until one is withdrawn; nothing is evicted, because an evicted grant is an operation that silently starts failing |
-| Capability presentation payload | `PRESENT_MAX` | modules/sdk/contracts/mesh/capability.rs | 1030 | Derived, not chosen: the presentation id plus `MAX_CHAIN_BYTES` |
-| Capability text form | `MAX_TEXT_LEN` | modules/sdk/contracts/mesh/capability.rs | 1375 | Derived, not chosen: the prefix plus unpadded base64url of `MAX_CHAIN_BYTES` — what an HTTP header carrying a chain must admit. Written as its value and held to that derivation by a const assert |
-| Object LIST page | `LIST_PAGE_MAX` | modules/sdk/contracts/storage/object.rs | 1000 | Policy: entries one `storage.object` `LIST` call may return — S3's own `MaxKeys` ceiling, and the bound on one call's work. A request outside 1..=1000 is `EINVAL` |
-| Storage key and entry name | `STORAGE_KEY_MAX` | modules/sdk/contracts/storage/handle.rs | 255 | Wire width: the `u8` `name_len` and trailing `cursor_len` of a `storage.namespace` LIST page, so it is also the longest key a store creates, the longest cursor on both listing surfaces (the cursor is the last name returned), the longest `storage.object` LIST prefix, and what the gateway's argument copy is sized to carry. A provider meeting a longer name in a range it lists refuses the page `EOVERFLOW` rather than skip it. One bound for one concept: the Linux and `bcm2712` key stores size their keys by it directly |
-| Namespace path | `PATH_MAX` | modules/sdk/contracts/storage/namespace.rs | 1024 | Policy: the longest `storage.namespace` LIST prefix or LOOKUP path. A path is not a name: a directory-shaped provider's prefix is a host directory at any depth, while each name below it stays within `STORAGE_KEY_MAX`. Namespace ops are not walked by the gateway, so the bound costs no gated stack |
-| Namespace change-feed token | `TOKEN_MAX` | modules/sdk/contracts/storage/namespace.rs | 320 | Policy: the longest `CHANGES` continuation token — a provider's relist cursor (a kind byte, a pinned revision and a `STORAGE_KEY_MAX` key: 264 bytes) with room for one that carries more. A request carrying a longer token does not parse, and a page is written with room reserved for a trailer token up to this length, so a page can always be finished. Contract surface, under the ABI digest |
+| Capability chain length | `MAX_CHAIN_LINKS` | crates/fluxor-abi/src/contracts/mesh/capability.rs | 8 | Policy: the root's grant plus seven delegations. Every link is one Ed25519 verification and a chain is verified on every presentation, so this is what one presentation can cost a verifier. A longer chain is refused (`ChainTooLong`), never truncated |
+| Capability chain bytes | `MAX_CHAIN_BYTES` | crates/fluxor-abi/src/contracts/mesh/capability.rs | 1026 | Derived, not chosen: `CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN` — the largest chain a receiver must be able to hold |
+| Capability roots per verifier | `MAX_ROOTS` | crates/fluxor-abi/src/contracts/mesh/capability.rs | 2 | Policy: the deployment's root and its successor during a rotation; a chain signed by either verifies |
+| Grants per session | `MAX_SESSION_GRANTS` | crates/fluxor-abi/src/contracts/mesh/capability.rs | 8 | Policy: the verified grants one session holds at once. A presentation past it is refused (`GRANTS_FULL`) until one is withdrawn; nothing is evicted, because an evicted grant is an operation that silently starts failing |
+| Capability presentation payload | `PRESENT_MAX` | crates/fluxor-abi/src/contracts/mesh/capability.rs | 1030 | Derived, not chosen: the presentation id plus `MAX_CHAIN_BYTES` |
+| Capability text form | `MAX_TEXT_LEN` | crates/fluxor-abi/src/contracts/mesh/capability.rs | 1375 | Derived, not chosen: the prefix plus unpadded base64url of `MAX_CHAIN_BYTES` — what an HTTP header carrying a chain must admit. Written as its value and held to that derivation by a const assert |
+| Object LIST page | `LIST_PAGE_MAX` | crates/fluxor-abi/src/contracts/storage/object.rs | 1000 | Policy: entries one `storage.object` `LIST` call may return — S3's own `MaxKeys` ceiling, and the bound on one call's work. A request outside 1..=1000 is `EINVAL` |
+| Storage key and entry name | `STORAGE_KEY_MAX` | crates/fluxor-abi/src/contracts/storage/handle.rs | 255 | Wire width: the `u8` `name_len` and trailing `cursor_len` of a `storage.namespace` LIST page, so it is also the longest key a store creates, the longest cursor on both listing surfaces (the cursor is the last name returned), the longest `storage.object` LIST prefix, and what the gateway's argument copy is sized to carry. A provider meeting a longer name in a range it lists refuses the page `EOVERFLOW` rather than skip it. One bound for one concept: the Linux and `bcm2712` key stores size their keys by it directly |
+| Namespace path | `PATH_MAX` | crates/fluxor-abi/src/contracts/storage/namespace.rs | 1024 | Policy: the longest `storage.namespace` LIST prefix or LOOKUP path. A path is not a name: a directory-shaped provider's prefix is a host directory at any depth, while each name below it stays within `STORAGE_KEY_MAX`. Namespace ops are not walked by the gateway, so the bound costs no gated stack |
+| Namespace change-feed token | `TOKEN_MAX` | crates/fluxor-abi/src/contracts/storage/namespace.rs | 320 | Policy: the longest `CHANGES` continuation token — a provider's relist cursor (a kind byte, a pinned revision and a `STORAGE_KEY_MAX` key: 264 bytes) with room for one that carries more. A request carrying a longer token does not parse, and a page is written with room reserved for a trailer token up to this length, so a page can always be finished. Contract surface, under the ABI digest |
 | Private regions per gated module | `MAX_PRIVATE` | src/kernel/module/gateway.rs | 3 | Sanity bound: state, heap and stack on an MMU target; one combined region on an MPU target. A pointer a gated module passes must lie in one of them |
 | Gateway argument copy | `WALK_MAX` | src/kernel/module/gateway.rs | 656 | Derived, not chosen: the largest walked request, an object `PUT` with a key and a content type of their longest, a 32-byte entity tag and a key reference of `KEY_REF_MAX`, rounded up to 16. Stack-resident per gated call |
 | Gated provider handles | `SLOTS` | src/kernel/module/gateway.rs | 128 | Policy: provider handles minted to gated callers, one kernel-wide table across every gated module. A gated module may name only a handle the kernel returned to it, so a handle that cannot be minted is unusable: the open is answered `ENOSPC`, with a warning naming the module |
@@ -334,8 +334,8 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | Graph parameters | `MAX_PARAMS` | tools/src/params.rs | 64 | Policy: parameters one graph, stack or bundle may declare. A graph needing more is being configured through its internals rather than its run surface; the bound also bounds the checks every launch makes |
 | Parameter value | `MAX_PARAM_STRING_BYTES` | tools/src/params.rs | 4096 | Policy: the longest string value from `--param` or `--params`; content belongs in a file the value names |
 | Parameter name | `MAX_PARAM_NAME_BYTES` | tools/src/params.rs | 64 | Sanity bound on a declared parameter name |
-| Object key reference | `KEY_REF_MAX` | modules/sdk/contracts/storage/object.rs | 64 | Policy: the longest opaque name of a sealing key a `PUT`, `PUT_STREAMED_OPEN` or `HEAD` record carries. A longer one is `EINVAL`, and `object_exchange` refuses it `400` rather than cut it, since a cut name names nothing. Contract surface, under the ABI digest |
-| Grant scope | `SCOPE_MAX` | modules/sdk/contracts/storage/object.rs | 255 | Derived, not chosen: a scope is a key prefix, so it is bounded as keys are (`STORAGE_KEY_MAX`), held equal by a const assert. A longer scope is refused at `PRESENT` |
+| Object key reference | `KEY_REF_MAX` | crates/fluxor-abi/src/contracts/storage/object.rs | 64 | Policy: the longest opaque name of a sealing key a `PUT`, `PUT_STREAMED_OPEN` or `HEAD` record carries. A longer one is `EINVAL`, and `object_exchange` refuses it `400` rather than cut it, since a cut name names nothing. Contract surface, under the ABI digest |
+| Grant scope | `SCOPE_MAX` | crates/fluxor-abi/src/contracts/storage/object.rs | 255 | Derived, not chosen: a scope is a key prefix, so it is bounded as keys are (`STORAGE_KEY_MAX`), held equal by a const assert. A longer scope is refused at `PRESENT` |
 | Grants on a guarded store | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `store_grants` pool, its default in `DEFAULT_RESERVES`): capability grants presented to the Linux store at once, the plan's `store_grants` ceiling (`DEFAULT_RESERVES`, or the envelope's entry). A presentation past it is `ENOMEM`, counted against the pool; none is evicted, because an evicted grant is a caller whose next operation silently starts failing |
 | Staged streaming write | `STORE_STAGE_MAX` | src/platform/linux/store.rs | 67108864 | Policy: 64 MiB, the bytes one `PUT_STREAMED_*` write may stage before its commit. The store keeps objects in memory, so an open stream is the one place a caller can take the node's memory without committing anything; past it the write is `ENOSPC`. A provider for bulk objects stages to disk and carries no such bound |
 | Streaming-write size hint | `STORE_STAGE_RESERVE_MAX` | src/platform/linux/store.rs | 1048576 | Policy: 1 MiB, the most a `PUT_STREAMED_OPEN` size hint may reserve up front. The hint is the caller's, so it is advice and not an allocation request; past this the staging buffer grows as the bytes arrive |
@@ -396,13 +396,13 @@ cannot be evaluated from its own file reads `—` and says why.
 | Workload store reads | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `owner_store_reads` pool, its default in `DEFAULT_RESERVES`): `GET` read slots one workload's own store holds open at once; a read past it is `ENOMEM` |
 | Workload store streaming writes | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `owner_store_writes` pool, its default in `DEFAULT_RESERVES`): `PUT_STREAMED_OPEN` write slots one workload's own store holds at once; an open past it is `ENOMEM` |
 | Workload staged streaming write | `OWNER_STAGE_MAX` | src/platform/linux/store.rs | 16777216 | Policy: 16 MiB, the bytes one of a workload's streamed writes may stage before its commit. Staged bytes are also charged to the owner's storage ledger, so its `storage_bytes` cap bounds them first when it is lower; past either the write is `ENOSPC` |
-| HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 8-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
-| HTTP per-connection receive buffer | `RECV_BUF_SIZE` | modules/sdk/abi/config.rs | 8192 | Policy: a whole request line, headers and a small body in one read; a request that does not fit is refused 431, not spilled 4096 on wasm, 2048 on embedded. |
-| HTTP per-connection send buffer | `SEND_BUF_SIZE` | modules/sdk/abi/config.rs | 4100 | Policy, deliberately 4 KiB + 4: a WebSocket frame of exactly 4096 bytes of payload plus its header fits in one write, so the RFC 6455 fragmentation path is taken only by frames that genuinely exceed it |
-| Dynamic routes | `MAX_DYN_ROUTES` | modules/sdk/abi/config.rs | 64 | Policy: the dynamic-route arena an ingress fills at runtime; a route past the ceiling is refused and counted in `http.routes.dropped` 8 on wasm and embedded. |
-| Backends per route | `MAX_ROUTE_BACKENDS` | modules/sdk/abi/config.rs | 8 | Policy: an oversized backend set is truncated by weight order and the overflow is counted, so the route keeps serving from its heaviest members 4 on wasm and embedded. |
-| Route filesystem path | `MAX_FS_PATH` | modules/sdk/abi/config.rs | 256 | Policy: host routes point into deep on-disk trees; embedded and wasm routes are short on-flash paths like `/web/INDEX.HTM`, and a longer path is refused at compose time 64 on wasm and embedded. |
-| Body pool default | `DEFAULT_BODY_POOL_SIZE` | modules/sdk/abi/config.rs | 262144 | Policy: the request-body pool an http module gets when its config names none; a body that does not fit is refused 413. 32 KiB on wasm; on the RP parts 16 KiB (rp2350) and 4 KiB (rp2040), where the pool is charged against the same SRAM the state arena is |
+| HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | crates/fluxor-abi/src/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 8-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
+| HTTP per-connection receive buffer | `RECV_BUF_SIZE` | crates/fluxor-abi/src/config.rs | 8192 | Policy: a whole request line, headers and a small body in one read; a request that does not fit is refused 431, not spilled 4096 on wasm, 2048 on embedded. |
+| HTTP per-connection send buffer | `SEND_BUF_SIZE` | crates/fluxor-abi/src/config.rs | 4100 | Policy, deliberately 4 KiB + 4: a WebSocket frame of exactly 4096 bytes of payload plus its header fits in one write, so the RFC 6455 fragmentation path is taken only by frames that genuinely exceed it |
+| Dynamic routes | `MAX_DYN_ROUTES` | crates/fluxor-abi/src/config.rs | 64 | Policy: the dynamic-route arena an ingress fills at runtime; a route past the ceiling is refused and counted in `http.routes.dropped` 8 on wasm and embedded. |
+| Backends per route | `MAX_ROUTE_BACKENDS` | crates/fluxor-abi/src/config.rs | 8 | Policy: an oversized backend set is truncated by weight order and the overflow is counted, so the route keeps serving from its heaviest members 4 on wasm and embedded. |
+| Route filesystem path | `MAX_FS_PATH` | crates/fluxor-abi/src/config.rs | 256 | Policy: host routes point into deep on-disk trees; embedded and wasm routes are short on-flash paths like `/web/INDEX.HTM`, and a longer path is refused at compose time 64 on wasm and embedded. |
+| Body pool default | `DEFAULT_BODY_POOL_SIZE` | crates/fluxor-abi/src/config.rs | 262144 | Policy: the request-body pool an http module gets when its config names none; a body that does not fit is refused 413. 32 KiB on wasm; on the RP parts 16 KiB (rp2350) and 4 KiB (rp2040), where the pool is charged against the same SRAM the state arena is |
 | Fan-in/fan-out scratch | `FAN_BUF_SIZE` | src/kernel/exec/scheduler/module_types.rs | 32768 | Sized per target family: the per-domain static scratch a tee or merge stages each transfer in, not a ring — the channels on either side of a fan are ordinary rings from the buffer arena. A byte-stream fan moves at most this much per step; a frame or record larger than it cannot cross a fan. 32768 on aarch64 (bcm2712, uefi and Linux on aarch64), 2048 on RP, 8192 elsewhere |
 | Config graph edges | `MAX_GRAPH_EDGES` | src/kernel/boot/config.rs | — | Per profile. On Linux, bcm2712 and uefi the format's bound, 255 × 128 (a slot code is a byte of 128-edge units): the graph section is laid out for the graph it carries and byte 3 states its slot count, and the edge and channel tables are sized at boot from the edges plus the `channels` reserve. On wasm and RP their compiled `GRAPH_EDGES` (`SMALL_GRAPH_EDGES`), the one layout every blob for them carries |
 | Static-profile graph edges | `GRAPH_EDGES` | src/kernel/config.rs | 128 | Policy: the wasm and RP profiles' edge slots; what their graph section holds, and so their channel-id domain. wasm's channel table is this static size; RP sizes its channel table from the plan within it, from the kernel's static pool. Linux, bcm2712 and uefi have none: they size them from the graph |
@@ -428,7 +428,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | `net.route` peer routes | `MAX_PEERS` | src/kernel/net_route.rs | — | Policy, sized at boot on Linux, bcm2712 and uefi (`net_route_peers`, by default 256: one per other node); none on wasm, by default none on RP. A ROUTES replace past it is `ENOSPC`, counted |
 | `net.route` held addresses | `MAX_HELD` | src/kernel/net_route.rs | — | Policy, sized at boot on Linux, bcm2712 and uefi (`net_route_held`, by default 256 service addresses); none on wasm, by default none on RP. A HOLD replace past it is `ENOSPC`, counted |
 | `net.route` state-region wait | `STATE_SPINS` | src/kernel/net_route.rs | 65536 | Sanity bound: tries a SEGMENTS, ROUTES or HOLD replace waits for the entry-state region before answering `EAGAIN`, and a CREATE recording its attachment (`attach_segment`) waits for a SEGMENTS replace in flight before answering `EAGAIN`; the caller retries. The region is held across a copy of the entry states and, where the platform realizes the tables itself, across asking it for each entry's state, which can wait on a realization in flight, so a hosted build yields between tries rather than spinning |
-| `net.route` cluster prefixes per segment | `MAX_CLUSTER_PREFIXES` | modules/sdk/contracts/net/route.rs | 8 | Protocol maximum: the cluster prefix and its service range with room for a few more; a segment carrying more is malformed (`EINVAL`) |
+| `net.route` cluster prefixes per segment | `MAX_CLUSTER_PREFIXES` | crates/fluxor-abi/src/contracts/net/route.rs | 8 | Protocol maximum: the cluster prefix and its service range with room for a few more; a segment carrying more is malformed (`EINVAL`) |
 | `net.policy` table rules | `MAX_TABLE_BYTES` | src/kernel/net_policy.rs | — | Policy, sized at boot on Linux, bcm2712 and uefi (`net_policy_table_bytes`, by default 8192: ~500 filter rules, or ~40 fully loaded services' DNAT with their backends); 2048 on wasm and by default on RP. A REPLACE of more is `ENOSPC` |
 | Kernel pool defaults | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, the profile's data on Linux, bcm2712, uefi and RP: each pool's live-add reserve when the config's envelope gives none (its size, for a pool the config cannot derive). Every table is sized at boot to derived + reserve (`resource_ledger::plan`) — on bcm2712 and uefi carved from the DRAM zone the machine describes, on RP from the kernel's static pool (`kernel::mem::carve`); none of these is a ceiling. RP's derived reserves are slim (4 module slots, 16 channels: an MCU graph changes by a rebuild, which plans the pool again) and its arena entries are the default split, and an ask the platform cannot hold is refused at boot naming the pool. The composer reads this table (`tools/src/capacity.rs`) and runs the same plan at build (`capacity::check_boot_plan`), refusing a ceiling past a pool's index domain or static table by name and by how much; only what the platform's memory cannot hold is left to the boot |
 | Kernel static pools | `STATIC_POOLS` | src/kernel/config.rs | — | Policy, the profile's data on wasm: the static size of every table the profile holds, the ceiling every boot plan must fit (refused at boot, naming the pool, past it). The composer reads this table as the profile's pool sizes (`tools/src/capacity.rs`). Linux, bcm2712, uefi and RP state none |
@@ -494,10 +494,10 @@ cannot be evaluated from its own file reads `—` and says why.
 | `pkt_filter` fragment admission | `FRAG_MS` | modules/foundation/pkt_filter/mod.rs | 30000 | Policy: how long a passed first fragment admits its datagram's later fragments — as long as a Linux host holds fragments for reassembly (`ipfrag_time`) |
 | `pkt_filter` static rules | `MAX_RULES` | modules/foundation/pkt_filter/mod.rs | 8 | Policy: static port rules (`rule_0` … `rule_7`) one instance holds; `rule_count` past it is held to it |
 | `pkt_filter` frame | `MAX_FRAME` | modules/foundation/pkt_filter/mod.rs | 1600 | Policy: the largest frame `pkt_filter` stages, an Ethernet frame with a VLAN tag, rounded; a longer length prefix is dropped as malformed |
-| Flow model: established TCP | `TCP_ESTABLISHED_S` | modules/sdk/contracts/net/policy.rs | 432000 | Policy, the host connection tracker's default: seconds an established TCP flow keeps its verdict with no packet, on every enforcer of the contract's flow model (`net::policy::flow`; the other TCP states' timeouts sit beside it, 10 to 120 s) |
-| Flow model: unanswered UDP flow | `DATAGRAM_UNREPLIED_S` | modules/sdk/contracts/net/policy.rs | 30 | Policy, the host connection tracker's default: seconds a UDP flow nobody answered keeps its verdict idle (`ip`'s `dg_flow_idle_s` default, `pkt_filter`'s UDP flows) |
-| Flow model: answered UDP flow | `DATAGRAM_REPLIED_S` | modules/sdk/contracts/net/policy.rs | 120 | Policy, the host connection tracker's default: seconds an answered UDP flow keeps its verdict idle |
-| Flow model: other protocols | `GENERIC_S` | modules/sdk/contracts/net/policy.rs | 600 | Policy, the host connection tracker's default: seconds a flow of a protocol other than TCP, UDP and ICMP keeps its verdict idle |
+| Flow model: established TCP | `TCP_ESTABLISHED_S` | crates/fluxor-abi/src/contracts/net/policy.rs | 432000 | Policy, the host connection tracker's default: seconds an established TCP flow keeps its verdict with no packet, on every enforcer of the contract's flow model (`net::policy::flow`; the other TCP states' timeouts sit beside it, 10 to 120 s) |
+| Flow model: unanswered UDP flow | `DATAGRAM_UNREPLIED_S` | crates/fluxor-abi/src/contracts/net/policy.rs | 30 | Policy, the host connection tracker's default: seconds a UDP flow nobody answered keeps its verdict idle (`ip`'s `dg_flow_idle_s` default, `pkt_filter`'s UDP flows) |
+| Flow model: answered UDP flow | `DATAGRAM_REPLIED_S` | crates/fluxor-abi/src/contracts/net/policy.rs | 120 | Policy, the host connection tracker's default: seconds an answered UDP flow keeps its verdict idle |
+| Flow model: other protocols | `GENERIC_S` | crates/fluxor-abi/src/contracts/net/policy.rs | 600 | Policy, the host connection tracker's default: seconds a flow of a protocol other than TCP, UDP and ICMP keeps its verdict idle |
 | DNS record types per allow entry | `MAX_ALLOW_TYPES` | modules/foundation/dns/mod.rs | 8 | Policy: one `update_allow` entry lists the types a signer may update; more than eight is a policy written in the wrong place |
 | fat32 enumeration | `MAX_FILES` | modules/foundation/fat32/mod.rs | 128 | Policy: entries one LIST returns; a larger directory is paged by the caller |
 | fat32 unlink free-list | `UNLINK_FREE_SLOTS` | modules/foundation/fat32/mod.rs | 8 | Deliberate cap with a stated degradation: sized for WAL segment compaction retiring a handful of segments per snapshot; overflow degrades to orphaning clusters, which fsck reclaims |
@@ -538,12 +538,12 @@ cannot be evaluated from its own file reads `—` and says why.
 | TLS redeliveries a record carries | `CONT_REDELIVER_MAX` | modules/foundation/tls/continuity.rs | 65544 | Policy, wire-visible in the CT_TLS record: the unconsumed deliveries (`[len:2][plaintext]` each, at most eight) a record carries for a standby to hand its worker again — four whole records' plaintext on the host, eight of 512 bytes off-host. A record past it is not importable, refused by name at the bridge (`TCS_REDELIVER_MAX`), never truncated |
 | TLS strict-mirror unacknowledged deltas | `CONT_OUT_BUDGET` | modules/foundation/tls/continuity.rs | 49152 | Policy: delta bytes a strict mirror lets stand unacknowledged on `cont_out` (three quarters of the 64 KiB channel the manifest asks for on the host; 12 KiB off-host) before it stops reading `cipher_in` — a delta the channel refuses ends the pair, and each inbound segment writes one as large as the partial record |
 | TLS strict-mirror `cont_out` need | `CONT_OUT_NEED` | modules/foundation/tls/continuity.rs | — | Policy, derived (`CONT_OUT_BUDGET + MAX_CMD_DATA` + one `CMD_SEND`'s RECORD_OUT framing + a KeyUpdate delta, ≈ 56.4 KiB on the host): the most a strict mirror leaves unread on `cont_out` — `CONT_OUT_BUDGET`, then one `CMD_SEND`'s RECORD_OUTs held for their horizon, then an owed KeyUpdate answer. `tls` measures `cont_out`'s ring at `module_new` (`IOCTL_WRITABLE`) and refuses a strict PAIR_PREPARE (`STATUS_NO_CAPACITY`, logged) on a smaller one, where a delta the channel refused would end the pair; asserted within the 64 KiB the manifest asks for on the host |
-| Strict pair: outbound records unacknowledged | `STRICT_TX_RECORDS` | modules/sdk/contracts/net/session_ctrl.rs | 32 | Policy, the canonical record's `TS_TXREC_MAX` (the provider asserts them equal): outbound TLS records written or held and not wholly acknowledged by the peer's transport. A strict `tls` holds the next record while this many stand — the clear side waits, the window slides on `ip`'s acknowledgement — and abandons the pair after `CONT_HORIZON_MS` with no acknowledgement (`txrec_cap_abandoned`). A small-record producer pipelining faster than the peer acknowledges (MQTT acknowledgements) waits here instead of losing the pair |
-| Strict pair: unacknowledged outbound bytes | `STRICT_SEND_BYTES` | modules/sdk/contracts/net/session_ctrl.rs | 32768 | Policy, the canonical record's `TS_SEND_MAX`: `tls`'s retransmit window (`RETX_BUF_SIZE`, 4 KiB) is asserted within it |
-| Strict pair: partial inbound record | `STRICT_RECV_BYTES` | modules/sdk/contracts/net/session_ctrl.rs | 16704 | Policy, the canonical record's `TS_RECV_MAX` (a whole protected TLS 1.3 record): `tls`'s receive buffer is asserted within it, and the provider carries it as one `RxSegment` |
-| Strict pair: out-of-order segments | `STRICT_OOO_SEGS` | modules/sdk/contracts/net/session_ctrl.rs | 4 | Policy, the canonical record's `TS_OOO_MAX`: `ip`'s reorder slots are asserted within it |
-| Strict pair: out-of-order segment bytes | `STRICT_OOO_SEG` | modules/sdk/contracts/net/session_ctrl.rs | 512 | Policy, the canonical record's `TS_OOO_SEG`: `ip`'s reorder slot bytes are asserted within it |
-| Strict pair: one delivery's plaintext | `STRICT_DELIVERY_BYTES` | modules/sdk/contracts/net/session_ctrl.rs | 16384 | Policy, the canonical record's `TS_DELIV_BYTES`: `tls`'s carried plaintext (`DELIV_CARRY_MAX`) is asserted within it |
+| Strict pair: outbound records unacknowledged | `STRICT_TX_RECORDS` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32 | Policy, the canonical record's `TS_TXREC_MAX` (the provider asserts them equal): outbound TLS records written or held and not wholly acknowledged by the peer's transport. A strict `tls` holds the next record while this many stand — the clear side waits, the window slides on `ip`'s acknowledgement — and abandons the pair after `CONT_HORIZON_MS` with no acknowledgement (`txrec_cap_abandoned`). A small-record producer pipelining faster than the peer acknowledges (MQTT acknowledgements) waits here instead of losing the pair |
+| Strict pair: unacknowledged outbound bytes | `STRICT_SEND_BYTES` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32768 | Policy, the canonical record's `TS_SEND_MAX`: `tls`'s retransmit window (`RETX_BUF_SIZE`, 4 KiB) is asserted within it |
+| Strict pair: partial inbound record | `STRICT_RECV_BYTES` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16704 | Policy, the canonical record's `TS_RECV_MAX` (a whole protected TLS 1.3 record): `tls`'s receive buffer is asserted within it, and the provider carries it as one `RxSegment` |
+| Strict pair: out-of-order segments | `STRICT_OOO_SEGS` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 4 | Policy, the canonical record's `TS_OOO_MAX`: `ip`'s reorder slots are asserted within it |
+| Strict pair: out-of-order segment bytes | `STRICT_OOO_SEG` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 512 | Policy, the canonical record's `TS_OOO_SEG`: `ip`'s reorder slot bytes are asserted within it |
+| Strict pair: one delivery's plaintext | `STRICT_DELIVERY_BYTES` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16384 | Policy, the canonical record's `TS_DELIV_BYTES`: `tls`'s carried plaintext (`DELIV_CARRY_MAX`) is asserted within it |
 
 ## Machine-checked block
 
@@ -615,20 +615,20 @@ MAX_MODULE_CODE_SIZE | src/kernel/config.rs | 1024 * 1024 | uefi
 MAX_MODULE_CODE_SIZE | src/kernel/config.rs | 1024 * 1024 | wasm-kernel
 MAX_MODULE_CODE_SIZE | src/kernel/config.rs | 1024 * 1024 | rp+rp2350
 MAX_MODULE_CODE_SIZE | src/kernel/config.rs | 384 * 1024 | rp+rp2040
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536 | host
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 256 | wasm
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 8 | embedded+rp2350
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 2 | embedded+rp2040
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 256 | host
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 256 | wasm
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 8 | embedded+rp2350
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 2 | embedded+rp2040
-MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 4096 | host
-MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8 | wasm
-MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8 | embedded
-MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 32 | host
-MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 8 | wasm
-MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 4 | embedded
+MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs | 65536 | host
+MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs | 256 | wasm
+MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs | 8 | embedded+rp2350
+MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs | 2 | embedded+rp2040
+MAX_DG_ENDPOINTS | crates/fluxor-abi/src/config.rs | 256 | host
+MAX_DG_ENDPOINTS | crates/fluxor-abi/src/config.rs | 256 | wasm
+MAX_DG_ENDPOINTS | crates/fluxor-abi/src/config.rs | 8 | embedded+rp2350
+MAX_DG_ENDPOINTS | crates/fluxor-abi/src/config.rs | 2 | embedded+rp2040
+MAX_LOCAL_ADDRS | crates/fluxor-abi/src/config.rs | 4096 | host
+MAX_LOCAL_ADDRS | crates/fluxor-abi/src/config.rs | 8 | wasm
+MAX_LOCAL_ADDRS | crates/fluxor-abi/src/config.rs | 8 | embedded
+MAX_PACKET_HOLD | crates/fluxor-abi/src/config.rs | 32 | host
+MAX_PACKET_HOLD | crates/fluxor-abi/src/config.rs | 8 | wasm
+MAX_PACKET_HOLD | crates/fluxor-abi/src/config.rs | 4 | embedded
 LANE_CEILING | src/kernel/workload/net_attach.rs | 255 | *
 STATIC_LANES | src/kernel/workload/net_attach.rs | 16 | static-tables
 STATIC_LANES | src/kernel/workload/net_attach.rs | 0 | boot-sized
@@ -636,34 +636,34 @@ MAX_ADD_MODULES | src/kernel/exec/scheduler/live.rs | 64 | *
 MAX_ADD_EDGES | src/kernel/exec/scheduler/live.rs | 192 | *
 ADD_WORKSPACES | src/kernel/exec/scheduler/live.rs | 2 | *
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
-CONTRACTS_ASSIGNED | modules/sdk/abi/registry_gen.rs | 41 | *
+CONTRACTS_ASSIGNED | crates/fluxor-abi/src/registry.rs | 41 | *
 MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | MAX_CHANNELS | *
 MAX_OWNERS | src/kernel/workload/owner.rs | 4096 | *
-MAX_PATH | modules/sdk/abi/config.rs | 200 | host
-MAX_PATH | modules/sdk/abi/config.rs | 32 | wasm
-MAX_PATH | modules/sdk/abi/config.rs | 32 | embedded
-RECORD_MAX | modules/sdk/contracts/exchange.rs | 8192 | *
-PAYLOAD_MAX | modules/sdk/contracts/exchange.rs | 8192 | *
-KEY_MAX | modules/sdk/contracts/exchange.rs | 512 | *
-RING_CONSUMERS | modules/sdk/contracts/telemetry.rs | 4 | *
+MAX_PATH | crates/fluxor-abi/src/config.rs | 200 | host
+MAX_PATH | crates/fluxor-abi/src/config.rs | 32 | wasm
+MAX_PATH | crates/fluxor-abi/src/config.rs | 32 | embedded
+RECORD_MAX | crates/fluxor-abi/src/contracts/exchange.rs | 8192 | *
+PAYLOAD_MAX | crates/fluxor-abi/src/contracts/exchange.rs | 8192 | *
+KEY_MAX | crates/fluxor-abi/src/contracts/exchange.rs | 512 | *
+RING_CONSUMERS | crates/fluxor-abi/src/contracts/telemetry.rs | 4 | *
 TELEMETRY_MAX_RECORD | src/kernel/exec/scheduler/module_types.rs | 144 | *
-DIM_MAX_PRODUCT | modules/sdk/contracts/telemetry.rs | 65534 | *
+DIM_MAX_PRODUCT | crates/fluxor-abi/src/contracts/telemetry.rs | 65534 | *
 MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024 | *
 MAX_CONTRACTS_PER_PROVIDER | src/kernel/module/loader.rs | 4 | *
 STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024 | *
 MAX_RING_BYTES | src/kernel/ipc/ring_size.rs | 4 * 1024 * 1024 | *
-MAX_CONNS | modules/sdk/abi/config.rs | 64 | host
-MAX_CONNS | modules/sdk/abi/config.rs | 8 | wasm
-MAX_CONNS | modules/sdk/abi/config.rs | 2 | embedded
-MAX_SESSIONS | modules/sdk/abi/config.rs | 512 | host
-MAX_SESSIONS | modules/sdk/abi/config.rs | 64 | wasm
-MAX_SESSIONS | modules/sdk/abi/config.rs | 1 | embedded
-MAX_STREAMS | modules/sdk/abi/config.rs | 4 | host
-MAX_STREAMS | modules/sdk/abi/config.rs | 4 | wasm
-MAX_STREAMS | modules/sdk/abi/config.rs | 4 | embedded
-MAX_ROUTES | modules/sdk/abi/config.rs | 8 | host
-MAX_ROUTES | modules/sdk/abi/config.rs | 4 | wasm
-MAX_ROUTES | modules/sdk/abi/config.rs | 4 | embedded
+MAX_CONNS | crates/fluxor-abi/src/config.rs | 64 | host
+MAX_CONNS | crates/fluxor-abi/src/config.rs | 8 | wasm
+MAX_CONNS | crates/fluxor-abi/src/config.rs | 2 | embedded
+MAX_SESSIONS | crates/fluxor-abi/src/config.rs | 512 | host
+MAX_SESSIONS | crates/fluxor-abi/src/config.rs | 64 | wasm
+MAX_SESSIONS | crates/fluxor-abi/src/config.rs | 1 | embedded
+MAX_STREAMS | crates/fluxor-abi/src/config.rs | 4 | host
+MAX_STREAMS | crates/fluxor-abi/src/config.rs | 4 | wasm
+MAX_STREAMS | crates/fluxor-abi/src/config.rs | 4 | embedded
+MAX_ROUTES | crates/fluxor-abi/src/config.rs | 8 | host
+MAX_ROUTES | crates/fluxor-abi/src/config.rs | 4 | wasm
+MAX_ROUTES | crates/fluxor-abi/src/config.rs | 4 | embedded
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 3 | chip-rp2040
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 4 | rp2350-chip
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 8 | non-rp
@@ -677,8 +677,8 @@ TAG_MAX | src/platform/linux/instance.rs | 32 | *
 STEM_MAX | src/platform/linux/instance.rs | 6 | *
 RULE_PRIORITY_MAIN | src/platform/linux/instance.rs | 32766 | *
 RSA_ENTRIES | src/kernel/security/key_vault.rs | 2 | rsa-vault
-RSA_MODULUS_BITS_MAX | modules/sdk/crypto/rsa.rs | 4096 | *
-RSA_EXPONENT_BITS_MAX | modules/sdk/crypto/rsa.rs | 32 | *
+RSA_MODULUS_BITS_MAX | crates/fluxor-sdk/src/crypto/rsa.rs | 4096 | *
+RSA_EXPONENT_BITS_MAX | crates/fluxor-sdk/src/crypto/rsa.rs | 32 | *
 MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 256 | host
 MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8 | off-host
 DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | host
@@ -768,9 +768,9 @@ DNSSEC_SIGNED_MAX | modules/foundation/dns/mod.rs | 4096 | *
 MAX_ANCHORS | modules/foundation/dns/mod.rs | 4 | *
 MAX_ANCHOR_RDATA | modules/foundation/dns/mod.rs | 1028 | *
 MAX_HOSTS | modules/foundation/dns/mod.rs | 16 | *
-MAX_NAME_LEN | modules/sdk/contracts/net/dns_wire.rs | 255 | *
-MAX_NAME_PTR_HOPS | modules/sdk/contracts/net/dns_wire.rs | 16 | *
-MAX_SECTION_RRS | modules/sdk/contracts/net/dns_wire.rs | 32 | *
+MAX_NAME_LEN | crates/fluxor-abi/src/contracts/net/dns_wire.rs | 255 | *
+MAX_NAME_PTR_HOPS | crates/fluxor-abi/src/contracts/net/dns_wire.rs | 16 | *
+MAX_SECTION_RRS | crates/fluxor-abi/src/contracts/net/dns_wire.rs | 32 | *
 MAX_CNAME_HOPS | modules/foundation/dns/mod.rs | 4 | *
 MAX_CHAIN_BYTES | modules/foundation/dns/mod.rs | 384 | *
 MAX_SYNTH_ADDRS | modules/foundation/dns/mod.rs | 8 | *
@@ -800,9 +800,9 @@ RX_DESC_COUNT | modules/drivers/rp1_gem/mod.rs | 192 | *
 FAN_FRAMES_PER_STEP | src/kernel/exec/scheduler/module_types.rs | 64 | *
 ALLOC_SCAN_SLICE | modules/foundation/ip/mod.rs | 256 | *
 SWEEP_SLICE_MAX | modules/foundation/ip/mod.rs | 1024 | *
-MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 8 | host
-MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 2 | wasm
-MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 1 | embedded
+MAX_TCP_SHADOWS | crates/fluxor-abi/src/config.rs | 8 | host
+MAX_TCP_SHADOWS | crates/fluxor-abi/src/config.rs | 2 | wasm
+MAX_TCP_SHADOWS | crates/fluxor-abi/src/config.rs | 1 | embedded
 FENCE_WIRE_WAIT_MS | modules/foundation/ip/mod.rs | 500 | *
 NET_OUT_FRAME_MAX | modules/foundation/ip/mod.rs | NET_FRAME_HDR + abi::contracts::net::net_proto::PEER_LEN | *
 MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 2 | host
@@ -816,12 +816,12 @@ CONT_REDELIVER_MAX | modules/foundation/tls/continuity.rs | 8 * 2 + 8 * 512 | of
 CONT_OUT_BUDGET | modules/foundation/tls/continuity.rs | 48 * 1024 | host
 CONT_OUT_BUDGET | modules/foundation/tls/continuity.rs | 12 * 1024 | off-host
 CONT_OUT_NEED | modules/foundation/tls/continuity.rs | - | *
-STRICT_TX_RECORDS | modules/sdk/contracts/net/session_ctrl.rs | 32 | *
-STRICT_SEND_BYTES | modules/sdk/contracts/net/session_ctrl.rs | 32 * 1024 | *
-STRICT_RECV_BYTES | modules/sdk/contracts/net/session_ctrl.rs | 16_704 | *
-STRICT_OOO_SEGS | modules/sdk/contracts/net/session_ctrl.rs | 4 | *
-STRICT_OOO_SEG | modules/sdk/contracts/net/session_ctrl.rs | 512 | *
-STRICT_DELIVERY_BYTES | modules/sdk/contracts/net/session_ctrl.rs | 16 * 1024 | *
+STRICT_TX_RECORDS | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32 | *
+STRICT_SEND_BYTES | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32 * 1024 | *
+STRICT_RECV_BYTES | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16_704 | *
+STRICT_OOO_SEGS | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 4 | *
+STRICT_OOO_SEG | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 512 | *
+STRICT_DELIVERY_BYTES | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16 * 1024 | *
 CONT_KEYS | modules/foundation/tls/continuity.rs | 2 + 2 * MAX_TLS_SHADOWS | *
 PEND_MAX | modules/foundation/tls/continuity.rs | 16 | *
 CONT_DERIVE_MAX | modules/foundation/tls/continuity.rs | 16 | *
@@ -865,29 +865,29 @@ DEFAULT_PEER_STREAM_WINDOW | modules/foundation/quic/connection.rs | 1 << 18 | *
 CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64 | *
 CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16 | *
 CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8 | *
-MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | host
-MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | wasm
-MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 4 | embedded+rp2350
-MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 1 | embedded+rp2040
-RECV_BUF_SIZE | modules/sdk/abi/config.rs | 8192 | host
-RECV_BUF_SIZE | modules/sdk/abi/config.rs | 4096 | wasm
-RECV_BUF_SIZE | modules/sdk/abi/config.rs | 2048 | embedded
-SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100 | host
-SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100 | wasm
-SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100 | embedded
-MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 64 | host
-MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 8 | wasm
-MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 8 | embedded
-MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 8 | host
-MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 4 | wasm
-MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 4 | embedded
-MAX_FS_PATH | modules/sdk/abi/config.rs | 256 | host
-MAX_FS_PATH | modules/sdk/abi/config.rs | 64 | wasm
-MAX_FS_PATH | modules/sdk/abi/config.rs | 64 | embedded
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 256 * 1024 | host
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 32 * 1024 | wasm
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | embedded+rp2350
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 4 * 1024 | embedded+rp2040
+MAX_CONCURRENT_CONNS | crates/fluxor-abi/src/config.rs | 256 | host
+MAX_CONCURRENT_CONNS | crates/fluxor-abi/src/config.rs | 256 | wasm
+MAX_CONCURRENT_CONNS | crates/fluxor-abi/src/config.rs | 4 | embedded+rp2350
+MAX_CONCURRENT_CONNS | crates/fluxor-abi/src/config.rs | 1 | embedded+rp2040
+RECV_BUF_SIZE | crates/fluxor-abi/src/config.rs | 8192 | host
+RECV_BUF_SIZE | crates/fluxor-abi/src/config.rs | 4096 | wasm
+RECV_BUF_SIZE | crates/fluxor-abi/src/config.rs | 2048 | embedded
+SEND_BUF_SIZE | crates/fluxor-abi/src/config.rs | 4100 | host
+SEND_BUF_SIZE | crates/fluxor-abi/src/config.rs | 4100 | wasm
+SEND_BUF_SIZE | crates/fluxor-abi/src/config.rs | 4100 | embedded
+MAX_DYN_ROUTES | crates/fluxor-abi/src/config.rs | 64 | host
+MAX_DYN_ROUTES | crates/fluxor-abi/src/config.rs | 8 | wasm
+MAX_DYN_ROUTES | crates/fluxor-abi/src/config.rs | 8 | embedded
+MAX_ROUTE_BACKENDS | crates/fluxor-abi/src/config.rs | 8 | host
+MAX_ROUTE_BACKENDS | crates/fluxor-abi/src/config.rs | 4 | wasm
+MAX_ROUTE_BACKENDS | crates/fluxor-abi/src/config.rs | 4 | embedded
+MAX_FS_PATH | crates/fluxor-abi/src/config.rs | 256 | host
+MAX_FS_PATH | crates/fluxor-abi/src/config.rs | 64 | wasm
+MAX_FS_PATH | crates/fluxor-abi/src/config.rs | 64 | embedded
+DEFAULT_BODY_POOL_SIZE | crates/fluxor-abi/src/config.rs | 256 * 1024 | host
+DEFAULT_BODY_POOL_SIZE | crates/fluxor-abi/src/config.rs | 32 * 1024 | wasm
+DEFAULT_BODY_POOL_SIZE | crates/fluxor-abi/src/config.rs | 16 * 1024 | embedded+rp2350
+DEFAULT_BODY_POOL_SIZE | crates/fluxor-abi/src/config.rs | 4 * 1024 | embedded+rp2040
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 32768 | host
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 2048 | rp-small
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 8192 | rp-large
@@ -913,7 +913,7 @@ MAX_TABLE_BYTES | src/kernel/net_policy.rs | crate::kernel::config::static_slots
 MAX_SEGMENTS | src/kernel/net_route.rs | crate::kernel::config::static_slots(res::POOL_NET_ROUTE_SEGMENTS) | *
 MAX_PEERS | src/kernel/net_route.rs | crate::kernel::config::static_slots(res::POOL_NET_ROUTE_PEERS) | *
 MAX_HELD | src/kernel/net_route.rs | crate::kernel::config::static_slots(res::POOL_NET_ROUTE_HELD) | *
-MAX_CLUSTER_PREFIXES | modules/sdk/contracts/net/route.rs | 8 | *
+MAX_CLUSTER_PREFIXES | crates/fluxor-abi/src/contracts/net/route.rs | 8 | *
 READ_RETRIES | src/kernel/net_policy.rs | 8 | *
 WRITER_SPINS | src/kernel/net_policy.rs | 1 << 16 | *
 STATE_SPINS | src/kernel/net_route.rs | 1 << 16 | *
@@ -983,19 +983,19 @@ MAX_PERSISTED | src/kernel/security/key_vault.rs | 8 | off-host
 MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048 | *
 MAX_CONSUMED | src/kernel/security/key_share.rs | 32 | *
 PARAM_TAG_MAX | tools/src/manifest.rs | 0xEC | *
-MAX_CHAIN_LINKS | modules/sdk/contracts/mesh/capability.rs | 8 | *
-MAX_CHAIN_BYTES | modules/sdk/contracts/mesh/capability.rs | CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN | *
-MAX_ROOTS | modules/sdk/contracts/mesh/capability.rs | 2 | *
-MAX_SESSION_GRANTS | modules/sdk/contracts/mesh/capability.rs | 8 | *
-PRESENT_MAX | modules/sdk/contracts/mesh/capability.rs | 4 + MAX_CHAIN_BYTES | *
-MAX_TEXT_LEN | modules/sdk/contracts/mesh/capability.rs | 1375 | *
-LIST_PAGE_MAX | modules/sdk/contracts/storage/object.rs | 1000 | *
-STORAGE_KEY_MAX | modules/sdk/contracts/storage/handle.rs | 255 | *
-PATH_MAX | modules/sdk/contracts/storage/namespace.rs | 1024 | *
-TOKEN_MAX | modules/sdk/contracts/storage/namespace.rs | 320 | *
+MAX_CHAIN_LINKS | crates/fluxor-abi/src/contracts/mesh/capability.rs | 8 | *
+MAX_CHAIN_BYTES | crates/fluxor-abi/src/contracts/mesh/capability.rs | CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN | *
+MAX_ROOTS | crates/fluxor-abi/src/contracts/mesh/capability.rs | 2 | *
+MAX_SESSION_GRANTS | crates/fluxor-abi/src/contracts/mesh/capability.rs | 8 | *
+PRESENT_MAX | crates/fluxor-abi/src/contracts/mesh/capability.rs | 4 + MAX_CHAIN_BYTES | *
+MAX_TEXT_LEN | crates/fluxor-abi/src/contracts/mesh/capability.rs | 1375 | *
+LIST_PAGE_MAX | crates/fluxor-abi/src/contracts/storage/object.rs | 1000 | *
+STORAGE_KEY_MAX | crates/fluxor-abi/src/contracts/storage/handle.rs | 255 | *
+PATH_MAX | crates/fluxor-abi/src/contracts/storage/namespace.rs | 1024 | *
+TOKEN_MAX | crates/fluxor-abi/src/contracts/storage/namespace.rs | 320 | *
 MAX_PRIVATE | src/kernel/module/gateway.rs | 3 | *
 WALK_MAX | src/kernel/module/gateway.rs | 656 | *
-KEY_REF_MAX | modules/sdk/contracts/storage/object.rs | 64 | *
+KEY_REF_MAX | crates/fluxor-abi/src/contracts/storage/object.rs | 64 | *
 SLOTS | src/kernel/module/gateway.rs | 128 | *
 PORT_CHANNELS | modules/foundation/remote_channel/wire.rs | 8 | *
 MAX_CHANNELS | modules/foundation/remote_channel/wire.rs | PORT_CHANNELS + 2 | *
@@ -1017,7 +1017,7 @@ RETAIN_FLOOR_MS | modules/foundation/remote_channel/mod.rs | 3 * SETUP_TIMEOUT_M
 MAX_PARAMS | tools/src/params.rs | 64 | *
 MAX_PARAM_STRING_BYTES | tools/src/params.rs | 4096 | *
 MAX_PARAM_NAME_BYTES | tools/src/params.rs | 64 | *
-SCOPE_MAX | modules/sdk/contracts/storage/object.rs | 255 | *
+SCOPE_MAX | crates/fluxor-abi/src/contracts/storage/object.rs | 255 | *
 STORE_STAGE_MAX | src/platform/linux/store.rs | 64 * 1024 * 1024 | *
 STORE_STAGE_RESERVE_MAX | src/platform/linux/store.rs | 1024 * 1024 | *
 CHANGES_SCAN_BUDGET | src/platform/linux/store.rs | 4096 | *
@@ -1064,19 +1064,19 @@ WORK_EDGES | src/kernel/exec/scheduler/live.rs | derived: a staged live add's ed
 WS_MODULE_SLOTS | src/kernel/exec/scheduler/live.rs | derived: a static-table profile's workspace module slots, ADD_WORKSPACES × WORK_MODULES (0 on wasm)
 WS_EDGE_SLOTS | src/kernel/exec/scheduler/live.rs | derived: a static-table profile's workspace edge slots, ADD_WORKSPACES × WORK_EDGES (0 on wasm)
 OWNER_TABLE_SLOTS | src/kernel/workload/owner.rs | derived: an owner-keyed table's compiled size, the static profile's owner figure (wasm) or MAX_OWNERS
-STATUS_NO_CAPACITY | modules/sdk/contracts/net/session_ctrl.rs | protocol: a continuity reply's status code, not a capacity
-SIG_MAX | modules/sdk/contracts/net/session_ctrl.rs | format: the longest custody-evidence signature (a P-256 DER signature) the evidence layout holds
-EVIDENCE_MAX | modules/sdk/contracts/net/session_ctrl.rs | derived: the custody evidence's fixed part and SIG_MAX
-CHECKPOINT_CHUNK_MAX | modules/sdk/contracts/net/session_ctrl.rs | format: the per-layer checkpoint chunk on the continuity wire, sized to the frames both ends assemble
-ABORT_TXREC_CAP | modules/sdk/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the outbound-record cap reached), not a capacity
-ABORT_REDELIVER_CAP | modules/sdk/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the redelivery cap reached), not a capacity
-ABORT_HORIZON_BUDGET | modules/sdk/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the horizon budget spent), not a budget
-MAX_CONTRACTS | modules/sdk/abi/registry_gen.rs | mirror: the registry header's `max_contracts`, which the kernel's `MAX_CONTRACTS` row registers
-MODULE_FLOW_BUDGET | modules/sdk/abi/registry_gen.rs | protocol: the kernel opcode that reads a module's flow budget, not a capacity
-SLOT_CAPACITY | modules/sdk/abi/registry_gen.rs | protocol: the reconfigure opcode that reads the kernel's module-slot capacity, not a capacity
+STATUS_NO_CAPACITY | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | protocol: a continuity reply's status code, not a capacity
+SIG_MAX | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | format: the longest custody-evidence signature (a P-256 DER signature) the evidence layout holds
+EVIDENCE_MAX | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | derived: the custody evidence's fixed part and SIG_MAX
+CHECKPOINT_CHUNK_MAX | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | format: the per-layer checkpoint chunk on the continuity wire, sized to the frames both ends assemble
+ABORT_TXREC_CAP | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the outbound-record cap reached), not a capacity
+ABORT_REDELIVER_CAP | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the redelivery cap reached), not a capacity
+ABORT_HORIZON_BUDGET | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the horizon budget spent), not a budget
+MAX_CONTRACTS | crates/fluxor-abi/src/registry.rs | mirror: the registry header's `max_contracts`, which the kernel's `MAX_CONTRACTS` row registers
+MODULE_FLOW_BUDGET | crates/fluxor-abi/src/registry.rs | protocol: the kernel opcode that reads a module's flow budget, not a capacity
+SLOT_CAPACITY | crates/fluxor-abi/src/registry.rs | protocol: the reconfigure opcode that reads the kernel's module-slot capacity, not a capacity
 REPLY_BODY_MAX | modules/foundation/tls/continuity.rs | derived: the larger of a CUT manifest body and a custody reply carrying the largest evidence
 DELTA_IN_TRAILER_MAX | modules/foundation/tls/continuity.rs | derived: a strict RECORD_IN's trailer at its largest, the content type and length and DELIV_CARRY_MAX bytes of plaintext
-BODY_MAX | modules/sdk/contracts/exchange.rs | derived: one RECORD_MAX record less its 16-byte prefix
+BODY_MAX | crates/fluxor-abi/src/contracts/exchange.rs | derived: one RECORD_MAX record less its 16-byte prefix
 STATE_SIZE | modules/foundation/pkt_filter/mod.rs | derived: the size of the instance block, as `module_state_size` answers it
 MAX_DG_ENDPOINTS | modules/foundation/ip/mod.rs | variant: the `small_table` override of the registered abi::config::ip ceiling, never above it — DHCP, a log or telemetry sink and one more, within that variant's four-slot table
 CTRL_CAP | modules/foundation/nbd_serve/mod.rs | derived: the longest handshake answer, EXPORT_NAME's 134 bytes with the pad, or GO's two infos and ACK
@@ -1101,14 +1101,14 @@ NET_BUF_SIZE | modules/foundation/quic/mod.rs | scratch: one net frame around on
 ERR_STREAM_LIMIT | modules/foundation/quic/connection.rs | RFC 9000 §20.1 transport error code STREAM_LIMIT_ERROR, a protocol constant
 ERR_CONNECTION_ID_LIMIT | modules/foundation/quic/connection.rs | RFC 9000 §20.1 transport error code CONNECTION_ID_LIMIT_ERROR, a protocol constant
 STATE_ARENA_SIZE | src/kernel/module/loader.rs | mirror of the registered src/kernel/config.rs ceiling, re-exported for the loader
-RSA_BYTES_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in bytes
-RSA_LIMBS_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in limbs of the target's word
-RSA_HALF_LIMBS_MAX | modules/sdk/crypto/rsa.rs | derived: a CRT prime is half the modulus
+RSA_BYTES_MAX | crates/fluxor-sdk/src/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in bytes
+RSA_LIMBS_MAX | crates/fluxor-sdk/src/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in limbs of the target's word
+RSA_HALF_LIMBS_MAX | crates/fluxor-sdk/src/crypto/rsa.rs | derived: a CRT prime is half the modulus
 BUF_SIZE | modules/drivers/rp1_gem/mod.rs | DMA scratch sized by the ring, not a policy ceiling
 MAX_FRAME | modules/drivers/rp1_gem/mod.rs | Ethernet frame size, a protocol constant (MTU + headers)
 STATE_SIZE | modules/drivers/rp1_gem/mod.rs | size_of the driver state, not a ceiling
 NET_BUF_SIZE | modules/foundation/dns/mod.rs | scratch: one net frame around one DNS packet
-MAX_LABEL_LEN | modules/sdk/contracts/net/dns_wire.rs | RFC 1035 label length, a protocol constant
+MAX_LABEL_LEN | crates/fluxor-abi/src/contracts/net/dns_wire.rs | RFC 1035 label length, a protocol constant
 MAX_ZONE_PATH | modules/foundation/dns/mod.rs | path scratch for the committed-generation file name
 ZONE_RECORD_MAX | modules/foundation/dns/mod.rs | derived from the registered zone name and rdata ceilings
 MAX_ZONE_FILE | modules/foundation/dns/mod.rs | derived from ZONE_RECORD_MAX and the registered record count
@@ -1156,21 +1156,21 @@ MIRROR_DELTA_MAX | modules/foundation/quic/continuity.rs | derived: a delta head
 DELTA_PAYLOAD_MAX | modules/foundation/tls/continuity.rs | derived from RECV_BUF_SIZE and the delta header
 CONT_SCRATCH_SIZE | modules/foundation/tls/continuity.rs | derived assembly scratch
 REPLY_MAX | modules/foundation/tls/continuity.rs | derived reply assembly scratch
-MAX_ID | modules/sdk/abi/config.rs | the highest vocabulary id, a marker rather than a cap
-MAX_CONTENT_TYPE | modules/sdk/abi/config.rs | content-type string width
-MAX_VARS | modules/sdk/abi/config.rs | template variable table, a tuning knob
-MAX_VAR_VALUE | modules/sdk/abi/config.rs | template variable width, a tuning knob
-MAX_CACHE | modules/sdk/abi/config.rs | template cache slots, a tuning knob
-HEADER_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-METRIC_SCALAR_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-METRIC_HIST_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-METRIC_HIST16_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-SPAN_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-PSTATUS_STEP_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-PSTATUS_RES_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-PSTATUS_POOL_SIZE | modules/sdk/contracts/telemetry.rs | record layout
-MAX_RECORD_SIZE | modules/sdk/contracts/telemetry.rs | mirror of TELEMETRY_MAX_RECORD, pinned by test
-BATCH_HEADER_SIZE | modules/sdk/contracts/telemetry.rs | batch envelope layout
+MAX_ID | crates/fluxor-abi/src/config.rs | the highest vocabulary id, a marker rather than a cap
+MAX_CONTENT_TYPE | crates/fluxor-abi/src/config.rs | content-type string width
+MAX_VARS | crates/fluxor-abi/src/config.rs | template variable table, a tuning knob
+MAX_VAR_VALUE | crates/fluxor-abi/src/config.rs | template variable width, a tuning knob
+MAX_CACHE | crates/fluxor-abi/src/config.rs | template cache slots, a tuning knob
+HEADER_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+METRIC_SCALAR_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+METRIC_HIST_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+METRIC_HIST16_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+SPAN_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+PSTATUS_STEP_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+PSTATUS_RES_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+PSTATUS_POOL_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | record layout
+MAX_RECORD_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | mirror of TELEMETRY_MAX_RECORD, pinned by test
+BATCH_HEADER_SIZE | crates/fluxor-abi/src/contracts/telemetry.rs | batch envelope layout
 SPI_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
 I2C_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
 UART_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
@@ -1214,12 +1214,12 @@ IDENTITIES | modules/foundation/remote_channel/mod.rs | derived: tls::MAX_SESSIO
 LINKS_MAX | modules/foundation/remote_channel/mod.rs | derived: SESSIONS_MAX plus the one transport session a listener holds while it settles a peer's newer session
 TAIL_MAX | modules/foundation/tls/mod.rs | derived: the generation and ALPN tail of MSG_CONNECTED/MSG_ACCEPTED, `2 + SESSION_GENERATION_LEN + 1 + ALPN_NAME_MAX`
 EXTRA_CHUNKS | modules/foundation/tls/mod.rs | derived: the elastic chunks past the inline one, (MAX_SESSIONS - SESSION_CHUNK) / SESSION_CHUNK, const-asserted to tile MAX_SESSIONS exactly
-SIZE | modules/sdk/contracts/net/route.rs | format: the byte length of a route-contract record (peer route, held address, entry state)
-MIN_OUT_CAP | modules/sdk/contracts/storage/namespace.rs | derived: the TAKE_RUNG answer head and one handle, the smallest out_cap that makes progress
-RSA_T_LIMBS | modules/sdk/crypto/rsa.rs | derived: RSA_LIMBS_MAX plus the two limbs the CIOS Montgomery accumulator carries
-RSA_WINDOW | modules/sdk/crypto/rsa.rs | algorithm: exponent bits per step of the fixed-window CRT exponentiation, a speed/table-size trade inside one signing job — nothing is refused at it
-RSA_TABLE | modules/sdk/crypto/rsa.rs | derived: 1 << RSA_WINDOW precomputed powers of the base
+SIZE | crates/fluxor-abi/src/contracts/net/route.rs | format: the byte length of a route-contract record (peer route, held address, entry state)
+MIN_OUT_CAP | crates/fluxor-abi/src/contracts/storage/namespace.rs | derived: the TAKE_RUNG answer head and one handle, the smallest out_cap that makes progress
+RSA_T_LIMBS | crates/fluxor-sdk/src/crypto/rsa.rs | derived: RSA_LIMBS_MAX plus the two limbs the CIOS Montgomery accumulator carries
+RSA_WINDOW | crates/fluxor-sdk/src/crypto/rsa.rs | algorithm: exponent bits per step of the fixed-window CRT exponentiation, a speed/table-size trade inside one signing job — nothing is refused at it
+RSA_TABLE | crates/fluxor-sdk/src/crypto/rsa.rs | derived: 1 << RSA_WINDOW precomputed powers of the base
 SIZE | src/kernel/module/loader.rs | format: the 80-byte fmod ModuleHeader, its layout pinned by the offset_of asserts beside it
-CONSUMERS | src/kernel/sys/telemetry_ring.rs | mirror: the kernel side of the registered RING_CONSUMERS (modules/sdk/contracts/telemetry.rs), held equal to it by a harness test
+CONSUMERS | src/kernel/sys/telemetry_ring.rs | mirror: the kernel side of the registered RING_CONSUMERS (crates/fluxor-abi/src/contracts/telemetry.rs), held equal to it by a harness test
 RELIST_TOKEN_MAX | src/platform/bcm2712/store.rs | derived: a relist continuation, the tag, a pinned revision and a STORAGE_KEY_MAX key (264 bytes), within the registered changes::TOKEN_MAX
 ```

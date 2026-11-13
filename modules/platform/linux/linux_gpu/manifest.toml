@@ -4,7 +4,7 @@ builtin = true
 
 # Native GPU compute and raster over wgpu/Vulkan, headless.
 #
-# The generic GPU contract (`modules/sdk/wire/gpu_wire.rs`) on a real
+# The generic GPU contract (`crates/fluxor-abi/src/contracts/gpu.rs`) on a real
 # device, with no display, no swapchain and no window: a compute graph builds
 # and runs here on a Pi 5's V3D exactly as it does on a discrete card, because
 # nothing in the path touches presentation. Raster runs the same way — a pass

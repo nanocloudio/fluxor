@@ -4,7 +4,7 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 timer_class = "agnostic"
 
 # Fixture director for the ip module's pre-transport decision seam
-# (`modules/sdk/contracts/net/packet.rs` §decision seam). Disposes every
+# (`crates/fluxor-abi/src/contracts/net/packet.rs` §decision seam). Disposes every
 # packet from a port table — LOCAL by default, DROP / REJECT / TUNNEL / DSR
 # for the destination ports its parameters name, and never for `hold_port`
 # so the hold deadline is exercised — and drains whatever ip forwards to

@@ -47,11 +47,11 @@ use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
 /// Input record (Pointer MSG_EVENT) — must match
-/// `modules/sdk/contracts/input/pointer.rs::EVENT_SIZE`.
+/// `crates/fluxor-abi/src/contracts/input/pointer.rs::EVENT_SIZE`.
 const POINTER_EVENT_SIZE: usize = 16;
 
 /// Output record (Gamepad MSG_STATE) — must match
-/// `modules/sdk/contracts/input/gamepad.rs::EVENT_SIZE`.
+/// `crates/fluxor-abi/src/contracts/input/gamepad.rs::EVENT_SIZE`.
 const GAMEPAD_EVENT_SIZE: usize = 16;
 
 /// Maximum concurrent active pointers we track. 8 covers every
@@ -60,7 +60,7 @@ const GAMEPAD_EVENT_SIZE: usize = 16;
 const MAX_ACTIVE_POINTERS: usize = 8;
 
 /// Hardcoded button bit indices from
-/// `modules/sdk/contracts/input/gamepad.rs` — must stay in sync.
+/// `crates/fluxor-abi/src/contracts/input/gamepad.rs` — must stay in sync.
 mod btn {
     pub const A: u8 = 0;
     pub const B: u8 = 1;

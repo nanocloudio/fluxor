@@ -7,7 +7,7 @@
 //! request is `EINVAL`, an address outside what the op may reach is
 //! `EFAULT`, an exhausted DMA arena is `ENOMEM`, and an op the machine has
 //! no hardware for is `ENOSYS` (the semantics text is
-//! `modules/sdk/contracts/hal/metal_device.rs`).
+//! `crates/fluxor-abi/src/contracts/hal/metal_device.rs`).
 
 use crate::abi::contracts::hal::metal_device as op;
 use crate::kernel::sys::errno::{EFAULT, EINVAL, ENOMEM, ENOSYS};

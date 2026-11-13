@@ -36,7 +36,7 @@ mod ws_source;
 mod dom_input;
 
 // Per-class input modules (capability-surface model). Each emits one
-// of the `modules/sdk/contracts/input/*` contracts; see the matching
+// of the `crates/fluxor-abi/src/contracts/input/*` contracts; see the matching
 // `stacks/{gamepad,pointer,keyboard}.toml` for how `platform.gamepad:
 // {}` etc. select the right producer per-target. `dom_input` above
 // multiplexes keyboard events on a single channel; a graph that wants one
@@ -679,7 +679,7 @@ unsafe fn load_embedded_modules() -> usize {
 
         // Per-class input modules — capability-surface partition of
         // `dom_input`. Each emits its corresponding
-        // `modules/sdk/contracts/input/*` contract on its single
+        // `crates/fluxor-abi/src/contracts/input/*` contract on its single
         // output port (port idx 0 — input modules are sources).
         if entry.name_hash == WASM_BROWSER_KEYBOARD_HASH {
             if !init_builtin_heap::<keyboard::KeyboardState>(module_idx) {
@@ -1498,7 +1498,7 @@ unsafe fn load_embedded_modules() -> usize {
         }
 
         // `module_init_wasm` is the wasm-only entry point each PIC
-        // module exports from `modules/sdk/runtime/wasm_entry.rs`. It owns
+        // module exports from `crates/fluxor-rt/src/wasm_entry.rs`. It owns
         // state allocation (via the module's bump heap) and calls
         // the module's `module_new` with `&WASM_SYSCALLS`. Args are
         // packed as four i32 LE values: in_chan, out_chan, ctrl_chan,

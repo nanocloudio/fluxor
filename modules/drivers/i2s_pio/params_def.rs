@@ -1,10 +1,9 @@
 // I2S parameter definitions (single source of truth).
 
 use super::I2sState;
-use super::SCHEMA_MAX;
 use super::{p_u32, p_u8};
 
-define_params! {
+fluxor_rt::define_params! {
     I2sState;
 
     1, data_pin, u8, 28

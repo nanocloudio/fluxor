@@ -113,25 +113,13 @@
 //!   two units, a header and its ciphertext (default 64).
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::key_vault as kv;
 use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
@@ -681,10 +669,10 @@ impl CryptState {
 
 mod params_def {
     use super::CryptState;
-    use super::SCHEMA_MAX;
+
     use super::{p_u32, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         CryptState;
 
         1, key, str, 0
@@ -1152,8 +1140,6 @@ const JOB_EXEC: u8 = 3;
 /// A rotation phase or a control record's work.
 const JOB_BACKGROUND: u8 = 4;
 
-/// Where a crypto-erase is: none asked for, under way, finished.
-const ERASE_NONE: u8 = 0;
 const ERASE_RUNNING: u8 = 1;
 const ERASE_DONE: u8 = 2;
 
@@ -3628,4 +3614,4 @@ pub mod test_hooks {
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

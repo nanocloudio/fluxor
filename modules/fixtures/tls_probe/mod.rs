@@ -13,16 +13,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -33,12 +23,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::net::net_proto;
 use net_proto::{
@@ -105,7 +93,7 @@ pub struct ProbeState {
 mod params_def {
     use super::*;
     // Tags 1 and 2 are retired; the next allocation is 5.
-    define_params! {
+    fluxor_rt::define_params! {
         ProbeState;
         3, count, u16, 1 => |s, d, len| { s.count = p_u16(d, len, 0, 1); };
         4, authority, str, 0 => |s, d, len| {
@@ -355,7 +343,7 @@ unsafe fn service_net(s: &mut ProbeState, now: u32) {
     }
 }
 
-declare_module_state_bytes!(ProbeState);
+fluxor_rt::declare_module_state_bytes!(ProbeState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]

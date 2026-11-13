@@ -17,16 +17,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -37,18 +27,14 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
 // ============================================================================
-
-const GT911_ADDR_LOW: u8 = 0x5D; // INT low during reset → 0x5D
 
 // GT911 registers
 const REG_PRODUCT_ID: u16 = 0x8140;
@@ -128,12 +114,7 @@ struct Gt911State {
     touch_count: u8,
 }
 
-impl Gt911State {
-    #[inline(always)]
-    fn sys(&self) -> &SyscallTable {
-        unsafe { &*self.syscalls }
-    }
-}
+impl Gt911State {}
 
 // ============================================================================
 // Parameters
@@ -142,9 +123,8 @@ impl Gt911State {
 mod params_def {
     use super::p_u8;
     use super::Gt911State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         Gt911State;
 
         1, i2c_bus, u8, 1
@@ -207,26 +187,10 @@ unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     ) // GPIO_SET_OUTPUT
 }
 
-unsafe fn claim_gpio_input(sys: &SyscallTable, pin: u8) -> i32 {
-    let mut arg = [pin];
-    (sys.provider_open)(
-        HAL_GPIO_CONTRACT,
-        abi::registry::gpio::SET_INPUT,
-        arg.as_mut_ptr(),
-        1,
-    ) // GPIO_SET_INPUT
-}
-
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {
     let mut lvl = [level];
     (sys.provider_call)(handle, abi::registry::gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
     // GPIO_SET_LEVEL
-}
-
-unsafe fn gpio_set_mode_output(sys: &SyscallTable, handle: i32) {
-    let mut mode = [1u8]; // 1 = output
-    (sys.provider_call)(handle, abi::registry::gpio::SET_MODE, mode.as_mut_ptr(), 1);
-    // GPIO_SET_MODE
 }
 
 unsafe fn gpio_set_mode_input(sys: &SyscallTable, handle: i32) {
@@ -249,7 +213,7 @@ unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
 // Module exports
 // ============================================================================
 
-declare_module_state_bytes!(Gt911State);
+fluxor_rt::declare_module_state_bytes!(Gt911State);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -721,6 +685,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

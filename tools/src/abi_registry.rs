@@ -1,5 +1,5 @@
-//! The ABI number registry: `modules/sdk/abi/registry.toml` parsed,
-//! validated and emitted as `modules/sdk/abi/registry_gen.rs`.
+//! The ABI number registry: `crates/fluxor-abi/registry/registry.toml` parsed,
+//! validated and emitted as `crates/fluxor-abi/src/registry.rs`.
 //!
 //! The TOML is the one place an ABI number is written: contract ids,
 //! opcode classes and opcodes, permission bits, errno values, poll bits and
@@ -16,9 +16,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Where the registry lives, relative to the repo root.
-pub const REGISTRY_TOML: &str = "modules/sdk/abi/registry.toml";
+pub const REGISTRY_TOML: &str = "crates/fluxor-abi/registry/registry.toml";
 /// Where the generated file is written, relative to the repo root.
-pub const REGISTRY_GEN: &str = "modules/sdk/abi/registry_gen.rs";
+pub const REGISTRY_GEN: &str = "crates/fluxor-abi/src/registry.rs";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

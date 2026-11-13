@@ -35,16 +35,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -55,12 +45,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[allow(
     dead_code,
@@ -289,7 +277,7 @@ pub struct Cyw43State {
 mod params_def {
     use super::*;
 
-    define_params! {
+    fluxor_rt::define_params! {
         Cyw43State;
 
         1, pio_idx, u8, 1, enum { pio0=0, pio1=1, pio2=2 }
@@ -335,20 +323,6 @@ unsafe fn log_error(s: &Cyw43State, msg: &[u8]) {
 unsafe fn log_info(s: &Cyw43State, msg: &[u8]) {
     let sys = &*s.syscalls;
     dev_log(sys, 3, msg.as_ptr(), msg.len());
-}
-
-/// Format u32 as "0xHHHHHHHH" (10 chars). Returns bytes written.
-unsafe fn fmt_hex32(dst: *mut u8, val: u32) -> usize {
-    *dst = b'0';
-    *dst.add(1) = b'x';
-    let hex = b"0123456789ABCDEF";
-    let mut i = 0usize;
-    while i < 8 {
-        let nib = ((val >> (28 - i * 4)) & 0xF) as usize;
-        *dst.add(2 + i) = hex[nib];
-        i += 1;
-    }
-    10
 }
 
 // LED state machine steps — direct backplane GPIO register access.
@@ -398,7 +372,7 @@ pub extern "C" fn module_state_size() -> u32 {
 
 // Same figure as data, for `pack` to record in the manifest so a graph's
 // state-arena demand is summable host-side.
-declare_module_state_bytes!(Cyw43State);
+fluxor_rt::declare_module_state_bytes!(Cyw43State);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -4020,6 +3994,6 @@ unsafe fn process_wifi_command(s: &mut Cyw43State, msg_type: u32, payload: *cons
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

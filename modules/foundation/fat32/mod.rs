@@ -26,16 +26,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -46,8 +36,7 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
+use fluxor_abi as abi;
 
 use abi::{errno, SyscallTable};
 
@@ -227,8 +216,7 @@ const CLN_SHUT_BIT: u32 = 0x0800_0000;
 /// not, and no fallback is appropriate.
 const E_NODEV: i32 = -19;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Parameter Definitions
@@ -237,9 +225,8 @@ include!("../../sdk/runtime/params.rs");
 mod params_def {
     use super::p_u32;
     use super::Fat32State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         Fat32State;
 
         1, path, str, 0
@@ -386,18 +373,7 @@ struct FileEntry {
     _pad: u8,
 }
 
-impl FileEntry {
-    const fn empty() -> Self {
-        Self {
-            start_cluster: 0,
-            size: 0,
-            dir_lba: 0,
-            dir_offset: 0,
-            short_name: [b' '; 11],
-            _pad: 0,
-        }
-    }
-}
+impl FileEntry {}
 
 /// Maximum concurrent FDs the FS_CONTRACT dispatch can hand out.
 ///
@@ -1820,7 +1796,7 @@ const FS_FSYNC_POLL: u32 = abi::registry::fs::FSYNC_POLL;
 const FS_OPENDIR: u32 = abi::registry::fs::OPENDIR;
 const FS_READDIR: u32 = abi::registry::fs::READDIR;
 /// `OPEN_CREATE` (`fs::OPEN_CREATE`) is documented in
-/// `modules/sdk/contracts/storage/fs.rs` and reserved at the
+/// `crates/fluxor-abi/src/contracts/storage/fs.rs` and reserved at the
 /// SDK level, but FAT32 doesn't implement file creation — no FAT
 /// table writeback, no cluster allocator, no directory-entry
 /// emit. We explicitly return ENOSYS rather than fall through to
@@ -1875,7 +1851,7 @@ const FS_RMDIR: u32 = abi::registry::fs::RMDIR;
 const FS_TRUNCATE: u32 = abi::registry::fs::TRUNCATE;
 
 /// FS capability bits — must match
-/// `modules/sdk/contracts/storage/fs.rs::caps`.
+/// `crates/fluxor-abi/src/contracts/storage/fs.rs::caps`.
 const FS_CAP_OPEN: u32 = 1 << 0;
 const FS_CAP_OPENDIR: u32 = 1 << 1;
 const FS_CAP_OPEN_CREATE: u32 = 1 << 2;
@@ -3122,26 +3098,6 @@ unsafe fn tx_save_file(s: &mut Fat32State, slot: usize) {
     s.tx.file_slot = slot as u32;
     let src = &s.open_files[slot] as *const OpenFile as *const u8;
     core::ptr::copy_nonoverlapping(src, s.tx.file.as_mut_ptr(), OF_HEAD);
-}
-
-/// Record that the transaction changed directory `dir`'s names, so an abort
-/// drops whatever walks of it were cached over tentative bytes.
-fn tx_note_dir(s: &mut Fat32State, dir: u32) {
-    if s.tx_active == 0 {
-        return;
-    }
-    let n = usize::from(s.tx.dirs_n);
-    let mut i = 0usize;
-    while i < n.min(TX_DIRS) {
-        if s.tx.dirs[i] == dir {
-            return;
-        }
-        i += 1;
-    }
-    if n < TX_DIRS {
-        s.tx.dirs[n] = dir;
-    }
-    s.tx.dirs_n = s.tx.dirs_n.saturating_add(1);
 }
 
 unsafe fn tx_abort(s: &mut Fat32State) {
@@ -5537,22 +5493,6 @@ unsafe fn fs_alloc_extent(s: &mut Fat32State, prev: u32) -> (u32, u8) {
     (cc, count)
 }
 
-/// Free an entire cluster chain (set every entry to 0). Used to
-/// truncate an existing file on FS_OPEN_CREATE.
-unsafe fn fs_free_chain(s: &mut Fat32State, start: u32) {
-    let mut c = start;
-    let mut guard: u32 = 0;
-    while (2..FAT32_EOC).contains(&c) && guard < 0x1000_0000 {
-        let next = fs_read_fat_entry(s, c); // EOC on chain end / 0
-        let _ = fs_write_fat_entry(s, c, 0);
-        if !(2..FAT32_EOC).contains(&next) {
-            break;
-        }
-        c = next;
-        guard += 1;
-    }
-}
-
 /// FS_UNLINK: remove `path`'s directory entry and queue its cluster chain
 /// for lazy reclamation. See the `FS_UNLINK` opcode doc for the split
 /// between the O(1) synchronous part and the per-step chain free.
@@ -6206,32 +6146,6 @@ unsafe fn fs_read_clean_bit(s: &mut Fat32State) -> bool {
         dev_log(s.sys(), 4, b"[fat32] volume not clean".as_ptr(), 24);
     }
     true
-}
-
-/// True for every opcode that can change what is on media.
-///
-/// `FSYNC` and `FSYNC_NAME` are mutations: both write a directory sector.
-/// `OPEN`, `READ`, `SEEK`, `STAT`, `OPENDIR`, `READDIR`, `CLOSE` and `CAPS`
-/// are not.
-const fn fs_op_mutates(opcode: u32) -> bool {
-    matches!(
-        opcode,
-        FS_OPEN_CREATE
-            | FS_UNLINK
-            | FS_PREALLOCATE
-            | FS_WRITE
-            | FS_WRITE_ASYNC
-            | FS_FSYNC
-            | FS_FSYNC_SUBMIT
-            | FS_FSYNC_NAME
-            | FS_RENAME
-            | FS_MKDIR
-            | FS_RMDIR
-            | FS_TRUNCATE
-            // An owner release closes that owner's handles, and closing a
-            // writable handle writes its directory entry back.
-            | OWNER_RELEASED
-    )
 }
 
 /// Mark the volume dirty ahead of a mutation, once per mount. Runs inside
@@ -9503,7 +9417,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
             None => E_INVAL,
         };
     }
-    // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
+    // FS capability bitmap (crates/fluxor-abi/src/contracts/storage/fs.rs::CAPS).
     // The CAPS query is the canonical way for callers to discover which
     // tiers this provider serves before they call an opcode and get
     // ENOSYS.
@@ -9917,7 +9831,7 @@ pub extern "C" fn module_observes_owner_release() -> u32 {
 // Exported PIC Module Interface
 // ============================================================================
 
-declare_module_state_bytes!(Fat32State);
+fluxor_rt::declare_module_state_bytes!(Fat32State);
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
@@ -10961,9 +10875,9 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();
 
 // ============================================================================
 // Host-test surface (feature = "host-test")

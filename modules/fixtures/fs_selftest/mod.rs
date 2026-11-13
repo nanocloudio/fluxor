@@ -29,16 +29,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -49,12 +39,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 const FS_OPEN: u32 = abi::registry::fs::OPEN;
 const FS_READ: u32 = abi::registry::fs::READ;
@@ -106,7 +94,7 @@ const PH_RMDIR_NAME: u8 = 14;
 const PH_DONE: u8 = 15;
 
 // Phase names, for the verdict line. Indexed by phase.
-name_table!(
+fluxor_rt::name_table!(
     PHASE_NAMES = [
         b"caps",
         b"mkdir",
@@ -167,9 +155,8 @@ const MAX_WAITS: u32 = 200_000;
 
 mod params_def {
     use super::SelfTestState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         SelfTestState;
     }
 }
@@ -662,4 +649,4 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -167,7 +167,7 @@ key with every object. A chain holds at most `MAX_CHAIN_LINKS`
 checks.
 
 The codec, the chain rules and the verifier are one source,
-`modules/sdk/contracts/mesh/capability.rs`. It ships in the SDK source
+`crates/fluxor-abi/src/contracts/mesh/capability.rs`. It ships in the SDK source
 artefact (`fluxor-abi`), so any PIC module or host tool links the same
 bytes. It takes SHA-256 and Ed25519 verification from its caller
 (`CapCrypto`), so the contract carries no crypto of its own. Golden
@@ -392,7 +392,7 @@ routing each record by its peer's key fingerprint).
   stream so one channel's loss recovery never blocks another's.
 - **Session state is visible.** The optional `session` output carries a
   frame each time a session opens or ends
-  (`modules/sdk/contracts/mesh/remote_session.rs`), numbered by session.
+  (`crates/fluxor-abi/src/contracts/mesh/remote_session.rs`), numbered by session.
   A record whose sending had begun when its session ended is lost and
   counted; one not yet begun waits for the next session. A consumer
   that must not wait for a member that is down refuses its requests

@@ -704,15 +704,10 @@ unsafe fn creds_dests(s: &mut TlsState) -> [(*mut u8, usize); CRED_SLOTS] {
 /// replace (a certificate presented, a signature or a chain walk taking
 /// several steps)?
 fn creds_in_use(s: &TlsState) -> bool {
-    let tcp = s.sessions.iter().any(|x| {
-        matches!(
-            x.state,
-            SessionState::Allocated
-                | SessionState::Connecting
-                | SessionState::AcceptPending
-                | SessionState::Handshaking
-        )
-    });
+    let tcp = s
+        .sessions
+        .iter()
+        .any(|x| matches!(x.state, SessionState::Allocated | SessionState::Handshaking));
     tcp || s
         .peer_sessions
         .iter()

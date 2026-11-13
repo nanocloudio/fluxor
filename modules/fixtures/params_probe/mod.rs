@@ -6,25 +6,13 @@
 //! both on its first step, once.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[repr(C)]
 pub struct State {
@@ -56,8 +44,8 @@ fn take(s: &mut State, d: *const u8, len: usize) {
 mod params_def {
     use super::take;
     use super::State;
-    use super::SCHEMA_MAX;
-    define_params! {
+
+    fluxor_rt::define_params! {
         State;
         1, payload, blob, 0 => |s, d, len| { take(s, d, len); };
     }
@@ -98,7 +86,7 @@ fn put_hex32(line: &mut [u8], n: &mut usize, v: u32) {
     }
 }
 
-declare_module_state_bytes!(State);
+fluxor_rt::declare_module_state_bytes!(State);
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
@@ -162,4 +150,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -495,7 +495,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // ───── ABI-surface pin ───────────────────────────────────────────────
     //
     // The checked-in ABI-surface pin (source hash + digest, mirrored in
-    // three files) must match what the current `modules/sdk` sources
+    // three files) must match what the current `crates/fluxor-abi` sources
     // produce. A stale pin means built modules embed a wrong surface digest
     // and generations pin to a surface that no longer exists. Only the
     // fluxor kernel tree carries these sources; downstream projects skip.

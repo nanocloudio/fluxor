@@ -5,7 +5,7 @@ which bundle a workload should run, against which revision of the target's
 descriptor, under which idempotency identity, and what the target observes,
 under a fence.
 
-Source: `modules/sdk/contracts/agent.rs` (records), `tools/src/agent_protocol.rs`
+Source: `crates/fluxor-abi/src/contracts/agent.rs` (records), `tools/src/agent_protocol.rs`
 (semantics), `tools/src/agent_cli.rs` (`fluxor agent serve`, `fluxor agent call`),
 `packaging/stack/agent_listen.yaml`, `packaging/stack/agent_dial.yaml` and their
 `_lane` forms (the remote transport).

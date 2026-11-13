@@ -63,7 +63,7 @@ parallel manifest, no parallel build tool.
 
 ## 3. Kernel and module code
 
-Source: `src/platform/wasm.rs`, `modules/sdk/runtime/wasm.rs`.
+Source: `src/platform/wasm.rs`, `crates/fluxor-rt/src/wasm.rs`.
 
 Both the Fluxor kernel and every PIC module compile for
 `wasm32-unknown-unknown` (no_std, no host imports beyond what this doc
@@ -81,7 +81,7 @@ defines). Outputs:
 
 The wasm32 build is selected via the Cargo target plus the
 `target_arch = "wasm32"` branch of the module SDK runtime
-(`modules/sdk/runtime/wasm.rs`, `modules/sdk/runtime/wasm_entry.rs`).
+(`crates/fluxor-rt/src/wasm.rs`, `crates/fluxor-rt/src/wasm_entry.rs`).
 That branch substitutes the `SyscallTable` struct of fn pointers (used
 on PIC targets) with WASM extern imports of the same names. Module
 source is unchanged; the SDK runtime knows how to talk to the kernel

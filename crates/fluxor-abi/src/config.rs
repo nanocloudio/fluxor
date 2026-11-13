@@ -1,0 +1,539 @@
+// Module-facing capacity / sizing tunables.
+//
+// One coherent envelope per module ABI profile. Adding a new target
+// means adding a `profile_*` module here, not editing 30 files.
+//
+// Why centralised: capacity knobs cross module boundaries. The
+// HTTP module's `MAX_CONCURRENT_CONNS` only makes sense if the IP
+// module's `MAX_TCP_CONNS` is at least as large. Spread across their
+// owning modules, any one change becomes a coordinated edit across
+// the tree. Centralising them lets a reviewer see the full envelope
+// on one screen and lets the compiler enforce cross-module
+// invariants.
+//
+// What lives here: tunables that more than one module reads, and the
+// coarse `TARGET_CLASS` a module sizes its own tables by.
+//
+// What does NOT live here: kernel capacity. The kernel's arenas,
+// module-slot count, bridge slots, heap segments, log ring and RP
+// override-merge buffer live in `src/kernel/config.rs`, per kernel
+// platform. Everything in this crate
+// is hashed into the ABI-surface digest, so a kernel
+// size stated here would make raising it an ABI epoch and a
+// workspace republish, though no module reads it. A module that
+// needs one of those figures asks the kernel at runtime (the module
+// slot count is `internal::reconfigure::SLOT_CAPACITY`) or keys on
+// `TARGET_CLASS`. `tools/tests/kernel_capacity_gate.rs` fails CI if a
+// kernel capacity constant appears in the SDK or in module source.
+//
+// Module-private opcodes, RFC values, internal struct offsets and
+// per-chip register layouts stay in the module that owns them.
+//
+// Adding a tunable:
+// 1. Add it to all three profile modules below with values that
+//    suit each target's memory budget.
+// 2. (No extra step — the `pub use` is wildcarded.)
+// 3. If it interacts with another subsystem, add a
+//    `const _: () = assert!(...);` at the bottom.
+// 4. `pub use abi::config::<subsystem>::*` in the consumer.
+
+/// Coarse memory class of the target a module is compiled for: the value of
+/// [`TARGET_CLASS`].
+///
+/// A module that scales its own buffers with the memory the target has keys
+/// on this, never on the kernel's arena sizes, which are kernel capacity and
+/// not part of the module ABI. The classes are ordered, so `TARGET_CLASS <=
+/// target_class::SMALL` reads "an MCU of either size".
+pub mod target_class {
+    /// The smallest MCU class: a state arena of 64 KiB or less (RP2040).
+    pub const TINY: u8 = 0;
+    /// An MCU, but not the smallest: a state arena of 512 KiB or less
+    /// (RP2350).
+    pub const SMALL: u8 = 1;
+    /// Host class: Linux, bcm2712 and wasm, with arenas of tens of MiB or
+    /// more.
+    pub const HOST: u8 = 2;
+}
+
+/// The `handler` byte of a compiled route record.
+///
+/// One definition, because two independent ones cannot be checked
+/// against each other. The config compiler derives this byte from a
+/// graph's route keys and bakes it into the artefact; the serving
+/// module switches on it. Neither repo can see the other's literals,
+/// and a disagreement is invisible in a config dump — the route
+/// simply serves the wrong thing, with every field that a reader
+/// would check to notice looking exactly right.
+///
+/// Ids are wire values baked into shipped artefacts: a number may be
+/// added, and never reused for a different meaning.
+pub mod route_handler {
+    /// Fixed body served verbatim.
+    pub const STATIC: u8 = 0;
+    /// Fixed body with `{{ }}` substitution.
+    pub const TEMPLATE: u8 = 1;
+    /// File fetched through the file channel and staged in the body
+    /// pool.
+    pub const FILE: u8 = 2;
+    /// Forward to `proxy_ip` / `proxy_port`.
+    pub const PROXY: u8 = 3;
+    /// Accept the RFC 6455 upgrade and echo frames.
+    pub const WEBSOCKET: u8 = 4;
+    /// WebSocket fan-out; a new subscriber is replayed the retained
+    /// frame.
+    pub const WS_FANOUT_RETAIN: u8 = 5;
+    /// Fixed-index fetch piped straight to the socket, never staged —
+    /// for payloads past the body-pool cap.
+    pub const STREAM: u8 = 6;
+    /// One file from the filesystem surface.
+    pub const FS_FILE: u8 = 7;
+    /// Directory listing from the filesystem surface.
+    pub const FS_LIST: u8 = 8;
+    /// WebSocket fan-out with no replay: a subscriber sees only what
+    /// arrives after it joins.
+    pub const WS_FANOUT: u8 = 9;
+    /// gRPC unary. The route path is the SERVICE prefix, because a
+    /// method path is `/<service>/<Method>` and a trailing `/`
+    /// matches as a prefix.
+    pub const GRPC: u8 = 10;
+    /// Hand the request to a downstream graph node as exchange records
+    /// and serve the response records it answers with.
+    pub const APP: u8 = 11;
+    /// WebSocket fan-out gated on external admission: the 101 is
+    /// composed only once the admission answer accepts. Distinct
+    /// from [`WS_FANOUT_RETAIN`] because replaying an earlier
+    /// connection's frames to a not-yet-admitted subscriber is
+    /// exactly what admission exists to prevent.
+    pub const WS_FANOUT_ADMIT: u8 = 12;
+    /// Highest id this vocabulary defines.
+    pub const MAX_ID: u8 = WS_FANOUT_ADMIT;
+}
+
+#[cfg(target_arch = "aarch64")]
+pub use self::profile_host::*;
+
+#[cfg(target_arch = "wasm32")]
+pub use self::profile_wasm::*;
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+pub use self::profile_embedded::*;
+
+// The three `profile_*` modules below each define the FULL set of
+// tunables for one target class. Only the cfg-selected one above is
+// re-exported, so the others' constants would otherwise trip the
+// `dead_code` lint (and the cross-subsystem invariants below would
+// trigger duplicate-definition errors). Cfg-gating each module to
+// its arch keeps the selection sharp: exactly one profile compiles
+// for any given target, and adding a profile only means adding one
+// more `mod profile_X` + matching `pub use` arm above.
+
+// ── aarch64 host (Pi 5, Linux host) ────────────────────────────────────────
+//
+// 8 GiB physical RAM, no allocator pressure. Sized for genuinely
+// concurrent serving — slot tables match what the IP layer exposes,
+// arenas absorb peak working sets without heroics.
+
+#[cfg(target_arch = "aarch64")]
+mod profile_host {
+    /// Coarse memory class of every target this profile builds for. See
+    /// [`target_class`](super::target_class).
+    pub const TARGET_CLASS: u8 = super::target_class::HOST;
+
+    pub mod http {
+        /// Maximum simultaneous in-flight HTTP connections per
+        /// server module instance. Slot table size on
+        /// `ServerState`.
+        ///
+        /// Bounded by the TCP connection table beneath it: this slot
+        /// count must not exceed `ip::MAX_TCP_CONNS`, since every HTTP
+        /// connection holds one, and a compile-time invariant in
+        /// `crates/fluxor-abi/src/config.rs` enforces that. Each slot also costs a
+        /// receive and a send buffer from the heap arena, so the figure
+        /// is a memory decision, not a wire one — `conn_id` is a `u16`
+        /// on the net-protocol wire and imposes no ceiling here.
+        pub const MAX_CONCURRENT_CONNS: usize = 256;
+        /// Peak active connections the heap arena is sized to
+        /// support simultaneously. Matches `MAX_CONCURRENT_CONNS`
+        /// 1:1, so every admissible connection has its buffers:
+        /// a smaller figure would admit a connection the arena
+        /// cannot then serve.
+        pub const ARENA_WORKING_SET_CONNS: usize = 256;
+        /// Per-conn inbound buffer holding the HTTP request line,
+        /// headers, and small request bodies. Heap-allocated on
+        /// accept, freed on close.
+        pub const RECV_BUF_SIZE: usize = 8192;
+        /// Per-conn outbound buffer. Sized to hold one full WS wire
+        /// frame for a ws_stream-produced envelope: ws_stream caps
+        /// payloads at 4096 bytes/emit (see `modules/foundation/ws_stream`),
+        /// so a 4096-byte payload + 4-byte WS server-to-client header
+        /// fits exactly in 4100. Anything larger than this on `ws_in`
+        /// — only reachable when something bypasses ws_stream — falls
+        /// through to the RFC 6455 §5.4 fragmentation path in
+        /// `ws_drain_fanout_input`.
+        pub const SEND_BUF_SIZE: usize = 4100;
+        // The http module's TLV parameter table in
+        // `modules/foundation/http/mod.rs` declares 10 tags per route
+        // (path, body, handler, proxy_ip, proxy_port, source,
+        // content_type, fs_path, fs_list, fs_filter) at tag offsets
+        // 10 + 10*i .. 10 + 10*(i+1). Bumping this ceiling REQUIRES
+        // adding matching `define_params!` entries for the new
+        // routes. The host profile is sized for 8
+        // routes (tags 10..89) — enough for the scenario synth host
+        // (runtime.html, fluxor.wasm, host_shims.js, /scenario.json,
+        // /api/list, plus 3 spare for user/scenario route merges).
+        pub const MAX_ROUTES: usize = 8;
+        // Dynamic-route arena. A DEDICATED arena, deliberately separate
+        // from the TLV-locked static `MAX_ROUTES` budget above: dyn
+        // routes are programmed at runtime from `/dataplane/edge/` via
+        // the table_consumer helper, carry a host axis + weighted backend
+        // set, and are NOT wired through `define_params!` — so this
+        // ceiling is free to size for route×backend fanout without
+        // touching the TLV parameter table. Host default 64; embedded/wasm
+        // keep 8 (see the other profiles).
+        pub const MAX_DYN_ROUTES: usize = 64;
+        // Backends carried per dynamic route (the `be=` set). One PUT
+        // replaces the whole set atomically; the compiler
+        // truncates oversized sets by weight order, and the edge counts
+        // the overflow into `http.routes.dropped`.
+        pub const MAX_ROUTE_BACKENDS: usize = 8;
+        // Request-path budget. Serving a real library (`list:` over
+        // `/tmp/music`) means request URLs like
+        // `/music/Elbow/Asleep In the Back/01 Any Day Now.m4a`, and
+        // percent-encoding (`%20` per space) inflates them further; 200 holds
+        // them without a clipped path → 404. (`req_path_len` is a u8, so this
+        // stays ≤ 255.)
+        pub const MAX_PATH: usize = 200;
+        pub const MAX_CONTENT_TYPE: usize = 32;
+        /// Per-route absolute filesystem path budget on host targets. 256 fits
+        /// realistic absolute paths like
+        /// `/home/<user>/Development/<project>/examples/.../viewer.html` that
+        /// the scenario synthesiser emits; a shorter budget truncates the path,
+        /// so `linux_fs_dispatch` OPENs the wrong filename (creating an empty
+        /// file via the `O_CREAT` fallback) and FS_STAT returns `st_size = 0` —
+        /// surfacing as 200-OK-with-0-byte-body responses for `fs_path:`
+        /// routes. Embedded/wasm profiles keep 64 — their fs_path values are
+        /// short on-flash paths like `/web/INDEX.HTM`.
+        pub const MAX_FS_PATH: usize = 256;
+        pub const MAX_VARS: usize = 16;
+        pub const MAX_VAR_VALUE: usize = 16;
+        pub const MAX_CACHE: usize = 4;
+        // Host profile (aarch64: linux orchestrator, pi5) serves
+        // synthesised wasm-scenario hosts that inline the canonical browser
+        // shell as `body:` routes — runtime.html (~83 KiB after scenario
+        // substitution) + host_shims.js (~56 KiB) + scenario.json. 256 KiB
+        // holds them without overflowing the pool (an overflow truncates bodies
+        // into corrupt JS / empty scenario.json); the arena reserves 2× this
+        // and these targets have GiBs of RAM, so it's a sanity bound, not a
+        // memory constraint. profile_wasm / profile_embedded keep their small
+        // pools.
+        pub const DEFAULT_BODY_POOL_SIZE: usize = 256 * 1024;
+    }
+
+    pub mod ip {
+        /// IP module's TCP-conn slot table size: the ceiling on locally
+        /// terminated TCP connections. The net-proto `conn_id` is u16, so
+        /// 65,536 slots is exactly the id space. A connection record is
+        /// ~2.2 KiB — most of it the bounded reorder buffer — so the table
+        /// is ~137 MiB and is what the kernel's state arena is sized
+        /// around. Lookup is by hash index (`ip/index.rs`), never a scan,
+        /// and the timer sweep is sliced across the 50 ms window, so the
+        /// a packet pays for the cluster it lands in rather than for the
+        /// table, and a step for its slice rather than the whole sweep.
+        /// At least `http::MAX_CONCURRENT_CONNS` (compile-time invariant).
+        pub const MAX_TCP_CONNS: usize = 65536;
+        /// Datagram endpoints carry a u8 `ep_id` on the wire, so they are
+        /// allocated only from the first `MAX_DG_ENDPOINTS` connection
+        /// slots — the id space binds the endpoint count, not the table.
+        pub const MAX_DG_ENDPOINTS: usize = 256;
+        /// Connections a transport-continuity pair may hold in flight at
+        /// once: shadows staged for import plus flows being mirrored out.
+        /// A shadow is one connection record plus its checkpoint bytes.
+        pub const MAX_TCP_SHADOWS: usize = 8;
+        /// Multi-homing address-table size. Slot 0 is the primary
+        /// (DHCP-managed); slots 1.. are secondaries added at runtime via
+        /// the ip module's `addr_ctl` port. Demuxed through a hash index
+        /// on the RX path, so a frame pays for the cluster it lands in
+        /// rather than for the table.
+        pub const MAX_LOCAL_ADDRS: usize = 4096;
+        /// Packets the pre-transport decision seam may hold awaiting a
+        /// director's disposition. One full frame each, so this is the
+        /// seam's whole footprint (~48 KiB here); a packet arriving with
+        /// every slot taken is refused and counted, never displaces one.
+        pub const MAX_PACKET_HOLD: usize = 32;
+    }
+
+    pub mod tls {
+        /// TLS session table. The ceiling on concurrent TLS connections — and
+        /// so on HTTPS concurrency, which `http::MAX_CONCURRENT_CONNS` above
+        /// does NOT bound on its own: an accept the tls module cannot seat is
+        /// closed before http ever sees it. Published here so a consumer reads
+        /// the envelope it actually has rather than inferring one from the
+        /// HTTP number.
+        ///
+        /// A seat costs ~13 KiB, and ~12 KiB of that is handshake scratch:
+        /// a session embeds a `HandshakeDriver` by value, whose `in_buf`
+        /// (8 KiB) and `out_buf` (4 KiB) stay resident for the session's
+        /// whole life though only its handshake reads them. A seat is
+        /// therefore priced by the handshake it runs once, not by the
+        /// traffic it carries after.
+        ///
+        /// The ceiling is generous anyway because the pool is elastic:
+        /// `SESSION_CHUNK` seats are inline and the rest arrive in
+        /// 8-session chunks from the kernel's elastic region as they are
+        /// needed, so an idle stack pays for eight. A grant the region
+        /// denies is a counted refusal and the accept is closed, not a
+        /// fault.
+        ///
+        /// It bounds ONE instance, and instances do not add up the way the
+        /// number invites. A chunk asks 8 × ~13 KiB ≈ 104 KiB and rounds up
+        /// to the 64 KiB grant quantum, so it takes 128 KiB: 512 seats are
+        /// 63 granted chunks ≈ 7.9 MiB, and the 16 MiB region holds 128
+        /// chunks — the same depth as the kernel's chunk table — for about
+        /// 1,024 seats shared across every elastic pool on the host.
+        /// Multiplying this ceiling by the instance count therefore
+        /// overstates what a host can hold; two saturated instances are
+        /// already the region.
+        pub const MAX_SESSIONS: usize = 512;
+    }
+
+    pub mod quic {
+        /// QUIC connection table. A connection carries ~58 KiB of state, so
+        /// the table is ~3.6 MiB — the dominant term in this module's
+        /// footprint. One past the ceiling is refused with a stateless
+        /// CONNECTION_REFUSED Initial.
+        ///
+        /// Every seat is paid resident: the table is a field of the module
+        /// state, not an elastic pool like `tls::MAX_SESSIONS`, so the
+        /// ceiling costs its full width whether or not the connections
+        /// exist. Roughly 13 KiB of a seat is the embedded
+        /// `HandshakeDriver`, idle once the connection is established; the
+        /// remaining ~45 KiB is state a live connection genuinely needs —
+        /// stream buffers, ACK and loss tracking, per-level keys — so this
+        /// ceiling, unlike the TLS one, is not mostly scratch. Sixty-four
+        /// sits against the headroom the kernel's state arena leaves
+        /// beside the connection table.
+        pub const MAX_CONNS: usize = 64;
+    }
+
+    pub mod h2 {
+        /// Per-conn HTTP/2 stream slots.
+        pub const MAX_STREAMS: usize = 4;
+    }
+}
+
+// ── wasm32 (browser, wasmtime, edge runtimes) ──────────────────────────────
+//
+// User-space-class memory but tighter budgets than Linux host —
+// browser tabs are squeezed; edge runtimes have memory ceilings.
+
+#[cfg(target_arch = "wasm32")]
+mod profile_wasm {
+    /// Coarse memory class; see [`target_class`](super::target_class). A
+    /// browser tab has host-class memory, paged in lazily.
+    pub const TARGET_CLASS: u8 = super::target_class::HOST;
+
+    pub mod http {
+        pub const MAX_CONCURRENT_CONNS: usize = 256;
+        pub const ARENA_WORKING_SET_CONNS: usize = 64;
+        pub const RECV_BUF_SIZE: usize = 4096;
+        pub const SEND_BUF_SIZE: usize = 4100;
+        pub const MAX_ROUTES: usize = 4;
+        // Dynamic-route arena; see profile_host.
+        pub const MAX_DYN_ROUTES: usize = 8;
+        pub const MAX_ROUTE_BACKENDS: usize = 4;
+        pub const MAX_PATH: usize = 32;
+        pub const MAX_CONTENT_TYPE: usize = 32;
+        pub const MAX_FS_PATH: usize = 64;
+        pub const MAX_VARS: usize = 16;
+        pub const MAX_VAR_VALUE: usize = 16;
+        pub const MAX_CACHE: usize = 4;
+        pub const DEFAULT_BODY_POOL_SIZE: usize = 32 * 1024;
+    }
+
+    pub mod ip {
+        pub const MAX_TCP_CONNS: usize = 256;
+        /// Datagram endpoints; see profile_host.
+        pub const MAX_DG_ENDPOINTS: usize = 256;
+        /// Transport-continuity shadows; see profile_host.
+        pub const MAX_TCP_SHADOWS: usize = 2;
+        /// Multi-homing address-table size.
+        pub const MAX_LOCAL_ADDRS: usize = 8;
+        /// Pre-transport decision hold slots; see profile_host.
+        pub const MAX_PACKET_HOLD: usize = 8;
+    }
+
+    pub mod tls {
+        /// TLS session table. The ceiling on concurrent TLS connections — and
+        /// so on HTTPS concurrency, which `http::MAX_CONCURRENT_CONNS` above
+        /// does NOT bound on its own: an accept the tls module cannot seat is
+        /// closed before http ever sees it. Published here so a consumer reads
+        /// the envelope it actually has rather than inferring one from the
+        /// HTTP number. Sixty-four sessions is ~830 KiB of elastic pool on
+        /// aarch64; the module grows it in 8-session chunks.
+        pub const MAX_SESSIONS: usize = 64;
+    }
+
+    pub mod quic {
+        /// QUIC connection table. A connection carries ~58 KiB of state, so
+        /// the table is ~464 KiB — the dominant term in this module's
+        /// footprint, and why the ceiling is eight rather than a round
+        /// number. One past it is refused with a stateless
+        /// CONNECTION_REFUSED Initial.
+        pub const MAX_CONNS: usize = 8;
+    }
+
+    pub mod h2 {
+        pub const MAX_STREAMS: usize = 4;
+    }
+}
+
+// ── Embedded (rp2350, rp2040) ──────────────────────────────────────────────
+//
+// 256-512 KiB SRAM. Single-conn HTTP, tight everything.
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+mod profile_embedded {
+    /// Coarse memory class; see [`target_class`](super::target_class).
+    /// Keyed on `fluxor_abi`, which the module build passes, because
+    /// `target_arch` cannot tell thumbv6m from thumbv8m: RP2040 is the tiny
+    /// die (264 KiB of SRAM), RP2350 the small one (520 KiB).
+    #[cfg(fluxor_abi = "thumbv6m")]
+    pub const TARGET_CLASS: u8 = super::target_class::TINY;
+    #[cfg(not(fluxor_abi = "thumbv6m"))]
+    pub const TARGET_CLASS: u8 = super::target_class::SMALL;
+
+    pub mod http {
+        /// Four, not one: a browser opens several connections to a page in
+        /// parallel, and a one-slot server closes all but the first, which
+        /// presents as a page that half-loads. Four slots cost
+        /// 4 × (2048 + 4100) ≈ 24 KiB of the 256 KiB arena, sized against the
+        /// 16-slot TCP table in this profile; the one-session TLS table
+        /// beneath it bounds HTTPS, not this.
+        // Four slots cost 4 x (2048 + 4100) ~= 24 KiB. That is 10% of RP2350's
+        // arena and 37% of RP2040's, so the smaller die serves ONE connection:
+        // a single-page local UI, not a browser opening parallel sockets. The
+        // SDK asserts `MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS`, so this moves
+        // with the connection table below.
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
+        pub const MAX_CONCURRENT_CONNS: usize = 4;
+        #[cfg(fluxor_abi = "thumbv6m")]
+        pub const MAX_CONCURRENT_CONNS: usize = 1;
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
+        pub const ARENA_WORKING_SET_CONNS: usize = 4;
+        #[cfg(fluxor_abi = "thumbv6m")]
+        pub const ARENA_WORKING_SET_CONNS: usize = 1;
+        pub const RECV_BUF_SIZE: usize = 2048;
+        pub const SEND_BUF_SIZE: usize = 4100;
+        pub const MAX_ROUTES: usize = 4;
+        // Dynamic-route arena; see profile_host. Embedded default 8 —
+        // small, and the feature is off (empty `routes_prefix`) on
+        // any edge that doesn't run the compiler.
+        pub const MAX_DYN_ROUTES: usize = 8;
+        pub const MAX_ROUTE_BACKENDS: usize = 4;
+        pub const MAX_PATH: usize = 32;
+        pub const MAX_CONTENT_TYPE: usize = 32;
+        pub const MAX_FS_PATH: usize = 64;
+        pub const MAX_VARS: usize = 16;
+        pub const MAX_VAR_VALUE: usize = 16;
+        pub const MAX_CACHE: usize = 4;
+        /// In-RAM body staging: inline route bodies copied out of the config
+        /// blob, template renders, and the content cache a `source`-fed route
+        /// fills. `fs_path` routes stream and never land here, so this bounds
+        /// what is HELD, not what can be served.
+        ///
+        /// Sixteen KiB, and the arena reserves twice that against
+        /// `heap_realloc` growth. The figure is set by what is left rather
+        /// than by what a body might want: the wireless stack takes 105 KiB
+        /// of this die's 240 KiB state arena, and the four connection slots
+        /// and the module's own state take 53 KiB more, so the pool is the
+        /// remainder that leaves the arena room to breathe.
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
+        pub const DEFAULT_BODY_POOL_SIZE: usize = 16 * 1024;
+        /// Four KiB on RP2040: a status page and a small JSON reply. Sixteen
+        /// would be a quarter of the whole arena for staging that a
+        /// `fs_path` route streams without touching this pool at all.
+        #[cfg(fluxor_abi = "thumbv6m")]
+        pub const DEFAULT_BODY_POOL_SIZE: usize = 4 * 1024;
+    }
+
+    pub mod ip {
+        // A `TcpConn` is ~2.2 KiB, most of it the bounded reorder buffer, so the
+        // table is the dominant term in `ip`'s module state: 8 slots measure
+        // 41,656 B of RP2040's 65,536 B arena. Two slots is what a sensor node
+        // holds at once — one broker session and one inbound request — and
+        // measures 20,600 B with the reorder cut below.
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
+        pub const MAX_TCP_CONNS: usize = 8;
+        #[cfg(fluxor_abi = "thumbv6m")]
+        pub const MAX_TCP_CONNS: usize = 2;
+        /// Datagram endpoints; see profile_host.
+        /// Endpoints are allocated from the connection table's first slots, and
+        /// the SDK asserts the bound, so this follows `MAX_TCP_CONNS`.
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
+        pub const MAX_DG_ENDPOINTS: usize = 8;
+        #[cfg(fluxor_abi = "thumbv6m")]
+        pub const MAX_DG_ENDPOINTS: usize = 2;
+        /// Transport-continuity shadows; see profile_host.
+        pub const MAX_TCP_SHADOWS: usize = 1;
+        /// Multi-homing address-table size.
+        pub const MAX_LOCAL_ADDRS: usize = 8;
+        /// Pre-transport decision hold slots; see profile_host.
+        pub const MAX_PACKET_HOLD: usize = 4;
+    }
+
+    pub mod tls {
+        /// Whole pool inline (no elastic region on MCU-class targets). One
+        /// session is what the rp2350's state arena holds beside the wifi
+        /// stack: a session is ~37 KiB on a 32-bit core and the tls
+        /// instance around it (one DTLS peer, one continuity shadow, its
+        /// identity and anchor, the RSA job) another ~88 KiB.
+        pub const MAX_SESSIONS: usize = 1;
+    }
+
+    pub mod quic {
+        /// The quic module does not build for this profile; the value is
+        /// published so a consumer reading the envelope sees a number rather
+        /// than an absence.
+        pub const MAX_CONNS: usize = 2;
+    }
+
+    pub mod h2 {
+        pub const MAX_STREAMS: usize = 4;
+    }
+}
+
+// ── Cross-subsystem invariants ─────────────────────────────────────────────
+//
+// Caught at compile time. Adding a new invariant here is the right
+// place when a tunable picks up a dependency on another subsystem.
+
+const _: () = assert!(
+    tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS,
+    "tls::MAX_SESSIONS cannot exceed ip::MAX_TCP_CONNS — a TLS session needs a TCP connection under it"
+);
+const _: () = assert!(
+    http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS,
+    "http::MAX_CONCURRENT_CONNS must not exceed ip::MAX_TCP_CONNS"
+);
+const _: () = assert!(
+    ip::MAX_DG_ENDPOINTS <= ip::MAX_TCP_CONNS && ip::MAX_DG_ENDPOINTS <= 256,
+    "ip::MAX_DG_ENDPOINTS is bounded by the connection table and by the u8 ep_id"
+);
+const _: () = assert!(
+    ip::MAX_TCP_CONNS <= 65536 && ip::MAX_TCP_CONNS.is_power_of_two(),
+    "ip::MAX_TCP_CONNS is bounded by the u16 conn_id and indexed by a power-of-two table"
+);
+const _: () = assert!(
+    ip::MAX_LOCAL_ADDRS <= 4096 && ip::MAX_LOCAL_ADDRS.is_power_of_two(),
+    "ip::MAX_LOCAL_ADDRS is bounded by the u16 slot (0xFFFF = wildcard) and indexed by a power-of-two table"
+);
+
+const _: () = assert!(
+    http::ARENA_WORKING_SET_CONNS <= http::MAX_CONCURRENT_CONNS,
+    "http::ARENA_WORKING_SET_CONNS cannot exceed slot table size"
+);
+
+const _: () = assert!(
+    http::ARENA_WORKING_SET_CONNS >= 1,
+    "http::ARENA_WORKING_SET_CONNS must allow at least one active conn"
+);

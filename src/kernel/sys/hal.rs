@@ -489,10 +489,10 @@ pub fn clock_sync_status() -> Option<(bool, u64)> {
 // being wrong is expensive enough that "tested on the board only" means
 // "not tested" — no bare-metal board runs in CI.
 //
-// Beside the kernel, NOT under `modules/sdk/`. The crypto cores live there
-// because modules include them, and anything under `modules/sdk/` is part
-// of the ABI surface — putting this there would advance the surface digest
-// and force every consumer through a rebuild for a rule no module calls.
+// Beside the kernel, NOT in `fluxor-abi`: anything in that crate is part
+// of the ABI surface, and putting this there would advance the surface
+// digest and force every consumer through a rebuild for a rule no module
+// calls.
 // Placement is an interface decision, not a filing one.
 include!("seal_provenance.rs");
 

@@ -33,11 +33,11 @@ check() {
 }
 
 echo "dependency budget:"
-check "kernel rp2350"  thumbv8m.main-none-eabihf   chip-rp2350b  5
-check "kernel rp2040"  thumbv6m-none-eabi          chip-rp2040   5
-check "kernel bcm2712" aarch64-unknown-none        chip-bcm2712  4
-check "kernel wasm"    wasm32-unknown-unknown      host-wasm     4
-check "kernel linux"   aarch64-unknown-linux-gnu   host-linux    20
+check "kernel rp2350"  thumbv8m.main-none-eabihf   chip-rp2350b  7
+check "kernel rp2040"  thumbv6m-none-eabi          chip-rp2040   7
+check "kernel bcm2712" aarch64-unknown-none        chip-bcm2712  6
+check "kernel wasm"    wasm32-unknown-unknown      host-wasm     6
+check "kernel linux"   aarch64-unknown-linux-gnu   host-linux    22
 
 # The CLI is measured as a whole package graph rather than by feature.
 #
@@ -49,7 +49,7 @@ check "kernel linux"   aarch64-unknown-linux-gnu   host-linux    20
 # is the resolution that actually builds the binary, and the two disagree.
 n=$(cd tools && cargo tree --target aarch64-unknown-linux-gnu -e normal --prefix none 2>/dev/null \
     | grep -v '^$' | sort -u | wc -l)
-ceiling=77
+ceiling=78
 if [[ "$n" -gt "$ceiling" ]]; then
     echo "deps: fluxor-tools is $n packages, ceiling $ceiling — raise the ceiling in tools/ci/deps_budget.sh, in the commit that adds the dependency" >&2
     fail=1

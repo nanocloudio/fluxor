@@ -7,7 +7,7 @@
 //! against a device whose granularity is 64.
 //!
 //! These three commands move that discovery to the build. They share the
-//! device's own decoder (`modules/sdk/cores/gpu_pack.rs`), so a pack this
+//! device's own decoder (`crates/fluxor-sdk/src/gpu/pack.rs`), so a pack this
 //! tool accepts is a pack that provider accepts, rather than one that passes a
 //! second implementation of the same rules.
 //!
@@ -186,7 +186,7 @@ fn parse_toolchain(spec: &str) -> Result<[u8; 16]> {
         }
         return Ok(id);
     }
-    let digest = crate::gpu_contract::sha256(spec.as_bytes());
+    let digest = fluxor_sdk::crypto::sha256::sha256(spec.as_bytes());
     id.copy_from_slice(&digest[..16]);
     Ok(id)
 }

@@ -14,8 +14,7 @@
     feature = "host-linux",
     feature = "host-wasm"
 ))]
-#[path = "../modules/sdk/abi.rs"]
-pub mod abi;
+pub use fluxor_abi as abi;
 
 /// Architecture primitives: the Cortex-M ones (barriers, interrupt masks,
 /// NVIC) and, for the AArch64 bare-metal platforms, `arch::aarch64` (vectors,

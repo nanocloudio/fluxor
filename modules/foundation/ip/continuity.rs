@@ -593,11 +593,6 @@ unsafe fn cmd_tombstone(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]) 
     reply(s, flow, epoch, sc::CR_RETIRED, st, &[]);
 }
 
-/// Whether the continuity ports are wired.
-pub(super) fn wired(s: &IpState) -> bool {
-    s.cont.in_chan >= 0 && s.cont.out_chan >= 0
-}
-
 /// Called once per admitted segment on `idx`, after its actions ran:
 /// turns what changed into deltas.
 pub(super) unsafe fn after_segment(
@@ -1692,14 +1687,6 @@ pub(super) fn on_conn_released(s: &mut IpState, idx: usize) {
             s.cont.shadows[i].conn_idx = u32::MAX;
         }
         i += 1;
-    }
-}
-
-/// Whether `idx` is quiescing (new application delivery refused).
-pub(super) fn quiescing(s: &IpState, idx: usize) -> bool {
-    match mirror_of_conn(s, idx) {
-        Some(mi) => s.cont.mirrors[mi].quiescing != 0,
-        None => false,
     }
 }
 

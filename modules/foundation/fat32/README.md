@@ -1,7 +1,7 @@
 # fat32
 
 A FAT32 filesystem provider for the `fs` contract
-(`modules/sdk/contracts/storage/fs.rs`).
+(`crates/fluxor-abi/src/contracts/storage/fs.rs`).
 
 ## What it is for
 
@@ -89,7 +89,7 @@ without decoding it, so only matching and generation are bounded.
 
 The vocabulary is the contract's — byte durability and name durability are
 separate, and file `FSYNC` does not publish a name. See
-`modules/sdk/contracts/storage/fs.rs`.
+`crates/fluxor-abi/src/contracts/storage/fs.rs`.
 
 - **Names** are published by `FSYNC_NAME`, or atomically by `RENAME`.
 - **`RENAME`** has no atomic primitive in the format: the new entry and the

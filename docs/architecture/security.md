@@ -23,7 +23,7 @@ The security surface decomposes into four orthogonal concerns:
 4. **Network stack hardening.** Reorder buffering, congestion control,
    ARP/DHCP hygiene, step-split for long crypto.
 
-Theme 3 is a property of the `modules/sdk/crypto/` primitives used by
+Theme 3 is a property of the `crates/fluxor-sdk/src/crypto/` primitives used by
 `modules/foundation/tls/`; its rationale is in the source. The rest is
 covered below.
 
@@ -106,7 +106,7 @@ Source: `src/kernel/security/crypto/`.
 
 Both hashes and the signature check run on kernel-owned code with no
 external crypto crates. SHA-256 and SHA-512 are `include!` shims over the
-single-source SDK implementations in `modules/sdk/crypto/`, so the kernel
+single-source SDK implementations in `crates/fluxor-sdk/src/crypto/`, so the kernel
 and module sides cannot drift. The Ed25519 + SHA-512 verifier is written
 in-tree because it is the root of trust: nothing else in the image can be
 trusted until verify returns true, and pulling an external crate into that
@@ -116,7 +116,7 @@ domain); the implementation conforms to RFC 8032.
 
 ## KEY_VAULT (contract id `0x0005`)
 
-Source: `modules/sdk/contracts/key_vault.rs` (contract),
+Source: `crates/fluxor-abi/src/contracts/key_vault.rs` (contract),
 `src/kernel/security/key_vault.rs` (software backend).
 
 The kernel's opaque key custody, for asymmetric and symmetric keys alike.
@@ -631,7 +631,7 @@ and are described at the top of `modules/foundation/ip/tcp.rs`.
 
 The TLS module's P-256 scalar multiplication is broken into chunks so a
 single handshake cannot block a second concurrent handshake for the full
-duration of its ladder. `modules/sdk/crypto/p256.rs::ScalarMulState`
+duration of its ladder. `crates/fluxor-sdk/src/crypto/p256.rs::ScalarMulState`
 tracks the ladder position; the key-derivation pump initialises it on
 first entry, advances `bits_per_step` ladder bits per pump tick, and
 finalises once the ladder completes. The `tls` module exposes an
@@ -707,7 +707,7 @@ Two crypto bodies exist by design:
   is admitted, so this code cannot depend on modules or external crates,
   and it stays readable and portable in preference to fast (an Ed25519
   verify runs at most once per module load).
-- **SDK** (`modules/sdk/crypto/`) — module-side crypto for protocol
+- **SDK** (`crates/fluxor-sdk/src/crypto/`) — module-side crypto for protocol
   workloads (TLS, QUIC), NEON-accelerated where it pays.
 
 The rule: where an implementation is identical, it has one source (kernel
@@ -745,7 +745,7 @@ so the definitions in the standard are what the code runs.
 
 Source: `src/kernel/exec/scheduler/attest.rs`,
 `src/kernel/security/key_vault.rs`, contract
-`modules/sdk/contracts/key_vault.rs` (`ATTEST_COMPOSITION`, `KEY_WRAP`,
+`crates/fluxor-abi/src/contracts/key_vault.rs` (`ATTEST_COMPOSITION`, `KEY_WRAP`,
 `KEY_UNWRAP`, `AEAD_SEAL`, `AEAD_OPEN`).
 
 The vault can sign what the kernel is running. `ATTEST_COMPOSITION`

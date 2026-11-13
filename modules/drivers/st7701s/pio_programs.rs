@@ -30,7 +30,6 @@ pub static VSYNC_PROGRAM: [u16; 14] = [
 ];
 pub const VSYNC_WRAP_TARGET: u8 = 1;
 pub const VSYNC_WRAP: u8 = 13;
-pub const VSYNC_SIDESET_BITS: u8 = 1;
 pub const VSYNC_SIDESET_OPT: bool = true;
 
 /// HSYNC program: .side_set 2 opt — drives PCLK(bit1) + HSYNC(bit0).
@@ -55,7 +54,6 @@ pub static HSYNC_PROGRAM: [u16; 15] = [
 ];
 pub const HSYNC_WRAP_TARGET: u8 = 2;
 pub const HSYNC_WRAP: u8 = 14;
-pub const HSYNC_SIDESET_BITS: u8 = 2;
 pub const HSYNC_SIDESET_OPT: bool = true;
 
 /// RGB program: no sideset — outputs 16-bit pixel data.
@@ -77,8 +75,6 @@ pub static RGB_PROGRAM: [u16; 11] = [
 ];
 pub const RGB_WRAP_TARGET: u8 = 2;
 pub const RGB_WRAP: u8 = 10;
-pub const RGB_SIDESET_BITS: u8 = 0;
-pub const RGB_SIDESET_OPT: bool = false;
 
 /// RGB_DE program: .side_set 1 opt — drives DE pin.
 /// Counts vsync BackPorch (T1=17+1=18 lines) and hsync BackPorch (T2=9+1=10 clocks).
@@ -105,5 +101,4 @@ pub static RGB_DE_PROGRAM: [u16; 17] = [
 ];
 pub const RGB_DE_WRAP_TARGET: u8 = 1;
 pub const RGB_DE_WRAP: u8 = 16;
-pub const RGB_DE_SIDESET_BITS: u8 = 1;
 pub const RGB_DE_SIDESET_OPT: bool = true;

@@ -1127,16 +1127,16 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
 }
 
 /// The ABI surface a project pins, found by walking up from the ELF, with
-/// whether that project OWNS the SDK source (`modules/sdk/`) or consumes a
-/// synced copy of it (`target/fluxor/fluxor-abi/sdk/`) — the two are told
+/// whether that project OWNS the ABI source (`crates/fluxor-abi/`) or consumes
+/// a synced copy of it (`target/fluxor/fluxor-abi/`) — the two are told
 /// apart because they are put right by different commands. `None` when
 /// neither pin is found or it does not parse.
 fn project_sdk_pin(elf: &Path) -> Option<([u8; 32], bool)> {
     let mut dir = elf.parent();
     while let Some(d) = dir {
         for (rel, owns_sdk) in [
-            ("target/fluxor/fluxor-abi/sdk/abi_surface_srcpin.rs", false),
-            ("modules/sdk/abi_surface_srcpin.rs", true),
+            ("target/fluxor/fluxor-abi/src/abi_surface/srcpin.rs", false),
+            ("crates/fluxor-abi/src/abi_surface/srcpin.rs", true),
         ] {
             let pin = d.join(rel);
             if !pin.is_file() {
@@ -1210,7 +1210,7 @@ fn read_embedded_abi_surface(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 /// Read the module's resident state size out of the ELF, as data.
 ///
 /// Emitted by the SDK's `declare_module_state_bytes!` macro
-/// (`modules/sdk/runtime/state.rs`) as a `#[used] static u32` carrying the same
+/// (`crates/fluxor-rt/src/state.rs`) as a `#[used] static u32` carrying the same
 /// `size_of::<ModuleState>()` the kernel-facing `module_state_size()` returns.
 /// Reading it here is what lets the composer sum a graph's state arena demand
 /// before a device tries to load it, instead of taking a hand-typed number.
@@ -1231,7 +1231,7 @@ fn read_embedded_state_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 /// Read the module's declared worst-case stack depth out of the ELF, as data.
 ///
 /// Emitted by the SDK's `declare_module_stack_bytes!` macro
-/// (`modules/sdk/runtime/state.rs`). `None` for a module that has not
+/// (`crates/fluxor-rt/src/state.rs`). `None` for a module that has not
 /// declared; the composer decides per target what an undeclared depth means.
 fn read_embedded_stack_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<u32> {
     let sym = symbols

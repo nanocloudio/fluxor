@@ -17,16 +17,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -37,12 +27,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -51,7 +39,6 @@ include!("../../sdk/runtime/params.rs");
 const MAX_STREAM_SLOTS: usize = 2;
 const MAX_CMD_SLOTS: usize = 2;
 const MAX_RX_SLOTS: usize = 1;
-const TOTAL_SLOTS: usize = MAX_STREAM_SLOTS + MAX_CMD_SLOTS + MAX_RX_SLOTS;
 
 /// Is this a 64 KiB-arena die (RP2040)?
 ///
@@ -137,18 +124,12 @@ const RX_STREAM_GET_BUFFER: u32 = abi::registry::pio::RX_STREAM_GET_BUFFER;
 const RX_STREAM_SET_RATE: u32 = abi::registry::pio::RX_STREAM_SET_RATE;
 
 // Kernel bridge opcodes imported from the layered ABI.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-use abi::platform::rp::pio_raw::GPIOBASE as PIO_GPIOBASE;
 use abi::platform::rp::pio_raw::{
-    CMD_POLL as PIO_CMD_XFER_POLL, CMD_TRANSFER as PIO_CMD_XFER, FSTAT_READ as PIO_FSTAT_READ,
+    CMD_POLL as PIO_CMD_XFER_POLL, CMD_TRANSFER as PIO_CMD_XFER,
     INPUT_SYNC_BYPASS as PIO_INPUT_SYNC_BYPASS, INSTR_ALLOC as PIO_INSTR_ALLOC,
     INSTR_FREE as PIO_INSTR_FREE, INSTR_WRITE as PIO_INSTR_WRITE, PIN_LEVEL as PIO_PIN_LEVEL,
     PIN_SETUP as PIO_PIN_SETUP, SM_ENABLE as PIO_SM_ENABLE, SM_EXEC as PIO_SM_EXEC,
-    SM_READ_REG as PIO_SM_READ_REG, SM_RESTART as PIO_SM_RESTART, SM_WRITE_REG as PIO_SM_WRITE_REG,
-    TXF_WRITE as PIO_TXF_WRITE,
+    SM_RESTART as PIO_SM_RESTART, SM_WRITE_REG as PIO_SM_WRITE_REG,
 };
 // pio_rp uses BOTH DMA families:
 //   * `dma_fd::*` for stream transfers (ping-pong queued) — see the
@@ -166,10 +147,6 @@ const DMA_FLAG_INCR_READ: u8 = 0x01;
 )]
 const DMA_FLAG_INCR_WRITE: u8 = 0x02;
 const DMA_FLAG_SIZE_32: u8 = 0x04;
-
-// FSTAT bit positions
-const FSTAT_TXFULL_SHIFT: u32 = 16;
-const FSTAT_RXEMPTY_SHIFT: u32 = 0;
 
 // SM register indices (for PIO_SM_WRITE_REG / PIO_SM_READ_REG)
 const REG_CLKDIV: u8 = 0;
@@ -343,17 +320,6 @@ unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8, val
 }
 
 #[inline(always)]
-unsafe fn pio_sm_read_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8) -> u32 {
-    let mut buf = [pio_num, sm, reg, 0, 0, 0, 0];
-    let r = (sys.provider_call)(-1, PIO_SM_READ_REG, buf.as_mut_ptr(), 7);
-    if r >= 0 {
-        r as u32
-    } else {
-        0
-    }
-}
-
-#[inline(always)]
 unsafe fn pio_sm_enable(sys: &SyscallTable, pio_num: u8, sm_mask: u8, enable: bool) {
     let mut buf = [pio_num, sm_mask, if enable { 1 } else { 0 }];
     (sys.provider_call)(-1, PIO_SM_ENABLE, buf.as_mut_ptr(), 3);
@@ -397,27 +363,9 @@ unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) {
     (sys.provider_call)(-1, PIO_PIN_SETUP, buf.as_mut_ptr(), 3);
 }
 
-unsafe fn pio_fstat_read(sys: &SyscallTable, pio_num: u8) -> u32 {
-    let mut buf = [pio_num];
-    (sys.provider_call)(-1, PIO_FSTAT_READ, buf.as_mut_ptr(), 1) as u32
-}
-
 unsafe fn pio_sm_restart(sys: &SyscallTable, pio_num: u8, sm_mask: u8) {
     let mut buf = [pio_num, sm_mask];
     (sys.provider_call)(-1, PIO_SM_RESTART, buf.as_mut_ptr(), 2);
-}
-
-unsafe fn pio_txf_write(sys: &SyscallTable, pio_num: u8, sm: u8, value: u32) {
-    let mut buf = [0u8; 6];
-    let p = buf.as_mut_ptr();
-    *p = pio_num;
-    *p.add(1) = sm;
-    let vb = value.to_le_bytes();
-    *p.add(2) = vb[0];
-    *p.add(3) = vb[1];
-    *p.add(4) = vb[2];
-    *p.add(5) = vb[3];
-    (sys.provider_call)(-1, PIO_TXF_WRITE, p, 6);
 }
 
 // DMA FD helpers — open against PLATFORM_DMA_FD.
@@ -457,22 +405,6 @@ unsafe fn dma_fd_start(
     (sys.provider_call)(fd, dma_fd::START, p, 14)
 }
 
-unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, read_addr: u32, count: u32) -> i32 {
-    let mut buf = [0u8; 8];
-    let p = buf.as_mut_ptr();
-    let ra = read_addr.to_le_bytes();
-    *p = ra[0];
-    *p.add(1) = ra[1];
-    *p.add(2) = ra[2];
-    *p.add(3) = ra[3];
-    let cb = count.to_le_bytes();
-    *p.add(4) = cb[0];
-    *p.add(5) = cb[1];
-    *p.add(6) = cb[2];
-    *p.add(7) = cb[3];
-    (sys.provider_call)(fd, dma_fd::QUEUE, p, 8)
-}
-
 unsafe fn dma_fd_free(sys: &SyscallTable, fd: i32) {
     (sys.provider_call)(fd, dma_fd::FREE, core::ptr::null_mut(), 0);
 }
@@ -495,41 +427,6 @@ unsafe fn raw_dma_alloc(sys: &SyscallTable) -> i32 {
 // from the handle param; arg carries only the per-op payload.
 unsafe fn raw_dma_free(sys: &SyscallTable, ch: u8) {
     (sys.provider_call)(ch as i32, dma_channel::FREE, core::ptr::null_mut(), 0);
-}
-
-unsafe fn raw_dma_start(
-    sys: &SyscallTable,
-    ch: u8,
-    read: u32,
-    write: u32,
-    count: u32,
-    dreq: u8,
-    flags: u8,
-) -> i32 {
-    let mut buf = [0u8; 14];
-    let p = buf.as_mut_ptr();
-    let r = read.to_le_bytes();
-    *p = r[0];
-    *p.add(1) = r[1];
-    *p.add(2) = r[2];
-    *p.add(3) = r[3];
-    let w = write.to_le_bytes();
-    *p.add(4) = w[0];
-    *p.add(5) = w[1];
-    *p.add(6) = w[2];
-    *p.add(7) = w[3];
-    let c = count.to_le_bytes();
-    *p.add(8) = c[0];
-    *p.add(9) = c[1];
-    *p.add(10) = c[2];
-    *p.add(11) = c[3];
-    *p.add(12) = dreq;
-    *p.add(13) = flags;
-    (sys.provider_call)(ch as i32, dma_channel::START, p, 14)
-}
-
-unsafe fn raw_dma_busy(sys: &SyscallTable, ch: u8) -> bool {
-    (sys.provider_call)(ch as i32, dma_channel::BUSY, core::ptr::null_mut(), 0) != 0
 }
 
 // ============================================================================
@@ -1749,7 +1646,7 @@ pub extern "C" fn module_state_size() -> usize {
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-declare_module_state_bytes!(PioState);
+fluxor_rt::declare_module_state_bytes!(PioState);
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -1995,6 +1892,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

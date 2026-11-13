@@ -1,8 +1,7 @@
 use super::LinkState;
-use super::SCHEMA_MAX;
 use super::{p_u16, p_u32, p_u8};
 
-define_params! {
+fluxor_rt::define_params! {
     LinkState;
 
     1, uart_bus, u8, 0

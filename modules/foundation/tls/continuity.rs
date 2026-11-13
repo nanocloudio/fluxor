@@ -659,48 +659,6 @@ struct TlsCheckpoint {
 }
 
 impl TlsCheckpoint {
-    const fn empty() -> Self {
-        Self {
-            suite: 0,
-            is_server: false,
-            conn_id: 0,
-            alpn: [0; CKPT_ALPN_MAX],
-            alpn_len: 0,
-            sni: [0; CKPT_SNI_MAX],
-            sni_len: 0,
-            sni_is_ip: false,
-            peer_verified: 0,
-            peer_profile: 0,
-            peer: [0; PEER_TAIL],
-            requester_tag: 0,
-            peer_id: PeerIdFacts::empty(),
-            exporter_ctx: [0; 48],
-            read_epoch: 0,
-            write_epoch: 0,
-            read_seq: 0,
-            write_seq: 0,
-            key_update: 0,
-            close_notify: 0,
-            delivered_in: 0,
-            emitted_out: 0,
-            out_bytes: 0,
-            consumer_cursor: 0,
-            cursor_at: 0,
-            in_bytes: 0,
-            recv_expected: 0,
-            recv_len: 0,
-            recv: [0; RECV_BUF_SIZE],
-            retx_base_seq: 0,
-            retx_anchored: false,
-            retx_len: 0,
-            retx: [0; RETX_BUF_SIZE],
-            deliv_count: 0,
-            deliv_len: 0,
-            deliv: [0; CONT_REDELIVER_MAX],
-            secrets: SecretSet::empty(),
-        }
-    }
-
     fn wipe(&mut self) {
         self.secrets.wipe();
         cont_wipe(&mut self.recv);
@@ -762,23 +720,6 @@ struct TlsShadow {
 }
 
 impl TlsShadow {
-    const fn empty() -> Self {
-        Self {
-            phase: ShadowPhase::Idle,
-            flow_id: [0; sc::FLOW_ID_BYTES],
-            epoch: 0,
-            profile: 0,
-            ckpt_gen: 0,
-            record_len: 0,
-            record_digest: [0; 32],
-            import: HandoffImport::new(),
-            record: [0; TLS_CKPT_RECORD_MAX],
-            ck: TlsCheckpoint::empty(),
-            delta_no: 0,
-            last_digest: [0; 32],
-        }
-    }
-
     /// Discard the transfer and the decoded state; keep the reservation.
     fn discard_to_prepared(&mut self) {
         self.import.reset();

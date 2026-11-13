@@ -34,6 +34,10 @@ crate-type = ["rlib"]
 # Shared, dependency-free contracts: the storage-surface vocabulary and the
 # per-owner log ring format/algorithm (no_std, no serde in this build).
 fluxor-contracts = { path = "contracts", default-features = false }
+# The ABI the kernel and every module share, and the library code (crypto)
+# both link.
+fluxor-abi = { path = "crates/fluxor-abi" }
+fluxor-sdk = { path = "crates/fluxor-sdk" }
 # RP2040's second-stage bootloader: a 256-byte SPI-flash setup blob with the
 # bootrom's checksum over it. The chip will not run an image without one.
 #
@@ -336,7 +340,7 @@ split-debuginfo = "unpacked"
 opt-level = 1
 
 [workspace]
-members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/fluxor-sdk", "crates/fluxor-uefi-loader", "tools", "tools/rig-observers"]
+members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/fluxor-rt", "crates/fluxor-sdk", "crates/fluxor-uefi-loader", "tools", "tools/rig-observers"]
 # `tests/harness` is a self-contained sub-workspace (its Cargo.toml
 # declares its own `[workspace]`) that depends on the crates above
 # via path. It is intentionally not a member here — host integration
@@ -482,7 +486,7 @@ verbose_bit_mask                      = "allow"
 # Unsafe hygiene: every `unsafe { }` block carries a `// SAFETY: …`
 # comment immediately above (multi-line is fine — clippy walks
 # contiguous comment lines). Modules outside the cargo workspace
-# (`modules/sdk/*`, `modules/drivers/*`, `modules/app/*`) build via
+# (`modules/*`) build via
 # `rustc` direct calls and don't run clippy; their SAFETY discipline
 # is enforced by review.
 undocumented_unsafe_blocks    = "deny"

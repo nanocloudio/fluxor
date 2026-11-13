@@ -8,7 +8,7 @@
 //!
 //! Validation, handles, views, sealing, residency, fences, dependency order,
 //! candidate-output commit and epochs are
-//! [`gpu_wire`](../../../modules/sdk/wire/gpu_wire.rs) and the cores beside it.
+//! [`gpu_wire`](../../../crates/fluxor-abi/src/contracts/gpu.rs) and the cores beside it.
 //! This file translates admitted work into the `host_gpu_service_*` imports and
 //! polls their answers. The JavaScript on the other side validates nothing,
 //! because everything it receives has already been proved — a backend that
@@ -36,10 +36,9 @@ use crate::kernel::exec::scheduler;
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
-use crate::abi::contracts::gpu as gw;
+use fluxor_sdk::gpu as gw;
 
-#[path = "../../../modules/sdk/wire/gpu_exec_wire.rs"]
-mod exec;
+use crate::abi::wire::gpu_exec_wire as exec;
 
 // ── Sizing ──────────────────────────────────────────────────────────────
 //

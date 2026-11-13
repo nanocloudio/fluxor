@@ -6,7 +6,7 @@
 //! - `wasm_browser_midi_in` subscribes to the user-selected input
 //!   port, decodes raw MIDI status bytes into the `input::midi`
 //!   4-byte frame shape (per
-//!   `modules/sdk/contracts/input/midi.rs`), and writes one frame
+//!   `crates/fluxor-abi/src/contracts/input/midi.rs`), and writes one frame
 //!   per event to the `events` output channel.
 //!
 //! - `wasm_browser_midi_out` consumes 4-byte frames from the

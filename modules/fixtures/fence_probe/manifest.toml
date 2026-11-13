@@ -4,7 +4,7 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 timer_class = "wall_clock"
 
 # Fixture writer for the address-control surface
-# (`modules/sdk/contracts/net/identity.rs`): it claims one address,
+# (`crates/fluxor-abi/src/contracts/net/identity.rs`): it claims one address,
 # waits `fence_after_s`, then fences it with the token the claim minted.
 # Either provider of that surface answers it — the ip module, where the
 # claim installs a secondary local address on this host, or an out-of-band

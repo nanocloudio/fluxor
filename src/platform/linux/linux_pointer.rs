@@ -39,7 +39,7 @@ const ABS_MT_POSITION_Y: u16 = 0x36; // 54
 const BTN_LEFT: u16 = 0x110;
 const BTN_TOUCH: u16 = 0x14a;
 
-// input::pointer record — mirrors modules/sdk/contracts/input/pointer.rs.
+// input::pointer record — mirrors crates/fluxor-abi/src/contracts/input/pointer.rs.
 const PTR_MSG_EVENT: u8 = 0x01;
 const PTR_KIND_DOWN: u8 = 1;
 const PTR_KIND_UP: u8 = 2;

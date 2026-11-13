@@ -1,10 +1,10 @@
 //! Replay GPU provider — the GPU contract with no GPU.
 //!
 //! A thin pump. Everything that decides anything lives in the shared cores:
-//! [`gpu_wire`](../../sdk/wire/gpu_wire.rs) is the contract,
-//! [`gpu_device`](../../sdk/cores/gpu_device.rs) is admission, handles,
-//! fences and output commit, [`gpu_pack`](../../sdk/cores/gpu_pack.rs)
-//! validates program identity, and [`gpu_replay`](../../sdk/cores/gpu_replay.rs)
+//! `fluxor_abi::contracts::gpu` is the contract,
+//! `fluxor_sdk::gpu`'s device is admission, handles,
+//! fences and output commit, its pack validator
+//! validates program identity, and its replay backend
 //! is the deterministic backend. This file owns only the channel loop and the
 //! buffers those cores borrow — which is the same division a browser or native
 //! provider makes, with a different backend on the far side.
@@ -24,27 +24,14 @@
 //!     `advance` always makes a submission runnable before it runs.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    unused_imports,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so this \
-              module's compile sees the full ABI and GPU-contract surface; a \
-              provider uses a subset of a contract shared with producers"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/wire/gpu_wire.rs");
-include!("../../sdk/cores/gpu_pack.rs");
-include!("../../sdk/cores/gpu_device.rs");
-include!("../../sdk/cores/gpu_pump.rs");
-include!("../../sdk/cores/gpu_replay.rs");
+pub use fluxor_sdk::crypto::sha256::*;
+pub use fluxor_sdk::gpu::*;
 
 // ── Sizing ──────────────────────────────────────────────────────────────
 //
@@ -172,7 +159,7 @@ pub extern "C" fn module_state_size() -> u32 {
     STATE_SIZE as u32
 }
 
-declare_module_arena_bytes!(HEAP_BYTES);
+fluxor_rt::declare_module_arena_bytes!(HEAP_BYTES);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_arena_size")]
@@ -475,6 +462,6 @@ fn run_work(
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

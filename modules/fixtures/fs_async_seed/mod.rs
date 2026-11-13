@@ -32,16 +32,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -52,12 +42,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::storage::fs::{
     CLOSE as FS_CLOSE, FSYNC_POLL as FS_FSYNC_POLL, FSYNC_SUBMIT as FS_FSYNC_SUBMIT,
@@ -82,7 +70,7 @@ const PH_VOPEN: u8 = 6;
 const PH_VREAD: u8 = 7;
 const PH_VCLOSE: u8 = 8;
 
-name_table!(
+fluxor_rt::name_table!(
     PHASE_NAMES = [
         b"create", b"write", b"submit", b"poll", b"close", b"done", b"vopen", b"vread", b"vclose"
     ]
@@ -134,9 +122,8 @@ struct SeedState {
 mod params_def {
     use super::p_u32;
     use super::SeedState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         SeedState;
 
         // Path prefix of every file, e.g. "/ASY" (names are <prefix>0001.DAT).
@@ -258,7 +245,7 @@ unsafe fn fail(s: &mut SeedState, rc: i32) -> i32 {
     0
 }
 
-declare_module_state_bytes!(SeedState);
+fluxor_rt::declare_module_state_bytes!(SeedState);
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -546,4 +533,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

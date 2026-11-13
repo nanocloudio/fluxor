@@ -1,6 +1,6 @@
 //! Base64, from the in-tree SDK core rather than an external crate.
 //!
-//! `modules/sdk/crypto/b64.rs` is the implementation every PIC module and the
+//! `crates/fluxor-sdk/src/crypto/b64.rs` is the implementation every PIC module and the
 //! kernel already use (RFC 4648, standard alphabet, `=` padding). Mounting it
 //! here is the same move `src/kernel/security/crypto/*` makes: one
 //! implementation of a primitive, one set of vectors, no second copy to
@@ -17,7 +17,7 @@
 //! self-consistent wrong pin and corrupted OCI digests together. That
 //! independence is the point, and it is why only base64 moves.
 
-include!("../../modules/sdk/crypto/b64.rs");
+pub use fluxor_sdk::crypto::b64::*;
 
 /// Encode to a `String`.
 #[must_use]

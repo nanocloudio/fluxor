@@ -22,16 +22,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -42,15 +32,13 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
 mod init_seq;
 mod pio_programs;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -86,15 +74,12 @@ const TXF_OFFSET: u32 = 0x010;
 
 const PIO_SM_EXEC: u32 = abi::registry::rp_raw::PIO_SM_EXEC;
 const PIO_SM_WRITE_REG: u32 = abi::registry::rp_raw::PIO_SM_WRITE_REG;
-const PIO_SM_READ_REG: u32 = abi::registry::rp_raw::PIO_SM_READ_REG;
 const PIO_SM_ENABLE: u32 = abi::registry::rp_raw::PIO_SM_ENABLE;
 const PIO_INSTR_ALLOC: u32 = abi::registry::rp_raw::PIO_INSTR_ALLOC;
 const PIO_INSTR_WRITE: u32 = abi::registry::rp_raw::PIO_INSTR_WRITE;
-const PIO_INSTR_FREE: u32 = abi::registry::rp_raw::PIO_INSTR_FREE;
 const PIO_PIN_SETUP: u32 = abi::registry::rp_raw::PIO_PIN_SETUP;
 const PIO_GPIOBASE: u32 = abi::registry::rp_raw::PIO_GPIOBASE;
 const PIO_TXF_WRITE: u32 = abi::registry::rp_raw::PIO_TXF_WRITE;
-const PIO_FSTAT_READ: u32 = abi::registry::rp_raw::PIO_FSTAT_READ;
 const PIO_SM_RESTART: u32 = abi::registry::rp_raw::PIO_SM_RESTART;
 
 // DMA fd family — st7701s uses async DMA for display scan-out. See
@@ -122,14 +107,11 @@ const REG_PINCTRL: u8 = 3;
 enum Phase {
     InitSeq = 3,
     SleepOut = 4,
-    DisplayOn = 5,
     AllocDmaFd = 6,
     ConfigurePioSync = 7,
     ConfigurePioData = 8,
     StartSMs = 9,
-    Running = 10,
     DmaWait = 11,
-    FillStripe = 12,
     Loading = 13,
     Error = 255,
 }
@@ -264,10 +246,10 @@ impl St7701sState {
 
 mod params_def {
     use super::St7701sState;
-    use super::SCHEMA_MAX;
+
     use super::{p_u16, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         St7701sState;
 
         1, cs_pin, u8, 18
@@ -700,16 +682,6 @@ unsafe fn fill_vertical_stripes(buf: *mut u32, width: u16, stripe_idx: u8) {
     }
 }
 
-/// Fill `word_count` u32 words with a solid RGB565 colour (packed as two pixels per word).
-unsafe fn fill_solid(buf: *mut u32, word_count: usize, color: u16) {
-    let packed = (color as u32) | ((color as u32) << 16);
-    let mut w = 0usize;
-    while w < word_count {
-        core::ptr::write_volatile(buf.add(w), packed);
-        w += 1;
-    }
-}
-
 /// Compute row_lookup: maps each display line to its source cache slot.
 /// Uses Bresenham DDA — no division required.
 /// For a 32-row source on a 480-line display: every 15 display lines map to one source row.
@@ -761,7 +733,7 @@ unsafe fn fill_stripe_from_row_cache(
 // Module exports
 // ============================================================================
 
-declare_module_state_bytes!(St7701sState);
+fluxor_rt::declare_module_state_bytes!(St7701sState);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -914,12 +886,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 spi9_cs_set(s, 1); // Raise CS from DISPLAY_ON hold
                 dev_log(sys, 3, b"[lcd] display on".as_ptr(), 16);
             }
-            s.phase = Phase::AllocDmaFd;
-            2
-        }
-
-        Phase::DisplayOn => {
-            // Unused — kept for enum completeness
             s.phase = Phase::AllocDmaFd;
             2
         }
@@ -1503,16 +1469,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             0
         }
 
-        Phase::FillStripe => {
-            // Unused — kept for enum stability
-            0
-        }
-
-        Phase::Running => {
-            // Unused in current flow — kept for enum completeness
-            0
-        }
-
         Phase::DmaWait => {
             // ── Step 1: DMA ping-pong ────────────────────────────────────────
             let poll = unsafe { dev_fd_poll(sys, s.dma_fd, POLL_IN) };
@@ -1633,6 +1589,6 @@ pub extern "C" fn module_deferred_ready() {}
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

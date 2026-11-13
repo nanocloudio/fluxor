@@ -14,10 +14,7 @@
 /// `Handshaking` and `Ready` peers are "live" and must NOT be
 /// overwritten by a new session for a different 4-tuple.
 fn dtls_slot_reusable(phase: DtlsPhase) -> bool {
-    matches!(
-        phase,
-        DtlsPhase::Idle | DtlsPhase::Errored | DtlsPhase::Closed
-    )
+    matches!(phase, DtlsPhase::Idle | DtlsPhase::Errored)
 }
 
 fn dtls_find_session(s: &TlsState, ip: &[u8; 4], port: u16) -> i32 {

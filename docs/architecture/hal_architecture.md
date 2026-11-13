@@ -12,9 +12,9 @@ logic — lives in modules.
    timers, DMA. Anything more specific (a TFT display controller, an
    audio DAC, a CAN bus chip) is a module that uses these primitives.
    The portable surface lives under
-   `modules/sdk/contracts/hal/{gpio,spi,i2c,uart,adc,pwm,pcie}.rs`;
+   `crates/fluxor-abi/src/contracts/hal/`;
    chip-specific raw register bridges (including RP PIO) live under
-   `modules/sdk/platform/<chip>/`.
+   `crates/fluxor-abi/src/platform/<chip>/`.
 
 2. **One stable contract surface across silicon.** The HAL contract
    opcodes are identical on RP2040, RP2350, and BCM2712. The kernel
@@ -291,7 +291,7 @@ default.
 
 ## Syscall Table
 
-Source: `modules/sdk/abi/kernel_abi.rs`
+Source: `crates/fluxor-abi/src/kernel_abi.rs`
 
 The syscall table (`SyscallTable`) is a `#[repr(C)]` struct of
 function pointers passed to each module at `module_init`. It is the
@@ -461,7 +461,7 @@ with the union of every supported peripheral.
 
 | Component | Location |
 |-----------|----------|
-| Syscall table definition | `modules/sdk/abi/kernel_abi.rs` (assembled by `modules/sdk/abi.rs`) |
+| Syscall table definition | `crates/fluxor-abi/src/kernel_abi.rs` (assembled by `crates/fluxor-abi/src/lib.rs`) |
 | Syscall dispatch | `src/kernel/module/syscalls.rs` |
 | Provider registry | `src/kernel/module/provider.rs` |
 | Channel implementation | `src/kernel/ipc/channel.rs` |
@@ -550,7 +550,7 @@ Applied:
   platform by this section's own principle.
 - **PIO** — RP PIO instruction-engine mechanics (16-bit programs, wrap
   targets, side-set, state-machine pin config), FIFO streaming, and the
-  associated DMA belong under `modules/sdk/platform/rp/pio.rs`; RP drivers
+  associated DMA belong under `crates/fluxor-abi/src/platform/rp/pio.rs`; RP drivers
   (cyw43, i2s_pio, mic_pio) consume them. The one truly platform-independent
   piece, the audio/media clock query, is the portable
   `contracts/stream_clock.rs` capability (class 0x001C); linux/wasm register

@@ -606,7 +606,7 @@ pub fn edges_for_slots_code(code: u8) -> usize {
 }
 
 /// Kernel resource-pool registry mirror: `(yaml name, pool id)` — the
-/// composer-facing names for `modules/sdk/contracts/resource.rs` ids.
+/// composer-facing names for `crates/fluxor-abi/src/contracts/resource.rs` ids.
 /// Pinned against the contract source by `capacity_pool_ids_match_contract`
 /// in `tools/tests/limit_register.rs`.
 pub const POOL_IDS: &[(&str, u16)] = &[

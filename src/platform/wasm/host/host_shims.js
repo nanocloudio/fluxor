@@ -1436,7 +1436,7 @@ registerProcessor('pcm-ring', PcmRing);
     // ── Per-class input drains (capability-surface model) ────────────
     //
     // Each maps a browser-native input source to the matching wire
-    // shape from `modules/sdk/contracts/input/<class>.rs`. The
+    // shape from `crates/fluxor-abi/src/contracts/input/<class>.rs`. The
     // host-side queues are exposed as globals so producer code
     // (event listeners installed by the page, or gamepad polling
     // installed by the shell) can push records into them.
@@ -3658,7 +3658,7 @@ registerProcessor('pcm-ring', PcmRing);
       host_gpu_service_release_program: (slot) => { svcModules.delete(slot >>> 0); return 0; },
 
       // Record and submit one already-validated item list. Sub-opcodes and
-      // field offsets are pinned against modules/sdk/wire/gpu_exec_wire.rs by
+      // field offsets are pinned against crates/fluxor-abi/src/wire/gpu_exec_wire.rs by
       // tests/harness/tests/gpu_backend_wire.rs.
       host_gpu_service_submit: (ticket, listPtr, listLen) => {
         const d = gpuService.device;

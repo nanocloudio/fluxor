@@ -9,7 +9,7 @@
 # (touch_gamepad_overlay maps virtual on-screen buttons to gamepad
 # events; touch_keyboard_overlay similarly for keyboard).
 #
-# Contract wire shape: `modules/sdk/contracts/input/pointer.rs` —
+# Contract wire shape: `crates/fluxor-abi/src/contracts/input/pointer.rs` —
 # W3C Pointer Events (down/up/move/cancel + 5 button flags +
 # pressure + modifiers).
 

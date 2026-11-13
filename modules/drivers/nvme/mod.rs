@@ -38,16 +38,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -59,12 +49,10 @@
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -74,13 +62,6 @@ include!("../../sdk/runtime/params.rs");
 /// arg empty. Used as a retry nudge when `PCIE_DEVICE::BIND` fails
 /// because the downstream card hasn't trained yet.
 const PCIE_RESCAN: u32 = abi::registry::metal_device::PCIE_RESCAN;
-
-/// PCI-bus address offset into BAR1's inbound window on BCM7712 PCIe1, the
-/// `dma_window_gib` default (64 GiB). BAR1 covers PCI bus
-/// 0x10_0000_0000..0x20_0000_0000 and is UBUS-REMAP'd to fabric 0x0
-/// (ACCESS_EN, cpu_hi=0), so a device TLP to `arm_addr | PCI_DMA_OFFSET`
-/// lands at `arm_addr`.
-const PCI_DMA_OFFSET: u64 = 0x10_0000_0000;
 
 // NVMe register offsets
 const REG_CAP: u64 = 0x00;
@@ -183,8 +164,6 @@ const S_READ_LBA0: u8 = 9;
 const S_READY: u8 = 10;
 const S_FAULT: u8 = 0xFF;
 
-// NVMe opcodes (NVMe 1.4 §5).
-const OPC_DELETE_SQ: u8 = 0x00;
 const OPC_CREATE_SQ: u8 = 0x01;
 const OPC_CREATE_CQ: u8 = 0x05;
 const OPC_IDENTIFY: u8 = 0x06;
@@ -198,9 +177,6 @@ const OPC_WRITE: u8 = 0x01;
 /// volatile write cache completes Flush successfully as a no-op.
 const OPC_FLUSH: u8 = 0x00;
 
-// Command IDs — stable across admin queue lifetime so a CQE can be
-// cross-referenced to the command that issued it.
-const CID_IDENTIFY_CTRL: u16 = 0x0001;
 const CID_IDENTIFY_NS: u16 = 0x0002;
 const CID_CREATE_IO_CQ: u16 = 0x0003;
 const CID_CREATE_IO_SQ: u16 = 0x0004;
@@ -532,10 +508,10 @@ const NVME_TLM_INTERVAL_MS: u64 = 5_000;
 
 mod params_def {
     use super::NvmeState;
-    use super::SCHEMA_MAX;
+
     use super::{p_u16, p_u32, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         NvmeState;
 
         // 1: bind. Selector string for the PCIE_DEVICE contract —
@@ -710,7 +686,7 @@ unsafe fn submit_admin_cmd(
 enum CqeResult {
     Pending,
     Ok,
-    Failed(u16), // Status Code (DW3[31:17])
+    Failed,
     Timeout,
 }
 
@@ -735,7 +711,7 @@ unsafe fn poll_admin_cqe(s: &mut NvmeState) -> CqeResult {
     if sc == 0 {
         CqeResult::Ok
     } else {
-        CqeResult::Failed(sc)
+        CqeResult::Failed
     }
 }
 
@@ -1266,7 +1242,7 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
         _ => match poll_admin_cqe(s) {
             CqeResult::Pending => 0,
             CqeResult::Timeout => fault(s, 13, b"[nvme] IdentifyNs CQE timeout\0"),
-            CqeResult::Failed(_) => fault(s, 14, b"[nvme] IdentifyNs failed\0"),
+            CqeResult::Failed => fault(s, 14, b"[nvme] IdentifyNs failed\0"),
             CqeResult::Ok => {
                 let id = s.identify_ns_buf as *const u8;
                 s.ns_size = read_volatile(id.add(INS_NSZE) as *const u64);
@@ -1356,7 +1332,7 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
         _ => match poll_admin_cqe(s) {
             CqeResult::Pending => 0,
             CqeResult::Timeout => fault(s, 16, b"[nvme] CreateIoCQ CQE timeout\0"),
-            CqeResult::Failed(_) => fault(s, 17, b"[nvme] CreateIoCQ failed\0"),
+            CqeResult::Failed => fault(s, 17, b"[nvme] CreateIoCQ failed\0"),
             CqeResult::Ok => {
                 let q = s.bringup_qidx as usize;
                 *s.io_cq_head.as_mut_ptr().add(q) = 0;
@@ -1411,7 +1387,7 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
         _ => match poll_admin_cqe(s) {
             CqeResult::Pending => 0,
             CqeResult::Timeout => fault(s, 19, b"[nvme] CreateIoSQ CQE timeout\0"),
-            CqeResult::Failed(_) => fault(s, 20, b"[nvme] CreateIoSQ failed\0"),
+            CqeResult::Failed => fault(s, 20, b"[nvme] CreateIoSQ failed\0"),
             CqeResult::Ok => {
                 let q = s.bringup_qidx as usize;
                 *s.io_sq_tail.as_mut_ptr().add(q) = 0;
@@ -1571,7 +1547,11 @@ pub mod sim {
 
     pub const IO_READ_BUDGET: u64 = IO_READ_BUDGET_MS;
     pub const IO_SQ_DOORBELL: u64 = REG_SQ0TDBL + ((2 * IO_QID as u64) << 2);
-    pub const DMA_WINDOW: u64 = PCI_DMA_OFFSET;
+    /// The `dma_window_gib` default (64 GiB) the model places its queues
+    /// behind: BCM7712 PCIe1's BAR1 inbound window, which covers PCI bus
+    /// 0x10_0000_0000..0x20_0000_0000 and is UBUS-REMAP'd to fabric 0x0, so
+    /// a device TLP to `arm_addr | DMA_WINDOW` lands at `arm_addr`.
+    pub const DMA_WINDOW: u64 = 0x10_0000_0000;
     pub const SQE_SIZE: usize = SQE_BYTES as usize;
     pub const CQE_SIZE: usize = CQE_BYTES as usize;
 
@@ -1654,7 +1634,7 @@ pub mod sim {
             CqeResult::Ok => 0,
             CqeResult::Pending => 1,
             CqeResult::Timeout => -1,
-            CqeResult::Failed(_) => -2,
+            CqeResult::Failed => -2,
         }
     }
 
@@ -1705,7 +1685,7 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
         _ => match poll_io_cqe(s, CID_READ_LBA0) {
             CqeResult::Pending => 0,
             CqeResult::Timeout => fault(s, 22, b"[nvme] ReadLba0 CQE timeout\0"),
-            CqeResult::Failed(_) => fault(s, 23, b"[nvme] ReadLba0 failed\0"),
+            CqeResult::Failed => fault(s, 23, b"[nvme] ReadLba0 failed\0"),
             CqeResult::Ok => {
                 emit_lba0_info(s);
                 // Hand control to the block-streaming loop starting at
@@ -1962,7 +1942,7 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
                         *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
                     }
                     if sc != 0 {
-                        return CqeResult::Failed(sc);
+                        return CqeResult::Failed;
                     }
                     continue;
                 }
@@ -1973,7 +1953,7 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
                     return if sc == 0 {
                         CqeResult::Ok
                     } else {
-                        CqeResult::Failed(sc)
+                        CqeResult::Failed
                     };
                 }
                 // A CID nothing here is waiting on: count it and drop it
@@ -2055,7 +2035,7 @@ unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
 unsafe fn harvest_write_cqes(s: &mut NvmeState) -> i32 {
     match poll_io_cqe(s, CID_NONE) {
         CqeResult::Ok | CqeResult::Pending => 0,
-        CqeResult::Failed(_) => {
+        CqeResult::Failed => {
             fault(s, 32, b"[nvme] req write failed\0");
             -1
         }
@@ -2316,7 +2296,7 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
         pos += prefix.len();
         // Two-hex format for the id.
         for i in 0..2 {
-            let n = ((id >> (4 - i * 4)) & 0xF) as u8;
+            let n = (id >> (4 - i * 4)) & 0xF;
             *p.add(pos) = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
             pos += 1;
         }
@@ -2324,7 +2304,7 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
         core::ptr::copy_nonoverlapping(at.as_ptr(), p.add(pos), at.len());
         pos += at.len();
         for i in 0..4 {
-            let n = ((ptr >> (12 - i * 4)) & 0xF) as u16;
+            let n = (ptr >> (12 - i * 4)) & 0xF;
             *p.add(pos) = if n < 10 {
                 b'0' + n as u8
             } else {
@@ -2642,7 +2622,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
         BLK_PHASE_READING => match poll_io_cqe(s, CID_READ_LBA0) {
             CqeResult::Pending => 0,
             CqeResult::Timeout => fault(s, 24, b"[nvme] block read CQE timeout\0"),
-            CqeResult::Failed(_) => fault(s, 25, b"[nvme] block read failed\0"),
+            CqeResult::Failed => fault(s, 25, b"[nvme] block read failed\0"),
             CqeResult::Ok => {
                 if s.discard_cqe != 0 {
                     // A seek arrived while this read was in flight —
@@ -3349,7 +3329,7 @@ pub extern "C" fn module_deferred_ready() -> u32 {
     1
 }
 
-declare_module_state_bytes!(NvmeState);
+fluxor_rt::declare_module_state_bytes!(NvmeState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
@@ -3561,6 +3541,6 @@ unsafe fn step_body(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -29,16 +29,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "the SDK's mounted matches are exhaustive on some targets"
 )]
@@ -46,11 +36,10 @@
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
+use fluxor_rt::*;
 
 // Registers (BAR0).
 const REG_AQ_BASE_LO: usize = 0x10;
@@ -198,7 +187,7 @@ struct EnaState {
     tx_malformed: u32,
 }
 
-declare_module_state_bytes!(EnaState);
+fluxor_rt::declare_module_state_bytes!(EnaState);
 
 fn sys(s: &EnaState) -> &'static SyscallTable {
     // SAFETY: set in `module_new`; the table outlives every module.
@@ -1019,4 +1008,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

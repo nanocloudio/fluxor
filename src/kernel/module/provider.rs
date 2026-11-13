@@ -58,7 +58,7 @@ pub type ContractId = u16;
 pub mod contract {
     //! Contract ids, as the kernel's dispatchers name them. Every value is
     //! the ABI registry's (`abi::registry`, from `abi/registry.toml`); see
-    //! the contract files under `modules/sdk/contracts/` for what each serves.
+    //! the contract files under `crates/fluxor-abi/src/contracts/` for what each serves.
 
     /// The kernel's own contract: primitives routed by opcode class ahead of
     /// any handle. Not a provider contract: `syscall_provider_open` refuses

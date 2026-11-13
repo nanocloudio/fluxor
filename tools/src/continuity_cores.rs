@@ -1,29 +1,14 @@
-//! Host mount + tests for the reusable continuity/protocol cores
-//! The core sources live in
-//! `modules/sdk/cores/` and are `include!`d by modules; path-mounting
-//! them here means the host tests exercise byte-for-byte the same
-//! logic the device runs — the same pattern as `wire.rs` /
-//! `genstore_wire.rs`.
+//! The continuity/protocol cores and their tests: `nonce_reservation` and
+//! `session_handoff` are the SDK's, the same code modules link;
+//! `protocol_timer` is the tools' own.
+
+pub use fluxor_sdk::cores::nonce_reservation;
+pub use fluxor_sdk::cores::session_handoff;
 
 #[allow(
     dead_code,
     reason = "host tests reach a subset; device consumers use the rest"
 )]
-#[path = "../../modules/sdk/cores/nonce_reservation.rs"]
-pub mod nonce_reservation;
-
-#[allow(
-    dead_code,
-    reason = "host tests reach a subset; device consumers use the rest"
-)]
-#[path = "../../modules/sdk/cores/session_handoff.rs"]
-pub mod session_handoff;
-
-#[allow(
-    dead_code,
-    reason = "host tests reach a subset; device consumers use the rest"
-)]
-#[path = "../../modules/sdk/cores/protocol_timer.rs"]
 pub mod protocol_timer;
 
 #[cfg(test)]

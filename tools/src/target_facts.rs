@@ -20,7 +20,7 @@ use fluxor_contracts::vocabulary::TARGET_CAPABILITIES;
 use crate::error::{Error, Result};
 use crate::manifest::{ExecutionProfile, Manifest};
 
-/// Vault key suites, `modules/sdk/contracts/key_vault.rs::suite`.
+/// Vault key suites, `crates/fluxor-abi/src/contracts/key_vault.rs::suite`.
 pub mod vault_suite {
     pub const P256: u16 = 1;
     pub const ED25519: u16 = 2;
@@ -36,7 +36,7 @@ pub mod vault_suite {
     pub const RSA_4096: u16 = 12;
 }
 
-/// Vault custody tiers, `modules/sdk/contracts/key_vault.rs::tier`.
+/// Vault custody tiers, `crates/fluxor-abi/src/contracts/key_vault.rs::tier`.
 pub mod vault_tier {
     pub const SOFTWARE: u8 = 0;
     pub const DEVICE_HW: u8 = 2;
@@ -67,7 +67,7 @@ const SUITES_PQ: &[u16] = &[
 ];
 
 /// The ip module's published ceilings on a target
-/// (`modules/sdk/abi/config.rs::ip`, per arch profile).
+/// (`crates/fluxor-abi/src/config.rs::ip`, per arch profile).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetCeilings {
     /// Locally terminated TCP connections (`MAX_TCP_CONNS`).

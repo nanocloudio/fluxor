@@ -5,7 +5,7 @@
 //! that queue into the configured output channel.
 //!
 //! Wire shape on `gamepad.events`:
-//!   `modules/sdk/contracts/input/gamepad.rs::MSG_STATE` /
+//!   `crates/fluxor-abi/src/contracts/input/gamepad.rs::MSG_STATE` /
 //!   `MSG_CONNECTION` — 16-byte records.
 //!
 //! Host shim contract: `host_gamepad_pop(buf, len)` returns one

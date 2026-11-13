@@ -15,11 +15,12 @@
 
 use fluxor_abi::contracts::net::session_ctrl as sc;
 
-include!("../../modules/sdk/crypto/sha256.rs");
-include!("../../modules/sdk/contracts/net/transport_continuity.rs");
+pub use fluxor_sdk::cores::session_handoff::*;
+pub use fluxor_sdk::cores::transport_continuity::*;
+pub use fluxor_sdk::cores::transport_continuity_contract::*;
+pub use fluxor_sdk::crypto::sha256::*;
+
 include!("../../modules/foundation/transport_continuity/heap_table.rs");
-include!("../../modules/sdk/cores/transport_continuity.rs");
-include!("../../modules/sdk/cores/session_handoff.rs");
 include!("../../modules/foundation/transport_continuity/stack.rs");
 
 #[cfg(test)]

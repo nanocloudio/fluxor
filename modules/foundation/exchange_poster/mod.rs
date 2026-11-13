@@ -1,7 +1,7 @@
 //! exchange_poster — framed payloads in, exchange requests out.
 //!
 //! Sits between the `otel` export engine and any provider of the exchange
-//! contract (`modules/sdk/contracts/exchange.rs`), as its requester: each
+//! contract (`crates/fluxor-abi/src/contracts/exchange.rs`), as its requester: each
 //! framed body read from `payload` becomes one request HEAD on `request_out`
 //! carrying the whole batch inline, and the terminal response for it on
 //! `response_in` maps to one `otel.delivery` status byte. See
@@ -22,16 +22,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -42,12 +32,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::exchange as ex;
 use abi::contracts::telemetry as tlm;
@@ -149,10 +137,10 @@ impl PosterState {
 
 mod params_def {
     use super::PosterState;
-    use super::SCHEMA_MAX;
+
     use super::{p_u8, CT_NAME, MAX_CONTENT_TYPE, MAX_PATH};
 
-    define_params! {
+    fluxor_rt::define_params! {
         PosterState;
         1, path, str, 0 => |s, d, len| {
             let n = len.min(MAX_PATH);
@@ -375,7 +363,7 @@ unsafe fn step_payload(s: &mut PosterState) {
 // Module entry points
 // ============================================================================
 
-declare_module_state_bytes!(PosterState);
+fluxor_rt::declare_module_state_bytes!(PosterState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_state_size() -> u32 {

@@ -75,12 +75,6 @@ impl Flow {
     };
 }
 
-/// Bytes the table of `n` flows takes in the heap: the records, the free
-/// stack and the index.
-pub(crate) const fn heap_bytes(n: usize) -> usize {
-    n * core::mem::size_of::<Flow>() + n * 2 + index_len(n) * 4
-}
-
 /// Entries of the index for `n` flows: the power of two at least `4 n`.
 const fn index_len(n: usize) -> usize {
     let mut i = 1usize;

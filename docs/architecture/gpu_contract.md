@@ -10,8 +10,8 @@ Vulkan on a Linux host — including a Raspberry Pi 5's V3D, headless.
 This document is the GPU peer of `av_capability_surface.md` (presentation)
 and `protocol_surfaces.md` (net).
 
-Sources: `modules/sdk/wire/gpu_wire.rs` (the contract),
-`modules/sdk/cores/gpu_{pack,device,pump,client,replay}.rs` (the portable
+Sources: `crates/fluxor-abi/src/contracts/gpu.rs` (the contract),
+`crates/fluxor-sdk/src/gpu/` (the portable
 half), `contracts/src/vocabulary.rs` (capability facts).
 
 ---

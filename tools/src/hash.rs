@@ -69,8 +69,11 @@ pub fn abi_surface_digest() -> [u8; 32] {
     out
 }
 
-/// Every source file the srcpin hashes: all `.rs` under `modules/sdk/**` and
+/// Every source file the srcpin hashes: all `.rs` under the ABI crate
+/// (`crates/fluxor-abi/src/**`, the generated `registry.rs` among them) and
 /// `contracts/src/**`, except build artifacts and the generated pin itself.
+/// `fluxor-sdk` and `fluxor-rt` are library code and are not hashed: a
+/// change confined to them leaves the digest where it was.
 ///
 /// One definition, shared by the hash and by the kernel-capacity gate
 /// (`tools/tests/kernel_capacity_gate.rs`), so the gate inspects exactly the
@@ -90,24 +93,26 @@ pub fn contracts_platform_src_files(repo_root: &Path) -> Result<Vec<std::path::P
                     continue;
                 }
                 walk(&p, out)?;
-            } else if p.extension().is_some_and(|e| e == "rs")
-                && p.file_name().is_none_or(|n| n != "abi_surface_srcpin.rs")
-            {
+            } else if p.extension().is_some_and(|e| e == "rs") && !p.ends_with(SRCPIN) {
                 out.push(p);
             }
         }
         Ok(())
     }
     let mut files = Vec::new();
-    walk(&repo_root.join("modules/sdk"), &mut files)?;
+    walk(&repo_root.join("crates/fluxor-abi/src"), &mut files)?;
     walk(&repo_root.join("contracts/src"), &mut files)?;
     Ok(files)
 }
 
-/// Recompute the canonical source hash over ALL of `modules/sdk` — the
-/// full SDK a module compiles against: kernel_abi (incl. SyscallTable
-/// layout and helper signatures), wire, config profiles, internal
-/// layers, contracts, platform — PLUS the repo-root `contracts/src`
+/// The generated pin, relative to the repository: the one ABI source the
+/// pin does not hash, as it holds the hash.
+pub const SRCPIN: &str = "crates/fluxor-abi/src/abi_surface/srcpin.rs";
+
+/// Recompute the canonical source hash over ALL of the ABI crate — what a
+/// module compiles its numbers and layouts from: kernel_abi (incl.
+/// SyscallTable layout and helper signatures), wire, config profiles,
+/// internal layers, contracts, platform, the registry — PLUS the repo-root `contracts/src`
 /// crate. The latter carries the wire vocabulary (`CONTENT_TYPES`
 /// positional bytes, capability names, rate classes) that every
 /// compiled manifest and config embeds: a vocabulary edit re-numbers
@@ -290,7 +295,7 @@ mod tests {
 
     /// Drift guard for the ABI-surface digest itself. This locks the
     /// current wire surface: if it fails, an ABI numeric allocation (or
-    /// the canonical field list in `modules/sdk/abi_surface.rs`) changed.
+    /// the canonical field list in `crates/fluxor-abi/src/abi_surface.rs`) changed.
     /// That must be a conscious decision — already-built `.fmod`s hardcode
     /// these values, and every staged generation/slot pinned to the old
     /// digest will (correctly) stop matching. Update the constant here
@@ -304,13 +309,13 @@ mod tests {
         assert_eq!(
             digest,
             crate::abi_surface::ABI_SURFACE_DIGEST,
-            "ABI_SURFACE_DIGEST const in modules/sdk/abi_surface_srcpin.rs is \
+            "ABI_SURFACE_DIGEST const in crates/fluxor-abi/src/abi_surface/srcpin.rs is \
              stale — run `fluxor abi-regen` (never hand-edit it). \
              See docs/architecture/abi_surface.md"
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "08898ba9d284e69c2816b7be790aa1f364b397efbbb1cb2f646c431147bfe4ed",
+            hex, "5f6b394afe605c1192fece3253ea08a68b231fd4b41eb2b1c067665f8421d9d8",
             "ABI wire-surface changed — this is a deliberate wire break or it is \
              a mistake; see docs/architecture/abi_surface.md before updating"
         );
@@ -370,7 +375,7 @@ mod tests {
 
     /// Drift guard for the checked-in contracts/platform source pin. When
     /// this fails, a contract or platform SDK file changed: paste the
-    /// printed array into `modules/sdk/abi_surface_srcpin.rs`, then update
+    /// printed array into `crates/fluxor-abi/src/abi_surface/srcpin.rs`, then update
     /// the two locked surface digests (here and in the harness) — the
     /// full restage/rebuild that implies is the point.
     #[test]
@@ -381,10 +386,10 @@ mod tests {
         if computed != stored {
             let arr: Vec<String> = computed.iter().map(|b| format!("0x{b:02x}")).collect();
             panic!(
-                "contracts/platform source pin is stale (a modules/sdk or \
+                "contracts/platform source pin is stale (a crates/fluxor-abi or \
                  contracts/src source changed).\nRun `fluxor abi-regen` to rewrite all pin sites, \
                  then `fluxor modules build --all` so .fmods re-attest.\n(Manual fallback — \
-                 replace the const in modules/sdk/abi_surface_srcpin.rs \
+                 replace the const in crates/fluxor-abi/src/abi_surface/srcpin.rs \
                  with:\n[{}])",
                 arr.join(", ")
             );

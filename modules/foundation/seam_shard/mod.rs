@@ -31,25 +31,13 @@
 //! (at least one).
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 pub const SHARDS: usize = 4;
 const HDR: usize = 3;
@@ -334,7 +322,7 @@ unsafe fn heartbeat(s: &mut ShardState) {
     dev_log(&*s.syscalls, 3, line.as_ptr(), at);
 }
 
-declare_module_state_bytes!(ShardState);
+fluxor_rt::declare_module_state_bytes!(ShardState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]

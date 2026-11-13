@@ -491,7 +491,7 @@ pub const CERT_ERR_UNSUPPORTED_SUITE: u32 = 24;
 /// deploying the stronger key was not to have this happen.
 pub const CERT_ERR_DOWNGRADE: u32 = 25;
 
-name_table!(
+fluxor_rt::name_table!(
     CERT_ERROR_NAMES = [
         b"ok",
         b"message-malformed",

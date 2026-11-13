@@ -17,25 +17,13 @@
 //! `ip.frames_tx`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 /// Outputs.
 pub const OUTPUTS: usize = 4;
@@ -126,7 +114,7 @@ unsafe fn set_list(s: &mut SplitState, k: usize, d: *const u8, len: usize) {
 
 mod params_def {
     use super::*;
-    define_params! {
+    fluxor_rt::define_params! {
         SplitState;
         1, out0, str, 0 => |s, d, len| { set_list(s, 0, d, len); };
         2, out1, str, 0 => |s, d, len| { set_list(s, 1, d, len); };
@@ -235,7 +223,7 @@ unsafe fn heartbeat(s: &mut SplitState) {
     dev_log(&*s.syscalls, 3, line.as_ptr(), at);
 }
 
-declare_module_state_bytes!(SplitState);
+fluxor_rt::declare_module_state_bytes!(SplitState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]

@@ -88,16 +88,6 @@
 // PIC library code must not panic; surface errors through the ABI.
 #![deny(clippy::unwrap_used)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -108,19 +98,16 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
 /// The DNS message codec, shared with the `dns` server.
-#[path = "../../sdk/contracts/net/dns_wire.rs"]
-mod dns_wire;
+use fluxor_abi::contracts::net::dns_wire;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 // SHA-256 and the chunked-handoff core, for transport-continuity records.
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/cores/session_handoff.rs");
+pub use fluxor_sdk::cores::session_handoff::*;
+pub use fluxor_sdk::crypto::sha256::*;
 
 #[allow(
     dead_code,
@@ -286,7 +273,7 @@ const NET_CMD_CONNECT_TO: u8 = abi::contracts::net::net_proto::CMD_CONNECT_TO;
 
 // Datagram surface opcodes share the same `net_in` / `net_out` pair as
 // net_proto; the disjoint opcode ranges keep the contracts unambiguous.
-// See `modules/sdk/contracts/net/datagram.rs`.
+// See `crates/fluxor-abi/src/contracts/net/datagram.rs`.
 
 // `DG_OWNER_TAG_MARK` / `DG_OWNER_TAG_FIELD` — the marker byte that introduces
 // the owner tag on `DG_CMD_SEND_TO` / `DG_CMD_CLOSE`, and the field's width —
@@ -694,7 +681,7 @@ impl LocalAddr {
 }
 
 /// `addr_ctl` port opcodes — the shared `net::identity` control contract
-/// (`modules/sdk/contracts/net/identity.rs`). This module is one *provider* of
+/// (`crates/fluxor-abi/src/contracts/net/identity.rs`). This module is one *provider* of
 /// that contract; the workload backend is its writer. Both sides reference these
 /// same constants, so the opcodes and payload layout have a single source of
 /// truth rather than one copy per side to keep in step by hand.
@@ -716,7 +703,7 @@ const AUTH_REQ_PORT: u8 = 7;
 const NET_IN_PORT: u8 = 1;
 const ADDR_CTL_PORT: u8 = 2;
 /// Pre-transport decision-seam ports of the packet contract
-/// (`modules/sdk/contracts/net/packet.rs`):
+/// (`crates/fluxor-abi/src/contracts/net/packet.rs`):
 /// dispositions in, decision records out, forwarded frames out.
 const PACKET_IN_PORT: u8 = 3;
 const PACKET_OUT_PORT: u8 = 3;
@@ -2105,7 +2092,7 @@ const IP_TLM_PERIOD: u32 = 5000;
 mod params_def {
     use super::*;
 
-    define_params! {
+    fluxor_rt::define_params! {
         IpState;
 
         1, use_dhcp, u8, 1, enum { no=0, yes=1 }
@@ -3469,25 +3456,6 @@ unsafe fn drain_pending_net_out(s: &mut IpState) {
     }
 }
 
-/// Helper: write a short net-proto frame (MSG_ACCEPTED/CLOSED/BOUND/
-/// CONNECTED) to `net_out`. All stores use `write_volatile` to keep
-/// LLVM from eliding them in PIC on aarch64. Returns whether the
-/// frame was delivered or queued; callers MUST hold off on any state
-/// transition the consumer needs to learn about when this returns
-/// false.
-#[inline(always)]
-#[must_use]
-unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u16) -> bool {
-    let mut frame = [0u8; 5];
-    let cb = conn_id.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr(), msg_type);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 2u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    net_send_or_queue(s, &frame)
-}
-
 #[inline(always)]
 #[must_use]
 unsafe fn net_send_accepted(s: &mut IpState, conn_id: u16, local_port: u16) -> bool {
@@ -3891,7 +3859,7 @@ unsafe fn report_ack(s: &mut IpState, idx: usize, queue: bool) {
 
 // ─── datagram emitters ──────────────────────────────────────────
 //
-// See modules/sdk/contracts/net/datagram.rs for the wire shape. All
+// See crates/fluxor-abi/src/contracts/net/datagram.rs for the wire shape. All
 // helpers write into `s.net_scratch` and emit on `s.net_out_chan`. IPv4
 // addresses are wire-order big-endian; ports are little-endian (matching
 // the contract spec).
@@ -4096,17 +4064,6 @@ unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
     );
     conn.consumed_bytes = conn.delivered_bytes;
     conn.rcv_wnd = continuity::rcv_wnd_exposed(s, conn_idx, wnd);
-}
-
-/// Unchecked TCP conn access (avoids bounds check panic in PIC).
-#[inline(always)]
-unsafe fn tcp_conn(s: &IpState, idx: usize) -> &tcp::TcpConn {
-    &*s.tcp_conns.ptr(idx)
-}
-
-#[inline(always)]
-unsafe fn tcp_conn_mut(s: &mut IpState, idx: usize) -> &mut tcp::TcpConn {
-    &mut *s.tcp_conns.ptr_mut(idx)
 }
 
 /// Ephemeral port range (IANA dynamic range, upper end kept clear of the
@@ -4615,11 +4572,11 @@ pub extern "C" fn module_state_size() -> usize {
 // its manifest and a graph's state-arena demand can be summed host-side. `ip` is
 // the module that most needs it: at the embedded profile's 16-entry TCP table it
 // measures 59,400 bytes, which is 90% of an RP2040's whole 64 KiB state arena.
-declare_module_state_bytes!(IpState);
+fluxor_rt::declare_module_state_bytes!(IpState);
 
 // The heap the declared tables are sized into (see "Declared capacities"):
 // elastic on aarch64, so the cap costs only what the tables touch.
-declare_module_arena_bytes!(HEAP_DEFAULT_BYTES);
+fluxor_rt::declare_module_arena_bytes!(HEAP_DEFAULT_BYTES);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_arena_size"]
@@ -13312,6 +13269,6 @@ pub mod test_helpers {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

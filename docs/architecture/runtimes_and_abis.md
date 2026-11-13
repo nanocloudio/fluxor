@@ -17,7 +17,7 @@ built only for bare metal is not placed under Linux: sharing bytes is
 not sharing contracts.
 
 Source: `tools/src/runtime_abi.rs` (the table),
-`modules/sdk/wire/wire.rs` (`runtime_bit`),
+`crates/fluxor-abi/src/wire.rs` (`runtime_bit`),
 `tools/src/modules_build.rs` (build), `src/kernel/module/loader.rs`
 (load-time check).
 

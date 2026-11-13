@@ -13,7 +13,7 @@
 //!
 //! ````text
 //! ```limit-register
-//! MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536
+//! MAX_TCP_CONNS | crates/fluxor-abi/src/config.rs | 65536
 //! MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | -
 //! ```
 //! ````
@@ -189,7 +189,7 @@ fn cfg_predicate(attr: &str) -> Option<String> {
 /// any line which is not itself an attribute, a comment or blank.
 ///
 /// Deliberately not a list of item keywords. An allowlist of what an item
-/// looks like is a list that will be short one entry: `modules/sdk/abi/config.rs`
+/// looks like is a list that will be short one entry: `crates/fluxor-abi/src/config.rs`
 /// re-exports its three profile modules as three consecutive
 /// `#[cfg(...)] pub use profile_*::*;` lines, and a list omitting `use` leaves
 /// all three cfgs unconsumed, to accumulate onto the next declaration and
@@ -1311,7 +1311,7 @@ mod tests {
     #[test]
     fn the_cfg_scanner_finds_every_declaration_the_flat_scan_does() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let body = std::fs::read_to_string(root.join("modules/sdk/abi/config.rs")).unwrap();
+        let body = std::fs::read_to_string(root.join("crates/fluxor-abi/src/config.rs")).unwrap();
         let names = ceiling_consts(&body);
         assert!(names.len() > 10, "expected the real config to be scanned");
         for name in &names {

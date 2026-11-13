@@ -37,7 +37,7 @@ the vocabulary admission test in `abi_layers.md`.
 
 ### 1.1 The encoded record stream
 
-Source: `modules/sdk/contracts/encoded.rs` (`abi::contracts::encoded`).
+Source: `crates/fluxor-abi/src/contracts/encoded.rs` (`abi::contracts::encoded`).
 
 `AudioEncoded` and `VideoEncoded` carry one record stream:
 
@@ -239,7 +239,7 @@ Four AV roles sit above the surface family:
 
 - **Clock authority** — owns the group timeline; audio sinks realise
   this role by exposing `StreamTime`
-  (`modules/sdk/contracts/stream_clock.rs`). Examples: `i2s_pio`
+  (`crates/fluxor-abi/src/contracts/stream_clock.rs`). Examples: `i2s_pio`
   (rp2350), `linux_audio` in `playback` mode, `wasm_browser_audio`
   (browser AudioWorklet sink).
 - **Presentation anchor** — owns the stable attachment to a sink or sink

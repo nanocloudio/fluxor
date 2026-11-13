@@ -61,6 +61,9 @@ clap = { version = "4.6.0", features = ["derive"] }
 # that a module then switches on, so the compiler and the module must read
 # one definition — re-declaring them here is how the two silently diverge.
 fluxor-abi = { path = "../crates/fluxor-abi" }
+# The library code modules link — crypto, the GPU device model, the continuity
+# cores, the font — so the host tools and their tests run the same code.
+fluxor-sdk = { path = "../crates/fluxor-sdk" }
 fluxor-contracts = { path = "../contracts" }
 libc = "0.2.186"
 regex = "1.12.3"
@@ -93,6 +96,9 @@ rustls = { version = "0.23.40", default-features = false, features = ["std", "tl
 webpki-roots = "0.26.11"
 
 [dev-dependencies]
+# The module runtime, for the tests that mount a module source as its
+# `.fmod` build compiles it.
+fluxor-rt = { path = "../crates/fluxor-rt" }
 # Used by test-side `#[cfg(test)]` helpers to construct auto-cleaning
 # scratch directories instead of leaking `std::env::temp_dir().join(...)`
 # paths to `/tmp`. Production tools that manage long-lived state in
@@ -101,9 +107,6 @@ webpki-roots = "0.26.11"
 # tooling.
 tempfile = "3.27.0"
 
-# `tests/module_sign_roundtrip.rs` verifies the CLI signer's output with the
-# SDK's Ed25519, independently of the tools' own signing code.
-fluxor-sdk = { path = "../crates/fluxor-sdk" }
 
 # `tests/param_store.rs` mounts `src/platform/linux/param_store.rs` the
 # way the platform does, with `include!`, so it needs the crates that

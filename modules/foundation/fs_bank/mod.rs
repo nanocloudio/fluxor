@@ -22,7 +22,7 @@
 //! user issues a navigation command).
 //!
 //! The navigation, FMP-command, param and streaming machinery lives in
-//! the shared [`sdk/cores/bank_stream`](../../sdk/cores/bank_stream.rs)
+//! the shared `fluxor_rt::bank_stream!`
 //! core; this module supplies only the FS_CONTRACT storage seam.
 //!
 //! # Configuration
@@ -57,16 +57,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -85,13 +75,11 @@ pub unsafe fn __aeabi_memclr(dest: *mut u8, n: usize) {
     core::ptr::write_bytes(dest, 0, n);
 }
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
-include!("../../sdk/cores/bank_stream.rs");
+use fluxor_rt::*;
+fluxor_rt::bank_stream!();
 
 // ============================================================================
 // FS_CONTRACT storage seam
@@ -301,6 +289,6 @@ unsafe fn hb_extra(s: &mut BankState, p: *mut u8, q: usize) -> usize {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

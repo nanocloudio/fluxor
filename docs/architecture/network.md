@@ -12,8 +12,8 @@ This document describes the stream wire format and the module layering.
 datagram, packet, and multiplexed-session surfaces and the session
 continuity classes above them. The `net_proto` TLV format described below
 is the stream surface; datagram and packet traffic use the separate
-contracts in `modules/sdk/contracts/net/datagram.rs` and
-`modules/sdk/contracts/net/packet.rs`, which share the same 3-byte TLV
+contracts in `crates/fluxor-abi/src/contracts/net/datagram.rs` and
+`crates/fluxor-abi/src/contracts/net/packet.rs`, which share the same 3-byte TLV
 header and disjoint opcode ranges so one channel pair can carry several
 contracts without ambiguity.
 
@@ -96,7 +96,7 @@ the bus primitives the drivers use to touch hardware, and nothing else.
 
 ## The net_proto Channel Protocol (Stream Surface)
 
-Source: `modules/sdk/contracts/net/net_proto.rs`.
+Source: `crates/fluxor-abi/src/contracts/net/net_proto.rs`.
 
 `net_proto` is the framing convention between the network provider and
 its stream consumers. It is stream-only: datagram traffic (DNS, RTP,
@@ -121,7 +121,7 @@ next frame's header. A frame larger than the consumer's buffer, or than
 the channel's ring, is discarded whole, now and as the rest of it arrives,
 which keeps the stream aligned. The SDK helpers
 `net_read_frame`, `net_read_frame_sized` and `net_write_frame` in
-`modules/sdk/runtime/net.rs` implement this; the sized reader reports a
+`crates/fluxor-rt/src/net.rs` implement this; the sized reader reports a
 dropped frame's length so a consumer of a reliable stream can treat it
 as a lost frame and reconnect, where the plain reader logs it.
 
@@ -392,7 +392,7 @@ params (`ssid`, `password`, `security`).
 
 Drivers emit interface transitions as `MSG_NETIF_STATE` frames on a
 dedicated `netif_state` output port, with a one-byte payload from the
-`NETIF_STATE_*` values in `modules/sdk/runtime/consts.rs` (`DOWN`,
+`NETIF_STATE_*` values in `crates/fluxor-rt/src/consts.rs` (`DOWN`,
 `NO_LINK`, `NO_ADDRESS`, `READY`, `ERROR`). Consumers that care (the
 `wifi` module, for example) wire an input port of the same name. The
 kernel tracks no interface state.
@@ -1038,7 +1038,7 @@ networking-related beyond the `channel_*` syscalls.
 
 ## Emission Control
 
-Contract: `modules/sdk/contracts/net/identity.rs` (`ADDR_ARM`,
+Contract: `crates/fluxor-abi/src/contracts/net/identity.rs` (`ADDR_ARM`,
 `ADDR_FENCE`, the `addr_evt` events). Provider: `modules/foundation/ip`.
 
 A secondary local address is installed by the address-control writer
@@ -1128,7 +1128,7 @@ only from a placed member.
 
 ## Transport Continuity
 
-Contract: `modules/sdk/contracts/net/session_ctrl.rs` §Transport
+Contract: `crates/fluxor-abi/src/contracts/net/session_ctrl.rs` §Transport
 continuity. Providers: `modules/foundation/ip` (`continuity.rs`, TCP),
 `modules/foundation/tls` (`continuity.rs`, the record layer),
 `modules/foundation/quic` (`continuity.rs`, the mux). Each answers the
@@ -1267,8 +1267,8 @@ graph that lacks them.
 
 ### The anchor surface: `TRANSPORT_CONTINUITY`
 
-Contract: `modules/sdk/contracts/net/transport_continuity.rs`. Provider:
-`modules/sdk/cores/transport_continuity.rs` (`TcProvider`). This is the
+Contract: `crates/fluxor-sdk/src/cores/transport_continuity_contract.rs`. Provider:
+`crates/fluxor-sdk/src/cores/transport_continuity.rs` (`TcProvider`). This is the
 single-flow surface an anchor outside the graph drives — one end of a
 primary/standby pair per host, on the `tc_ctl` / `tc_evt` port pair —
 rather than a coordinator speaking the per-layer surface above, and it

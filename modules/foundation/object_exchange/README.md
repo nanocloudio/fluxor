@@ -1,7 +1,7 @@
 # `object_exchange` — the exchange front of `storage.object`
 
 `object_exchange` is a provider of the exchange contract
-(`modules/sdk/contracts/exchange.rs`, [docs/architecture/exchange.md](../../../docs/architecture/exchange.md))
+(`crates/fluxor-abi/src/contracts/exchange.rs`, [docs/architecture/exchange.md](../../../docs/architecture/exchange.md))
 that answers each request by reading or writing objects through the
 `storage.object` provider the graph binds. A graph that wires a requester to
 it reaches storage through ordinary exchange edges and never holds the

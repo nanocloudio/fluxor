@@ -1,7 +1,6 @@
-use super::SCHEMA_MAX;
 use super::{p_u16, p_u8, GuardState, MAX_TABLE};
 
-define_params! {
+fluxor_rt::define_params! {
     GuardState;
 
     1, rate_table_size, u8, MAX_TABLE as u32

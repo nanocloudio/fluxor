@@ -10,7 +10,7 @@
 //!
 //! Validation, handles, views, sealing, residency, fences, dependency order,
 //! candidate-output commit and epochs are the shared cores
-//! (`modules/sdk/cores/gpu_*.rs`) — the same code the `gpu_replay` provider runs,
+//! (`crates/fluxor-sdk/src/gpu/`) — the same code the `gpu_replay` provider runs,
 //! so both are held to one lifetime corpus. This file owns exactly what wgpu
 //! owns: adapters, buffers, shader modules, pipelines, encoders and mapped
 //! memory.
@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
-use crate::abi::contracts::gpu as gpu_wire;
+use fluxor_sdk::gpu as gpu_wire;
 
 // ── Sizing ──────────────────────────────────────────────────────────────
 
@@ -295,7 +295,7 @@ mod worker {
     use std::collections::HashMap;
     use std::sync::mpsc::{Receiver, Sender};
 
-    use crate::abi::contracts::gpu as w;
+    use fluxor_sdk::gpu as w;
 
     /// Open an adapter and serve jobs until the channel closes.
     ///

@@ -1,7 +1,7 @@
 // TLV walker for built-in module params.
 //
 // Built-in modules receive a per-instance TLV blob via `ModuleEntry::params()`.
-// Format mirrors `modules/sdk/runtime/params.rs::parse_tlv` and the config-tool
+// Format mirrors `crates/fluxor-rt/src/params.rs::parse_tlv` and the config-tool
 // packer in `tools/src/schema.rs`:
 //
 //   [0xFE][0x01][len_lo][len_hi]

@@ -7,7 +7,7 @@ timer_class      = "agnostic"
 
 # exchange_poster — the generic byte-egress adapter between a framed payload
 # producer (the `otel` export engine) and any provider of the exchange
-# contract (`modules/sdk/contracts/exchange.rs`) — an HTTP client, or anything
+# contract (`crates/fluxor-abi/src/contracts/exchange.rs`) — an HTTP client, or anything
 # else that answers a request. The poster is the requester.
 #
 #   payload       ->  one framed body per batch (net_proto [msg_type][len][body])

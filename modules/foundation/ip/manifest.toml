@@ -102,7 +102,7 @@ buffer_size = { default = 512, aarch64 = 1024 }
 # on `packet_out` (`MSG_PKT_DECIDE` / `MSG_PKT_DECIDE6`) and held until the
 # director's disposition arrives on `packet_in`; a TUNNEL, DSR or CHAIN
 # disposition, and a MIRROR's copy, hand the whole frame over on
-# `packet_fwd`. Wire contract: `modules/sdk/contracts/net/packet.rs`
+# `packet_fwd`. Wire contract: `crates/fluxor-abi/src/contracts/net/packet.rs`
 # (`CMD_PKT_DISPOSE`, `MSG_PKT_FORWARD`). Unwired means the seam does not
 # exist at runtime; wiring it with the parameter off is refused at
 # construct, as is the parameter on without the ports.

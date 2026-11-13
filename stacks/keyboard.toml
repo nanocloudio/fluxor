@@ -4,7 +4,7 @@
 # per-target keyboard producer. Every variant emits the
 # `input::key` contract on a `keyboard.events` output port.
 #
-# Contract wire shape: `modules/sdk/contracts/input/key.rs` —
+# Contract wire shape: `crates/fluxor-abi/src/contracts/input/key.rs` —
 # W3C KeyboardEvent shape with key_code (logical, post-keymap) +
 # scan_code (physical) + modifier bits + autorepeat flag.
 

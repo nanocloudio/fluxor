@@ -13,9 +13,10 @@
               mirrors; the host tests reach the provider half"
 )]
 
-include!("../../modules/sdk/crypto/sha256.rs");
-include!("../../modules/sdk/contracts/net/transport_continuity.rs");
-include!("../../modules/sdk/cores/transport_continuity.rs");
+pub use fluxor_sdk::cores::transport_continuity::*;
+pub use fluxor_sdk::cores::transport_continuity_contract::*;
+#[cfg(test)]
+use fluxor_sdk::crypto::sha256::{sha256, Sha256};
 
 #[cfg(test)]
 mod tests {

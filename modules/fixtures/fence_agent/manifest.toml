@@ -10,7 +10,7 @@ timer_class = "wall_clock"
 
 # The reference out-of-band fence agent: `fence.enforceable` answered from
 # OUTSIDE the failure domain it fences. It speaks the net-identity
-# address-control surface (`modules/sdk/contracts/net/identity.rs` §Two
+# address-control surface (`crates/fluxor-abi/src/contracts/net/identity.rs` §Two
 # providers, one surface) on `addr_ctl_in` / `addr_evt_out` — the same
 # verbs the ip module answers — and its cut is a host command run through
 # the `proc` executor.

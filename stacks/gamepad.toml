@@ -9,7 +9,7 @@
 # libinput on linux, Web Gamepad API in the browser, etc.
 #
 # The contract wire shape lives at
-# `modules/sdk/contracts/input/gamepad.rs` — W3C-mapped 16-button,
+# `crates/fluxor-abi/src/contracts/input/gamepad.rs` — W3C-mapped 16-button,
 # 4-axis snapshots with optional rumble.
 
 [stack]

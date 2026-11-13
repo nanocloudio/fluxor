@@ -12,7 +12,7 @@ application graph works whether the button is a GPIO switch, the BOOTSEL
 button, or a browser tap.
 
 Source: `modules/foundation/gesture/`, `modules/drivers/button/`,
-`modules/sdk/contracts/input/button.rs`.
+`crates/fluxor-abi/src/contracts/input/button.rs`.
 
 ## The raw button contract
 

@@ -18,7 +18,7 @@
 //! points a connection is keyed or released (`conn_index_insert` /
 //! `conn_reset` in `mod.rs`), so nothing here is ever rebuilt on the hot
 //! path. The hash indices are the shared open-addressed index
-//! (`modules/sdk/runtime/hash_index.rs`, mounted below): entries are
+//! (`crates/fluxor-sdk/src/hash_index.rs`, mounted below): entries are
 //! `slot + 1`, removal is backward-shift deletion, so a lookup always ends
 //! at an empty entry. The per-source table deletes the same way.
 //!
@@ -26,7 +26,37 @@
 //! the hash is seeded per module instance so the tuples that land in one
 //! cluster cannot be chosen from outside.
 
-include!("../../sdk/runtime/hash_index.rs");
+pub use fluxor_sdk::hash_index::*;
+
+/// As [`lookup`], also reporting how many entries were probed — so a
+/// harness can hold the cost of a lookup against the table's size rather
+/// than take it on trust.
+///
+/// # Safety
+/// `index` must be a power-of-two length, or empty.
+#[cfg(feature = "host-test")]
+pub unsafe fn lookup_counted<F: FnMut(usize) -> bool>(
+    index: &[u32],
+    hash: u32,
+    mut matches: F,
+) -> (Option<usize>, usize) {
+    let mask = index.len().wrapping_sub(1);
+    let mut i = hash as usize & mask;
+    let mut probes = 0;
+    while probes < index.len() {
+        probes += 1;
+        let e = *index.as_ptr().add(i);
+        if e == EMPTY {
+            return (None, probes);
+        }
+        let slot = (e - 1) as usize;
+        if matches(slot) {
+            return (Some(slot), probes);
+        }
+        i = (i + 1) & mask;
+    }
+    (None, probes)
+}
 
 /// A keyed connection: what distinguishes one from another at the
 /// transport, including which local address it is reached at.
@@ -150,33 +180,4 @@ pub unsafe fn source_leave(table: &mut [SourceCount], ip: u32) {
         i = (i + 1) & mask;
         probes += 1;
     }
-}
-
-/// As [`lookup`], also reporting how many entries were probed — so a
-/// harness can hold the cost of a lookup against the table's size rather
-/// than take it on trust.
-///
-/// # Safety
-/// `index` must be a power-of-two length, or empty.
-pub unsafe fn lookup_counted<F: FnMut(usize) -> bool>(
-    index: &[u32],
-    hash: u32,
-    mut matches: F,
-) -> (Option<usize>, usize) {
-    let mask = index.len().wrapping_sub(1);
-    let mut i = hash as usize & mask;
-    let mut probes = 0;
-    while probes < index.len() {
-        probes += 1;
-        let e = *index.as_ptr().add(i);
-        if e == EMPTY {
-            return (None, probes);
-        }
-        let slot = (e - 1) as usize;
-        if matches(slot) {
-            return (Some(slot), probes);
-        }
-        i = (i + 1) & mask;
-    }
-    (None, probes)
 }

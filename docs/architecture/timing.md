@@ -5,8 +5,8 @@ stream-clock time (what time the data corresponds to). Modules that
 keep the two clocks separate get predictable A/V sync; modules that
 conflate them drift.
 
-Source: `modules/sdk/abi/kernel_abi.rs` (`StreamTime`),
-`modules/sdk/contracts/stream_clock.rs`
+Source: `crates/fluxor-abi/src/kernel_abi.rs` (`StreamTime`),
+`crates/fluxor-abi/src/contracts/stream_clock.rs`
 
 ## 1) Define what "time" means in your system
 

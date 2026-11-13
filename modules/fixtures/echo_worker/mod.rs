@@ -63,21 +63,11 @@
 //!
 //! # Wire format
 //!
-//! See `modules/sdk/contracts/net/session_ctrl.rs`. session_id is 16
+//! See `crates/fluxor-abi/src/contracts/net/session_ctrl.rs`. session_id is 16
 //! bytes big-endian; anchor_id / worker_id are 8 bytes big-endian;
 //! session_epoch is 4 bytes little-endian.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 #![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
@@ -89,15 +79,14 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/cores/session_handoff.rs");
+use fluxor_rt::*;
+pub use fluxor_sdk::cores::session_handoff::*;
 
 // ============================================================================
-// session-control opcodes (see modules/sdk/contracts/net/session_ctrl.rs)
+// session-control opcodes (see crates/fluxor-abi/src/contracts/net/session_ctrl.rs)
 // ============================================================================
 
 const SC_CMD_HELLO: u8 = 0x70;
@@ -248,11 +237,6 @@ impl WorkerState {
         self.import = HandoffImport::new();
         self.import_buf = [0; BLOB_LEN];
         self.import_epoch = 0;
-    }
-
-    #[inline(always)]
-    unsafe fn sys(&self) -> &SyscallTable {
-        &*self.syscalls
     }
 }
 
@@ -752,7 +736,7 @@ unsafe fn handle_data(s: &mut WorkerState) {
 // Module interface
 // ============================================================================
 
-declare_module_state_bytes!(WorkerState);
+fluxor_rt::declare_module_state_bytes!(WorkerState);
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -829,6 +813,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -155,7 +155,7 @@ unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
             None => errno::EINVAL,
         };
     }
-    // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
+    // FS capability bitmap (crates/fluxor-abi/src/contracts/storage/fs.rs::CAPS).
     // Reports handle-acquisition / write-tier capability only;
     // per-FD ops (READ, STAT, CLOSE) are always supported on any
     // FD this provider hands back and aren't represented in the

@@ -5,7 +5,7 @@ hardware_targets = ["bcm2712", "rp2350", "linux"]
 timer_class      = "agnostic"
 
 # object_exchange — the exchange front of `storage.object`: a PROVIDER of the
-# exchange contract (`modules/sdk/contracts/exchange.rs`) that answers each
+# exchange contract (`crates/fluxor-abi/src/contracts/exchange.rs`) that answers each
 # request by reading or writing objects through whichever `storage.object`
 # provider the graph binds. A graph reaches storage through ordinary exchange
 # edges and never holds the storage resource itself.

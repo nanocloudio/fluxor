@@ -6,7 +6,7 @@ producer publishing to a broker or a table: every request a graph carries
 travels in the same records. The party that asks is the **requester**, the
 party that answers is the **provider**, and neither learns what the other is.
 
-The contract is `modules/sdk/contracts/exchange.rs`, mounted for every module
+The contract is `crates/fluxor-abi/src/contracts/exchange.rs`, mounted for every module
 as `abi::contracts::exchange`. It is the authority for every byte; this page
 describes what the records are for.
 
@@ -138,7 +138,7 @@ grant and the refusal it owes are taken after each record and written by the
 module that owns the port.
 
 A module that writes answers places them through `ExchangeOutbox`
-(`modules/sdk/runtime/exchange.rs`): a record the channel has no room for is
+(`crates/fluxor-rt/src/exchange.rs`): a record the channel has no room for is
 held and placed on a later step, so no answer is dropped.
 
 ## Contracts behind an exchange

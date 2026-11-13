@@ -350,9 +350,11 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     let mut report = Report::default();
 
     // fluxor owns the SDK sources; every other repo consumes them from
-    // the staged tree. `modules/sdk/abi_surface.rs` is the same marker
+    // the staged tree. `crates/fluxor-abi/src/abi_surface.rs` is the same marker
     // the ABI pin test keys off.
-    let sdk_owner = project_root.join("modules/sdk/abi_surface.rs").is_file();
+    let sdk_owner = project_root
+        .join("crates/fluxor-abi/src/abi_surface.rs")
+        .is_file();
 
     // Files whose inline tests actually run on the host (see
     // `host_compiled_closure`). The inline-tests rule does not apply to
@@ -426,9 +428,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
             file_violations.extend(scan_consumer_naming(&rel, &content, &consumers));
             file_violations.extend(scan_tenancy_vocabulary(&rel, &content));
         }
-        if !sdk_owner {
-            file_violations.extend(scan_sdk_mounts(&rel, &content));
-        }
+        file_violations.extend(scan_sdk_mounts(&rel, &content));
         file_violations.extend(scan_pending_writes(&rel, &content, &write_consts));
         file_violations.extend(scan_descriptor_hygiene(&rel, &content));
         file_violations.extend(scan_abi_literals(&rel, &content));
@@ -498,8 +498,7 @@ fn apply_ratchets(report: &mut Report, ratchets: &[Ratchet]) {
 
 /// Structure rules for the `modules/` tree: a module is a directory, never a crate; tier placement
 /// must agree with the manifest; in-module `tests/` must be declared.
-/// `modules/sdk/` is the staged-source contract, not a module tree —
-/// exempt. All findings report under `Rule::ModuleStructure`.
+/// All findings report under `Rule::ModuleStructure`.
 fn scan_module_structure(project_root: &Path, report: &mut Report) {
     let modules_root = project_root.join("modules");
     if !modules_root.is_dir() {
@@ -517,9 +516,6 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
     for entry in walkdir::WalkDir::new(&modules_root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            e.file_name() != "sdk" || e.path().parent() != Some(modules_root.as_path())
-        })
         .filter_map(std::result::Result::ok)
     {
         let rel = match entry.path().strip_prefix(project_root) {
@@ -913,11 +909,16 @@ fn shadow_tier_is_empty(shadow_dir: &Path, project_root: &Path, tier: &str) -> b
     }
 }
 
-/// SDK-mount rule: a consuming project
-/// mounts fluxor's SDK — and any sibling's shared source tree — from
-/// the staged, digest-verified tree `fluxor sync` materialises under
-/// `target/fluxor/`, never from a raw `deps/<project>/` checkout. A
-/// `deps/` mount has no pin, no digest, and no staleness signal.
+/// SDK-mount rule. The ABI, the SDK and the module runtime are three crates
+/// a module links (`fluxor_abi`, `fluxor_sdk`, `fluxor_rt`); no file anywhere
+/// mounts their source by `#[path]` or `include!` — not from `crates/`, not
+/// from the tree `fluxor sync` stages under `target/fluxor/`, not from a
+/// `deps/` checkout. A mount compiles a second copy whose types are not the
+/// crate's and whose digest nothing checks.
+///
+/// A sibling's shared source tree is still mounted, from the staged
+/// `target/fluxor/<project>-common/` and never a raw `deps/` checkout: a
+/// `deps/` mount has no pin, no digest and no staleness signal.
 fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
     let mut out = Vec::new();
     for (idx, line) in src.lines().enumerate() {
@@ -925,14 +926,23 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
         if !(trimmed.starts_with("#[path") || trimmed.contains("include!(")) {
             continue;
         }
-        let Some(pos) = line.find("deps/") else {
+        let Some(open) = line.find('"') else {
             continue;
         };
-        let tail = &line[pos..];
-        let staged = if tail.contains("/modules/sdk/") {
-            "target/fluxor/fluxor-abi/sdk/"
-        } else if tail.contains("/modules/common/") {
-            "target/fluxor/<project>-common/"
+        let path = line[open + 1..].split('"').next().unwrap_or("");
+        let message = if ["fluxor-abi/", "fluxor-sdk/", "fluxor-rt/", "modules/sdk/"]
+            .iter()
+            .any(|c| path.contains(c))
+        {
+            format!(
+                "mounts SDK source (`{path}`): the ABI, the SDK and the runtime are crates — \
+                 import them (`use fluxor_abi as abi; use fluxor_rt::*;`, \
+                 `use fluxor_sdk::crypto::sha256::*;`) and let the module build link them"
+            )
+        } else if path.contains("deps/") && path.contains("/modules/common/") {
+            "raw `deps/` source mount — no pin, no digest, no staleness signal. Mount the \
+             staged tree `target/fluxor/<project>-common/...` that `fluxor sync` materialises"
+                .to_string()
         } else {
             continue;
         };
@@ -940,10 +950,7 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
             path: rel.to_path_buf(),
             line: idx + 1,
             rule: Rule::SdkMount,
-            message: format!(
-                "raw `deps/` source mount — no pin, no digest, no staleness signal. Mount the \
-                 staged tree `{staged}...` that `fluxor sync` materialises"
-            ),
+            message,
         });
     }
     out
@@ -1032,14 +1039,29 @@ fn git_dir(project_root: &Path) -> Option<PathBuf> {
 /// a consumer compiles against.
 fn is_normative_surface(rel: &Path) -> bool {
     let p = rel.to_string_lossy().replace('\\', "/");
-    p.starts_with("contracts/src/") || p.starts_with("modules/sdk/")
+    p.starts_with("contracts/src/")
+        || p.starts_with("crates/fluxor-abi/")
+        || p.starts_with("crates/fluxor-sdk/")
+        || p.starts_with("crates/fluxor-rt/")
 }
 
 /// Storage write opcodes whose answer may be `EINPROGRESS`
-/// (`modules/sdk/contracts/storage/object.rs`, "Writes: `EINPROGRESS` means ask again
+/// (`crates/fluxor-abi/src/contracts/storage/object.rs`, "Writes: `EINPROGRESS` means ask again
 /// with the same request"): `storage.object` PUT, DELETE, PUT_STREAMED_COMMIT
 /// and RETAIN, and `storage.namespace` RENAME, DELETE and BIND.
-const STORAGE_WRITE_OPS: [u64; 7] = [0x1420, 0x1424, 0x1428, 0x142C, 0x1303, 0x1304, 0x1308];
+/// Read from the registry, never restated: a renumbering moves them with it.
+const STORAGE_WRITE_OPS: [u64; 7] = {
+    use fluxor_abi::registry::{storage_namespace as ns, storage_object as obj};
+    [
+        obj::PUT as u64,
+        obj::DELETE as u64,
+        obj::PUT_STREAMED_COMMIT as u64,
+        obj::RETAIN as u64,
+        ns::RENAME as u64,
+        ns::DELETE as u64,
+        ns::BIND as u64,
+    ]
+};
 
 /// pending-write: a storage write's return code must go straight into
 /// `write_answer(...)`, so the `WriteAnswer` it becomes makes every caller
@@ -1315,7 +1337,7 @@ fn scan_consumer_naming(rel: &Path, src: &str, consumers: &[String]) -> Vec<Viol
 /// Unix credentials: what a portable contract must never carry. A workload
 /// reaches what its owner was granted, inside a root of its own; a user,
 /// group, mode bit or identity switch is a host-process mechanism, and lives
-/// only in that platform's own contract (`modules/sdk/platform/linux/`).
+/// only in that platform's own contract (`crates/fluxor-abi/src/platform/linux/`).
 const UNIX_CREDENTIAL_WORDS: &[&str] = &[
     "gid",
     "setuid",
@@ -1339,7 +1361,7 @@ const UNIX_CREDENTIAL_WORDS: &[&str] = &[
 const ORCHESTRATOR_WORDS: &[&str] = &["pod", "pods", "kubelet", "kubernetes", "k8s"];
 
 /// Host mechanisms: how one platform realizes a portable concept. They belong
-/// to that platform (`src/platform/<p>/`, `modules/sdk/platform/<p>/`); a
+/// to that platform (`src/platform/<p>/`, `crates/fluxor-abi/src/platform/<p>/`); a
 /// portable surface, the kernel and the architecture docs say what is
 /// guaranteed, not which host facility guarantees it. `bridge` and `uid` are
 /// deliberately absent: both are ordinary portable words here (a channel
@@ -1382,7 +1404,7 @@ const VOCABULARY_EXEMPT_END: &str = "vocabulary-exempt-end";
 /// mechanisms.
 fn is_portable_surface(rel: &Path) -> bool {
     let p = rel.to_string_lossy().replace('\\', "/");
-    is_normative_surface(rel) && !p.starts_with("modules/sdk/platform/")
+    is_normative_surface(rel) && !p.starts_with("crates/fluxor-abi/src/platform/")
 }
 
 /// Whether `rel` is an architecture document: the prose that states the
@@ -1478,7 +1500,7 @@ fn scan_tenancy_vocabulary(rel: &Path, src: &str) -> Vec<Violation> {
                         "names the Unix credential `{word}` in {scope} — what a \
                          workload may reach is a grant on its owner, made real inside a root of \
                          its own; a credential belongs to the host-process platform \
-                         (`src/platform/linux/`, `modules/sdk/platform/linux/`)"
+                         (`src/platform/linux/`, `crates/fluxor-abi/src/platform/linux/`)"
                     ),
                 ));
             }
@@ -1502,7 +1524,7 @@ fn scan_tenancy_vocabulary(rel: &Path, src: &str) -> Vec<Violation> {
                     format!(
                         "names the host mechanism `{word}` in {scope} — say what \
                          is guaranteed, not which host facility realizes it; mechanisms live in \
-                         `src/platform/<p>/` and `modules/sdk/platform/<p>/`, and a ruling that \
+                         `src/platform/<p>/` and `crates/fluxor-abi/src/platform/<p>/`, and a ruling that \
                          must name a backend goes inside a `{VOCABULARY_EXEMPT_BEGIN}: <reason>` \
                          … `{VOCABULARY_EXEMPT_END}` block"
                     ),
@@ -1784,7 +1806,7 @@ fn should_skip(entry: &walkdir::DirEntry) -> bool {
 }
 
 /// An ABI number is declared once, in the ABI registry
-/// (`modules/sdk/abi/registry.toml`); everywhere else names it through the
+/// (`crates/fluxor-abi/registry/registry.toml`); everywhere else names it through the
 /// generated `abi::registry`. A `u32` constant spelled as a four-digit hex
 /// literal whose high byte is a registered opcode class restates an opcode.
 fn scan_abi_literals(rel: &Path, src: &str) -> Vec<Violation> {
@@ -1830,7 +1852,7 @@ fn scan_abi_literals(rel: &Path, src: &str) -> Vec<Violation> {
                     rule: Rule::AbiLiteral,
                     message: format!(
                         "`{}` restates an opcode of class {class:#04x}: name it through \
-                         `abi::registry` (declared in modules/sdk/abi/registry.toml)",
+                         `abi::registry` (declared in crates/fluxor-abi/registry/registry.toml)",
                         &c[1]
                     ),
                 });
@@ -2333,14 +2355,20 @@ mod tests {
     fn tenancy_vocabulary_is_refused_on_the_portable_surface_only() {
         let src =
             "/// mode: u32, uid: u32, gid: u32\n/// a Pod's state\nconst OWNER_UID: u8 = 0;\n";
-        let v = scan_tenancy_vocabulary(Path::new("modules/sdk/contracts/storage/fs.rs"), src);
+        let v = scan_tenancy_vocabulary(
+            Path::new("crates/fluxor-abi/src/contracts/storage/fs.rs"),
+            src,
+        );
         let words: Vec<_> = v.iter().map(|v| (v.line, v.message.clone())).collect();
         assert_eq!(v.len(), 2, "{words:?}");
         assert!(v[0].line == 1 && v[0].message.contains("`gid`"));
         assert!(v[1].line == 2 && v[1].message.contains("`pod`"));
         assert!(
-            scan_tenancy_vocabulary(Path::new("modules/sdk/platform/linux/host_process.rs"), src)
-                .is_empty(),
+            scan_tenancy_vocabulary(
+                Path::new("crates/fluxor-abi/src/platform/linux/host_process.rs"),
+                src
+            )
+            .is_empty(),
             "a platform's own contract names its own mechanisms"
         );
         assert!(
@@ -2844,18 +2872,25 @@ extern crate alloc;
     }
 
     #[test]
-    fn sdk_mount_flags_deps_path_and_include() {
-        let src = r#"
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
-mod abi;
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-"#;
-        let v = scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src);
-        assert_eq!(v.len(), 2, "got: {v:?}");
-        assert!(v.iter().all(|v| v.rule == Rule::SdkMount));
-        assert!(v[0].message.contains("target/fluxor/fluxor-abi/sdk/"));
-        assert_eq!(v[0].line, 2);
-        assert_eq!(v[1].line, 4);
+    fn sdk_mount_flags_every_mount_of_the_crates() {
+        // Spelled at run time: written out, these lines would be mounts this
+        // very rule refuses in this file.
+        let (path, inc) = ("#[path", "include!(");
+        let src = format!(
+            "\n{path} = \"../../../deps/fluxor/crates/fluxor-abi/src/lib.rs\"]\nmod abi;\n\
+             {inc}\"../../../target/fluxor/fluxor-rt/src/lib.rs\");\n\
+             {inc}\"../../sdk/crypto/sha256.rs\");\n\
+             {inc}\"../../crates/fluxor-sdk/src/crypto/sha256.rs\");\n"
+        );
+        let v = scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), &src);
+        assert_eq!(
+            v.iter().map(|v| v.line).collect::<Vec<_>>(),
+            [2, 4, 6],
+            "got: {v:?}"
+        );
+        assert!(v
+            .iter()
+            .all(|v| v.rule == Rule::SdkMount && v.message.contains("crates")));
     }
 
     #[test]
@@ -2867,21 +2902,14 @@ include!("../../../deps/fluxor/modules/sdk/runtime.rs");
     }
 
     #[test]
-    fn sdk_mount_accepts_the_staged_tree() {
-        let src = r#"
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-"#;
-        assert!(scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src).is_empty());
-    }
-
-    #[test]
-    fn sdk_mount_ignores_non_sdk_deps_mounts() {
-        // A cross-project module mount is a different question; this
-        // rule is about the staged source tree only.
-        let src = "#[path = \"../../../deps/fluxor/modules/foundation/http/mod.rs\"]\nmod http;\n";
-        assert!(scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src).is_empty());
+    fn sdk_mount_accepts_imports_and_module_local_mounts() {
+        let (path, inc) = ("#[path", "include!(");
+        let src = format!(
+            "\nuse fluxor_abi as abi;\nuse fluxor_rt::*;\n{inc}\"cid_route.rs\");\n\
+             {path} = \"../../../target/fluxor/sibling-common/kv.rs\"]\nmod kv;\n\
+             {path} = \"../../../deps/fluxor/modules/foundation/http/mod.rs\"]\nmod http;\n"
+        );
+        assert!(scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), &src).is_empty());
     }
 
     fn repo_files_report(root: &TempRoot, _config: &Config) -> Vec<Violation> {
@@ -3082,7 +3110,7 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
         );
         assert_eq!(consumer_names("", "").len(), CONSUMER_PROJECTS.len());
 
-        let surface = Path::new("modules/sdk/contracts/net/net_proto.rs");
+        let surface = Path::new("crates/fluxor-abi/src/contracts/net/net_proto.rs");
         let src = "/// the record alpha writes\nconst A: u8 = 0;\n";
         assert_eq!(scan_consumer_naming(surface, src, &names).len(), 1);
         assert!(

@@ -1,7 +1,7 @@
 //! `fluxor modules cap` — issue and check mesh capability chains.
 //!
 //! The codec, the chain rules and the verifier are the contract's
-//! (`modules/sdk/contracts/mesh/capability.rs`, reached through
+//! (`crates/fluxor-abi/src/contracts/mesh/capability.rs`, reached through
 //! `fluxor_abi`), the same source every verifying module links, so a chain
 //! issued here is accepted there by construction. Keys are the 32-byte
 //! Ed25519 seeds `fluxor modules keygen` makes, held exactly as module

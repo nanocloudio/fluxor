@@ -1,6 +1,6 @@
 # transport_continuity
 
-`TRANSPORT_CONTINUITY` (`modules/sdk/contracts/net/transport_continuity.rs`)
+`TRANSPORT_CONTINUITY` (`crates/fluxor-sdk/src/cores/transport_continuity_contract.rs`)
 over this graph's `ip` and `tls`: the provider an anchor drives to
 checkpoint, import, arm and activate a live TCP+TLS connection the graph's own
 stack holds. The record is sized to the TLS record, so a crash-continuous pair

@@ -26,16 +26,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -46,11 +36,8 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
-
-include!("../../sdk/runtime.rs");
+use fluxor_abi as abi;
 
 // ============================================================================
 // Constants
@@ -63,8 +50,6 @@ const IPV4_MIN_HLEN: usize = 20;
 
 // Ethertypes (big-endian on wire)
 const ETH_P_IPV4: u16 = 0x0800;
-const ETH_P_ARP: u16 = 0x0806;
-const ETH_P_IPV6: u16 = 0x86DD;
 
 // IP protocols
 const IPPROTO_ICMP: u8 = 1;
@@ -218,7 +203,7 @@ unsafe fn parse_and_forward(s: &mut ParserState, frame: *const u8, frame_len: us
 // Module ABI
 // ============================================================================
 
-declare_module_state_bytes!([u8; STATE_SIZE]);
+fluxor_rt::declare_module_state_bytes!([u8; STATE_SIZE]);
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -279,6 +264,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

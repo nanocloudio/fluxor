@@ -22,7 +22,7 @@
 //! record describes an audio-only device with physical buttons, and a consumer
 //! drives it by transport buttons + audio cues, never a screen.
 //!
-//! Params (PIC schema via define_params!, NOT manifest [[params]]):
+//! Params (PIC schema via fluxor_rt::define_params!, NOT manifest [[params]]):
 //!   1 width          (u32) — viewport width px  (ignored when display_count=0)
 //!   2 height         (u32) — viewport height px (ignored when display_count=0)
 //!   3 modalities     (u32) — input::surface_traits MODALITY_* bitmask
@@ -35,16 +35,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -55,12 +45,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::input::surface_traits as st;
 
@@ -90,9 +78,9 @@ struct PanelState {
 mod params_def {
     use super::p_u32;
     use super::PanelState;
-    use super::{DEFAULT_MODALITIES, SCHEMA_MAX};
+    use super::DEFAULT_MODALITIES;
 
-    define_params! {
+    fluxor_rt::define_params! {
         PanelState;
 
         1, width, u32, 800
@@ -112,7 +100,7 @@ mod params_def {
     }
 }
 
-declare_module_state_bytes!(PanelState);
+fluxor_rt::declare_module_state_bytes!(PanelState);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -219,4 +207,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

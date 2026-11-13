@@ -8,7 +8,7 @@
 //! surface architecture).
 //!
 //! Wire shape on `keyboard.events`:
-//!   `modules/sdk/contracts/input/key.rs::MSG_EVENT` —
+//!   `crates/fluxor-abi/src/contracts/input/key.rs::MSG_EVENT` —
 //!   8-byte records (msg_type / kind / modifiers / repeat /
 //!   key_code:u16 / scan_code:u16).
 //!

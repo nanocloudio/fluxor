@@ -10,8 +10,10 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 # rp2040-boot2 is a data dependency supplying a checksummed flash blob and
-# contributes no control flow.
-ALLOW="critical-section fluxor fluxor-contracts log portable-atomic rp2040-boot2"
+# contributes no control flow. fluxor-abi (the ABI every module shares) and
+# fluxor-sdk (the crypto the vault and loader use) are this repository's own
+# crates, with no dependencies but each other.
+ALLOW="critical-section fluxor fluxor-abi fluxor-contracts fluxor-sdk log portable-atomic rp2040-boot2"
 
 fail=0
 for spec in "pico2w thumbv8m.main-none-eabihf chip-rp2350b" \

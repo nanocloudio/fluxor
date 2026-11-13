@@ -17,31 +17,19 @@
 //! `flows = 0`, refuses to start, saying so.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::contracts::net::session_ctrl as sc;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/contracts/net/transport_continuity.rs");
+use fluxor_rt::*;
+pub use fluxor_sdk::cores::transport_continuity_contract::*;
+pub use fluxor_sdk::crypto::sha256::*;
 include!("../transport_continuity/heap_table.rs");
-include!("../../sdk/cores/transport_continuity.rs");
-include!("../../sdk/cores/session_handoff.rs");
+pub use fluxor_sdk::cores::session_handoff::*;
+pub use fluxor_sdk::cores::transport_continuity::*;
 include!("qcs.rs");
 
 const PORTS: usize = 3;
@@ -210,7 +198,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
 
 mod params_def {
     use super::*;
-    define_params! {
+    fluxor_rt::define_params! {
         State;
         1, anchor_id, str, 0 => |s, d, len| {
             if len == 16 {
@@ -237,9 +225,9 @@ mod params_def {
 /// header (8 B), its rounding to the allocator's 16-byte granularity and
 /// the 4-byte canary under `canary_enabled`, within 64 B.
 const ARENA_BASE: u32 = 64;
-declare_module_arena_bytes!(ARENA_BASE);
+fluxor_rt::declare_module_arena_bytes!(ARENA_BASE);
 
-declare_module_state_bytes!(State);
+fluxor_rt::declare_module_state_bytes!(State);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
@@ -346,4 +334,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0
 }
 
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

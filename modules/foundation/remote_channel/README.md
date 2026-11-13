@@ -2,7 +2,7 @@
 
 `remote_channel` carries up to eight local channels record for record
 across authenticated transport sessions, and optionally one exchange
-(`modules/sdk/contracts/exchange.rs`,
+(`crates/fluxor-abi/src/contracts/exchange.rs`,
 [docs/architecture/exchange.md](../../../docs/architecture/exchange.md)). Two
 instances, one on each node, are the two ends of a session; a listener
 serves up to `sessions` of them at once, one per verified peer. The transport

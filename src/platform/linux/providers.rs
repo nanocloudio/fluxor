@@ -813,7 +813,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     let owner = crate::kernel::exec::scheduler::caller_owner();
     let rooted = crate::platform::linux::owner_root::rooted(owner);
 
-    // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
+    // FS capability bitmap (crates/fluxor-abi/src/contracts/storage/fs.rs::CAPS).
     // Linux implements the full read-tier, the write-tier, both
     // name-publication ops (RENAME, FSYNC_NAME) and TRUNCATE.
     // FSYNC_ASYNC stays clear: this provider fences with a blocking
@@ -1828,7 +1828,7 @@ const CMD_CONNECT: u8 = 0x13;
 /// and the scheduler never blocks on a lookup.
 const CMD_CONNECT_TO: u8 = 0x14;
 
-// Datagram surface (modules/sdk/contracts/net/datagram.rs, opcodes
+// Datagram surface (crates/fluxor-abi/src/contracts/net/datagram.rs, opcodes
 // 0x20..0x43). Disjoint from net_proto so the same channel can carry
 // both contracts.
 const DG_CMD_BIND: u8 = 0x20;
@@ -5000,7 +5000,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                             had_work = true;
                         }
                         DG_CMD_BIND if payload_len >= 3 => {
-                            // Payload (modules/sdk/contracts/net/datagram.rs):
+                            // Payload (crates/fluxor-abi/src/contracts/net/datagram.rs):
                             //   [port: u16 LE] [flags: u8] [owner_tag: u16 LE]?
                             // A bind that omits the tag records tag 0.
                             let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);

@@ -28,16 +28,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -48,12 +38,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -61,19 +49,11 @@ include!("../../sdk/runtime/params.rs");
 
 const MAX_HANDLES: usize = 8;
 const MAX_BUSES: usize = 2;
-const OWNER_KERNEL: u8 = 0xFF;
 
 // SPI register offsets (PL022 / RP2350)
 const SSPCR0: u8 = 0x00; // Control register 0 (format, clock rate)
-const SSPCR1: u8 = 0x04; // Control register 1 (enable, mode)
-const SSPDR: u8 = 0x08; // Data register
-const SSPSR: u8 = 0x0C; // Status register
 const SSPCPSR: u8 = 0x10; // Clock prescaler
 const SSPDMACR: u8 = 0x24; // DMA control
-
-// SSPSR bits
-const SSPSR_BSY: u32 = 1 << 4;
-const SSPSR_TFE: u32 = 1 << 0; // TX FIFO empty
 
 // DMA flags for SPI: data_size=8bit (0), incr_read=1, incr_write=1
 const DMA_FLAG_INCR_READ: u8 = 0x01;
@@ -148,8 +128,7 @@ use abi::contracts::hal::spi::{
 };
 
 use abi::platform::rp::spi_raw::{
-    BUS_INFO as SPI_BUS_INFO, PIN_INIT as SPI_PIN_INIT, REG_READ as SPI_REG_READ,
-    REG_WRITE as SPI_REG_WRITE, SET_ENABLE as SPI_SET_ENABLE,
+    BUS_INFO as SPI_BUS_INFO, REG_WRITE as SPI_REG_WRITE, SET_ENABLE as SPI_SET_ENABLE,
 };
 
 unsafe fn spi_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
@@ -162,14 +141,6 @@ unsafe fn spi_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     *bp.add(3) = v[2];
     *bp.add(4) = v[3];
     (sys.provider_call)(bus as i32, SPI_REG_WRITE, bp, 5);
-}
-
-unsafe fn spi_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
-    let mut buf = [0u8; 5];
-    let bp = buf.as_mut_ptr();
-    *bp = offset;
-    (sys.provider_call)(bus as i32, SPI_REG_READ, bp, 5);
-    u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 
 unsafe fn spi_bus_info(sys: &SyscallTable, bus: u8, info: &mut BusInfo) {
@@ -185,11 +156,6 @@ unsafe fn spi_bus_info(sys: &SyscallTable, bus: u8, info: &mut BusInfo) {
 unsafe fn spi_set_enable(sys: &SyscallTable, bus: u8, enable: bool) {
     let mut buf = [if enable { 1u8 } else { 0u8 }];
     (sys.provider_call)(bus as i32, SPI_SET_ENABLE, buf.as_mut_ptr(), 1);
-}
-
-unsafe fn spi_pin_init(sys: &SyscallTable, bus: u8, clk: u8, mosi: u8, miso: u8) {
-    let mut buf = [clk, mosi, miso];
-    (sys.provider_call)(bus as i32, SPI_PIN_INIT, buf.as_mut_ptr(), 3);
 }
 
 // DMA: channel family only. spi_pl022 allocates a raw DMA channel per
@@ -718,7 +684,7 @@ pub extern "C" fn module_state_size() -> usize {
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-declare_module_state_bytes!(SpiState);
+fluxor_rt::declare_module_state_bytes!(SpiState);
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -825,6 +791,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

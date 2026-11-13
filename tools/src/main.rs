@@ -108,33 +108,15 @@ mod wasm_bundle;
 mod workload_src;
 mod workspace;
 
-/// Wire-format constants — path-mounted from `modules/sdk/wire/wire.rs` so
-/// the host tools see the exact same `ABI_VERSION` byte and `fnv1a32`
-/// implementation the kernel uses. The lib facade in `tools/src/lib.rs`
-/// mounts the same file for integration tests. `#[allow(dead_code)]`
-/// because tools only need a subset of the constants (e.g.
-/// `CHANNEL_HINT_WIRE_BYTES` is kernel-side only) but the file is
-/// shared verbatim.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-#[path = "../../modules/sdk/wire/wire.rs"]
-mod wire;
+/// Wire-format constants shared byte-for-byte with the kernel and modules.
+use fluxor_abi::wire;
 
-/// The `.fmod` container's signed region — path-mounted from
-/// `modules/sdk/wire/fmod.rs`, the definition the kernel loader verifies
-/// against, so the signer hashes exactly the bytes the loader does.
-#[allow(
-    dead_code,
-    reason = "the signer reads a subset of the container constants the kernel loader shares"
-)]
-#[path = "../../modules/sdk/wire/fmod.rs"]
-mod fmod;
+/// The `.fmod` container's signed region, the definition the kernel loader
+/// verifies against, so the signer hashes exactly the bytes the loader does.
+use fluxor_abi::wire::fmod;
 
-/// Canonical ABI wire-surface encoding (see `tools/src/lib.rs` mount).
-#[path = "../../modules/sdk/abi_surface.rs"]
-mod abi_surface;
+/// The ABI wire-surface encoding the kernel folds into the same digest.
+use fluxor_abi::abi_surface;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};

@@ -21,16 +21,6 @@
 
 #![no_std]
 #![allow(
-    dead_code,
-    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
-              module's compile sees the entire ABI surface while using a subset. This \
-              allow is the SDK's textual mounting showing through"
-)]
-#![allow(
-    unused_imports,
-    reason = "same cause: the mounted SDK brings names this module does not reach for"
-)]
-#![allow(
     unreachable_patterns,
     reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
               exhaustive, which is why the lint fires; the arm exists so that adding a \
@@ -46,18 +36,16 @@
 
 use core::ffi::c_void;
 
-#[path = "../../sdk/abi.rs"]
-mod abi;
 use abi::internal::reconfigure::{OTA_STAGE_CTRL, OTA_STAGE_WRITE};
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../sdk/runtime.rs");
-include!("../../sdk/runtime/params.rs");
-include!("../../sdk/crypto/sha256.rs");
-include!("../../sdk/crypto/sha384.rs");
-include!("../../sdk/crypto/hmac.rs");
-include!("../../sdk/crypto/p256.rs");
-include!("../../sdk/crypto/ed25519.rs");
+use fluxor_rt::*;
+pub use fluxor_sdk::crypto::ed25519::*;
+pub use fluxor_sdk::crypto::hmac::*;
+pub use fluxor_sdk::crypto::p256::*;
+pub use fluxor_sdk::crypto::sha256::*;
+pub use fluxor_sdk::crypto::sha384::*;
 
 use abi::contracts::net::net_proto;
 use net_proto::{
@@ -231,11 +219,11 @@ mod params_def {
     use super::p_u32;
     use super::ptr_copy;
     use super::State;
-    use super::SCHEMA_MAX;
+
     use super::{MAX_AUTHORITY_LEN, MAX_REPO_LEN, MAX_TAG_LEN};
 
     // Tags 1, 2 and 3 are retired; the next allocation is 11.
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         4, repo, str, 0
