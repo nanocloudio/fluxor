@@ -365,13 +365,7 @@ unsafe fn process_samples_16(s: &mut AudioFormatState, in_bytes: usize) -> usize
 // PIC Module Interface
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(AudioFormatState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AudioFormatState>() as u32
-}
+fluxor_rt::module_facts! { state: AudioFormatState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

@@ -44,10 +44,10 @@ mod wasm_syscalls {
 // module-local bump allocator whose backing storage lives in the
 // module's own linear memory, grown via `memory.grow`.
 //
-// The arena is sized from `module_state_size + module_arena_size +
-// slack`. `memory.grow` extends linear memory by enough 64 KiB pages
+// The arena is sized from `MODULE_STATE_BYTES + MODULE_ARENA_BYTES +
+// slack` (`module_facts!`). `memory.grow` extends linear memory by enough 64 KiB pages
 // to cover the budget; the returned page index is the heap base.
-// Modules with `module_arena_size == 0` still get one page so the
+// Modules with no arena still get one page so the
 // state struct and the init-time params blob fit.
 //
 // The allocator is bump-only: free is a no-op, realloc copies. Modules
@@ -73,9 +73,9 @@ static mut WASM_HEAP_USED: usize = 0;
 /// linear memory by enough pages to fit `state_size + arena_size +
 /// slack`; subsequent calls return without touching memory.
 ///
-/// `state_size` and `arena_size` come from the kernel-side wasm shim,
-/// which reads the module's `module_state_size` and (optional)
-/// `module_arena_size` exports before invoking `module_init_wasm`.
+/// `state_size` and `arena_size` come from the module's own
+/// `module_facts!` (`wasm_entry!` passes them), or the kernel's arena
+/// figure for the instance when it has one.
 ///
 /// # Safety
 /// Mutates the `WASM_HEAP_*` statics — single-threaded wasm rules out

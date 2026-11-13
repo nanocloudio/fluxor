@@ -126,13 +126,7 @@ mod params_def {
 // Module ABI
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(UsbMidiHostState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<UsbMidiHostState>() as u32
-}
+fluxor_rt::module_facts! { state: UsbMidiHostState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

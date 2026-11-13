@@ -2,6 +2,7 @@ version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
 
 permissions = ["flash_raw"]
+deferred_ready = true
 
 # Channel-served: FMP-framed requests in, `gs.result` answers out
 # (`contracts/storage/graph_slot.rs`). Its consumers are `ota_ingest` and

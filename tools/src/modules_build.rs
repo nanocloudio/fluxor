@@ -1622,7 +1622,6 @@ fn compile_module_pic(
         .arg(&ld_script)
         .arg("--gc-sections")
         .arg("--no-undefined")
-        .arg("--undefined=module_arena_size")
         // The runtime's ABI attestation: rooting it keeps the runtime's
         // object (its panic handler and intrinsics) in every module.
         .arg("--undefined=FLUXOR_ABI_SURFACE")
@@ -1732,7 +1731,7 @@ impl Refusals {
             why.push(format!(
                 "writable static {} — a module image is read-only and shared by \
                  every instance; keep mutable state in the state block \
-                 (`module_state_size`), and declare read-only tables as a plain \
+                 (sized by `module_facts!`), and declare read-only tables as a plain \
                  `static` or `const` with no interior mutability",
                 self.writable.join(", ")
             ));

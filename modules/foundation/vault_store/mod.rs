@@ -457,13 +457,7 @@ unsafe fn step(s: &mut VaultStoreState) -> i32 {
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<VaultStoreState>()
-}
-
-fluxor_rt::declare_module_state_bytes!(VaultStoreState);
+fluxor_rt::module_facts! { state: VaultStoreState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

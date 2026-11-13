@@ -67,7 +67,6 @@ const FS_FSYNC_NAME: u32 = abi::registry::fs::FSYNC_NAME;
 const FS_LINK: u32 = abi::registry::fs::LINK;
 const FS_RMDIR: u32 = abi::registry::fs::RMDIR;
 const FS_CAPS: u32 = abi::registry::fs::CAPS;
-const CONTRACT_FS: u32 = abi::registry::fs::ID as u32;
 
 // errno
 const EINVAL: i32 = -22;
@@ -649,13 +648,7 @@ unsafe fn mount_dispatch(
 
 // ── Exported PIC module interface ───────────────────────────────────────────
 
-fluxor_rt::declare_module_state_bytes!(MountState);
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<MountState>()
-}
+fluxor_rt::module_facts! { state: MountState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
@@ -741,15 +734,6 @@ unsafe fn emit_telemetry(s: &mut MountState) {
     let counter = abi::contracts::telemetry::METRIC_COUNTER;
     dev_telemetry_metric(sys, -1, me as u16, t, counter, 0, s.ops_routed);
     dev_telemetry_metric(sys, -1, me as u16, t, counter, 1, s.route_misses);
-}
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(
-    not(feature = "host-test"),
-    link_section = ".text.module_provides_contract"
-)]
-pub extern "C" fn module_provides_contract() -> u32 {
-    CONTRACT_FS
 }
 
 /// # Safety

@@ -593,15 +593,13 @@ pub struct SchedulerState {
     /// re-sets the marker before resetting state again).
     pub(crate) prepare_in_progress: bool,
 
-    // ── Per-module export table info (for resolve_export_for_module) ──
+    // ── Per-module code region (for provider pointer validation) ──
     /// Code base address per module (for resolving export offsets)
     pub(crate) module_code_base: ModTable<usize>,
     /// Code size per module (for provider pointer validation)
     pub(crate) module_code_size: ModTable<u32>,
     /// Export table pointer per module
-    pub(crate) module_export_table: ModTable<*const u8>,
     /// Export count per module
-    pub(crate) module_export_count: ModTable<u16>,
 
     // ── Step timing histogram (8 log2 buckets) ─────────────────────
     /// Per-module bucket counts: <64us, <128, <256, <512, <1024, <2048, <4096, >=4096
@@ -689,8 +687,6 @@ impl SchedulerState {
             prepare_in_progress: false,
             module_code_base: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             module_code_size: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
-            module_export_table: crate::boot_table!(MAX_MODULES, core::ptr::null(), MODULE_POOL),
-            module_export_count: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             step_hist: crate::boot_table!(MAX_MODULES, [0; 8], MODULE_POOL),
             step_hist_global: [0; 8],
             owners: OwnerTable::kernel(),
@@ -770,8 +766,6 @@ impl SchedulerState {
         self.pass_module_steps.reserve(ceiling)?;
         self.module_code_base.reserve(ceiling)?;
         self.module_code_size.reserve(ceiling)?;
-        self.module_export_table.reserve(ceiling)?;
-        self.module_export_count.reserve(ceiling)?;
         self.step_hist.reserve(ceiling)?;
         self.module_owner.reserve(ceiling)?;
         for t in self.domain_exec_order.iter() {
@@ -824,8 +818,6 @@ impl SchedulerState {
         m = m.max(self.pass_module_steps.len());
         m = m.max(self.module_code_base.len());
         m = m.max(self.module_code_size.len());
-        m = m.max(self.module_export_table.len());
-        m = m.max(self.module_export_count.len());
         m = m.max(self.step_hist.len());
         m = m.max(self.module_owner.len());
         for t in self.domain_exec_order.iter() {
@@ -876,8 +868,6 @@ impl SchedulerState {
         self.pass_module_steps.grow(n)?;
         self.module_code_base.grow(n)?;
         self.module_code_size.grow(n)?;
-        self.module_export_table.grow(n)?;
-        self.module_export_count.grow(n)?;
         self.step_hist.grow(n)?;
         self.module_owner.grow(n)?;
         for t in self.domain_exec_order.iter() {
@@ -972,8 +962,6 @@ impl SchedulerState {
             self.fault_info[i] = ModuleFaultInfo::new();
             self.module_code_base[i] = 0;
             self.module_code_size[i] = 0;
-            self.module_export_table[i] = core::ptr::null();
-            self.module_export_count[i] = 0;
             self.step_hist[i] = [0; 8];
             self.pre_tick_drain[i] = false;
         }
@@ -1246,7 +1234,7 @@ pub fn clear_instantiation_state() {
 /// late-bound lookup (a registration made from `step_ready`, long after
 /// `module_new`) can't find the state through
 /// `SCHED.modules`. This shadow is set by both paths and read as the
-/// second-choice source in `get_module_state`.
+/// second-choice source for the module's state pointer.
 static mut MODULE_STATE_PTR: [*mut u8; MAX_MODULES] = [core::ptr::null_mut(); MAX_MODULES];
 
 /// Publish a module's state pointer for later syscall lookups. Callable
@@ -1258,29 +1246,6 @@ pub fn set_module_state_ptr(idx: usize, state: *mut u8) {
     // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
         MODULE_STATE_PTR[idx] = state;
-    }
-}
-
-pub fn get_module_state(idx: usize) -> *mut u8 {
-    if idx >= module_slots() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: scheduler-thread-only access; idx bounded; the SCHED.modules
-    // entry / MODULE_STATE_PTR shadow / INSTANTIATION_STATE union covers
-    // every platform's lifecycle stage.
-    unsafe {
-        // During module_new, the module isn't stored in SCHED yet
-        if idx == INSTANTIATION_IDX && !INSTANTIATION_STATE.is_null() {
-            return INSTANTIATION_STATE;
-        }
-        match &SCHED.modules[idx] {
-            ModuleSlot::Dynamic(m) => m.state_ptr(),
-            _ => {
-                // Fall back to the shadow array populated by platforms
-                // that don't store modules in SCHED.modules (bcm2712).
-                MODULE_STATE_PTR[idx]
-            }
-        }
     }
 }
 
@@ -1321,40 +1286,6 @@ pub fn current_module_permissions() -> u16 {
     let idx = current_module_index();
     // SAFETY: scheduler-thread-only read.
     unsafe { SCHED.permissions[idx] }
-}
-
-/// Return the export table info for a module by index.
-/// Used by loader::resolve_export_for_module to resolve export hashes.
-pub fn get_module_exports(idx: usize) -> (usize, *const u8, u16) {
-    if idx >= module_slots() {
-        return (0, core::ptr::null(), 0);
-    }
-    // SAFETY: scheduler-thread-only read; idx bounded.
-    unsafe {
-        (
-            SCHED.module_code_base[idx],
-            SCHED.module_export_table[idx],
-            SCHED.module_export_count[idx],
-        )
-    }
-}
-
-/// Set the export table info for a module (used by Linux platform loader).
-pub fn set_module_exports(
-    idx: usize,
-    code_base: usize,
-    export_table: *const u8,
-    export_count: u16,
-) {
-    if idx >= module_slots() {
-        return;
-    }
-    // SAFETY: scheduler-thread-only mutation; idx bounded.
-    unsafe {
-        SCHED.module_code_base[idx] = code_base;
-        SCHED.module_export_table[idx] = export_table;
-        SCHED.module_export_count[idx] = export_count;
-    }
 }
 
 /// Get the code region (base, size) for a module, used for provider pointer validation.

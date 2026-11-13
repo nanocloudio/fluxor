@@ -79,7 +79,7 @@ mod plan {
         /// built in: the loader holds no manifest for it, so none of its
         /// ports is sized.
         pub ports: Vec<RingPort>,
-        /// It may consume from an aliased mailbox (`module_mailbox_safe`).
+        /// It may consume from an aliased mailbox (`mailbox_safe`).
         pub mailbox_safe: bool,
         /// Its data inputs keep one channel per edge rather than a merge
         /// (a platform registers it; `linux_net` on Linux).

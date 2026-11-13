@@ -226,16 +226,6 @@ extern "C" {
         ret_cap: usize,
     ) -> i32;
 
-    /// Probe whether a module exports a function by name. Returns 1
-    /// if exported, 0 if absent, negative on bad handle. Used to
-    /// check optional exports (e.g. `module_arena_size`) without
-    /// invoking the host's missing-export diagnostic.
-    fn host_module_export_exists(
-        handle: i32,
-        export_name_ptr: *const u8,
-        export_name_len: usize,
-    ) -> i32;
-
     /// Free the module instance identified by `handle`. Subsequent
     /// `host_invoke_module` calls with the same handle return an
     /// error.
@@ -358,10 +348,6 @@ fn init_tick_demo() {
         b"[wasm-kernel] tick demo: 2 builtins (tick_source -> tick_sink)",
     );
 }
-
-/// Bit 5 of the FXMD reserved[0] flags byte = wasm-payload module.
-/// Mirrors `tools/src/modules.rs::pack_fmod_wasm` (sets reserved[0] |= 0x20).
-const FLAG_WASM_PAYLOAD: u8 = 0x20;
 
 use crate::abi::wire::fnv1a32;
 
@@ -518,8 +504,8 @@ unsafe fn load_embedded_modules() -> usize {
         // Each built-in's `alloc_state` calls `(table.heap_alloc)(size)`
         // for its single State struct, routing through
         // `MODULE_HEAPS[module_idx].alloc`. That heap returns null
-        // until initialised; the PIC loader sets it up via
-        // `module_arena_size` for compiled wasm modules, but built-ins
+        // until initialised; the PIC loader sets it up from the manifest's
+        // arena for compiled wasm modules, but built-ins
         // skip the loader. Each branch below sizes a heap to fit its
         // own State struct (plus alignment slack) before calling
         // `build()`.
@@ -1316,7 +1302,7 @@ unsafe fn load_embedded_modules() -> usize {
             }
         };
         let header = &loaded.header;
-        if header.reserved[0] & FLAG_WASM_PAYLOAD == 0 {
+        if header.flags & crate::abi::wire::fmod::header::flag::WASM_PAYLOAD == 0 {
             log_fmt2(
                 3,
                 "[wasm-kernel] module ",
@@ -1358,7 +1344,7 @@ unsafe fn load_embedded_modules() -> usize {
         scheduler::set_module_caps(
             module_idx,
             cap_class,
-            header.required_caps(),
+            header.required_caps,
             loaded.manifest_permissions(),
         );
         scheduler::set_module_type_hash(module_idx, entry.name_hash);
@@ -1425,35 +1411,8 @@ unsafe fn load_embedded_modules() -> usize {
             ctrl_chan as i64 as u64,
         );
 
-        // Read the optional `module_arena_size` export. Modules that
-        // need a non-trivial heap export it from their `mod.rs`;
-        // modules whose state fits inside the State struct skip it.
-        // The export-exists probe stays quiet when the export is
-        // absent.
-        let arena_size: u32 = {
-            let arena_export = b"module_arena_size";
-            let exists =
-                host_module_export_exists(handle, arena_export.as_ptr(), arena_export.len());
-            if exists == 1 {
-                let mut arena_ret = [0u8; 4];
-                let arena_rc = host_invoke_module(
-                    handle,
-                    arena_export.as_ptr(),
-                    arena_export.len(),
-                    core::ptr::null(),
-                    0,
-                    arena_ret.as_mut_ptr(),
-                    arena_ret.len(),
-                );
-                if arena_rc >= 4 {
-                    u32::from_le_bytes(arena_ret)
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        };
+        // The heap arena the module's manifest declares (0 for none).
+        let arena_size = loaded.manifest_arena_bytes() as u32;
 
         // Allocate a per-module kernel-side scratch heap. The wasm
         // host shim routes every PIC syscall that crosses linear-memory

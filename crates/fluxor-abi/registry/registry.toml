@@ -638,6 +638,7 @@ mints = true
 [[contract]]
 name = "gpio"
 id = 0x06
+module_provided = true
 mints = true
 manifest = true
 
@@ -680,6 +681,7 @@ manifest = true
 [[contract]]
 name = "spi"
 id = 0x07
+module_provided = true
 mints = true
 manifest = true
 
@@ -730,6 +732,7 @@ manifest = true
 [[contract]]
 name = "i2c"
 id = 0x08
+module_provided = true
 mints = true
 manifest = true
 
@@ -768,6 +771,7 @@ manifest = true
 [[contract]]
 name = "pio"
 id = 0x09
+module_provided = true
 mints = true
 manifest = true
 
@@ -882,6 +886,7 @@ manifest = true
 [[contract]]
 name = "uart"
 id = 0x0A
+module_provided = true
 mints = true
 manifest = true
 
@@ -912,6 +917,7 @@ manifest = true
 [[contract]]
 name = "adc"
 id = 0x0B
+module_provided = true
 mints = true
 manifest = true
 
@@ -938,6 +944,7 @@ manifest = true
 [[contract]]
 name = "pwm"
 id = 0x0C
+module_provided = true
 mints = true
 manifest = true
 
@@ -964,6 +971,7 @@ manifest = true
 [[contract]]
 name = "fs"
 id = 0x0D
+module_provided = true
 mints = true
 manifest = true
 
@@ -1065,6 +1073,7 @@ manifest = true
 [[contract]]
 name = "storage.namespace"
 id = 0x0E
+module_provided = true
 mints = true
 manifest = true
 
@@ -1115,6 +1124,7 @@ manifest = true
 [[contract]]
 name = "storage.object"
 id = 0x0F
+module_provided = true
 mints = true
 manifest = true
 
@@ -1245,6 +1255,7 @@ route = "class"
 [[contract]]
 name = "runtime_params"
 id = 0x12
+module_provided = true
 unlisted = "platform_raw"
 route = "class"
 
@@ -1820,17 +1831,6 @@ route = "class"
   op = 0x10
 
 [[contract]]
-name = "provider_registry"
-id = 0x24
-permission = "flash_raw"
-unlisted = "platform_raw"
-route = "class"
-
-  [[contract.op]]
-  name = "FLASH_STORE_ENABLE"
-  op = 0x37
-
-[[contract]]
 name = "diag"
 id = 0x25
 permission = "platform_raw"
@@ -2044,7 +2044,7 @@ route = "class"
 
 [[contract]]
 name = "metal_device"
-id = 0x28
+id = 0x24
 manifest = true
 permission = "platform_raw"
 unlisted = "platform_raw"
@@ -2659,3 +2659,45 @@ members = ["net_proto", "datagram", "packet", "session_ctrl", "identity", "peer_
   surface = "mux"
   name = "MSG_MUX_STREAM_ERROR"
   value = 0xCF
+
+# Module entry points: the functions the kernel calls in a module, found by
+# the FNV-1a hash of their names in the `.fmod` export table. A module exports
+# these and nothing else; every static fact about it is in its manifest.
+
+[[entry_point]]
+name = "module_init"
+doc = "Once per module type, before any instance: the syscall table."
+
+[[entry_point]]
+name = "module_new"
+required = true
+doc = "Initialise one instance's state from its ports and params."
+
+[[entry_point]]
+name = "module_step"
+required = true
+doc = "One step of an instance; answers a step return."
+
+[[entry_point]]
+name = "module_pipeline_refill"
+doc = "Refill a pipelined instance's input between steps."
+
+[[entry_point]]
+name = "module_post_tick_flush"
+doc = "Flush an instance's output after every module has stepped."
+
+[[entry_point]]
+name = "module_drain"
+doc = "Drain an instance before a live reconfiguration removes it."
+
+[[entry_point]]
+name = "module_isr_entry"
+doc = "The interrupt-tier entry of an ISR module."
+
+[[entry_point]]
+name = "module_provider_dispatch"
+doc = "Serve one call on a contract the manifest says the module provides."
+
+[[entry_point]]
+name = "module_provider_selector"
+doc = "The selector an instance-keyed provider registers under, from its config."

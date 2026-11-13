@@ -92,7 +92,7 @@ artefact in both.
 
 Foundation modules define clear behaviour for:
 
-- initialisation readiness (export `module_deferred_ready` if
+- initialisation readiness (`deferred_ready = true` in the manifest if
   downstream consumers must wait)
 - transient upstream/downstream failure
 - reset/reconfigure handling (export `module_drain` if in-flight work

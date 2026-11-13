@@ -226,7 +226,9 @@ Modules are isolated runtime units with a stable kernel boundary.
 
 Each dynamic module follows this lifecycle:
 
-1. `module_state_size()` declares state memory requirements.
+1. The manifest states the instance's footprint (`module_facts!` at the
+   crate root; the packer writes it into the signed manifest), so the loader
+   reserves state without running module code.
 2. `module_init(syscalls)` receives the syscall table.
 3. `module_new(...)` binds channels, parses params, and initialises module state.
 4. `module_step(state)` advances the state machine cooperatively.
@@ -241,16 +243,21 @@ The runtime loader enforces a concrete module binary contract:
 
 - Table magic: `FXMT`; module magic: `FXMD`
 - Module ABI version must match loader expectation
-- Required exports are FNV-1a hash resolved: `module_state_size`,
-  `module_init`, `module_new`, `module_step`
-- Optional exports: `module_arena_size`,
-  `module_drain`, `module_deferred_ready`, `module_mailbox_safe`,
-  `module_in_place_safe`, `module_pipeline_refill`,
-  `module_post_tick_flush`, `module_isr_init` / `module_isr_entry`,
-  and the provider-contract exports (`module_provider_dispatch`,
-  `module_provides_contract`, `module_provider_selector`)
-- The header carries schema/manifest section sizes, capability flag
-  byte (`reserved[0]`), and required capability bits
+- Exports are entry points only, the registry's `entry_point` list,
+  resolved by FNV-1a hash: `module_new` and `module_step` (required),
+  `module_init`, `module_pipeline_refill`, `module_post_tick_flush`,
+  `module_drain`, `module_isr_entry`, `module_provider_dispatch` and
+  `module_provider_selector`. `module.ld` keeps exactly these.
+- Every static fact is in the signed manifest, never asked of the module:
+  state, stack and arena bytes (`module_facts!`), the contracts it provides
+  (`provider_contracts`), and the facts carried as header flag bits
+  (`mailbox_safe`, `in_place_writer`, `deferred_ready`,
+  `observes_owner_release`, `samples_pool`, plus `DRAIN` / `ISR` for the
+  entry points it defines). A module whose manifest states no state size is
+  refused at load.
+- The header (`abi::wire::fmod::header`, named fields) carries schema and
+  manifest section sizes, the flag byte, the step period and phase, and the
+  required capability bits
 - Parameter schema and manifest payloads are embedded in the `.fmod` image
 - The manifest section (`FXMF`) carries a SHA-256 integrity hash over
   code+data, an Ed25519 signature over that hash, and the signer's
@@ -312,8 +319,8 @@ returning the literal from it.
 with interior mutability (`AtomicU32`, `Cell`, `UnsafeCell`), and a
 zero-initialised one (`.bss`, which the module linker script discards) have
 nowhere to live: the image is read-only and one copy serves every instance.
-Mutable state goes in the state block the kernel allocates from
-`module_state_size()` and hands to every entry point.
+Mutable state goes in the state block the kernel allocates from the
+manifest's state size (`module_facts!`) and hands to every entry point.
 
 `fluxor modules build` enforces all of this, in a lenient build as in a
 strict one (each is an artefact that reads a wrong address, not a style
@@ -447,7 +454,10 @@ needs — a provider it calls that calls back, inline assembly that moves the
 stack pointer — the module declares it:
 
 ```rust
-declare_module_stack_bytes!(if cfg!(fluxor_abi = "aarch64") { 16 * 1024 } else { 5 * 1024 });
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    stack: if cfg!(fluxor_abi = "aarch64") { 16 * 1024 } else { 5 * 1024 },
+}
 ```
 
 A declaration is a floor: the manifest records the larger of it and the
@@ -492,7 +502,8 @@ use fluxor_sdk::crypto::sha256::*; // only what the module calls
 - `fluxor_rt` is the module runtime: the syscall wrappers, the PIC compiler
   intrinsics, the panic handler, and the macros a module invokes by path —
   `fluxor_rt::define_params!` (parameter schema and TLV reader),
-  `fluxor_rt::name_table!`, `fluxor_rt::declare_module_state_bytes!` and
+  `fluxor_rt::name_table!`, `fluxor_rt::module_facts!` (the module's
+  state, arena and stack, which the packer writes into the manifest) and
   `fluxor_rt::wasm_entry!()` (the wasm entry glue, at the end of the root).
 - `fluxor_sdk` is library code: crypto, DNSSEC validation, the GPU device
   model and the cores more than one module runs.
@@ -586,8 +597,8 @@ nothing else of the section.
 `Burst` is a scheduling hint, not a licence for unbounded work. Each step
 call remains bounded and non-blocking.
 
-`Ready` participates in the deferred-ready chain. A module that exports
-`module_deferred_ready` (header flag bit 2) gates its downstream consumers
+`Ready` participates in the deferred-ready chain. A module whose manifest
+says `deferred_ready = true` (header flag bit 2) gates its downstream consumers
 until it returns `Ready` from a step. This is how drivers like cyw43 and
 the IP module signal "I am initialised" without the kernel needing to
 know what initialisation means for any specific device. A module that
@@ -762,7 +773,7 @@ channels, and the runner steps all modules each iteration.
 +-------------------------------------------------------------+
 |                      LOADER                                  |
 |  PIC modules loaded from flash -> DynamicModule wrapper      |
-|  module_state_size() -> module_init() -> module_new()         |
+|  manifest facts -> module_init() -> module_new()              |
 |  State in kernel RAM, code executes from flash (XIP)        |
 +-------------------------------------------------------------+
 |                      RUNNER                                  |

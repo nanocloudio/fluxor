@@ -69,7 +69,7 @@ pub unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
     )
 }
 
-/// Get this module's arena allocation (from module_arena_size export).
+/// Get this module's arena allocation (sized by the manifest's arena).
 /// Returns (ptr, size). ptr is null and size is 0 if no arena was allocated.
 #[inline(always)]
 pub unsafe fn dev_arena_get(sys: &SyscallTable) -> (*mut u8, u32) {

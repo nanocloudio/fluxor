@@ -10,10 +10,12 @@ timer_class = "wall_clock"
 # which this module does not implement — so only `file.data` is declared.
 # Free-form provider capability string; tools-only, never serialized.
 provides = ["file.data"]
+provider_contracts = ["fs"]
+observes_owner_release = true
 
 # FAT32 filesystem provider. Every operation goes through the FS
 # contract (`provider_call(-1, FS_OPEN, …)`); the kernel routes the
-# dispatch here via `module_provides_contract = FS`. Reads and writes
+# dispatch here via `provider_contracts = ["fs"]`. Reads and writes
 # both use the block source's synchronous ioctls on the `blocks` port,
 # so the module owns no outbound block channel of its own.
 

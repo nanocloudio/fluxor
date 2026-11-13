@@ -187,7 +187,7 @@ struct EnaState {
     tx_malformed: u32,
 }
 
-fluxor_rt::declare_module_state_bytes!(EnaState);
+fluxor_rt::module_facts! { state: EnaState }
 
 fn sys(s: &EnaState) -> &'static SyscallTable {
     // SAFETY: set in `module_new`; the table outlives every module.
@@ -915,18 +915,6 @@ unsafe fn step_setup(s: &mut EnaState) {
         }
         _ => {}
     }
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<EnaState>()
 }
 
 /// # Safety

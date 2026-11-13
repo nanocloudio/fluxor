@@ -471,11 +471,7 @@ unsafe fn service_ctl(s: &mut AgentState) {
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AgentState>() as u32
-}
+fluxor_rt::module_facts! { state: AgentState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

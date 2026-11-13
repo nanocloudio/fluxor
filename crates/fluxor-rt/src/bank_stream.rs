@@ -588,13 +588,7 @@ macro_rules! bank_stream {
         // Module API
         // ============================================================================
 
-        $crate::declare_module_state_bytes!(BankState);
-
-        #[cfg_attr(not(feature = "host-test"), no_mangle)]
-        #[link_section = ".text.module_state_size"]
-        pub extern "C" fn module_state_size() -> u32 {
-            core::mem::size_of::<BankState>() as u32
-        }
+        $crate::module_facts! { state: BankState }
 
         #[cfg_attr(not(feature = "host-test"), no_mangle)]
         #[link_section = ".text.module_init"]

@@ -6,6 +6,7 @@ version = "1.0.0"
 timer_class = "tick_counted"
 hardware_targets = ["rp2350", "rp2040", "bcm2712"]
 permissions = ["reconfigure", "monitor"]
+deferred_ready = true
 
 [[ports]]
 name = "trigger"

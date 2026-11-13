@@ -76,10 +76,9 @@ struct IsoProbeState {
     window_size: u32,
 }
 
-fluxor_rt::declare_module_state_bytes!(IsoProbeState);
+fluxor_rt::module_facts! { state: IsoProbeState, stack: 512 }
 // The recursion in `overflow` has no bound the build can measure; this is
 // the stack every other mode needs, which `overflow` then runs past.
-fluxor_rt::declare_module_stack_bytes!(512);
 
 const SENTINEL_MAGIC: u32 = 0x5130_B0E0; // "iso probe"
 
@@ -111,12 +110,6 @@ mod params_def {
 // ============================================================================
 // Exported functions
 // ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<IsoProbeState>() as u32
-}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

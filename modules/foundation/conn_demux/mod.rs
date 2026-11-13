@@ -90,8 +90,6 @@ pub struct ConnDemuxState {
     frame_buf: [u8; HDR + MAX_PAYLOAD],
 }
 
-const STATE_SIZE: usize = core::mem::size_of::<ConnDemuxState>();
-
 /// Map a connection id to a lane index in `0..lane_count`. FNV-style mix so
 /// adjacent conn_ids spread across lanes; modulo over the (static) lane
 /// count gives a fixed assignment for the life of the graph.
@@ -149,19 +147,7 @@ unsafe fn flush_pending(s: &mut ConnDemuxState, sys: &SyscallTable) {
     }
 }
 
-fluxor_rt::declare_module_state_bytes!(ConnDemuxState);
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    STATE_SIZE
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    0
-}
+fluxor_rt::module_facts! { state: ConnDemuxState, arena: 0 }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

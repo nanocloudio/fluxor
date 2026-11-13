@@ -545,50 +545,37 @@ mints handles, their fd tag; ids are dense from `0x00`.
 
 ## Provider registration
 
-PIC provider modules (the HAL and FS providers above) export two
-well-known functions:
+A PIC provider module (the HAL and FS providers above) says so in its
+manifest and serves the contracts through one entry point:
+
+```toml
+# manifest.toml
+provider_contracts = ["pwm"]
+```
 
 ```rust
-#[no_mangle]
-#[link_section = ".text.module_provides_contract"]
-pub extern "C" fn module_provides_contract() -> u32 {
-    abi::registry::pwm::ID as u32 // the contract id this module provides
-}
-
-#[no_mangle]
-#[link_section = ".text.module_provider_dispatch"]
-pub unsafe extern "C" fn module_provider_dispatch(
+#[cfg_attr(not(feature = "host-test"), export_name = "module_provider_dispatch")]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_dispatch")]
+pub unsafe extern "C" fn pwm_dispatch(
     state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize,
 ) -> i32 { /* ... */ }
 ```
 
-The loader resolves both after `module_new()` succeeds and calls
-`provider::register_module_provider()`. There is no runtime
-registration syscall — a module that doesn't export these is not a
-provider. The loader's registration is whitelisted to the HAL
-contracts, FS, and the storage namespace/object contracts
-(`is_module_providable` in `src/kernel/module/provider.rs`); other
-contract ids are rejected.
+The packer writes the contracts into the signed manifest (its provides
+block, at most four), and refuses a module that names contracts without
+defining `module_provider_dispatch`, or defines it without naming any.
+After `module_new()` returns Ready the loader registers the module for each
+listed contract with the same dispatch, state and selector; the dispatch
+tells them apart by the opcode's class byte. There is no runtime
+registration syscall and no export to ask: a module whose manifest names
+none is not a provider. Only contracts the registry marks
+`module_provided` may be named (`abi::registry::module_providable`): the
+HAL contracts, FS, the storage namespace/object contracts and the runtime
+parameter store. The packer and the kernel both refuse any other.
 
-A provider whose one state serves several contracts — a store that owns
-its objects and their namespace — exports `module_provides_contracts`
-instead:
-
-```rust
-#[no_mangle]
-#[link_section = ".text.module_provides_contracts"]
-pub unsafe extern "C" fn module_provides_contracts(
-    state: *mut u8, out: *mut u16, cap: u32,
-) -> u32 {
-    /* write each contract id to out[..], answer how many — none when this
-       instance's config says it provides nothing */
-}
-```
-
-The loader calls it after `module_new()`, with the module's state, and
-registers each listed contract (at most four) with the same dispatch,
-state and selector; the dispatch tells them apart by the opcode's class
-byte. When both exports are present, the list wins.
+An instance-keyed provider (a fat32 with a `volume:` param) also defines
+`module_provider_selector(state) -> u32`, the selector it registers under,
+computed from its own config.
 
 ## Capabilities
 

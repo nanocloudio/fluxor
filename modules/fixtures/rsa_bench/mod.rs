@@ -377,13 +377,7 @@ unsafe fn advance(s: &mut BenchState) -> bool {
     }
 }
 
-fluxor_rt::declare_module_state_bytes!(BenchState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<BenchState>() as u32
-}
+fluxor_rt::module_facts! { state: BenchState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

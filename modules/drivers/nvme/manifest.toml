@@ -9,6 +9,7 @@ timer_class = "wall_clock"
 # I/O at the namespace's logical block size (512 B to 4 KiB). Free-form
 # provider capability string; tools-only, never serialized to the .fmod.
 provides = ["storage.block"]
+deferred_ready = true
 
 # Bind the NVMe controller via the PCIE_DEVICE contract. The driver
 # supplies a selector (alias string or `@class=nvme`) at module_new

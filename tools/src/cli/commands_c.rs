@@ -1618,12 +1618,13 @@ fn cmd_sign(
     }
 
     // Locate the manifest section from the module header.
-    let code_size = u32::from_le_bytes([fmod[8], fmod[9], fmod[10], fmod[11]]) as usize;
-    let data_size = u32::from_le_bytes([fmod[12], fmod[13], fmod[14], fmod[15]]) as usize;
-    let export_count = u16::from_le_bytes([fmod[24], fmod[25]]) as usize;
-    let export_table_size = export_count * 8;
-    let schema_size = u16::from_le_bytes([fmod[62], fmod[63]]) as usize;
-    let manifest_size = u16::from_le_bytes([fmod[64], fmod[65]]) as usize;
+    let h = fluxor_abi::wire::fmod::header::Header::read(&fmod)
+        .ok_or_else(|| Error::Module("fmod file too small".into()))?;
+    let code_size = h.code_size as usize;
+    let data_size = h.data_size as usize;
+    let export_table_size = h.export_count as usize * 8;
+    let schema_size = h.schema_size as usize;
+    let manifest_size = h.manifest_size as usize;
 
     let manifest_offset =
         MODULE_HEADER_SIZE + code_size + data_size + export_table_size + schema_size;
@@ -1677,8 +1678,8 @@ fn cmd_sign(
     out_bytes.extend_from_slice(&new_manifest_bytes);
 
     let manifest_size_le = (new_manifest_size as u16).to_le_bytes();
-    out_bytes[64] = manifest_size_le[0];
-    out_bytes[65] = manifest_size_le[1];
+    let at = fluxor_abi::wire::fmod::HEADER_MANIFEST_SIZE_AT;
+    out_bytes[at..at + 2].copy_from_slice(&manifest_size_le);
 
     let out_path = output.unwrap_or(input.as_path());
     fs::write(out_path, &out_bytes)

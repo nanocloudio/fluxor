@@ -74,7 +74,7 @@ struct GraphFacts {
 /// manifests. Returns `(bytes, modules_without_a_figure)`.
 ///
 /// The per-module figure is recorded at pack time from the SDK's
-/// `declare_module_state_bytes!` static, in 64-byte units, so it is a
+/// `module_facts!` static, in 64-byte units, so it is a
 /// measurement of the built artefact rather than an author's estimate. A module
 /// with no figure contributes nothing and is COUNTED, so a partial sum is never
 /// presented as a total.
@@ -301,7 +301,7 @@ pub fn emit_bundle(
         std::fs::write(target_dir.join("graph.yaml"), &graph_bytes)?;
 
         // State arena demand, derived from the modules the graph names: each
-        // `.fmod` records its own resident state (`declare_module_state_bytes!`,
+        // `.fmod` records its own resident state (`module_facts!`,
         // read at pack time), so the sum is the footprint the kernel will
         // carve and the composer charges against `NodeCapacity.state_bytes`.
         // An explicit `[resources] state_bytes` overrides the measurement, for

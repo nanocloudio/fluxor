@@ -149,12 +149,11 @@ pub use super::super::registry::resource::ELASTIC_ALLOC;
 // in-use figure from that provider, and the provider tells it of each
 // refusal, so the pool's `POOL` record reads the same whoever serves it.
 //
-// A provider opts in by exporting the marker
+// A provider opts in with a manifest fact,
 //
-//   #[no_mangle] #[link_section = ".text.module_samples_pool"]
-//   pub extern "C" fn module_samples_pool() -> u32 { 1 }
+//   samples_pool = true
 //
-// beside `module_provider_dispatch`. The loader reads it after the
+// beside its `provider_contracts`. The loader reads it after the
 // provider's registration succeeds; a module that registers no contract is
 // refused, and one without the marker is never called with `POOL_SAMPLE`.
 

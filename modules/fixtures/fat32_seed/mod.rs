@@ -191,13 +191,7 @@ unsafe fn fail(s: &mut SeedState, rc: i32) -> i32 {
     0
 }
 
-fluxor_rt::declare_module_state_bytes!(SeedState);
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<SeedState>()
-}
+fluxor_rt::module_facts! { state: SeedState }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

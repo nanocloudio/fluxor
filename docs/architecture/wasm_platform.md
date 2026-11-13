@@ -103,9 +103,10 @@ wasm32 module bytes for that module.
 A module's wasm32 code exposes wasm-specific entry points that the
 kernel invokes by export name through the host (§6):
 `module_init_wasm` (no-arg init, replacing the pointer-argument native
-entry), `module_step_wasm` (no-arg step), and the optional
-`module_arena_size` probe. The kernel probes optional exports with
-`host_module_export_exists` before invoking them.
+entry) and `module_step_wasm` (no-arg step). The module sizes its own
+state and heap from the `MODULE_STATE_BYTES` and `MODULE_ARENA_BYTES` its
+`module_facts!` defines, as a wasm payload carries no symbols for the
+packer to read.
 
 A module's wasm32 code does not contain its `.fmod` parameters or
 manifest hash — those live in the envelope's `params_tlv` and

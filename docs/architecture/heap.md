@@ -127,15 +127,11 @@ The owner of a workload module is charged its heap's **cap** against its
 
 ## Declaring Heap Needs
 
-Modules that need heap declare it in their manifest
-(`declare_module_arena_bytes!`) or export `module_arena_size() -> u32`:
+Modules that need heap state it among their facts, which the packer writes
+into the signed manifest:
 
 ```rust
-#[no_mangle]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    4096 // request 4 KB heap
-}
+fluxor_rt::module_facts! { state: ModuleState, arena: 4096 } // a 4 KB heap
 ```
 
 That figure is the module TYPE's default cap. Modules without it receive no
@@ -172,7 +168,7 @@ heap_from_params = { tags = [2, 11], base = { default = 65536, thumbv6m = 8192 }
 | Field | Meaning |
 |---|---|
 | `tags` | params tags whose value bytes count; every chunk of a chunked param counts |
-| `base` | the type's default cap (`module_arena_size()`), per ABI like any capacity |
+| `base` | the type's default cap (`module_facts!`'s `arena:`), per ABI like any capacity |
 | `included` | the counted bytes `base` already holds (default 0) |
 
 Packing an instance, the composer totals the value bytes under `tags` in the
@@ -186,7 +182,7 @@ are sized the same way.
 
 `base` is a copy of a figure the module computes, so it is checked rather
 than trusted: a module with the rule must declare its arena
-(`declare_module_arena_bytes!`), and `pack` refuses a build whose declared
+(`module_facts!`'s `arena:`), and `pack` refuses a build whose declared
 arena differs from `base` resolved for that build's ABI and variant, naming
 the figure to write.
 
@@ -387,8 +383,8 @@ arena: `heap=<committed>/<caps> heaps=<n>`.
 
 ## Config Behaviour Keys
 
-The heap's cap comes from the module type (manifest or
-`module_arena_size()` export) or the instance's `heap.arena_bytes`. A
+The heap's cap comes from the module type (its manifest's arena) or the
+instance's `heap.arena_bytes`. A
 module's YAML entry can tune heap behaviour through the optional `heap:`
 subtree, validated in `tools/src/config/builder.rs`:
 
@@ -439,7 +435,7 @@ the heaps commit has to fit, and a heap that cannot grow fails loudly.
 
 ## Checklist for Heap-Using Modules
 
-- [ ] Does the module export `module_arena_size()` with a non-zero value?
+- [ ] Does the module's `module_facts!` state a non-zero `arena:`?
 - [ ] Does `module_new()` call `heap_alloc()` and check for null?
 - [ ] Is heap allocation confined to setup paths?
 - [ ] Is the heap budget documented and validated against the target?

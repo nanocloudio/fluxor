@@ -21,7 +21,7 @@
 //! the store's subscriptions, under a module `storage.namespace` provider) is
 //! sampled from its owner like any other pool, and its owner is the
 //! provider. [`emit_all`] asks it
-//! (`resource::POOL_SAMPLE`, to a provider exporting `module_samples_pool`)
+//! (`resource::POOL_SAMPLE`, to a provider whose manifest says `samples_pool = true`)
 //! and keeps the answer as the pool's in-use figure until the next round, so
 //! a [`deny`] or [`stats`] between rounds reports it without calling into
 //! module code. The provider counts its refusals through

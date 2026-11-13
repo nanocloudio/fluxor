@@ -491,7 +491,7 @@ pub fn free_module_state(module_idx: usize) {
     #[cfg(not(feature = "kernel-mpu"))]
     let private: Option<(*mut u8, usize)> = None;
 
-    // The heap arena (from the module_arena_size export, if any) and the
+    // The heap arena (from the manifest, if any) and the
     // state buffer, which lives inside the DynamicModule.
     let arena = core::mem::replace(&mut sched.arenas[module_idx], ArenaInfo::empty());
     let state = match core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty) {
@@ -542,6 +542,4 @@ pub fn free_module_state(module_idx: usize) {
     sched.step_counter[module_idx] = 0;
     sched.module_code_base[module_idx] = 0;
     sched.module_code_size[module_idx] = 0;
-    sched.module_export_table[module_idx] = core::ptr::null();
-    sched.module_export_count[module_idx] = 0;
 }

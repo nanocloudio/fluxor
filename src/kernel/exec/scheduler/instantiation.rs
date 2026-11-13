@@ -195,13 +195,15 @@ pub(crate) fn collect_one_module_hints(
 
     // Extract mailbox_safe / in_place_writer flags early so open_channels
     // can use them for buffer-group aliasing decisions.
-    let flags_byte = loaded.header.reserved[0];
+    let flags_byte = loaded.header.flags;
     // SAFETY: graph-mutation context — single mutator of SCHED.
     unsafe {
         let p = &raw mut SCHED;
         let sched = &mut *p;
-        sched.mailbox_safe[module_idx] = (flags_byte & 0x01) != 0;
-        sched.in_place_writer[module_idx] = (flags_byte & 0x02) != 0;
+        sched.mailbox_safe[module_idx] =
+            (flags_byte & crate::abi::wire::fmod::header::flag::MAILBOX_SAFE) != 0;
+        sched.in_place_writer[module_idx] =
+            (flags_byte & crate::abi::wire::fmod::header::flag::IN_PLACE_WRITER) != 0;
         sched.port_caps[module_idx] = loaded.port_capacities();
     }
 }

@@ -1530,7 +1530,7 @@ pub fn set_module_quarantine_partner(module_idx: usize, partner: ModuleId) {
 /// `period - phase` ticks rather than `period`. Lets graph authors
 /// stagger coarse-period modules so they don't all fire on the same
 /// tick (convoy mitigation). Mirrors what `instantiate_one_module`
-/// does from the manifest's `ModuleHeader::step_phase()` byte.
+/// does from the manifest's `ModuleHeader::step_phase` byte.
 pub fn set_module_step_phase(module_idx: usize, phase: u8) {
     if module_idx >= module_slots() {
         return;

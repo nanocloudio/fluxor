@@ -493,9 +493,7 @@ Tier 2 (IRQ-owned) admission and dispatch:
   plus WFI, with dispatch driven entirely by the hardware IRQ.
 - Tier 2 module state is built through the normal cooperative
   `module_new` at instantiation time (non-ISR context), the same
-  construction path Tier 1b uses. `module_isr_init` is a reserved
-  ABI symbol: the packer detects it and the loader defines its
-  type, but nothing calls it. Status: design target, not wired.
+  construction path Tier 1b uses. There is no ISR init entry point.
 
 Tier 1c pre-pass dispatch:
 

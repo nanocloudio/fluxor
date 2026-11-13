@@ -4,6 +4,7 @@ permissions = ["platform_raw"]
 # DSI/PIO panel scanout: paced sink, owns the display refresh timeline so
 # it qualifies as a `presentation.clock` for solo display groups.
 capabilities = ["video.raster", "video.scanout", "display.scanout", "presentation.clock"]
+deferred_ready = true
 
 [[ports]]
 name = "pixels"

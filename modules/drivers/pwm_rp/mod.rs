@@ -57,9 +57,6 @@ const REG_CTR: u8 = 2;
 const REG_CC: u8 = 3;
 const REG_TOP: u8 = 4;
 
-// Contract id (HAL_PWM).
-const HAL_PWM_CONTRACT: u32 = abi::registry::pwm::ID as u32;
-
 // ============================================================================
 // State
 // ============================================================================
@@ -164,7 +161,7 @@ unsafe fn get_slot_mut(s: &mut PwmState, handle: i32) -> *mut PwmSlot {
 /// module's `module_new` initialised, and `arg` points to `arg_len` bytes
 /// (may be null when `arg_len` is 0) valid for the call.
 #[export_name = "module_provider_dispatch"]
-#[link_section = ".text.pwm_provider_dispatch"]
+#[link_section = ".text.module_provider_dispatch"]
 pub unsafe extern "C" fn pwm_provider_dispatch(
     state: *mut u8,
     handle: i32,
@@ -371,13 +368,7 @@ pub unsafe extern "C" fn pwm_provider_dispatch(
 // Module API
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(PwmState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<PwmState>() as u32
-}
+fluxor_rt::module_facts! { state: PwmState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -427,7 +418,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // Signal ready (once). Provider registration is handled by the
-        // loader via `module_provides_contract` — no runtime syscall.
+        // loader from the manifest's `provider_contracts` — no runtime syscall.
         if !s.signaled_ready {
             s.signaled_ready = true;
             return 3; // StepOutcome::Ready
@@ -437,21 +428,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_provides_contract"]
-pub extern "C" fn module_provides_contract() -> u32 {
-    HAL_PWM_CONTRACT
-}
-
 // ============================================================================
 // Deferred ready — gates downstream until first step signals Ready
 // ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> i32 {
-    1
-}
 
 // ============================================================================
 // Panic Handler

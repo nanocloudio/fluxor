@@ -13,7 +13,7 @@
 //! - `in[0]`: TX packets from upstream
 //! - `out[0]`: RX packets to downstream
 //!
-//! Exports `module_deferred_ready` — gates downstream until link up.
+//! Declares `deferred_ready` — gates downstream until link up.
 
 #![no_std]
 #![allow(
@@ -52,8 +52,6 @@ const RX_DESC_COUNT: u16 = 128;
 const TX_DESC_COUNT: u16 = 128;
 const BUF_SIZE: u16 = 2048;
 const BUF_COUNT: u16 = 256;
-
-const STATE_SIZE: usize = 256;
 
 const DEFAULT_MAC: [u8; 6] = [0x02, 0xE8, 0x10, 0x00, 0x00, 0x01];
 
@@ -226,17 +224,7 @@ unsafe fn poll_tx(s: &mut E810State) {
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    STATE_SIZE
-}
+fluxor_rt::module_facts! { state: E810State }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

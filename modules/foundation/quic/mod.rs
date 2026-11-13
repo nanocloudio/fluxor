@@ -795,19 +795,7 @@ fn authority_of(s: &QuicState) -> &[u8] {
     &s.authority[..s.authority_len as usize]
 }
 
-fluxor_rt::declare_module_state_bytes!(QuicState);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<QuicState>() as u32
-}
-
-fluxor_rt::declare_module_arena_bytes!(65536);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-pub extern "C" fn module_arena_size() -> u32 {
-    65536
-}
+fluxor_rt::module_facts! { state: QuicState, arena: 65536 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_init(_syscalls: *const core::ffi::c_void) {}

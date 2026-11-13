@@ -140,7 +140,7 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | decision-seam hold (`pkt_id` slot) | `PKT_SLOT_BITS` (8) | 256 | `MAX_PACKET_HOLD` | crates/fluxor-abi/src/config.rs | 32 | The DEFAULT of `ip`'s declared capacity `packet_holds` (8 on wasm, 4 on embedded): a graph declares more, up to the 256 slots a `pkt_id` names (refused at construction past it), held in `ip`'s heap at one full frame a slot. An arrival with every slot taken is refused and counted (`hold_refused`), never displaces a held packet |
 | workload lane (`ip` provider, `workload::NET_PROVIDE`) | u8 | 255 | `LANE_CEILING` | src/kernel/workload/net_attach.rs | 255 | The provider states its lane capacity when it claims the role (`ip` param `lanes`), and the kernel sizes its lane tables to it — carved on bcm2712 and uefi, allocated on Linux — keeping `max(previous, stated)` across rebuilds; an attach past it is `ENOSPC`. The `u8` lane id is the ceiling; the static profiles (wasm, RP) hold `STATIC_LANES` |
 | contract class (`required_caps` bitmask, fmod header) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the header's `required_caps`. Registration past the ceiling is refused EINVAL, and a dispatch id at or past it is refused ENOSYS by `check_contract_grant` before either capability gate |
-| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | crates/fluxor-abi/src/registry.rs | 41 | Generated from `crates/fluxor-abi/registry/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the header's `required_caps` and of the kernel's vtable registry; the generator refuses an id at or past it |
+| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | crates/fluxor-abi/src/registry.rs | 40 | Generated from `crates/fluxor-abi/registry/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the header's `required_caps` and of the kernel's vtable registry; the generator refuses an id at or past it |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
 | module index (`ModuleId`: exec order, owners, fault ids, wire fields) | u16 | 65535 | `MAX_MODULES` | src/kernel/config.rs | 4096 | `0xFFFF` is `NO_MODULE`, the no-owner sentinel. On Linux this is the module-index DOMAIN, format-bound: the config blob carries a module id in 12 bits (low byte plus four spare bits of entry byte 9) and a `ModuleMask` holds one bit per index, while the scheduler's per-module tables are sized at boot from the graph — its modules, fans and resident workloads plus the `module_slots` reserve (`resource_ledger::plan`) — and grown a segment at a time by live adds; a plan past the domain is refused at boot naming `module_slots`. On bcm2712, uefi and RP the same domain, with the tables sized from the plan within it (1024 on bcm2712 and uefi, carved from the DRAM zone the machine describes; 32 on RP, from the kernel's static pool); on wasm, the static table, 48. The telemetry ring holds one PSTATUS round of it. Kernel capacity, not ABI: modules read the live slot count at runtime (`internal::reconfigure::SLOT_CAPACITY`). Asserts: `src/kernel/boot/config.rs` and `src/kernel/config.rs` (fits the blob's 12 bits), `src/kernel/exec/scheduler/mod.rs` (below the sentinel) |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | — | Derived, not chosen: one slot per channel (`MAX_CHANNELS`), so the two cannot drift. `ChannelSlot.buffer_slot` holds a single id and every allocation takes its owning channel, so a slot past the channel table is unreachable and a pool short of it leaves the table's upper range unallocatable — `channel_open` refusing while slots are free. The buffer arena binds first by orders of magnitude |
@@ -466,7 +466,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | uefi secondary cores | `MAX_SECONDARIES` | src/platform/uefi/smp.rs | 3 | Policy: cores the uefi kernel wakes beside the boot core, one per execution domain past domain 0 (`MAX_DOMAINS` is 4); a machine with more runs the rest idle |
 | uefi secondary-core stack | `STACK_BYTES` | src/platform/uefi/smp.rs | 1048576 | Policy: each uefi secondary core's kernel stack, matching the boot core's `kernel_stack_kb`, since modules step on it |
 | Provider vtables | `MAX_PROVIDERS` | src/kernel/module/provider.rs | 64 | Derived, not chosen: one vtable slot per contract id, so a contract registerable in one and not the other is impossible by construction |
-| Contracts per provider module | `MAX_CONTRACTS_PER_PROVIDER` | src/kernel/module/loader.rs | 4 | Policy: the contracts one provider state may serve through `module_provides_contracts` (a store owning its objects and their namespace needs two); entries past it are not registered |
+| Contracts per provider module | `MAX_PROVIDES` | crates/fluxor-abi/src/wire/fmod.rs | 4 | Policy: the contracts one module's manifest may name in `provider_contracts`, all served by one provider state through one dispatch (a store owning its objects and their namespace needs two); the packer refuses more, and the loader refuses a manifest naming more |
 | Key material per vault slot | `MAX_KEY_BYTES` | src/kernel/security/key_vault.rs | 64 | Policy: a P-256 scalar is 32; the doubled width admits larger keying material without a header change |
 | Vault label | `MAX_LABEL` | src/kernel/security/key_vault.rs | 64 | Policy, wire-visible: the label is how a module names a key; the contract's `MAX_LABEL` mirrors it |
 | Persisted vault keys | `MAX_PERSISTED` | src/kernel/security/key_vault.rs | — | Policy, per-profile (64 aarch64 / 8 elsewhere), like the slot table: a Pi-class node persists a master per replication group, replica and key epoch, per locally encrypted volume, and its identities. With none free, persisting is refused and the consumer refuses its operation rather than holding an unpersisted key |
@@ -636,7 +636,7 @@ MAX_ADD_MODULES | src/kernel/exec/scheduler/live.rs | 64 | *
 MAX_ADD_EDGES | src/kernel/exec/scheduler/live.rs | 192 | *
 ADD_WORKSPACES | src/kernel/exec/scheduler/live.rs | 2 | *
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
-CONTRACTS_ASSIGNED | crates/fluxor-abi/src/registry.rs | 41 | *
+CONTRACTS_ASSIGNED | crates/fluxor-abi/src/registry.rs | 40 | *
 MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | MAX_CHANNELS | *
 MAX_OWNERS | src/kernel/workload/owner.rs | 4096 | *
 MAX_PATH | crates/fluxor-abi/src/config.rs | 200 | host
@@ -649,7 +649,7 @@ RING_CONSUMERS | crates/fluxor-abi/src/contracts/telemetry.rs | 4 | *
 TELEMETRY_MAX_RECORD | src/kernel/exec/scheduler/module_types.rs | 144 | *
 DIM_MAX_PRODUCT | crates/fluxor-abi/src/contracts/telemetry.rs | 65534 | *
 MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024 | *
-MAX_CONTRACTS_PER_PROVIDER | src/kernel/module/loader.rs | 4 | *
+MAX_PROVIDES | crates/fluxor-abi/src/wire/fmod.rs | 4 | *
 STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024 | *
 MAX_RING_BYTES | src/kernel/ipc/ring_size.rs | 4 * 1024 * 1024 | *
 MAX_CONNS | crates/fluxor-abi/src/config.rs | 64 | host
@@ -1077,7 +1077,6 @@ SLOT_CAPACITY | crates/fluxor-abi/src/registry.rs | protocol: the reconfigure op
 REPLY_BODY_MAX | modules/foundation/tls/continuity.rs | derived: the larger of a CUT manifest body and a custody reply carrying the largest evidence
 DELTA_IN_TRAILER_MAX | modules/foundation/tls/continuity.rs | derived: a strict RECORD_IN's trailer at its largest, the content type and length and DELIV_CARRY_MAX bytes of plaintext
 BODY_MAX | crates/fluxor-abi/src/contracts/exchange.rs | derived: one RECORD_MAX record less its 16-byte prefix
-STATE_SIZE | modules/foundation/pkt_filter/mod.rs | derived: the size of the instance block, as `module_state_size` answers it
 MAX_DG_ENDPOINTS | modules/foundation/ip/mod.rs | variant: the `small_table` override of the registered abi::config::ip ceiling, never above it — DHCP, a log or telemetry sink and one more, within that variant's four-slot table
 CTRL_CAP | modules/foundation/nbd_serve/mod.rs | derived: the longest handshake answer, EXPORT_NAME's 134 bytes with the pad, or GO's two infos and ACK
 INFO_BLOCK_SIZE | modules/foundation/nbd_serve/mod.rs | protocol: the NBD info type number for block-size constraints
@@ -1219,7 +1218,19 @@ MIN_OUT_CAP | crates/fluxor-abi/src/contracts/storage/namespace.rs | derived: th
 RSA_T_LIMBS | crates/fluxor-sdk/src/crypto/rsa.rs | derived: RSA_LIMBS_MAX plus the two limbs the CIOS Montgomery accumulator carries
 RSA_WINDOW | crates/fluxor-sdk/src/crypto/rsa.rs | algorithm: exponent bits per step of the fixed-window CRT exponentiation, a speed/table-size trade inside one signing job — nothing is refused at it
 RSA_TABLE | crates/fluxor-sdk/src/crypto/rsa.rs | derived: 1 << RSA_WINDOW precomputed powers of the base
-SIZE | src/kernel/module/loader.rs | format: the 80-byte fmod ModuleHeader, its layout pinned by the offset_of asserts beside it
+SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the 64-byte module header
+MODULE_HEADER_SIZE | crates/fluxor-abi/src/wire/fmod.rs | mirror: the module header's SIZE, for callers outside the header module
+CODE_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the header offset of the code-size field
+DATA_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the header offset of the data-size field
+SCHEMA_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the header offset of the schema-size field
+MANIFEST_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the header offset of the manifest-size field
+HEADER_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the 16-byte module-table header
+TOTAL_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the table-header offset of the table's total size
+ENTRY_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the 12-byte module-table entry
+MANIFEST_HEADER_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the 20-byte manifest head
+FLAG_PORT_CAPACITY | crates/fluxor-abi/src/wire/fmod.rs | format: the manifest flag bit marking a port-capacity block, not a capacity
+DIGEST_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: a SHA-256 digest in the manifest's integrity block
+SIGNATURE_BLOCK_SIZE | crates/fluxor-abi/src/wire/fmod.rs | format: the Ed25519 signature and signer fingerprint block
 CONSUMERS | src/kernel/sys/telemetry_ring.rs | mirror: the kernel side of the registered RING_CONSUMERS (crates/fluxor-abi/src/contracts/telemetry.rs), held equal to it by a harness test
 RELIST_TOKEN_MAX | src/platform/bcm2712/store.rs | derived: a relist continuation, the tag, a pinned revision and a STORAGE_KEY_MAX key (264 bytes), within the registered changes::TOKEN_MAX
 ```

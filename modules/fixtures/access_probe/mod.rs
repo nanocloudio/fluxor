@@ -80,11 +80,7 @@ unsafe fn run_cases(sys: &SyscallTable, own_state: u64) -> u8 {
     0
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<AccessProbeState>()
-}
+fluxor_rt::module_facts! { state: AccessProbeState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

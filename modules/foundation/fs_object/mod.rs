@@ -1534,13 +1534,7 @@ fn op_ns_list(s: &mut State, a: &[u8]) -> i32 {
 
 // ── module ABI ────────────────────────────────────────────────────────
 
-fluxor_rt::declare_module_state_bytes!(State);
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
@@ -1604,33 +1598,6 @@ pub unsafe extern "C" fn module_new(
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
 pub extern "C" fn module_step(_state: *mut u8) -> i32 {
     0
-}
-
-/// Both surfaces of one store: its objects and their namespace. A
-/// contract's id is its opcodes' class byte.
-///
-/// # Safety
-/// Kernel module-ABI entry point: `out` points to `cap` writable `u16`s
-/// valid for the call.
-#[cfg_attr(
-    not(feature = "host-test"),
-    link_section = ".text.module_provides_contracts"
-)]
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-pub unsafe extern "C" fn module_provides_contracts(
-    _state: *mut u8,
-    out: *mut u16,
-    cap: u32,
-) -> u32 {
-    if out.is_null() || cap < 2 {
-        return 0;
-    }
-    // SAFETY: the loader named `cap` (>= 2) writable `u16`s at `out`.
-    unsafe {
-        *out = (obj::PUT >> 8) as u16;
-        *out.add(1) = (ns::LIST >> 8) as u16;
-    }
-    2
 }
 
 /// # Safety

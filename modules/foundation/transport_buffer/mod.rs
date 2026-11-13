@@ -279,15 +279,10 @@ unsafe fn discard_net_in(s: &mut TransportBufferState) {
 // Module interface
 // ============================================================================
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<TransportBufferState>() as u32
-}
+fluxor_rt::module_facts! { state: TransportBufferState }
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(TransportBufferState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

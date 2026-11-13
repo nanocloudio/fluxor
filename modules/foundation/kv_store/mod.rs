@@ -473,15 +473,4 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     0 // Continue
 }
 
-fluxor_rt::declare_module_arena_bytes!(65536);
-
-#[no_mangle]
-pub extern "C" fn module_arena_size() -> u32 {
-    // The 64 KiB resident arena the store lives in.
-    65536
-}
-
-// `wasm_entry.rs` is not included here: this module has
-// `module_init` / `module_new` / `module_step` but no
-// `module_state_size` export, which the canonical PIC ABI loader
-// requires.
+fluxor_rt::module_facts! { state: State, arena: 65536 }

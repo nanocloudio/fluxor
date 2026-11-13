@@ -476,7 +476,7 @@ pub fn init_providers() {
     provider::register_vtable(&PCIE_DEVICE_VTABLE);
 
     // HAL vtables for contracts whose `call` dispatch is supplied by a
-    // PIC module (registered by the loader via `module_provides_contract`).
+    // PIC module (registered by the loader from its manifest's `provider_contracts`).
     // The vtable's `call` routes through the kernel's class-byte dispatch
     // chain so it picks up whatever provider is registered at call time.
     // Consumer modules with tracked handles dispatch through the vtable;
@@ -584,7 +584,7 @@ static FS_VTABLE: crate::kernel::module::provider::ProviderVTable =
 // STORAGE_NAMESPACE / STORAGE_OBJECT vtables. Same shape as FS: the
 // kernel ships no built-in provider; a PIC module (a local store, a
 // cluster store, an object-store adapter) registers via
-// `module_provides_contract` and is
+// `provider_contracts` and is
 // routed through the class-byte dispatch chain. The vtable carries
 // `default_close_op` so `provider_close` releases tracked handles
 // uniformly.

@@ -116,13 +116,7 @@ unsafe fn flush_line(s: &mut FsTapState) {
     s.fill = 0;
 }
 
-fluxor_rt::declare_module_state_bytes!(FsTapState);
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<FsTapState>()
-}
+fluxor_rt::module_facts! { state: FsTapState }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

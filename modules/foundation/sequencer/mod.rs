@@ -167,13 +167,7 @@ fn lfsr_next(lfsr: &mut u32) -> u32 {
 // Module API
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(Sequencer);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<Sequencer>() as u32
-}
+fluxor_rt::module_facts! { state: Sequencer }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

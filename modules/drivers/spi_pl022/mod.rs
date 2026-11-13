@@ -670,21 +670,10 @@ pub unsafe extern "C" fn spi_dispatch(
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<SpiState>()
-}
+fluxor_rt::module_facts! { state: SpiState }
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(SpiState);
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -748,15 +737,6 @@ pub unsafe extern "C" fn module_new(
         dev_log(sys, 3, b"[spi] ready".as_ptr(), 10);
         0
     }
-}
-
-/// Loader-driven provider registration: kernel calls this after
-/// module_new() succeeds, reads the contract id, looks up
-/// `module_provider_dispatch` in the export table, and registers us.
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_provides_contract"]
-pub extern "C" fn module_provides_contract() -> u32 {
-    abi::registry::spi::ID as u32
 }
 
 /// # Safety

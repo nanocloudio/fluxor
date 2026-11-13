@@ -12,7 +12,7 @@ pub const MAX_CONTRACTS: usize = 64;
 /// ORed onto an opcode: dispatch to the provider below the caller.
 pub const CHAIN_NEXT: u32 = 0x10000;
 /// Contract ids the registry assigns.
-pub const CONTRACTS_ASSIGNED: usize = 41;
+pub const CONTRACTS_ASSIGNED: usize = 40;
 
 /// Manifest permission bits (`permissions = [..]`).
 pub mod permission {
@@ -87,6 +87,44 @@ pub mod permission {
             _ => None,
         }
     }
+}
+
+/// The functions the kernel calls in a module, by the FNV-1a hash of
+/// their names: a module exports these and nothing else.
+pub mod entry_point {
+    /// Once per module type, before any instance: the syscall table.
+    pub const MODULE_INIT: u32 = 0xfb8dc9bc;
+    /// Initialise one instance's state from its ports and params.
+    pub const MODULE_NEW: u32 = 0xe6d4ac90;
+    /// One step of an instance; answers a step return.
+    pub const MODULE_STEP: u32 = 0xc7ea2db4;
+    /// Refill a pipelined instance's input between steps.
+    pub const MODULE_PIPELINE_REFILL: u32 = 0xc9c83859;
+    /// Flush an instance's output after every module has stepped.
+    pub const MODULE_POST_TICK_FLUSH: u32 = 0x85d25b69;
+    /// Drain an instance before a live reconfiguration removes it.
+    pub const MODULE_DRAIN: u32 = 0xc4c5636c;
+    /// The interrupt-tier entry of an ISR module.
+    pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743;
+    /// Serve one call on a contract the manifest says the module provides.
+    pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76;
+    /// The selector an instance-keyed provider registers under, from its config.
+    pub const MODULE_PROVIDER_SELECTOR: u32 = 0xfd70b311;
+
+    /// Every entry point, by name.
+    pub const NAMES: [&str; 9] = [
+        "module_init",
+        "module_new",
+        "module_step",
+        "module_pipeline_refill",
+        "module_post_tick_flush",
+        "module_drain",
+        "module_isr_entry",
+        "module_provider_dispatch",
+        "module_provider_selector",
+    ];
+    /// The entry points every module defines.
+    pub const REQUIRED: [&str; 2] = ["module_new", "module_step"];
 }
 
 /// Negative return values.
@@ -628,11 +666,6 @@ pub mod flash {
     pub const SIDEBAND: u32 = 0x2310;
 }
 
-pub mod provider_registry {
-    pub const ID: u16 = 0x0024;
-    pub const FLASH_STORE_ENABLE: u32 = 0x2437;
-}
-
 pub mod diag {
     pub const ID: u16 = 0x0025;
     pub const LOG_RING_DRAIN: u32 = 0x2564;
@@ -694,17 +727,17 @@ pub mod rp_raw {
 }
 
 pub mod metal_device {
-    pub const ID: u16 = 0x0028;
-    pub const MMIO_READ32: u32 = 0x28e4;
-    pub const MMIO_WRITE32: u32 = 0x28e5;
-    pub const DMA_ALLOC_CONTIG: u32 = 0x28e6;
-    pub const CACHE_FLUSH_RANGE: u32 = 0x28e7;
-    pub const DMA_FLUSH: u32 = 0x28ea;
-    pub const DMA_INVALIDATE: u32 = 0x28eb;
-    pub const DMA_ALLOC_STREAMING: u32 = 0x28ec;
-    pub const PCIE_RESCAN: u32 = 0x28f5;
-    pub const PCIE_CFG_READ32: u32 = 0x28f6;
-    pub const PCIE_CFG_WRITE32: u32 = 0x28f7;
+    pub const ID: u16 = 0x0024;
+    pub const MMIO_READ32: u32 = 0x24e4;
+    pub const MMIO_WRITE32: u32 = 0x24e5;
+    pub const DMA_ALLOC_CONTIG: u32 = 0x24e6;
+    pub const CACHE_FLUSH_RANGE: u32 = 0x24e7;
+    pub const DMA_FLUSH: u32 = 0x24ea;
+    pub const DMA_INVALIDATE: u32 = 0x24eb;
+    pub const DMA_ALLOC_STREAMING: u32 = 0x24ec;
+    pub const PCIE_RESCAN: u32 = 0x24f5;
+    pub const PCIE_CFG_READ32: u32 = 0x24f6;
+    pub const PCIE_CFG_WRITE32: u32 = 0x24f7;
 }
 
 /// The contract a manifest names (`requires_contract`, `provides`).
@@ -735,7 +768,7 @@ pub fn contract_of_name(name: &str) -> Option<u16> {
         "platform_nic_ring" => Some(0x001d),
         "platform_dma" => Some(0x001e),
         "platform_dma_fd" => Some(0x001f),
-        "metal_device" => Some(0x0028),
+        "metal_device" => Some(0x0024),
         _ => None,
     }
 }
@@ -779,13 +812,31 @@ pub fn contract_name(id: u16) -> Option<&'static str> {
         0x0021 => Some("monitor"),
         0x0022 => Some("bridge"),
         0x0023 => Some("flash"),
-        0x0024 => Some("provider_registry"),
+        0x0024 => Some("metal_device"),
         0x0025 => Some("diag"),
         0x0026 => Some("vault_store"),
         0x0027 => Some("rp_raw"),
-        0x0028 => Some("metal_device"),
         _ => None,
     }
+}
+
+/// Whether a module may serve the contract as a provider
+/// (`provider_contracts`); the kernel registers a module for no other.
+pub fn module_providable(id: u16) -> bool {
+    matches!(
+        id,
+        0x0006
+            | 0x0007
+            | 0x0008
+            | 0x0009
+            | 0x000a
+            | 0x000b
+            | 0x000c
+            | 0x000d
+            | 0x000e
+            | 0x000f
+            | 0x0012
+    )
 }
 
 /// How many contracts a manifest may name.
@@ -841,7 +892,6 @@ pub fn op_routes_to_kernel(op: u32) -> bool {
             | 0x21
             | 0x22
             | 0x23
-            | 0x24
             | 0x25
             | 0x27
     ) && !matches!(op, 0x00fe)
@@ -1371,7 +1421,16 @@ pub fn op_permission(op: u32) -> Option<u16> {
         0x2310 => Some(permission::FLASH_RAW),
         0x2338 => Some(permission::FLASH_RAW),
         0x2339 => Some(permission::FLASH_RAW),
-        0x2437 => Some(permission::FLASH_RAW),
+        0x24e4 => Some(permission::PLATFORM_RAW),
+        0x24e5 => Some(permission::PLATFORM_RAW),
+        0x24e6 => Some(permission::DMA),
+        0x24e7 => Some(permission::DMA),
+        0x24ea => Some(permission::DMA),
+        0x24eb => Some(permission::DMA),
+        0x24ec => Some(permission::DMA),
+        0x24f5 => Some(permission::PLATFORM_RAW),
+        0x24f6 => Some(permission::PLATFORM_RAW),
+        0x24f7 => Some(permission::PLATFORM_RAW),
         0x2564 => Some(permission::PLATFORM_RAW),
         0x2565 => None,
         0x2640 => Some(permission::VAULT_STORE),
@@ -1420,16 +1479,6 @@ pub fn op_permission(op: u32) -> Option<u16> {
         0x27d0 => Some(permission::PLATFORM_RAW),
         0x27d1 => Some(permission::PLATFORM_RAW),
         0x27d2 => Some(permission::PLATFORM_RAW),
-        0x28e4 => Some(permission::PLATFORM_RAW),
-        0x28e5 => Some(permission::PLATFORM_RAW),
-        0x28e6 => Some(permission::DMA),
-        0x28e7 => Some(permission::DMA),
-        0x28ea => Some(permission::DMA),
-        0x28eb => Some(permission::DMA),
-        0x28ec => Some(permission::DMA),
-        0x28f5 => Some(permission::PLATFORM_RAW),
-        0x28f6 => Some(permission::PLATFORM_RAW),
-        0x28f7 => Some(permission::PLATFORM_RAW),
         _ => match op >> 8 {
             0x00 => Some(permission::PLATFORM_RAW),
             0x10 => Some(permission::PLATFORM_RAW),
@@ -1449,7 +1498,6 @@ pub fn op_permission(op: u32) -> Option<u16> {
             0x24 => Some(permission::PLATFORM_RAW),
             0x25 => Some(permission::PLATFORM_RAW),
             0x27 => Some(permission::PLATFORM_RAW),
-            0x28 => Some(permission::PLATFORM_RAW),
             _ => None,
         },
     }

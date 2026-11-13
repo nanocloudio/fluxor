@@ -154,8 +154,6 @@ pub struct GuardState {
     log_buf: [u8; 128],
 }
 
-const STATE_SIZE: usize = core::mem::size_of::<GuardState>();
-
 // ============================================================================
 // Frame classification
 // ============================================================================
@@ -298,19 +296,7 @@ unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, dst_ip: u32, now_ms: u32) -
 // Module ABI
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(GuardState);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    STATE_SIZE
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    0
-}
+fluxor_rt::module_facts! { state: GuardState, arena: 0 }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

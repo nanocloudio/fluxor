@@ -4150,24 +4150,11 @@ unsafe fn near_step(s: &mut State) {
 
 // ── Entry points ────────────────────────────────────────────────────────────
 
-fluxor_rt::declare_module_state_bytes!(State);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, arena: 0 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-/// The module consumes whole buffers on `mailbox` channels.
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_mailbox_safe"]
-pub extern "C" fn module_mailbox_safe() -> i32 {
-    1
-}
 
 /// Bind the exchange endpoint's ports for this instance's side. The side's
 /// own pair must be wired and the other side's must not: an edge to a port
@@ -4528,11 +4515,6 @@ unsafe fn report_session(s: &mut State) {
         s.reported_open = open;
         s.reported_session = session;
     }
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-pub extern "C" fn module_arena_size() -> u32 {
-    0
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.

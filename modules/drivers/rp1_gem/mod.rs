@@ -17,7 +17,7 @@
 //! 4. Program GEM registers (DMA config, MAC address, enable RX/TX)
 //! 5. Return Ready when link is up
 //!
-//! Exports `module_deferred_ready` — gates downstream until link up.
+//! Declares `deferred_ready` — gates downstream until link up.
 
 #![no_std]
 #![allow(
@@ -172,8 +172,6 @@ const DMA_OFFSET: u64 = 0;
 // ============================================================================
 // State
 // ============================================================================
-
-const STATE_SIZE: usize = core::mem::size_of::<GemState>();
 
 #[repr(C)]
 struct GemState {
@@ -1009,17 +1007,7 @@ unsafe fn check_link(s: &mut GemState) -> bool {
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    STATE_SIZE
-}
+fluxor_rt::module_facts! { state: GemState }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

@@ -1,6 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["uefi"]
 permissions = ["pcie_device", "dma"]
+deferred_ready = true
 
 # Amazon's Elastic Network Adapter: one queue pair in host memory, polled. Frames
 # reach `ip` and leave it exactly as with any other NIC here, and the MAC address

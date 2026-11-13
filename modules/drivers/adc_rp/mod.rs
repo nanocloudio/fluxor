@@ -207,21 +207,10 @@ pub unsafe extern "C" fn adc_dispatch(
     }
 }
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<AdcState>()
-}
+fluxor_rt::module_facts! { state: AdcState }
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(AdcState);
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -263,12 +252,6 @@ pub unsafe extern "C" fn module_new(
         dev_log(sys, 3, b"[adc] ready".as_ptr(), 10);
         0
     }
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_provides_contract"]
-pub extern "C" fn module_provides_contract() -> u32 {
-    abi::registry::adc::ID as u32
 }
 
 /// # Safety

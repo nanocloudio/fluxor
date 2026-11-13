@@ -192,7 +192,6 @@ pub mod internal {
     pub mod diag;
     pub mod flash;
     pub mod monitor;
-    pub mod provider_registry;
     pub mod reconfigure;
     pub mod vault_store;
 }

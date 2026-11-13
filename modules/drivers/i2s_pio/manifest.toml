@@ -2,6 +2,7 @@ version = "1.0.0"
 hardware_targets = ["rp2350"]
 # I2S DMA is the canonical sink-authored clock for rp2350 audio playback.
 capabilities = ["audio.sample", "presentation.clock"]
+mailbox_safe = true
 
 [[ports]]
 name = "audio"

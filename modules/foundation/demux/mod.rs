@@ -47,8 +47,6 @@ pub struct DemuxState {
     frame_buf: [u8; 2 + MAX_FRAME],
 }
 
-const STATE_SIZE: usize = core::mem::size_of::<DemuxState>();
-
 /// Pick a lane index (0 or 1) based on the IPv4/TCP 4-tuple, or None for
 /// non-TCP/IPv4 frames.
 unsafe fn classify_lane(frame: *const u8, len: usize) -> Option<u8> {
@@ -108,19 +106,7 @@ unsafe fn write_framed(sys: &SyscallTable, chan: i32, buf: *const u8, total: usi
     true
 }
 
-fluxor_rt::declare_module_state_bytes!(DemuxState);
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    STATE_SIZE
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    0
-}
+fluxor_rt::module_facts! { state: DemuxState, arena: 0 }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

@@ -9777,14 +9777,7 @@ unsafe fn fs_dispatch_op(
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(
-    not(feature = "host-test"),
-    link_section = ".text.module_provides_contract"
-)]
-pub extern "C" fn module_provides_contract() -> u32 {
-    abi::registry::fs::ID as u32
-}
+fluxor_rt::module_facts! { state: Fat32State }
 
 /// FNV-1a hash of a `volume:` param string via the shared kernel/module
 /// `provider_selector::hash`, so this fat32's declared selector matches the
@@ -9814,30 +9807,9 @@ pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
     unsafe { (*(state as *const Fat32State)).selector }
 }
 
-/// Marker export: subscribe this provider to `OWNER_RELEASED`. Present because
-/// the open-file table is provider-wide and stamped per owner, so a torn-down
-/// consumer's slots have to be reclaimed by somebody, and this provider is the
-/// only one that knows which slots those are.
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(
-    not(feature = "host-test"),
-    link_section = ".text.module_observes_owner_release"
-)]
-pub extern "C" fn module_observes_owner_release() -> u32 {
-    1
-}
-
 // ============================================================================
 // Exported PIC Module Interface
 // ============================================================================
-
-fluxor_rt::declare_module_state_bytes!(Fat32State);
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<Fat32State>() as u32
-}
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
@@ -11031,7 +11003,7 @@ pub unsafe fn test_intent_lba(state: *const u8) -> u32 {
 ///
 /// # Safety
 /// `state` must point at a live `Fat32State` of at least
-/// `module_state_size()` bytes whose `syscalls` is set (i.e. `module_new`
+/// `MODULE_STATE_BYTES` bytes whose `syscalls` is set (i.e. `module_new`
 /// has run).
 #[cfg(feature = "host-test")]
 pub unsafe fn test_force_ready(state: *mut u8, fat_size_32: u32, fsinfo_sector: u16) {

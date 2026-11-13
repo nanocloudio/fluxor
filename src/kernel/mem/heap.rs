@@ -10,8 +10,8 @@
 //!
 //! ## Committed and elastic heaps
 //!
-//! A heap has a CAP: the module type's declared arena (manifest
-//! `arena_bytes` or its `module_arena_size` export), or the graph's
+//! A heap has a CAP: the module type's declared arena (the manifest's
+//! `arena_bytes`), or the graph's
 //! per-instance `heap.arena_bytes` override (params tag 0xEF). How the cap
 //! is backed depends on the module and the platform:
 //!

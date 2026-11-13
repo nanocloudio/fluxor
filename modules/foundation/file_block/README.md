@@ -66,4 +66,4 @@ the image it mounts.
 - Writes complete `Volatile`; `FLUSH` and `FUA` run the file's `FSYNC` and
   complete `LocalDurable`, naming a device id hashed from the path (and the
   `volume`, when one is named).
-- `module_deferred_ready`: consumers wait until the image is open.
+- `deferred_ready = true`: consumers wait until the image is open.

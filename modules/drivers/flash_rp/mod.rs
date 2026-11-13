@@ -12,8 +12,9 @@
 //! 2. **Blob serving** — Stores inline data blobs from config presets,
 //!    serves them on out[1] via IOCTL_NOTIFY protocol (replaces data_source).
 //!
-//! 3. **Param store provider** — Registers via FLASH_STORE_ENABLE. Other
-//!    modules persist params via PARAM_STORE/DELETE/CLEAR_ALL syscalls.
+//! 3. **Param store provider** — provides `runtime_params` (its manifest
+//!    says so): other modules persist their params through STORE / DELETE /
+//!    CLEAR_ALL, each keyed by the module the kernel names as the caller.
 //!
 //! 4. **Data store** — a `storage.block` source on out[2] (`store`) over the
 //!    flash's data region (`flash_layout::DATA_STORE_SIZE` bytes directly below
@@ -70,7 +71,6 @@ const READ_CS: u8 = abi::internal::flash::sideband_op::READ_CS;
 // Constants — Flash Store Provider
 // ============================================================================
 
-const FLASH_STORE_ENABLE: u32 = abi::registry::provider_registry::FLASH_STORE_ENABLE;
 const FLASH_RAW_ERASE: u32 = abi::registry::flash::RAW_ERASE;
 const FLASH_RAW_PROGRAM: u32 = abi::registry::flash::RAW_PROGRAM;
 
@@ -284,23 +284,11 @@ mod params_def {
 // Module API
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(FlashState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<FlashState>() as u32
-}
+fluxor_rt::module_facts! { state: FlashState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> i32 {
-    1
-}
 
 /// # Safety
 /// Kernel module-ABI entry point: `state` is the loader-owned instance block
@@ -446,14 +434,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let sys = &*s.syscalls;
 
-        // ---- Register as flash store provider on first step ----
+        // ---- Learn where the parameter store is, on first step ----
         if s.registered == 0 {
-            let dispatch_hash: u32 = 0x2f7172b5; // FNV-1a("module_flash_store_dispatch")
-            let mut args = dispatch_hash.to_le_bytes();
-            let result = (sys.provider_call)(-1, FLASH_STORE_ENABLE, args.as_mut_ptr(), 4);
-            if result < 0 {
-                return result;
-            }
             s.registered = 1;
             // Where this board's parameter store is.
             let mut layout = [0u8; abi::platform::rp::flash_layout::GRAPH_FLASH_LEN];
@@ -624,18 +606,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // Flash Store Provider Dispatch
 // ============================================================================
 
-/// Provider dispatch function — called by kernel when modules use
-/// PARAM_STORE/DELETE/CLEAR_ALL syscalls. The kernel prepends the caller's
-/// module_id to the arg buffer before forwarding here.
+/// The `runtime_params` provider: a module's `STORE` / `DELETE` /
+/// `CLEAR_ALL` arrive here as ordinary provider calls, and the overrides are
+/// keyed by the calling module, which the kernel names (`QUERY_CALLER_MODULE`)
+/// so no caller can write another's.
 ///
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
 /// module's `module_new` initialised, and `arg` points to `arg_len` bytes
 /// (may be null when `arg_len` is 0) valid for the call.
-#[export_name = "module_flash_store_dispatch"]
-#[link_section = ".text.flash_store_dispatch"]
+#[cfg_attr(not(feature = "host-test"), export_name = "module_provider_dispatch")]
+#[cfg_attr(
+    not(feature = "host-test"),
+    link_section = ".text.module_provider_dispatch"
+)]
 pub unsafe extern "C" fn flash_store_dispatch(
     state: *mut u8,
+    _handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
@@ -652,37 +639,49 @@ pub unsafe extern "C" fn flash_store_dispatch(
         // The kernel did not say where the store is.
         return -38;
     }
+    // The caller's module index: the store keys its overrides by it.
+    let mut caller = [0u8; 8];
+    let rc = (sys.provider_query)(
+        -1,
+        abi::kernel_abi::query_key::CALLER_MODULE,
+        caller.as_mut_ptr(),
+        caller.len(),
+    );
+    if rc != 8 {
+        return if rc < 0 { rc } else { -22 };
+    }
+    let module_id = match u8::try_from(u16::from_le_bytes([caller[0], caller[1]])) {
+        Ok(id) if id != 0xFF => id,
+        _ => return -22,
+    };
 
     match opcode {
         PARAM_STORE_OP => {
-            // arg = [module_id:u8, tag:u8, value_bytes...]
-            if arg.is_null() || arg_len < 2 {
-                return -22;
-            }
-            let module_id = *arg;
-            let tag = *arg.add(1);
-            let value_len = arg_len - 2;
-            if value_len > MAX_VALUE_LEN {
-                return -22;
-            }
-            store_param(s, sys, module_id, tag, arg.add(2), value_len)
-        }
-        PARAM_DELETE_OP => {
-            // arg = [module_id:u8, tag:u8]
-            if arg.is_null() || arg_len < 2 {
-                return -22;
-            }
-            delete_param(s, sys, *arg, *arg.add(1))
-        }
-        PARAM_CLEAR_ALL_OP => {
-            // arg = [module_id:u8] or [0xFF] for factory reset
+            // arg = [tag:u8, value_bytes...]
             if arg.is_null() || arg_len < 1 {
                 return -22;
             }
-            if *arg == 0xFF {
+            let tag = *arg;
+            let value_len = arg_len - 1;
+            if value_len > MAX_VALUE_LEN {
+                return -22;
+            }
+            store_param(s, sys, module_id, tag, arg.add(1), value_len)
+        }
+        PARAM_DELETE_OP => {
+            // arg = [tag:u8]
+            if arg.is_null() || arg_len < 1 {
+                return -22;
+            }
+            delete_param(s, sys, module_id, *arg)
+        }
+        PARAM_CLEAR_ALL_OP => {
+            // arg = [] for the caller's own overrides, [0xFF] for a factory
+            // reset of every module's.
+            if arg_len >= 1 && !arg.is_null() && *arg == 0xFF {
                 erase_store(s, sys)
             } else {
-                clear_all(s, sys, *arg)
+                clear_all(s, sys, module_id)
             }
         }
         _ => -38, // ENOSYS

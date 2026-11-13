@@ -29,7 +29,7 @@
 //! cleared: a PCI bus address, which the outbound window places in CPU
 //! space; 0 for an I/O BAR.
 //!
-//! Exports module_deferred_ready: downstream diagnostic consumers wait
+//! Declares `deferred_ready`: downstream diagnostic consumers wait
 //! for the report before draining the `devices` channel.
 
 #![no_std]
@@ -187,17 +187,7 @@ unsafe fn report(s: &mut PcieScanState) {
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<PcieScanState>()
-}
+fluxor_rt::module_facts! { state: PcieScanState }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

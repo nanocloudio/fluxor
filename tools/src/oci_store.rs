@@ -948,8 +948,9 @@ pub struct ImageLayer<'a> {
 pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
     const FXSL_MAGIC: u32 = 0x4C53_5846;
     const FXMT_MAGIC: u32 = 0x544D_5846;
-    const TABLE_HEADER_SIZE: usize = 16;
-    const ENTRY_SIZE: usize = 16;
+    use fluxor_abi::wire::fmod::table::{
+        ENTRY_OFFSET, ENTRY_SIZE, ENTRY_SIZE_AT, HEADER_SIZE as TABLE_HEADER_SIZE, MODULE_COUNT,
+    };
     if image.len() < 96 || u32::from_le_bytes(image[0..4].try_into().unwrap()) != FXSL_MAGIC {
         return Err(Error::Config("not a graph image (no FXSL header)".into()));
     }
@@ -966,7 +967,7 @@ pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
     {
         return Err(Error::Config("image has no FXMT module table".into()));
     }
-    let count = table[5] as usize;
+    let count = u16::from_le_bytes([table[MODULE_COUNT], table[MODULE_COUNT + 1]]) as usize;
     if TABLE_HEADER_SIZE + count * ENTRY_SIZE > table.len() {
         return Err(Error::Config("module table entries out of bounds".into()));
     }
@@ -976,8 +977,16 @@ pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
     let mut fmods: Vec<(usize, usize)> = Vec::with_capacity(count); // (table-rel offset, size)
     for i in 0..count {
         let e = TABLE_HEADER_SIZE + i * ENTRY_SIZE;
-        let off = u32::from_le_bytes(table[e + 4..e + 8].try_into().unwrap()) as usize;
-        let size = u32::from_le_bytes(table[e + 8..e + 12].try_into().unwrap()) as usize;
+        let off = u32::from_le_bytes(
+            table[e + ENTRY_OFFSET..e + ENTRY_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let size = u32::from_le_bytes(
+            table[e + ENTRY_SIZE_AT..e + ENTRY_SIZE_AT + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         if off + size > table.len() {
             return Err(Error::Config(format!("fmod {i} out of table bounds")));
         }
@@ -2832,8 +2841,9 @@ mod tests {
     fn explode_image_roundtrips_byte_exact() {
         const HDR: usize = 256;
         let modules_offset = 4096usize;
-        // FXMT: header 16 + 2 entries à 16, fmods page-aligned so code
-        // (offset + 72) is 4096-aligned, mirroring build_module_table.
+        // FXMT (`fluxor_abi::wire::fmod::table`): header + 2 entries, fmods
+        // laid out as build_module_table lays them.
+        use fluxor_abi::wire::fmod::table as t;
         let fmod_a = vec![0xAAu8; 300];
         let fmod_b = vec![0xBBu8; 150];
         let a_off = 4096 - 72; // table-relative; code at 4096
@@ -2841,13 +2851,16 @@ mod tests {
         let table_len = b_off + fmod_b.len();
         let mut table = vec![0u8; table_len];
         table[0..4].copy_from_slice(&0x544D_5846u32.to_le_bytes());
-        table[4] = 1; // version
-        table[5] = 2; // count
+        table[t::VERSION..t::VERSION + 2].copy_from_slice(&1u16.to_le_bytes());
+        table[t::MODULE_COUNT..t::MODULE_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
         for (i, (off, data)) in [(a_off, &fmod_a), (b_off, &fmod_b)].iter().enumerate() {
-            let e = 16 + i * 16;
-            table[e..e + 4].copy_from_slice(&(0x1111u32 * (i as u32 + 1)).to_le_bytes());
-            table[e + 4..e + 8].copy_from_slice(&(*off as u32).to_le_bytes());
-            table[e + 8..e + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            let e = t::HEADER_SIZE + i * t::ENTRY_SIZE;
+            table[e + t::ENTRY_NAME_HASH..e + t::ENTRY_NAME_HASH + 4]
+                .copy_from_slice(&(0x1111u32 * (i as u32 + 1)).to_le_bytes());
+            table[e + t::ENTRY_OFFSET..e + t::ENTRY_OFFSET + 4]
+                .copy_from_slice(&(*off as u32).to_le_bytes());
+            table[e + t::ENTRY_SIZE_AT..e + t::ENTRY_SIZE_AT + 4]
+                .copy_from_slice(&(data.len() as u32).to_le_bytes());
         }
         table[a_off..a_off + fmod_a.len()].copy_from_slice(&fmod_a);
         table[b_off..b_off + fmod_b.len()].copy_from_slice(&fmod_b);
@@ -2905,8 +2918,10 @@ mod tests {
         };
         let mut table = vec![0u8; 4096];
         table[0..4].copy_from_slice(&0x544D_5846u32.to_le_bytes());
-        table[4] = 1;
-        table[10..14].copy_from_slice(&4096u32.to_le_bytes());
+        use fluxor_abi::wire::fmod::table as t;
+        table[t::VERSION..t::VERSION + 2].copy_from_slice(&1u16.to_le_bytes());
+        table[t::PROGRAM_SECTION_OFFSET..t::PROGRAM_SECTION_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
         table.extend_from_slice(&section);
         let config = vec![0xCCu8; 64];
         let config_offset = (modules_offset + table.len()).div_ceil(256) * 256;

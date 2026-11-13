@@ -3,6 +3,7 @@ hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
 # Redial backoff and the session-setup deadline are wall-clock; everything
 # else is per-frame.
 timer_class = "wall_clock"
+mailbox_safe = true
 
 # Remote-channel multiplexer: up to eight local channels carried record for
 # record across authenticated transport sessions — a dialler's one, or up to

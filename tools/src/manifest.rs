@@ -43,23 +43,24 @@ pub const MODULE_TIERS: &[&str] = &[
 ];
 
 /// Manifest section magic: "FXMF"
-pub const MANIFEST_MAGIC: u32 = 0x464D5846;
+pub use fluxor_abi::wire::fmod::MANIFEST_MAGIC;
 
 /// Manifest format version. Kept at v1 by policy — the kernel and
 /// tools always ship together, so additive wire-format extensions
 /// ride within v1 rather than bumping the integer. The current
 /// layout is:
 ///
-/// - 17-byte header (magic, version, port/resource/dependency
-///   counts, module_version, hardware_targets, state_bytes_64,
-///   flags, 16-bit fine-grained permissions).
+/// - 20-byte header (magic, version, port/resource/dependency
+///   counts, module_version, hardware_targets, flags, provided-contract
+///   count, 16-bit fine-grained permissions, 32-bit state_bytes_64).
 /// - Port records (4 bytes each): `[direction, content_type, flags,
 ///   index]`. Byte 3 is the resolved per-direction `PortSpec.index`,
 ///   matching what the config compiler wires against.
 /// - Resource records (4 bytes each).
 /// - Dependency records (8 bytes each).
 /// - Optional port-capacity records, 8 bytes per port (flags bit 5).
-/// - Optional 2-byte `stack_bytes_64` (flags bit 6).
+/// - 2-byte `stack_bytes_64`, 4-byte `arena_bytes`, then one 2-byte id per
+///   provided contract (`fluxor_abi::wire::fmod::ManifestLayout`).
 /// - Optional 32-byte SHA-256 integrity hash (flags bit 0).
 /// - Optional `[ed25519_signature: 64B][signer_pubkey_fingerprint:
 ///   32B]` block (flags bit 1). The signature covers the integrity
@@ -68,7 +69,7 @@ pub const MANIFEST_MAGIC: u32 = 0x464D5846;
 pub const MANIFEST_VERSION: u8 = 1;
 
 /// Manifest header size (fixed portion before variable sections)
-pub const MANIFEST_HEADER_SIZE: usize = 17;
+pub use fluxor_abi::wire::fmod::MANIFEST_HEADER_SIZE;
 
 /// Signature block size (ed25519 signature + signer fingerprint).
 pub const SIGNATURE_BLOCK_SIZE: usize = 96;
@@ -628,6 +629,42 @@ fn parse_when(
 /// is resolved by exact string match downstream — the config resolver wires
 /// consumers to providers by name — so an unwhitelisted typo would silently
 /// never resolve. Fail it at parse instead, with a did-you-mean.
+/// The registry ids of the contracts a manifest's `provider_contracts`
+/// names: each a registry contract, none twice, at most
+/// `fluxor_abi::wire::fmod::MAX_PROVIDES`.
+fn provider_contract_ids(names: &[String]) -> Result<Vec<u16>> {
+    use fluxor_abi::wire::fmod::MAX_PROVIDES;
+    if names.len() > MAX_PROVIDES {
+        return Err(Error::Config(format!(
+            "provider_contracts names {} contracts; one module serves at most {MAX_PROVIDES}",
+            names.len()
+        )));
+    }
+    let mut ids = Vec::with_capacity(names.len());
+    for n in names {
+        let id = (0..fluxor_abi::registry::CONTRACTS_ASSIGNED as u16)
+            .find(|&id| fluxor_abi::registry::contract_name(id) == Some(n.as_str()))
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "provider_contracts: `{n}` is not a registry contract"
+                ))
+            })?;
+        if !fluxor_abi::registry::module_providable(id) {
+            return Err(Error::Config(format!(
+                "provider_contracts: `{n}` is not a contract a module may provide \
+                 (the registry does not mark it `module_provided`)"
+            )));
+        }
+        if ids.contains(&id) {
+            return Err(Error::Config(format!(
+                "provider_contracts names `{n}` twice"
+            )));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
 fn validate_provides_names(provides: &[String]) -> Result<()> {
     for p in provides {
         let known = provider_contracts()
@@ -1197,7 +1234,7 @@ pub struct HeapFromParamsOverride {
 /// needs only one surface does not implicitly get the others.
 ///
 /// Serialised as a little-endian u16 bitmap into the manifest binary at
-/// offset 15 (bytes 15..17); DMA is bit 7 and `observe` bit 8. Not part of
+/// offset 14 (bytes 14..16); DMA is bit 7 and `observe` bit 8. Not part of
 /// the module header's flags byte.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ManifestPermissions {
@@ -1424,6 +1461,46 @@ pub struct ExecutionEnvelope {
     pub evidence: Option<String>,
 }
 
+/// The facts a module's manifest TOML states as booleans, carried as the
+/// module header's flag bits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModuleFacts {
+    /// Consumes from mailbox channels safely.
+    pub mailbox_safe: bool,
+    /// Writes its output buffer in place (implies `mailbox_safe`).
+    pub in_place_writer: bool,
+    /// Needs init time before its downstream runs.
+    pub deferred_ready: bool,
+    /// A provider told when a consumer's owner is released.
+    pub observes_owner_release: bool,
+    /// A provider the resource ledger asks for a pool's in-use figure.
+    pub samples_pool: bool,
+}
+
+impl ModuleFacts {
+    /// The header flag bits these facts set.
+    pub fn header_flags(self) -> u8 {
+        use fluxor_abi::wire::fmod::header::flag;
+        let mut f = 0;
+        if self.mailbox_safe || self.in_place_writer {
+            f |= flag::MAILBOX_SAFE;
+        }
+        if self.in_place_writer {
+            f |= flag::IN_PLACE_WRITER;
+        }
+        if self.deferred_ready {
+            f |= flag::DEFERRED_READY;
+        }
+        if self.observes_owner_release {
+            f |= flag::OBSERVES_OWNER_RELEASE;
+        }
+        if self.samples_pool {
+            f |= flag::SAMPLES_POOL;
+        }
+        f
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub module_version: u16,
@@ -1431,7 +1508,7 @@ pub struct Manifest {
     /// Resident module state, in units of 64 BYTES, rounded up.
     ///
     /// Filled by `pack` from the `FLUXOR_MODULE_STATE_BYTES` static the SDK's
-    /// `declare_module_state_bytes!` emits — a measurement of the built artefact, not
+    /// `module_facts!` emits — a measurement of the built artefact, not
     /// a declaration an author can get wrong. `0` means the module has not
     /// adopted the macro and its state cost is unknown.
     ///
@@ -1440,22 +1517,31 @@ pub struct Manifest {
     /// cannot express. Sixty-four-byte units reach ~4 MiB, above every module in
     /// the tree, and rounding UP means the recorded figure is never an
     /// understatement of what the arena must provide. (Elastic arena demand is
-    /// `module_arena_size`, a separate question from resident state.)
-    pub state_bytes_64: u16,
+    /// `module_facts!`'s `arena:`, a separate question from resident state.)
+    pub state_bytes_64: u32,
     /// Worst-case stack depth, in units of 64 BYTES, rounded up.
     ///
-    /// Filled by `pack` from the `FLUXOR_MODULE_STACK_BYTES` static the SDK's
-    /// `declare_module_stack_bytes!` emits. The composer admits it against the
-    /// target's stack: the per-module isolated stack where there is an MMU,
-    /// the kernel stack every module steps on where there is not. `0` means
-    /// the module has not declared. Carried in the binary as flag bit 6 plus a
-    /// 2-byte block, inside the signed envelope.
+    /// Filled by `pack`: what the build measured from the call graph, or the
+    /// `stack:` the module states in `fluxor_rt::module_facts!` where the
+    /// graph has no bound. The composer admits it against the target's
+    /// stack: the per-module isolated stack where there is an MMU, the
+    /// kernel stack every module steps on where there is not. A 2-byte block
+    /// inside the signed envelope.
     pub stack_bytes_64: u16,
     /// The heap arena the module asks for, in bytes; 0 for none. Filled by
-    /// `pack` from the `FLUXOR_MODULE_ARENA_BYTES` static the SDK's
-    /// `declare_module_arena_bytes!` emits, so the loader sizes the arena
-    /// without calling module code.
+    /// `pack` from the `arena:` the module states in `module_facts!`, so the
+    /// loader sizes the arena without calling module code.
     pub arena_bytes: u32,
+    /// The registry contracts the module serves through
+    /// `module_provider_dispatch`, by id (`provider_contracts = [names]` in
+    /// the TOML). The kernel registers it as their provider after
+    /// `module_new` returns Ready.
+    pub provider_contracts: Vec<u16>,
+    /// Header facts the TOML states (`mailbox_safe`, `in_place_writer`,
+    /// `deferred_ready`, `observes_owner_release`, `samples_pool`); `pack`
+    /// writes them as the header's flag bits
+    /// (`fluxor_abi::wire::fmod::header::flag`).
+    pub facts: ModuleFacts,
     pub ports: Vec<PortSpec>,
     pub resources: Vec<ResourceClaim>,
     pub permissions: ManifestPermissions,
@@ -1535,8 +1621,8 @@ pub struct Manifest {
     /// `[capacities] heap_per_param`: heap bytes per unit of one of the
     /// instance's own integer params (see [`HeapPerParam`]). TOML-only.
     pub heap_per_param: Option<HeapPerParam>,
-    /// Module attests that its `module_step` / `module_isr_init` /
-    /// `module_isr_entry` exports are safe to invoke from an ISR
+    /// Module attests that its `module_step` / `module_isr_entry`
+    /// entry points are safe to invoke from an ISR
     /// context: no heap allocation, no `provider_call`, no
     /// `channel_read`/`channel_write`, bounded execution within the
     /// declared `isr_budget_cycles`. The author owns this claim; the
@@ -1634,6 +1720,8 @@ impl Default for Manifest {
             state_bytes_64: 0,
             stack_bytes_64: 0,
             arena_bytes: 0,
+            provider_contracts: Vec::new(),
+            facts: ModuleFacts::default(),
             ports: Vec::new(),
             resources: Vec::new(),
             permissions: ManifestPermissions::default(),
@@ -2411,6 +2499,15 @@ impl Manifest {
 
         let provides = toml_val.provides.unwrap_or_default();
         validate_provides_names(&provides)?;
+        let provider_contracts =
+            provider_contract_ids(&toml_val.provider_contracts.unwrap_or_default())?;
+        let facts = ModuleFacts {
+            mailbox_safe: toml_val.mailbox_safe.unwrap_or(false),
+            in_place_writer: toml_val.in_place_writer.unwrap_or(false),
+            deferred_ready: toml_val.deferred_ready.unwrap_or(false),
+            observes_owner_release: toml_val.observes_owner_release.unwrap_or(false),
+            samples_pool: toml_val.samples_pool.unwrap_or(false),
+        };
         let mut capabilities = toml_val.capabilities.unwrap_or_default();
         validate_capability_names(&mut capabilities)?;
         let capability_facts =
@@ -2924,6 +3021,8 @@ impl Manifest {
             state_bytes_64,
             stack_bytes_64: 0, // set by pack from the built artefact
             arena_bytes: 0,    // likewise
+            provider_contracts,
+            facts,
             ports,
             resources,
             permissions,
@@ -2975,12 +3074,6 @@ impl Manifest {
             .ports
             .iter()
             .any(|p| p.buffer_size != 0 || p.max_record != 0);
-        // Stack block (flag bit 6): 2 bytes, `stack_bytes_64` LE, directly
-        // after the port-capacity section and so inside the signed envelope.
-        let has_stack = self.stack_bytes_64 != 0;
-        // Arena block (flag bit 7): 4 bytes, `arena_bytes` LE, after the stack
-        // block and inside the signed envelope.
-        let has_arena = self.arena_bytes != 0;
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
@@ -2989,8 +3082,9 @@ impl Manifest {
             } else {
                 0
             }
-            + if has_stack { 2 } else { 0 }
-            + if has_arena { 4 } else { 0 }
+            + 2
+            + 4
+            + self.provider_contracts.len() * 2
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -3001,9 +3095,9 @@ impl Manifest {
         let total = MANIFEST_HEADER_SIZE + var_size;
         let mut buf = Vec::with_capacity(total);
 
-        // Header (16 bytes). Signed and unsigned manifests share the
+        // Header (20 bytes). Signed and unsigned manifests share the
         // same port-record layout; signature presence is signalled by
-        // flag bit 1 (byte 14), not by a version split.
+        // flag bit 1 (byte 12), not by a version split.
         buf.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
         buf.push(MANIFEST_VERSION);
         buf.push(self.ports.len() as u8);
@@ -3011,8 +3105,7 @@ impl Manifest {
         buf.push(self.dependencies.len() as u8);
         buf.extend_from_slice(&self.module_version.to_le_bytes());
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
-        buf.extend_from_slice(&self.state_bytes_64.to_le_bytes());
-        // byte 14: bit 0 = has_integrity, bit 1 = has_signature,
+        // byte 12 (`MANIFEST_FLAGS_AT`): bit 0 = has_integrity, bit 1 = has_signature,
         //          bit 2 = isr_safe (author attestation; the
         //                  **build-time** `validate_isr_tier_admission`
         //                  in `tools/src/config/builder.rs` is the gate
@@ -3031,20 +3124,20 @@ impl Manifest {
         //                  the module from `domain_exec_order`.
         //          bit 4 = ABI-surface attestation block present.
         //          bit 5 = port-capacity block present.
-        //          bit 6 = stack block present.
-        //          bit 7 = arena block present.
         let flags = (if has_integrity { 1 } else { 0 })
             | (if has_signature { 2 } else { 0 })
             | (if self.isr_safe { 4 } else { 0 })
             | (if self.pre_tick_drain { 8 } else { 0 })
             | (if has_abi_surface { 0x10 } else { 0 })
-            | (if has_port_capacity { 0x20 } else { 0 })
-            | (if has_stack { 0x40 } else { 0 })
-            | (if has_arena { 0x80 } else { 0 });
+            | (if has_port_capacity { 0x20 } else { 0 });
         buf.push(flags);
-        // byte 15: fine-grained permissions bitmap (see `permission::*`).
-        // The kernel reads this byte directly at module instantiation.
+        // byte 13: provided contracts, listed after the arena block.
+        buf.push(self.provider_contracts.len() as u8);
+        // bytes 14..16: fine-grained permissions bitmap (see `permission::*`).
+        // The kernel reads this directly at module instantiation.
         buf.extend_from_slice(&self.permissions.bits.to_le_bytes());
+        // bytes 16..20: one instance's state in 64-byte units.
+        buf.extend_from_slice(&self.state_bytes_64.to_le_bytes());
 
         // Ports (4 bytes each: direction, content_type, flags, index).
         // Byte 3 is the per-direction port index (0..15) the TOML
@@ -3084,14 +3177,11 @@ impl Manifest {
             }
         }
 
-        // Stack block (flag bit 6).
-        if has_stack {
-            buf.extend_from_slice(&self.stack_bytes_64.to_le_bytes());
-        }
-
-        // Arena block (flag bit 7).
-        if has_arena {
-            buf.extend_from_slice(&self.arena_bytes.to_le_bytes());
+        // Stack, arena and provided contracts: every module states them.
+        buf.extend_from_slice(&self.stack_bytes_64.to_le_bytes());
+        buf.extend_from_slice(&self.arena_bytes.to_le_bytes());
+        for id in &self.provider_contracts {
+            buf.extend_from_slice(&id.to_le_bytes());
         }
 
         // Integrity hash (32 bytes)
@@ -3146,24 +3236,31 @@ impl Manifest {
         let dependency_count = data[7] as usize;
         let module_version = u16::from_le_bytes([data[8], data[9]]);
         let hardware_targets = u16::from_le_bytes([data[10], data[11]]);
-        let state_bytes_64 = u16::from_le_bytes([data[12], data[13]]);
-        let flags = data[14];
+        use fluxor_abi::wire::fmod::{
+            MANIFEST_FLAGS_AT, MANIFEST_PERMISSIONS_AT, MANIFEST_PROVIDES_AT, MANIFEST_STATE_AT,
+        };
+        let flags = data[MANIFEST_FLAGS_AT];
+        let provides_count = data[MANIFEST_PROVIDES_AT] as usize;
+        let at = MANIFEST_PERMISSIONS_AT;
+        let permissions_bits = u16::from_le_bytes([data[at], data[at + 1]]);
+        let at = MANIFEST_STATE_AT;
+        let state_bytes_64 =
+            u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
         let has_integrity = (flags & 0x01) != 0;
         let has_signature = (flags & 0x02) != 0;
         let isr_safe = (flags & 0x04) != 0;
         let pre_tick_drain = (flags & 0x08) != 0;
         let has_abi_surface = (flags & 0x10) != 0;
         let has_port_capacity = (flags & 0x20) != 0;
-        let has_stack = (flags & 0x40) != 0;
-        let permissions_bits = u16::from_le_bytes([data[15], data[16]]); // fine-grained permissions bitmap (bytes 15..17)
 
         let expected_size = MANIFEST_HEADER_SIZE
             + port_count * 4
             + resource_count * 4
             + dependency_count * 8
             + if has_port_capacity { port_count * 8 } else { 0 }
-            + if has_stack { 2 } else { 0 }
-            + if flags & 0x80 != 0 { 4 } else { 0 }
+            + 2
+            + 4
+            + provides_count * 2
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -3257,28 +3354,20 @@ impl Manifest {
             }
         }
 
-        // Stack block (flag bit 6).
-        let stack_bytes_64 = if has_stack {
-            let v = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            v
-        } else {
-            0
-        };
-
-        // Arena block (flag bit 7).
-        let arena_bytes = if flags & 0x80 != 0 {
-            let v = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
-            offset += 4;
-            v
-        } else {
-            0
-        };
+        // Stack, arena and provided contracts, always present.
+        let stack_bytes_64 = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        offset += 2;
+        let arena_bytes = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        offset += 4;
+        let provider_contracts = (0..provides_count)
+            .map(|i| u16::from_le_bytes([data[offset + 2 * i], data[offset + 2 * i + 1]]))
+            .collect();
+        offset += provides_count * 2;
 
         let integrity_hash = if has_integrity {
             let mut hash = [0u8; 32];
@@ -3315,6 +3404,8 @@ impl Manifest {
             state_bytes_64,
             stack_bytes_64,
             arena_bytes,
+            provider_contracts,
+            facts: ModuleFacts::default(), // header flag bits, not manifest bytes
             ports,
             resources,
             permissions: ManifestPermissions {
@@ -3539,7 +3630,7 @@ struct TomlDimension {
 struct TomlManifest {
     version: String,
     hardware_targets: Option<Vec<String>>,
-    state_bytes_64: Option<u16>,
+    state_bytes_64: Option<u32>,
     ports: Option<Vec<TomlPort>>,
     resources: Option<Vec<TomlResource>>,
     /// Top-level `permissions = ["reconfigure", "flash_raw", …]` list —
@@ -3549,6 +3640,14 @@ struct TomlManifest {
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
     provides: Option<Vec<String>>,
+    /// Registry contracts the module serves through `module_provider_dispatch`.
+    provider_contracts: Option<Vec<String>>,
+    /// Header facts (`ModuleFacts`).
+    mailbox_safe: Option<bool>,
+    in_place_writer: Option<bool>,
+    deferred_ready: Option<bool>,
+    observes_owner_release: Option<bool>,
+    samples_pool: Option<bool>,
     /// Role/surface capability strings. Whitelisted by
     /// `CAPABILITY_NAMES`; validated and canonicalized at parse time.
     capabilities: Option<Vec<String>>,
@@ -4667,12 +4766,16 @@ mod tests {
             gates_readiness: true,
         });
         let bytes = m.to_bytes();
-        assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
-        // Section sits after the header + port records (17 + 2*4 = 25),
-        // before any hash.
-        assert_eq!(&bytes[25..29], &65536u32.to_le_bytes());
-        assert_eq!(&bytes[33..37], &1048576u32.to_le_bytes());
-        assert_eq!(&bytes[37..41], &16384u32.to_le_bytes());
+        assert_eq!(
+            bytes[fluxor_abi::wire::fmod::MANIFEST_FLAGS_AT] & 0x20,
+            0x20,
+            "capacity flag set"
+        );
+        // Section sits after the header + port records, before any hash.
+        let at = MANIFEST_HEADER_SIZE + 2 * 4;
+        assert_eq!(&bytes[at..at + 4], &65536u32.to_le_bytes());
+        assert_eq!(&bytes[at + 8..at + 12], &1048576u32.to_le_bytes());
+        assert_eq!(&bytes[at + 12..at + 16], &16384u32.to_le_bytes());
         let back = Manifest::from_bytes(&bytes).unwrap();
         assert_eq!(back.ports[0].buffer_size, 65536);
         assert_eq!(back.ports[0].max_record, 0);
@@ -4697,7 +4800,8 @@ mod tests {
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
-        assert_eq!(pb.len(), 17 + 4);
+        // Head, one port record, then the stack and arena blocks.
+        assert_eq!(pb.len(), MANIFEST_HEADER_SIZE + 4 + 2 + 4);
         assert!(Manifest::from_bytes(&pb).is_ok());
     }
 
@@ -4788,7 +4892,8 @@ mod tests {
     fn empty_manifest_roundtrip() {
         let m = Manifest::default();
         let bytes = m.to_bytes();
-        assert_eq!(bytes.len(), MANIFEST_HEADER_SIZE);
+        // The head, then the stack and arena blocks every manifest carries.
+        assert_eq!(bytes.len(), MANIFEST_HEADER_SIZE + 2 + 4);
         let m2 = Manifest::from_bytes(&bytes).unwrap();
         assert_eq!(m2.module_version, m.module_version);
         assert!(m2.ports.is_empty());

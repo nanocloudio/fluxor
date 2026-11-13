@@ -225,7 +225,7 @@ boot2_src = "0x400e0000"
 # ip stack wants sixteen of them and does not fit in 32 KiB. Module state
 # is sized by the same graph with tls on top.
 #
-# The figures are read from `module_state_size` in the linked artefacts,
+# The figures are the state sizes the modules' manifests state (`module_facts!`),
 # never estimated: a networked graph fits RP2040's 64 KiB arena, which an
 # estimate overstated by half.
 #

@@ -1521,13 +1521,7 @@ unsafe fn service_net(s: &mut NbdState) {
 
 // ── Module ABI ───────────────────────────────────────────────────────────
 
-fluxor_rt::declare_module_state_bytes!(NbdState);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<NbdState>()
-}
+fluxor_rt::module_facts! { state: NbdState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

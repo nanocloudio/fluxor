@@ -20,32 +20,19 @@ SECTIONS
 {
     .text : {
         _code_start = .;
-        KEEP(*(.text.module_state_size*))
+        /* The entry points (the registry's `entry_point` list, held equal
+         * by `tools/tests/module_ld_keeps_the_entry_points.rs`): the kernel
+         * finds them by export hash, so nothing in the module references
+         * them and --gc-sections would discard them unless kept here. */
         KEEP(*(.text.module_init*))
         KEEP(*(.text.module_new*))
         KEEP(*(.text.module_step*))
         KEEP(*(.text.module_pipeline_refill*))
         KEEP(*(.text.module_post_tick_flush*))
-        KEEP(*(.text.module_channel_hints*))
-        KEEP(*(.text.module_in_place_safe*))
-        KEEP(*(.text.module_mailbox_safe*))
-        KEEP(*(.text.module_deferred_ready*))
         KEEP(*(.text.module_drain*))
-        KEEP(*(.text.module_arena_size*))
-        KEEP(*(.text.module_provider_dispatch*))
-        KEEP(*(.text.module_provides_contract*))
-        KEEP(*(.text.module_provides_contracts*))
-        /* Instance selector for a keyed provider, and the owner-release
-         * subscription marker. Both are resolved by the loader through
-         * `get_export_addr`, so nothing in the module references them and
-         * --gc-sections discards them unless they are kept here. */
-        KEEP(*(.text.module_provider_selector*))
-        KEEP(*(.text.module_observes_owner_release*))
-        KEEP(*(.text.module_samples_pool*))
-        KEEP(*(.text.module_flash_store_dispatch*))
-        KEEP(*(.text.module_isr_init*))
         KEEP(*(.text.module_isr_entry*))
-        KEEP(*(.text.backing_provider_dispatch*))
+        KEEP(*(.text.module_provider_dispatch*))
+        KEEP(*(.text.module_provider_selector*))
         *(.text*)
         . = ALIGN(8);
     } > FLASH

@@ -4,7 +4,7 @@
 //
 //     fluxor_rt::wasm_entry!();
 //
-// after defining `module_state_size`, `module_init`, `module_new`,
+// after `fluxor_rt::module_facts!` and its `module_init`, `module_new`,
 // and `module_step` with the standard PIC signatures. On non-wasm
 // targets it expands to nothing.
 //
@@ -23,9 +23,10 @@
 //      `in_chan` / `out_chan` / `ctrl_chan` are the module's slot-0
 //      ports (or -1 when undeclared); modules with extra ports look
 //      them up inside their own `module_new` via `dev_channel_port`.
-//      `arena_size` comes from the module's optional
-//      `module_arena_size` export, probed by the kernel-side wasm
-//      shim and passed through here.
+//      `arena_size` is the kernel's figure for the instance when it has
+//      one (non-zero); otherwise the module's own `MODULE_ARENA_BYTES`
+//      from `module_facts!`, as a wasm payload carries no symbols for
+//      the packer to read the figure from.
 //
 //   `module_step_wasm() -> i32`
 //      Reads the state pointer stashed by `module_init_wasm` and
@@ -37,7 +38,6 @@ macro_rules! wasm_entry {
         #[cfg(target_arch = "wasm32")]
         mod __wasm_entry {
             // Module handler signatures (PIC ABI):
-            //   module_state_size() -> u32
             //   module_init(syscalls: *const c_void)
             //   module_new(in_chan, out_chan, ctrl_chan,
             //              params, params_len, state, state_size, syscalls) -> i32
@@ -45,7 +45,9 @@ macro_rules! wasm_entry {
             //
             // The state struct stashes the `syscalls` pointer at `module_new`
             // time, so `module_step` only needs the state pointer.
-            use super::{module_init, module_new, module_state_size, module_step};
+            use super::{
+                module_init, module_new, module_step, MODULE_ARENA_BYTES, MODULE_STATE_BYTES,
+            };
             use $crate::abi::SyscallTable;
             use $crate::{wasm_heap_init, WASM_SYSCALLS};
 
@@ -71,14 +73,17 @@ macro_rules! wasm_entry {
                 // shapes are raw-pointer-equivalent at the wasm32 ABI level,
                 // so each call below transmutes through a fn-pointer of the
                 // canonical shape.
-                let state_size = unsafe {
-                    let f: extern "C" fn() -> u32 =
-                        core::mem::transmute(module_state_size as *const ());
-                    f() as usize
-                };
+                let state_size = MODULE_STATE_BYTES;
 
                 unsafe {
-                    wasm_heap_init(state_size, arena_size as usize);
+                    wasm_heap_init(
+                        state_size,
+                        if arena_size != 0 {
+                            arena_size as usize
+                        } else {
+                            MODULE_ARENA_BYTES
+                        },
+                    );
                 }
 
                 // Two-phase params fetch: size query with `arg=null`, then

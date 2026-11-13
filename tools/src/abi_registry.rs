@@ -36,6 +36,21 @@ pub struct Registry {
     pub contract: Vec<Contract>,
     #[serde(default)]
     pub msgset: Vec<Msgset>,
+    #[serde(default)]
+    pub entry_point: Vec<EntryPoint>,
+}
+
+/// A function the kernel calls in a module, found by the FNV-1a hash of its
+/// name in the `.fmod` export table. These are a module's only exports: every
+/// static fact about a module is in its manifest.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryPoint {
+    pub name: String,
+    /// Every module defines it.
+    #[serde(default)]
+    pub required: bool,
+    pub doc: Option<String>,
 }
 
 /// Channel message types that share one TLV header: every value is unique
@@ -110,6 +125,10 @@ pub struct Contract {
     /// A module manifest may name it (`requires_contract`, `provides`).
     #[serde(default)]
     pub manifest: bool,
+    /// A module may serve it as a provider (`provider_contracts`): the
+    /// kernel registers a module for no other contract.
+    #[serde(default)]
+    pub module_provided: bool,
     /// Permission every op of the entry requires unless the op says
     /// otherwise; absent, the ops require none.
     pub permission: Option<String>,
@@ -220,6 +239,22 @@ pub fn parse(text: &str) -> Result<Registry> {
 /// Every rule the registry must satisfy; all violations, not the first.
 pub fn validate(r: &Registry) -> Result<()> {
     let mut bad: Vec<String> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut hashes = BTreeSet::new();
+    for e in &r.entry_point {
+        if !seen.insert(e.name.as_str()) {
+            bad.push(format!("entry point `{}` declared twice", e.name));
+        }
+        if !e.name.starts_with("module_") {
+            bad.push(format!("entry point `{}`: names start `module_`", e.name));
+        }
+        if !hashes.insert(fluxor_abi::wire::fnv1a32(e.name.as_bytes())) {
+            bad.push(format!(
+                "entry point `{}`: its hash collides with another's",
+                e.name
+            ));
+        }
+    }
     let perms: BTreeSet<&str> = r.permission.iter().map(|p| p.name.as_str()).collect();
     let mut seen = BTreeSet::new();
     let mut bits = BTreeSet::new();
@@ -497,6 +532,41 @@ pub fn emit(r: &Registry) -> String {
     }
     let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n}}\n");
 
+    // Entry points.
+    let _ = writeln!(
+        w,
+        "/// The functions the kernel calls in a module, by the FNV-1a hash of\n\
+         /// their names: a module exports these and nothing else.\npub mod entry_point {{"
+    );
+    for e in &r.entry_point {
+        if let Some(d) = &e.doc {
+            let _ = writeln!(w, "    /// {d}");
+        }
+        let _ = writeln!(
+            w,
+            "    pub const {}: u32 = {:#010x};",
+            shout(&e.name),
+            fluxor_abi::wire::fnv1a32(e.name.as_bytes())
+        );
+    }
+    let _ = writeln!(w, "\n    /// Every entry point, by name.");
+    let _ = writeln!(
+        w,
+        "    pub const NAMES: [&str; {}] = [",
+        r.entry_point.len()
+    );
+    for e in &r.entry_point {
+        let _ = writeln!(w, "        \"{}\",", e.name);
+    }
+    let _ = writeln!(w, "    ];");
+    let _ = writeln!(w, "    /// The entry points every module defines.");
+    let req: Vec<&EntryPoint> = r.entry_point.iter().filter(|e| e.required).collect();
+    let _ = writeln!(w, "    pub const REQUIRED: [&str; {}] = [", req.len());
+    for e in req {
+        let _ = writeln!(w, "        \"{}\",", e.name);
+    }
+    let _ = writeln!(w, "    ];\n}}\n");
+
     // Errno and poll.
     let _ = writeln!(w, "/// Negative return values.\npub mod errno {{");
     for e in &r.errno {
@@ -552,6 +622,26 @@ pub fn emit(r: &Registry) -> String {
         let _ = writeln!(w, "        {:#06x} => Some(\"{}\"),", c.id, c.name);
     }
     let _ = writeln!(w, "        _ => None,\n    }}\n}}\n");
+    let _ = writeln!(
+        w,
+        "/// Whether a module may serve the contract as a provider\n\
+         /// (`provider_contracts`); the kernel registers a module for no other.\n\
+         pub fn module_providable(id: u16) -> bool {{\n    matches!(\n        id,"
+    );
+    let providable: Vec<String> = by_id
+        .iter()
+        .filter(|c| c.module_provided)
+        .map(|c| format!("{:#06x}", c.id))
+        .collect();
+    let _ = writeln!(
+        w,
+        "        {}\n    )\n}}\n",
+        if providable.is_empty() {
+            "_ if false".to_string()
+        } else {
+            providable.join(" | ")
+        }
+    );
     let manifest: Vec<&Contract> = r.contract.iter().filter(|c| c.manifest).collect();
     let _ = writeln!(
         w,

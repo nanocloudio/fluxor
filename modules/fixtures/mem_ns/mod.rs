@@ -224,13 +224,7 @@ struct MemNsState {
     log_len: u16,
 }
 
-fluxor_rt::declare_module_state_bytes!(MemNsState);
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<MemNsState>() as u32
-}
+fluxor_rt::module_facts! { state: MemNsState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
@@ -1079,15 +1073,6 @@ fn changes_relist(s: &MemNsState, prefix: &[u8], tok: &[u8], out: &mut [u8]) -> 
 }
 
 // ── provider exports ───────────────────────────────────────────────
-
-#[cfg_attr(
-    not(feature = "host-test"),
-    link_section = ".text.module_provides_contract"
-)]
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-pub extern "C" fn module_provides_contract() -> u32 {
-    abi::registry::storage_namespace::ID as u32
-}
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this

@@ -113,7 +113,7 @@ pub use super::super::registry::reconfigure::OWNER_RESUME;
 // behalf while the owner handle is still valid and the provider is still live.
 //
 // It is delivered only to providers that opted in by exporting
-// `module_observes_owner_release`; a provider that has not is never called
+// `observes_owner_release = true` in its manifest; a provider that has not is never called
 // with this opcode. The kernel ignores the return value — a provider that
 // answers `-ENOSYS` is simply one with nothing to release.
 

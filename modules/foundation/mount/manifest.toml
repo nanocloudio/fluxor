@@ -9,6 +9,7 @@ timer_class = "wall_clock"
 # only this module's `mounts:` config knows the volume set.
 # See docs/architecture/storage_capability_surface.md.
 provides = ["file.data"]
+provider_contracts = ["fs"]
 
 # Every op it routes goes to a volume through `provider_call_sel`, under
 # this module's own `fs` grant: the kernel checks the module that makes the

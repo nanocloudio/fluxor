@@ -634,12 +634,10 @@ pub fn instantiate_one_module(
     let name = found_module.name_str();
     let static_name = NameArena::intern(name);
 
-    // Validate integrity/signature BEFORE any module export runs or any
-    // manifest metadata is trusted. The `module_arena_size` export below is
-    // module code, and `start_new` (which also validates) runs only after it —
-    // so without an early gate here unverified native code executes. This is
-    // redundant with start_new's check by design: defense in depth at the two
-    // points where module code first becomes reachable.
+    // Validate integrity/signature BEFORE any module code runs or any
+    // manifest metadata is trusted. This is redundant with start_new's check
+    // by design: defense in depth at the two points where module code first
+    // becomes reachable.
     if let Err(e) = crate::kernel::module::loader::validate_module(&found_module, static_name) {
         e.log("validate");
         return InstantiateResult::Error(-1);
@@ -661,7 +659,7 @@ pub fn instantiate_one_module(
             4 => 2, // EventHandler → CAP_SERVICE_GPIO
             _ => 0, // Source, Transformer → CAP_SERVICE
         };
-        sched.required_caps[instantiated] = found_module.header.required_caps();
+        sched.required_caps[instantiated] = found_module.header.required_caps;
         sched.permissions[instantiated] = found_module.manifest_permissions();
         // Boot-time record of what the capability gate will enforce for
         // this slot: the packed .fmod HEADER value (`required_caps()`),
@@ -677,15 +675,15 @@ pub fn instantiate_one_module(
             sched.cap_class[instantiated],
             sched.permissions[instantiated],
         );
-        // Store export table info for resolve_export_for_module
+        // The code region provider pointers are validated against.
         sched.module_code_base[instantiated] = found_module.code_base() as usize;
         sched.module_code_size[instantiated] = found_module.header.code_size;
-        sched.module_export_table[instantiated] = found_module.export_table_ptr();
-        sched.module_export_count[instantiated] = found_module.header.export_count;
-        let flags_byte = found_module.header.reserved[0];
-        sched.mailbox_safe[instantiated] = (flags_byte & 0x01) != 0;
-        sched.in_place_writer[instantiated] = (flags_byte & 0x02) != 0;
-        let deferred = (flags_byte & 0x04) != 0;
+        let flags_byte = found_module.header.flags;
+        sched.mailbox_safe[instantiated] =
+            (flags_byte & crate::abi::wire::fmod::header::flag::MAILBOX_SAFE) != 0;
+        sched.in_place_writer[instantiated] =
+            (flags_byte & crate::abi::wire::fmod::header::flag::IN_PLACE_WRITER) != 0;
+        let deferred = (flags_byte & crate::abi::wire::fmod::header::flag::DEFERRED_READY) != 0;
         sched.deferred_ready[instantiated] = deferred;
         if deferred {
             sched.ready[instantiated] = false;
@@ -769,7 +767,7 @@ pub fn instantiate_one_module(
             // Record step period before returning
             // SAFETY: scheduler-thread context; instantiated bounded.
             unsafe {
-                SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
+                SCHED.step_period[instantiated] = found_module.header.step_period;
                 // Apply the manifest's `step_phase` as the initial
                 // counter value. With period P and phase φ, the first
                 // eligible tick is at `P - φ`, so coarse-period
@@ -778,7 +776,7 @@ pub fn instantiate_one_module(
                 // the clamp here is defense in depth so a malformed
                 // header can't index modulo 0.
                 let period = SCHED.step_period[instantiated];
-                let phase = found_module.header.step_phase();
+                let phase = found_module.header.step_phase;
                 SCHED.step_counter[instantiated] = if period > 0 { phase % period } else { 0 };
             }
             return InstantiateResult::Pending(pending);
@@ -792,10 +790,10 @@ pub fn instantiate_one_module(
     // Record step frequency hint from module header
     // SAFETY: scheduler-thread context; instantiated bounded.
     unsafe {
-        SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
+        SCHED.step_period[instantiated] = found_module.header.step_period;
         // See Pending arm above — same step_phase initialisation.
         let period = SCHED.step_period[instantiated];
-        let phase = found_module.header.step_phase();
+        let phase = found_module.header.step_phase;
         SCHED.step_counter[instantiated] = if period > 0 { phase % period } else { 0 };
     }
 

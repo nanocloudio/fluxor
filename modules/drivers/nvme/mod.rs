@@ -3323,19 +3323,7 @@ unsafe fn v1_exec(s: &mut NvmeState, arg: *mut u8) -> i32 {
 // Module ABI
 // ============================================================================
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-fluxor_rt::declare_module_state_bytes!(NvmeState);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<NvmeState>()
-}
+fluxor_rt::module_facts! { state: NvmeState }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

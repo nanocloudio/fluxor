@@ -225,21 +225,7 @@ mod params_def {
 /// header (8 B), its rounding to the allocator's 16-byte granularity and
 /// the 4-byte canary under `canary_enabled`, within 64 B.
 const ARENA_BASE: u32 = 64;
-fluxor_rt::declare_module_arena_bytes!(ARENA_BASE);
-
-fluxor_rt::declare_module_state_bytes!(State);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    ARENA_BASE
-}
+fluxor_rt::module_facts! { state: State, arena: ARENA_BASE }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

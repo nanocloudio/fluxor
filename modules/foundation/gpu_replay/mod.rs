@@ -149,23 +149,9 @@ pub struct GpuNullState {
     faulted: bool,
 }
 
-const STATE_SIZE: usize = core::mem::size_of::<GpuNullState>();
-
 // ── Entry points ────────────────────────────────────────────────────────
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
-pub extern "C" fn module_state_size() -> u32 {
-    STATE_SIZE as u32
-}
-
-fluxor_rt::declare_module_arena_bytes!(HEAP_BYTES);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_arena_size")]
-pub extern "C" fn module_arena_size() -> u32 {
-    HEAP_BYTES
-}
+fluxor_rt::module_facts! { state: GpuNullState, arena: HEAP_BYTES }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -190,7 +176,7 @@ pub unsafe extern "C" fn module_new(
     _state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: the loader hands a state block of at least `module_state_size()`
+    // SAFETY: the loader hands a state block of at least `MODULE_STATE_BYTES`
     // bytes, aligned for this type, and calls `module_new` exactly once for it.
     let s = unsafe { &mut *(state as *mut GpuNullState) };
     let syscalls = syscalls as *const SyscallTable;
@@ -211,7 +197,7 @@ pub unsafe extern "C" fn module_new(
     s.faulted = false;
 
     // SAFETY: `syscalls` is the loader's live table for this module, and the
-    // heap it draws from was sized by `module_arena_size` above.
+    // heap it draws from was sized by the manifest arena (`module_facts!` above).
     let sys = unsafe { &*syscalls };
     s.cmd_buf = unsafe { (sys.heap_alloc)(CMD_BUF as u32) };
     s.ring = unsafe { (sys.heap_alloc)(RING_BYTES as u32) };

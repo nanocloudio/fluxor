@@ -10,6 +10,7 @@ provides = ["storage.object", "storage.namespace"]
 
 # No tick-based timekeeping: a pure provider_call surface.
 timer_class = "agnostic"
+provider_contracts = ["storage.object", "storage.namespace"]
 
 # Every op is answered from the filesystem the graph wires underneath.
 [[resources]]

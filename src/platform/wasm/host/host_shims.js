@@ -2571,12 +2571,6 @@ registerProcessor('pcm-ring', PcmRing);
         }
         return 0;
       },
-      host_module_export_exists: (handle, namePtr, nameLen) => {
-        const inst = moduleInstances.get(handle);
-        if (!inst) return -2;
-        const name = kstr(namePtr, nameLen);
-        return typeof inst.exports[name] === 'function' ? 1 : 0;
-      },
       host_destroy_module: (handle) => moduleInstances.delete(handle) ? 0 : -1,
     };
 

@@ -996,7 +996,7 @@ rest of the stack can work. The scheduler integrates this through the
 deferred-ready mechanism:
 
 - A module that needs initialisation time exports
-  `module_deferred_ready`; the pack tool sets header flag bit 2
+  `deferred_ready = true` in its manifest; the pack tool sets header flag bit 2
   (`deferred_ready`) on the `.fmod`.
 - The scheduler gates downstream modules until upstream ready signals
   arrive; when a module returns `StepOutcome::Ready` (3) from a step,

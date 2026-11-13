@@ -173,13 +173,7 @@ impl I2sState {
 // PIC Module Interface
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(I2sState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<I2sState>() as u32
-}
+fluxor_rt::module_facts! { state: I2sState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -521,14 +515,6 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
     }
 
     0
-}
-
-/// Declare that the I2S module can safely consume from mailbox channels: it
-/// reads them with `channel_read` and never modifies a buffer in place.
-#[no_mangle]
-#[link_section = ".text.module_mailbox_safe"]
-pub extern "C" fn module_mailbox_safe() -> i32 {
-    1
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

@@ -632,18 +632,7 @@ unsafe fn open_image(s: &mut FileBlockState) -> i32 {
     0
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<FileBlockState>()
-}
-
-/// Consumers wait for the image to open: `Ready` gates them.
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
+fluxor_rt::module_facts! { state: FileBlockState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

@@ -5697,16 +5697,11 @@ unsafe fn evaluate_update(
 // PIC Module Interface
 // ============================================================================
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<DnsState>() as u32
-}
+fluxor_rt::module_facts! { state: DnsState }
 
 // Same figure as data, so `pack` records it and a resolver-bearing graph's arena
 // demand is summable at compose time. It matters here more than most: `dns` is
 // the second-largest term in a Pico W graph after the wireless stack.
-fluxor_rt::declare_module_state_bytes!(DnsState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

@@ -717,13 +717,7 @@ unsafe fn heartbeat(s: &mut RtState) {
     dev_log(&*s.syscalls, 3, line.as_ptr(), at);
 }
 
-fluxor_rt::declare_module_state_bytes!(RtState);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<RtState>() as u32
-}
+fluxor_rt::module_facts! { state: RtState, arena: 0 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -815,10 +809,5 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     if s.step_count.is_multiple_of(LOG_PERIOD) {
         heartbeat(s);
     }
-    0
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-pub extern "C" fn module_arena_size() -> u32 {
     0
 }

@@ -101,13 +101,7 @@ unsafe fn fail(s: &mut ProbeState, rc: i32) {
     say(s);
 }
 
-fluxor_rt::declare_module_state_bytes!(ProbeState);
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<ProbeState>()
-}
+fluxor_rt::module_facts! { state: ProbeState }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

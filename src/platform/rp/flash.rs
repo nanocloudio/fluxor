@@ -119,50 +119,6 @@ pub mod store {
     }
 
     // ============================================================================
-    // Flash store dispatch — registered by flash module at runtime
-    // ============================================================================
-
-    /// Dispatch function signature: (state, opcode, arg, arg_len) -> i32.
-    /// Matches the flash module's `flash_store_dispatch` export.
-    pub type FlashStoreDispatchFn =
-        unsafe extern "C" fn(state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
-
-    /// Registered dispatch function (None = flash module not wired).
-    static mut STORE_DISPATCH: Option<FlashStoreDispatchFn> = None;
-    /// State pointer for the registered dispatch function.
-    static mut STORE_STATE: *mut u8 = core::ptr::null_mut();
-
-    /// Register the flash module's dispatch function. Called via FLASH_STORE_ENABLE.
-    pub fn register_dispatch(dispatch: FlashStoreDispatchFn, state: *mut u8) -> i32 {
-        // SAFETY: STORE_DISPATCH / STORE_STATE are set once during
-        // FLASH_STORE_ENABLE on the scheduler thread; EBUSY guard prevents
-        // double registration.
-        unsafe {
-            let p = &raw const STORE_DISPATCH;
-            if (*p).is_some() {
-                return crate::kernel::sys::errno::EBUSY;
-            }
-            STORE_DISPATCH = Some(dispatch);
-            STORE_STATE = state;
-        }
-        0
-    }
-
-    /// Forward a param operation to the flash module's dispatch function.
-    /// Returns ENOSYS if no flash module is registered.
-    pub fn dispatch_param_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-        // SAFETY: STORE_DISPATCH is set once at boot; the registered dispatch
-        // function is the flash module's own export. We forward the caller's
-        // arg/arg_len; dispatch contract validates them.
-        unsafe {
-            match STORE_DISPATCH {
-                Some(dispatch) => dispatch(STORE_STATE, opcode, arg, arg_len),
-                None => crate::kernel::sys::errno::ENOSYS,
-            }
-        }
-    }
-
-    // ============================================================================
     // Override table (boot-time data)
     // ============================================================================
 

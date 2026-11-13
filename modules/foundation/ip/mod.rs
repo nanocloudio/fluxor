@@ -405,7 +405,7 @@ const DNS_PENDING_DEFAULT: u8 = 4;
 const DNS_PENDING_DEFAULT: u8 = 2;
 
 /// The heap cap this module asks for when the graph names none
-/// (`module_arena_size`). On aarch64 the heap is elastic — it commits what
+/// (`module_facts!`'s `arena:`). On aarch64 the heap is elastic — it commits what
 /// the tables touch, so the cap is room to declare more, not memory spent;
 /// on an MCU-class target it is committed whole, so it is what the defaults
 /// need.
@@ -4556,33 +4556,15 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
 // Module ABI
 // ============================================================================
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<IpState>()
-}
+fluxor_rt::module_facts! { state: IpState, arena: HEAP_DEFAULT_BYTES }
 
 // The same figure as data, so `pack` records this module's resident footprint in
 // its manifest and a graph's state-arena demand can be summed host-side. `ip` is
 // the module that most needs it: at the embedded profile's 16-entry TCP table it
 // measures 59,400 bytes, which is 90% of an RP2040's whole 64 KiB state arena.
-fluxor_rt::declare_module_state_bytes!(IpState);
 
 // The heap the declared tables are sized into (see "Declared capacities"):
 // elastic on aarch64, so the cap costs only what the tables touch.
-fluxor_rt::declare_module_arena_bytes!(HEAP_DEFAULT_BYTES);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    HEAP_DEFAULT_BYTES
-}
 
 /// PIC module ABI entry: one-time initialisation. The kernel calls this
 /// once during loader bring-up before any `module_new` invocation.

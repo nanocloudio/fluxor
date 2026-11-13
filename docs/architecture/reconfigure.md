@@ -82,20 +82,16 @@ A provider that holds resources on a consumer's behalf — scratch objects, open
 files, staged writes — is told when that consumer's owner is torn down, so it
 can reclaim them instead of holding them until the next reset.
 
-Subscribe by exporting a marker:
+Subscribe in the manifest:
 
-```rust
-#[no_mangle]
-#[link_section = ".text.module_observes_owner_release"]
-pub extern "C" fn module_observes_owner_release() -> u32 {
-    1
-}
+```toml
+observes_owner_release = true
 ```
 
-The loader reads the marker after provider registration succeeds; a module that
-registers no contract has no dispatch to call and is refused. A module that does
-not export it is never notified, so a provider holding nothing per consumer pays
-nothing.
+The packer carries it as a header flag; the loader acts on it after provider
+registration succeeds, and a module that registers no contract has no dispatch
+to call and is refused. A module that does not say so is never notified, so a
+provider holding nothing per consumer pays nothing.
 
 The kernel then calls `module_provider_dispatch` with opcode `OWNER_RELEASED`
 (`0x2022`) and an 8-byte argument:
@@ -140,17 +136,13 @@ A pool can be served by a module provider instead of a kernel table — the
 store's subscriptions (`POOL_STORE_SUBS`) when a module provides
 `storage.namespace` (`resource::module_provided_pool_contract`). The resource
 ledger keeps no counters; it samples each pool from its owner, so for such a
-pool it asks the provider. Opt in with a second marker:
+pool it asks the provider. Opt in with a second manifest fact:
 
-```rust
-#[no_mangle]
-#[link_section = ".text.module_samples_pool"]
-pub extern "C" fn module_samples_pool() -> u32 {
-    1
-}
+```toml
+samples_pool = true
 ```
 
-As with the owner-release marker, the loader reads it after provider
+As with the owner-release fact, the loader acts on it after provider
 registration succeeds, refuses it from a module that registers no contract,
 and drops it with the module's provider layers. The node's server of the pool
 is the system owner's top-most unkeyed layer of its contract.
@@ -310,6 +302,6 @@ modules would see under an atomic reconfigure.
 | 1 | in_place_writer | Uses buffer_acquire_inplace |
 | 2 | deferred_ready | Needs init time before downstream runs |
 | 3 | drain_capable | Exports module_drain for live reconfigure |
-| 4 | isr_module | Exports module_isr_init / module_isr_entry (Tier 2) |
+| 4 | isr_module | Defines module_isr_entry (Tier 2) |
 | 5 | wasm_payload | Module body is a wasm payload (set by `pack_fmod_wasm`, read by `src/platform/wasm.rs`) |
 | 6-7 | reserved | Must be 0 |

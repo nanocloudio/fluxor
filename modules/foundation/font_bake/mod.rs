@@ -86,8 +86,7 @@ pub struct State {
     diag_len: usize,
 }
 
-fluxor_rt::declare_module_state_bytes!(State);
-fluxor_rt::declare_module_arena_bytes!(ARENA_BYTES);
+fluxor_rt::module_facts! { state: State, arena: ARENA_BYTES }
 
 fn copy_param(dst: &mut [u8], len: &mut usize, d: *const u8, n: usize) {
     if n == 0 || n > dst.len() {
@@ -359,19 +358,6 @@ fn send(sys: &SyscallTable, chan: i32, buf: &[u8], sent: &mut usize) -> bool {
 }
 
 // --- Module ABI ----------------------------------------------------------
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
-
-/// The heap arena, for a loader that asks instead of reading the manifest.
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_arena_size")]
-pub extern "C" fn module_arena_size() -> u32 {
-    ARENA_BYTES
-}
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]

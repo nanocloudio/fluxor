@@ -250,15 +250,10 @@ unsafe fn soft_reset(s: &Enc28State) {
 // Module API
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<Enc28State>() as u32
-}
+fluxor_rt::module_facts! { state: Enc28State }
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(Enc28State);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

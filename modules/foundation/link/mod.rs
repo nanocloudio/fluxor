@@ -7,7 +7,7 @@
 //!   - mode 2 (bidir): both directions simultaneously.
 //!
 //! Uses two UART handles for full duplex (one TX, one RX).
-//! Exports `module_deferred_ready`, so downstream modules wait for its Ready:
+//! Declares `deferred_ready`, so downstream modules wait for its Ready:
 //! TX reports it once its UART is configured, RX and bidir once the jitter
 //! buffer has filled.
 //!
@@ -453,13 +453,7 @@ struct LinkState {
 // PIC Module Interface
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(LinkState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<LinkState>() as u32
-}
+fluxor_rt::module_facts! { state: LinkState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1148,18 +1142,6 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
         }
         s.last_beacon_ms = now_ms;
     }
-}
-
-#[no_mangle]
-#[link_section = ".text.module_mailbox_safe"]
-pub extern "C" fn module_mailbox_safe() -> i32 {
-    1
-}
-
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> i32 {
-    1
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

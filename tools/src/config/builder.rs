@@ -1237,10 +1237,9 @@ fn validate_isr_tier_admission(
             // so a Tier 2 module missing the entry point fails the graph
             // build instead of getting refused on the rig. (Tier 1b —
             // `exec_mode == 2` — dispatches the cooperative step from a
-            // polled timer and needs no ISR entry. `module_isr_init` is
-            // a reserved ABI symbol nothing calls — Tier 2 construction
+            // polled timer and needs no ISR entry; Tier 2 construction
             // goes through the normal cooperative `module_new`, same as
-            // Tier 1b — so it is intentionally not required here.)
+            // Tier 1b.)
             if exec_mode == 4 {
                 if let Err(e) = crate::manifest::check_module_exports_isr_entry(&root) {
                     return Err(Error::Config(format!(

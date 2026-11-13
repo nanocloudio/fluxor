@@ -11,7 +11,7 @@
 //! quarantined module's memory. No other core allocates or frees module
 //! state, so the state arena needs no lock; other cores read only the
 //! word-sized occupancy figures. See `docs/architecture/concurrency.md`.
-use crate::abi::wire::fmod::{signing_envelope, ManifestLayout};
+use crate::abi::wire::fmod::{signing_envelope, ManifestLayout, MANIFEST_MAGIC};
 use crate::abi::SyscallTable;
 use crate::fnv1a32;
 use crate::kernel::boot::config::read_layout;
@@ -39,27 +39,9 @@ const MODULE_SIGNING_ROOT: Option<[u8; 32]> =
 // ============================================================================
 // Constants
 // ============================================================================
-/// Pre-computed export hashes for standard module interface
-pub mod export_hashes {
-    pub const MODULE_STATE_SIZE: u32 = 0x74f40805; // "module_state_size"
-    pub const MODULE_INIT: u32 = 0xfb8dc9bc; // "module_init"
-    pub const MODULE_NEW: u32 = 0xe6d4ac90; // "module_new"
-    pub const MODULE_STEP: u32 = 0xc7ea2db4; // "module_step"
-    pub const MODULE_PIPELINE_REFILL: u32 = 0xc9c83859; // "module_pipeline_refill"
-    pub const MODULE_POST_TICK_FLUSH: u32 = 0x85d25b69; // "module_post_tick_flush"
-    pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
-    pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
-    pub const MODULE_DRAIN: u32 = 0xc4c5636c; // "module_drain"
-    pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03; // "module_isr_init"
-    pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743; // "module_isr_entry"
-    pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76; // "module_provider_dispatch"
-    pub const MODULE_PROVIDES_CONTRACT: u32 = 0x671c57bb; // "module_provides_contract"
-    pub const MODULE_PROVIDES_CONTRACTS: u32 = 0x199e2fd8; // "module_provides_contracts"
-    pub const MODULE_PROVIDER_SELECTOR: u32 = 0xfd70b311; // "module_provider_selector"
-    pub const MODULE_OBSERVES_OWNER_RELEASE: u32 = 0x3dc0c8a1; // "module_observes_owner_release"
-    pub const MODULE_SAMPLES_POOL: u32 = 0x479835c4; // "module_samples_pool"
-    pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
-}
+/// The module entry points by export hash: the registry's list, the same
+/// one the packer keeps exports to.
+pub use crate::abi::registry::entry_point as export_hashes;
 /// Module table magic: "FXMT"
 pub const MODULE_TABLE_MAGIC: u32 = 0x544D5846;
 /// Module magic: "FXMD"
@@ -108,7 +90,7 @@ pub use crate::abi::wire::ABI_VERSION as MODULE_ABI_VERSION;
 // a corrupt artifact, not a format it can parse. They share a value but are
 // named distinctly because they are distinct axes.
 /// Module-table envelope format version (`ModuleTableHeader.version`).
-pub const EXPECTED_TABLE_VERSION: u8 = 1;
+pub const EXPECTED_TABLE_VERSION: u16 = 1;
 /// Per-module header envelope format version (`ModuleHeader.version`,
 /// distinct from `abi_version`).
 pub const EXPECTED_MODULE_VERSION: u8 = 1;
@@ -163,9 +145,12 @@ pub enum LoaderError {
     /// An isolated module's manifest declares more stack than the isolated
     /// stack holds.
     StackTooSmall { declared: u32, available: u32 },
-    /// A gated module's manifest does not declare a footprint the loader
-    /// needs, and the loader never runs a gated module's code to ask it.
-    GatedUndeclared(&'static str),
+    /// The module's manifest does not declare a footprint the loader needs,
+    /// and the loader never runs module code to ask it.
+    Undeclared(&'static str),
+    /// The manifest names provided contracts the loader cannot register:
+    /// more than `MAX_PROVIDES`, or with no `module_provider_dispatch`.
+    BadProvides,
     /// A gated module does something the gateway cannot mediate (provides a
     /// contract, owns an interrupt).
     GatedRefused(&'static str),
@@ -222,9 +207,13 @@ impl LoaderError {
             } => log::error!(
                 "[loader] {context}: declares {declared} B of stack; isolation gives {available} B"
             ),
-            Self::GatedUndeclared(what) => log::error!(
-                "[loader] {context}: gated, but the manifest declares no {what}; rebuild it \
-                 with the SDK's declare_module_* macros"
+            Self::Undeclared(what) => log::error!(
+                "[loader] {context}: the manifest declares no {what}; rebuild it with \
+                 `fluxor_rt::module_facts!`"
+            ),
+            Self::BadProvides => log::error!(
+                "[loader] {context}: the manifest's provided contracts cannot be registered \
+                 (more than the limit, or no module_provider_dispatch)"
             ),
             Self::GatedRefused(why) => {
                 log::error!("[loader] {context}: cannot be gated: {why}")
@@ -250,7 +239,16 @@ impl LoaderError {
 /// - The memory must contain a valid ModuleTableHeader struct
 #[inline]
 unsafe fn read_table_header(ptr: *const u8) -> ModuleTableHeader {
-    core::ptr::read_volatile(ptr as *const ModuleTableHeader)
+    let h = core::slice::from_raw_parts(ptr, fmod_table::HEADER_SIZE);
+    let u16_at = |at: usize| u16::from_le_bytes([h[at], h[at + 1]]);
+    let u32_at = |at: usize| u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]]);
+    ModuleTableHeader {
+        magic: u32_at(fmod_table::MAGIC),
+        version: u16_at(fmod_table::VERSION),
+        module_count: u16_at(fmod_table::MODULE_COUNT),
+        total_size: u32_at(fmod_table::TOTAL_SIZE),
+        program_section_offset: u32_at(fmod_table::PROGRAM_SECTION_OFFSET),
+    }
 }
 /// Read a ModuleTableEntry from flash at the given index.
 ///
@@ -259,8 +257,16 @@ unsafe fn read_table_header(ptr: *const u8) -> ModuleTableHeader {
 /// - `index` must be within bounds of the table
 #[inline]
 unsafe fn read_table_entry(base: *const u8, index: usize) -> ModuleTableEntry {
-    let entry_ptr = base.add(index * 16) as *const ModuleTableEntry;
-    core::ptr::read_volatile(entry_ptr)
+    let e = core::slice::from_raw_parts(
+        base.add(index * fmod_table::ENTRY_SIZE),
+        fmod_table::ENTRY_SIZE,
+    );
+    let u32_at = |at: usize| u32::from_le_bytes([e[at], e[at + 1], e[at + 2], e[at + 3]]);
+    ModuleTableEntry {
+        name_hash: u32_at(fmod_table::ENTRY_NAME_HASH),
+        offset: u32_at(fmod_table::ENTRY_OFFSET),
+        size: u32_at(fmod_table::ENTRY_SIZE_AT),
+    }
 }
 /// Read a ModuleHeader from flash.
 ///
@@ -268,7 +274,8 @@ unsafe fn read_table_entry(base: *const u8, index: usize) -> ModuleTableEntry {
 /// - `ptr` must point to valid, aligned flash memory containing a module
 #[inline]
 unsafe fn read_module_header(ptr: *const u8) -> ModuleHeader {
-    core::ptr::read_volatile(ptr as *const ModuleHeader)
+    let h = core::slice::from_raw_parts(ptr, fmod_header::SIZE);
+    ModuleHeader::read(h).expect("a slice of the header's size")
 }
 /// Read an ExportEntry from the export table.
 ///
@@ -292,8 +299,6 @@ unsafe fn offset_ptr(base: *const u8, offset: usize) -> *const u8 {
 // ============================================================================
 // FFI types and wrappers
 // ============================================================================
-/// Function pointer type for module_state_size export
-pub type ModuleStateSizeFn = unsafe extern "C" fn() -> usize;
 /// Function pointer type for module_init export
 pub type ModuleInitFn = unsafe extern "C" fn(*const SyscallTable);
 /// Function pointer type for module_new export
@@ -326,72 +331,43 @@ pub type ModulePostTickFlushFn = unsafe extern "C" fn(*mut u8) -> i32;
 unsafe fn fn_ptr_from_addr<F: Copy>(addr: usize) -> F {
     core::mem::transmute_copy(&addr)
 }
-/// Resolved provider-auto-registration hooks for a module.
+/// A provider module's registration, resolved at load time.
 ///
-/// A PIC module is a provider for a contract when it exports both
-/// `module_provides_contract() -> u32` (returns the contract id) and
-/// `module_provider_dispatch(state, handle, op, arg, len) -> i32` (the
-/// dispatch fn). We resolve both addresses at load time and call
-/// `register_module_provider` after `module_new()` returns Ready.
-/// Modules that aren't providers leave both exports absent and this
-/// whole path is a no-op.
+/// A module provides the contracts its signed manifest names, through its
+/// `module_provider_dispatch` entry point, under the selector its optional
+/// `module_provider_selector` entry point computes from its config. The
+/// manifest also says whether it observes owner releases and samples a
+/// pool. `register` runs after `module_new` returns Ready.
 struct ProviderAutoRegister {
-    /// `module_provides_contract() -> u32`: the one contract, or absent
-    /// when the module lists several.
-    contract_fn: Option<unsafe extern "C" fn() -> u32>,
-    /// `module_provides_contracts(state, out: *mut u16, cap: u32) -> u32`:
-    /// every contract one provider state serves (a store providing its
-    /// objects and their namespace), written to `out`, their count answered
-    /// — none when the module's config says it provides nothing. Each is
-    /// registered with the same dispatch, state and selector; the dispatch
-    /// tells them apart by opcode class.
-    contracts_fn: Option<unsafe extern "C" fn(*mut u8, *mut u16, u32) -> u32>,
+    contracts: [u16; crate::abi::wire::fmod::MAX_PROVIDES],
+    count: usize,
     dispatch_fn: crate::kernel::module::provider::ModuleProviderDispatchFn,
-    /// Optional `module_provider_selector(state) -> u32` export. Present on
-    /// instance-keyed volume backends (a fat32 with a `volume:` param), which
-    /// compute their selector hash from their own config and expose it here.
-    /// Absent on ordinary single-default providers (selector 0).
+    /// Present on instance-keyed volume backends (a fat32 with a `volume:`
+    /// param); absent on single-default providers (selector 0).
     selector_fn: Option<unsafe extern "C" fn(*mut u8) -> u32>,
-    /// Present when the module exports `module_observes_owner_release`, the
-    /// marker that subscribes it to `OWNER_RELEASED` notifications. A provider
-    /// that holds per-consumer resources (scratch objects, open files) uses it
-    /// to reclaim them when the consumer's owner is torn down; one that holds
-    /// nothing per-consumer omits the export and is never called.
+    /// The provider is told when a consumer's owner is released, to reclaim
+    /// what it holds for it.
     observes_owner_release: bool,
-    /// Present when the module exports `module_samples_pool`, the marker
-    /// that has the resource ledger ask it for the in-use figure of a pool it
-    /// serves (`resource::POOL_SAMPLE`). A provider serving no
-    /// module-provided pool omits it and is never asked.
+    /// The resource ledger asks the provider for the in-use figure of a pool
+    /// it serves (`resource::POOL_SAMPLE`).
     samples_pool: bool,
 }
 impl ProviderAutoRegister {
-    /// Look for the `module_provides_contract` + `module_provider_dispatch`
-    /// export pair. Returns None if the module isn't a provider.
-    unsafe fn resolve(module: &LoadedModule) -> Option<Self> {
-        let contract_fn = module
-            .get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACT)
-            .ok()
-            .map(|addr| {
-                // SAFETY: resolved inside the module's code region; the
-                // symbol's declared C ABI is `fn() -> u32`.
-                unsafe { fn_ptr_from_addr::<unsafe extern "C" fn() -> u32>(addr) }
-            });
-        let contracts_fn = module
-            .get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACTS)
-            .ok()
-            .map(|addr| {
-                // SAFETY: as above; the declared C ABI is
-                // `fn(*mut u8, *mut u16, u32) -> u32`.
-                unsafe {
-                    fn_ptr_from_addr::<unsafe extern "C" fn(*mut u8, *mut u16, u32) -> u32>(addr)
-                }
-            });
-        if contract_fn.is_none() && contracts_fn.is_none() {
-            return None;
+    /// The module's provider registration; `Ok(None)` when its manifest names
+    /// no contract. A manifest that names contracts without a dispatch entry
+    /// point, or more than `MAX_PROVIDES`, is refused.
+    unsafe fn resolve(module: &LoadedModule) -> Result<Option<Self>, LoaderError> {
+        use crate::abi::wire::fmod::{header::flag, MAX_PROVIDES};
+        if module.manifest_provides_count() > MAX_PROVIDES {
+            return Err(LoaderError::BadProvides);
+        }
+        let (contracts, count) = module.manifest_provides();
+        if count == 0 {
+            return Ok(None);
         }
         let dispatch_addr = module
             .get_export_addr(export_hashes::MODULE_PROVIDER_DISPATCH)
-            .ok()?;
+            .map_err(|_| LoaderError::BadProvides)?;
         let selector_fn = module
             .get_export_addr(export_hashes::MODULE_PROVIDER_SELECTOR)
             .ok()
@@ -401,49 +377,24 @@ impl ProviderAutoRegister {
                 // declared C ABI is `fn(*mut u8) -> u32`.
                 unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8) -> u32>(addr) }
             });
-        let observes_owner_release = module
-            .get_export_addr(export_hashes::MODULE_OBSERVES_OWNER_RELEASE)
-            .is_ok();
-        let samples_pool = module
-            .get_export_addr(export_hashes::MODULE_SAMPLES_POOL)
-            .is_ok();
-        Some(Self {
-            contract_fn,
-            contracts_fn,
+        let flags = module.header.flags;
+        Ok(Some(Self {
+            contracts,
+            count,
             dispatch_fn: fn_ptr_from_addr(dispatch_addr),
             selector_fn,
-            observes_owner_release,
-            samples_pool,
-        })
+            observes_owner_release: flags & flag::OBSERVES_OWNER_RELEASE != 0,
+            samples_pool: flags & flag::SAMPLES_POOL != 0,
+        }))
     }
     /// Register this module as a provider. Called after module_new() Ready.
     unsafe fn register(&self, module_idx: ModuleId, state_ptr: *mut u8, name: &'static str) {
-        let mut list = [0u16; MAX_CONTRACTS_PER_PROVIDER];
-        let n = match (self.contracts_fn, self.contract_fn) {
-            (Some(f), _) => (f(
-                state_ptr,
-                list.as_mut_ptr(),
-                MAX_CONTRACTS_PER_PROVIDER as u32,
-            ) as usize)
-                .min(MAX_CONTRACTS_PER_PROVIDER),
-            (None, Some(f)) => {
-                list[0] = f() as u16;
-                1
-            }
-            (None, None) => 0,
-        };
-        // Selector 0 = unkeyed / default provider (the class-byte dispatch
-        // path). Instance-keyed volume backends supply a non-zero selector
-        // through the optional `module_provider_selector` export (called with
-        // the module's state so it can derive the key from its `volume:`
-        // config); a module without it is the single default provider at
-        // selector 0.
         let selector = match self.selector_fn {
             Some(f) => f(state_ptr),
             None => 0u32,
         };
         let mut registered = 0usize;
-        for &contract in &list[..n] {
+        for &contract in &self.contracts[..self.count] {
             let rc = crate::kernel::module::provider::register_module_provider(
                 contract,
                 module_idx,
@@ -479,10 +430,6 @@ impl ProviderAutoRegister {
         }
     }
 }
-/// Contracts one provider state may serve through
-/// `module_provides_contracts`.
-const MAX_CONTRACTS_PER_PROVIDER: usize = 4;
-
 /// Count of PIC calls that returned with interrupts disabled.
 static mut PIC_IRQ_DISABLED_COUNT: u32 = 0;
 /// Increment the IRQ-disabled counter (called by HAL pic_barrier).
@@ -498,13 +445,6 @@ pub fn increment_irq_disabled_count() {
 #[inline(always)]
 fn pic_barrier() {
     hal::pic_barrier();
-}
-/// Call module_state_size export.
-#[inline]
-unsafe fn call_state_size(f: ModuleStateSizeFn) -> usize {
-    let r = f();
-    pic_barrier();
-    r
 }
 /// Call module_init export.
 #[inline]
@@ -576,9 +516,6 @@ unsafe fn call_post_tick_flush(f: ModulePostTickFlushFn, state: *mut u8) -> i32 
 }
 /// Function pointer type for module_drain export
 pub type ModuleDrainFn = unsafe extern "C" fn(*mut u8) -> i32;
-/// Function pointer type for module_isr_init export (Tier 2 ISR modules).
-/// Called once during setup (non-ISR context) to initialize ISR-tier state.
-pub type ModuleIsrInitFn = unsafe extern "C" fn(*mut u8, *const SyscallTable) -> i32;
 /// Function pointer type for module_isr_entry export (Tier 2 ISR modules).
 /// Called from the IRQ handler. Returns i32 status (0 = ok, <0 = error).
 pub type ModuleIsrEntryFn = unsafe extern "C" fn(*mut u8) -> i32;
@@ -1868,173 +1805,27 @@ pub fn state_free_list_usage() -> (usize, usize) {
 // ============================================================================
 // Table types
 // ============================================================================
-/// Module table header (16 bytes)
-#[repr(C)]
+// The on-disk layouts are `abi::wire::fmod::{header, table}`: the packer
+// writes them and every reader reads them from that one definition.
+pub use crate::abi::wire::fmod::header::Header as ModuleHeader;
+use crate::abi::wire::fmod::{header as fmod_header, table as fmod_table};
+/// The module table's header (`abi::wire::fmod::table`).
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleTableHeader {
     pub magic: u32,
-    pub version: u8,
-    pub module_count: u8,
-    pub total_size_lo: u16, // low 16 bits of total blob size
-    pub total_size_hi: u16, // high 16 bits — combined value = full FXMT blob length
-    pub reserved: [u8; 6],
+    pub version: u16,
+    pub module_count: u16,
+    /// Bytes of the whole table, modules included.
+    pub total_size: u32,
+    /// Offset of the program section from the table's start; 0 for none.
+    pub program_section_offset: u32,
 }
-/// Module table entry (16 bytes)
-#[repr(C)]
+/// One module's entry in the table.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleTableEntry {
     pub name_hash: u32,
     pub offset: u32,
     pub size: u32,
-    pub module_type: u8,
-    pub flags: u8,
-    pub reserved: [u8; 2],
-}
-/// Module header (80 bytes). `required_caps` is a u64 at reserved bytes
-/// 6..14 so every contract id in `MAX_CONTRACTS` (0..63) is expressible
-/// in the manifest bitmask.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ModuleHeader {
-    pub magic: u32,
-    pub version: u8,
-    pub abi_version: u8,
-    pub module_type: u8,
-    pub flags: u8,
-    pub code_size: u32,
-    pub data_size: u32,
-    pub bss_size: u32,
-    pub init_offset: u32,
-    pub export_count: u16,
-    pub export_offset: u16,
-    pub name: [u8; 32],
-    pub reserved: [u8; 20],
-}
-
-// On-disk ABI ratchet. These three structs are read field-by-field from
-// flash / blob bytes at fixed offsets, and the pack tool
-// (`tools/src/modules.rs`) writes the identical byte layout. A size or
-// offset change here silently misaligns every downstream typed read (and
-// desyncs from the packer) — pin the load-bearing sizes and offsets so
-// any such change fails the build and forces a matching packer change
-// and a rebuild of every packed module. (`SyscallTable` carries its own
-// ratchet in `kernel_abi.rs`.)
-const _: () = {
-    // Sizes — catch any field add/remove.
-    assert!(core::mem::size_of::<ModuleTableHeader>() == 16);
-    assert!(core::mem::size_of::<ModuleTableEntry>() == 16);
-    assert!(core::mem::size_of::<ModuleHeader>() == ModuleHeader::SIZE);
-    assert!(ModuleHeader::SIZE == 80);
-    // Every field offset is pinned, not a representative subset — a
-    // size-preserving reorder (e.g. swapping data_size and bss_size, or
-    // module_type and flags) would otherwise pass. These are the positions
-    // the loader and the pack tool both hardcode.
-    assert!(core::mem::offset_of!(ModuleTableHeader, magic) == 0);
-    assert!(core::mem::offset_of!(ModuleTableHeader, version) == 4);
-    assert!(core::mem::offset_of!(ModuleTableHeader, module_count) == 5);
-    assert!(core::mem::offset_of!(ModuleTableHeader, total_size_lo) == 6);
-    assert!(core::mem::offset_of!(ModuleTableHeader, total_size_hi) == 8);
-    assert!(core::mem::offset_of!(ModuleTableHeader, reserved) == 10);
-    assert!(core::mem::offset_of!(ModuleTableEntry, name_hash) == 0);
-    assert!(core::mem::offset_of!(ModuleTableEntry, offset) == 4);
-    assert!(core::mem::offset_of!(ModuleTableEntry, size) == 8);
-    assert!(core::mem::offset_of!(ModuleTableEntry, module_type) == 12);
-    assert!(core::mem::offset_of!(ModuleTableEntry, flags) == 13);
-    assert!(core::mem::offset_of!(ModuleTableEntry, reserved) == 14);
-    assert!(core::mem::offset_of!(ModuleHeader, magic) == 0);
-    assert!(core::mem::offset_of!(ModuleHeader, version) == 4);
-    assert!(core::mem::offset_of!(ModuleHeader, abi_version) == 5);
-    assert!(core::mem::offset_of!(ModuleHeader, module_type) == 6);
-    assert!(core::mem::offset_of!(ModuleHeader, flags) == 7);
-    assert!(core::mem::offset_of!(ModuleHeader, code_size) == 8);
-    assert!(core::mem::offset_of!(ModuleHeader, data_size) == 12);
-    assert!(core::mem::offset_of!(ModuleHeader, bss_size) == 16);
-    assert!(core::mem::offset_of!(ModuleHeader, init_offset) == 20);
-    assert!(core::mem::offset_of!(ModuleHeader, export_count) == 24);
-    assert!(core::mem::offset_of!(ModuleHeader, export_offset) == 26);
-    assert!(core::mem::offset_of!(ModuleHeader, name) == 28);
-    // schema_size / manifest_size live in reserved[2..4] / reserved[4..6];
-    // required_caps in reserved[6..14]; step_phase at reserved[14].
-    assert!(core::mem::offset_of!(ModuleHeader, reserved) == 60);
-};
-
-impl ModuleHeader {
-    pub const SIZE: usize = 80;
-    /// Reserved layout:
-    ///   byte 0: flags
-    ///     bit 0: mailbox_safe — module can safely consume from mailbox channels.
-    ///     bit 1: in_place_writer — module uses buffer_acquire_inplace.
-    ///     bit 2: deferred_ready — module needs init time before downstream runs.
-    ///     bit 3: drain_capable — module exports module_drain for live reconfigure.
-    ///     bit 4: isr_module — module exports module_isr_init / module_isr_entry.
-    ///     bit 5: wasm_payload — module body is a wasm payload (set by
-    ///       `pack_fmod_wasm`, read by `platform/wasm.rs`).
-    ///     bits 6-7: reserved (0). Fine-grained permissions
-    ///     (reconfigure / flash_raw / platform_raw / monitor / bridge …) live in the manifest binary at byte 15,
-    ///     read by `LoadedModule::manifest_permissions()`.
-    ///   byte 1: step_period_ticks (0 = every tick, N = step every N
-    ///     scheduler ticks). The scheduler enforces this verbatim in
-    ///     `step_one_module` — it counts scheduler ticks, not
-    ///     milliseconds, so the wall-clock period is
-    ///     `step_period_ticks * domain_tick_us`. Modules that need a
-    ///     specific cadence in real time must size the field against
-    ///     the deployment's `tick_us`.
-    ///   bytes 2-3: schema_size (u16 LE).
-    ///   bytes 4-5: manifest_size (u16 LE).
-    ///   bytes 6-13: required_caps (u64 LE) — public contract bitmask,
-    ///     bit N = contract id N required in `[[resources]]`. Covers
-    ///     the full 0..63 range of contract ids defined in
-    ///     `provider::contract`.
-    ///   byte 14: step_phase — phase offset applied to the period
-    ///     counter at instantiation. Lets graph authors stagger
-    ///     coarse-period modules so they don't all fire on the same
-    ///     tick (convoy mitigation). Must satisfy
-    ///     `step_phase < step_period_ticks`; validated by the loader.
-    ///     `0` is the natural cadence.
-    ///   bytes 15-19: reserved (0), available for future ABI extensions.
-    /// Step period from reserved[1]: 0 = every tick, N = step every N
-    /// scheduler ticks. Units are scheduler ticks, not milliseconds —
-    /// the wall-clock period depends on the domain's `tick_us`.
-    pub fn step_period_ticks(&self) -> u8 {
-        self.reserved[1]
-    }
-    /// Phase offset applied to the period counter at module
-    /// instantiation. The scheduler initialises `step_counter[idx] =
-    /// step_phase` so the module's first eligible tick is at
-    /// `step_period_ticks - step_phase`. `0` means no phase, the
-    /// natural cadence. Validated against `step_period_ticks` so
-    /// `phase < period`.
-    pub fn step_phase(&self) -> u8 {
-        self.reserved[14]
-    }
-    /// Schema section size from reserved[2..4].
-    pub fn schema_size(&self) -> u16 {
-        u16::from_le_bytes([self.reserved[2], self.reserved[3]])
-    }
-    /// Manifest section size from reserved[4..6].
-    pub fn manifest_size(&self) -> u16 {
-        u16::from_le_bytes([self.reserved[4], self.reserved[5]])
-    }
-    /// Required public-contract bitmask from reserved[6..14].
-    /// Bit N set = module declared `requires_contract = "..."` for
-    /// contract id N in its manifest. Full 0..63 contract id range —
-    /// the width is `MAX_CONTRACTS`, and the two must move together.
-    pub fn required_caps(&self) -> u64 {
-        u64::from_le_bytes([
-            self.reserved[6],
-            self.reserved[7],
-            self.reserved[8],
-            self.reserved[9],
-            self.reserved[10],
-            self.reserved[11],
-            self.reserved[12],
-            self.reserved[13],
-        ])
-    }
-    /// Whether this module is an ISR module (Tier 2). Flags bit 4.
-    pub fn is_isr_module(&self) -> bool {
-        self.reserved[0] & 0x10 != 0
-    }
 }
 /// Export table entry (8 bytes)
 #[repr(C)]
@@ -2068,7 +1859,7 @@ impl LoadedModule {
     /// Get the code section base address
     pub fn code_base(&self) -> *const u8 {
         // SAFETY: base is valid flash pointer, SIZE is constant offset
-        unsafe { offset_ptr(self.base, ModuleHeader::SIZE) }
+        unsafe { offset_ptr(self.base, fmod_header::SIZE) }
     }
     /// Get module name as string slice
     pub fn name_str(&self) -> &str {
@@ -2084,35 +1875,54 @@ impl LoadedModule {
         // the export table per the .fmod layout validated at load time.
         unsafe { offset_ptr(self.code_base(), offset) }
     }
-    /// Read the fine-grained permissions bitmap from the manifest section.
-    /// The manifest binary stores this at byte offset 15 (manifest magic
-    /// `FXMF` occupies bytes 0-3). Returns 0 if the manifest is missing
-    /// or too small to contain the permissions byte. See
-    /// `docs/architecture/abi_layers.md` and the `permission` module in
-    /// `src/kernel/syscalls.rs` for the bit layout.
-    pub fn manifest_permissions(&self) -> u16 {
-        let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 17 {
-            return 0;
+    /// The manifest's address, size, flags and layout, or `None` when it is
+    /// absent, not a manifest, or shorter than the blocks its head declares.
+    fn manifest_view(&self) -> Option<(*const u8, usize, u8, ManifestLayout)> {
+        use crate::abi::wire::fmod::{
+            MANIFEST_FLAGS_AT, MANIFEST_HEADER_SIZE, MANIFEST_PROVIDES_AT,
+        };
+        let manifest_size = self.header.manifest_size as usize;
+        if manifest_size < MANIFEST_HEADER_SIZE {
+            return None;
         }
-        let code_size = self.header.code_size as usize;
-        let data_size = self.header.data_size as usize;
-        let export_size = self.header.export_count as usize * 8;
-        let schema_size = self.header.schema_size() as usize;
-        let manifest_offset =
-            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
-        // SAFETY: `manifest_offset` plus 17 bytes lies inside the .fmod
-        // mapping (caller has already validated total_size by this point);
-        // the FXMF magic check rejects mis-aligned tails before we trust
-        // bytes 15..17 (the u16 permissions bitmap).
+        let manifest_offset = fmod_header::SIZE
+            + self.header.code_size as usize
+            + self.header.data_size as usize
+            + self.header.export_count as usize * 8
+            + self.header.schema_size as usize;
+        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
+        // mapping (validated at load time); every read below is within the
+        // head, or within `layout.hash <= manifest_size`.
         unsafe {
             let p = offset_ptr(self.base, manifest_offset);
-            // Verify magic before trusting the permissions bytes.
             let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
-            if magic != 0x464D5846 {
-                return 0;
-            } // "FXMF"
-            u16::from_le_bytes([*p.add(15), *p.add(16)])
+            if magic != MANIFEST_MAGIC {
+                return None;
+            }
+            let flags = *p.add(MANIFEST_FLAGS_AT);
+            let layout = ManifestLayout::of(
+                *p.add(5),
+                *p.add(6),
+                *p.add(7),
+                *p.add(MANIFEST_PROVIDES_AT),
+                flags,
+            );
+            if manifest_size < layout.hash {
+                return None;
+            }
+            Some((p, manifest_size, flags, layout))
+        }
+    }
+    /// The fine-grained permissions bitmap (`MANIFEST_PERMISSIONS_AT`); 0
+    /// without a manifest. See `docs/architecture/abi_layers.md` for the bits.
+    pub fn manifest_permissions(&self) -> u16 {
+        match self.manifest_view() {
+            // SAFETY: the permissions field lies in the manifest head.
+            Some((p, ..)) => unsafe {
+                let at = crate::abi::wire::fmod::MANIFEST_PERMISSIONS_AT;
+                u16::from_le_bytes([*p.add(at), *p.add(at + 1)])
+            },
+            None => 0,
         }
     }
     /// Look up a port's `content_type` byte by direction and the
@@ -2139,33 +1949,15 @@ impl LoadedModule {
     /// bit 1 is the port's own `framed = true`). Same lookup and same `None`
     /// cases as [`Self::port_content_type`].
     pub fn port_spec(&self, direction: u8, index: u8) -> Option<(u8, u8)> {
-        let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 17 {
-            return None;
-        }
-        let code_size = self.header.code_size as usize;
-        let data_size = self.header.data_size as usize;
-        let export_size = self.header.export_count as usize * 8;
-        let schema_size = self.header.schema_size() as usize;
-        let manifest_offset =
-            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
-        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
-        // mapping (validated at load time). Inner loop bounded by
-        // `manifest_size >= 17 + port_count * 4`.
+        use crate::abi::wire::fmod::MANIFEST_HEADER_SIZE;
+        let (p, ..) = self.manifest_view()?;
+        // SAFETY: the port records sit between the head and the capacity
+        // block, inside a manifest `manifest_view` has bounds-checked.
         unsafe {
-            let p = offset_ptr(self.base, manifest_offset);
-            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
-            if magic != 0x464D5846 {
-                return None;
-            } // "FXMF"
             let port_count = *p.add(5) as usize;
-            // Header is 17 bytes, each port record is 4 bytes:
-            // [direction, content_type, flags, index].
-            if manifest_size < 17 + port_count * 4 {
-                return None;
-            }
             for i in 0..port_count {
-                let entry = p.add(17 + i * 4);
+                // Each record is [direction, content_type, flags, index].
+                let entry = p.add(MANIFEST_HEADER_SIZE + i * 4);
                 if *entry == direction && *entry.add(3) == index {
                     return Some((*entry.add(1), *entry.add(2)));
                 }
@@ -2173,102 +1965,84 @@ impl LoadedModule {
             None
         }
     }
-    /// The module's declared worst-case stack depth in bytes, from the
-    /// manifest's flag-bit-6 block; 0 when the module declares none or the
-    /// manifest is absent or malformed. Covered by the signing envelope.
+    /// The module's worst-case stack depth in bytes, from the manifest's stack
+    /// block: measured by the build, or declared where it cannot measure. 0
+    /// without a manifest. Covered by the signing envelope.
     pub fn manifest_stack_bytes(&self) -> u32 {
-        let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 17 {
-            return 0;
-        }
-        let code_size = self.header.code_size as usize;
-        let data_size = self.header.data_size as usize;
-        let export_size = self.header.export_count as usize * 8;
-        let schema_size = self.header.schema_size() as usize;
-        let manifest_offset =
-            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
-        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
-        // mapping (validated at load time); the block read is bounds-checked
-        // against manifest_size first.
-        unsafe {
-            let p = offset_ptr(self.base, manifest_offset);
-            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
-            if magic != 0x464D5846 {
-                return 0;
-            } // "FXMF"
-            let flags = *p.add(14);
-            if flags & 0x40 == 0 {
-                return 0;
-            }
-            let at = ManifestLayout::of(*p.add(5), *p.add(6), *p.add(7), flags).stack;
-            if manifest_size < at + 2 {
-                return 0;
-            }
-            u16::from_le_bytes([*p.add(at), *p.add(at + 1)]) as u32 * 64
-        }
-    }
-    /// The manifest's head and layout, or `None` when it is absent or not a
-    /// manifest. The pointer addresses the manifest's first byte; the length
-    /// is its size.
-    fn manifest_view(&self) -> Option<(*const u8, usize, u8, ManifestLayout)> {
-        let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 17 {
-            return None;
-        }
-        let code_size = self.header.code_size as usize;
-        let data_size = self.header.data_size as usize;
-        let export_size = self.header.export_count as usize * 8;
-        let schema_size = self.header.schema_size() as usize;
-        let manifest_offset =
-            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
-        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
-        // mapping (validated at load time).
-        unsafe {
-            let p = offset_ptr(self.base, manifest_offset);
-            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
-            if magic != 0x464D5846 {
-                return None;
-            } // "FXMF"
-            let flags = *p.add(14);
-            let layout = ManifestLayout::of(*p.add(5), *p.add(6), *p.add(7), flags);
-            Some((p, manifest_size, flags, layout))
+        match self.manifest_view() {
+            // SAFETY: the stack block lies before `layout.hash`.
+            Some((p, _, _, l)) => unsafe {
+                u32::from(u16::from_le_bytes([*p.add(l.stack), *p.add(l.stack + 1)])) * 64
+            },
+            None => 0,
         }
     }
 
     /// The runtimes the module may run under: the signed manifest's
     /// `hardware_targets` mask (bytes 10..12), `None` without a manifest.
     pub fn manifest_runtime_mask(&self) -> Option<u16> {
-        let (p, _, _, _) = self.manifest_view()?;
-        // SAFETY: bytes 10..12 of a manifest of at least 17 bytes.
+        let (p, ..) = self.manifest_view()?;
+        // SAFETY: bytes 10..12 lie in the manifest head.
         Some(unsafe { u16::from_le_bytes([*p.add(10), *p.add(11)]) })
     }
 
     /// The module's resident state in bytes, from the manifest head, or
-    /// `None` when it declares none — or declares the most the 16-bit field
-    /// can hold, which says only "at least this much" and is not a size.
+    /// `None` without a manifest.
     pub fn manifest_state_bytes(&self) -> Option<usize> {
-        let (p, _, _, _) = self.manifest_view()?;
-        // SAFETY: bytes 12..14 of a manifest of at least 17 bytes.
-        let units = unsafe { u16::from_le_bytes([*p.add(12), *p.add(13)]) };
-        if units == 0 || units == u16::MAX {
-            return None;
-        }
+        let (p, ..) = self.manifest_view()?;
+        let at = crate::abi::wire::fmod::MANIFEST_STATE_AT;
+        // SAFETY: the state field lies in the manifest head.
+        let units = unsafe {
+            u32::from_le_bytes([*p.add(at), *p.add(at + 1), *p.add(at + 2), *p.add(at + 3)])
+        };
         Some(units as usize * 64)
     }
 
-    /// The heap arena the module declares in bytes (flag-bit-7 block), or
-    /// `None` when it declares none.
-    pub fn manifest_arena_bytes(&self) -> Option<usize> {
-        let (p, size, flags, layout) = self.manifest_view()?;
-        if flags & 0x80 == 0 || size < layout.arena + 4 {
-            return None;
+    /// The heap arena an instance gets, in bytes (0 for none), from the
+    /// manifest's arena block; a graph may override it per instance.
+    pub fn manifest_arena_bytes(&self) -> usize {
+        match self.manifest_view() {
+            // SAFETY: the arena block lies before `layout.hash`.
+            Some((p, _, _, l)) => unsafe {
+                u32::from_le_bytes([
+                    *p.add(l.arena),
+                    *p.add(l.arena + 1),
+                    *p.add(l.arena + 2),
+                    *p.add(l.arena + 3),
+                ]) as usize
+            },
+            None => 0,
         }
-        let at = layout.arena;
-        // SAFETY: bounds-checked against the manifest size above.
-        let v = unsafe {
-            u32::from_le_bytes([*p.add(at), *p.add(at + 1), *p.add(at + 2), *p.add(at + 3)])
+    }
+
+    /// The contracts the manifest says the module provides, and how many
+    /// (at most `MAX_PROVIDES`; a manifest naming more is refused at load).
+    pub fn manifest_provides(&self) -> ([u16; crate::abi::wire::fmod::MAX_PROVIDES], usize) {
+        use crate::abi::wire::fmod::{MANIFEST_PROVIDES_AT, MAX_PROVIDES};
+        let mut out = [0u16; MAX_PROVIDES];
+        let Some((p, _, _, l)) = self.manifest_view() else {
+            return (out, 0);
         };
-        (v != 0).then_some(v as usize)
+        // SAFETY: the count is in the head; the ids lie before `layout.hash`.
+        unsafe {
+            let n = (*p.add(MANIFEST_PROVIDES_AT) as usize).min(MAX_PROVIDES);
+            for (i, slot) in out.iter_mut().enumerate().take(n) {
+                let at = l.provides + i * 2;
+                *slot = u16::from_le_bytes([*p.add(at), *p.add(at + 1)]);
+            }
+            (out, n)
+        }
+    }
+
+    /// How many contracts the manifest names, before any cap.
+    pub fn manifest_provides_count(&self) -> usize {
+        match self.manifest_view() {
+            // SAFETY: the count is in the head.
+            Some((p, ..)) => unsafe {
+                *p.add(crate::abi::wire::fmod::MANIFEST_PROVIDES_AT) as usize
+            },
+            None => 0,
+        }
     }
 
     /// The static port capacities from the manifest's flag-bit-5
@@ -2283,10 +2057,10 @@ impl LoadedModule {
             Some(v) => v,
             None => return PortCapacities::NONE,
         };
-        if flags & 0x20 == 0 {
+        if flags & crate::abi::wire::fmod::FLAG_PORT_CAPACITY == 0 {
             return PortCapacities::NONE;
         }
-        // SAFETY: byte 5 of a manifest of at least 17 bytes.
+        // SAFETY: byte 5 lies in the manifest head.
         let port_count = unsafe { *p.add(5) };
         if size < layout.capacity + port_count as usize * 8 {
             return PortCapacities::NONE;
@@ -2428,16 +2202,11 @@ impl ModuleLoader {
     pub fn program_section(&self) -> Option<(*const u8, usize)> {
         use crate::abi::kernel_abi::program as pg;
         let header = self.header?;
-        let at = u32::from_le_bytes([
-            header.reserved[0],
-            header.reserved[1],
-            header.reserved[2],
-            header.reserved[3],
-        ]) as usize;
+        let at = header.program_section_offset as usize;
         if at == 0 || self.table_base.is_null() {
             return None;
         }
-        let total = ((header.total_size_hi as usize) << 16) | header.total_size_lo as usize;
+        let total = header.total_size as usize;
         if at < total
             || !at.is_multiple_of(pg::OWNER_ALIGN)
             || at.checked_add(pg::HEADER_LEN)? > self.blob_bound
@@ -2611,7 +2380,7 @@ impl ModuleLoader {
         // bounds-checked against the mapping when the table was loaded
         // (`validate_table_layout`).
         unsafe {
-            let entries_base = offset_ptr(self.table_base, 16);
+            let entries_base = offset_ptr(self.table_base, fmod_table::HEADER_SIZE);
             for i in 0..header.module_count as usize {
                 let entry = read_table_entry(entries_base, i);
                 let base = offset_ptr(self.table_base, entry.offset as usize);
@@ -2626,8 +2395,8 @@ impl ModuleLoader {
     /// Find module by name hash
     pub fn find_by_name_hash(&self, name_hash: u32) -> Result<LoadedModule, LoaderError> {
         let header = self.header.ok_or(LoaderError::NoModules)?;
-        // SAFETY: table_base is valid, offset 16 is after the header
-        let entries_base = unsafe { offset_ptr(self.table_base, 16) };
+        // SAFETY: table_base is valid, the entries follow the header
+        let entries_base = unsafe { offset_ptr(self.table_base, fmod_table::HEADER_SIZE) };
         for i in 0..header.module_count as usize {
             // SAFETY: i < module_count from validated header
             let entry = unsafe { read_table_entry(entries_base, i) };
@@ -2636,28 +2405,6 @@ impl ModuleLoader {
             }
         }
         Err(LoaderError::ModuleNotFound)
-    }
-    /// Find module by type (returns first match)
-    pub fn find_by_type(&self, module_type: ModuleType) -> Result<LoadedModule, LoaderError> {
-        let header = self.header.ok_or(LoaderError::NoModules)?;
-        // SAFETY: table_base is valid, offset 16 is after the header
-        let entries_base = unsafe { offset_ptr(self.table_base, 16) };
-        for i in 0..header.module_count as usize {
-            // SAFETY: i < module_count from validated header
-            let entry = unsafe { read_table_entry(entries_base, i) };
-            if entry.module_type == module_type as u8 {
-                return self.load_module_at(entry.offset);
-            }
-        }
-        Err(LoaderError::ModuleNotFound)
-    }
-    /// Find all modules of a given type
-    pub fn find_all_by_type(&self, module_type: ModuleType) -> ModuleIter<'_> {
-        ModuleIter {
-            loader: self,
-            index: 0,
-            filter_type: Some(module_type),
-        }
     }
     /// Load module at given offset within table
     fn load_module_at(&self, offset: u32) -> Result<LoadedModule, LoaderError> {
@@ -2749,7 +2496,7 @@ impl ModuleLoader {
             );
             return Err(LoaderError::InvalidTableMagic);
         }
-        let total_size = ((header.total_size_hi as u32) << 16) | (header.total_size_lo as u32);
+        let total_size = header.total_size;
         if (total_size as usize) > MAX_MODULES_BLOB_SIZE {
             log::error!(
                 "[loader] modules blob size {total_size} exceeds MAX_MODULES_BLOB_SIZE={MAX_MODULES_BLOB_SIZE}"
@@ -2762,9 +2509,10 @@ impl ModuleLoader {
             );
             return Err(LoaderError::InvalidTableMagic);
         }
-        // Table header (16 bytes) + N × 16-byte entries must fit
+        // Table header + N entries (`abi::wire::fmod::table`) must fit
         // within total_size.
-        let table_size = 16usize.saturating_add((header.module_count as usize) * 16);
+        let table_size = fmod_table::HEADER_SIZE
+            .saturating_add((header.module_count as usize) * fmod_table::ENTRY_SIZE);
         if table_size > total_size as usize {
             log::error!("[loader] module-table size {table_size} > total_size {total_size}");
             return Err(LoaderError::InvalidTableMagic);
@@ -2779,7 +2527,7 @@ impl ModuleLoader {
         // SAFETY: table_size <= total_size <= blob_len; entries start at
         // offset 16 and span `header.module_count * 16` bytes within
         // `table_size`.
-        let entries_base = unsafe { offset_ptr(blob, 16) };
+        let entries_base = unsafe { offset_ptr(blob, fmod_table::HEADER_SIZE) };
         for i in 0..header.module_count as usize {
             // SAFETY: i bounded by module_count; entry footprint inside table.
             let entry = unsafe { read_table_entry(entries_base, i) };
@@ -2792,17 +2540,17 @@ impl ModuleLoader {
                 );
                 return Err(LoaderError::InvalidTableMagic);
             }
-            if sz < ModuleHeader::SIZE {
+            if sz < fmod_header::SIZE {
                 log::error!(
-                    "[loader] entry {} size={} < ModuleHeader::SIZE={}",
+                    "[loader] entry {} size={} < fmod_header::SIZE={}",
                     i,
                     sz,
-                    ModuleHeader::SIZE
+                    fmod_header::SIZE
                 );
                 return Err(LoaderError::InvalidTableMagic);
             }
-            // SAFETY: `off + ModuleHeader::SIZE <= end <= total_size` (sz
-            // >= ModuleHeader::SIZE checked above); pointer in bounds.
+            // SAFETY: `off + fmod_header::SIZE <= end <= total_size` (sz
+            // >= fmod_header::SIZE checked above); pointer in bounds.
             let mh = unsafe { read_module_header(offset_ptr(blob, off)) };
             // Full on-disk footprint: header + code + data + export table +
             // schema tail + manifest tail. The schema and manifest sizes MUST
@@ -2815,9 +2563,9 @@ impl ModuleLoader {
             let inner = (mh.code_size as usize)
                 .saturating_add(mh.data_size as usize)
                 .saturating_add((mh.export_count as usize).saturating_mul(8))
-                .saturating_add(mh.schema_size() as usize)
-                .saturating_add(mh.manifest_size() as usize)
-                .saturating_add(ModuleHeader::SIZE);
+                .saturating_add(mh.schema_size as usize)
+                .saturating_add(mh.manifest_size as usize)
+                .saturating_add(fmod_header::SIZE);
             if inner > sz {
                 log::error!("[loader] entry {i} internal sections {inner} > entry size {sz}");
                 return Err(LoaderError::InvalidTableMagic);
@@ -2832,34 +2580,9 @@ impl ModuleLoader {
             return None;
         }
         // SAFETY: table_base is valid, index < module_count
-        let entries_base = unsafe { offset_ptr(self.table_base, 16) };
+        let entries_base = unsafe { offset_ptr(self.table_base, fmod_table::HEADER_SIZE) };
         // SAFETY: index bounds checked above
         Some(unsafe { read_table_entry(entries_base, index) })
-    }
-}
-/// Iterator over modules
-pub struct ModuleIter<'a> {
-    loader: &'a ModuleLoader,
-    index: usize,
-    filter_type: Option<ModuleType>,
-}
-impl<'a> Iterator for ModuleIter<'a> {
-    type Item = LoadedModule;
-    fn next(&mut self) -> Option<Self::Item> {
-        let header = self.loader.header?;
-        while self.index < header.module_count as usize {
-            let entry = self.loader.get_entry(self.index)?;
-            self.index += 1;
-            if let Some(filter_type) = self.filter_type {
-                if entry.module_type != filter_type as u8 {
-                    continue;
-                }
-            }
-            if let Ok(module) = self.loader.load_module_at(entry.offset) {
-                return Some(module);
-            }
-        }
-        None
     }
 }
 // ============================================================================
@@ -2992,12 +2715,12 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
     // bad-magic manifest hits an explicit rejection arm before any
     // byte read so `enforce_signatures` can never be bypassed by an
     // undersized manifest.
-    let manifest_size = module.header.manifest_size() as usize;
+    let manifest_size = module.header.manifest_size as usize;
     if manifest_size < 48 {
-        // Manifest is absent or too small to carry even the integrity hash
-        // (16-byte header + 32-byte SHA-256 minimum), so it carries no
-        // ABI-surface attestation either (17-byte head + 32). Every module
-        // must attest, signed or not.
+        // Manifest is absent or too small to carry an ABI-surface
+        // attestation (the smallest attested manifest is its head, the stack
+        // and arena blocks and the 32-byte attestation). Every module must
+        // attest, signed or not.
         if cfg!(feature = "enforce_signatures") {
             log::error!(
                 "[loader] {name}: manifest size {manifest_size} below minimum (48) under enforce_signatures"
@@ -3012,15 +2735,21 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
         let code_size = module.header.code_size as usize;
         let data_size = module.header.data_size as usize;
         let export_size = module.header.export_count as usize * 8;
-        let schema_size = module.header.schema_size() as usize;
-        let manifest_offset =
-            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        let schema_size = module.header.schema_size as usize;
+        let manifest_offset = fmod_header::SIZE + code_size + data_size + export_size + schema_size;
         // SAFETY: `manifest_offset + manifest_size` is the slot footprint
         // validated at table load; manifest lies within the .fmod mapping.
         let manifest_ptr = unsafe { offset_ptr(module.base, manifest_offset) };
         // SAFETY: `manifest_ptr` covers `manifest_size` bytes inside the
         // mapping (per the entry-size check at load time).
         let manifest_data = unsafe { core::slice::from_raw_parts(manifest_ptr, manifest_size) };
+        // The head is in bounds (`manifest_size >= 48` was checked above);
+        // every block offset below comes from this one layout.
+        let Some(manifest_layout) = ManifestLayout::read(manifest_data) else {
+            let e = LoaderError::Unattested;
+            e.log(name);
+            return Err(e);
+        };
         // `manifest_size >= 48` was checked above, so `>= 16` is trivially
         // true — keep the explicit assertion-style read but reject any
         // tampered manifest header explicitly under enforcement.
@@ -3031,7 +2760,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                 manifest_data[2],
                 manifest_data[3],
             ]);
-            if magic != 0x464D5846 {
+            if magic != MANIFEST_MAGIC {
                 if cfg!(feature = "enforce_signatures") {
                     log::error!(
                         "[loader] {name}: bad manifest magic 0x{magic:08x} under enforce_signatures"
@@ -3065,7 +2794,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     e.log(name);
                     return Err(e);
                 }
-                let flags = manifest_data[14];
+                let flags = manifest_data[crate::abi::wire::fmod::MANIFEST_FLAGS_AT];
                 let has_integrity = (flags & 0x01) != 0;
                 // Signature presence is signalled by flag bit 1, not by a
                 // manifest-version split — mirroring the tool serializer
@@ -3076,13 +2805,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     // Stored hash sits after ports/resources/dependencies; its
                     // offset depends on those counts. If signature follows,
                     // the hash is still first (signature is appended after).
-                    let hash_offset = ManifestLayout::of(
-                        manifest_data[5],
-                        manifest_data[6],
-                        manifest_data[7],
-                        flags,
-                    )
-                    .hash;
+                    let hash_offset = manifest_layout.hash;
                     if hash_offset + 32 > manifest_size {
                         log::error!("[loader] {name}: manifest hash out of range");
                         return Err(LoaderError::IntegrityMismatch);
@@ -3124,13 +2847,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                 // surface mismatches in test builds) but do not reject on
                 // missing signatures.
                 if has_signature {
-                    let hash_offset = ManifestLayout::of(
-                        manifest_data[5],
-                        manifest_data[6],
-                        manifest_data[7],
-                        flags,
-                    )
-                    .hash;
+                    let hash_offset = manifest_layout.hash;
                     let sig_offset = hash_offset + 32;
                     if sig_offset + 96 > manifest_size {
                         return Err(LoaderError::SignatureInvalid);
@@ -3149,7 +2866,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                         // SAFETY: [module.base, +manifest_offset) is the
                         // header+code+data+exports+schema region, inside the
                         // validated entry footprint; manifest_offset >=
-                        // ModuleHeader::SIZE.
+                        // fmod_header::SIZE.
                         let pre =
                             unsafe { core::slice::from_raw_parts(module.base, manifest_offset) };
                         if signing_envelope(pre, manifest_data, |b| eh.update(b)).is_err() {
@@ -3195,9 +2912,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     e.log(name);
                     return Err(e);
                 }
-                let attn_offset =
-                    ManifestLayout::of(manifest_data[5], manifest_data[6], manifest_data[7], flags)
-                        .attestation;
+                let attn_offset = manifest_layout.attestation;
                 if manifest_size != attn_offset + 32 {
                     log::error!(
                         "[loader] {name}: attestation flag with non-canonical manifest size"
@@ -3238,7 +2953,6 @@ fn validate_fn_in_code(
 // ============================================================================
 /// Validated typed function pointers for a module.
 pub struct ModuleExports {
-    pub state_size_fn: ModuleStateSizeFn,
     pub new_fn: ModuleNewFn,
     pub step_fn: ModuleStepFn,
     /// Optional input-refill hook called between bounded graph passes.
@@ -3253,17 +2967,13 @@ pub struct ModuleExports {
 }
 /// Lookup and validate all required exports from a module (safe - no FFI calls)
 pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExports, LoaderError> {
-    let state_size_addr = module.get_export_addr(export_hashes::MODULE_STATE_SIZE)?;
-    validate_fn_addr(state_size_addr, "module_state_size")?;
     let new_addr = module.get_export_addr(export_hashes::MODULE_NEW)?;
     validate_fn_addr(new_addr, "module_new")?;
     let step_addr = module.get_export_addr(export_hashes::MODULE_STEP)?;
     validate_fn_addr(step_addr, "module_step")?;
     // Convert addresses to typed function pointers.
-    // SAFETY: all three addresses validated above by validate_fn_addr;
+    // SAFETY: both addresses validated above by validate_fn_addr;
     // ModuleExports types match the module ABI shape.
-    let ss_fn = unsafe { fn_ptr_from_addr(state_size_addr) };
-    // SAFETY: as above.
     let nw_fn = unsafe { fn_ptr_from_addr(new_addr) };
     // SAFETY: as above.
     let st_fn = unsafe { fn_ptr_from_addr(step_addr) };
@@ -3300,18 +3010,12 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
         Err(_) => None,
     };
     Ok(ModuleExports {
-        state_size_fn: ss_fn,
         new_fn: nw_fn,
         step_fn: st_fn,
         pipeline_refill_fn,
         post_tick_flush_fn,
         isr_entry_fn,
     })
-}
-/// Call module_state_size - returns required state buffer size
-pub fn invoke_state_size(exports: &ModuleExports) -> usize {
-    // SAFETY: state_size_fn was validated in lookup_exports
-    unsafe { call_state_size(exports.state_size_fn) }
 }
 /// Prepare and call module_init - validates then invokes
 pub fn invoke_init(
@@ -3456,7 +3160,6 @@ pub unsafe fn invoke_new(
 /// Unified dynamic module wrapper for PIC modules using standard exports.
 ///
 /// This wrapper works with modules that export:
-/// - `module_state_size()` - Returns required state buffer size
 /// - `module_init(syscalls)` - Called once after loading
 /// - `module_new(in_chan, out_chan, ctrl_chan, params, len, state, state_size, syscalls)` - Creates instance
 /// - `module_step(state)` - Advances module state
@@ -3767,7 +3470,7 @@ impl DynamicModule {
     /// Sequence:
     /// 1. Validate module header
     /// 2. Lookup and validate all exports
-    /// 3. Call module_state_size() to get required buffer size
+    /// 3. Read the required state size from the manifest
     /// 4. Allocate state from kernel pool
     /// 5. Call module_init() with syscall table
     /// 6. Call module_new() - may return pending
@@ -3821,11 +3524,9 @@ impl DynamicModule {
         let iso_requested = false;
         if gated {
             // What the gateway cannot mediate: a module other modules call
-            // into, and one the hardware calls into.
-            if module
-                .get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACT)
-                .is_ok()
-            {
+            // into, and one the hardware calls into. Provider-ness is the
+            // signed manifest's to say, so no export can slip past it.
+            if module.manifest_provides_count() != 0 {
                 return Err(LoaderError::GatedRefused(
                     "it provides a contract, and other modules' calls would run its code privileged",
                 ));
@@ -3837,31 +3538,19 @@ impl DynamicModule {
             }
         }
         // The heap's cap: the graph's per-instance `heap.arena_bytes` (params
-        // tag 0xEF) when it gives one, else the type's — the manifest's
-        // figure, or (a trusted module only) what its `module_arena_size`
-        // export says.
-        let arena_size = match crate::kernel::exec::scheduler::params_heap_arena_bytes(params_slice)
-        {
-            Some(n) => n,
-            None => match module.manifest_arena_bytes() {
-                Some(n) => n,
-                None if gated => 0,
-                None => match module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
-                    Ok(arena_addr) => {
-                        let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
-                        call_state_size(arena_fn)
-                    }
-                    Err(_) => 0,
-                },
-            },
+        // tag 0xEF) when it gives one, else the manifest's.
+        let arena_size = crate::kernel::exec::scheduler::params_heap_arena_bytes(params_slice)
+            .unwrap_or_else(|| module.manifest_arena_bytes());
+        // 3. Required state size: the manifest's figure. No module code runs
+        // to learn a fact; a module whose manifest states none is refused,
+        // gated or not.
+        let Some(required_size) = module.manifest_state_bytes() else {
+            return Err(LoaderError::Undeclared("state size"));
         };
-        // 3. Required state size: the manifest's figure, so no module code
-        // runs to find it; a trusted module that declares none is asked.
-        let required_size = match module.manifest_state_bytes() {
-            Some(n) => n,
-            None if gated => return Err(LoaderError::GatedUndeclared("state size")),
-            None => invoke_state_size(&exports),
-        };
+        // The provider registration the manifest asks for, checked before
+        // anything is allocated: a manifest that names contracts it cannot
+        // serve is refused here, not after module_new() has run.
+        let auto_register = ProviderAutoRegister::resolve(module)?;
         // An isolated module runs on a fixed stack above a guard page. The
         // composer admits its declared depth against that stack; this refuses a
         // blob that reached the device without going through the composer.
@@ -3890,7 +3579,7 @@ impl DynamicModule {
             // carries no depth would get one too small to reach its first
             // call, so it is refused here rather than faulted there.
             if module.manifest_stack_bytes() == 0 {
-                return Err(LoaderError::GatedUndeclared("stack depth"));
+                return Err(LoaderError::Undeclared("stack depth"));
             }
             let stack = (module.manifest_stack_bytes() as usize).next_multiple_of(8)
                 + crate::platform::rp_protection::EXCEPTION_FRAME_BYTES
@@ -3948,11 +3637,6 @@ impl DynamicModule {
         // locate the module by index → state pointer.
         let inst_idx = crate::kernel::exec::scheduler::current_module_index();
         crate::kernel::exec::scheduler::set_instantiation_state(inst_idx, state_ptr);
-        // Resolve optional provider-auto-registration exports. If the
-        // module declares itself a provider, the loader calls
-        // `register_module_provider` as soon as module_new() returns
-        // Ready — module code never touches registration directly.
-        let auto_register = ProviderAutoRegister::resolve(module);
         // 4b. The heap. Failing to carve a committed heap is a hard load
         // error, logged with the arena's occupancy: a module that asked for
         // an arena and ran without one would fail every heap_alloc, usually
@@ -4349,10 +4033,12 @@ impl PortCapacities {
         }
         for i in 0..self.port_count as usize {
             // SAFETY: `port_capacities` checked that the port records
-            // (17 + i*4) and the capacity section (capacity + i*8) both
+            // (head + i*4) and the capacity section (capacity + i*8) both
             // lie inside the manifest.
             unsafe {
-                let rec = self.manifest.add(17 + i * 4);
+                let rec = self
+                    .manifest
+                    .add(crate::abi::wire::fmod::MANIFEST_HEADER_SIZE + i * 4);
                 if *rec != port_type || *rec.add(3) != port_index {
                     continue;
                 }
@@ -4370,54 +4056,6 @@ impl PortCapacities {
 // ============================================================================
 // Export resolution for provider dispatch
 // ============================================================================
-/// Resolve an export hash to an absolute address for a given module.
-///
-/// Used by loader-side lookups that bind module exports to kernel-side
-/// function pointers — e.g. the flash-store and NVMe-backing
-/// registration paths pass an FNV-1a hash of an exported symbol name,
-/// and this helper walks the module's export table to get the real
-/// function address (code_base + offset, with the Thumb bit applied
-/// for ARMv7-M/ARMv8-M).
-///
-/// The export offset is bounds-checked against the module's stored
-/// `code_size`; an entry whose offset falls outside the code range is
-/// rejected (returns `None`) rather than producing an address that
-/// could redirect dispatch into module data or off-module memory.
-///
-/// Returns `Some(absolute_address)` on success, `None` if the hash is
-/// not found, or the entry is malformed.
-pub fn resolve_export_for_module(module_idx: usize, export_hash: u32) -> Option<usize> {
-    let (code_base, export_table, export_count) =
-        crate::kernel::exec::scheduler::get_module_exports(module_idx);
-    if export_table.is_null() || export_count == 0 || code_base == 0 {
-        return None;
-    }
-    let (_, code_size) = crate::kernel::exec::scheduler::module_code_region(module_idx);
-    if code_size == 0 {
-        return None;
-    }
-    for i in 0..export_count as usize {
-        // SAFETY: `export_table` covers `export_count * 8` bytes per the
-        // module's section; loop bounded by `export_count`.
-        let entry = unsafe { read_export_entry(export_table, i) };
-        if entry.hash == export_hash {
-            let offset = entry.offset & !1;
-            // Require the masked offset to land strictly inside the
-            // module's code range. `>=` rather than `>` so a zero-byte
-            // entry at the boundary is rejected too.
-            if (offset as u64) >= code_size as u64 {
-                log::warn!(
-                    "[loader] resolve_export: module {module_idx} export 0x{export_hash:08x} offset {offset} out of code_size {code_size}"
-                );
-                return None;
-            }
-            let fn_addr = code_base.wrapping_add(offset as usize);
-            let fn_addr = hal::apply_code_bit(fn_addr);
-            return Some(fn_addr);
-        }
-    }
-    None
-}
 // ============================================================================
 // Tests
 // ============================================================================

@@ -44,13 +44,7 @@ mod params_def {
     }
 }
 
-fluxor_rt::declare_module_state_bytes!(State);
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<State>()
-}
+fluxor_rt::module_facts! { state: State }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

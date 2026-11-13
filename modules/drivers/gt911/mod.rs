@@ -213,13 +213,7 @@ unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
 // Module exports
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(Gt911State);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<Gt911State>() as u32
-}
+fluxor_rt::module_facts! { state: Gt911State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

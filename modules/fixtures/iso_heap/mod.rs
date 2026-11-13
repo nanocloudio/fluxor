@@ -59,26 +59,11 @@ struct IsoHeapState {
     cycles: u32,
 }
 
-fluxor_rt::declare_module_state_bytes!(IsoHeapState);
+fluxor_rt::module_facts! { state: IsoHeapState, arena: ARENA_BYTES }
 
 // ============================================================================
 // Exported functions
 // ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<IsoHeapState>() as u32
-}
-
-fluxor_rt::declare_module_arena_bytes!(ARENA_BYTES);
-
-/// The heap arena, for a loader that asks instead of reading the manifest.
-#[no_mangle]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    ARENA_BYTES
-}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

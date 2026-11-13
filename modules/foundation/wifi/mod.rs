@@ -295,15 +295,10 @@ unsafe fn send_connect(s: &mut WifiConnectState) -> bool {
 // Module API
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<WifiConnectState>() as u32
-}
+fluxor_rt::module_facts! { state: WifiConnectState }
 
 // Same figure as data, for `pack` to record in the manifest so a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(WifiConnectState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

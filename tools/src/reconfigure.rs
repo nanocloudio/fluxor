@@ -235,15 +235,8 @@ fn is_drain_capable(module_name: &str, modules_dir: &Path) -> bool {
     }
 
     match std::fs::read(&fmod_path) {
-        Ok(data) => {
-            // Header flag byte is at offset 60 (reserved[0])
-            // Bit 3 = drain_capable
-            if data.len() > 60 {
-                (data[60] & 0x08) != 0
-            } else {
-                false
-            }
-        }
+        Ok(data) => fluxor_abi::wire::fmod::header::Header::read(&data)
+            .is_some_and(|h| h.flags & fluxor_abi::wire::fmod::header::flag::DRAIN != 0),
         Err(_) => false,
     }
 }

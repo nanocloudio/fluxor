@@ -1736,12 +1736,7 @@ const LOCAL_CLOSE_FWD: u8 = 2;
 // Module ABI exports
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(TlsState);
-
-#[no_mangle]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<TlsState>() as u32
-}
+fluxor_rt::module_facts! { state: TlsState }
 
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const core::ffi::c_void) {}

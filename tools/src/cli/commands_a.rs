@@ -194,7 +194,7 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                     table_header[3],
                 ]);
                 if table_magic == modules::MODULE_TABLE_MAGIC {
-                    let module_count = table_header[5] as usize;
+                    let module_count = u16::from_le_bytes([table_header[6], table_header[7]]) as usize;
                     println!("\nModules: {module_count} embedded");
 
                     // Read entries
@@ -211,18 +211,19 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                             let fmod_size =
                                 u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]])
                                     as usize;
-                            let mod_type = entry[12];
 
                             let fmod_addr = modules_addr + fmod_offset;
                             if let Some(fmod_header) =
                                 uf2::extract_region(&memory, fmod_addr, modules::MODULE_HEADER_SIZE)
                             {
-                                // Extract name from header (offset 28, 32 bytes)
-                                let name_bytes = &fmod_header[28..60];
-                                let name_end =
-                                    name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
-                                let name = String::from_utf8_lossy(&name_bytes[..name_end]);
-                                let abi = fmod_header[5];
+                                let Some(h) =
+                                    fluxor_abi::wire::fmod::header::Header::read(&fmod_header)
+                                else {
+                                    continue;
+                                };
+                                let name = String::from_utf8_lossy(h.name_bytes());
+                                let mod_type = h.module_type;
+                                let abi = h.abi_version;
 
                                 let type_str = match mod_type {
                                     1 => "Source",
@@ -240,27 +241,11 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
 
                                 // Read the manifest the fmod carries (a header abi of 2 or more)
                                 if abi >= 2 {
-                                    let code_size = u32::from_le_bytes([
-                                        fmod_header[8],
-                                        fmod_header[9],
-                                        fmod_header[10],
-                                        fmod_header[11],
-                                    ]) as usize;
-                                    let data_size = u32::from_le_bytes([
-                                        fmod_header[12],
-                                        fmod_header[13],
-                                        fmod_header[14],
-                                        fmod_header[15],
-                                    ]) as usize;
-                                    let export_count =
-                                        u16::from_le_bytes([fmod_header[24], fmod_header[25]])
-                                            as usize;
-                                    let schema_size =
-                                        u16::from_le_bytes([fmod_header[62], fmod_header[63]])
-                                            as usize;
-                                    let manifest_size =
-                                        u16::from_le_bytes([fmod_header[64], fmod_header[65]])
-                                            as usize;
+                                    let code_size = h.code_size as usize;
+                                    let data_size = h.data_size as usize;
+                                    let export_count = h.export_count as usize;
+                                    let schema_size = h.schema_size as usize;
+                                    let manifest_size = h.manifest_size as usize;
 
                                     let manifest_offset = modules::MODULE_HEADER_SIZE
                                         + code_size
@@ -529,7 +514,7 @@ fn check_code_ceiling(
 /// over-budget image.
 ///
 /// Each `.fmod` carries the resident-state figure `pack` read from the SDK's
-/// `declare_module_state_bytes!` static, so this is a sum of measurements rather
+/// `module_facts!` static, so this is a sum of measurements rather
 /// than of estimates. The kernel refuses arena exhaustion at module load; that
 /// is correct but late — it presents as a board that boots with modules missing,
 /// on a die with no console guarantee. Doing the arithmetic here turns it into a
@@ -618,8 +603,8 @@ fn check_state_budget(
         if !target.has_mmu {
             return Err(Error::Config(format!(
                 "{} publish(es) no state size, and {} admits a graph only on a complete \
-                 sum. Add `declare_module_state_bytes!(<state type>)` beside each \
-                 module's `module_state_size`.",
+                 sum. Rebuild them: every module states its facts \
+                 (`fluxor_rt::module_facts!`).",
                 unknown.join(", "),
                 target.id,
             )));
@@ -759,7 +744,7 @@ fn check_stack_budget(
         return Err(Error::Config(format!(
             "{} carr(ies) no stack depth, and {} steps every module on one unguarded \
              stack. Rebuild with `fluxor modules build`, which measures it, or declare \
-             it with `declare_module_stack_bytes!` where the build cannot.",
+             it with `module_facts!`'s `stack:` where the build cannot.",
             unknown.join(", "),
             target.id,
         )));
@@ -1921,18 +1906,16 @@ fn cmd_pack(
         println!("  Name: {}", result.name);
         println!("  Code size: {} bytes", result.code_size);
         println!("  Data size: {} bytes", result.data_size);
-        println!("  BSS size: {} bytes", result.bss_size);
-        println!("  Init offset: 0x{:x}", result.init_offset);
         println!("  Exports: {}", result.exports.len());
         for (name, offset, hash) in &result.exports {
             println!("    {name}: 0x{offset:x} (hash: 0x{hash:08x})");
         }
         println!("  Total size: {} bytes", result.total_size);
     } else {
-        // Concise single-line output: name code+data+bss=total
+        // Concise single-line output: name code+data=total
         println!(
-            "\x1b[1;32mSuccess\x1b[0m {} {}+{}+{}={} bytes",
-            result.name, result.code_size, result.data_size, result.bss_size, result.total_size
+            "\x1b[1;32mSuccess\x1b[0m {} {}+{}={} bytes",
+            result.name, result.code_size, result.data_size, result.total_size
         );
     }
 

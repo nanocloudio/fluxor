@@ -363,12 +363,7 @@ unsafe fn step_payload(s: &mut PosterState) {
 // Module entry points
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(PosterState);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<PosterState>() as u32
-}
+fluxor_rt::module_facts! { state: PosterState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}

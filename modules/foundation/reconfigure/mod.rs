@@ -473,15 +473,10 @@ unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
 // Module entry points
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(State);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -622,12 +617,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 #[link_section = ".text.module_drain"]
 pub extern "C" fn module_drain(_state: *mut u8) -> i32 {
     // No self-drain work: report immediately drained.
-    1
-}
-
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> i32 {
     1
 }
 

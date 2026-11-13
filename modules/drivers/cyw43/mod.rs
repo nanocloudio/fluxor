@@ -358,21 +358,10 @@ const UPLOAD_STEP_BUDGET_US: u64 = 500;
 // Module API
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<Cyw43State>() as u32
-}
+fluxor_rt::module_facts! { state: Cyw43State }
 
 // Same figure as data, for `pack` to record in the manifest so a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(Cyw43State);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

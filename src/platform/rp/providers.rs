@@ -192,13 +192,6 @@ use portable_atomic::AtomicU8;
 
 use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 
-/// The byte the flash param store keys a module's records by: RP graphs hold
-/// at most `MAX_MODULES` (32) modules, so a module index fits it.
-fn param_store_module_id() -> u8 {
-    const _: () = assert!(crate::kernel::exec::scheduler::MAX_MODULES <= u8::MAX as usize);
-    crate::kernel::exec::scheduler::current_module_index() as u8
-}
-
 const MAX_DMA_FDS: usize = 8;
 
 struct DmaFdSlot {
@@ -479,7 +472,7 @@ pub fn release_handles(module_idx: ModuleId) {
 //
 // SPI, I2C, UART, and ADC providers live in PIC modules; the loader
 // auto-registers them after module_new() via the
-// `module_provides_contract` export. The raw register bridges they
+// manifest's `provider_contracts`. The raw register bridges they
 // call into remain in `rp_system_extension_dispatch` below.
 
 use crate::platform::rp_io::pio as pio_util;
@@ -828,9 +821,7 @@ unsafe fn rp_system_extension_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    use crate::abi::contracts::storage::runtime_params;
     use crate::abi::internal::flash;
-    use crate::abi::internal::provider_registry::FLASH_STORE_ENABLE;
     use crate::abi::kernel_abi::SYS_CLOCK_HZ;
     use crate::abi::platform::rp::{
         adc_raw, dma_raw, i2c_raw, pio_raw, pwm_raw, spi9_raw, spi_raw, uart_raw,
@@ -1729,68 +1720,6 @@ unsafe fn rp_system_extension_dispatch(
                 _ => E_NOSYS,
             }
         }
-        // ── Runtime parameter store ──
-        runtime_params::STORE => {
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            let module_id = param_store_module_id();
-            let mut fwd = [0u8; 252];
-            fwd[0] = module_id;
-            let n = if arg_len > 251 { 251 } else { arg_len };
-            core::ptr::copy_nonoverlapping(arg, fwd.as_mut_ptr().add(1), n);
-            crate::platform::rp_flash::store::dispatch_param_op(
-                runtime_params::STORE,
-                fwd.as_mut_ptr(),
-                1 + n,
-            )
-        }
-        runtime_params::DELETE => {
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            let module_id = param_store_module_id();
-            let mut fwd = [module_id, *arg];
-            crate::platform::rp_flash::store::dispatch_param_op(
-                runtime_params::DELETE,
-                fwd.as_mut_ptr(),
-                2,
-            )
-        }
-        runtime_params::CLEAR_ALL => {
-            if arg_len >= 1 && !arg.is_null() && *arg == 0xFF {
-                let mut fwd = [0xFFu8];
-                crate::platform::rp_flash::store::dispatch_param_op(
-                    runtime_params::CLEAR_ALL,
-                    fwd.as_mut_ptr(),
-                    1,
-                )
-            } else {
-                let module_id = param_store_module_id();
-                let mut fwd = [module_id];
-                crate::platform::rp_flash::store::dispatch_param_op(
-                    runtime_params::CLEAR_ALL,
-                    fwd.as_mut_ptr(),
-                    1,
-                )
-            }
-        }
-        // ── Flash store bridge ──
-        FLASH_STORE_ENABLE => {
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
-            }
-            let fn_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let module_idx = crate::kernel::exec::scheduler::current_module_index();
-            // Resolve export hash to absolute address (PIC-safe)
-            let resolved_addr =
-                crate::kernel::module::loader::resolve_export_for_module(module_idx, fn_addr)
-                    .unwrap_or(fn_addr as usize);
-            let dispatch: crate::platform::rp_flash::store::FlashStoreDispatchFn =
-                core::mem::transmute(resolved_addr);
-            let state = crate::kernel::exec::scheduler::get_module_state(module_idx);
-            crate::platform::rp_flash::store::register_dispatch(dispatch, state)
-        }
         flash::RAW_ERASE => {
             if arg.is_null() || arg_len < 4 {
                 return E_INVAL;
@@ -1914,7 +1843,7 @@ fn init_rp_providers() {
     // global ops.
     provider::register_vtable(&GPIO_VTABLE);
     // PIO, SPI, I2C, UART, ADC, PWM providers are registered by the
-    // loader when their PIC module exports `module_provides_contract`.
+    // loader when their PIC module's manifest names it in `provider_contracts`.
     // Register system extension for hardware opcodes (raw register bridges)
     register_system_extension(rp_system_extension_dispatch);
 }

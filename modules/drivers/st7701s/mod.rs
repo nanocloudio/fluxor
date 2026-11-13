@@ -733,13 +733,7 @@ unsafe fn fill_stripe_from_row_cache(
 // Module exports
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(St7701sState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<St7701sState>() as u32
-}
+fluxor_rt::module_facts! { state: St7701sState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1579,10 +1573,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         _ => -1,
     }
 }
-
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() {}
 
 // ============================================================================
 // Panic handler

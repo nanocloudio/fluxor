@@ -25,11 +25,11 @@ pub const TABLE_VERSION: u8 = 1;
 /// not here.
 pub const MAX_TABLE_MODULES: usize = 128;
 
-/// Module table header (16 bytes)
-pub const TABLE_HEADER_SIZE: usize = 16;
+/// Module table header size (`fluxor_abi::wire::fmod::table`).
+pub const TABLE_HEADER_SIZE: usize = fluxor_abi::wire::fmod::table::HEADER_SIZE;
 
-/// Module entry size (16 bytes)
-pub const ENTRY_SIZE: usize = 16;
+/// Module table entry size.
+pub const ENTRY_SIZE: usize = fluxor_abi::wire::fmod::table::ENTRY_SIZE;
 
 /// Information about a module to embed
 #[derive(Debug)]
@@ -65,10 +65,7 @@ pub struct ModuleInfo {
 impl ModuleInfo {
     /// Bytes of code in the packed module (its header's `code_size`).
     pub fn code_size(&self) -> usize {
-        self.data
-            .get(8..12)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-            .unwrap_or(0)
+        fluxor_abi::wire::fmod::header::Header::read(&self.data).map_or(0, |h| h.code_size as usize)
     }
 
     /// Load module from .fmod file
@@ -83,57 +80,25 @@ impl ModuleInfo {
             )));
         }
 
-        // Verify magic
-        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        if magic != MODULE_MAGIC {
+        let h = fluxor_abi::wire::fmod::header::Header::read(&data)
+            .ok_or_else(|| Error::Module("module header truncated".into()))?;
+        if h.magic != MODULE_MAGIC {
             return Err(Error::Module(format!(
-                "Invalid module magic: 0x{magic:08x}"
+                "Invalid module magic: 0x{:08x}",
+                h.magic
             )));
         }
-
-        // Extract name from header (offset 28, 32 bytes, null-terminated)
-        // Header layout: magic(4) + version(1) + abi(1) + type(1) + flags(1) +
-        //                code_size(4) + data_size(4) + bss_size(4) + init_offset(4) +
-        //                export_count(2) + export_offset(2) + name[32] + reserved[8]
-        let name_bytes = &data[28..60];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
-        let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
-
-        // Module type at offset 6
-        let module_type = data[6];
-
-        // Capability flags at offset 60 (reserved[0] in header)
-        let flags_byte = if data.len() > 60 { data[60] } else { 0 };
-        let mailbox_safe = (flags_byte & 0x01) != 0;
-        let in_place_writer = (flags_byte & 0x02) != 0;
-        let drain_capable = (flags_byte & 0x08) != 0;
-
-        // Reserved layout (in the 80-byte module header):
-        //   byte 0 (offset 60): flags
-        //   byte 1 (offset 61): step_period_ticks (scheduler ticks, NOT ms)
-        //   bytes 2-3 (offset 62-63): schema_size (u16 LE)
-        //   bytes 4-5 (offset 64-65): manifest_size (u16 LE)
-        //   bytes 6-13 (offset 66-73): required_caps (u64 LE)
-        //   byte 14 (offset 74): step_phase
-        //   bytes 15-19 (offset 75-79): reserved
-        let schema_size = if data.len() > 63 {
-            u16::from_le_bytes([data[62], data[63]]) as usize
-        } else {
-            0
-        };
-        let manifest_size = if data.len() > 65 {
-            u16::from_le_bytes([data[64], data[65]]) as usize
-        } else {
-            0
-        };
-
-        // Compute section offsets from header fields
-        let code_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-        let data_section_size =
-            u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
-        let export_count = u16::from_le_bytes([data[24], data[25]]) as usize;
-        let export_table_size = export_count * 8;
-        let schema_offset = MODULE_HEADER_SIZE + code_size + data_section_size + export_table_size;
+        use fluxor_abi::wire::fmod::header::flag;
+        let name = String::from_utf8_lossy(h.name_bytes()).to_string();
+        let module_type = h.module_type;
+        let mailbox_safe = h.flags & flag::MAILBOX_SAFE != 0;
+        let in_place_writer = h.flags & flag::IN_PLACE_WRITER != 0;
+        let drain_capable = h.flags & flag::DRAIN != 0;
+        let schema_size = h.schema_size as usize;
+        let manifest_size = h.manifest_size as usize;
+        let export_table_size = h.export_count as usize * 8;
+        let schema_offset =
+            MODULE_HEADER_SIZE + h.code_size as usize + h.data_size as usize + export_table_size;
 
         let schema = if schema_size >= 4 && schema_offset + schema_size <= data.len() {
             Some(data[schema_offset..schema_offset + schema_size].to_vec())
@@ -222,24 +187,20 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     };
     let mut result = Vec::with_capacity(total_size);
 
-    // Header (16 bytes)
+    // Header (`fluxor_abi::wire::fmod::table`): magic, version, module
+    // count, total size, program-section offset (0 until a section is
+    // appended).
     result.extend_from_slice(&MODULE_TABLE_MAGIC.to_le_bytes());
-    result.push(TABLE_VERSION);
-    result.push(modules.len() as u8);
-    // total_size is a u32 written as two little-endian u16 fields: the low
-    // half first, then the high half, followed by 6 reserved bytes.
-    result.extend_from_slice(&((total_size & 0xFFFF) as u16).to_le_bytes());
-    result.extend_from_slice(&(((total_size >> 16) & 0xFFFF) as u16).to_le_bytes());
-    result.extend_from_slice(&[0u8; 6]); // remaining reserved
+    result.extend_from_slice(&u16::from(TABLE_VERSION).to_le_bytes());
+    result.extend_from_slice(&(modules.len() as u16).to_le_bytes());
+    result.extend_from_slice(&(total_size as u32).to_le_bytes());
+    result.extend_from_slice(&0u32.to_le_bytes());
 
-    // Entries (16 bytes each)
+    // Entries: name hash, offset, size.
     for (i, module) in modules.iter().enumerate() {
         result.extend_from_slice(&module.name_hash.to_le_bytes());
         result.extend_from_slice(&(offsets[i] as u32).to_le_bytes());
         result.extend_from_slice(&(module.data.len() as u32).to_le_bytes());
-        result.push(module.module_type);
-        result.push(0); // flags
-        result.extend_from_slice(&[0u8; 2]); // reserved
     }
 
     // Module data (with alignment padding — code must start at page boundary)
@@ -465,8 +426,8 @@ pub fn build_program_section(programs: &[ProgramBlob]) -> Result<Vec<u8>> {
 }
 
 /// Byte offset, in the module-table header, of the program section's offset
-/// from the table's start (the header's first reserved word; 0 = none).
-pub const TABLE_PROGRAMS_AT: usize = 10;
+/// from the table's start (0 = none).
+pub const TABLE_PROGRAMS_AT: usize = fluxor_abi::wire::fmod::table::PROGRAM_SECTION_OFFSET;
 
 /// The module table with the graph's program section after it: the
 /// section starts on the first 4 KiB boundary at or past the table's end,
@@ -879,7 +840,7 @@ pub fn parse_modules_from_config_multi(
 /// Module header size (must match firmware's `ModuleHeader::SIZE`).
 /// The reserved tail carries `required_caps` as a u64, so every contract
 /// id in 0..63 (`MAX_CONTRACTS`) is expressible in the manifest bitmask.
-pub const MODULE_HEADER_SIZE: usize = 80;
+pub use fluxor_abi::wire::fmod::MODULE_HEADER_SIZE;
 
 /// ABI version byte stamped into every packed module header. Sourced
 /// from `crate::wire` so the pack tool, the kernel loader, and the
@@ -892,8 +853,6 @@ pub struct PackResult {
     pub name: String,
     pub code_size: usize,
     pub data_size: usize,
-    pub bss_size: usize,
-    pub init_offset: u32,
     pub exports: Vec<(String, u32, u32)>, // (name, offset, hash)
     pub total_size: usize,
 }
@@ -1209,9 +1168,9 @@ fn read_embedded_abi_surface(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 
 /// Read the module's resident state size out of the ELF, as data.
 ///
-/// Emitted by the SDK's `declare_module_state_bytes!` macro
+/// Emitted by the SDK's `module_facts!` macro
 /// (`crates/fluxor-rt/src/state.rs`) as a `#[used] static u32` carrying the same
-/// `size_of::<ModuleState>()` the kernel-facing `module_state_size()` returns.
+/// `size_of::<ModuleState>()` an instance needs.
 /// Reading it here is what lets the composer sum a graph's state arena demand
 /// before a device tries to load it, instead of taking a hand-typed number.
 ///
@@ -1230,7 +1189,7 @@ fn read_embedded_state_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 
 /// Read the module's declared worst-case stack depth out of the ELF, as data.
 ///
-/// Emitted by the SDK's `declare_module_stack_bytes!` macro
+/// Emitted by the SDK's `module_facts!`'s `stack:` macro
 /// (`crates/fluxor-rt/src/state.rs`). `None` for a module that has not
 /// declared; the composer decides per target what an undeclared depth means.
 fn read_embedded_stack_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<u32> {
@@ -1244,7 +1203,7 @@ fn read_embedded_stack_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 }
 
 /// Read the module's declared heap arena out of the ELF, as data (the SDK's
-/// `declare_module_arena_bytes!`). `None` for a module that has not declared.
+/// `module_facts!`'s `arena:`). `None` for a module that has not declared.
 fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<u32> {
     let sym = symbols
         .iter()
@@ -1260,7 +1219,7 @@ fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 /// is the module type's default heap cap, which the composer grows from. It
 /// is a copy of a figure the module computes, so `pack` holds the two equal
 /// for the very build it packs — this ABI, this variant: the module must declare its arena
-/// (`declare_module_arena_bytes!`) and the manifest's `base`, resolved for
+/// (`module_facts!`'s `arena:`) and the manifest's `base`, resolved for
 /// both, must be that figure. A drifted `base` would size every derived cap
 /// wrong, too small (the module refuses its params) or too large (the
 /// ledger charges what is never used).
@@ -1297,7 +1256,7 @@ fn check_heap_rule_base(
         ))),
         None => Err(Error::Module(format!(
             "{}: declares `[capacities] {key}` but no arena \
-             (`declare_module_arena_bytes!`), so its `base` cannot be checked against \
+             (`module_facts!`'s `arena:`), so its `base` cannot be checked against \
              the build ({build})",
             input.display()
         ))),
@@ -1632,7 +1591,6 @@ pub fn pack_fmod(
     let data_data = find_section(&sections, ".data")
         .map(|s| &s.data[..])
         .unwrap_or(&[]);
-    let bss_size = find_section(&sections, ".bss").map(|s| s.size).unwrap_or(0);
 
     // Extract param schema (optional — only present if module uses define_params!)
     let schema_data = find_section(&sections, ".param_schema")
@@ -1699,58 +1657,10 @@ pub fn pack_fmod(
     let data_size = data_data.len();
 
     // Find module_init offset
-    let init_offset = symbols
-        .iter()
-        .find(|s| s.name == "module_init")
-        .map(|s| s.value)
-        .unwrap_or(0);
-
-    // Build export table - filter to global functions
-    let export_names = [
-        // Core module interface
-        "module_state_size",
-        "module_init",
-        "module_new",
-        "module_step",
-        "module_pipeline_refill",
-        "module_post_tick_flush",
-        // heap arena size (per-module heap allocation)
-        "module_arena_size",
-        // buffer capability markers
-        "module_in_place_safe",
-        "module_mailbox_safe",
-        // deferred ready (infrastructure modules that need init time)
-        "module_deferred_ready",
-        // drain support (graceful shutdown for live reconfigure)
-        "module_drain",
-        // ISR tier 2 module exports
-        "module_isr_init",
-        "module_isr_entry",
-        // Provider dispatch (resolved by kernel via export hash)
-        "module_provider_dispatch",
-        // Provider auto-registration (loader reads this to get the
-        // contract id and auto-registers the module as provider).
-        "module_provides_contract",
-        // Several contracts from one provider state (a store that owns its
-        // objects and their namespace): the loader registers each.
-        "module_provides_contracts",
-        // Instance selector for a keyed provider (a fat32 with a `volume:`).
-        // The loader resolves this by hash; without it here the symbol never
-        // reaches the fmod export table and every keyed backend silently
-        // registers at selector 0, where the second one is refused as a
-        // duplicate.
-        "module_provider_selector",
-        // Owner-release subscription marker. Absent from the export table the
-        // loader cannot see it, and a provider that holds per-consumer
-        // resources is never told its consumer went away — a failure that is
-        // invisible to host tests, which resolve exports directly.
-        "module_observes_owner_release",
-        // Pool-sampler marker: the ledger asks a provider marked with it for
-        // the in-use figure of a pool it serves (`resource::POOL_SAMPLE`).
-        // Absent from the export table, the pool reads as the host's.
-        "module_samples_pool",
-        "module_flash_store_dispatch",
-    ];
+    // Build export table: the module's entry points, the registry's list,
+    // which the kernel's export-hash table is generated from too. Every
+    // other fact about the module is in its manifest.
+    let export_names = fluxor_abi::registry::entry_point::NAMES;
 
     let mut exports: Vec<(String, u32, u32)> = Vec::new();
     for sym in &symbols {
@@ -1834,15 +1744,19 @@ pub fn pack_fmod(
     // declared. Same shape as the ABI-surface attestation above: the compiler
     // embedded the value, the packer copies it, so the manifest cannot claim a
     // footprint the code does not have. Absent for a module that has not
-    // adopted `declare_module_state_bytes!` — left at 0 ("unknown") rather than
+    // adopted `module_facts!` — left at 0 ("unknown") rather than
     // guessed, since a wrong state size would be admitted by a composer that
     // trusts it.
-    if let Some(bytes) = read_embedded_state_bytes(&sections, &symbols) {
-        // Round UP into 64-byte units: the recorded figure must never be an
-        // understatement of what the state arena has to provide.
-        let units = bytes.div_ceil(64);
-        module_manifest.state_bytes_64 = u16::try_from(units).unwrap_or(u16::MAX);
-    }
+    // Every module states its facts; the kernel never asks it.
+    let Some(bytes) = read_embedded_state_bytes(&sections, &symbols) else {
+        return Err(Error::Module(format!(
+            "{name}: states no facts — add `fluxor_rt::module_facts! {{ state: <State type> }}` \
+             at the crate root"
+        )));
+    };
+    // Round UP into 64-byte units: the recorded figure must never be an
+    // understatement of what the state arena has to provide.
+    module_manifest.state_bytes_64 = bytes.div_ceil(64);
 
     // Stack depth: what the build measured from the call graph, or what the
     // author declared where the graph has no bound. A declaration is a floor
@@ -1853,7 +1767,7 @@ pub fn pack_fmod(
         if declared != 0 && declared < measured {
             return Err(Error::Module(format!(
                 "{name}: declares {declared} B of stack but its call graph reaches \
-                 {measured} B. Raise `declare_module_stack_bytes!` or shorten the \
+                 {measured} B. Raise `module_facts!`'s `stack:` or shorten the \
                  path (`fluxor modules build -v` names it)."
             )));
         }
@@ -1861,10 +1775,27 @@ pub fn pack_fmod(
     let stack = declared.max(measured_stack.unwrap_or(0));
     module_manifest.stack_bytes_64 = u16::try_from(stack.div_ceil(64)).unwrap_or(u16::MAX);
 
-    // Heap arena: the declared figure, so the loader sizes the arena from the
-    // manifest instead of calling `module_arena_size`.
-    if let Some(bytes) = read_embedded_arena_bytes(&sections, &symbols) {
-        module_manifest.arena_bytes = bytes;
+    // Heap arena: the declared figure (0 for none), so the loader sizes the
+    // arena from the manifest.
+    module_manifest.arena_bytes = read_embedded_arena_bytes(&sections, &symbols).unwrap_or(0);
+
+    // Provider-ness: the manifest names the contracts, the dispatch entry
+    // point serves them. One without the other is a module that cannot be
+    // registered, or a dispatch nothing reaches.
+    let has_dispatch = exports
+        .iter()
+        .any(|(n, _, _)| n == "module_provider_dispatch");
+    if module_manifest.provider_contracts.is_empty() == has_dispatch {
+        return Err(Error::Module(format!(
+            "{name}: {}",
+            if has_dispatch {
+                "defines `module_provider_dispatch` but its manifest names no \
+                 `provider_contracts`"
+            } else {
+                "its manifest names `provider_contracts` but it defines no \
+                 `module_provider_dispatch`"
+            }
+        )));
     }
 
     let manifest_bytes = module_manifest.to_bytes();
@@ -1873,7 +1804,6 @@ pub fn pack_fmod(
     let export_table_size = exports.len() * 8; // 4 bytes hash + 4 bytes offset
                                                // Export table is stored immediately after code + data in the file.
                                                // BSS is not stored, so it must not be included here.
-    let mem_export_offset = code_size + data_size;
     let schema_size = schema_data.len();
     let manifest_size = manifest_bytes.len();
     let total_size = MODULE_HEADER_SIZE
@@ -1883,105 +1813,44 @@ pub fn pack_fmod(
         + schema_size
         + manifest_size;
 
-    // Build module header (MODULE_HEADER_SIZE bytes).
-    let mut header = Vec::with_capacity(MODULE_HEADER_SIZE);
-
-    // Magic (4 bytes)
-    header.extend_from_slice(&MODULE_MAGIC.to_le_bytes());
-    // Version, ABI, Type, Reserved (4 bytes)
-    header.push(TABLE_VERSION);
-    header.push(ABI_VERSION);
-    header.push(module_type);
-    header.push(0);
-    // Code size (4 bytes)
-    header.extend_from_slice(&(code_size as u32).to_le_bytes());
-    // Data size (4 bytes)
-    header.extend_from_slice(&(data_size as u32).to_le_bytes());
-    // BSS size (4 bytes)
-    header.extend_from_slice(&(bss_size as u32).to_le_bytes());
-    // Init offset (4 bytes)
-    header.extend_from_slice(&init_offset.to_le_bytes());
-    // Export count (2 bytes) + export offset (2 bytes)
-    // NOTE: export_offset is u16 in the header — overflows for modules > 64KB.
-    // The kernel loader computes the offset from code_size + data_size instead.
-    // Store 0xFFFF as sentinel when it overflows.
-    let export_offset_u16 = if mem_export_offset > u16::MAX as usize {
-        0xFFFFu16
-    } else {
-        mem_export_offset as u16
-    };
-    header.extend_from_slice(&(exports.len() as u16).to_le_bytes());
-    header.extend_from_slice(&export_offset_u16.to_le_bytes());
-    // Name (32 bytes, null-terminated)
-    let mut name_bytes = [0u8; 32];
-    let name_slice = name.as_bytes();
-    let copy_len = name_slice.len().min(31);
-    name_bytes[..copy_len].copy_from_slice(&name_slice[..copy_len]);
-    header.extend_from_slice(&name_bytes);
-    // Reserved (20 bytes):
-    //   byte 0: flags
-    //     bit 0: mailbox_safe
-    //     bit 1: in_place_writer
-    //     bit 2: deferred_ready
-    //     bit 3: drain_capable
-    //     bit 4: isr_module
-    //     bits 5-7: reserved (0)
-    //   byte 1: step_period_ticks (0 = every tick; N = every N scheduler
-    //                              ticks. NOT milliseconds. Set by config, not pack)
-    //   bytes 2-3: schema_size (u16 LE)
-    //   bytes 4-5: manifest_size (u16 LE)
-    //   bytes 6-13: required_caps (u64 LE) — public contract bitmask, full 0..63 range
-    //   byte 14: step_phase
-    //   bytes 15-19: reserved (0)
-    //
-    // Fine-grained permissions (flash_raw, platform_raw, …) live in the
-    // manifest binary at byte 15 (written by Manifest::to_bytes).
-    let has_in_place_safe = symbols
-        .iter()
-        .any(|s| s.bind == 1 && s.name == "module_in_place_safe");
-    let has_mailbox_safe = symbols
-        .iter()
-        .any(|s| s.bind == 1 && s.name == "module_mailbox_safe");
-    let has_deferred_ready = symbols
-        .iter()
-        .any(|s| s.bind == 1 && s.name == "module_deferred_ready");
-    let has_drain = symbols
-        .iter()
-        .any(|s| s.bind == 1 && s.name == "module_drain");
-    let mut reserved = [0u8; 20];
-    if has_in_place_safe {
-        reserved[0] |= 0x03; // mailbox_safe (bit 0) + in_place_writer (bit 1)
+    // The module header (`fluxor_abi::wire::fmod::header`). Its flag bits
+    // are the manifest's facts, plus `DRAIN` / `ISR` for the entry points the
+    // module defines.
+    use fluxor_abi::wire::fmod::header::{flag, Header, NAME_LEN};
+    let defines = |entry: &str| exports.iter().any(|(n, _, _)| n == entry);
+    let mut flags = module_manifest.facts.header_flags();
+    if defines("module_drain") {
+        flags |= flag::DRAIN;
     }
-    if has_mailbox_safe {
-        reserved[0] |= 0x01; // mailbox_safe only (bit 0)
+    if defines("module_isr_entry") {
+        flags |= flag::ISR;
     }
-    if has_deferred_ready {
-        reserved[0] |= 0x04; // deferred_ready (bit 2)
+    let mut name_bytes = [0u8; NAME_LEN];
+    let copy_len = name.len().min(NAME_LEN - 1);
+    name_bytes[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+    // `step_period` counts SCHEDULER TICKS, so on a mechanism-(b) domain —
+    // one whose tick cadence the pacer varies — the wall-clock period it
+    // implies (step_period_ticks × domain_tick_us) warps. The adaptive
+    // validator therefore rejects a non-zero value on such a domain unless
+    // the module declares `timer_class = "wall_clock"`.
+    let header = Header {
+        magic: MODULE_MAGIC,
+        version: TABLE_VERSION,
+        abi_version: ABI_VERSION,
+        module_type,
+        flags,
+        code_size: code_size as u32,
+        data_size: data_size as u32,
+        export_count: exports.len() as u16,
+        schema_size: schema_size as u16,
+        manifest_size: manifest_size as u16,
+        step_period: module_manifest.step_period_ticks,
+        step_phase: 0,
+        required_caps: module_manifest.required_caps_mask()?,
+        name: name_bytes,
     }
-    if has_drain {
-        reserved[0] |= 0x08; // drain_capable (bit 3)
-    }
-    let has_isr_entry = symbols
-        .iter()
-        .any(|s| s.bind == 1 && s.name == "module_isr_entry");
-    if has_isr_entry {
-        reserved[0] |= 0x10; // isr_module (bit 4)
-    }
-    // byte 1: step_period_ticks (0 = every tick). Sourced from the manifest
-    // (`step_period_ticks = N`) — this is the producer the loader/scheduler ABI
-    // (loader.rs:846) reads back. A non-zero value counts SCHEDULER TICKS, so
-    // on a mechanism-(b) domain — one whose tick cadence the pacer varies — the
-    // wall-clock period it implies (step_period_ticks × domain_tick_us) warps.
-    // The adaptive validator therefore rejects a non-zero value on such a
-    // domain unless the module declares `timer_class = "wall_clock"`, i.e.
-    // re-derives its period from real time.
-    reserved[1] = module_manifest.step_period_ticks;
-    reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
-    reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
-    reserved[6..14].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
-    header.extend_from_slice(&reserved);
-
-    assert_eq!(header.len(), MODULE_HEADER_SIZE);
+    .to_bytes()
+    .to_vec();
 
     // Build export table
     let mut export_table = Vec::with_capacity(export_table_size);
@@ -2005,8 +1874,6 @@ pub fn pack_fmod(
         name: name.to_string(),
         code_size,
         data_size,
-        bss_size,
-        init_offset,
         exports,
         total_size,
     })
@@ -2124,47 +1991,33 @@ pub fn pack_fmod_wasm(
     // Layout: header + wasm code + (no data) + (no exports) + schema + manifest
     let code_size = wasm_data.len();
     let data_size = 0usize;
-    let bss_size = 0usize;
-    let init_offset = 0u32;
-    let mem_export_offset = code_size + data_size; // 0 exports follow at this offset
     let schema_size = schema_data.len();
     let manifest_size = manifest_bytes.len();
     let total_size = MODULE_HEADER_SIZE + code_size + schema_size + manifest_size;
 
-    let mut header = Vec::with_capacity(MODULE_HEADER_SIZE);
-    header.extend_from_slice(&MODULE_MAGIC.to_le_bytes());
-    header.push(TABLE_VERSION);
-    header.push(ABI_VERSION);
-    header.push(module_type);
-    header.push(0);
-    header.extend_from_slice(&(code_size as u32).to_le_bytes());
-    header.extend_from_slice(&(data_size as u32).to_le_bytes());
-    header.extend_from_slice(&(bss_size as u32).to_le_bytes());
-    header.extend_from_slice(&init_offset.to_le_bytes());
-    header.extend_from_slice(&0u16.to_le_bytes()); // export_count = 0
-    let export_offset_u16 = if mem_export_offset > u16::MAX as usize {
-        0xFFFFu16
-    } else {
-        mem_export_offset as u16
-    };
-    header.extend_from_slice(&export_offset_u16.to_le_bytes());
-    let mut name_bytes = [0u8; 32];
-    let name_slice = name.as_bytes();
-    let copy_len = name_slice.len().min(31);
-    name_bytes[..copy_len].copy_from_slice(&name_slice[..copy_len]);
-    header.extend_from_slice(&name_bytes);
-
-    // Reserved bytes — same layout as PIC modules but with the
-    // `wasm_payload` flag set in byte 0 bit 5.
-    let mut reserved = [0u8; 20];
-    reserved[0] |= 0x20; // bit 5: wasm_payload
-    reserved[1] = module_manifest.step_period_ticks; // byte 1: step_period_ticks (see pack_fmod)
-    reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
-    reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
-    reserved[6..14].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
-    header.extend_from_slice(&reserved);
-
-    assert_eq!(header.len(), MODULE_HEADER_SIZE);
+    // The same header as a PIC module's, with `WASM_PAYLOAD` set and no
+    // exports: the wasm kernel calls the module by export name.
+    use fluxor_abi::wire::fmod::header::{flag, Header, NAME_LEN};
+    let mut name_bytes = [0u8; NAME_LEN];
+    let copy_len = name.len().min(NAME_LEN - 1);
+    name_bytes[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+    let header = Header {
+        magic: MODULE_MAGIC,
+        version: TABLE_VERSION,
+        abi_version: ABI_VERSION,
+        module_type,
+        flags: module_manifest.facts.header_flags() | flag::WASM_PAYLOAD,
+        code_size: code_size as u32,
+        data_size: data_size as u32,
+        export_count: 0,
+        schema_size: schema_size as u16,
+        manifest_size: manifest_size as u16,
+        step_period: module_manifest.step_period_ticks,
+        step_phase: 0,
+        required_caps: module_manifest.required_caps_mask()?,
+        name: name_bytes,
+    }
+    .to_bytes();
 
     let mut output_data = Vec::with_capacity(total_size);
     output_data.extend_from_slice(&header);
@@ -2178,8 +2031,6 @@ pub fn pack_fmod_wasm(
         name: name.to_string(),
         code_size,
         data_size,
-        bss_size,
-        init_offset,
         exports: Vec::new(),
         total_size,
     })
@@ -2339,12 +2190,16 @@ mod tests {
         assert_eq!(&sec[off2..off2 + len2], b"second owner");
     }
 
-    /// The table names the section by its first reserved word, and the
-    /// section starts on the page after the table.
+    /// The table header names the section, and the section starts on the
+    /// page after the table.
     #[test]
     fn module_table_points_at_its_program_section() {
         let t = build_module_table_with_programs(&[], &[blob(1, 0, 0, b"x")]).unwrap();
-        let at = u32::from_le_bytes(t[10..14].try_into().unwrap()) as usize;
+        let at = u32::from_le_bytes(
+            t[TABLE_PROGRAMS_AT..TABLE_PROGRAMS_AT + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         assert_eq!(at, 4096);
         assert_eq!(&t[at..at + 4], b"FXPG");
         let none = build_module_table_with_programs(&[], &[]).unwrap();
@@ -2414,7 +2269,7 @@ mod tests {
             "{e}"
         );
         let e = ok("aarch64", "full", None).unwrap_err().to_string();
-        assert!(e.contains("declare_module_arena_bytes!"), "{e}");
+        assert!(e.contains("module_facts!"), "{e}");
         // No rule: nothing to check.
         check_heap_rule_base(p, &Manifest::default(), None, None, None).expect("no rule");
     }
@@ -2871,7 +2726,8 @@ mod tests {
         };
         let table = build_module_table(&[module("a", 100), module("b", 5000)]).unwrap();
         assert_eq!(table.len() % 4096, 0, "the table ends on a page");
-        let total = u32::from_le_bytes([table[6], table[7], table[8], table[9]]) as usize;
+        let at = fluxor_abi::wire::fmod::table::TOTAL_SIZE;
+        let total = u32::from_le_bytes(table[at..at + 4].try_into().unwrap()) as usize;
         assert_eq!(total, table.len(), "the header states the padded size");
         for i in 0..2 {
             let at = TABLE_HEADER_SIZE + i * ENTRY_SIZE + 4;

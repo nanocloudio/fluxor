@@ -1632,21 +1632,10 @@ fn pio_rxf_addr(pio_num: u8, sm: u8) -> u32 {
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<PioState>()
-}
+fluxor_rt::module_facts! { state: PioState }
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
-fluxor_rt::declare_module_state_bytes!(PioState);
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -1690,12 +1679,6 @@ pub unsafe extern "C" fn module_new(
         dev_log(sys, 3, b"[pio] ready".as_ptr(), 10);
         0
     }
-}
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_provides_contract"]
-pub extern "C" fn module_provides_contract() -> u32 {
-    abi::registry::pio::ID as u32
 }
 
 /// # Safety

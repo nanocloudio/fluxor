@@ -194,7 +194,7 @@ never reuses one.
 - **Rollback:** on a raw lower device the generations share the data's
   rollback domain. They make crash recovery exact, and do not detect a
   hostile restore of the whole device.
-- **Readiness:** `module_deferred_ready` holds consumers until the container
+- **Readiness:** `deferred_ready = true` holds consumers until the container
   mounts.
 
 ## Lower and upper I/O

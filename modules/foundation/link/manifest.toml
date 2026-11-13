@@ -1,5 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["rp2350"]
+deferred_ready = true
+mailbox_safe = true
 
 [[ports]]
 name = "audio_in"

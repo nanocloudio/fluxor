@@ -247,8 +247,6 @@ pub struct FilterState {
     bufs: [[u8; POLICY_BUF]; 2],
 }
 
-const STATE_SIZE: usize = core::mem::size_of::<FilterState>();
-
 /// The table in force.
 fn held(s: &FilterState) -> &[u8] {
     match s.bufs.get((s.live & 1) as usize) {
@@ -791,20 +789,7 @@ unsafe fn pass_one(s: &mut FilterState, input: i32, output: i32, now: u32) -> bo
 // Module ABI
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(FilterState);
-fluxor_rt::declare_module_arena_bytes!(HEAP_DEFAULT_BYTES);
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    STATE_SIZE
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    HEAP_DEFAULT_BYTES
-}
+fluxor_rt::module_facts! { state: FilterState, arena: HEAP_DEFAULT_BYTES }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -866,7 +851,7 @@ pub unsafe extern "C" fn module_new(
             seed = (t ^ 0x9e37_79b9).to_le_bytes();
         }
         s.seed = u32::from_le_bytes(seed);
-        // SAFETY: the heap is this module's, sized by `module_arena_size`
+        // SAFETY: the heap is this module's, sized by its manifest arena
         // or the graph's `heap.arena_bytes`.
         if !unsafe { flows::size(s) } {
             let msg = b"[pkt_filter] refusing to construct: the heap cannot hold the flow table (max_flows)";

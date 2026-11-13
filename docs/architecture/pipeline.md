@@ -97,10 +97,11 @@ The config tool enforces:
 Source: `src/kernel/module/loader.rs`,
 `src/kernel/exec/scheduler/module_types.rs`
 
-Modules implement four required exports:
+A module states its facts once, at the crate root, and implements its
+entry points:
 
 ```rust
-#[no_mangle] pub extern "C" fn module_state_size() -> usize { ... }
+fluxor_rt::module_facts! { state: ModuleState }
 #[no_mangle] pub extern "C" fn module_init(syscalls: *const c_void) { ... }
 #[no_mangle] pub extern "C" fn module_new(in_chan: i32, out_chan: i32, ctrl_chan: i32,
                                           params: *const u8, params_len: usize,
@@ -109,19 +110,19 @@ Modules implement four required exports:
 #[no_mangle] pub extern "C" fn module_step(state: *mut u8) -> i32 { ... }
 ```
 
-Optional exports surface additional capabilities:
+Further capabilities are manifest facts or optional entry points:
 
-| Export | Purpose |
+| Fact / entry point | Purpose |
 |--------|--------|
-| `module_arena_size` | Request a per-module heap (see [heap.md](heap.md)) |
+| `module_facts!`'s `arena:` | Request a per-module heap (see [heap.md](heap.md)) |
 | `module_drain` | Support graceful drain during live reconfigure |
-| `module_deferred_ready` | Gate downstream modules until init completes |
-| `module_mailbox_safe` | Declare safe consumption from mailbox channels |
-| `module_in_place_safe` | Declare safe in-place mailbox transformation |
+| `deferred_ready = true` | Gate downstream modules until init completes |
+| `mailbox_safe = true` | Declare safe consumption from mailbox channels |
+| `in_place_writer = true` | Declare safe in-place mailbox transformation |
 | `module_pipeline_refill` | Bounded input-refill hook called between steps |
 | `module_post_tick_flush` | TX-only flush hook called after the module pass |
-| `module_isr_init` / `module_isr_entry` | Tier 2 ISR entry (see [scheduler.md](scheduler.md)) |
-| `module_provider_dispatch` / `module_provides_contract` / `module_provider_selector` | Provider contract surface (see [abi_layers.md](abi_layers.md)) |
+| `module_isr_entry` | Tier 2 ISR entry (see [scheduler.md](scheduler.md)) |
+| `provider_contracts` + `module_provider_dispatch` / `module_provider_selector` | Provider contract surface (see [abi_layers.md](abi_layers.md)) |
 
 ### Step Outcome
 
@@ -145,7 +146,7 @@ cannot consume the whole tick. `MAX_BURST_STEPS` in
 final safety valve.
 
 `Ready` participates in the deferred-ready chain: a module that exports
-`module_deferred_ready` is gated by the scheduler so that its downstream
+`deferred_ready = true` is gated by the scheduler so that its downstream
 consumers do not run until it has returned `Ready` from a step. The
 gating is transitive: if A is gated on B and B is gated on C, then A's
 consumers wait until C reports ready, then B reports ready.
@@ -333,7 +334,7 @@ via header flags (`reserved[0]` in the `.fmod` header):
 | 1 | `in_place_writer` | Module uses `buffer_acquire_inplace` to transform the buffer |
 | 2 | `deferred_ready` | Module needs init time before downstream may run |
 | 3 | `drain_capable` | Module exports `module_drain` for live reconfigure |
-| 4 | `isr_module` | Module exports `module_isr_init` / `module_isr_entry` |
+| 4 | `isr_module` | Module defines `module_isr_entry` |
 | 5 | `wasm_payload` | Module body is a wasm payload |
 
 The pack tool detects the corresponding `module_*` export and sets the
@@ -433,11 +434,11 @@ PIC modules go through this sequence during graph setup:
 
 1. **Find** — locate the module in flash by name hash
 2. **Validate** — check magic bytes, ABI version, code bounds
-3. **Size** — the manifest's state size; a trusted module that declares none is
-   asked through `module_state_size()`
+3. **Size** — the manifest's state size; a module whose manifest states none
+   is refused
 4. **Allocate** — reserve state from the state arena
 5. **Heap** — the cap is the graph's per-instance `heap.arena_bytes`, else the
-   type's declared arena (manifest, or `module_arena_size()`); a committed heap
+   type's declared arena (the manifest's); a committed heap
    is carved now, an elastic one as the module allocates
 6. **Init** — call `module_init(syscalls)` once
 7. **New** — call `module_new(in, out, ctrl, params, params_len, state, state_size, syscalls)`.
@@ -456,8 +457,8 @@ module proceeds.
 
 ### Per-Module Heap
 
-Modules that need dynamic allocation declare an arena (manifest or
-`module_arena_size()`), which the graph may resize per instance with
+Modules that need dynamic allocation declare an arena (`module_facts!`'s
+`arena:`, written into the manifest), which the graph may resize per instance with
 `heap.arena_bytes`. The SDK helpers `heap_alloc`, `heap_free`,
 `heap_realloc` allocate within that cap; on linux and bcm2712 the heap
 commits state-arena memory as it is used, elsewhere the cap is carved at

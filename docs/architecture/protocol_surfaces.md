@@ -693,7 +693,7 @@ separate anchor-HA mechanism.
 
 Machinery that fits anchor-preserved replacement: staged graph images
 via `graph_slot` with activation by epoch change, and deferred
-readiness (`module_deferred_ready`) so a module delays live
+readiness (`deferred_ready = true` in the manifest) so a module delays live
 participation until import and attach complete. `graph_slot`
 activation is whole-graph, so anchor-preserved worker swap uses an
 equivalent staging mechanism instead: both worker generations resident

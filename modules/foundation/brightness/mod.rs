@@ -172,13 +172,7 @@ fn isqrt_u32(n: u32) -> u32 {
 // Module API
 // ============================================================================
 
-fluxor_rt::declare_module_state_bytes!(BrightnessState);
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<BrightnessState>() as u32
-}
+fluxor_rt::module_facts! { state: BrightnessState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

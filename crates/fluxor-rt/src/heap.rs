@@ -3,7 +3,7 @@
 // ============================================================================
 //
 // Wrappers for the kernel-managed per-module heap. Modules that export
-// `module_arena_size() -> u32` with a non-zero return value receive a
+// a non-zero `arena:` in `module_facts!` receive a
 // heap arena. These helpers call through the SyscallTable function pointers.
 //
 // The heap is bounded per-module: allocation failures return null.

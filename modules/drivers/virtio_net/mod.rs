@@ -19,7 +19,7 @@
 //!    Ready on that step
 //! 6. Poll: RX used ring → out_chan, in_chan → TX available ring
 //!
-//! Exports `module_deferred_ready`: the non-deferred modules downstream of
+//! Declares `deferred_ready`: the non-deferred modules downstream of
 //! it are not stepped until it reports Ready, so it reports Ready once the
 //! device is up and its MAC is announced.
 
@@ -532,19 +532,7 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
-fluxor_rt::declare_module_state_bytes!([u8; STATE_SIZE]);
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize {
-    STATE_SIZE
-}
+fluxor_rt::module_facts! { state: [u8; STATE_SIZE] }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,

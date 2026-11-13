@@ -12,6 +12,7 @@ provides = ["storage.namespace"]
 
 # No tick-based timekeeping: pure provider_call surface.
 timer_class = "agnostic"
+provider_contracts = ["storage.namespace"]
 
 # Optional control channel, declared for symmetry with `mount`; inert
 # when unwired.

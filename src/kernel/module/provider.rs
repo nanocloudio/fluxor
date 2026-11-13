@@ -26,7 +26,7 @@
 //! - A kernel-internal function (registered at startup via `register()`).
 //! - A PIC module export (registered by the loader via
 //!   `register_module_provider()` after the module publishes a
-//!   `module_provides_contract` export). Module providers form a chain
+//!   manifest's `provider_contracts`). Module providers form a chain
 //!   (stack) per contract. Middleware modules (TLS, compression)
 //!   intercept calls and forward to the layer below via `CHAIN_NEXT`.
 //!
@@ -796,28 +796,17 @@ pub fn register(contract: ContractId, dispatch: ProviderDispatch) {
 
 /// Contracts a PIC module is allowed to provide. The loader calls
 /// `register_module_provider` after resolving a module's
-/// `module_provides_contract` (or `module_provides_contracts`) export — a
+/// manifest naming the contract in `provider_contracts` — a
 /// compromised or mis-built module could in principle name any contract.
 /// Only the contracts where it is architecturally legitimate for a module to
-/// be the provider are admitted: the HAL peripherals, FS, and the
-/// `storage.namespace` / `storage.object` surfaces. CHANNEL / TIMER / BUFFER /
-/// EVENT / KEY_VAULT and the internal dispatch bucket are kernel-only and
-/// must not be replaceable by a module.
+/// be the provider are admitted — those the registry marks `module_provided`
+/// (the HAL peripherals, FS, the `storage.namespace` / `storage.object`
+/// surfaces, the runtime parameter store). CHANNEL / TIMER / BUFFER / EVENT /
+/// KEY_VAULT and the internal dispatch bucket are kernel-only and must not be
+/// replaceable by a module.
 #[inline]
 fn is_module_providable(contract: ContractId) -> bool {
-    matches!(
-        contract,
-        contract::HAL_GPIO
-            | contract::HAL_SPI
-            | contract::HAL_I2C
-            | contract::HAL_PIO
-            | contract::HAL_UART
-            | contract::HAL_ADC
-            | contract::HAL_PWM
-            | contract::FS
-            | contract::STORAGE_NAMESPACE
-            | contract::STORAGE_OBJECT
-    )
+    crate::abi::registry::module_providable(contract)
 }
 
 /// Register a PIC module as provider for a contract.
@@ -1043,7 +1032,7 @@ pub fn release_module_providers(module_idx: ModuleId) {
 
 /// Providers that asked to hear about owner teardown, by module index.
 /// Opt-in: set by the loader when a provider module exports
-/// `module_observes_owner_release`. Never notified otherwise, because
+/// `observes_owner_release = true`. Never notified otherwise, because
 /// calling every registered provider with an opcode it does not know would
 /// reach modules whose dispatch does not bounds-check its input.
 static mut OWNER_RELEASE_OBSERVERS: crate::kernel::workload::bitmask::ModuleMask =
@@ -1059,7 +1048,7 @@ pub fn register_owner_release_observer(module_idx: ModuleId) -> i32 {
     }
     if !module_has_provider_layer(module_idx) {
         log::warn!(
-            "[provider] module {module_idx} exports module_observes_owner_release but \
+            "[provider] module {module_idx} observes owner release but \
              provides no contract; nothing to notify"
         );
         return errno::EINVAL;
@@ -1100,7 +1089,7 @@ pub fn clear_owner_release_observer(module_idx: ModuleId) {
 // node's class-byte calls reach.
 
 /// Providers that answer `POOL_SAMPLE`, by module index. Opt-in, set by the
-/// loader when a provider exports `module_samples_pool`, for the reason
+/// loader when a provider's manifest says `samples_pool = true`, for the reason
 /// `OWNER_RELEASE_OBSERVERS` is: a dispatch that never asked for the opcode
 /// is never handed it.
 static mut POOL_SAMPLERS: crate::kernel::workload::bitmask::ModuleMask =
@@ -1116,7 +1105,7 @@ pub fn register_pool_sampler(module_idx: ModuleId) -> i32 {
     }
     if !module_has_provider_layer(module_idx) {
         log::warn!(
-            "[provider] module {module_idx} exports module_samples_pool but provides no \
+            "[provider] module {module_idx} samples a pool but provides no \
              contract; nothing to ask"
         );
         return errno::EINVAL;
