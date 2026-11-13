@@ -13,11 +13,10 @@
 //! after the slot is reused, because the generation no longer matches; it also
 //! fails immediately on free, because the slot's state is no longer `Active`.
 //!
-//! Zero cost on single-tenant targets: when the `multitenant` feature is off
-//! `MAX_OWNERS == 1`, the table holds only the system slot, and the
-//! authorization helpers ([`same_or_system`]) compile to `true`. Owner fields
-//! on graph objects are themselves `#[cfg(feature = "multitenant")]`, so
-//! bare-metal targets carry no per-object ownership state.
+//! One shape on every target: the owner table is sized at boot from the
+//! plan's `owners` ceiling (`resource_ledger::plan`), so an image whose plan
+//! holds only the system owner carries one slot and every handle it stamps is
+//! [`OWNER_SYSTEM`].
 //!
 //! Authority: an owner is also the authority its modules act with, unless it
 //! was admitted to act with the node's ([`Authority::Node`]). The owner
@@ -29,31 +28,28 @@
 
 use crate::kernel::workload::storage::StorageGrant;
 
-/// The owner-slot DOMAIN on a hosted kernel, not a table size: the owner
-/// table — and every per-owner table beside it (log rings, code-pack
-/// regions, workload slots) — is sized at boot from the plan's `owners`
-/// ceiling (the system slot, the resident workloads and the owner reserve,
-/// `resource_ledger::plan`). What this bounds is what a slot may be at all:
-/// the host-process backend's workload index, which shares an fd slot space
-/// with the graph backend's above `0x1000`
-/// (`platform::linux::workload::GRAPH_SLOT_BASE`). A plan past it is refused
-/// at boot naming `owners`. Wire fields carrying a slot are `u16`.
-#[cfg(all(feature = "multitenant", feature = "host-linux"))]
+/// The owner-slot DOMAIN, not a table size: the owner table — and every
+/// per-owner table beside it (log rings, code-pack regions, workload slots)
+/// — is sized at boot from the plan's `owners` ceiling (the system slot, the
+/// resident workloads and the owner reserve, `resource_ledger::plan`). What
+/// this bounds is what a slot may be at all: the host-process backend's
+/// workload index, which shares an fd slot space with the graph backend's
+/// above `0x1000` (`platform::linux::workload::GRAPH_SLOT_BASE`). A plan past
+/// it is refused at boot naming `owners`. Wire fields carrying a slot are
+/// `u16`.
 pub const MAX_OWNERS: usize = 4096;
-/// The owner-slot domain on aarch64 bare metal (bcm2712, uefi), including the
-/// system slot: the table is sized at boot from the plan (and carved), and a
-/// plan past this is refused naming `owners`.
-#[cfg(all(feature = "multitenant", not(feature = "host-linux")))]
-pub const MAX_OWNERS: usize = 64;
-/// Single-tenant: only the system owner exists.
-#[cfg(not(feature = "multitenant"))]
-pub const MAX_OWNERS: usize = 1;
+
+/// The compiled size of an owner-keyed table: the profile's static owner
+/// figure where its tables are static arrays (wasm), else the domain, which a
+/// table sized at boot does not reserve.
+pub const OWNER_TABLE_SLOTS: usize =
+    match crate::kernel::config::static_pool(crate::abi::contracts::resource::POOL_OWNERS) {
+        Some(n) => n,
+        None => MAX_OWNERS,
+    };
 
 const _: () = assert!(MAX_OWNERS >= 1, "MAX_OWNERS must include the system slot");
-const _: () = assert!(
-    (MAX_OWNERS > 1) == cfg!(feature = "multitenant"),
-    "MAX_OWNERS > 1 must coincide with the `multitenant` feature"
-);
+const _: () = assert!(OWNER_TABLE_SLOTS >= 1 && OWNER_TABLE_SLOTS <= MAX_OWNERS);
 // Slot is a u16; keep the table within that index domain.
 const _: () = assert!(MAX_OWNERS <= u16::MAX as usize);
 
@@ -183,11 +179,10 @@ impl OwnerEntry {
 ///
 /// On Linux, aarch64 bare metal and RP the table is sized at boot to the
 /// plan's `owners` ceiling — the system slot, the resident workloads and the
-/// owner reserve — within the owner-slot domain `MAX_OWNERS` (4096 on Linux,
-/// 64 on aarch64 bare metal, 1 on the single-tenant RP); on wasm it is the
-/// static array.
+/// owner reserve — within the owner-slot domain `MAX_OWNERS`; on wasm it is
+/// the profile's static array.
 pub struct OwnerTable {
-    entries: crate::kernel::mem::table::Table<OwnerEntry, MAX_OWNERS>,
+    entries: crate::kernel::mem::table::Table<OwnerEntry, OWNER_TABLE_SLOTS>,
     /// The kernel's table ([`OwnerTable::kernel`]): its owners' log rings
     /// are created with them and freed with them. A free-standing table (a
     /// test's) holds no rings.
@@ -227,7 +222,7 @@ impl OwnerTable {
         }
         #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
         {
-            let mut entries = [OwnerEntry::EMPTY; MAX_OWNERS];
+            let mut entries = [OwnerEntry::EMPTY; OWNER_TABLE_SLOTS];
             entries[0] = OwnerEntry::SYSTEM;
             OwnerTable {
                 entries: crate::kernel::mem::table::Table::from_array(entries),
@@ -326,8 +321,7 @@ impl OwnerTable {
                 return None;
             }
         }
-        // Empty on single-tenant builds (one slot): no workload slots exist,
-        // so nothing matches.
+        // Empty on a table of the system slot alone.
         for slot in 1..self.slots().len() {
             if matches!(self.entries[slot].state, OwnerState::Free) {
                 let generation = self.entries[slot].generation.wrapping_add(1);
@@ -438,8 +432,7 @@ impl OwnerTable {
     /// [`authorize_admit`](Self::authorize_admit) — a `Draining`/`Revoked`
     /// owner resolves but must not admit new work.
     pub fn find_by_uid(&self, owner_uid: [u8; 16]) -> Option<OwnerHandle> {
-        // Empty on single-tenant builds (one slot): no workload slots exist,
-        // so nothing matches.
+        // Empty on a table of the system slot alone.
         for slot in 1..self.slots().len() {
             let e = &self.entries[slot];
             if !matches!(e.state, OwnerState::Free) && e.owner_uid == owner_uid {
@@ -767,17 +760,7 @@ impl Default for OwnerTable {
 /// target is system-owned or the same owner — slot and generation both, so a
 /// resource stamped by an owner that is gone is never the next tenant of its
 /// slot's. Explicit cross-owner bindings are not modeled by this predicate.
-///
-/// On single-tenant builds this is a compile-time `true` with no instructions.
-#[cfg(feature = "multitenant")]
 #[inline]
 pub fn same_or_system(caller: OwnerHandle, target: OwnerHandle) -> bool {
     target.is_system() || caller == target
-}
-
-/// Single-tenant no-op (everything is the one owner).
-#[cfg(not(feature = "multitenant"))]
-#[inline(always)]
-pub fn same_or_system(_caller: OwnerHandle, _target: OwnerHandle) -> bool {
-    true
 }

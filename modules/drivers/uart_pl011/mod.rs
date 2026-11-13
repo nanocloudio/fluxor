@@ -351,7 +351,7 @@ pub unsafe extern "C" fn module_new(
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_provides_contract"]
 pub extern "C" fn module_provides_contract() -> u32 {
-    0x000D // HAL_UART
+    abi::registry::uart::ID as u32
 }
 
 /// # Safety

@@ -65,32 +65,30 @@ fn drain_driver() -> &'static mut DrainDriver {
 /// the expiry boundary still observes the outcome.
 const TERMINAL_RETAIN_SECS: u64 = 30;
 
-/// Arm the drains a delta apply produced. Re-arming an already-armed
+/// Arm one drain a plan apply produced. Re-arming an already-armed
 /// `(slot, generation)` keeps the ORIGINAL deadline: a replayed revocation
 /// record never resets the clock.
-pub fn arm_drains(delta: &crate::kernel::workload::owner_plan::DrainDelta) {
+pub fn arm_drain(arm: crate::kernel::workload::owner_plan::DrainArm) {
     let d = drain_driver();
-    for arm in &delta.arms[..delta.count] {
-        let already = d
-            .entries
-            .iter()
-            .any(|e| e.slot == arm.slot && e.generation == arm.generation);
-        if already {
-            continue;
-        }
-        log::info!(
-            "[drain] owner slot {} gen {} draining until unix {}",
-            arm.slot,
-            arm.generation,
-            arm.deadline_unix
-        );
-        d.entries.push(DrainEntry {
-            owner_uid: arm.owner_uid,
-            slot: arm.slot,
-            generation: arm.generation,
-            deadline_unix: arm.deadline_unix,
-        });
+    let already = d
+        .entries
+        .iter()
+        .any(|e| e.slot == arm.slot && e.generation == arm.generation);
+    if already {
+        return;
     }
+    log::info!(
+        "[drain] owner slot {} gen {} draining until unix {}",
+        arm.slot,
+        arm.generation,
+        arm.deadline_unix
+    );
+    d.entries.push(DrainEntry {
+        owner_uid: arm.owner_uid,
+        slot: arm.slot,
+        generation: arm.generation,
+        deadline_unix: arm.deadline_unix,
+    });
 }
 
 /// Drive every armed drain: free the owner at quiescence or deadline and record
@@ -175,13 +173,10 @@ pub fn synthesize_restart_terminals(
     now_unix: u64,
     seeded_terminated: &std::collections::HashSet<String>,
 ) {
-    let mut revs = vec![
-        crate::kernel::workload::owner_plan::PlanRevocation::EMPTY;
-        crate::kernel::workload::owner_plan::MAX_PLAN_ASSIGNMENTS
-    ];
-    let n = crate::kernel::workload::owner_plan::retained_revocations(&mut revs);
+    let mut revs = Vec::new();
+    crate::kernel::workload::owner_plan::retained_revocations(|r| revs.push(r));
     let d = drain_driver();
-    for rev in &revs[..n] {
+    for rev in &revs {
         let handle = crate::kernel::workload::owner::OwnerHandle {
             slot: rev.assignment.slot,
             generation: rev.assignment.generation,

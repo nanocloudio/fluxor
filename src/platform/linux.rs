@@ -371,7 +371,7 @@ use fluxor::platform::builtin_param_tags::linux_net::{
     PORT_NET_IN, PORT_NET_OUT, TAG_LISTEN_BACKLOG as NET_TAG_LISTEN_BACKLOG,
     TAG_MAX_CONNS as NET_TAG_MAX_CONNS, TAG_WRITE_BUF_KIB as NET_TAG_WRITE_BUF_KIB,
 };
-use fluxor::platform::linux::owner_drain::{arm_drains, drain_tick, synthesize_restart_terminals};
+use fluxor::platform::linux::owner_drain::{arm_drain, drain_tick, synthesize_restart_terminals};
 use fluxor::platform::linux::owner_status::OwnerStatusWriter;
 use fluxor::platform::linux::providers::{
     linux_fs_dispatch, linux_net_attach, linux_net_close_all_and_clear_registry, linux_net_detach,
@@ -1081,8 +1081,8 @@ fn main() {
                     // to Draining and the drain driver takes over — no
                     // rebuild, co-resident owners untouched. Anything
                     // structural falls through to the rebuild.
-                    match fluxor::kernel::workload::owner_plan::try_apply_drain_delta() {
-                        Some(delta) => arm_drains(&delta),
+                    match fluxor::kernel::workload::owner_plan::try_apply_drain_delta(arm_drain) {
+                        Some(_) => {}
                         None => {
                             // Structural plan: not a pure-drain delta, but it may
                             // still revoke owners. Arm their drains before the
@@ -1090,10 +1090,9 @@ fn main() {
                             // reset drops the owner from the table and the next
                             // drain_tick finalises it, instead of it vanishing
                             // untracked.
-                            let drains =
-                                fluxor::kernel::workload::owner_plan::arm_staged_revocation_drains(
-                                );
-                            arm_drains(&drains);
+                            fluxor::kernel::workload::owner_plan::arm_staged_revocation_drains(
+                                arm_drain,
+                            );
                             // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
                             unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
                         }

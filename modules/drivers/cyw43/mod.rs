@@ -366,14 +366,19 @@ const LED_OP_INIT_OUT: u8 = 4; // Clear GPIO_OUTPUT bit 0 (LED off)
 const LED_OP_SEND_WINDOW: u8 = 5; // Set backplane window (if needed)
 const LED_OP_SEND_WRITE: u8 = 6; // Write GPIO_OUTPUT bit 0
 
-/// Backplane chunks uploaded per `module_step` call during firmware load.
-///
-/// Each chunk is a synchronous 64-byte gSPI backplane write preceded by a
-/// window set, so this number sets how long one step takes. Eight keeps a
-/// step inside the default step deadline with margin for a slow gSPI
-/// response, at the cost of more scheduler passes to move the same firmware:
-/// the work is bounded per pass rather than fast and occasionally fatal.
+/// Most backplane chunks uploaded per `module_step` call during firmware
+/// load. Each chunk is a synchronous 64-byte gSPI backplane write preceded
+/// by a window set.
 const FW_CHUNKS_PER_STEP: u32 = 8;
+
+/// Microseconds of a step the firmware and NVRAM uploads spend before they
+/// yield, a quarter of the default step deadline. A chunk's cost is not a
+/// constant: on an XIP part it depends on what the instruction cache holds
+/// while the firmware streams out of the same flash (on RP2040 the same
+/// eight chunks take ~0.7 ms in one kernel layout and past 2 ms in another),
+/// so a count alone does not bound the step. The upload stops at whichever
+/// comes first, after at least one chunk.
+const UPLOAD_STEP_BUDGET_US: u64 = 500;
 
 // ============================================================================
 // Module API
@@ -1593,8 +1598,13 @@ unsafe fn step_load_fw(s: &mut Cyw43State) -> i32 {
     // Upload FW_CHUNKS_PER_STEP chunks per step() call, yielding to the
     // scheduler between batches. This prevents the ~180ms blocking stall
     // that would starve all other modules during firmware upload.
+    let sys = &*s.syscalls;
+    let t0 = dev_micros(sys);
     let mut chunks_done = 0u32;
-    while s.fw_offset < fw_len && chunks_done < FW_CHUNKS_PER_STEP {
+    while s.fw_offset < fw_len
+        && chunks_done < FW_CHUNKS_PER_STEP
+        && (chunks_done == 0 || dev_micros(sys).wrapping_sub(t0) < UPLOAD_STEP_BUDGET_US)
+    {
         let addr = ATCM_RAM_BASE + s.fw_offset;
         let remaining = fw_len - s.fw_offset;
         let chunk = if remaining > FW_CHUNK_SIZE as u32 {
@@ -1629,8 +1639,13 @@ unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
     let nvram_base_addr = ATCM_RAM_BASE + CHIP_RAM_SIZE - 4 - nvram_len_aligned;
 
     // Upload NVRAM data chunks (chunked like FW upload for consistency)
+    let sys = &*s.syscalls;
+    let t0 = dev_micros(sys);
     let mut chunks_done = 0u32;
-    while s.fw_offset < nvram_len_aligned && chunks_done < FW_CHUNKS_PER_STEP {
+    while s.fw_offset < nvram_len_aligned
+        && chunks_done < FW_CHUNKS_PER_STEP
+        && (chunks_done == 0 || dev_micros(sys).wrapping_sub(t0) < UPLOAD_STEP_BUDGET_US)
+    {
         let addr = nvram_base_addr + s.fw_offset;
         let remaining = nvram_len_aligned - s.fw_offset;
         let chunk = if remaining > FW_CHUNK_SIZE as u32 {

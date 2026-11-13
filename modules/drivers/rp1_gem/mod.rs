@@ -483,7 +483,7 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     write_volatile(p.add(2) as *mut u16, TX_DESC_COUNT.to_le());
     write_volatile(p.add(4) as *mut u16, BUF_SIZE.to_le());
     write_volatile(p.add(6) as *mut u16, BUF_COUNT.to_le());
-    const PLATFORM_NIC_RING: u32 = 0x0007;
+    const PLATFORM_NIC_RING: u32 = abi::registry::platform_nic_ring::ID as u32;
     let ring_handle = (sys.provider_open)(PLATFORM_NIC_RING, NIC_RING_CREATE, ring_arg.as_ptr(), 8);
     if ring_handle < 0 {
         log_msg(sys, b"[rp1_gem] RING_CREATE failed");

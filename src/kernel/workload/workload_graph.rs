@@ -7,7 +7,7 @@
 // lease / live-graph primitives.
 // This is the metal twin of `platform::linux::workload` (the host-process
 // backend). It lives in `src/kernel` — not `src/platform/bcm2712` — because the
-// logic is kernel-generic multitenant: `apply_add`/`free_owner`/`owner_pause`
+// logic is kernel-generic: `apply_add`/`free_owner`/`owner_pause`
 // reach the run loop on **host-linux** too, so the harness drives this dispatch
 // end-to-end there (the metal registration in `bcm2712::bcm_init_providers` is a
 // thin wrapper that installs `workload_dispatch` as the 0x1A provider).
@@ -38,7 +38,7 @@ use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_WORKLOAD};
 use crate::kernel::sys::errno;
 use crate::kernel::workload::code_pack;
-use crate::kernel::workload::owner::{OwnerHandle, MAX_OWNERS, OWNER_SYSTEM};
+use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM, OWNER_TABLE_SLOTS};
 use crate::kernel::workload::owner_plan::{lease_gate, LeaseGate};
 use crate::kernel::workload::storage::StorageGrant;
 
@@ -205,17 +205,14 @@ impl ResolverCtx {
 }
 
 /// One context per owner slot, sized with the owner table.
-static mut RESOLVER_CTX: crate::kernel::mem::table::Table<ResolverCtx, MAX_OWNERS> = crate::boot_table!(
-    MAX_OWNERS,
+static mut RESOLVER_CTX: crate::kernel::mem::table::Table<ResolverCtx, OWNER_TABLE_SLOTS> = crate::boot_table!(
+    OWNER_TABLE_SLOTS,
     ResolverCtx::EMPTY,
     crate::abi::contracts::resource::POOL_OWNERS
 );
 /// The sequence of every context entry: writes are rare (one per CREATE),
 /// so one counter for the table keeps the reader's check one load.
 static RESOLVER_SEQ: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-/// The context of the CREATE being staged, held from its first call to its
-/// last, when the owner it belongs to exists.
-static mut PENDING_RESOLVER: (u16, [u8; wl::resolver::MAX]) = (0, [0; wl::resolver::MAX]);
 const RESOLVER_READ_RETRIES: usize = 8;
 
 /// Check a resolver context value: a known family, a whole search list.
@@ -747,9 +744,9 @@ const WL_EMPTY: WorkloadSlot = WorkloadSlot {
     lane_count: 0,
 };
 
-/// One workload slot per owner slot: the static profile's compiled size. On
-/// Linux the table is sized at boot to the owner table ([`size`]).
-const MAX_WORKLOADS: usize = MAX_OWNERS;
+/// One workload slot per owner slot: the static profile's compiled size.
+/// Where tables are sized at boot it is sized to the owner table ([`size`]).
+const MAX_WORKLOADS: usize = OWNER_TABLE_SLOTS;
 
 static mut FMOD_WORKLOADS: crate::kernel::mem::table::Table<WorkloadSlot, MAX_WORKLOADS> = crate::boot_table!(
     MAX_WORKLOADS,
@@ -773,7 +770,14 @@ pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::Table
     t.grow(owners)?;
     let h = &*core::ptr::addr_of!(FMOD_HOLDERS);
     h.reserve(owners)?;
-    h.grow(owners)
+    h.grow(owners)?;
+    let staging_slots = staging_for(live::workspaces_for(owners));
+    let st = &*core::ptr::addr_of!(STAGING);
+    st.reserve(staging_slots)?;
+    st.grow(staging_slots)?;
+    let b = &*core::ptr::addr_of!(PENDING_BLOB);
+    b.reserve(staging_slots * BLOB_BYTES)?;
+    b.grow(staging_slots * BLOB_BYTES)
 }
 
 /// Whether the calling module may act on the workload in slot `widx`: its
@@ -809,11 +813,81 @@ struct PendingCreate {
     caller_edge_count: usize,
 }
 
-static mut PENDING: Option<PendingCreate> = None;
+/// What a `CREATE` holds from its first call to its last: the add it stages,
+/// and the name-service context of the owner that exists only once the last
+/// module is in.
+struct Staging {
+    pending: Option<PendingCreate>,
+    resolver: (u16, [u8; wl::resolver::MAX]),
+}
 
-/// The pending `CREATE`'s copy of its subgraph. An FLXA source is at most a
-/// `u16` long (the header's `source_ref_len`).
-static mut PENDING_BLOB: [u8; u16::MAX as usize] = [0; u16::MAX as usize];
+impl Staging {
+    const EMPTY: Staging = Staging {
+        pending: None,
+        resolver: (0, [0; wl::resolver::MAX]),
+    };
+}
+
+/// An FLXA source is at most a `u16` long (the header's `source_ref_len`).
+const BLOB_BYTES: usize = u16::MAX as usize;
+
+/// Staging slots on a node that stages `adds` adds at once: one `CREATE` at
+/// a time, none where it stages none.
+const fn staging_for(adds: usize) -> usize {
+    if adds > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The profile's compiled staging slots, for a static-table profile (wasm).
+const STAGING_SLOTS: usize = if OWNER_TABLE_SLOTS > 1 { 1 } else { 0 };
+
+/// The staging slot, sized from the plan ([`size`]).
+static mut STAGING: crate::kernel::mem::table::Table<Staging, STAGING_SLOTS> = {
+    #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
+    {
+        crate::kernel::mem::table::Table::new_planned(
+            |_| Staging::EMPTY,
+            || staging_for(live::add_capacity()),
+        )
+    }
+    #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
+    {
+        crate::kernel::mem::table::Table::from_array([const { Staging::EMPTY }; STAGING_SLOTS])
+    }
+};
+
+/// The pending `CREATE`'s copy of its subgraph, sized with the staging slot.
+static mut PENDING_BLOB: crate::kernel::mem::table::Table<u8, { STAGING_SLOTS * BLOB_BYTES }> = {
+    #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
+    {
+        crate::kernel::mem::table::Table::new_planned(
+            |_| 0,
+            || staging_for(live::add_capacity()) * BLOB_BYTES,
+        )
+    }
+    #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
+    {
+        crate::kernel::mem::table::Table::from_array([0; STAGING_SLOTS * BLOB_BYTES])
+    }
+};
+
+/// The staging slot, if the node holds one. Scheduler thread.
+fn staging() -> Option<&'static mut Staging> {
+    // SAFETY: scheduler-thread state; callers hold no other borrow of it.
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(STAGING) };
+    t.get_mut(0)
+}
+
+/// The pending `CREATE`'s blob buffer, if the node holds one. Scheduler
+/// thread.
+fn pending_blob() -> Option<&'static mut [u8]> {
+    // SAFETY: scheduler-thread state; callers hold no other borrow of it.
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(PENDING_BLOB) };
+    (t.len() >= BLOB_BYTES).then(|| &mut t[..BLOB_BYTES])
+}
 
 /// Modules a `CREATE` instantiates per call. A subgraph with more answers
 /// `EINPROGRESS` between batches, so no call holds the scheduler for longer
@@ -824,13 +898,14 @@ pub const CREATE_MODULES_PER_CALL: usize = 4;
 /// already dropped every workload, the half-added one with them, and freed
 /// the code pool its pack lived in.
 pub fn reset_pending() {
-    // SAFETY: rebuild path, scheduler thread.
-    unsafe { *core::ptr::addr_of_mut!(PENDING) = None };
+    if let Some(st) = staging() {
+        st.pending = None;
+    }
 }
 
 /// Roll the pending `CREATE` back: its add, and the pack it brought.
 unsafe fn abandon_pending() {
-    if let Some(p) = (*core::ptr::addr_of_mut!(PENDING)).take() {
+    if let Some(p) = staging().and_then(|st| st.pending.take()) {
         live::abandon_staged(p.staged);
         if let Some(s) = p.pack {
             code_pack::release(s);
@@ -847,8 +922,7 @@ pub fn holds_identity(identity: &[u8; 16]) -> bool {
 
 /// The identity of the pending `CREATE`, if any.
 fn pending_identity() -> Option<[u8; 16]> {
-    // SAFETY: scheduler thread.
-    unsafe { (*core::ptr::addr_of!(PENDING)).as_ref().map(|p| p.identity) }
+    staging().and_then(|st| st.pending.as_ref().map(|p| p.identity))
 }
 
 /// SHA-256 of a `CREATE` spec.
@@ -1112,7 +1186,10 @@ unsafe fn begin_create(
     //    written out from the CREATE's environment, carrying the header's
     //    identity (what `apply_add` allocates the owner by) and the memory
     //    ceiling clamped onto the subgraph's caps.
-    let pending = &mut *core::ptr::addr_of_mut!(PENDING_BLOB);
+    let Some(pending) = pending_blob() else {
+        unstage(staged);
+        return errno::ENOSPC;
+    };
     let blob_len = match bind_env(flxa, opts, pending) {
         Ok(n) => n,
         Err(e) => {
@@ -1167,7 +1244,14 @@ unsafe fn begin_create(
         staged_add.handle().generation,
         storage_bytes
     );
-    *core::ptr::addr_of_mut!(PENDING) = Some(PendingCreate {
+    let Some(st) = staging() else {
+        live::abandon_staged(staged_add);
+        if let Some(s) = staged {
+            code_pack::release(s);
+        }
+        return errno::ENOSPC;
+    };
+    st.pending = Some(PendingCreate {
         identity,
         spec,
         staged: staged_add,
@@ -1325,12 +1409,16 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     identity.copy_from_slice(&buf[..16]);
     let spec = spec_digest(&buf[..opt_end]);
 
+    // A node whose plan seats no workload owner stages no CREATE.
+    if staging().is_none() {
+        return errno::ENOSPC;
+    }
     // A CREATE being staged is continued by its own identity with the same
     // spec; anything else waits until it is published or abandoned.
     if let Some(id) = pending_identity() {
         let same = id == identity
-            && (*core::ptr::addr_of!(PENDING))
-                .as_ref()
+            && staging()
+                .and_then(|st| st.pending.as_ref())
                 .is_some_and(|p| p.spec == spec);
         if !same {
             return errno::EBUSY;
@@ -1359,7 +1447,10 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         }
         // Captured on the first call; the owner it belongs to exists only
         // once the last module is in.
-        let pr = &mut *core::ptr::addr_of_mut!(PENDING_RESOLVER);
+        let Some(st) = staging() else {
+            return errno::ENOSPC;
+        };
+        let pr = &mut st.resolver;
         pr.0 = 0;
         if let Some(v) = resolver_ctx {
             pr.0 = v.len() as u16;
@@ -1369,9 +1460,9 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
 
     // ── One batch of the pending add; the rest of CREATE once its last
     //    module is in.
-    let p = (*core::ptr::addr_of_mut!(PENDING))
-        .as_mut()
-        .expect("pending CREATE");
+    let Some(p) = staging().and_then(|st| st.pending.as_mut()) else {
+        return errno::EINVAL;
+    };
     if let Some(s) = p.pack {
         code_pack::begin_staging(s);
     }
@@ -1382,7 +1473,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         Ok(true) => {}
         Err(e) => {
             // The add rolled itself back; its pack goes with it.
-            if let Some(p) = (*core::ptr::addr_of_mut!(PENDING)).take() {
+            if let Some(p) = staging().and_then(|st| st.pending.take()) {
                 if let Some(s) = p.pack {
                     code_pack::release(s);
                 }
@@ -1390,7 +1481,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             return e.code();
         }
     }
-    let Some(p) = (*core::ptr::addr_of_mut!(PENDING)).take() else {
+    let Some(p) = staging().and_then(|st| st.pending.take()) else {
         return errno::EINVAL;
     };
     let edge_base = p.staged.edge_base();
@@ -1411,9 +1502,8 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         code_pack::bind(s, owner.slot);
     }
     // The owner's name-service context, for its lanes' provider.
-    {
-        let pr = &*core::ptr::addr_of!(PENDING_RESOLVER);
-        let v = &pr.1[..pr.0 as usize];
+    if let Some(st) = staging() {
+        let v = &st.resolver.1[..st.resolver.0 as usize];
         resolver_ctx_set(owner, v);
     }
 
@@ -1575,18 +1665,8 @@ unsafe fn workload_wait(owner: Option<OwnerHandle>, arg: *mut u8, arg_len: usize
     if arg.is_null() || arg_len < 5 {
         return errno::EINVAL;
     }
-    let mut snap = crate::scratch![
-        OwnerLiveStatus::EMPTY;
-        MAX_OWNERS,
-        scheduler::owners().slot_count()
-    ];
-    let n = scheduler::owner_live_snapshot(&mut snap);
-    let rec = owner.and_then(|o| {
-        snap[..n]
-            .iter()
-            .find(|r| r.slot == o.slot && r.generation == o.generation)
-    });
-    let (state, code) = wait_state_map(rec);
+    let rec = owner.and_then(scheduler::owner_live_status);
+    let (state, code) = wait_state_map(rec.as_ref());
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
     out[0] = state;
     out[1..5].copy_from_slice(&code.to_le_bytes());
@@ -1611,7 +1691,7 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     // the node has code space for packs. Never a host bundle: metal has no
     // rootfs to unpack one into.
     out[1] = wl::caps::SOURCE_FMOD_GRAPH
-        | if code_pack::POOL_SIZE > 0 {
+        | if code_pack::POOL_SIZE != 0 {
             wl::caps::SOURCE_FMOD_PACK
         } else {
             0

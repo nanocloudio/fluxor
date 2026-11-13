@@ -43,7 +43,7 @@ use crate::kernel::module::syscalls;
 use crate::kernel::module::syscalls::{get_syscall_table, is_spi_initialized};
 use crate::kernel::sys::hal;
 use crate::kernel::workload::bitmask::ModuleMask;
-use crate::kernel::workload::owner::{OwnerHandle, OwnerTable, MAX_OWNERS, OWNER_SYSTEM};
+use crate::kernel::workload::owner::{OwnerHandle, OwnerTable, OWNER_SYSTEM};
 use crate::modules::StepOutcome;
 
 // ============================================================================
@@ -727,11 +727,8 @@ pub use module_types::{
     FRAME_KIND_NET, FRAME_KIND_RECORD,
 };
 
-/// Live graph mutation (add owner / free owner). Multi-tenant only —
-/// bare-metal single-tenant targets compile it out at zero cost.
-#[cfg(feature = "multitenant")]
+/// Live graph mutation (add owner / free owner).
 pub mod live;
-#[cfg(feature = "multitenant")]
 pub use live::{
     apply_add, free_owner, AddEdge, AddError, AddModule, AddSubgraph, Endpoint, FreeError,
     ModuleSource, StepBudget,

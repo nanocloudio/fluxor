@@ -27,7 +27,6 @@ use super::*;
 /// `take_wake_in_mask` is an `EVENT_WAKE ∩ mask` intersection, never a scan).
 /// `primed` forces the first pass after (re)build to step the graph at least
 /// once so the steady-state runnable predicate has prior-pass signals to read.
-#[cfg(feature = "multitenant")]
 #[derive(Clone, Copy)]
 struct ResidentGraph {
     slot: u16,
@@ -54,7 +53,6 @@ struct ResidentGraph {
     backstop_next_due_us: u64,
 }
 
-#[cfg(feature = "multitenant")]
 impl ResidentGraph {
     const EMPTY: ResidentGraph = ResidentGraph {
         slot: 0,
@@ -71,17 +69,15 @@ impl ResidentGraph {
 
 /// The resident `(graph, domain)` entries, `RESIDENT_GRAPH_COUNT` of them
 /// live, at most one per owner slot and domain.
-#[cfg(feature = "multitenant")]
 static mut RESIDENT_GRAPHS: crate::kernel::mem::table::Table<
     ResidentGraph,
-    { crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS },
+    { crate::kernel::workload::owner::OWNER_TABLE_SLOTS * MAX_DOMAINS },
 > = crate::boot_table!(
-    crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS,
+    crate::kernel::workload::owner::OWNER_TABLE_SLOTS * MAX_DOMAINS,
     ResidentGraph::EMPTY,
     crate::abi::contracts::resource::POOL_OWNERS,
     MAX_DOMAINS
 );
-#[cfg(feature = "multitenant")]
 static mut RESIDENT_GRAPH_COUNT: usize = 0;
 
 /// Size the resident-graph index for an owner table of `owners` slots: an
@@ -90,7 +86,6 @@ static mut RESIDENT_GRAPH_COUNT: usize = 0;
 ///
 /// # Safety
 /// As `Table::reserve`: graph preparation, with no entry borrowed.
-#[cfg(feature = "multitenant")]
 pub(crate) unsafe fn size_resident_graphs(
     owners: usize,
 ) -> Result<(), crate::kernel::mem::table::TableError> {
@@ -108,99 +103,96 @@ pub(crate) unsafe fn size_resident_graphs(
 /// boot after all admission `apply_add`s and on every reconfigure / `free_owner`
 /// (a reused slot is a *new* generation, so its pacer is reset and its
 /// `primed` flag re-armed). One bounded pass over module slots — never on the
-/// hot path. No-op (single-graph degenerate) on non-multitenant builds.
+/// hot path.
 pub fn rebuild_resident_graph_index() {
-    #[cfg(feature = "multitenant")]
-    {
-        // SAFETY: scheduler-thread-exclusive; runs at boot finalize / reconfigure,
-        // never concurrently with a stepping pass. Mutable: re-anchors each
-        // periodic module's `module_next_due_us`.
-        let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
-        // SAFETY: same single-mutator context as `sched` above.
-        let table = unsafe { &mut *core::ptr::addr_of_mut!(RESIDENT_GRAPHS) };
-        let mut count = 0usize;
-        for entry in table.iter_mut() {
-            *entry = ResidentGraph::EMPTY;
+    // SAFETY: scheduler-thread-exclusive; runs at boot finalize / reconfigure,
+    // never concurrently with a stepping pass. Mutable: re-anchors each
+    // periodic module's `module_next_due_us`.
+    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
+    // SAFETY: same single-mutator context as `sched` above.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(RESIDENT_GRAPHS) };
+    let mut count = 0usize;
+    for entry in table.iter_mut() {
+        *entry = ResidentGraph::EMPTY;
+    }
+    for idx in 0..module_slots() {
+        if matches!(sched.modules[idx], ModuleSlot::Empty) {
+            continue;
         }
-        for idx in 0..module_slots() {
-            if matches!(sched.modules[idx], ModuleSlot::Empty) {
-                continue;
+        let owner = sched.module_owner[idx];
+        let domain = (sched.domain_id[idx] as usize).min(MAX_DOMAINS - 1) as u8;
+        // Find or append the (owner.slot, owner.generation, domain) entry.
+        let mut found = None;
+        for (i, e) in table.iter().take(count).enumerate() {
+            if e.slot == owner.slot && e.generation == owner.generation && e.domain == domain {
+                found = Some(i);
+                break;
             }
-            let owner = sched.module_owner[idx];
-            let domain = (sched.domain_id[idx] as usize).min(MAX_DOMAINS - 1) as u8;
-            // Find or append the (owner.slot, owner.generation, domain) entry.
-            let mut found = None;
-            for (i, e) in table.iter().take(count).enumerate() {
-                if e.slot == owner.slot && e.generation == owner.generation && e.domain == domain {
-                    found = Some(i);
-                    break;
+        }
+        let i = match found {
+            Some(i) => i,
+            None => {
+                // The index commits entries as it fills. Its ceiling
+                // is an entry per owner slot and domain, which no set of
+                // live owners exceeds; fail closed if it ever does.
+                if count >= table.len() && table.grow(count + 1).is_err() {
+                    log::error!(
+                        "[multigraph] resident-graph index full ({}); module {idx} owner \
+                         slot={} not indexed",
+                        table.len(),
+                        owner.slot
+                    );
+                    continue;
                 }
+                let i = count;
+                table[i].slot = owner.slot;
+                table[i].generation = owner.generation;
+                table[i].domain = domain;
+                table[i].mask = ModuleMask::EMPTY;
+                table[i].primed = false;
+                table[i].periodic_mask = ModuleMask::EMPTY;
+                // Fresh entry: assume idle-safe and AND each owned module's
+                // attestation in below (an empty graph stays the EMPTY default).
+                table[i].idle_safe = true;
+                table[i].backstop_next_due_us = 0;
+                count += 1;
+                i
             }
-            let i = match found {
-                Some(i) => i,
-                None => {
-                    // The index commits entries as it fills. Its ceiling
-                    // is an entry per owner slot and domain, which no set of
-                    // live owners exceeds; fail closed if it ever does.
-                    if count >= table.len() && table.grow(count + 1).is_err() {
-                        log::error!(
-                            "[multigraph] resident-graph index full ({}); module {idx} owner \
-                             slot={} not indexed",
-                            table.len(),
-                            owner.slot
-                        );
-                        continue;
-                    }
-                    let i = count;
-                    table[i].slot = owner.slot;
-                    table[i].generation = owner.generation;
-                    table[i].domain = domain;
-                    table[i].mask = ModuleMask::EMPTY;
-                    table[i].primed = false;
-                    table[i].periodic_mask = ModuleMask::EMPTY;
-                    // Fresh entry: assume idle-safe and AND each owned module's
-                    // attestation in below (an empty graph stays the EMPTY default).
-                    table[i].idle_safe = true;
-                    table[i].backstop_next_due_us = 0;
-                    count += 1;
-                    i
-                }
-            };
-            table[i].mask.set(idx);
-            // Each multi-tick period-gated module keeps its OWN absolute schedule
-            // (per-module `module_next_due_us`), preserving distinct periods and
-            // phases. Reset its next-due so it (re)primes on the next pass.
-            if sched.step_period[idx] > 1 {
-                table[i].periodic_mask.set(idx);
-                sched.module_next_due_us[idx] = 0;
-            }
-            // A graph is idle-safe only if EVERY owned module attests it.
-            if !sched.module_idle_safe[idx] {
-                table[i].idle_safe = false;
-            }
+        };
+        table[i].mask.set(idx);
+        // Each multi-tick period-gated module keeps its OWN absolute schedule
+        // (per-module `module_next_due_us`), preserving distinct periods and
+        // phases. Reset its next-due so it (re)primes on the next pass.
+        if sched.step_period[idx] > 1 {
+            table[i].periodic_mask.set(idx);
+            sched.module_next_due_us[idx] = 0;
         }
-        // Reconcile the graph-local pacer table (`GRAPH_PACERS`) against the rebuilt
-        // resident keys. A pacer whose (slot, generation, domain) no longer
-        // appears belongs to a freed / reconfigured owner and is released, so a
-        // reused slot's new graph starts from a fresh instance. Rebuild-time
-        // only — never on the hot path.
-        // SAFETY: same single-mutator (scheduler-thread-exclusive) context.
-        let pacers = unsafe { &mut *core::ptr::addr_of_mut!(GRAPH_PACERS) };
-        for p in pacers.iter_mut() {
-            if !p.active {
-                continue;
-            }
-            let live = table.iter().take(count).any(|e| {
-                e.slot == p.graph_slot && e.generation == p.generation && e.domain == p.domain
-            });
-            if !live {
-                *p = GraphPacer::new();
-            }
+        // A graph is idle-safe only if EVERY owned module attests it.
+        if !sched.module_idle_safe[idx] {
+            table[i].idle_safe = false;
         }
-        // SAFETY: scheduler-thread-exclusive write.
-        unsafe {
-            RESIDENT_GRAPH_COUNT = count;
+    }
+    // Reconcile the graph-local pacer table (`GRAPH_PACERS`) against the rebuilt
+    // resident keys. A pacer whose (slot, generation, domain) no longer
+    // appears belongs to a freed / reconfigured owner and is released, so a
+    // reused slot's new graph starts from a fresh instance. Rebuild-time
+    // only — never on the hot path.
+    // SAFETY: same single-mutator (scheduler-thread-exclusive) context.
+    let pacers = unsafe { &mut *core::ptr::addr_of_mut!(GRAPH_PACERS) };
+    for p in pacers.iter_mut() {
+        if !p.active {
+            continue;
         }
+        let live = table.iter().take(count).any(|e| {
+            e.slot == p.graph_slot && e.generation == p.generation && e.domain == p.domain
+        });
+        if !live {
+            *p = GraphPacer::new();
+        }
+    }
+    // SAFETY: scheduler-thread-exclusive write.
+    unsafe {
+        RESIDENT_GRAPH_COUNT = count;
     }
 }
 
@@ -214,35 +206,31 @@ pub fn rebuild_resident_graph_index() {
 /// order, exactly as `prepare_graph` does for the base graph.
 ///
 /// Boot-time only (cores not yet stepping) or single-threaded host — NOT safe to
-/// call while a BCM domain loop is mid-pass over `domain_exec_order`. No-op on
-/// non-multitenant builds.
+/// call while a BCM domain loop is mid-pass over `domain_exec_order`.
 pub fn finalize_resident_graphs() {
-    #[cfg(feature = "multitenant")]
-    {
-        // SAFETY: scheduler-thread-exclusive; boot finalize / single-threaded host.
-        let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
-        for m in sched.domain_module_mask.iter_mut() {
-            *m = ModuleMask::EMPTY;
-        }
-        let mut max_domain: u8 = 0;
-        for i in 0..module_slots() {
-            if matches!(sched.modules[i], ModuleSlot::Empty) {
-                continue;
-            }
-            let did = sched.domain_id[i];
-            let d = (did as usize).min(MAX_DOMAINS - 1);
-            sched.domain_module_mask[d].set(i);
-            if did > max_domain {
-                max_domain = did;
-            }
-        }
-        let want_count = (max_domain as usize + 1).min(MAX_DOMAINS) as u8;
-        if want_count > sched.domain_count {
-            sched.domain_count = want_count;
-        }
-        let mc = sched.active_module_count;
-        compute_domain_exec_orders_static(mc);
+    // SAFETY: scheduler-thread-exclusive; boot finalize / single-threaded host.
+    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
+    for m in sched.domain_module_mask.iter_mut() {
+        *m = ModuleMask::EMPTY;
     }
+    let mut max_domain: u8 = 0;
+    for i in 0..module_slots() {
+        if matches!(sched.modules[i], ModuleSlot::Empty) {
+            continue;
+        }
+        let did = sched.domain_id[i];
+        let d = (did as usize).min(MAX_DOMAINS - 1);
+        sched.domain_module_mask[d].set(i);
+        if did > max_domain {
+            max_domain = did;
+        }
+    }
+    let want_count = (max_domain as usize + 1).min(MAX_DOMAINS) as u8;
+    if want_count > sched.domain_count {
+        sched.domain_count = want_count;
+    }
+    let mc = sched.active_module_count;
+    compute_domain_exec_orders_static(mc);
     rebuild_resident_graph_index();
 }
 
@@ -252,137 +240,121 @@ pub fn finalize_resident_graphs() {
 /// tables. Call ONCE after `prepare_graph` + instantiation and BEFORE the
 /// per-domain run loops start (same constraint as `finalize_resident_graphs`).
 /// No-op when there is no workload section (single-graph config,
-/// byte-identical boot) or on non-multitenant builds.
+/// byte-identical boot).
 pub fn admit_resident_workloads_from_config() {
-    #[cfg(feature = "multitenant")]
-    {
-        // SAFETY: boot context — single-threaded, sole reader of STATIC_CONFIG.
-        let cfg = unsafe { static_config() };
-        let ptr = cfg.resident_workload_section;
-        let len = cfg.resident_workload_section_len;
-        // Header: magic(4)+section_len(4)+crc16(2)+count(2) = 12 bytes. The whole
-        // section's length+CRC were already validated in `read_config_from_slice`
-        // (it only records the section when bounds AND CRC pass), so by here the
-        // bytes are integral; the per-workload bounds below are belt-and-braces.
-        if ptr.is_null() || len < 12 {
-            return;
+    // SAFETY: boot context — single-threaded, sole reader of STATIC_CONFIG.
+    let cfg = unsafe { static_config() };
+    let ptr = cfg.resident_workload_section;
+    let len = cfg.resident_workload_section_len;
+    // Header: magic(4)+section_len(4)+crc16(2)+count(2) = 12 bytes. The whole
+    // section's length+CRC were already validated in `read_config_from_slice`
+    // (it only records the section when bounds AND CRC pass), so by here the
+    // bytes are integral; the per-workload bounds below are belt-and-braces.
+    if ptr.is_null() || len < 12 {
+        return;
+    }
+    // SAFETY: `read_config_from_slice` validated `ptr`/`len` lie within the
+    // mapped config blob, `len <= MAX_WORKLOAD_SECTION_BYTES`, and the CRC matched.
+    let section = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let magic = u32::from_le_bytes([section[0], section[1], section[2], section[3]]);
+    if magic != crate::kernel::boot::config::WORKLOAD_SECTION_MAGIC {
+        return;
+    }
+    let count = u16::from_le_bytes([section[10], section[11]]) as usize;
+    // Each workload's blob is applied where it lies in the config image:
+    // the add borrows the blob's params in place, as the base graph's
+    // modules borrow theirs, and the image stays mapped for the kernel's
+    // life. Nothing is copied, so no blob is too large for a buffer.
+    //
+    // Atomic admission: a partial admit (some workloads live, others
+    // rejected) would contradict the "all workloads" contract and leave the
+    // runtime half-built. Each admitted owner's slot is recorded; if ANY
+    // workload fails, every owner admitted in this pass is rolled back via
+    // `free_owner` and ZERO are admitted — the runtime stays single-graph
+    // rather than partially multiplexed.
+    const SLOT_WORDS: usize = crate::kernel::workload::owner::MAX_OWNERS.div_ceil(64);
+    let mut admitted_slots = [0u64; SLOT_WORDS];
+    let mut admitted = 0usize;
+    let mut failed = false;
+    let mut off = 12usize;
+    for _ in 0..count {
+        // Per-workload frame: blob_len(4) + flags(1) + blob. flags bit0 = idle-safe
+        // attestation (the operator/tooling asserts the workload is demand-driven).
+        if off + 5 > len {
+            log::error!("[multigraph] workload section truncated mid-frame; rolling back");
+            failed = true;
+            break;
         }
-        // SAFETY: `read_config_from_slice` validated `ptr`/`len` lie within the
-        // mapped config blob, `len <= MAX_WORKLOAD_SECTION_BYTES`, and the CRC matched.
-        let section = unsafe { core::slice::from_raw_parts(ptr, len) };
-        let magic = u32::from_le_bytes([section[0], section[1], section[2], section[3]]);
-        if magic != crate::kernel::boot::config::WORKLOAD_SECTION_MAGIC {
-            return;
+        let blob_len = u32::from_le_bytes([
+            section[off],
+            section[off + 1],
+            section[off + 2],
+            section[off + 3],
+        ]) as usize;
+        off += 4;
+        let workload_flags = section[off];
+        off += 1;
+        let workload_idle_safe = (workload_flags & 0x01) != 0;
+        if blob_len == 0 || off + blob_len > len {
+            log::error!("[multigraph] workload blob len {blob_len} out of range; rolling back");
+            failed = true;
+            break;
         }
-        let count = u16::from_le_bytes([section[10], section[11]]) as usize;
-        // Each workload's blob is applied where it lies in the config image:
-        // the add borrows the blob's params in place, as the base graph's
-        // modules borrow theirs, and the image stays mapped for the kernel's
-        // life. Nothing is copied, so no blob is too large for a buffer.
-        //
-        // Atomic admission: a partial admit (some workloads live, others
-        // rejected) would contradict the "all workloads" contract and leave the
-        // runtime half-built. Each admitted owner's handle is recorded, one
-        // slot per workload the section declares; if ANY workload fails, every
-        // handle admitted in this pass is rolled back via `free_owner` and ZERO
-        // are admitted — the runtime stays single-graph rather than partially
-        // multiplexed.
-        let mut handles = crate::scratch![
-            crate::kernel::workload::owner::OwnerHandle { slot: 0, generation: 0 };
-            crate::kernel::workload::owner::MAX_OWNERS,
-            count
-        ];
-        if handles.len() < count {
-            log::error!(
-                "[multigraph] no room to record {count} resident workload handle(s) for \
-                 rollback; none admitted (single-graph boot)"
-            );
-            return;
-        }
-        let mut admitted = 0usize;
-        let mut failed = false;
-        let mut off = 12usize;
-        for _ in 0..count {
-            // Per-workload frame: blob_len(4) + flags(1) + blob. flags bit0 = idle-safe
-            // attestation (the operator/tooling asserts the workload is demand-driven).
-            if off + 5 > len {
-                log::error!("[multigraph] workload section truncated mid-frame; rolling back");
+        let blob = &section[off..off + blob_len];
+        off += blob_len;
+        // SAFETY: `blob` lies in the config image, which stays mapped and
+        // unchanged for the kernel's life; `apply_add_borrowed` validates
+        // the FLXA blob structure and bounds.
+        match unsafe { live::apply_add_borrowed(blob) } {
+            Ok(handle) => {
+                let slot = handle.slot as usize;
+                admitted_slots[slot / 64] |= 1 << (slot % 64);
+                admitted += 1;
+                // The workload's idle-safe attestation goes on its
+                // modules before finalize, which rebuilds each graph's
+                // `idle_safe` from them. Unattested workloads stay
+                // fail-closed (backstop cadence).
+                set_owner_idle_safe(handle, workload_idle_safe);
+            }
+            Err(rc) => {
+                log::error!("[multigraph] resident workload admit failed rc={rc}; rolling back");
                 failed = true;
                 break;
             }
-            let blob_len = u32::from_le_bytes([
-                section[off],
-                section[off + 1],
-                section[off + 2],
-                section[off + 3],
-            ]) as usize;
-            off += 4;
-            let workload_flags = section[off];
-            off += 1;
-            let workload_idle_safe = (workload_flags & 0x01) != 0;
-            if blob_len == 0 || off + blob_len > len {
-                log::error!("[multigraph] workload blob len {blob_len} out of range; rolling back");
-                failed = true;
-                break;
+        }
+    }
+    if failed {
+        for slot in 1..crate::kernel::workload::owner::MAX_OWNERS {
+            if admitted_slots[slot / 64] & (1 << (slot % 64)) == 0 {
+                continue;
             }
-            let blob = &section[off..off + blob_len];
-            off += blob_len;
-            // SAFETY: `blob` lies in the config image, which stays mapped and
-            // unchanged for the kernel's life; `apply_add_borrowed` validates
-            // the FLXA blob structure and bounds.
-            match unsafe { live::apply_add_borrowed(blob) } {
-                Ok(handle) => {
-                    handles[admitted] = handle;
-                    admitted += 1;
-                    // The workload's idle-safe attestation goes on its
-                    // modules before finalize, which rebuilds each graph's
-                    // `idle_safe` from them. Unattested workloads stay
-                    // fail-closed (backstop cadence).
-                    set_owner_idle_safe(handle, workload_idle_safe);
-                }
-                Err(rc) => {
-                    log::error!(
-                        "[multigraph] resident workload admit failed rc={rc}; rolling back"
-                    );
-                    failed = true;
-                    break;
-                }
+            if let Some(e) = super::owners().entry_at(slot) {
+                let _ = live::free_owner(crate::kernel::workload::owner::OwnerHandle {
+                    slot: slot as u16,
+                    generation: e.generation,
+                });
             }
         }
-        if failed {
-            for h in handles.iter().take(admitted) {
-                let _ = live::free_owner(*h);
-            }
-            log::error!(
-                "[multigraph] resident workload admission aborted; rolled back {admitted} workload(s) — \
-                 none active (single-graph boot)"
-            );
-            return;
-        }
-        if admitted > 0 {
-            log::info!("[multigraph] admitted {admitted} resident workload(s) from config");
-            finalize_resident_graphs();
-        }
+        log::error!(
+            "[multigraph] resident workload admission aborted; rolled back {admitted} workload(s) — \
+             none active (single-graph boot)"
+        );
+        return;
+    }
+    if admitted > 0 {
+        log::info!("[multigraph] admitted {admitted} resident workload(s) from config");
+        finalize_resident_graphs();
     }
 }
 
 /// Number of distinct resident `(graph, domain)` instances the runner is
 /// multiplexing. `<= 1` selects the single-graph fast path.
-/// Always `0`/`1`-equivalent on non-multitenant builds (one resident graph).
 pub fn resident_graph_count() -> usize {
-    #[cfg(feature = "multitenant")]
-    {
-        // SAFETY: scheduler-thread read of a bounded counter.
-        unsafe { RESIDENT_GRAPH_COUNT }
-    }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        1
-    }
+    // SAFETY: scheduler-thread read of a bounded counter.
+    unsafe { RESIDENT_GRAPH_COUNT }
 }
 
 /// Count resident `(graph, domain)` instances whose domain is `domain`.
-#[cfg(feature = "multitenant")]
 fn resident_graph_count_in_domain(domain: usize) -> usize {
     // SAFETY: scheduler-thread read of the bounded resident-graph table/counter.
     let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
@@ -402,7 +374,6 @@ fn resident_graph_count_in_domain(domain: usize) -> usize {
 /// graph's per-sub-pass `(work, burst)` signals, read back from the per-domain
 /// `PACER_WORK_TICK` / `PACER_BURST_TICK` accumulators (reset here, so they
 /// reflect only this graph's modules — every module in `domain` for this owner).
-#[cfg(feature = "multitenant")]
 #[allow(
     clippy::too_many_arguments,
     reason = "mirrors step_one_module's threaded (modules, sched, not_ready, \
@@ -542,7 +513,6 @@ fn step_graph_owner(
 /// (`owner_wake_pending`); this returns `false` and the wake carries it. A
 /// future per-owner timer wheel can make this precise; until then a graph with
 /// no targeted wake and no prior-pass work is treated idle.
-#[cfg(feature = "multitenant")]
 #[inline]
 fn owner_timer_due(_slot: u16, _generation: u32, _domain: usize) -> bool {
     false
@@ -552,7 +522,6 @@ fn owner_timer_due(_slot: u16, _generation: u32, _domain: usize) -> bool {
 /// `Paused` at this generation. Callers MUST short-circuit behind
 /// `event::paused_owners_present()` so the unused path stays a single
 /// relaxed load (default-off discipline).
-#[cfg(feature = "multitenant")]
 #[inline]
 fn owner_graph_paused(sched: &SchedulerState, slot: u16, generation: u32) -> bool {
     slot != 0
@@ -568,7 +537,6 @@ fn owner_graph_paused(sched: &SchedulerState, slot: u16, generation: u32) -> boo
 /// stepping path) instead of the pause-blind fast path. Bounded scan of the
 /// resident-graph index; callers short-circuit behind
 /// `event::paused_owners_present()`.
-#[cfg(feature = "multitenant")]
 fn domain_has_paused_graph(domain: usize) -> bool {
     // SAFETY: scheduler-thread read; the table is only mutated at rebuild.
     let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
@@ -610,7 +578,6 @@ fn domain_has_paused_graph(domain: usize) -> bool {
 /// channel data thereby carries exactly the semantics of a targeted
 /// `event_signal`, which is what mechanism (a) means by a "channel
 /// write" wake. Returns `true` if any were found.
-#[cfg(feature = "multitenant")]
 fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut ModuleMask) -> bool {
     let mut any = false;
     for e in sched.edges.iter().take(sched.edge_count) {
@@ -645,7 +612,6 @@ fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut M
 /// worst-step decay, Tier-1c pre-tick, ISR-bridge pump) but runs the
 /// exec-order rotation once PER resident graph so each graph's burst/budget
 /// fairness and pacer state stay independent.
-#[cfg(feature = "multitenant")]
 fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult, u32) {
     // SAFETY: scheduler-thread context — sole stepper for this domain (mirrors
     // `step_domain_modules`).
@@ -1027,7 +993,6 @@ impl PacerLine {
 /// Feed resident-graph entry `gi`'s state at `now` to its [`PacerLine`] and
 /// log the `MON_GRAPH_PACER` line when one is due. `stepped` is whether this
 /// pass stepped the graph.
-#[cfg(feature = "multitenant")]
 fn log_pacer_line(
     gi: usize,
     now: u64,
@@ -1055,7 +1020,6 @@ fn log_pacer_line(
 /// Read a graph-local pacer instance's stored runnability without mutating it (the
 /// merge/deadline path re-reads it; this is the pre-step "did the prior pass
 /// leave it runnable?" query).
-#[cfg(feature = "multitenant")]
 fn graph_pacer_instance_runnable(graph_slot: u16, generation: u32, domain: u8) -> bool {
     let Some(idx) = graph_pacer_index(graph_slot, generation, domain) else {
         return true; // fail-closed: no instance yet ⇒ run it
@@ -1069,14 +1033,10 @@ fn graph_pacer_instance_runnable(graph_slot: u16, generation: u32, domain: u8) -
 /// Multi-graph entry point for a FLAT single-domain cooperative runner (Linux /
 /// wasm): step all resident graphs in domain 0 and return the next pacing
 /// deadline (µs). The single-graph fast path (`resident_graph_count() <= 1`)
-/// is exactly `step_modules` + `pacer_next_deadline_us(0)`. On non-multitenant
-/// builds always the fast path.
+/// is exactly `step_modules` + `pacer_next_deadline_us(0)`.
 pub fn step_resident_graphs_flat(modules: &mut [ModuleSlot], count: usize) -> (StepResult, u32) {
-    #[cfg(feature = "multitenant")]
-    {
-        if resident_graph_count() > 1 {
-            return multi_graph_runner(modules, 0);
-        }
+    if resident_graph_count() > 1 {
+        return multi_graph_runner(modules, 0);
     }
     let result = step_modules(modules, count);
     (result, pacer_next_deadline_us(0))
@@ -1087,19 +1047,15 @@ pub fn step_resident_graphs_flat(modules: &mut [ModuleSlot], count: usize) -> (S
 /// domain's next pacing deadline (µs). Single-graph-in-domain fast path is the
 /// existing `step_domain_modules(domain)` + `pacer_next_deadline_us(domain)`.
 pub fn step_resident_graphs_domain(modules: &mut [ModuleSlot], domain: usize) -> (StepResult, u32) {
-    #[cfg(feature = "multitenant")]
+    // A domain whose ONLY resident graph belongs to a paused owner must
+    // also take the runner path: the fast path below is pause-blind and
+    // would keep stepping the paused modules. Default-off — with no owner
+    // paused the second term is never evaluated and the predicate reduces
+    // to the `> 1` rule.
+    if resident_graph_count_in_domain(domain) > 1
+        || (crate::kernel::ipc::event::paused_owners_present() && domain_has_paused_graph(domain))
     {
-        // A domain whose ONLY resident graph belongs to a paused owner must
-        // also take the runner path: the fast path below is pause-blind and
-        // would keep stepping the paused modules. Default-off — with no owner
-        // paused the second term is never evaluated and the predicate reduces
-        // to the `> 1` rule.
-        if resident_graph_count_in_domain(domain) > 1
-            || (crate::kernel::ipc::event::paused_owners_present()
-                && domain_has_paused_graph(domain))
-        {
-            return multi_graph_runner(modules, domain);
-        }
+        return multi_graph_runner(modules, domain);
     }
     let result = step_domain_modules(modules, domain);
     // Event-wake drain for the single-graph domain path. Every consumer

@@ -109,14 +109,6 @@ default = ["chip-rp2350b"]
 # lib alone.
 embedded-platform = []
 
-# Multi-owner workload ownership.
-# When OFF, `MAX_OWNERS == 1`, the owner table collapses to a single system
-# slot, owner fields on graph objects compile out, and the authorization
-# helpers become no-ops — so single-tenant bare-metal targets (rp*) carry no
-# ownership cost. Enabled by the multi-owner targets (aarch64 bare metal,
-# host-linux).
-multitenant = ["fluxor-contracts/alloc"]
-
 # Test-only: bcm2712 fires a one-shot graph rebuild ~5 s after boot so the
 # live-rebuild bridge can be observed on hardware. Never enabled in
 # production images.
@@ -212,12 +204,11 @@ chip-bcm2712 = [
 
 # What every aarch64 kernel without a host OS under it shares, whatever started
 # it (a device tree on bcm2712, UEFI and ACPI on uefi): page-table virtual
-# memory, tables carved at boot from the machine's memory, the multi-owner
-# kernel and the full key vault.
+# memory, tables carved at boot from the machine's memory and the full key
+# vault.
 aarch64-metal = [
     "portable-atomic",
     "embedded-platform",
-    "multitenant",
     "kernel-vm",
     "pq-vault",
     "rsa-vault",
@@ -245,7 +236,7 @@ test_tier2_sgi = []
 
 # Linux hosted (aarch64 userspace). Uses std.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
-host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault", "rsa-vault", "trust-system"]
+host-linux = ["portable-atomic", "env_logger", "libc", "fluxor-contracts/alloc", "pq-vault", "rsa-vault", "trust-system"]
 # The `trust` contract's Linux provider. Separable from host-linux so a build
 # that does not want the verifier's dependency tree can drop it and have
 # `trust = "system"` refuse at compose instead of at runtime.

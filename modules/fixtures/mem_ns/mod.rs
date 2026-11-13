@@ -1097,7 +1097,7 @@ fn changes_relist(s: &MemNsState, prefix: &[u8], tok: &[u8], out: &mut [u8]) -> 
 )]
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 pub extern "C" fn module_provides_contract() -> u32 {
-    0x0013 // STORAGE_NAMESPACE
+    abi::registry::storage_namespace::ID as u32
 }
 
 /// # Safety

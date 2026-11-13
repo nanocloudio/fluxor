@@ -9869,7 +9869,7 @@ unsafe fn fs_dispatch_op(
     link_section = ".text.module_provides_contract"
 )]
 pub extern "C" fn module_provides_contract() -> u32 {
-    0x0009 // FS
+    abi::registry::fs::ID as u32
 }
 
 /// FNV-1a hash of a `volume:` param string via the shared kernel/module

@@ -101,9 +101,9 @@ pub struct NodeCapacity {
 /// disagree.
 ///
 /// `linux` and `pi5`/`bcm2712` share one arm but not their figures: each is
-/// read from its own kernel profile (`profile_linux`, `profile_bcm2712`). Both
-/// build the `multitenant` feature, and `max_owners` is the profile's
-/// owner-slot domain; the table a node actually holds is its boot plan's
+/// read from its own kernel profile (`profile_linux`, `profile_bcm2712`).
+/// `max_owners` is the kernel's owner-slot domain, one on every kernel; the
+/// table a node actually holds is its boot plan's
 /// `owners` ceiling (the system slot, its resident workloads and the owner
 /// reserve), which a deployment raises within the domain with `capacity: {
 /// owners }`. `max_endpoints` is agent-level admission policy: the kernel has
@@ -136,9 +136,9 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
         // textually and fails on drift — the same mitigation the host row uses
         // against the kernel constants.
         //
-        // `max_owners` is the system slot alone: the RP kernels are
-        // single-tenant, so there are no workload slots to hand out. The
-        // module and edge figures are the RP profile's domains.
+        // `max_owners` is the kernel's owner-slot domain; an RP plan keeps
+        // no owner reserve by default, so it seats only what its graph
+        // carries. The module and edge figures are the RP profile's domains.
         "rp2040" | "pico" | "picow" => Some(NodeCapacity {
             max_owners: crate::capacity::kernel_max_owners(profile) as u16,
             max_modules: crate::capacity::kernel_max_modules(profile) as u16,
@@ -1990,15 +1990,7 @@ mod tests {
             ("bcm2712", "profile_bcm2712"),
         ] {
             let cap = capacity_for_profile(target).expect(target);
-            // owner.rs declares the hosted multitenant MAX_OWNERS first, the
-            // bare-metal multitenant one second.
-            let owners_src = if target == "linux" {
-                owner.as_str()
-            } else {
-                let first = owner.find("pub const MAX_OWNERS").expect("MAX_OWNERS");
-                &owner[first + 1..]
-            };
-            assert_eq!(cap.max_owners as u64, extract(owners_src, "MAX_OWNERS"));
+            assert_eq!(cap.max_owners as u64, extract(&owner, "MAX_OWNERS"));
             assert_eq!(cap.max_modules as u64, k(profile, "MAX_MODULES", target));
             assert_eq!(
                 cap.state_bytes as u64,
@@ -2029,20 +2021,14 @@ mod tests {
             crate::add_subgraph::MAX_ADD_EDGES as u64,
             extract(&live, "MAX_ADD_EDGES")
         );
-        // The MCU rows exist but hand out no workload owner slots: the RP
-        // kernels are single-tenant, so `max_owners` is the system slot alone
-        // (owner.rs's last MAX_OWNERS). Their arena figures are pinned against the silicon
-        // TOMLs by `capacity_mirrors_silicon_tomls`; what belongs here is the
-        // half that mirrors a kernel source — profile_rp's module ceiling.
+        // The MCU rows carry the same owner-slot domain as every kernel.
+        // Their arena figures are pinned against the silicon TOMLs by
+        // `capacity_mirrors_silicon_tomls`; what belongs here is the half
+        // that mirrors a kernel source — the owner domain and profile_rp's
+        // module ceiling.
         for mcu in ["rp2040", "rp2350"] {
             let c = capacity_for_profile(mcu).unwrap_or_else(|| panic!("{mcu}: no capacity row"));
-            let single = &owner[owner.rfind("pub const MAX_OWNERS").expect("MAX_OWNERS")..];
-            assert_eq!(
-                c.max_owners as u64,
-                extract(single, "MAX_OWNERS"),
-                "{mcu} is single-tenant"
-            );
-            assert_eq!(c.max_owners, 1, "{mcu} is single-tenant");
+            assert_eq!(c.max_owners as u64, extract(&owner, "MAX_OWNERS"));
             assert_eq!(
                 c.max_modules as u64,
                 k("profile_rp", "MAX_MODULES", mcu),

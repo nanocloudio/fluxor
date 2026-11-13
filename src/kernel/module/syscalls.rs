@@ -1591,53 +1591,33 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             0
         }
 
-        // ── Live graph mutation (multi-tenant only) ──
+        // ── Live graph mutation ──
         reconfigure::APPLY_ADD => {
-            #[cfg(feature = "multitenant")]
-            {
-                // SAFETY: `arg`/`arg_len` describe the caller's request buffer,
-                // valid for this call; the decoder borrows module params from it
-                // in place and writes the owner handle back into it. The
-                // calling module is the add's creator.
-                unsafe {
-                    scheduler::live::apply_add_encoded_by(
-                        arg,
-                        arg_len,
-                        scheduler::current_module_index(),
-                    )
-                }
+            // A node whose plan seats no workload owner stages no add.
+            if scheduler::live::add_capacity() == 0 {
+                return crate::kernel::sys::errno::ENOSPC;
             }
-            #[cfg(not(feature = "multitenant"))]
-            {
-                let _ = (arg, arg_len);
-                E_NOSYS
+            // SAFETY: `arg`/`arg_len` describe the caller's request buffer,
+            // valid for this call; the decoder borrows module params from it
+            // in place and writes the owner handle back into it. The
+            // calling module is the add's creator.
+            unsafe {
+                scheduler::live::apply_add_encoded_by(
+                    arg,
+                    arg_len,
+                    scheduler::current_module_index(),
+                )
             }
         }
         reconfigure::FREE_OWNER => {
-            #[cfg(feature = "multitenant")]
-            {
-                // SAFETY: `arg`/`arg_len` describe a readable handle record.
-                unsafe { scheduler::live::free_owner_encoded(arg, arg_len) }
-            }
-            #[cfg(not(feature = "multitenant"))]
-            {
-                let _ = (arg, arg_len);
-                E_NOSYS
-            }
+            // SAFETY: `arg`/`arg_len` describe a readable handle record.
+            unsafe { scheduler::live::free_owner_encoded(arg, arg_len) }
         }
-        // Owner pause/resume. Arms are cfg-gated OUT (not ENOSYS-stubbed) on
-        // non-multitenant builds so the opcodes fall through to the platform
-        // extension. They live in the `reconfigure::APPLY_ADD`..=`reconfigure::OWNER_RESUME` live-mutation block
-        // (well clear of the peripheral register-bridge range), so on an rp
-        // build `reconfigure::OWNER_PAUSE`/`reconfigure::OWNER_RESUME` reach the platform extension and are simply
-        // unknown there, clear of the rp PIO SM_READ_REG/SM_ENABLE bridges at
-        // `rp_raw::PIO_SM_READ_REG`/`rp_raw::PIO_SM_ENABLE`.
-        #[cfg(feature = "multitenant")]
+        // Owner pause/resume.
         reconfigure::OWNER_PAUSE => {
             // SAFETY: `arg`/`arg_len` describe a readable handle record.
             unsafe { scheduler::live::owner_pause_encoded(arg, arg_len) }
         }
-        #[cfg(feature = "multitenant")]
         reconfigure::OWNER_RESUME => {
             // SAFETY: `arg`/`arg_len` describe a readable handle record.
             unsafe { scheduler::live::owner_resume_encoded(arg, arg_len) }
@@ -1851,27 +1831,19 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         // module declares itself the node's shared network stack, carrying its
         // own `addr_ctl` / ingress input-port indices in `arg` (see
         // `kernel_abi::NET_IDENT_PROVIDER`). Workload modules are refused —
-        // a tenant must not hijack identity installs. Single-tenant builds
-        // have no workload backend to serve: ENOSYS.
+        // a tenant must not hijack identity installs.
         NET_IDENT_PROVIDER => {
-            #[cfg(feature = "multitenant")]
-            {
-                if arg.is_null() || arg_len < 2 {
-                    return crate::kernel::sys::errno::EINVAL;
-                }
-                let idx = scheduler::current_module_index();
-                if !scheduler::module_owner(idx).is_system() {
-                    return crate::kernel::sys::errno::EACCES;
-                }
-                let a = core::slice::from_raw_parts(arg, 2);
-                crate::kernel::workload::workload_graph::register_net_identity_provider(
-                    idx as u16, a[0], a[1],
-                )
+            if arg.is_null() || arg_len < 2 {
+                return crate::kernel::sys::errno::EINVAL;
             }
-            #[cfg(not(feature = "multitenant"))]
-            {
-                crate::kernel::sys::errno::ENOSYS
+            let idx = scheduler::current_module_index();
+            if !scheduler::module_owner(idx).is_system() {
+                return crate::kernel::sys::errno::EACCES;
             }
+            let a = core::slice::from_raw_parts(arg, 2);
+            crate::kernel::workload::workload_graph::register_net_identity_provider(
+                idx as u16, a[0], a[1],
+            )
         }
         // Module-facing ISR-bridge enumeration. Returns the calling
         // module's own input /

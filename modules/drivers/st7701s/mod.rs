@@ -471,7 +471,7 @@ unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
     // tracks the returned tagged fd against this contract; follow-up
     // fd::* ops route through PLATFORM_DMA_FD's vtable and reject
     // handles from the sibling PLATFORM_DMA (channel) surface.
-    const PLATFORM_DMA_FD: u32 = 0x0011;
+    const PLATFORM_DMA_FD: u32 = abi::registry::platform_dma_fd::ID as u32;
     (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)
 }
 

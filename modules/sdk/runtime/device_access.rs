@@ -138,7 +138,7 @@ unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
 #[inline(always)]
 unsafe fn dev_pcie_device_open(sys: &SyscallTable, selector: &[u8]) -> i32 {
     (sys.provider_open)(
-        0x0012, // PCIE_DEVICE contract id
+        abi::registry::pcie_device::ID as u32,
         abi::contracts::hal::pcie_device::BIND,
         selector.as_ptr(),
         selector.len(),

@@ -4,12 +4,11 @@
 //!
 //! This is the kernel half of the host composer's wire format
 //! (`tools/src/compose.rs::encode_plan`). The two MUST stay in lockstep: same
-//! magic, version, and fixed-width record layout. Decoding is `no_std` and,
-//! on a static profile, allocation-free — assignments land in a fixed array
-//! bounded by the owner table; a hosted kernel, whose owner domain is
-//! thousands of slots, holds exactly the records the plan carries — and fails
-//! closed on bad magic/version, length overrun, over-cap count, or digest
-//! mismatch.
+//! magic, version, and fixed-width record layout. Decoding is `no_std` and
+//! allocation-free on every target: a decoded plan is a view over the bytes
+//! it verified, its records read from them when asked, so it holds no record
+//! array of any size. It fails closed on bad magic/version, length overrun,
+//! over-cap count, or digest mismatch.
 //!
 //! `apply` installs each owner at its plan-assigned slot/generation and stamps
 //! the owner onto its module range, so provider enforcement and per-owner
@@ -49,57 +48,12 @@ pub const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
 /// Decoder ceiling for the lease section (bounded-binary rule): the format's
 /// own domain, one grant per `(protocol, port)` a node can lease — tcp and
 /// udp, nonzero ports — the same bound as
-/// `tools/src/compose.rs::MAX_PLAN_LEASES`. A hosted kernel holds exactly
-/// the leases a plan carries.
-#[cfg(feature = "host-linux")]
+/// `tools/src/compose.rs::MAX_PLAN_LEASES`.
 pub const MAX_PLAN_LEASES: usize = 2 * u16::MAX as usize;
-/// Decoder ceiling for the lease section on a static profile: the fixed
-/// array a decoded plan holds.
-#[cfg(not(feature = "host-linux"))]
-pub const MAX_PLAN_LEASES: usize = 256;
-/// At most one assignment per owner slot: the owner-slot domain (4096 on a
-/// hosted kernel, the static table elsewhere). The wire count is a `u32` and
-/// the slot a `u16`; a slot past the live owner table is refused when the
-/// plan is validated.
+/// At most one assignment per owner slot: the owner-slot domain. The wire
+/// count is a `u32` and the slot a `u16`; a slot past the live owner table
+/// is refused when the plan is validated.
 pub const MAX_PLAN_ASSIGNMENTS: usize = MAX_OWNERS;
-
-/// A plan's records of one kind: the fixed array a static profile holds, or
-/// on a hosted kernel exactly the records decoded. Either indexes and slices
-/// the same way.
-#[cfg(feature = "host-linux")]
-pub type Records<T> = std::vec::Vec<T>;
-/// A plan's records of one kind (see the hosted definition).
-#[cfg(not(feature = "host-linux"))]
-pub type Records<T> = [T; MAX_PLAN_ASSIGNMENTS];
-
-/// Records for `n` entries, each `empty` until written.
-#[cfg(feature = "host-linux")]
-fn records<T: Copy>(empty: T, n: usize) -> Records<T> {
-    std::vec![empty; n]
-}
-/// Records for `n` entries (`n <= MAX_PLAN_ASSIGNMENTS`), each `empty` until
-/// written.
-#[cfg(not(feature = "host-linux"))]
-fn records<T: Copy>(empty: T, _n: usize) -> Records<T> {
-    [empty; MAX_PLAN_ASSIGNMENTS]
-}
-
-/// A plan's lease grants: exactly those decoded on a hosted kernel, the
-/// fixed array elsewhere.
-#[cfg(feature = "host-linux")]
-pub type LeaseRecords = std::vec::Vec<PlanLease>;
-/// A plan's lease grants (see the hosted definition).
-#[cfg(not(feature = "host-linux"))]
-pub type LeaseRecords = [PlanLease; MAX_PLAN_LEASES];
-
-#[cfg(feature = "host-linux")]
-fn lease_records(n: usize) -> LeaseRecords {
-    std::vec![PlanLease::EMPTY; n]
-}
-#[cfg(not(feature = "host-linux"))]
-fn lease_records(_n: usize) -> LeaseRecords {
-    [PlanLease::EMPTY; MAX_PLAN_LEASES]
-}
 
 /// One decoded owner placement.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,20 +69,6 @@ pub struct PlanAssignment {
     pub buffer_cap: u32,
 }
 
-impl PlanAssignment {
-    const EMPTY: PlanAssignment = PlanAssignment {
-        owner_uid: [0; 16],
-        slot: 0,
-        generation: 0,
-        module_base: 0,
-        module_count: 0,
-        edge_base: 0,
-        edge_count: 0,
-        state_cap: 0,
-        buffer_cap: 0,
-    };
-}
-
 /// One decoded revocation: a departing owner's last assignment plus its drain
 /// window.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,14 +76,6 @@ pub struct PlanRevocation {
     pub assignment: PlanAssignment,
     pub grace_secs: u16,
     pub deadline_unix: u64,
-}
-
-impl PlanRevocation {
-    pub const EMPTY: PlanRevocation = PlanRevocation {
-        assignment: PlanAssignment::EMPTY,
-        grace_secs: 0,
-        deadline_unix: 0,
-    };
 }
 
 /// One granted endpoint lease: owner `(slot, generation)` may bind
@@ -156,44 +88,127 @@ pub struct PlanLease {
     pub port: u16,
 }
 
-impl PlanLease {
-    const EMPTY: PlanLease = PlanLease {
-        slot: 0,
-        generation: 0,
-        protocol: 0,
-        port: 0,
-    };
-}
-
-/// A decoded, digest-verified plan: allocation-free on a static profile, its
-/// records exactly those decoded on a hosted kernel.
-pub struct DecodedPlan {
+/// A decoded, digest-verified plan: a view over the bytes it was decoded
+/// from, which it reads its records from.
+#[derive(Clone, Copy)]
+pub struct DecodedPlan<'a> {
     pub generation: u64,
     /// The sha256 over the plan's body that its trailer carries, verified at
     /// decode.
     pub digest: [u8; 32],
+    body: &'a [u8],
     count: usize,
-    assignments: Records<PlanAssignment>,
     rev_count: usize,
-    revocations: Records<PlanRevocation>,
     lease_count: usize,
-    leases: LeaseRecords,
+    /// Where the lease records begin in `body`.
+    lease_base: usize,
 }
 
-impl DecodedPlan {
-    /// The valid assignment slice.
-    pub fn assignments(&self) -> &[PlanAssignment] {
-        &self.assignments[..self.count]
+impl<'a> DecodedPlan<'a> {
+    /// The assignments, in plan order.
+    pub fn assignments(&self) -> Records<'a, PlanAssignment> {
+        Records::new(
+            &self.body[12..],
+            ASSIGN_REC_LEN,
+            self.count,
+            read_assignment,
+        )
     }
 
-    /// The valid revocation slice (usually empty).
-    pub fn revocations(&self) -> &[PlanRevocation] {
-        &self.revocations[..self.rev_count]
+    /// The revocations, in plan order (usually none).
+    pub fn revocations(&self) -> Records<'a, PlanRevocation> {
+        let base = 12 + self.count * ASSIGN_REC_LEN + 4;
+        let bytes = if self.rev_count == 0 {
+            &[][..]
+        } else {
+            &self.body[base..]
+        };
+        Records::new(bytes, REVOKE_REC_LEN, self.rev_count, read_revocation)
     }
 
-    /// The valid lease slice, empty when the plan grants no endpoints.
-    pub fn leases(&self) -> &[PlanLease] {
-        &self.leases[..self.lease_count]
+    /// The lease grants, none when the plan grants no endpoints.
+    pub fn leases(&self) -> Records<'a, PlanLease> {
+        let bytes = if self.lease_count == 0 {
+            &[][..]
+        } else {
+            &self.body[self.lease_base..]
+        };
+        Records::new(bytes, LEASE_REC_LEN, self.lease_count, read_lease)
+    }
+}
+
+/// A plan's records of one kind, read from its verified bytes in order.
+#[derive(Clone)]
+pub struct Records<'a, T> {
+    bytes: &'a [u8],
+    stride: usize,
+    next: usize,
+    end: usize,
+    read: fn(&[u8]) -> T,
+}
+
+impl<'a, T> Records<'a, T> {
+    fn new(bytes: &'a [u8], stride: usize, count: usize, read: fn(&[u8]) -> T) -> Self {
+        Self {
+            bytes,
+            stride,
+            next: 0,
+            end: count,
+            read,
+        }
+    }
+}
+
+impl<T> Iterator for Records<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.next == self.end {
+            return None;
+        }
+        let at = self.next * self.stride;
+        self.next += 1;
+        Some((self.read)(&self.bytes[at..at + self.stride]))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.end - self.next;
+        (n, Some(n))
+    }
+}
+
+impl<T> ExactSizeIterator for Records<'_, T> {}
+
+fn read_assignment(r: &[u8]) -> PlanAssignment {
+    let mut owner_uid = [0u8; 16];
+    owner_uid.copy_from_slice(&r[0..16]);
+    PlanAssignment {
+        owner_uid,
+        slot: be_u16(&r[16..18]),
+        generation: be_u32(&r[18..22]),
+        module_base: be_u16(&r[22..24]),
+        module_count: be_u16(&r[24..26]),
+        edge_base: be_u16(&r[26..28]),
+        edge_count: be_u16(&r[28..30]),
+        state_cap: be_u32(&r[30..34]),
+        buffer_cap: be_u32(&r[34..38]),
+    }
+}
+
+fn read_revocation(r: &[u8]) -> PlanRevocation {
+    PlanRevocation {
+        assignment: read_assignment(&r[..ASSIGN_REC_LEN]),
+        grace_secs: be_u16(&r[ASSIGN_REC_LEN..ASSIGN_REC_LEN + 2]),
+        deadline_unix: be_u64(&r[ASSIGN_REC_LEN + 2..ASSIGN_REC_LEN + 10]),
+    }
+}
+
+fn read_lease(r: &[u8]) -> PlanLease {
+    PlanLease {
+        slot: be_u16(&r[0..2]),
+        generation: be_u32(&r[2..6]),
+        protocol: r[6],
+        port: be_u16(&r[7..9]),
     }
 }
 
@@ -231,7 +246,7 @@ fn be_u64(b: &[u8]) -> u64 {
 }
 
 /// Decode and verify a bounded binary plan. Fails closed on any inconsistency.
-pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
+pub fn decode(bytes: &[u8]) -> Result<DecodedPlan<'_>, PlanError> {
     if bytes.len() < PLAN_HEADER_LEN + 12 + 32 {
         return Err(PlanError::Truncated);
     }
@@ -308,35 +323,21 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
     if computed.as_slice() != &bytes[PLAN_HEADER_LEN + body_len..] {
         return Err(PlanError::DigestMismatch);
     }
-    fn read_assignment(r: &[u8]) -> PlanAssignment {
-        let mut owner_uid = [0u8; 16];
-        owner_uid.copy_from_slice(&r[0..16]);
-        PlanAssignment {
-            owner_uid,
-            slot: be_u16(&r[16..18]),
-            generation: be_u32(&r[18..22]),
-            module_base: be_u16(&r[22..24]),
-            module_count: be_u16(&r[24..26]),
-            edge_base: be_u16(&r[26..28]),
-            edge_count: be_u16(&r[28..30]),
-            state_cap: be_u32(&r[30..34]),
-            buffer_cap: be_u32(&r[34..38]),
-        }
-    }
-    let mut assignments = records(PlanAssignment::EMPTY, count);
-    for (i, a) in assignments.iter_mut().enumerate().take(count) {
-        *a = read_assignment(&body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN]);
-    }
-    let mut revocations = records(PlanRevocation::EMPTY, rev_count);
-    for (i, rev) in revocations.iter_mut().enumerate().take(rev_count) {
-        let base = assign_len + 4 + i * REVOKE_REC_LEN;
-        let r = &body[base..base + REVOKE_REC_LEN];
-        *rev = PlanRevocation {
-            assignment: read_assignment(&r[..ASSIGN_REC_LEN]),
-            grace_secs: be_u16(&r[ASSIGN_REC_LEN..ASSIGN_REC_LEN + 2]),
-            deadline_unix: be_u64(&r[ASSIGN_REC_LEN + 2..ASSIGN_REC_LEN + 10]),
-        };
-    }
+    let plan = DecodedPlan {
+        generation,
+        digest: [0; 32],
+        body: &body[..body_len],
+        count,
+        rev_count,
+        lease_count,
+        lease_base: assign_len
+            + if rev_count > 0 {
+                4 + rev_count * REVOKE_REC_LEN
+            } else {
+                0
+            }
+            + 8, // marker + count
+    };
     // Semantic validation: framing + digest prove the bytes are intact, not
     // that the plan is coherent. The kernel does not trust the composer's
     // promise of unique slots / non-overlapping ranges — a corrupt or hostile
@@ -345,11 +346,12 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
     // isolation). Validate assignments AND revocations under one rule set: a
     // draining owner still occupies its slot and module range, so revocations
     // participate in the same duplicate/overlap checks.
-    let record = |i: usize| -> &PlanAssignment {
+    let record = |i: usize| -> PlanAssignment {
         if i < count {
-            &assignments[i]
+            read_assignment(&body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN])
         } else {
-            &revocations[i - count].assignment
+            let base = assign_len + 4 + (i - count) * REVOKE_REC_LEN;
+            read_assignment(&body[base..base + ASSIGN_REC_LEN])
         }
     };
     let total = count + rev_count;
@@ -382,42 +384,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
             }
         }
     }
-    let mut leases = lease_records(lease_count);
-    let lease_base = assign_len
-        + if rev_count > 0 {
-            4 + rev_count * REVOKE_REC_LEN
-        } else {
-            0
-        }
-        + 8; // marker + count
-    for (i, lease) in leases.iter_mut().enumerate().take(lease_count) {
-        let r = &body[lease_base + i * LEASE_REC_LEN..lease_base + (i + 1) * LEASE_REC_LEN];
-        *lease = PlanLease {
-            slot: be_u16(&r[0..2]),
-            generation: be_u32(&r[2..6]),
-            protocol: r[6],
-            port: be_u16(&r[7..9]),
-        };
-    }
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&bytes[PLAN_HEADER_LEN + body_len..]);
-    Ok(DecodedPlan {
-        generation,
-        digest,
-        count,
-        assignments,
-        rev_count,
-        revocations,
-        lease_count,
-        leases,
-    })
+    Ok(DecodedPlan { digest, ..plan })
 }
 
 /// Apply a decoded plan to the running owner table: install each owner at its
 /// plan-assigned slot/generation and stamp the owner onto its module range.
-/// Returns the number of owners installed. On single-tenant builds the install
-/// is a no-op (only the system slot exists), so this is inert there.
-pub fn apply(plan: &DecodedPlan) -> usize {
+/// Returns the number of owners installed.
+pub fn apply(plan: &DecodedPlan<'_>) -> usize {
     let table = crate::kernel::exec::scheduler::owners_mut();
     // The plan is authoritative for residency: revoke owners not re-installed
     // below so a removed workload's slot fails closed (generations preserved).
@@ -453,7 +428,9 @@ pub fn apply(plan: &DecodedPlan) -> usize {
 // ============================================================================
 
 /// Pending staged plan `(ptr, len)`, set by the node agent / platform before the
-/// graph is instantiated and consumed once by `apply_staged`.
+/// graph is instantiated and consumed once by `apply_staged`. Its bytes stay
+/// valid for the run: the plan applied from them is retained as a view over
+/// them.
 static mut STAGED_PLAN: Option<(*const u8, usize)> = None;
 
 /// Generation of the last successfully-applied plan; a staged plan older than
@@ -465,8 +442,9 @@ static mut LAST_APPLIED_DIGEST: [u8; 32] = [0; 32];
 
 /// The last successfully-applied plan, retained so a graph rebuild (which runs
 /// `prepare_graph`, resetting every module to the system owner) can RE-apply it
-/// without a fresh staged blob. `None` until the first plan is applied.
-static mut RETAINED_PLAN: Option<DecodedPlan> = None;
+/// without a fresh staged blob. `None` until the first plan is applied. A view
+/// over the staged bytes, which live for the run ([`set_staged_plan`]).
+static mut RETAINED_PLAN: Option<DecodedPlan<'static>> = None;
 
 /// Generation of the last successfully-applied plan (0 = none yet). Lets the
 /// platform's owner-status writer stamp which plan generation the live state
@@ -489,8 +467,9 @@ pub fn last_applied_digest() -> [u8; 32] {
 /// Stage a binary plan to be applied at the next `apply_staged`.
 ///
 /// # Safety
-/// `ptr..ptr+len` must remain valid until `apply_staged` consumes it (i.e. until
-/// just after module instantiation in the platform boot/rebuild path).
+/// `ptr..ptr+len` must remain valid and unchanged for the rest of the run: the
+/// plan applied from it is retained, and read from these bytes on every
+/// rebuild.
 pub unsafe fn set_staged_plan(ptr: *const u8, len: usize) {
     let p = &raw mut STAGED_PLAN;
     *p = Some((ptr, len));
@@ -522,24 +501,16 @@ fn take_staged_plan() -> Option<(*const u8, usize)> {
     }
 }
 
-/// Copy the retained plan's revocations into `out`, returning the count. The
-/// platform uses this at boot to synthesize drain-timeout-by-restart terminal
-/// records for owners that were mid-drain when the previous process died —
-/// they are absent from the assignment section, so nothing re-instantiates
-/// them; the record is the only trace.
-pub fn retained_revocations(out: &mut [PlanRevocation]) -> usize {
+/// Hand each of the retained plan's revocations to `f`. The platform uses
+/// this at boot to synthesize drain-timeout-by-restart terminal records for
+/// owners that were mid-drain when the previous process died — they are
+/// absent from the assignment section, so nothing re-instantiates them; the
+/// record is the only trace.
+pub fn retained_revocations(mut f: impl FnMut(PlanRevocation)) {
     let retained = &raw const RETAINED_PLAN;
     // SAFETY: scheduler-thread read.
-    match unsafe { &*retained } {
-        Some(plan) => {
-            let mut n = 0;
-            for (o, r) in out.iter_mut().zip(plan.revocations()) {
-                *o = *r;
-                n += 1;
-            }
-            n
-        }
-        None => 0,
+    if let Some(plan) = unsafe { &*retained } {
+        plan.revocations().for_each(&mut f);
     }
 }
 
@@ -577,8 +548,7 @@ pub fn lease_gate(slot: u16, generation: u32, protocol: u8, port: u16) -> LeaseG
     // A retained plan is lease-aware; enforcement is mandatory. An owner may
     // bind only a nonzero port it was granted — every other nonzero bind is
     // refused, whether or not the plan grants any endpoints at all.
-    let leases = plan.leases();
-    if leases.iter().any(|l| {
+    if plan.leases().any(|l| {
         l.slot == slot && l.generation == generation && l.protocol == protocol && l.port == port
     }) {
         LeaseGate::Granted
@@ -599,22 +569,6 @@ pub struct DrainArm {
     pub deadline_unix: u64,
 }
 
-impl DrainArm {
-    pub const EMPTY: DrainArm = DrainArm {
-        owner_uid: [0; 16],
-        slot: 0,
-        generation: 0,
-        grace_secs: 0,
-        deadline_unix: 0,
-    };
-}
-
-/// Drains armed by a delta apply. Fixed-size, allocation-free.
-pub struct DrainDelta {
-    pub count: usize,
-    pub arms: Records<DrainArm>,
-}
-
 /// Attempt to apply the staged plan as a **pure-drain delta** — the one plan
 /// shape a removal generation produces: every staged assignment is
 /// byte-identical to a retained one, every retained assignment either
@@ -625,14 +579,14 @@ pub struct DrainDelta {
 /// closes; its modules keep stepping until the platform's drain driver frees
 /// it at quiescence or deadline).
 ///
-/// Returns `Some(delta)` (possibly with `count == 0` drains when every
-/// revocation names an already-gone owner) after consuming the staged plan and
-/// updating the retained-plan bookkeeping — the caller must NOT rebuild.
+/// Returns `Some(n)`, the drains handed to `arm` (0 when every revocation
+/// names an already-gone owner), after consuming the staged plan and updating
+/// the retained-plan bookkeeping — the caller must NOT rebuild.
 /// Returns `None` — leaving the staged plan in place for the ordinary
 /// `apply_staged` rebuild path — when there is no staged plan, no retained
 /// plan (boot), a decode/rollback failure (the rebuild path reports it), or a
 /// structural change.
-pub fn try_apply_drain_delta() -> Option<DrainDelta> {
+pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
     // Peek without consuming: an ineligible plan must stay staged for the
     // rebuild path.
     // SAFETY: scheduler-thread single accessor.
@@ -644,8 +598,9 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
     // SAFETY: scheduler-thread single accessor.
     let retained = unsafe { (*retained_ptr).as_ref()? };
 
-    // SAFETY: `set_staged_plan`'s caller upheld the validity contract.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    // SAFETY: `set_staged_plan`'s caller upheld the validity contract: the
+    // bytes live for the run.
+    let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr, len) };
     let Ok(plan) = decode(bytes) else {
         return None; // rebuild path surfaces the decode error
     };
@@ -658,15 +613,15 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
     // Delta-eligible? Every staged assignment must exist verbatim in the
     // retained plan (no additions, no mutations)…
     for a in plan.assignments() {
-        if !retained.assignments().iter().any(|r| r == a) {
+        if !retained.assignments().any(|r| r == a) {
             return None;
         }
     }
     // …and every retained assignment either survives verbatim or departed into
     // the staged revocation section verbatim.
     for r in retained.assignments() {
-        let survives = plan.assignments().iter().any(|a| a == r);
-        let revoked = plan.revocations().iter().any(|rev| rev.assignment == *r);
+        let survives = plan.assignments().any(|a| a == r);
+        let revoked = plan.revocations().any(|rev| rev.assignment == r);
         if !survives && !revoked {
             return None;
         }
@@ -683,7 +638,7 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
                 slot: rev.assignment.slot,
                 generation: rev.assignment.generation,
             };
-            if table.lookup(handle).is_some() && !plan.revocations().contains(rev) {
+            if table.lookup(handle).is_some() && !plan.revocations().any(|r| r == rev) {
                 return None;
             }
         }
@@ -691,7 +646,7 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
 
     // Eligible: consume the staged plan and apply the delta in place.
     let _ = take_staged_plan();
-    let delta = arm_revocations(&plan);
+    let armed = arm_revocations(&plan, arm);
 
     let generation = plan.generation;
     // SAFETY: scheduler-thread single accessor; retain for rebuild re-apply.
@@ -701,41 +656,35 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
         LAST_APPLIED_DIGEST = plan.digest;
         RETAINED_PLAN = Some(plan);
     }
-    log::info!(
-        "[owner] drain delta applied: {} drains armed (gen {generation})",
-        delta.count
-    );
-    Some(delta)
+    log::info!("[owner] drain delta applied: {armed} drains armed (gen {generation})");
+    Some(armed)
 }
 
 /// `begin_drain` every still-installed owner named in `plan`'s revocation
-/// section and return their drain arms. An already-revoked / never-installed
-/// owner is a no-op; `begin_drain` is idempotent for an already-Draining owner,
-/// and the platform re-arms with the record's original deadline, so a replayed
-/// record never resets the clock.
-fn arm_revocations(plan: &DecodedPlan) -> DrainDelta {
-    let mut delta = DrainDelta {
-        count: 0,
-        arms: records(DrainArm::EMPTY, plan.revocations().len()),
-    };
+/// section and hand each its drain arm; the count armed. An already-revoked /
+/// never-installed owner is a no-op; `begin_drain` is idempotent for an
+/// already-Draining owner, and the platform re-arms with the record's original
+/// deadline, so a replayed record never resets the clock.
+fn arm_revocations(plan: &DecodedPlan<'_>, mut arm: impl FnMut(DrainArm)) -> usize {
     let table = crate::kernel::exec::scheduler::owners_mut();
+    let mut armed = 0;
     for rev in plan.revocations() {
         let handle = crate::kernel::workload::owner::OwnerHandle {
             slot: rev.assignment.slot,
             generation: rev.assignment.generation,
         };
         if table.lookup(handle).is_some() && table.begin_drain(handle) {
-            delta.arms[delta.count] = DrainArm {
+            arm(DrainArm {
                 owner_uid: rev.assignment.owner_uid,
                 slot: rev.assignment.slot,
                 generation: rev.assignment.generation,
                 grace_secs: rev.grace_secs,
                 deadline_unix: rev.deadline_unix,
-            };
-            delta.count += 1;
+            });
+            armed += 1;
         }
     }
-    delta
+    armed
 }
 
 /// Arm drains for the staged plan's revocations without consuming it or
@@ -743,30 +692,27 @@ fn arm_revocations(plan: &DecodedPlan) -> DrainDelta {
 /// that adds or changes owners is not a pure-drain delta, but any owner it
 /// revokes must still drain — `begin_drain` plus a terminal record — rather than
 /// being dropped untracked by the rebuild's `reset_workloads`. The staged plan
-/// stays in place for `apply_staged`; the returned arms outlive the table reset,
-/// so the drain driver finalises each freed owner.
-pub fn arm_staged_revocation_drains() -> DrainDelta {
-    let empty = DrainDelta {
-        count: 0,
-        arms: records(DrainArm::EMPTY, 0),
-    };
+/// stays in place for `apply_staged`; the arms handed to `arm` outlive the
+/// table reset, so the drain driver finalises each freed owner. The count
+/// armed.
+pub fn arm_staged_revocation_drains(arm: impl FnMut(DrainArm)) -> usize {
     // SAFETY: scheduler-thread single accessor; scalar read by value.
     let Some((ptr, len)) = (unsafe { STAGED_PLAN }) else {
-        return empty;
+        return 0;
     };
     // SAFETY: `set_staged_plan`'s caller upheld the validity contract.
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let Ok(plan) = decode(bytes) else {
-        return empty;
+        return 0;
     };
     // A rollback is rejected by the rebuild's `apply_staged`; do not arm drains
     // for a plan that will not be applied.
     // SAFETY: scheduler-thread single accessor; scalar read by value.
     let last = unsafe { LAST_APPLIED_GENERATION };
     if plan.generation < last {
-        return empty;
+        return 0;
     }
-    arm_revocations(&plan)
+    arm_revocations(&plan, arm)
 }
 
 /// Establish plan ownership for the graph. Called by the platform BEFORE module
@@ -796,8 +742,9 @@ pub fn apply_staged() -> Result<usize, PlanError> {
             None => 0,
         });
     };
-    // SAFETY: caller of `set_staged_plan` upheld the validity contract.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    // SAFETY: caller of `set_staged_plan` upheld the validity contract: the
+    // bytes live for the run.
+    let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr, len) };
     let plan = decode(bytes).inspect_err(|e| {
         log::error!("[owner] staged plan invalid: {e:?}");
     })?;

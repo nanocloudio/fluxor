@@ -346,7 +346,8 @@ mod brcm {
 
     /// PCIe HW revision register; refuse MSI bring-up below rev 3.3.
     pub const MISC_REVISION: u64 = 0x406c;
-    pub const HW_REV_33: u32 = crate::abi::registry::i2c::READ;
+    /// Major in the high byte, minor in the low: 3.3.
+    pub const HW_REV_33: u32 = (3 << 8) | 3;
 }
 
 /// The PCIe1 root complex's register values after Linux's

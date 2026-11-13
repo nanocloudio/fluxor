@@ -2728,7 +2728,8 @@ mod continuity_tests {
             e.contains("primary domain") && e.contains("live-added"),
             "{e}"
         );
-        // A single-tenant kernel admits no workload.
+        // A node that keeps no owner reserve (RP's default) admits no
+        // live-added workload.
         check(&graph(Some("io"), Some("io"), json!({})), "rp2350").unwrap();
     }
 
@@ -4602,10 +4603,10 @@ mod dynamic_capacity_tests {
         );
         assert_eq!(kernel_max_modules("linux"), 4096);
         assert_eq!(kernel_max_modules("pi5"), 1024);
-        assert_eq!(kernel_max_owners("linux"), 4096);
-        assert_eq!(kernel_max_owners("pi5"), 64);
-        assert_eq!(kernel_max_owners("rp2350"), 1);
-        assert_eq!(kernel_max_owners("wasm"), 1);
+        // One owner-slot domain on every kernel.
+        for t in ["linux", "pi5", "rp2040", "rp2350", "wasm"] {
+            assert_eq!(kernel_max_owners(t), 4096, "{t}");
+        }
         assert!(kernel_has_pool("linux", "tty_sessions"));
         assert!(kernel_has_pool("pi5", "store_reads"));
         assert!(!kernel_has_pool("pi5", "store_writes"));
@@ -4616,7 +4617,7 @@ mod dynamic_capacity_tests {
             assert_eq!(crate::capacity::kernel_profile(t), "profile_uefi");
             assert!(crate::capacity::graph_section_per_graph(t));
             assert_eq!(kernel_max_modules(t), 1024);
-            assert_eq!(kernel_max_owners(t), 64);
+            assert_eq!(kernel_max_owners(t), 4096);
             assert_eq!(kernel_pool_default_reserve(t, "module_slots"), Some(256));
             assert_eq!(
                 kernel_pool_default_reserve(t, "state_arena"),
@@ -6315,24 +6316,24 @@ mod boot_plan_tests {
         );
     }
 
-    /// bcm2712's owner-slot domain is 64 and its default owner reserve 63: a
-    /// resident workload's slot comes out of the default, while an explicit
-    /// reserve of 63 is refused.
+    /// The owner-slot domain is 4096 and bcm2712's default owner reserve 63:
+    /// a resident workload's slot comes beside the default, while a reserve
+    /// past the domain is refused.
     #[test]
     fn a_resident_workload_takes_an_owner_slot() {
         let mut s = shape(10, 10);
         s.workloads = 1;
         let plan = plan_pool("pi5", "owners", &s, NONE, NONE);
-        assert_eq!((plan.derived, plan.reserve), (2, 62));
+        assert_eq!((plan.derived, plan.reserve), (2, 63));
         check_boot_plan("pi5", &s, NONE, NONE).expect("the default leaves room");
-        let e = check_boot_plan("pi5", &s, &figures(&[("owners", 63)]), NONE).unwrap_err();
+        let e = check_boot_plan("pi5", &s, &figures(&[("owners", 4095)]), NONE).unwrap_err();
         assert!(
-            e.contains("pool 'owners' to 65 (derived 2 + reserve 63 from `capacity:`)")
-                && e.contains("owner-slot domain (MAX_OWNERS) of 64")
+            e.contains("pool 'owners' to 4097 (derived 2 + reserve 4095 from `capacity:`)")
+                && e.contains("owner-slot domain (MAX_OWNERS) of 4096")
                 && e.contains("over by 1"),
             "{e}"
         );
-        check_boot_plan("pi5", &s, &figures(&[("owners", 62)]), NONE).expect("62 fits");
+        check_boot_plan("pi5", &s, &figures(&[("owners", 4094)]), NONE).expect("4094 fits");
         check_boot_plan("linux", &s, NONE, NONE).expect("linux owners");
     }
 
@@ -6453,7 +6454,16 @@ mod boot_plan_tests {
         let mut s = shape(4, 0);
         (s.workloads, s.workload_modules, s.workload_edges) = resident_demand(&section);
         assert_eq!(plan_pool("linux", "owners", &s, NONE, NONE).derived, 3);
-        assert_eq!(plan_pool("rp2350", "owners", &s, NONE, NONE).derived, 1);
+        // RP plans its owner table from the same demand. wasm's is a static
+        // table holding the system slot alone, so the kernel refuses the
+        // resident workloads at boot, and so does the composer.
+        assert_eq!(plan_pool("rp2350", "owners", &s, NONE, NONE).derived, 3);
+        check_boot_plan("rp2350", &s, NONE, NONE).expect("rp plans its owners");
+        let e = check_boot_plan("wasm", &s, NONE, NONE).unwrap_err();
+        assert!(
+            e.contains("pool 'owners' to 3") && e.contains("past its static table of 1"),
+            "{e}"
+        );
         assert_eq!(
             plan_pool("linux", "module_slots", &s, NONE, NONE).derived,
             9

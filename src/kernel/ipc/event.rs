@@ -104,70 +104,43 @@ static EVENT_WAKE_PENDING: [AtomicU64; MODULE_MASK_WORDS] =
 // drains the deferred store — a concurrent signal lands in whichever
 // store is live and is delivered either way.
 //
-// Default-off: `PAUSED_OWNER_COUNT == 0` short-circuits every check, and
-// non-multitenant builds compile the checks out entirely (a single-tenant
-// target has no pausable owner).
+// Default-off: `PAUSED_OWNER_COUNT == 0` short-circuits every check.
 
 /// Modules whose wake delivery is masked (their owner is paused).
-#[cfg(feature = "multitenant")]
 static PAUSED_MODULES: [AtomicU64; MODULE_MASK_WORDS] =
     [const { AtomicU64::new(0) }; MODULE_MASK_WORDS];
 /// Wakes that arrived for masked modules; re-latched on resume.
-#[cfg(feature = "multitenant")]
 static PAUSED_DEFERRED_WAKES: [AtomicU64; MODULE_MASK_WORDS] =
     [const { AtomicU64::new(0) }; MODULE_MASK_WORDS];
 /// Number of currently paused owners — the default-off guard.
-#[cfg(feature = "multitenant")]
 static PAUSED_OWNER_COUNT: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
 
 /// Default-off guard: true iff at least one owner is paused. One relaxed
 /// load; every pause-aware check short-circuits on it.
 #[inline]
 pub fn paused_owners_present() -> bool {
-    #[cfg(feature = "multitenant")]
-    {
-        PAUSED_OWNER_COUNT.load(Ordering::Relaxed) != 0
-    }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        false
-    }
+    PAUSED_OWNER_COUNT.load(Ordering::Relaxed) != 0
 }
 
 /// True iff `module_idx`'s wake delivery is masked (its owner is paused).
 /// Callers MUST short-circuit behind [`paused_owners_present`].
 #[inline]
 pub fn module_wake_masked(module_idx: usize) -> bool {
-    #[cfg(feature = "multitenant")]
-    {
-        module_idx < crate::kernel::exec::scheduler::committed_module_slots()
-            && (PAUSED_MODULES[module_idx / 64].load(Ordering::Acquire) >> (module_idx % 64)) & 1
-                != 0
-    }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        let _ = module_idx;
-        false
-    }
+    module_idx < crate::kernel::exec::scheduler::committed_module_slots()
+        && (PAUSED_MODULES[module_idx / 64].load(Ordering::Acquire) >> (module_idx % 64)) & 1 != 0
 }
 
 /// Divert a wake for a masked module into the deferred store.
 #[inline]
 pub fn defer_masked_wake(module_idx: usize) {
-    #[cfg(feature = "multitenant")]
     if module_idx < crate::kernel::exec::scheduler::committed_module_slots() {
         PAUSED_DEFERRED_WAKES[module_idx / 64]
             .fetch_or(1u64 << (module_idx % 64), Ordering::Release);
-    }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        let _ = module_idx;
     }
 }
 
 /// Divert an already-taken wake set into the deferred store (the runner's
 /// per-pass straggler sweep for a paused graph).
-#[cfg(feature = "multitenant")]
 pub fn defer_masked_wakes(mask: &ModuleMask) {
     for (atomic, w) in PAUSED_DEFERRED_WAKES.iter().zip(mask.as_words().iter()) {
         if *w != 0 {
@@ -179,7 +152,6 @@ pub fn defer_masked_wakes(mask: &ModuleMask) {
 /// `owner_pause` half of wake masking: mark `mask`'s modules wake-masked and
 /// bump the paused-owner count. Mask-then-check: callers sweep
 /// already-latched bits AFTER this returns.
-#[cfg(feature = "multitenant")]
 pub fn pause_mask_modules(mask: &ModuleMask) {
     PAUSED_OWNER_COUNT.fetch_add(1, Ordering::Release);
     for (atomic, w) in PAUSED_MODULES.iter().zip(mask.as_words().iter()) {
@@ -192,7 +164,6 @@ pub fn pause_mask_modules(mask: &ModuleMask) {
 /// `owner_resume` half: unmask `mask`'s modules and drop the paused-owner
 /// count. Returns the deferred wakes accumulated while masked — the caller
 /// re-latches them (or discards them on `free_owner` of a paused owner).
-#[cfg(feature = "multitenant")]
 pub fn unpause_mask_modules(mask: &ModuleMask) -> ModuleMask {
     let mw = mask.as_words();
     for (atomic, w) in PAUSED_MODULES.iter().zip(mw.iter()) {
@@ -517,16 +488,13 @@ pub fn release_owned_by(module_idx: ModuleId) {
 /// there (`reset_workloads`), so stale masks would suppress wakes for
 /// reused module slots — and folded into [`reset_all`].
 pub fn reset_pause_masking() {
-    #[cfg(feature = "multitenant")]
-    {
-        for w in PAUSED_MODULES.iter() {
-            w.store(0, Ordering::Release);
-        }
-        for w in PAUSED_DEFERRED_WAKES.iter() {
-            w.store(0, Ordering::Release);
-        }
-        PAUSED_OWNER_COUNT.store(0, Ordering::Release);
+    for w in PAUSED_MODULES.iter() {
+        w.store(0, Ordering::Release);
     }
+    for w in PAUSED_DEFERRED_WAKES.iter() {
+        w.store(0, Ordering::Release);
+    }
+    PAUSED_OWNER_COUNT.store(0, Ordering::Release);
 }
 
 /// Clear all event slots. Called on graph teardown / reload.

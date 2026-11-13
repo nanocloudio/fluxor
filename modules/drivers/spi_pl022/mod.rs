@@ -200,7 +200,7 @@ unsafe fn spi_pin_init(sys: &SyscallTable, bus: u8, clk: u8, mosi: u8, miso: u8)
 // channel-vs-fd family distinction.
 use abi::platform::rp::dma_raw::channel as dma_channel;
 
-const PLATFORM_DMA: u32 = 0x0008;
+const PLATFORM_DMA: u32 = abi::registry::platform_dma::ID as u32;
 
 unsafe fn dma_alloc(sys: &SyscallTable) -> i32 {
     (sys.provider_open)(PLATFORM_DMA, dma_channel::ALLOC, core::ptr::null(), 0)
@@ -790,7 +790,7 @@ pub unsafe extern "C" fn module_new(
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_provides_contract"]
 pub extern "C" fn module_provides_contract() -> u32 {
-    0x0002 // HAL_SPI
+    abi::registry::spi::ID as u32
 }
 
 /// # Safety

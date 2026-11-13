@@ -314,26 +314,16 @@ pub fn release_module(idx: usize) {
 /// Forwarding between segments, translated egress and `announce` are not
 /// realized there.
 fn module_caps() -> u32 {
-    #[cfg(feature = "multitenant")]
-    {
-        if crate::kernel::workload::workload_graph::net_identity_provider_present() {
-            return wire::caps::SEGMENTS | wire::caps::PEER_ROUTES | wire::caps::HOLD_DELIVER;
-        }
+    if crate::kernel::workload::workload_graph::net_identity_provider_present() {
+        return wire::caps::SEGMENTS | wire::caps::PEER_ROUTES | wire::caps::HOLD_DELIVER;
     }
     0
 }
 
 /// Whether the caller is the node's registered net-identity provider.
 fn caller_is_net_identity_provider() -> bool {
-    #[cfg(feature = "multitenant")]
-    {
-        let (slot, gen) = caller();
-        crate::kernel::workload::workload_graph::is_net_identity_provider(slot, gen)
-    }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        false
-    }
+    let (slot, gen) = caller();
+    crate::kernel::workload::workload_graph::is_net_identity_provider(slot, gen)
 }
 
 // ---- reads for the platform -----------------------------------------------
@@ -598,17 +588,7 @@ fn parse_segments(a: &[u8], out: &mut [wire::Segment]) -> Result<usize, i32> {
 fn segment_in_use(id: u16, realizer: Option<&Realizer>) -> bool {
     match realizer {
         Some(r) => (r.segment_in_use)(id),
-        None => {
-            #[cfg(feature = "multitenant")]
-            {
-                crate::kernel::workload::workload_graph::segment_attached(id)
-            }
-            #[cfg(not(feature = "multitenant"))]
-            {
-                let _ = id;
-                false
-            }
-        }
+        None => crate::kernel::workload::workload_graph::segment_attached(id),
     }
 }
 
@@ -1003,7 +983,6 @@ pub unsafe fn dispatch(
             // A held address a module realizes goes through that module's
             // own table; with a coordinator writing its `addr_ctl` there
             // would be two writers of the node's addresses.
-            #[cfg(feature = "multitenant")]
             if realizer.is_none()
                 && crate::kernel::workload::workload_graph::direct_addr_ctl_wired()
             {

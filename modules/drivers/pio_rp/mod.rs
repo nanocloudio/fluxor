@@ -422,7 +422,7 @@ unsafe fn pio_txf_write(sys: &SyscallTable, pio_num: u8, sm: u8, value: u32) {
 
 // DMA FD helpers — open against PLATFORM_DMA_FD.
 unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
-    const PLATFORM_DMA_FD: u32 = 0x0011;
+    const PLATFORM_DMA_FD: u32 = abi::registry::platform_dma_fd::ID as u32;
     (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)
 }
 
@@ -486,7 +486,7 @@ unsafe fn dma_fd_poll(sys: &SyscallTable, fd: i32) -> bool {
 unsafe fn raw_dma_alloc(sys: &SyscallTable) -> i32 {
     // DMA_ALLOC returns a channel handle; track via provider_open on
     // PLATFORM_DMA. Gated by `platform_raw` permission.
-    const PLATFORM_DMA: u32 = 0x0008;
+    const PLATFORM_DMA: u32 = abi::registry::platform_dma::ID as u32;
     (sys.provider_open)(PLATFORM_DMA, dma_channel::ALLOC, core::ptr::null(), 0)
 }
 
@@ -1798,7 +1798,7 @@ pub unsafe extern "C" fn module_new(
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_provides_contract"]
 pub extern "C" fn module_provides_contract() -> u32 {
-    0x0004 // HAL_PIO
+    abi::registry::pio::ID as u32
 }
 
 /// # Safety

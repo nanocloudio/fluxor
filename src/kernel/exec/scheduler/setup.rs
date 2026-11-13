@@ -91,17 +91,13 @@ pub unsafe fn size_kernel_tables(
     // owner slot; the graph-local pacers and the resident-graph index hold
     // one entry per owner slot and execution domain.
     super::merge::size_graph_pacers(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
-    #[cfg(feature = "multitenant")]
     super::multigraph::size_resident_graphs(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     #[cfg(feature = "host-linux")]
     crate::kernel::workload::owner_log::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
-    #[cfg(feature = "multitenant")]
-    {
-        crate::kernel::workload::code_pack::size(owners)
-            .map_err(|e| refused(res::POOL_OWNERS, e))?;
-        crate::kernel::workload::workload_graph::size(owners)
-            .map_err(|e| refused(res::POOL_OWNERS, e))?;
-    }
+    crate::kernel::workload::code_pack::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
+    crate::kernel::workload::workload_graph::size(owners)
+        .map_err(|e| refused(res::POOL_OWNERS, e))?;
+    super::live::size_workspaces(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     // A host-process sandbox is a workload with an owner of its own: the
     // owner table's workload slots are the sandbox pool's derived part, so
     // every workload owner the table seats has a sandbox slot. The reserve on
@@ -293,11 +289,8 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
     reset_state_arena();
     // A rebuild drops every workload, and with them the code packs they
     // brought.
-    #[cfg(feature = "multitenant")]
-    {
-        crate::kernel::workload::workload_graph::reset_pending();
-        crate::kernel::workload::code_pack::reset();
-    }
+    crate::kernel::workload::workload_graph::reset_pending();
+    crate::kernel::workload::code_pack::reset();
     // Drop any EL0-isolation page tables from a previous graph so a
     // reconfigure rebuilds them from the new graph's regions. No-op on
     // non-BCM2712 platforms.

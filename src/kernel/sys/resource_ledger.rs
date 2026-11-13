@@ -596,14 +596,7 @@ pub fn plan(config: &crate::kernel::boot::config::Config) {
     let channels = edges + fans + 2 * wl_edges;
     set_derived(res::POOL_MODULE_SLOTS, module_slots as u32);
     set_derived(res::POOL_CHANNELS, channels as u32);
-    set_derived(
-        res::POOL_OWNERS,
-        if cfg!(feature = "multitenant") {
-            1 + workloads as u32
-        } else {
-            1
-        },
-    );
+    set_derived(res::POOL_OWNERS, 1 + workloads as u32);
     // Holes below the bump mark number at most the live allocations plus
     // one, and a module holds its state, its arena and its heap segments. A
     // static profile's list is its fixed size, and a free past it is leaked

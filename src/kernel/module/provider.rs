@@ -182,9 +182,7 @@ const MAX_TRACKED: usize =
 struct HandleBinding {
     handle: i32,
     contract: ContractId,
-    /// Owner that opened the handle. Present only on multi-tenant builds —
-    /// bare metal carries no per-handle ownership state.
-    #[cfg(feature = "multitenant")]
+    /// Owner that opened the handle.
     owner: crate::kernel::workload::owner::OwnerHandle,
 }
 
@@ -193,7 +191,6 @@ static mut HANDLE_BINDINGS: crate::kernel::mem::table::Table<HandleBinding, MAX_
     HandleBinding {
         handle: -1,
         contract: 0,
-        #[cfg(feature = "multitenant")]
         owner: crate::kernel::workload::owner::OWNER_SYSTEM,
     },
     crate::abi::contracts::resource::POOL_TRACKED_HANDLES
@@ -252,10 +249,7 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
                 slot.handle = handle;
                 slot.contract = contract;
                 // Stamp the opening module's owner so later use is owner-scoped.
-                #[cfg(feature = "multitenant")]
-                {
-                    slot.owner = crate::kernel::exec::scheduler::caller_owner();
-                }
+                slot.owner = crate::kernel::exec::scheduler::caller_owner();
                 return Ok(());
             }
         }
@@ -275,11 +269,12 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
 /// when the calling module's owner may not use `handle` because it was opened
 /// by a different, non-system owner. Self-identifying FDs (event/timer/dma)
 /// are skipped: they carry no tracking entry and the event/timer subsystems
-/// enforce their own per-module ownership. Compile-time `false` (allow) on
-/// single-tenant builds.
-#[cfg(feature = "multitenant")]
+/// enforce their own per-module ownership.
 fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
-    if handle < 0 {
+    // An owner table of the system slot alone stamps every handle and every
+    // caller `OWNER_SYSTEM`: nothing can be another owner's. This is every
+    // call on a node whose plan seats no workload, so it costs one load.
+    if handle < 0 || crate::kernel::exec::scheduler::owners().slot_count() <= 1 {
         return false;
     }
     let caller = crate::kernel::exec::scheduler::caller_owner();
@@ -320,13 +315,6 @@ fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
         );
         true
     }
-}
-
-/// Single-tenant: no ownership to enforce.
-#[cfg(not(feature = "multitenant"))]
-#[inline(always)]
-fn deny_cross_owner_handle(_handle: i32, _syscall: &str) -> bool {
-    false
 }
 
 /// Public lookup — returns the contract bound to `handle`. Resolution
@@ -436,18 +424,15 @@ pub fn provider_open(
     // semantics) so in-flight work can run dry, and an owner being added
     // opens for its modules' `module_new` (`authorize_own_admit`).
     // System-owned modules are unaffected.
-    #[cfg(feature = "multitenant")]
+    let owner = crate::kernel::exec::scheduler::caller_owner();
+    if !owner.is_system()
+        && !crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner)
     {
-        let owner = crate::kernel::exec::scheduler::caller_owner();
-        if !owner.is_system()
-            && !crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner)
-        {
-            log::warn!(
-                "[provider] open refused: owner slot {} draining/revoked",
-                owner.slot
-            );
-            return errno::EACCES;
-        }
+        log::warn!(
+            "[provider] open refused: owner slot {} draining/revoked",
+            owner.slot
+        );
+        return errno::EACCES;
     }
     let handle = match vtable_for(contract) {
         // SAFETY: vt.call is the contract's registered fn-pointer; passing

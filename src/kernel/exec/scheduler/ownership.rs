@@ -27,53 +27,35 @@ pub fn owners_mut() -> &'static mut OwnerTable {
     unsafe { &mut (*p).owners }
 }
 
-/// Owner handle stamped on module `module_idx`. On single-tenant builds there
-/// is no per-module owner array; every module is the system owner.
+/// Owner handle stamped on module `module_idx`.
 #[inline]
 pub fn module_owner(module_idx: usize) -> OwnerHandle {
-    #[cfg(feature = "multitenant")]
-    {
-        if module_idx >= module_slots() {
-            return OWNER_SYSTEM;
-        }
-        // SAFETY: scheduler-thread read; module_idx bounded above.
-        unsafe { SCHED.module_owner[module_idx] }
+    if module_idx >= module_slots() {
+        return OWNER_SYSTEM;
     }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        let _ = module_idx;
-        OWNER_SYSTEM
-    }
+    // SAFETY: scheduler-thread read; module_idx bounded above.
+    unsafe { SCHED.module_owner[module_idx] }
 }
 
-/// Stamp module `module_idx` with `owner`. No-op on single-tenant builds.
+/// Stamp module `module_idx` with `owner`.
 #[inline]
 pub fn set_module_owner(module_idx: usize, owner: OwnerHandle) {
-    #[cfg(feature = "multitenant")]
-    {
-        if module_idx < module_slots() {
-            // SAFETY: scheduler-thread-exclusive mutation; module_idx bounded.
-            unsafe {
-                SCHED.module_owner[module_idx] = owner;
-            }
+    if module_idx < module_slots() {
+        // SAFETY: scheduler-thread-exclusive mutation; module_idx bounded.
+        unsafe {
+            SCHED.module_owner[module_idx] = owner;
         }
-    }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        let _ = (module_idx, owner);
     }
 }
 
 /// Authorize `caller` to touch a resource owned by module `target_idx`.
 /// Returns true when the target is system-owned or the same owner.
-/// Compile-time `true` on single-tenant builds.
 #[inline]
 pub fn authorize_module_access(caller: OwnerHandle, target_idx: usize) -> bool {
     crate::kernel::workload::owner::same_or_system(caller, module_owner(target_idx))
 }
 
-/// Owner of the currently-executing module (the syscall caller). On
-/// single-tenant builds this is always the system owner.
+/// Owner of the currently-executing module (the syscall caller).
 #[inline]
 pub fn caller_owner() -> OwnerHandle {
     // Before the platform is up no module runs: the caller is the kernel.
@@ -131,6 +113,9 @@ pub struct OwnerLiveStatus {
     /// `fault_type::*` of the most recent fault among this owner's
     /// terminated modules (`fault_type::NONE` when none terminated).
     pub last_fault_kind: u8,
+    /// When that fault happened (the fault record's `last_fault_ms`), 0 when
+    /// none terminated.
+    pub last_fault_ms: u64,
     /// Owner lifecycle state: [`OWNER_STATE_ACTIVE`] or
     /// [`OWNER_STATE_DRAINING`]. `Active` until the drain driver flips it.
     pub owner_state: u8,
@@ -160,6 +145,7 @@ impl OwnerLiveStatus {
         modules_terminated: 0,
         modules_recovering: 0,
         last_fault_kind: fault_type::NONE,
+        last_fault_ms: 0,
         owner_state: OWNER_STATE_ACTIVE,
         drain_deadline_unix: 0,
         drain_remaining_secs: 0,
@@ -172,8 +158,7 @@ impl OwnerLiveStatus {
 /// (`owners().slot_count()`) holds them all — and returns the record count.
 /// Scheduler-thread only (same access class as `module_fault_state`).
 ///
-/// On single-tenant builds (`MAX_OWNERS == 1`) there are no workload slots
-/// and this always returns 0.
+/// An owner table of the system slot alone has no workload slots: 0.
 pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus]) -> usize {
     // SAFETY: scheduler-thread read of the static owner table + fault state.
     let sched = unsafe {
@@ -181,71 +166,99 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus]) -> usize {
         &*p
     };
     let mut count = 0usize;
-    // Empty range on single-tenant (one slot) builds — returns 0, per the doc above.
     for slot in 1..sched.owners.slot_count() {
-        let Some(e) = sched.owners.entry_at(slot) else {
-            continue;
-        };
         if count == out.len() {
             break;
         }
-        if matches!(e.state, crate::kernel::workload::owner::OwnerState::Free) {
-            continue;
+        if let Some(rec) = owner_record(sched, slot) {
+            out[count] = rec;
+            count += 1;
         }
-        let owner_state = match e.state {
-            crate::kernel::workload::owner::OwnerState::Draining => OWNER_STATE_DRAINING,
-            crate::kernel::workload::owner::OwnerState::Paused => OWNER_STATE_PAUSED,
-            _ => OWNER_STATE_ACTIVE,
-        };
-        out[count] = OwnerLiveStatus {
-            owner_uid: e.owner_uid,
-            slot: slot as u16,
-            generation: e.generation,
-            owner_state,
-            ..OwnerLiveStatus::EMPTY
-        };
-        count += 1;
     }
     // Fold each module's state into its owning record. A stale stamp (owner
     // slot reused at a newer generation) attributes to nobody — the module
     // belongs to the previous occupant, not the current one.
-    let mut last_fault_ms = crate::scratch![0u64; MAX_OWNERS, count];
     for idx in 0..module_slots() {
         let owner = module_owner(idx);
         if owner.is_system() {
             continue;
         }
-        let Some(pos) = out[..count]
-            .iter()
-            .position(|r| r.slot == owner.slot && r.generation == owner.generation)
-        else {
-            continue;
-        };
-        let rec = &mut out[pos];
-        rec.modules_total += 1;
-        if !matches!(sched.modules[idx], ModuleSlot::Empty) {
-            rec.modules_loaded += 1;
-        }
-        let fi = &sched.fault_info[idx];
-        match fi.state {
-            FaultState::Terminated => {
-                rec.modules_terminated += 1;
-                if fi.last_fault_ms >= last_fault_ms[pos] {
-                    last_fault_ms[pos] = fi.last_fault_ms;
-                    rec.last_fault_kind = fi.last_fault_type;
-                }
-            }
-            FaultState::Faulted | FaultState::Recovering => {
-                rec.modules_recovering += 1;
-            }
-            FaultState::Running => {
-                if sched.finished[idx] {
-                    rec.modules_finished += 1;
-                }
-            }
+        if let Some(rec) = out[..count]
+            .iter_mut()
+            .find(|r| r.slot == owner.slot && r.generation == owner.generation)
+        {
+            fold_module(sched, rec, idx);
         }
     }
     count
+}
+
+/// The live status of one owner, as [`owner_live_snapshot`] reports it;
+/// `None` for a free slot or a stale handle. Scheduler-thread only.
+pub fn owner_live_status(handle: OwnerHandle) -> Option<OwnerLiveStatus> {
+    // SAFETY: scheduler-thread read of the static owner table + fault state.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    if handle.is_system() {
+        return None;
+    }
+    let mut rec = owner_record(sched, handle.slot as usize)?;
+    if rec.generation != handle.generation {
+        return None;
+    }
+    for idx in 0..module_slots() {
+        if module_owner(idx) == handle {
+            fold_module(sched, &mut rec, idx);
+        }
+    }
+    Some(rec)
+}
+
+/// The record for owner slot `slot` before any module is folded in; `None`
+/// for a free slot.
+fn owner_record(sched: &SchedulerState, slot: usize) -> Option<OwnerLiveStatus> {
+    let e = sched.owners.entry_at(slot)?;
+    let owner_state = match e.state {
+        crate::kernel::workload::owner::OwnerState::Free => return None,
+        crate::kernel::workload::owner::OwnerState::Draining => OWNER_STATE_DRAINING,
+        crate::kernel::workload::owner::OwnerState::Paused => OWNER_STATE_PAUSED,
+        _ => OWNER_STATE_ACTIVE,
+    };
+    Some(OwnerLiveStatus {
+        owner_uid: e.owner_uid,
+        slot: slot as u16,
+        generation: e.generation,
+        owner_state,
+        ..OwnerLiveStatus::EMPTY
+    })
+}
+
+/// Fold module `idx`'s load, finish and fault state into its owner's record.
+fn fold_module(sched: &SchedulerState, rec: &mut OwnerLiveStatus, idx: usize) {
+    rec.modules_total += 1;
+    if !matches!(sched.modules[idx], ModuleSlot::Empty) {
+        rec.modules_loaded += 1;
+    }
+    let fi = &sched.fault_info[idx];
+    match fi.state {
+        FaultState::Terminated => {
+            rec.modules_terminated += 1;
+            if fi.last_fault_ms >= rec.last_fault_ms {
+                rec.last_fault_ms = fi.last_fault_ms;
+                rec.last_fault_kind = fi.last_fault_type;
+            }
+        }
+        FaultState::Faulted | FaultState::Recovering => {
+            rec.modules_recovering += 1;
+        }
+        FaultState::Running => {
+            if sched.finished[idx] {
+                rec.modules_finished += 1;
+            }
+        }
+    }
 }
 
 /// Is a draining owner's subgraph quiescent? Two structural

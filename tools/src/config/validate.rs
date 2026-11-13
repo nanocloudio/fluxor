@@ -2002,14 +2002,13 @@ pub fn validate_provider_domains(
             .to_string();
         placed.push((name, domain, domain_name, manifest, m));
     }
-    let live_adds = crate::capacity::kernel_max_owners(target) > 1
-        && config
-            .get("capacity")
-            .and_then(|c| c.get("owners"))
-            .and_then(Value::as_u64)
-            .or_else(|| crate::capacity::kernel_pool_default_reserve(target, "owners"))
-            .unwrap_or(0)
-            > 0;
+    let live_adds = config
+        .get("capacity")
+        .and_then(|c| c.get("owners"))
+        .and_then(Value::as_u64)
+        .or_else(|| crate::capacity::kernel_pool_default_reserve(target, "owners"))
+        .unwrap_or(0)
+        > 0;
     for &(provider, p_domain, ref p_domain_name, pm, _) in &placed {
         for contract in &pm.provides {
             if !crate::manifest::provider_contracts().contains(&contract.as_str()) {

@@ -55,7 +55,7 @@ pub mod stage {
     pub const CLOCKS: u32 = 1;
     pub const USB: u32 = 2;
     /// Building the graph; the low byte is the module being instantiated.
-    pub const GRAPH: u32 = crate::abi::registry::gpio::CLAIM;
+    pub const GRAPH: u32 = 1 << 8;
     pub const MAIN_LOOP: u32 = 3;
 }
 

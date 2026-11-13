@@ -325,7 +325,6 @@ pub(crate) fn compute_domain_exec_orders_static(_module_count: usize) {
 /// Safe to call ONLY single-threaded (boot / host) or with every peer domain
 /// core parked (`domains::request_quiesce` + `wait_parked`). Never on the hot
 /// path — a bounded scan invoked once per CREATE/DESTROY.
-#[cfg(feature = "multitenant")]
 pub fn recompute_domain_orders(affected_mask: u32) {
     // SAFETY: scheduler-thread-exclusive; caller guarantees peers are quiesced
     // (or single-threaded boot/host) — same access class as

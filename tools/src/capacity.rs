@@ -297,19 +297,11 @@ fn cfg_const(src: &str, cfg: Option<&str>, name: &str) -> Option<u64> {
     None
 }
 
-/// The owner-slot domain (`MAX_OWNERS`, `src/kernel/workload/owner.rs`) of
-/// the kernel `target` compiles, the system slot included: the hosted
-/// multitenant figure on Linux, the bare-metal multitenant one on bcm2712 and
-/// uefi, and the system slot alone on the single-tenant profiles.
-pub fn kernel_max_owners(target: &str) -> u64 {
-    let cfg = match kernel_profile(target) {
-        "profile_linux" => r#"all(feature = "multitenant", feature = "host-linux")"#,
-        "profile_bcm2712" | "profile_uefi" => {
-            r#"all(feature = "multitenant", not(feature = "host-linux"))"#
-        }
-        _ => r#"not(feature = "multitenant")"#,
-    };
-    cfg_const(KERNEL_OWNER, Some(cfg), "MAX_OWNERS").unwrap_or(1)
+/// The owner-slot domain (`MAX_OWNERS`, `src/kernel/workload/owner.rs`), the
+/// system slot included: one constant on every kernel. What a node holds is
+/// its plan's `owners` ceiling within it.
+pub fn kernel_max_owners(_target: &str) -> u64 {
+    cfg_const(KERNEL_OWNER, None, "MAX_OWNERS").unwrap_or(1)
 }
 
 /// The Linux host-process backend, embedded for its sandbox and PTY-session
@@ -485,8 +477,7 @@ pub fn plan_pool(
             shape.edges + shape.fans + 2 * shape.workload_edges + shape.crossings
         }
         "channels" => shape.edges + shape.fans + 2 * shape.workload_edges,
-        "owners" if kernel_max_owners(target) > 1 => 1 + shape.workloads,
-        "owners" => 1,
+        "owners" => 1 + shape.workloads,
         "sandboxes" if profile == "profile_linux" => {
             plan_pool(target, "owners", shape, declared, entries)
                 .ceiling()
@@ -541,11 +532,12 @@ pub fn check_boot_plan(
             continue;
         }
         let plan = plan_pool(target, pool, shape, declared, entries);
-        // A static table binds an envelope's ask; without one it keeps every
-        // slot it has (`resource_ledger::check_static`).
-        let static_bound = kernel_pool_static_size(target, pool)
-            .filter(|_| plan.from_envelope)
-            .map(|t| (t, "static table"));
+        // A static table binds what the plan asks of it: the envelope's
+        // ceiling when there is one, otherwise the derived part alone, the
+        // reserve being whatever the table leaves
+        // (`resource_ledger::check_static`).
+        let static_size = kernel_pool_static_size(target, pool);
+        let static_bound = static_size.map(|t| (t, "static table"));
         let bound = [static_bound, kernel_pool_domain(target, pool)]
             .into_iter()
             .flatten()
@@ -553,10 +545,16 @@ pub fn check_boot_plan(
         let Some((bound, what)) = bound else {
             continue;
         };
-        let ceiling = plan.ceiling();
+        let ceiling = if static_size.is_some() && !plan.from_envelope {
+            plan.derived
+        } else {
+            plan.ceiling()
+        };
         if ceiling > bound {
             let reserve = if plan.from_envelope {
                 format!("reserve {} from `capacity:`", plan.reserve)
+            } else if static_size.is_some() {
+                "reserve 0: a static table keeps only what is left".to_string()
             } else {
                 format!("default reserve {}", plan.reserve)
             };

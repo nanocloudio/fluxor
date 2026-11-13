@@ -401,20 +401,12 @@ pub struct SchedulerState {
     /// module keeps its OWN period and phase, independent of sibling load and
     /// of other periodic modules in the same graph. `0` ⇒ not yet anchored
     /// (primes on first encounter). Unused by the single-graph fast path.
-    #[cfg_attr(
-        not(feature = "multitenant"),
-        allow(dead_code, reason = "read only by the multi-graph runner")
-    )]
     pub(crate) module_next_due_us: ModTable<u64>,
     /// Per-module idle-safe attestation: the module owner asserts it is
     /// demand-driven (woken by events / its own periodic schedule) and may be
     /// idle-skipped. DEFAULT false = fail-closed: an unattested workload graph is
     /// never fully parked, only relaxed to the backstop (`tick_max`) cadence.
     /// Set from the workload's FXPD attestation flag at admission.
-    #[cfg_attr(
-        not(feature = "multitenant"),
-        allow(dead_code, reason = "read only by the multi-graph runner")
-    )]
     pub(crate) module_idle_safe: ModTable<bool>,
     /// Per-module count of consecutive ticks the module was considered
     /// by the scheduler but never reached `m.step()` — readiness gate
@@ -616,13 +608,10 @@ pub struct SchedulerState {
     pub(crate) step_hist: ModTable<[u32; 8]>,
     /// Global bucket counts across all modules.
     pub(crate) step_hist_global: [u32; 8],
-    /// Workload owner table. Slot 0 is the system owner. Size-1 (system
-    /// only) on single-tenant builds, so it costs nothing meaningful
-    /// when `multitenant` is off.
+    /// Workload owner table. Slot 0 is the system owner; sized at boot from
+    /// the plan's `owners` ceiling.
     pub owners: OwnerTable,
-    /// Per-module owner handle. Present only on multi-tenant builds — bare
-    /// metal carries no per-module ownership state.
-    #[cfg(feature = "multitenant")]
+    /// Per-module owner handle.
     pub(crate) module_owner: ModTable<OwnerHandle>,
 }
 
@@ -705,7 +694,6 @@ impl SchedulerState {
             step_hist: crate::boot_table!(MAX_MODULES, [0; 8], MODULE_POOL),
             step_hist_global: [0; 8],
             owners: OwnerTable::kernel(),
-            #[cfg(feature = "multitenant")]
             module_owner: crate::boot_table!(MAX_MODULES, OWNER_SYSTEM, MODULE_POOL),
         }
     }
@@ -785,7 +773,6 @@ impl SchedulerState {
         self.module_export_table.reserve(ceiling)?;
         self.module_export_count.reserve(ceiling)?;
         self.step_hist.reserve(ceiling)?;
-        #[cfg(feature = "multitenant")]
         self.module_owner.reserve(ceiling)?;
         for t in self.domain_exec_order.iter() {
             t.reserve(ceiling)?;
@@ -840,10 +827,7 @@ impl SchedulerState {
         m = m.max(self.module_export_table.len());
         m = m.max(self.module_export_count.len());
         m = m.max(self.step_hist.len());
-        #[cfg(feature = "multitenant")]
-        {
-            m = m.max(self.module_owner.len());
-        }
+        m = m.max(self.module_owner.len());
         for t in self.domain_exec_order.iter() {
             m = m.max(t.len());
         }
@@ -895,7 +879,6 @@ impl SchedulerState {
         self.module_export_table.grow(n)?;
         self.module_export_count.grow(n)?;
         self.step_hist.grow(n)?;
-        #[cfg(feature = "multitenant")]
         self.module_owner.grow(n)?;
         for t in self.domain_exec_order.iter() {
             t.grow(n)?;
@@ -974,10 +957,7 @@ impl SchedulerState {
             self.completion_mask[i] = ModuleMask::EMPTY;
             // Clear the per-module owner stamp; workload owner lifecycle in the
             // owner table is managed by the transition path, not here.
-            #[cfg(feature = "multitenant")]
-            {
-                self.module_owner[i] = OWNER_SYSTEM;
-            }
+            self.module_owner[i] = OWNER_SYSTEM;
             self.step_period[i] = 0;
             self.step_counter[i] = 0;
             self.inactive_for_ticks[i] = 0;
@@ -1909,8 +1889,7 @@ pub fn set_module_idle_safe_for_test(slot: usize, idle_safe: bool) {
 /// Mark every module currently owned by `owner` as idle-safe (or not) — the
 /// admission-time application of a workload's FXPD idle-safe attestation. Bounded
 /// boot-time pass; the resident-graph index's per-graph `idle_safe` is recomputed
-/// by the following `rebuild_resident_graph_index`. No-op on non-multitenant.
-#[cfg(feature = "multitenant")]
+/// by the following `rebuild_resident_graph_index`.
 pub fn set_owner_idle_safe(owner: crate::kernel::workload::owner::OwnerHandle, idle_safe: bool) {
     // SAFETY: scheduler-thread-exclusive boot context.
     let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
@@ -2417,9 +2396,9 @@ impl GraphPacer {
 /// slots.
 pub(crate) static mut GRAPH_PACERS: crate::kernel::mem::table::Table<
     GraphPacer,
-    { crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS },
+    { crate::kernel::workload::owner::OWNER_TABLE_SLOTS * MAX_DOMAINS },
 > = crate::boot_table!(
-    crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS,
+    crate::kernel::workload::owner::OWNER_TABLE_SLOTS * MAX_DOMAINS,
     GraphPacer::new(),
     crate::abi::contracts::resource::POOL_OWNERS,
     MAX_DOMAINS

@@ -2,7 +2,6 @@
 //! backend, bitmask, ext bridge.
 
 pub mod bitmask;
-#[cfg(feature = "multitenant")]
 pub mod code_pack;
 pub mod extbridge;
 pub mod net_attach;
@@ -11,5 +10,4 @@ pub mod owner;
 pub mod owner_log;
 pub mod owner_plan;
 pub mod storage;
-#[cfg(feature = "multitenant")]
 pub mod workload_graph;

@@ -28,8 +28,9 @@
 //! core parked (see the live-splice section below). A PIC module loads within
 //! the add: a load that cannot complete synchronously refuses it
 //! ([`AddError::WouldBlock`]). Replacing part of a running owner is not part
-//! of this surface. Gated on `multitenant` (host-linux + bcm2712 enable it;
-//! bare-metal rp compiles it out at zero cost).
+//! of this surface. A node whose plan holds no workload owner (every RP
+//! image by default) has no staging capacity, and an add answers `ENOSPC`
+//! ([`add_capacity`]).
 
 use super::{
     module_slots, BuiltInModule, Edge, FanDirection, InstantiateResult, ModuleId, ModuleSlot,
@@ -42,16 +43,11 @@ use crate::kernel::exec::step_guard::{
 use crate::kernel::module::loader::ModuleLoader;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerState, OWNER_SYSTEM};
 
-/// Largest subgraph one `apply_add` admits. The working set is stack-only
-/// and sized by these caps, not by the subgraph: decoding an encoded add
-/// holds every module and edge record at once, and staging holds the
-/// fan-expanded copy. A whole graph-backend `CREATE` at 64 / 192 reaches
-/// ~273 KiB deep optimised (~202 KiB at 64 / 128) and ~679 KiB unoptimised,
-/// inside the kernel stack of the targets that compile live mutation
-/// (bcm2712's 1 MiB core stacks, linux's 8 MiB main thread; RP compiles it
-/// out); the harness runs one on a 1 MiB stack and measures it
-/// (`workload_backend`). A message broker with durable storage is ~14
-/// modules and ~49 edges; a traffic-fabric integration image ~50 and ~182.
+/// Largest subgraph one `apply_add` admits. An add stages in a workspace
+/// sized by these caps, not by the subgraph (the fan-expanded modules and
+/// edges, see [`add_capacity`]): a table sized from the plan, never the
+/// stack. A message broker with durable storage is ~14 modules and ~49
+/// edges; a traffic-fabric integration image ~50 and ~182.
 pub const MAX_ADD_MODULES: usize = 64;
 /// Largest edge count one `apply_add` admits. 192 is the most the staged
 /// subgraph's byte-wide module index allows: every edge may need a fan
@@ -324,6 +320,215 @@ impl AddEdge {
     };
 }
 
+impl AddModule {
+    /// A slot of a staging array no module occupies, and what a module's
+    /// moved-out source leaves behind.
+    const PLACEHOLDER: AddModule = AddModule {
+        source: ModuleSource::Pic(ModuleEntry {
+            name_hash: 0,
+            id: 0,
+            domain_id: 0,
+            pre_tick_drain: false,
+            frame_kind: 0,
+            params_ptr: core::ptr::null(),
+            params_len: 0,
+        }),
+        domain_id: 0,
+        budget: StepBudget::NODE_DEFAULT,
+    };
+}
+
+// ── Add workspaces ──────────────────────────────────────────────────────────
+//
+// An add stages in a workspace: the subgraph's modules and edges with their
+// fans expanded, the record-edge marks, the slot each module takes, and the
+// scratch the fan and ordering passes use. Workspaces are tables sized from
+// the plan, never stack: a node whose plan seats a workload owner holds
+// `ADD_WORKSPACES` of them, and one whose plan holds the system owner alone
+// (every RP image by default) holds none and answers an add `ENOSPC` before
+// it decodes a byte.
+
+/// Adds staged at once: a `CREATE` staged over several calls, and one add
+/// applied whole within a call beside it.
+const ADD_WORKSPACES: usize = 2;
+
+/// Workspaces an owner table of `owners` slots holds.
+pub const fn workspaces_for(owners: usize) -> usize {
+    if owners > 1 {
+        ADD_WORKSPACES
+    } else {
+        0
+    }
+}
+
+/// The workspaces of a profile whose tables are static arrays (wasm); a table
+/// sized at boot does not reserve it.
+const WS_COUNT: usize = workspaces_for(crate::kernel::workload::owner::OWNER_TABLE_SLOTS);
+
+/// The adds this node can stage at once: none when its plan seats no
+/// workload owner.
+pub fn add_capacity() -> usize {
+    workspaces_for(crate::kernel::sys::resource_ledger::ceiling(
+        crate::abi::contracts::resource::POOL_OWNERS,
+    ) as usize)
+}
+
+/// A workspace table: `$per` slots per workspace, sized from the plan.
+macro_rules! ws_table {
+    ($t:ty, $per:expr, $init:expr) => {{
+        #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
+        {
+            crate::kernel::mem::table::Table::<$t, { WS_COUNT * $per }>::new_planned(
+                |_| $init,
+                || add_capacity() * $per,
+            )
+        }
+        #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
+        {
+            crate::kernel::mem::table::Table::<$t, { WS_COUNT * $per }>::from_array(
+                [const { $init }; WS_COUNT * $per],
+            )
+        }
+    }};
+}
+
+/// Compiled sizes of the per-module and per-edge workspace tables.
+const WS_MODULE_SLOTS: usize = WS_COUNT * WORK_MODULES;
+const WS_EDGE_SLOTS: usize = WS_COUNT * WORK_EDGES;
+type Table<T, const N: usize> = crate::kernel::mem::table::Table<T, N>;
+
+static mut WS_MODS: Table<AddModule, WS_MODULE_SLOTS> =
+    ws_table!(AddModule, WORK_MODULES, AddModule::PLACEHOLDER);
+static mut WS_EDGES: Table<AddEdge, WS_EDGE_SLOTS> =
+    ws_table!(AddEdge, WORK_EDGES, AddEdge::UNUSED);
+static mut WS_MAILBOX: Table<bool, WS_EDGE_SLOTS> = ws_table!(bool, WORK_EDGES, false);
+static mut WS_MARK: Table<bool, WS_EDGE_SLOTS> = ws_table!(bool, WORK_EDGES, false);
+static mut WS_SLOTS: Table<usize, WS_MODULE_SLOTS> = ws_table!(usize, WORK_MODULES, 0usize);
+static mut WS_ORDER: Table<usize, WS_EDGE_SLOTS> = ws_table!(usize, WORK_EDGES, 0usize);
+static mut WS_BUSY: [bool; ADD_WORKSPACES] = [false; ADD_WORKSPACES];
+
+/// Size the workspaces for an owner table of `owners` slots.
+///
+/// # Safety
+/// Graph-preparation context: no workspace is claimed.
+pub unsafe fn size_workspaces(owners: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    let w = workspaces_for(owners);
+    // SAFETY: the caller's contract.
+    unsafe {
+        size_ws(&*core::ptr::addr_of!(WS_MODS), w * WORK_MODULES)?;
+        size_ws(&*core::ptr::addr_of!(WS_EDGES), w * WORK_EDGES)?;
+        size_ws(&*core::ptr::addr_of!(WS_MAILBOX), w * WORK_EDGES)?;
+        size_ws(&*core::ptr::addr_of!(WS_MARK), w * WORK_EDGES)?;
+        size_ws(&*core::ptr::addr_of!(WS_SLOTS), w * WORK_MODULES)?;
+        size_ws(&*core::ptr::addr_of!(WS_ORDER), w * WORK_EDGES)
+    }
+}
+
+/// # Safety
+/// As `Table::reserve`.
+unsafe fn size_ws<T, const N: usize>(
+    t: &crate::kernel::mem::table::Table<T, N>,
+    n: usize,
+) -> Result<(), crate::kernel::mem::table::TableError> {
+    // SAFETY: the caller's contract.
+    unsafe { t.reserve(n)? };
+    t.grow(n)
+}
+
+/// One claimed workspace's tables.
+struct Parts<'a> {
+    mods: &'a mut [AddModule],
+    edges: &'a mut [AddEdge],
+    mailbox: &'a mut [bool],
+    mark: &'a mut [bool],
+    slots: &'a mut [usize],
+    order: &'a mut [usize],
+}
+
+/// A claimed workspace. Dropping it puts back what its modules left and
+/// frees it for the next add.
+struct Workspace(usize);
+
+impl Workspace {
+    /// Claim a free workspace: `NoCapacity` where the plan holds none,
+    /// `WorkspaceBusy` while every one is staging an add.
+    fn claim() -> Result<Workspace, AddError> {
+        let cap = add_capacity();
+        if cap == 0 {
+            return Err(AddError::NoCapacity);
+        }
+        // SAFETY: scheduler-thread state, as every add.
+        let busy = unsafe { &mut *core::ptr::addr_of_mut!(WS_BUSY) };
+        let w = busy[..cap.min(ADD_WORKSPACES)]
+            .iter()
+            .position(|b| !b)
+            .ok_or(AddError::WorkspaceBusy)?;
+        // A table smaller than the plan's workspaces (sized under an older
+        // plan) holds none past its length.
+        // SAFETY: scheduler-thread state; nothing borrows the tables.
+        let held = unsafe {
+            let edges = &*core::ptr::addr_of!(WS_EDGES);
+            let mods = &*core::ptr::addr_of!(WS_MODS);
+            (edges.len() / WORK_EDGES).min(mods.len() / WORK_MODULES)
+        };
+        if w >= held {
+            return Err(AddError::NoCapacity);
+        }
+        busy[w] = true;
+        Ok(Workspace(w))
+    }
+
+    /// The workspace's tables, each its own slice.
+    fn parts(&mut self) -> Parts<'_> {
+        let m = self.0 * WORK_MODULES..(self.0 + 1) * WORK_MODULES;
+        let e = self.0 * WORK_EDGES..(self.0 + 1) * WORK_EDGES;
+        // SAFETY: scheduler-thread state; the workspace is this guard's alone,
+        // and each slice is a different table.
+        unsafe {
+            Parts {
+                mods: ws_slice(core::ptr::addr_of_mut!(WS_MODS), m.clone()),
+                edges: ws_slice(core::ptr::addr_of_mut!(WS_EDGES), e.clone()),
+                mailbox: ws_slice(core::ptr::addr_of_mut!(WS_MAILBOX), e.clone()),
+                mark: ws_slice(core::ptr::addr_of_mut!(WS_MARK), e.clone()),
+                slots: ws_slice(core::ptr::addr_of_mut!(WS_SLOTS), m),
+                order: ws_slice(core::ptr::addr_of_mut!(WS_ORDER), e),
+            }
+        }
+    }
+}
+
+/// Slots `r` of a workspace table.
+///
+/// # Safety
+/// Scheduler-thread state; nothing else borrows those slots for `'a`.
+unsafe fn ws_slice<'a, T, const N: usize>(
+    t: *mut Table<T, N>,
+    r: core::ops::Range<usize>,
+) -> &'a mut [T] {
+    // SAFETY: the caller's contract.
+    let t = unsafe { &mut *t };
+    &mut t[r]
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        for m in self.parts().mods.iter_mut() {
+            *m = AddModule::PLACEHOLDER;
+        }
+        // SAFETY: scheduler-thread state.
+        unsafe { (*core::ptr::addr_of_mut!(WS_BUSY))[self.0] = false };
+    }
+}
+
+/// What an add says of its owner, beside its modules and edges.
+#[derive(Clone, Copy)]
+struct AddHeader {
+    owner_uid: [u8; 16],
+    state_cap: u32,
+    buffer_cap: u32,
+    authority: AddAuthority,
+}
+
 /// A new owner's subgraph. `modules` is `&mut` because the sources are moved
 /// out during instantiation; the caller's array is consumed.
 pub struct AddSubgraph<'a> {
@@ -392,6 +597,11 @@ pub enum AddError {
     /// `CREATE` writes in, from its environment. Refused before anything is
     /// allocated.
     UnboundEnv,
+    /// The node's plan seats no workload owner, so it has no workspace to
+    /// stage an add in ([`add_capacity`]). Refused before anything is read.
+    NoCapacity,
+    /// Every workspace is staging an add.
+    WorkspaceBusy,
 }
 
 impl AddError {
@@ -402,14 +612,15 @@ impl AddError {
         use crate::kernel::sys::errno;
         match self {
             AddError::TooManyModules | AddError::TooManyEdges => errno::E2BIG,
-            AddError::OwnerSlotsExhausted | AddError::NoFreeSlot | AddError::StateCapExceeded => {
-                errno::ENOSPC
-            }
+            AddError::OwnerSlotsExhausted
+            | AddError::NoFreeSlot
+            | AddError::StateCapExceeded
+            | AddError::NoCapacity => errno::ENOSPC,
             AddError::PlanMismatch | AddError::BadEndpoint | AddError::UnboundEnv => errno::EINVAL,
             AddError::ChannelOpenFailed => errno::ENOMEM,
             AddError::Instantiate => errno::ENOEXEC,
             AddError::WouldBlock => errno::EAGAIN,
-            AddError::NetAttachFailed => errno::EBUSY,
+            AddError::NetAttachFailed | AddError::WorkspaceBusy => errno::EBUSY,
             AddError::OwnerExists => errno::EEXIST,
             AddError::BudgetRefused => errno::ERANGE,
             AddError::NodeParamRefused | AddError::AuthorityRefused => errno::EACCES,
@@ -562,9 +773,29 @@ pub fn begin_add(
     if e > MAX_ADD_EDGES {
         return Err(AddError::TooManyEdges);
     }
-    // Every declared step budget is admitted before anything is allocated:
-    // one module over the node's ceiling refuses the whole subgraph.
-    for (i, m) in sub.modules.iter().enumerate() {
+    admit_modules(sub.modules)?;
+    let mut ws = Workspace::claim()?;
+    let p = ws.parts();
+    for (w, m) in p.mods.iter_mut().zip(sub.modules.iter_mut()) {
+        w.source = core::mem::replace(&mut m.source, ModuleSource::Pic(ModuleEntry::default()));
+        w.domain_id = m.domain_id;
+        w.budget = m.budget;
+    }
+    p.edges[..e].copy_from_slice(sub.edges);
+    let header = AddHeader {
+        owner_uid: sub.owner_uid,
+        state_cap: sub.state_cap,
+        buffer_cap: sub.buffer_cap,
+        authority: sub.authority,
+    };
+    begin_in(ws, header, n, e, assignment)
+}
+
+/// Refuse a subgraph whose modules ask what a workload may not have: a step
+/// budget past the node's ceiling, a node tag, an unbound env record. Before
+/// anything is allocated.
+fn admit_modules(modules: &[AddModule]) -> Result<(), AddError> {
+    for (i, m) in modules.iter().enumerate() {
         if let Err(why) = admit_step_budget(&m.budget, m.domain_id) {
             log::warn!(
                 "[live] module {} of the add refused its step budget (deadline {} us, burst {} us, \
@@ -593,48 +824,38 @@ pub fn begin_add(
             }
         }
     }
-    let mut mods: [AddModule; WORK_MODULES] = core::array::from_fn(|_| AddModule {
-        source: ModuleSource::Pic(ModuleEntry::default()),
-        domain_id: 0,
-        budget: StepBudget::NODE_DEFAULT,
-    });
-    for (w, m) in mods.iter_mut().zip(sub.modules.iter_mut()) {
-        w.source = core::mem::replace(&mut m.source, ModuleSource::Pic(ModuleEntry::default()));
-        w.domain_id = m.domain_id;
-        w.budget = m.budget;
-    }
-    let mut edges = [AddEdge::UNUSED; WORK_EDGES];
-    edges[..e].copy_from_slice(sub.edges);
-    let mut mailbox = [false; WORK_EDGES];
+    Ok(())
+}
+
+/// Stage the `n` modules and `e` edges already in `ws`: expand their fans,
+/// mark their record edges, then steps 1 to 5.
+fn begin_in(
+    mut ws: Workspace,
+    header: AddHeader,
+    n: usize,
+    e: usize,
+    assignment: Option<(u16, u32)>,
+) -> Result<StagedAdd, AddError> {
+    let p = ws.parts();
+    p.mailbox.fill(false);
     let declared = n;
-    let (n, e) = expand_fans(&mut mods, n, &mut edges, e, &mut mailbox);
-    mark_record_edges(&mods, declared, &edges[..e], &mut mailbox);
-    begin_staged(
-        sub.owner_uid,
-        sub.state_cap,
-        sub.buffer_cap,
-        sub.authority,
-        mods,
-        n,
-        edges,
-        e,
-        &mailbox[..e],
-        assignment,
-    )
+    let (n, e) = expand_fans(p.mods, n, p.edges, e, p.mailbox, p.mark, p.order);
+    mark_record_edges(p.mods, declared, &p.edges[..e], p.mailbox);
+    begin_staged(ws, header, n, e, assignment)
 }
 
 /// A live add between its staging and its publication: the owner is
 /// reserved, the slots are assigned, the edges and channels are open, and
 /// the modules instantiate a batch at a time.
 pub struct StagedAdd {
+    /// Its modules, edges and slots; freed when the add is published or
+    /// rolled back.
+    ws: Workspace,
     handle: OwnerHandle,
     owner_uid: [u8; 16],
     n: usize,
     e: usize,
     edge_base: usize,
-    local_to_global: [usize; WORK_MODULES],
-    mods: [AddModule; WORK_MODULES],
-    edges: [AddEdge; WORK_EDGES],
     /// Modules instantiated so far: the next local index.
     done: usize,
 }
@@ -661,34 +882,26 @@ impl StagedAdd {
     }
 }
 
-/// Steps 1 to 5 of an add over the staged (fan-expanded) subgraph:
-/// `mailbox[i]` marks an edge that carries records, around a record fan or
-/// point to point, which gets a channel of its own in mailbox mode.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::large_types_passed_by_value,
-    reason = "the staged subgraph's parts, moved in so the add owns them until it is published or rolled back"
-)]
+/// Steps 1 to 5 of an add over the staged (fan-expanded) subgraph in `ws`:
+/// its `mailbox[i]` marks an edge that carries records, around a record fan
+/// or point to point, which gets a channel of its own in mailbox mode.
 fn begin_staged(
-    owner_uid: [u8; 16],
-    state_cap: u32,
-    buffer_cap: u32,
-    authority: AddAuthority,
-    mut mods: [AddModule; WORK_MODULES],
+    mut ws: Workspace,
+    header: AddHeader,
     n: usize,
-    edges: [AddEdge; WORK_EDGES],
     e: usize,
-    mailbox: &[bool],
     assignment: Option<(u16, u32)>,
 ) -> Result<StagedAdd, AddError> {
+    let p = ws.parts();
     let sub = AddSubgraph {
-        owner_uid,
-        modules: &mut mods[..n],
-        edges: &edges[..e],
-        state_cap,
-        buffer_cap,
-        authority,
+        owner_uid: header.owner_uid,
+        modules: &mut p.mods[..n],
+        edges: &p.edges[..e],
+        state_cap: header.state_cap,
+        buffer_cap: header.buffer_cap,
+        authority: header.authority,
     };
+    let mailbox = &p.mailbox[..e];
 
     // 0. An add on its creator's behalf is admitted only from a module that
     //    acts with the node's authority: a workload cannot pass on what it
@@ -743,7 +956,7 @@ fn begin_staged(
 
     // 2. Assign each new module the lowest-free `Empty` slot. NOT a watermark:
     //    freeing a non-last owner leaves holes, so we scan.
-    let mut local_to_global = [0usize; WORK_MODULES];
+    let local_to_global = &mut *p.slots;
     {
         let s = sched();
         let mut scan = 0usize;
@@ -1002,16 +1215,14 @@ fn begin_staged(
         super::set_module_owner(slot, handle);
     }
 
-    let _ = sub;
+    let owner_uid = sub.owner_uid;
     Ok(StagedAdd {
+        ws,
         handle,
         owner_uid,
         n,
         e,
         edge_base,
-        local_to_global,
-        mods,
-        edges,
         done: 0,
     })
 }
@@ -1025,11 +1236,12 @@ pub fn instantiate_batch(st: &mut StagedAdd, max: usize) -> Result<bool, AddErro
     let handle = st.handle;
     let edge_base = st.edge_base;
     let last = n.min(st.done.saturating_add(max));
+    let p = st.ws.parts();
+    let local_to_global = &*p.slots;
     while st.done < last {
         let local = st.done;
-        let slot = st.local_to_global[local];
-        let local_to_global = st.local_to_global;
-        let m = &mut st.mods[local];
+        let slot = local_to_global[local];
+        let m = &mut p.mods[local];
         let source = core::mem::replace(&mut m.source, ModuleSource::Pic(ModuleEntry::default()));
         // The admitted budget is in place before the module's first
         // instruction. Its params carry no fault tag (`begin_add` refused
@@ -1086,14 +1298,15 @@ pub fn instantiate_batch(st: &mut StagedAdd, max: usize) -> Result<bool, AddErro
 /// net lanes to the provider, gate the new modules on each other, splice
 /// them into the schedule and activate the owner. A refused lane rolls the
 /// whole add back.
-pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
+pub fn finish_staged(mut st: StagedAdd) -> Result<OwnerHandle, AddError> {
     debug_assert!(st.complete());
     let n = st.n;
     let e = st.e;
     let handle = st.handle;
     let edge_base = st.edge_base;
-    let local_to_global = st.local_to_global;
-    let sub_edges = &st.edges[..e];
+    let p = st.ws.parts();
+    let local_to_global = &*p.slots;
+    let sub_edges = &p.edges[..e];
     // Hand each net key's two channels to the node's net provider as one lane
     // of this owner's. Every module has instantiated, so nothing it opens can
     // precede its lane; a refused lane rolls the whole add back.
@@ -1143,10 +1356,10 @@ pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
 
     //    Splice into the execution order: topo-sort the new modules over their
     //    internal edges, then append. Existing entries are untouched.
-    let order = topo_order_new(&local_to_global[..n], sub_edges);
+    let order = topo_order_new(&local_to_global[..n], sub_edges, p.order, p.mark);
     {
         let s = sched();
-        for &slot in order.iter().take(n) {
+        for &slot in order.iter() {
             let pos = s.exec_order_count;
             s.exec_order[pos] = slot as ModuleId;
             s.exec_order_count = pos + 1;
@@ -1224,14 +1437,9 @@ pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
 
 /// Roll a staged add back: what instantiated is freed, its channels close,
 /// its edges go and its owner is revoked, as a failed add's would.
-pub fn abandon_staged(st: StagedAdd) {
-    rollback_add(
-        st.handle,
-        &st.local_to_global[..st.n],
-        st.done,
-        st.edge_base,
-        st.e,
-    );
+pub fn abandon_staged(mut st: StagedAdd) {
+    let p = st.ws.parts();
+    rollback_add(st.handle, &p.slots[..st.n], st.done, st.edge_base, st.e);
 }
 
 /// Instantiate a PIC module into `slot`. Synchronous only: an async
@@ -1362,13 +1570,16 @@ fn rollback_add(
 /// boot graph leaves unfanned are left so here: a multi-inbound consumer's
 /// data inputs, and a multi-outbound producer whose fan reaches exactly the
 /// modules feeding it. A port carrying records (`FRAME_KIND_RECORD`) marks
-/// every edge around its fan in `mailbox`. Returns the staged counts.
+/// every edge around its fan in `mailbox`. `taken` and `group` are the
+/// pass's scratch, an edge's worth each. Returns the staged counts.
 fn expand_fans(
-    mods: &mut [AddModule; WORK_MODULES],
+    mods: &mut [AddModule],
     n: usize,
-    edges: &mut [AddEdge; WORK_EDGES],
+    edges: &mut [AddEdge],
     e: usize,
-    mailbox: &mut [bool; WORK_EDGES],
+    mailbox: &mut [bool],
+    taken: &mut [bool],
+    group: &mut [usize],
 ) -> (usize, usize) {
     // SAFETY: scheduler-thread graph-mutation context, as every add.
     let node = unsafe { super::static_loader() };
@@ -1378,13 +1589,12 @@ fn expand_fans(
             // The edges staged before this module's pass. The joining edge
             // a fan adds is the port's only edge, so it never fans again.
             let scan = e2;
-            let mut taken = [false; WORK_EDGES];
+            taken[..scan].fill(false);
             for start in 0..scan {
                 if taken[start] || !fan_touches(&edges[start], l, dir) {
                     continue;
                 }
                 let key = fan_port_key(&edges[start], dir);
-                let mut group = [0usize; WORK_EDGES];
                 let mut g = 0usize;
                 for j in start..scan {
                     if !taken[j]
@@ -1464,12 +1674,7 @@ fn expand_fans(
 /// fan's decision, and a byte fan must keep FIFOs. A tap's mirror only lands in
 /// a FIFO, a shared lane's channel is already open, and a net lane carries its
 /// own framing.
-fn mark_record_edges(
-    mods: &[AddModule; WORK_MODULES],
-    declared: usize,
-    edges: &[AddEdge],
-    mailbox: &mut [bool; WORK_EDGES],
-) {
+fn mark_record_edges(mods: &[AddModule], declared: usize, edges: &[AddEdge], mailbox: &mut [bool]) {
     // SAFETY: scheduler-thread graph-mutation context, as every add.
     let node = unsafe { super::static_loader() };
     let carries_record = |ep: Endpoint, dir: FanDirection, port: u8| {
@@ -1541,9 +1746,9 @@ fn staged_hash(m: &AddModule) -> u32 {
 /// keeps one per edge when its fan reaches exactly the modules feeding its
 /// data input, each once.
 fn fan_exempt(
-    mods: &[AddModule; WORK_MODULES],
+    mods: &[AddModule],
     l: usize,
-    edges: &[AddEdge; WORK_EDGES],
+    edges: &[AddEdge],
     e: usize,
     group: &[usize],
     dir: FanDirection,
@@ -1596,8 +1801,8 @@ fn same_endpoint(a: Endpoint, b: Endpoint) -> bool {
 /// (`agreed_frame_kind`), as the boot fan pass reads it.
 fn fan_frame_kind(
     node: &ModuleLoader,
-    mods: &[AddModule; WORK_MODULES],
-    edges: &[AddEdge; WORK_EDGES],
+    mods: &[AddModule],
+    edges: &[AddEdge],
     group: &[usize],
     l: usize,
     dir: FanDirection,
@@ -1627,8 +1832,14 @@ fn fan_frame_kind(
 /// Topologically order the new modules over their subgraph-internal edges so
 /// producers precede consumers within the owner. Falls back to declaration
 /// order on a cycle (the running graph already rejects cycles elsewhere; an
-/// added subgraph is expected acyclic).
-fn topo_order_new(slots: &[usize], edges: &[AddEdge]) -> [usize; WORK_MODULES] {
+/// added subgraph is expected acyclic). Written into `out`, with `visited` as
+/// scratch; the order is `out[..slots.len()]`.
+fn topo_order_new<'a>(
+    slots: &[usize],
+    edges: &[AddEdge],
+    out: &'a mut [usize],
+    visited: &mut [bool],
+) -> &'a [usize] {
     let n = slots.len();
     let mut indeg = [0u8; WORK_MODULES];
     for ae in edges {
@@ -1639,8 +1850,7 @@ fn topo_order_new(slots: &[usize], edges: &[AddEdge]) -> [usize; WORK_MODULES] {
             }
         }
     }
-    let mut out = [0usize; WORK_MODULES];
-    let mut visited = [false; WORK_MODULES];
+    visited[..n].fill(false);
     let mut w = 0usize;
     // Kahn over local indices; O(n^2) is fine for n <= WORK_MODULES.
     while w < n {
@@ -1674,7 +1884,7 @@ fn topo_order_new(slots: &[usize], edges: &[AddEdge]) -> [usize; WORK_MODULES] {
             break;
         }
     }
-    out
+    &out[..n]
 }
 
 /// Stop mirroring into every tap edge in `edges[base..base+count]`.
@@ -1907,7 +2117,6 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     // owner runs any more (its modules are unspliced, their handles and
     // provider layers released), and a module whose state is quarantined
     // for a lend keeps only that state.
-    #[cfg(feature = "multitenant")]
     crate::kernel::workload::code_pack::release_owner(handle.slot);
     // Drop the freed owner from the resident-graph index. A later slot reuse
     // bumps the generation, so its pacer instance resets and the re-added
@@ -2176,15 +2385,7 @@ pub fn caller_edges(blob: &[u8], out: &mut [CallerEdge]) -> Option<usize> {
 /// workload's own pack while its CREATE stages it (`code_pack`), else the
 /// node's.
 fn resolving_loader(name_hash: u32, node: &ModuleLoader) -> &ModuleLoader {
-    #[cfg(feature = "multitenant")]
-    {
-        crate::kernel::workload::code_pack::resolve(name_hash, node)
-    }
-    #[cfg(not(feature = "multitenant"))]
-    {
-        let _ = name_hash;
-        node
-    }
+    crate::kernel::workload::code_pack::resolve(name_hash, node)
 }
 
 /// The fmod header's module type that runs at `CAP_FULL` (see the loader's
@@ -2302,13 +2503,12 @@ unsafe fn apply_add_encoded_inner(
     let bytes = unsafe { core::slice::from_raw_parts(arg, arg_len) };
     // SAFETY: the modules' params are borrowed from `bytes`, which outlives
     // the add: it completes within this call.
-    match unsafe { decode_add(bytes, spare_lane, creator, |sub| apply_add(sub, None)) } {
-        Ok(Ok(handle)) => {
+    match unsafe { decode_add(bytes, spare_lane, creator) }.and_then(apply_decoded) {
+        Ok(handle) => {
             // SAFETY: a decoded blob is longer than the handle's 6 bytes.
             unsafe { write_handle(core::slice::from_raw_parts_mut(arg, 6), handle) };
             0
         }
-        Ok(Err(e)) => e.code(),
         Err(e) => e,
     }
 }
@@ -2324,11 +2524,7 @@ unsafe fn apply_add_encoded_inner(
 /// read from it as they instantiate.
 pub unsafe fn apply_add_borrowed(bytes: &[u8]) -> Result<OwnerHandle, i32> {
     // SAFETY: the caller's contract; the add completes within this call.
-    match unsafe { decode_add(bytes, None, None, |sub| apply_add(sub, None)) } {
-        Ok(Ok(handle)) => Ok(handle),
-        Ok(Err(e)) => Err(e.code()),
-        Err(e) => Err(e),
-    }
+    unsafe { decode_add(bytes, None, None) }.and_then(apply_decoded)
 }
 
 /// Decode an encoded subgraph and stage it, for an add its caller finishes
@@ -2341,11 +2537,30 @@ pub unsafe fn apply_add_borrowed(bytes: &[u8]) -> Result<OwnerHandle, i32> {
 /// or abandoned: its modules' params are read from it as they instantiate.
 pub unsafe fn begin_add_encoded(bytes: &[u8], spare_lane: Option<i32>) -> Result<StagedAdd, i32> {
     // SAFETY: forwarded contract.
-    match unsafe { decode_add(bytes, spare_lane, None, |sub| begin_add(sub, None)) } {
-        Ok(Ok(st)) => Ok(st),
-        Ok(Err(e)) => Err(e.code()),
-        Err(e) => Err(e),
-    }
+    let d = unsafe { decode_add(bytes, spare_lane, None) }?;
+    begin_decoded(d).map_err(AddError::code)
+}
+
+/// An encoded subgraph decoded into a workspace: the add's header, and its
+/// `n` modules and `e` edges at the front of the workspace.
+struct Decoded {
+    ws: Workspace,
+    header: AddHeader,
+    n: usize,
+    e: usize,
+}
+
+/// Stage a decoded subgraph.
+fn begin_decoded(mut d: Decoded) -> Result<StagedAdd, AddError> {
+    admit_modules(&d.ws.parts().mods[..d.n])?;
+    begin_in(d.ws, d.header, d.n, d.e, None)
+}
+
+/// Stage, instantiate and publish a decoded subgraph within this call.
+fn apply_decoded(d: Decoded) -> Result<OwnerHandle, i32> {
+    let mut staged = begin_decoded(d).map_err(AddError::code)?;
+    instantiate_batch(&mut staged, usize::MAX).map_err(AddError::code)?;
+    finish_staged(staged).map_err(AddError::code)
 }
 
 /// Write an owner handle as an add reports it: `[slot:u16 LE][generation:u32
@@ -2355,7 +2570,8 @@ pub fn write_handle(out: &mut [u8], handle: OwnerHandle) {
     out[2..6].copy_from_slice(&handle.generation.to_le_bytes());
 }
 
-/// Decode an encoded subgraph and hand it to `f`. `spare_lane`:
+/// Decode an encoded subgraph into a workspace it claims first: a node with
+/// none answers `ENOSPC` before a byte is read. `spare_lane`:
 ///   * `None`         — no metal rewrite (sentinel → `BadEndpoint`),
 ///   * `Some(l)` l>=0 — rewrite a sentinel `to` to `ExistingChannel(l)`,
 ///   * `Some(l)` l<0  — a sentinel with no resolved lane → `-ENOMEM`.
@@ -2363,19 +2579,20 @@ pub fn write_handle(out: &mut [u8], handle: OwnerHandle) {
 /// `creator` is the module an [`ADD_FLAG_CREATOR_AUTHORITY`] add acts on
 /// behalf of; with `None` the flag is refused.
 ///
-/// `Err(EINVAL)` for a malformed blob, before `f` runs.
+/// `Err(EINVAL)` for a malformed blob.
 ///
 /// # Safety
-/// The decoded modules' params borrow `bytes`; `f` and whatever it keeps
-/// must not outlive it.
-unsafe fn decode_add<R>(
+/// The decoded modules' params borrow `bytes`; the workspace must be
+/// released (the add published or rolled back) before it goes.
+unsafe fn decode_add(
     bytes: &[u8],
     spare_lane: Option<i32>,
     creator: Option<usize>,
-    f: impl FnOnce(AddSubgraph<'_>) -> R,
-) -> Result<R, i32> {
+) -> Result<Decoded, i32> {
     const EINVAL: i32 = -22;
     const ENOMEM: i32 = -12;
+    let mut ws = Workspace::claim().map_err(AddError::code)?;
+    let p = ws.parts();
     let mut c = Cur::new(bytes);
 
     if c.u32() != Some(ADD_MAGIC) || c.u16() != Some(ADD_VERSION) {
@@ -2403,12 +2620,7 @@ unsafe fn decode_add<R>(
         _ => return Err(EINVAL),
     };
 
-    let mut mods: [AddModule; MAX_ADD_MODULES] = core::array::from_fn(|_| AddModule {
-        source: ModuleSource::Pic(ModuleEntry::default()),
-        domain_id: 0,
-        budget: StepBudget::NODE_DEFAULT,
-    });
-    for m in mods.iter_mut().take(mc) {
+    for m in p.mods.iter_mut().take(mc) {
         let name_hash = match c.u32() {
             Some(v) => v,
             None => return Err(EINVAL),
@@ -2445,18 +2657,10 @@ unsafe fn decode_add<R>(
         m.budget = budget;
     }
 
-    let mut edges = [AddEdge {
-        from: Endpoint::New(0),
-        from_port_index: 0,
-        to: Endpoint::New(0),
-        to_port_index: 0,
-        buffer_bytes: 0,
-        // The per-edge wire record (kind/idx/port ×2 + buffer_bytes) has
-        // no reserved space to carry the wake flag; encoded edges are never
-        // wake-flagged. See the field doc on `AddEdge::wake_on_write`.
-        wake_on_write: false,
-    }; MAX_ADD_EDGES];
-    for edge in edges.iter_mut().take(ec) {
+    // The per-edge wire record (kind/idx/port ×2 + buffer_bytes) has no
+    // reserved space to carry the wake flag; encoded edges are never
+    // wake-flagged. See the field doc on `AddEdge::wake_on_write`.
+    for edge in p.edges.iter_mut().take(ec) {
         let from_kind = c.u8();
         let from_idx = c.u16();
         let from_port = c.u8();
@@ -2499,16 +2703,20 @@ unsafe fn decode_add<R>(
         edge.to = to;
         edge.to_port_index = tp;
         edge.buffer_bytes = bb;
+        edge.wake_on_write = false;
     }
 
-    Ok(f(AddSubgraph {
-        owner_uid,
-        modules: &mut mods[..mc],
-        edges: &edges[..ec],
-        state_cap,
-        buffer_cap,
-        authority,
-    }))
+    Ok(Decoded {
+        ws,
+        header: AddHeader {
+            owner_uid,
+            state_cap,
+            buffer_cap,
+            authority,
+        },
+        n: mc,
+        e: ec,
+    })
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and free that owner.

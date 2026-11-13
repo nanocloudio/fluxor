@@ -42,16 +42,27 @@ pub const POOL_SIZE: usize = 0;
 
 const PAGES: usize = POOL_SIZE / PAGE;
 
-/// Regions at once: one per owner, and one being staged. The static
-/// profile's compiled size; where tables are sized at boot they are sized to
-/// the owner table plus one ([`size`]).
-const REGIONS: usize = crate::kernel::workload::owner::MAX_OWNERS + 1;
+/// Regions at once: one per owner, and one being staged; none where there is
+/// no pool to stage into. The static profile's compiled size; where tables
+/// are sized at boot they are sized from the owner table ([`regions_for`]).
+const REGIONS: usize = regions_for(crate::kernel::workload::owner::OWNER_TABLE_SLOTS);
 
+/// Regions for an owner table of `owners` slots.
+const fn regions_for(owners: usize) -> usize {
+    if POOL_SIZE == 0 {
+        0
+    } else {
+        owners + 1
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
 #[repr(C, align(65536))]
 struct Pool {
     bytes: [u8; POOL_SIZE],
 }
 
+#[cfg(target_pointer_width = "64")]
 static mut POOL: Pool = Pool {
     bytes: [0; POOL_SIZE],
 };
@@ -83,20 +94,20 @@ struct State {
 
 /// Regions a table no plan has sized takes on first use: one per owner the
 /// plan's defaults seat, and one being staged.
-#[cfg(any(feature = "host-linux", feature = "aarch64-metal"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 fn default_regions() -> usize {
-    crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_OWNERS)
-        as usize
-        + 1
+    regions_for(crate::kernel::sys::resource_ledger::ceiling(
+        crate::abi::contracts::resource::POOL_OWNERS,
+    ) as usize)
 }
 
-#[cfg(any(feature = "host-linux", feature = "aarch64-metal"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 static mut STATE: State = State {
     regions: Table::new_planned(|_| Region::EMPTY, default_regions),
     loaders: Table::new_planned(|_| ModuleLoader::new(), default_regions),
 };
 
-#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
 static mut STATE: State = State {
     regions: Table::from_array([Region::EMPTY; REGIONS]),
     loaders: Table::from_array([const { ModuleLoader::new() }; REGIONS]),
@@ -109,7 +120,7 @@ static mut STATE: State = State {
 /// Graph-preparation context: no reference into the tables is live.
 pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::TableError> {
     let st = &*core::ptr::addr_of!(STATE);
-    let n = owners + 1;
+    let n = regions_for(owners);
     st.regions.reserve(n)?;
     st.regions.grow(n)?;
     st.loaders.reserve(n)?;
@@ -125,10 +136,15 @@ fn state() -> &'static mut State {
 }
 
 fn pool_base() -> *mut u8 {
+    #[cfg(target_pointer_width = "64")]
     // SAFETY: the pool's address; access is scheduler-thread only.
     unsafe {
         let p = &raw mut POOL;
         (*p).bytes.as_mut_ptr()
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        core::ptr::null_mut()
     }
 }
 
