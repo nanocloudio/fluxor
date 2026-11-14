@@ -1084,7 +1084,7 @@ struct TlsState {
     /// Strict pairs abandoned because the redelivery caps held with no
     /// consumption for `CONT_HORIZON_MS` (`continuity::redelivery_room`).
     redeliver_cap_abandoned: u32,
-    /// Strict pairs abandoned because `sc::STRICT_TX_RECORDS` records stood
+    /// Strict pairs abandoned because the record ceiling (`TS_TXREC_MAX`) records stood
     /// unacknowledged by the peer's transport, with no acknowledgement for
     /// `CONT_HORIZON_MS` (`continuity::strict_tx_room`).
     txrec_cap_abandoned: u32,
@@ -8583,7 +8583,7 @@ pub mod test_helpers {
         (*(state as *const TlsState)).redeliver_cap_abandoned
     }
 
-    /// Strict pairs abandoned when `sc::STRICT_TX_RECORDS` records stood
+    /// Strict pairs abandoned when the record ceiling (`TS_TXREC_MAX`) records stood
     /// unacknowledged with no acknowledgement (`txrec_cap_abandoned`).
     ///
     /// # Safety

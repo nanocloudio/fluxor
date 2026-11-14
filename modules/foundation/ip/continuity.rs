@@ -139,8 +139,8 @@ pub const TCP_RECORD_MAX: usize =
 // A strict pair's provider holds the out-of-order segments this module's
 // reorder slots keep (`session_ctrl`'s strict bounds): the record a slot
 // becomes always fits the canonical record.
-const _: () = assert!(tcp::REORDER_SLOTS <= sc::STRICT_OOO_SEGS);
-const _: () = assert!(tcp::REORDER_SLOT_BYTES <= sc::STRICT_OOO_SEG);
+const _: () = assert!(tcp::REORDER_SLOTS <= tcr::TS_OOO_MAX);
+const _: () = assert!(tcp::REORDER_SLOT_BYTES <= tcr::TS_OOO_SEG);
 
 /// What `PAIR_PREPARE` binds: the layout of the record above.
 const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6:timers";
@@ -213,6 +213,7 @@ impl TcpTomb {
 }
 
 use abi::contracts::net::session_ctrl as sc;
+use fluxor_sdk::cores::transport_continuity_record as tcr;
 
 /// One connection staged for import.
 #[repr(C)]

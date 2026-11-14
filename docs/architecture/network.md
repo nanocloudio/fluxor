@@ -1267,16 +1267,18 @@ graph that lacks them.
 
 ### The anchor surface: `TRANSPORT_CONTINUITY`
 
-Contract: `crates/fluxor-sdk/src/cores/transport_continuity_contract.rs`. Provider:
+Contract: `crates/fluxor-abi/src/contracts/net/transport_continuity.rs` (frames,
+magics, versions); record library:
+`crates/fluxor-sdk/src/cores/transport_continuity_record.rs`. Provider:
 `crates/fluxor-sdk/src/cores/transport_continuity.rs` (`TcProvider`). This is the
 single-flow surface an anchor outside the graph drives — one end of a
 primary/standby pair per host, on the `tc_ctl` / `tc_evt` port pair —
 rather than a coordinator speaking the per-layer surface above, and it
 differs from that one in one deliberate way: a connection's TCP and TLS
-halves are ONE canonical record (`TsState`, magic `WHTC`), so every mirror
+halves are ONE canonical record (`TsState`, magic `TCRC`), so every mirror
 delta is one atomic transition of both and "the standby holds the primary's
-state" is a byte comparison. The bytes — record, chunks (`WHCC`), deltas
-(`WHMD`), the provider frames and the cut — are fixed, and the canonical
+state" is a byte comparison. The bytes — record, chunks (`TCCC`), deltas
+(`TCMD`), the provider frames and the cut — are fixed, and the canonical
 encoding of a reference state is pinned by its SHA-256
 (`tools/src/transport_continuity.rs`), so every implementation of the codec
 is held to the same bytes. Every decoder is strict past
@@ -1355,7 +1357,7 @@ unanswered horizon), `ABORT_MIRROR_LOST` — and the STATUS that ends the
 pairing (`tcs_why::MIRROR | tcs_lost::LAYER`) carries the layer in its
 value's second byte and the reason in the first.
 
-**Chunks.** CHECKPOINT_BEGIN sends the encoded record as `WHCC` chunks of
+**Chunks.** CHECKPOINT_BEGIN sends the encoded record as `TCCC` chunks of
 16 KiB (`CKPT_CHUNK_PAYLOAD`, at most `CKPT_MAX_CHUNKS`), each naming the
 checkpoint (its id, the flow, its epoch and mirror generation, the total
 length) and carrying a running SHA-256 chain seeded under the domain
@@ -1369,7 +1371,7 @@ assembled is stale and ignored. Chunk arithmetic is shifts and masks
 (`CKPT_CHUNK_SHIFT`): no division by a runtime value, so it links in a PIC
 module on a core without a divide instruction.
 
-**Deltas.** Each transition is a `WHMD` delta — its kind, the flow, epoch,
+**Deltas.** Each transition is a `TCMD` delta — its kind, the flow, epoch,
 mirror generation and base checkpoint, a sequence number (1 after the
 checkpoint), the previous delta's digest (the checkpoint's final chain
 before the first) and a payload of up to 17 KiB (`MD_PAYLOAD_MAX`: a whole
@@ -1539,12 +1541,12 @@ on unprotected.
 
 A full table is not such a transition: it holds. Every fixed table or
 buffer of the record a delta fills is one the halves keep their own within —
-`session_ctrl`'s strict bounds (`STRICT_TX_RECORDS` 32 outbound records,
-`STRICT_SEND_BYTES`, `STRICT_RECV_BYTES`, `STRICT_OOO_SEGS` ×
-`STRICT_OOO_SEG`, `STRICT_DELIVERY_BYTES`), which the provider asserts equal
-to the record's `TS_*` and `tls` and `ip` assert their own buffers within:
+the canonical record's bounds (`TS_TXREC_MAX` 32 outbound records,
+`TS_SEND_MAX`, `TS_RECV_MAX`, `TS_OOO_MAX` × `TS_OOO_SEG`, `TS_DELIV_BYTES`,
+in `transport_continuity_record`), which `tls` and `ip` assert their own
+buffers within:
 
-- `tls` holds its next outbound record while `STRICT_TX_RECORDS` records
+- `tls` holds its next outbound record while `TS_TXREC_MAX` records
   stand written-or-held and not wholly acknowledged by the peer's transport
   (its retransmit window since SND.UNA, and its horizon hold), the clear side
   waiting behind it; `ip`'s acknowledgement, sliding the window, releases it.
@@ -1707,7 +1709,7 @@ the moved flow by the same name.
 Contract: `transport_continuity.rs`, its QUIC section. Module:
 `modules/foundation/quic_continuity` (`qcs.rs`), for `TcTransport::Quic`
 pairings, wired `quic.cont_out -> quic_cont`, `quic_ctl -> quic.cont_in`.
-The canonical record is `WHQ1`: the anchor's view (both connection IDs, the
+The canonical record is `TCQ1`: the anchor's view (both connection IDs, the
 peer's path and family, the packet-number high-water, the largest received)
 followed by `quic`'s own CT_QUIC record (magic `QKRC`) whole; a standby
 refuses a header that disagrees with the record it carries.

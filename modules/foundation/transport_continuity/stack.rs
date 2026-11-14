@@ -150,8 +150,8 @@
 //
 // A full table is not such a transition: it holds. Every bound of the
 // record a delta fills is one the halves keep their own within
-// (`session_ctrl`'s `STRICT_*`: `tls` holds its next record while
-// `STRICT_TX_RECORDS` stand unacknowledged by the peer, and opens the next
+// (the record's `TS_*` bounds: `tls` holds its next record while
+// `TS_TXREC_MAX` stand unacknowledged by the peer, and opens the next
 // inbound record only once the consumption before it is mirrored), and the
 // provider takes a half's next frame only while the gate, the half's queue
 // and the anchor's event queue have room for what it can become, and a
@@ -262,7 +262,7 @@ pub mod tcs_lost {
     /// A half's delta is past a bound of the canonical record (`TsState`'s
     /// tables and buffers: `TS_TXREC_MAX`, `TS_SEND_MAX`, `TS_DELIV_MAX`,
     /// `TS_RECV_MAX`, the out-of-order slots). The halves hold each of their
-    /// own within the strict bounds (`session_ctrl`'s `STRICT_*`), and the
+    /// own within the record's `TS_*` bounds, and the
     /// provider holds a record past a full table until the peer's
     /// acknowledgement frees it, so this names a layer that did not. The
     /// STATUS value is the detail (`tcs_bounds_detail`).
@@ -315,14 +315,8 @@ pub const TCS_FRAME_DELTAS: usize = 2;
 /// its deltas at their largest, and the STATUS a lost pairing reports.
 pub const TCS_FRAME_EVT: usize =
     TCS_FRAME_DELTAS * (TCS_HDR + TC_HANDLE_LEN + MD_FRAME_MAX) + TCS_HDR + TC_STATUS_LEN;
-// The canonical record's bounds are the strict profile's (`session_ctrl`),
-// the ones `ip` and `tls` hold their own buffers and tables to.
-const _: () = assert!(TS_TXREC_MAX == sc::STRICT_TX_RECORDS);
-const _: () = assert!(TS_SEND_MAX == sc::STRICT_SEND_BYTES);
-const _: () = assert!(TS_RECV_MAX == sc::STRICT_RECV_BYTES);
-const _: () = assert!(TS_OOO_MAX == sc::STRICT_OOO_SEGS);
-const _: () = assert!(TS_OOO_SEG == sc::STRICT_OOO_SEG);
-const _: () = assert!(TS_DELIV_BYTES == sc::STRICT_DELIVERY_BYTES);
+// The canonical record's bounds (`TS_*`) are the ones `ip` and `tls` hold
+// their own buffers and tables to under the strict profile.
 /// `ip`'s tombstone command on `cont_in` (`session_ctrl`'s
 /// `CMD_SC_TOMBSTONE`): `[flow_id:16][epoch:4][ttl_ms:4]`, answered
 /// `CONTINUITY{RETIRED}`.
@@ -341,9 +335,9 @@ const TCS_CT_APPLICATION: u8 = 23;
 const TCS_DERIVE_MAX: u32 = 16;
 /// The most bytes one `RxSegment` carries here: a whole protected record.
 const TCS_SEG_CHUNK: usize = TS_RECV_MAX;
-// A partial record `tls` holds (at most `sc::STRICT_RECV_BYTES`) is one
+// A partial record `tls` holds (at most `TS_RECV_MAX`) is one
 // segment: `TCS_FRAME_DELTAS` counts it so.
-const _: () = assert!(TCS_SEG_CHUNK >= sc::STRICT_RECV_BYTES);
+const _: () = assert!(TCS_SEG_CHUNK >= TS_RECV_MAX);
 
 /// The per-layer layouts the codecs below read and write; their SHA-256 is
 /// what each module's PAIR_PREPARE binds, so a layout change in `ip` or

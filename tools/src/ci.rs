@@ -1777,10 +1777,25 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
     // examples in the primary repo or in a separate tracking repo.
     let listing =
         crate::project::tracked_files(project_root, &["examples/*.yaml", "examples/**/*.yaml"]);
+    // `[[ci.examples.exemption]]`: examples kept in the tree that cannot be
+    // build-checked, each with its reason (the schema phase checks the rows).
+    let exempt: Vec<String> = std::fs::read_to_string(project_root.join("fluxor.toml"))
+        .ok()
+        .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+        .map(|doc| {
+            crate::ci_schema::example_exemptions(&doc)
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for rel in &listing {
         let rel = rel.as_str();
+        if exempt.iter().any(|e| e == rel) {
+            continue;
+        }
         // Not examples: the harness tree is fixtures and probes, and a
         // `bundle/` holds packaged OUTPUT (`workload.json` beside a
         // rendered `graph.yaml`) whose source graph is checked already.

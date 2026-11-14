@@ -232,16 +232,19 @@ const NON_CARGO_DIRS: &[&str] = &[
     ".context",
 ];
 
-/// Does a cargo-visible source file `#[path]`-mount the staged tree?
+/// Does cargo read the staged tree: a source file `#[path]`-mounts it, or
+/// a manifest takes a path dependency on a crate staged there (the SDK
+/// crates a module-mounting test links)?
 ///
 /// Detected, never hard-coded: the mount is what makes staging a
 /// build-order dependency, and which projects have one changes.
 ///
 /// The test is not "the text mentions `target/fluxor`" — it is that a
-/// `#[path]` attribute's own relative path, resolved against the file
-/// holding it, lands inside *this* checkout's `target/fluxor`. Prose,
-/// runtime path joins, and a fixture string in someone's unit test all
-/// mention the directory; none of them make cargo read it.
+/// `#[path]` attribute's or a dependency's own relative path, resolved
+/// against the file holding it, lands inside *this* checkout's
+/// `target/fluxor`. Prose, runtime path joins, and a fixture string in
+/// someone's unit test all mention the directory; none of them make cargo
+/// read it.
 fn mounts_staged_tree(project_root: &Path) -> bool {
     let staged = project_root.join("target/fluxor");
     for entry in walkdir::WalkDir::new(project_root)
@@ -253,12 +256,25 @@ fn mounts_staged_tree(project_root: &Path) -> bool {
         })
         .filter_map(std::result::Result::ok)
     {
-        if entry.file_type().is_dir() || entry.path().extension().is_none_or(|e| e != "rs") {
+        if entry.file_type().is_dir() {
             continue;
         }
         let Some(dir) = entry.path().parent() else {
             continue;
         };
+        if entry.file_name() == "Cargo.toml" {
+            if std::fs::read_to_string(entry.path()).is_ok_and(|text| {
+                dependency_paths(&text)
+                    .iter()
+                    .any(|rel| lexical_join(dir, rel).starts_with(&staged))
+            }) {
+                return true;
+            }
+            continue;
+        }
+        if entry.path().extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
@@ -271,6 +287,43 @@ fn mounts_staged_tree(project_root: &Path) -> bool {
         }
     }
     false
+}
+
+/// The `path` of every dependency a cargo manifest declares, in any of its
+/// dependency tables (`[dependencies]`, `[dev-dependencies]`,
+/// `[build-dependencies]`, their `[target.*]` forms and
+/// `[workspace.dependencies]`).
+fn dependency_paths(manifest: &str) -> Vec<String> {
+    const TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    fn collect(table: Option<&toml::Value>, out: &mut Vec<String>) {
+        let Some(deps) = table.and_then(toml::Value::as_table) else {
+            return;
+        };
+        out.extend(
+            deps.values()
+                .filter_map(|d| d.get("path").and_then(toml::Value::as_str))
+                .map(str::to_string),
+        );
+    }
+    let Ok(doc) = toml::from_str::<toml::Value>(manifest) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for t in TABLES {
+        collect(doc.get(t), &mut out);
+    }
+    if let Some(targets) = doc.get("target").and_then(toml::Value::as_table) {
+        for cfg in targets.values() {
+            for t in TABLES {
+                collect(cfg.get(t), &mut out);
+            }
+        }
+    }
+    collect(
+        doc.get("workspace").and_then(|w| w.get("dependencies")),
+        &mut out,
+    );
+    out
 }
 
 /// The literal of a `#[path = "…"]` attribute line, if this is one.
@@ -853,6 +906,44 @@ mod tests {
         assert!(
             ci_gated_scripts(&shape(other.path())).is_empty(),
             "a project that is not the kernel workspace runs no kernel-link phase"
+        );
+    }
+
+    #[test]
+    fn a_path_dependency_on_a_staged_crate_is_a_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let p = root.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.0.1\"\n\
+             [dependencies]\nlocal = { path = \"crates/local\" }\n",
+        );
+        assert!(
+            !mounts_staged_tree(root.path()),
+            "a sibling path crate is not the staged tree"
+        );
+        write(
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.0.1\"\n\
+             [dev-dependencies]\nfluxor-abi = { path = \"target/fluxor/fluxor-abi\" }\n",
+        );
+        assert!(
+            mounts_staged_tree(root.path()),
+            "a dev-dependency staged by sync is"
+        );
+        write("Cargo.toml", "[workspace]\nmembers = [\"tests/harness\"]\n");
+        write(
+            "tests/harness/Cargo.toml",
+            "[package]\nname = \"h\"\nversion = \"0.0.1\"\n\
+             [target.'cfg(unix)'.dependencies]\nfluxor-rt = { path = \"../../target/fluxor/fluxor-rt\" }\n",
+        );
+        assert!(
+            mounts_staged_tree(root.path()),
+            "resolved against the manifest that holds it"
         );
     }
 

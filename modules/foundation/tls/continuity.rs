@@ -193,6 +193,7 @@
 // the consumer learns of the connection.
 
 use abi::contracts::net::session_ctrl as sc;
+use fluxor_sdk::cores::transport_continuity_record as tcr;
 
 /// Standby shadows one instance holds. Each is a staging record plus a
 /// decoded checkpoint — about twice the record maximum.
@@ -400,9 +401,9 @@ const _: () = assert!(CONT_OUT_NEED <= 64 * 1024);
 // What a strict pair's provider holds of a connection (`session_ctrl`'s
 // strict bounds) holds each buffer of this module's a delta carries: the
 // retransmit window, the partial record, a record's plaintext.
-const _: () = assert!(RETX_BUF_SIZE <= sc::STRICT_SEND_BYTES);
-const _: () = assert!(RECV_BUF_SIZE <= sc::STRICT_RECV_BYTES);
-const _: () = assert!(DELIV_CARRY_MAX <= sc::STRICT_DELIVERY_BYTES);
+const _: () = assert!(RETX_BUF_SIZE <= tcr::TS_SEND_MAX);
+const _: () = assert!(RECV_BUF_SIZE <= tcr::TS_RECV_MAX);
+const _: () = assert!(DELIV_CARRY_MAX <= tcr::TS_DELIV_BYTES);
 /// `TlsSession::retx_head` of a window whose record boundaries are not
 /// known (installed from a checkpoint, which carries the bytes and not
 /// where its records start).
@@ -831,7 +832,7 @@ struct SessionContinuity {
     /// `dev_millis` when the redelivery caps began holding the next record
     /// back with no consumption since (0 while they do not).
     cap_since_ms: u64,
-    /// `dev_millis` when the record ceiling (`sc::STRICT_TX_RECORDS`) began
+    /// `dev_millis` when the record ceiling (`tcr::TS_TXREC_MAX`) began
     /// holding the next outbound record back with no acknowledgement from
     /// the peer's transport since (0 while it does not).
     pub(crate) txrec_since_ms: u64,
@@ -2492,14 +2493,14 @@ fn strict_tx_records(s: &TlsState, idx: usize) -> Option<usize> {
 /// Under a strict pair: may one more outbound record be written or held?
 /// Only while the records the peer's transport has not acknowledged, with
 /// this one, stay within what the canonical record holds
-/// (`sc::STRICT_TX_RECORDS`, its `TS_TXREC_MAX`); otherwise the record waits
+/// (`tcr::TS_TXREC_MAX`, its `TS_TXREC_MAX`); otherwise the record waits
 /// (`EmitOutcome::Blocked`) and the acknowledgement that slides the window
 /// releases it. A peer that acknowledges nothing for `CONT_HORIZON_MS` while
 /// the ceiling holds would hold the connection for ever: the pair is
 /// abandoned then and the connection goes on unmirrored
 /// (`txrec_cap_abandoned`).
 unsafe fn strict_tx_room(s: &mut TlsState, idx: usize) -> bool {
-    if matches!(strict_tx_records(s, idx), Some(n) if n < sc::STRICT_TX_RECORDS) {
+    if matches!(strict_tx_records(s, idx), Some(n) if n < tcr::TS_TXREC_MAX) {
         s.sessions[idx].cont.txrec_since_ms = 0;
         return true;
     }

@@ -865,8 +865,8 @@ pub mod query_key {
     pub use super::super::registry::kernel::QUERY_CLASS as CLASS;
     /// Error count since last reset (returns u32)
     pub use super::super::registry::kernel::QUERY_ERROR_COUNT as ERROR_COUNT;
-    /// Heap statistics (returns HeapStats struct, 16 bytes).
-    /// handle=-1 queries the calling module's heap.
+    /// Heap statistics: the `heap_stats` record, exactly `heap_stats::LEN`
+    /// bytes. handle=-1 queries the calling module's heap.
     pub use super::super::registry::kernel::QUERY_HEAP_STATS as HEAP_STATS;
     /// Human-readable name (returns null-terminated string)
     pub use super::super::registry::kernel::QUERY_NAME as NAME;

@@ -14,7 +14,7 @@
 )]
 
 pub use fluxor_sdk::cores::transport_continuity::*;
-pub use fluxor_sdk::cores::transport_continuity_contract::*;
+pub use fluxor_sdk::cores::transport_continuity_record::*;
 #[cfg(test)]
 use fluxor_sdk::crypto::sha256::{sha256, Sha256};
 
@@ -473,7 +473,7 @@ mod tests {
         let st = reference(&mut v);
         let mut out = vec![0u8; TS_CKPT_MAX];
         let n = ts_encode(&st, &mut out).unwrap();
-        assert_eq!(&out[..4], b"WHTC");
+        assert_eq!(&out[..4], b"TCRC");
         assert_eq!(out[4], TS_VERSION);
         assert_eq!(u16::from_le_bytes([out[6], out[7]]), TS_FLAG_CLIENT);
         assert_eq!(
@@ -503,7 +503,7 @@ mod tests {
     }
 
     const TS_REFERENCE_DIGEST: &str =
-        "c9258d1d493db0fca6e338d6d11ed96f8c8a7ffb63eba34f19fb5db90ebf9079";
+        "6a157a7a1c7e0b58a4e7b3ce6432679f8216d3b0932df6c1d1e04f0a5b81deb9";
 
     /// A digest that verifies does not make the record readable: another
     /// version, a reserved flag, an IPv4 address with bytes past its four,
@@ -595,7 +595,7 @@ mod tests {
             let mut c = vec![0u8; CKPT_CHUNK_MAX];
             let m = ckpt_write_chunk(&id, &rec[..n], i, &mut chain, &mut c).unwrap();
             c.truncate(m);
-            assert_eq!(&c[..4], b"WHCC");
+            assert_eq!(&c[..4], b"TCCC");
             last = asm.offer(&c);
             chunks.push(c);
         }
@@ -1007,7 +1007,7 @@ mod tests {
     }
 
     /// A record whose plaintext is past any small bound crosses a
-    /// crash-continuous pair whole: the checkpoint in `WHCC` chunks, the
+    /// crash-continuous pair whole: the checkpoint in `TCCC` chunks, the
     /// record one delta, and the standby holds the primary byte for byte.
     #[test]
     fn a_whole_record_crosses_a_crash_continuous_pair() {

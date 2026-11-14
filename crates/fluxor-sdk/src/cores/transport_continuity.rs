@@ -52,7 +52,7 @@
 // ── the primary's horizons ────────────────────────────────────────────────
 
 /// One emitted delta's effect on the externally visible horizons.
-use crate::cores::transport_continuity_contract::*;
+use crate::cores::transport_continuity_record::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MdEffect {

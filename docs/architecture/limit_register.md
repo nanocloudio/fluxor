@@ -118,15 +118,10 @@ tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE | modules/foundation/ip/mod.r
 PACKET_HOLDS_DEFAULT as usize <= PACKET_HOLDS_MAX | modules/foundation/ip/mod.rs
 HO_SRC_ENTRIES >= tcp::SYN_COOKIE_WATERMARK as usize * 2 | modules/foundation/ip/mod.rs
 TELEMETRY_RING_CAPACITY >= pstatus_round(MAX_MODULES) | src/kernel/config.rs
-TS_TXREC_MAX == sc::STRICT_TX_RECORDS | modules/foundation/transport_continuity/stack.rs
-TS_SEND_MAX == sc::STRICT_SEND_BYTES | modules/foundation/transport_continuity/stack.rs
-TS_RECV_MAX == sc::STRICT_RECV_BYTES | modules/foundation/transport_continuity/stack.rs
-TS_OOO_MAX == sc::STRICT_OOO_SEGS | modules/foundation/transport_continuity/stack.rs
-TS_DELIV_BYTES == sc::STRICT_DELIVERY_BYTES | modules/foundation/transport_continuity/stack.rs
-RETX_BUF_SIZE <= sc::STRICT_SEND_BYTES | modules/foundation/tls/continuity.rs
-RECV_BUF_SIZE <= sc::STRICT_RECV_BYTES | modules/foundation/tls/continuity.rs
-DELIV_CARRY_MAX <= sc::STRICT_DELIVERY_BYTES | modules/foundation/tls/continuity.rs
-tcp::REORDER_SLOTS <= sc::STRICT_OOO_SEGS | modules/foundation/ip/continuity.rs
+RETX_BUF_SIZE <= tcr::TS_SEND_MAX | modules/foundation/tls/continuity.rs
+RECV_BUF_SIZE <= tcr::TS_RECV_MAX | modules/foundation/tls/continuity.rs
+DELIV_CARRY_MAX <= tcr::TS_DELIV_BYTES | modules/foundation/tls/continuity.rs
+tcp::REORDER_SLOTS <= tcr::TS_OOO_MAX | modules/foundation/ip/continuity.rs
 CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 ```
 
@@ -140,7 +135,7 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | decision-seam hold (`pkt_id` slot) | `PKT_SLOT_BITS` (8) | 256 | `MAX_PACKET_HOLD` | crates/fluxor-abi/src/config.rs | 32 | The DEFAULT of `ip`'s declared capacity `packet_holds` (8 on wasm, 4 on embedded): a graph declares more, up to the 256 slots a `pkt_id` names (refused at construction past it), held in `ip`'s heap at one full frame a slot. An arrival with every slot taken is refused and counted (`hold_refused`), never displaces a held packet |
 | workload lane (`ip` provider, `workload::NET_PROVIDE`) | u8 | 255 | `LANE_CEILING` | src/kernel/workload/net_attach.rs | 255 | The provider states its lane capacity when it claims the role (`ip` param `lanes`), and the kernel sizes its lane tables to it — carved on bcm2712 and uefi, allocated on Linux — keeping `max(previous, stated)` across rebuilds; an attach past it is `ENOSPC`. The `u8` lane id is the ceiling; the static profiles (wasm, RP) hold `STATIC_LANES` |
 | contract class (first grant word, manifest head) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the first grant word. Registration past the ceiling is refused EINVAL, and an op of a class the registry does not assign is refused ENOSYS by `check_grant` |
-| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | crates/fluxor-abi/src/registry.rs | 40 | Generated from `crates/fluxor-abi/registry/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the first grant word and of the kernel's vtable registry; the generator refuses an id at or past it |
+| contract-class positions consumed | — | 64 | `CONTRACTS_ASSIGNED` | crates/fluxor-abi/src/registry.rs | 41 | Generated from `crates/fluxor-abi/registry/registry.toml`, whose ids are dense from `0x00`: the next contract takes `CONTRACTS_ASSIGNED`. The ceiling is `MAX_CONTRACTS`, the width of the first grant word and of the kernel's vtable registry; the generator refuses an id at or past it |
 | op-level grant (second grant word, manifest head) | u64 bit position | 64 | `MAX_GRANTS` | tools/src/abi_registry.rs | 64 | 17 of 64 bits assigned; the generator refuses a bit at or past 64 and a grant no op needs |
 | module index (`ModuleId`: exec order, owners, fault ids, wire fields) | u16 | 65535 | `MAX_MODULES` | src/kernel/config.rs | 4096 | `0xFFFF` is `NO_MODULE`, the no-owner sentinel. On Linux this is the module-index DOMAIN, format-bound: the config blob carries a module id in 12 bits (low byte plus four spare bits of entry byte 9) and a `ModuleMask` holds one bit per index, while the scheduler's per-module tables are sized at boot from the graph — its modules, fans and resident workloads plus the `module_slots` reserve (`resource_ledger::plan`) — and grown a segment at a time by live adds; a plan past the domain is refused at boot naming `module_slots`. On bcm2712, uefi and RP the same domain, with the tables sized from the plan within it (1024 on bcm2712 and uefi, carved from the DRAM zone the machine describes; 32 on RP, from the kernel's static pool); on wasm, the static table, 48. The telemetry ring holds one PSTATUS round of it. Kernel capacity, not ABI: modules read the live slot count at runtime (`internal::reconfigure::SLOT_CAPACITY`). Asserts: `src/kernel/boot/config.rs` and `src/kernel/config.rs` (fits the blob's 12 bits), `src/kernel/exec/scheduler/mod.rs` (below the sentinel) |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | — | Derived, not chosen: one slot per channel (`MAX_CHANNELS`), so the two cannot drift. `ChannelSlot.buffer_slot` holds a single id and every allocation takes its owning channel, so a slot past the channel table is unreachable and a pool short of it leaves the table's upper range unallocatable — `channel_open` refusing while slots are free. The buffer arena binds first by orders of magnitude |
@@ -538,12 +533,6 @@ cannot be evaluated from its own file reads `—` and says why.
 | TLS redeliveries a record carries | `CONT_REDELIVER_MAX` | modules/foundation/tls/continuity.rs | 65544 | Policy, wire-visible in the CT_TLS record: the unconsumed deliveries (`[len:2][plaintext]` each, at most eight) a record carries for a standby to hand its worker again — four whole records' plaintext on the host, eight of 512 bytes off-host. A record past it is not importable, refused by name at the bridge (`TCS_REDELIVER_MAX`), never truncated |
 | TLS strict-mirror unacknowledged deltas | `CONT_OUT_BUDGET` | modules/foundation/tls/continuity.rs | 49152 | Policy: delta bytes a strict mirror lets stand unacknowledged on `cont_out` (three quarters of the 64 KiB channel the manifest asks for on the host; 12 KiB off-host) before it stops reading `cipher_in` — a delta the channel refuses ends the pair, and each inbound segment writes one as large as the partial record |
 | TLS strict-mirror `cont_out` need | `CONT_OUT_NEED` | modules/foundation/tls/continuity.rs | — | Policy, derived (`CONT_OUT_BUDGET + MAX_CMD_DATA` + one `CMD_SEND`'s RECORD_OUT framing + a KeyUpdate delta, ≈ 56.4 KiB on the host): the most a strict mirror leaves unread on `cont_out` — `CONT_OUT_BUDGET`, then one `CMD_SEND`'s RECORD_OUTs held for their horizon, then an owed KeyUpdate answer. `tls` measures `cont_out`'s ring at `module_new` (`IOCTL_WRITABLE`) and refuses a strict PAIR_PREPARE (`STATUS_NO_CAPACITY`, logged) on a smaller one, where a delta the channel refused would end the pair; asserted within the 64 KiB the manifest asks for on the host |
-| Strict pair: outbound records unacknowledged | `STRICT_TX_RECORDS` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32 | Policy, the canonical record's `TS_TXREC_MAX` (the provider asserts them equal): outbound TLS records written or held and not wholly acknowledged by the peer's transport. A strict `tls` holds the next record while this many stand — the clear side waits, the window slides on `ip`'s acknowledgement — and abandons the pair after `CONT_HORIZON_MS` with no acknowledgement (`txrec_cap_abandoned`). A small-record producer pipelining faster than the peer acknowledges (MQTT acknowledgements) waits here instead of losing the pair |
-| Strict pair: unacknowledged outbound bytes | `STRICT_SEND_BYTES` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32768 | Policy, the canonical record's `TS_SEND_MAX`: `tls`'s retransmit window (`RETX_BUF_SIZE`, 4 KiB) is asserted within it |
-| Strict pair: partial inbound record | `STRICT_RECV_BYTES` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16704 | Policy, the canonical record's `TS_RECV_MAX` (a whole protected TLS 1.3 record): `tls`'s receive buffer is asserted within it, and the provider carries it as one `RxSegment` |
-| Strict pair: out-of-order segments | `STRICT_OOO_SEGS` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 4 | Policy, the canonical record's `TS_OOO_MAX`: `ip`'s reorder slots are asserted within it |
-| Strict pair: out-of-order segment bytes | `STRICT_OOO_SEG` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 512 | Policy, the canonical record's `TS_OOO_SEG`: `ip`'s reorder slot bytes are asserted within it |
-| Strict pair: one delivery's plaintext | `STRICT_DELIVERY_BYTES` | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16384 | Policy, the canonical record's `TS_DELIV_BYTES`: `tls`'s carried plaintext (`DELIV_CARRY_MAX`) is asserted within it |
 
 ## Machine-checked block
 
@@ -636,7 +625,7 @@ MAX_ADD_MODULES | src/kernel/exec/scheduler/live.rs | 64 | *
 MAX_ADD_EDGES | src/kernel/exec/scheduler/live.rs | 192 | *
 ADD_WORKSPACES | src/kernel/exec/scheduler/live.rs | 2 | *
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
-CONTRACTS_ASSIGNED | crates/fluxor-abi/src/registry.rs | 40 | *
+CONTRACTS_ASSIGNED | crates/fluxor-abi/src/registry.rs | 41 | *
 MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | MAX_CHANNELS | *
 MAX_OWNERS | src/kernel/workload/owner.rs | 4096 | *
 MAX_PATH | crates/fluxor-abi/src/config.rs | 200 | host
@@ -816,12 +805,6 @@ CONT_REDELIVER_MAX | modules/foundation/tls/continuity.rs | 8 * 2 + 8 * 512 | of
 CONT_OUT_BUDGET | modules/foundation/tls/continuity.rs | 48 * 1024 | host
 CONT_OUT_BUDGET | modules/foundation/tls/continuity.rs | 12 * 1024 | off-host
 CONT_OUT_NEED | modules/foundation/tls/continuity.rs | - | *
-STRICT_TX_RECORDS | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32 | *
-STRICT_SEND_BYTES | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 32 * 1024 | *
-STRICT_RECV_BYTES | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16_704 | *
-STRICT_OOO_SEGS | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 4 | *
-STRICT_OOO_SEG | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 512 | *
-STRICT_DELIVERY_BYTES | crates/fluxor-abi/src/contracts/net/session_ctrl.rs | 16 * 1024 | *
 CONT_KEYS | modules/foundation/tls/continuity.rs | 2 + 2 * MAX_TLS_SHADOWS | *
 PEND_MAX | modules/foundation/tls/continuity.rs | 16 | *
 CONT_DERIVE_MAX | modules/foundation/tls/continuity.rs | 16 | *

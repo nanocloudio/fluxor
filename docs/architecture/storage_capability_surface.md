@@ -32,6 +32,16 @@ compose the family; every provider declares one or more.
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32 and the mount router provide; player / viewer modules consume |
 | `storage.namespace` | Name-keyed directory surface (lookup, stat, list, rename, delete, bind, subscribe) | host platform providers and fs_object (§5); scanners and stores consume |
 | `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete, list) | host platform providers and fs_object (§5); object_bank consumes |
+| `storage.custody`   | Custody of a keyed volume's key (seal, open, custodian, split, drill) | a keyed volume provides it beside its data surface; consumers select it by the volume's name |
+
+`storage.custody` is not a data surface: it is how a consumer uses a keyed
+volume's key without holding it. The vault scopes key labels by module type,
+so only the volume's own module reaches its key; what another module needs
+of that key (a backup sealed under it, the volume's recovery custodians,
+recovery shares, a drill that the shares still rebuild it) it asks the volume
+for, by the volume's name. Every argument is in place
+(`crates/fluxor-abi/src/contracts/storage/custody.rs`); shares use key_vault's
+v1 share format.
 
 Multipart object upload is deliberately not part of `storage.object`.
 Large writes compose via the `event.log` pattern in §4 and finalise with
@@ -313,6 +323,7 @@ contract id, so every dispatched surface needs its own class byte:
 | `0x0D`     | `FS`                                        | `0x0D00..0x0DFF` — random-access file I/O (`fs.rs`) |
 | `0x0E`     | `STORAGE_NAMESPACE`                         | `0x0E00..0x0EFF` — directory-like name-keyed surface (`namespace.rs`) |
 | `0x0F`     | `STORAGE_OBJECT`                            | `0x0F00..0x0FFF` — whole-blob byte-addressed surface (`object.rs`) |
+| `0x28`     | `storage_custody::ID`                       | `0x2800..0x28FF` — custody of a keyed volume's key (`custody.rs`) |
 
 `storage.block` has no class byte. Its requests are channel ioctls on the
 source's `blocks` channel (§1.1). Class byte `0x03` is `BUFFER`, not a

@@ -2145,25 +2145,16 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
             }
             dev_query_key::STATE => E_NOSYS,
             dev_query_key::HEAP_STATS => {
-                // Accept any `out_len >= HEAP_STATS_MIN` and copy up
-                // to `out_len` bytes from the struct, returning the
-                // actual bytes written: a module whose buffer holds
-                // only a prefix of `HeapStats` is answered with that
-                // prefix, so the struct can grow at its end.
-                const HEAP_STATS_MIN: usize = 16;
-                let stats_size = core::mem::size_of::<crate::kernel::mem::heap::HeapStats>();
-                if out.is_null() || out_len < HEAP_STATS_MIN {
+                // The record is one length (`abi::heap_stats::LEN`); a
+                // buffer of any other is a caller reading another layout.
+                use crate::abi::heap_stats::LEN;
+                if out.is_null() || out_len != LEN {
                     return E_INVAL;
                 }
                 let idx = crate::kernel::exec::scheduler::current_module_index();
-                let stats = crate::kernel::mem::heap::heap_stats(idx);
-                let copy_len = stats_size.min(out_len);
-                core::ptr::copy_nonoverlapping(
-                    &stats as *const crate::kernel::mem::heap::HeapStats as *const u8,
-                    out,
-                    copy_len,
-                );
-                copy_len as i32
+                let bytes = crate::kernel::mem::heap::heap_stats(idx).encode();
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, LEN);
+                LEN as i32
             }
             dev_query_key::LAST_FENCE => last_fence_query(handle, out, out_len),
             dev_query_key::CALLER_OWNER => {

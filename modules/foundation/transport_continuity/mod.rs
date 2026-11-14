@@ -46,7 +46,7 @@ use abi::SyscallTable;
 use fluxor_abi as abi;
 
 use fluxor_rt::*;
-pub use fluxor_sdk::cores::transport_continuity_contract::*;
+pub use fluxor_sdk::cores::transport_continuity_record::*;
 pub use fluxor_sdk::crypto::sha256::*;
 include!("heap_table.rs");
 pub use fluxor_sdk::cores::session_handoff::*;

@@ -348,23 +348,26 @@ let bigger = heap_realloc(sys, buf, 512);
 
 Query heap statistics via `provider_query` with key
 `query_key::HEAP_STATS` (6); `handle = -1` queries the calling
-module's own heap:
+module's own heap. The answer is the `abi::heap_stats` record: nine
+little-endian u32 fields at fixed offsets, exactly `heap_stats::LEN` (36)
+bytes; a buffer of any other length is refused `EINVAL`.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| arena_size | u32 | The heap's cap in bytes (an elastic heap commits it as used) |
-| allocated | u32 | Currently allocated bytes (excluding headers) |
-| alloc_count | u16 | Number of active allocations |
-| total_allocs | u16 | Lifetime allocation count |
-| high_water | u32 | Peak allocated bytes |
-| free_blocks | u16 | Number of free blocks (fragmentation indicator) |
-| largest_free | u32 | Largest allocation the heap can serve next: its largest free block, or what it can still commit |
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0 | arena_size | The heap's cap in bytes (an elastic heap commits it as used) |
+| 4 | allocated | Currently allocated bytes (excluding headers) |
+| 8 | alloc_count | Number of active allocations |
+| 12 | total_allocs | Lifetime allocation count |
+| 16 | high_water | Peak allocated bytes |
+| 20 | free_blocks | Number of free blocks (fragmentation indicator) |
+| 24 | largest_free | Largest allocation the heap can serve next: its largest free block, or what it can still commit |
+| 28 | fail_count | Allocations that failed |
+| 32 | grow_denied | Allocations refused because the heap could not grow |
 
 PIC runtime helper:
 
 ```rust
-let (arena_size, allocated, alloc_count, total_allocs, high_water,
-     free_blocks, largest_free) = heap_stats(sys);
+let stats = heap_stats(sys); // abi::heap_stats::HeapStats
 ```
 
 ## Allocator Design

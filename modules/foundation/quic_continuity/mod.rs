@@ -25,7 +25,7 @@ use abi::SyscallTable;
 use fluxor_abi as abi;
 
 use fluxor_rt::*;
-pub use fluxor_sdk::cores::transport_continuity_contract::*;
+pub use fluxor_sdk::cores::transport_continuity_record::*;
 pub use fluxor_sdk::crypto::sha256::*;
 include!("../transport_continuity/heap_table.rs");
 pub use fluxor_sdk::cores::session_handoff::*;
@@ -38,7 +38,7 @@ const P_QUIC: usize = 1;
 const P_AUTH: usize = 2;
 const HDR: usize = 3;
 const RX_MAX: usize = TC_FRAME_MAX + 64;
-/// Output queues: a whole `WHQ1` record as chunks and the deltas behind it
+/// Output queues: a whole `TCQ1` record as chunks and the deltas behind it
 /// to the anchor, per-layer frames to `quic`, token checks.
 const Q_CAP: [usize; PORTS] = [QCS_REC_MAX + 64 * 1024, 64 * 1024, 1024];
 const Q_MAX: usize = QCS_REC_MAX + 64 * 1024;

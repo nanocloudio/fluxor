@@ -61,6 +61,9 @@ pub mod registry;
 
 pub mod kernel_abi;
 
+/// A module's heap statistics, by offset and exact length.
+pub mod heap_stats;
+
 /// Canonical ABI wire-surface encoding (`abi_surface.rs`): the fixed
 /// (name, value) walk over every numeric allocation above whose sha256
 /// is the ABI-surface digest. Generations and slot images record the
@@ -104,6 +107,8 @@ pub mod contracts {
         /// platform or a module provider and reported per entry.
         pub mod route;
         pub mod session_ctrl;
+        /// The single-flow continuity surface's frames, magics and versions.
+        pub mod transport_continuity;
         /// The records that drive a WebSocket connector from outside it:
         /// which resource to open on which link, and what became of it.
         pub mod ws_control;
@@ -132,6 +137,8 @@ pub mod contracts {
     pub mod storage {
         /// Raw logical-block I/O over a `blocks` channel.
         pub mod block;
+        /// Custody of a keyed volume's key: sealing, custodians, shares.
+        pub mod custody;
         pub mod fs;
         pub mod graph_slot;
         /// Leased mesh Handle specialised for storage surfaces.
@@ -148,9 +155,6 @@ pub mod contracts {
     /// local verification, and their presentation on a session.
     pub mod mesh {
         pub mod capability;
-        /// Golden vectors every consumer of `capability` checks itself
-        /// against.
-        pub mod capability_vectors;
         /// A `remote_channel`'s session opening and ending.
         pub mod remote_session;
     }

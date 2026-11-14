@@ -370,7 +370,16 @@ pub fn cmd_inspect(chain: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxor_abi::contracts::mesh::capability_vectors as golden;
+    #[allow(
+        dead_code,
+        reason = "the fixture names every field a consumer checks; these tests read some"
+    )]
+    mod golden {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/mesh_capability_vectors.rs"
+        ));
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())

@@ -1,7 +1,7 @@
 // qcs — TRANSPORT_CONTINUITY over this graph's `quic` (`TcTransport::Quic`):
 // the anchor's operations become the per-layer continuity commands `quic`
 // answers on `cont_in` / `cont_out` (`session_ctrl.rs` §Transport
-// continuity, `CT_QUIC`), and the canonical record is `WHQ1` — the anchor's
+// continuity, `CT_QUIC`), and the canonical record is `TCQ1` — the anchor's
 // view, then `quic`'s own record (`QKRC`) whole (transport_continuity.rs,
 // the QUIC section).
 //
@@ -9,7 +9,7 @@
 // `tc_flow_id_quic` (it binds an established connection by its ID);
 // CHECKPOINT_BEGIN is `quic`'s CUT_EXPORT, its record assembled from the
 // per-layer chunk stream, checked (SHA-256 and CRC32), viewed and sent as
-// `WHCC` chunks; a crash-continuous pair then tells `quic` its checkpoint
+// `TCCC` chunks; a crash-continuous pair then tells `quic` its checkpoint
 // is held, which turns its mirror on, and every per-layer delta becomes the
 // next `QuicDelta` on this stream, numbered as `quic` numbers it (a delta
 // this stream cannot carry, or out of number, ends the pairing: STATUS of
@@ -35,7 +35,7 @@
 /// heap_per_param`). Zeroed memory is the empty table; a pairing past it is
 /// refused `CAPACITY`.
 pub type QcsFlows = HeapTable<QcsFlow>;
-/// A whole `WHQ1` record.
+/// A whole `TCQ1` record.
 pub const QCS_REC_MAX: usize = TC_QUIC_HDR + TC_QUIC_LAYER_MAX;
 /// Why a crash-continuous pairing ended here (STATUS of op ABORT,
 /// unsolicited, reason `0x80 | …`; `quic`'s own end is `0x80 | its

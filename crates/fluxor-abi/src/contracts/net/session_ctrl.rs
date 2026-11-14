@@ -13,13 +13,9 @@
 // the scaffolding every continuity class above `drain_only` rests on
 // (see protocol_surfaces.md §Continuity Classes).
 //
-// Status: LIVE. Consumers: `echo_anchor` + `echo_worker` exercise the
-// full surface — HELLO/ATTACH/DETACH/DRAIN plus the handoff half
-// (EXPORT_BEGIN/CHUNK/END → IMPORT_BEGIN/END → RESUME/RESUMED with
-// epoch bump). An anchor wired to an active and a standby worker gives
-// an anchor-preserved worker swap on a live TCP session. The chunking
-// and CRC logic is the reusable `session_handoff` core in
-// `crates/fluxor-sdk/src/cores/`.
+// An anchor wired to an active and a standby worker gives an
+// anchor-preserved worker swap on a live TCP session. The chunking and CRC
+// logic is the `session_handoff` library in `fluxor_sdk::cores`.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto, datagram, and packet so the shared SDK
@@ -421,27 +417,12 @@ pub const PROFILE_PLANNED: u8 = 1;
 /// Every externally visible transition waits for its DELTA_ACK.
 pub const PROFILE_CRASH_CONTINUOUS: u8 = 2;
 
-/// What a crash-continuous pair's provider holds of one connection: the
-/// canonical record's bounds (`TRANSPORT_CONTINUITY`'s `TS_*`, which its
-/// provider holds equal to these). A layer under the strict profile keeps
-/// each of its own within them, so a full table is back-pressure at the
-/// layer, never a delta its provider cannot apply.
-///
-/// Outbound records written or held and not yet acknowledged by the peer's
-/// transport: `tls` holds the next record while this many stand.
-pub const STRICT_TX_RECORDS: usize = 32;
-/// Unacknowledged outbound bytes (`tls`'s retransmit window).
-pub const STRICT_SEND_BYTES: usize = 32 * 1024;
-/// In-order received bytes not yet a record (`tls`'s partial record).
-pub const STRICT_RECV_BYTES: usize = 16_704;
-/// Out-of-order segments held, and the bytes of each (`ip`'s reorder
-/// slots).
-pub const STRICT_OOO_SEGS: usize = 4;
-pub const STRICT_OOO_SEG: usize = 512;
-/// The plaintext one delivery carries (`tls`'s RECORD_IN).
-pub const STRICT_DELIVERY_BYTES: usize = 16 * 1024;
-
-/// Delta kinds (`DELTA_APPLY` `kind`).
+/// Delta kinds (`DELTA_APPLY` `kind`). Kinds below 0x80 are this
+/// contract's, numbered without gaps; 0x80 and up are a provider's own. A
+/// delta's payload is the layer's that emits it (`ip`, `tls`, `quic`), which
+/// defines and checks its bytes; a crash-continuous layer keeps what it holds
+/// of a connection within the canonical record's bounds
+/// (`transport_continuity_record`'s `TS_*`).
 /// TCP: a send-side transition — bytes allocated to sequence space,
 /// with the segment bytes so retransmission is byte-identical.
 pub const DELTA_TCP_SEND: u8 = 1;
@@ -451,13 +432,7 @@ pub const DELTA_TCP_RECV: u8 = 2;
 /// TCP: acknowledgement from the peer reclaimed send bytes / window.
 pub const DELTA_TCP_ACKED: u8 = 3;
 /// TCP: a state change without bytes — its timers and congestion state as
-/// they stand after it. `ip`'s payload:
-///   [state:1][rto:2 LE][srtt:2 LE][rttvar:2 LE][cwnd:2 LE][ssthresh:2 LE]
-///   [retx_rem_ms:4 LE][idle_ms:4 LE][idle_rem_ms:4 LE]
-///   [closewait_rem_ms:4 LE][closing_rem_ms:4 LE][timewait_rem_ms:4 LE]
-/// `state` is `ip`'s record code (`FXTC`, TIME-WAIT included); each
-/// remainder is what is left of a timer the new state runs, 0 when it runs
-/// none, 1 when it is due (`TRANSPORT_CONTINUITY`'s `TS_TIMER_DUE`).
+/// they stand after it.
 pub const DELTA_TCP_TIMERS: u8 = 4;
 /// TLS: a record is about to be handed to the transport — its
 /// ciphertext, write epoch and sequence, so the standby retransmits the
@@ -501,7 +476,7 @@ pub const DELTA_TLS_RECV_BYTES: u8 = 12;
 /// count so a takeover redelivers from that byte and hands both to the next
 /// consumer (`net_proto::MSG_RESUMED`).
 ///   [consumed: 8 LE][consumer_cursor: 8 LE][cursor_at: 8 LE]
-pub const DELTA_TLS_DELIVERED: u8 = 0x81;
+pub const DELTA_TLS_DELIVERED: u8 = 15;
 /// TCP: the connection ended by a reset — the peer's, accepted
 /// (RFC 5961 rules), or ours. The provider hears it before the connection
 /// is released; ours goes on the wire only once this delta is acknowledged
@@ -516,9 +491,8 @@ pub const DELTA_TCP_CLOSED: u8 = 14;
 /// (no payload). The alert's ciphertext is the RECORD_OUT before it; the
 /// transport FIN that follows is `ip`'s SEND with its FIN flag. A session
 /// that sent it stays exportable (CT_TLS `close_notify` bit 0).
-pub const DELTA_TLS_CLOSE_SENT: u8 = 0x82;
-// Other kinds 0x80 and up are a provider's own, as are commands 0x8B and up
-// on `cont_in`.
+pub const DELTA_TLS_CLOSE_SENT: u8 = 16;
+// Commands 0x8B and up on `cont_in` are a provider's own too.
 
 /// Abort reasons (`ABORT` `reason`, `CONTINUITY{ABORTED}` body).
 pub const ABORT_COORDINATOR: u8 = 1;
@@ -528,11 +502,11 @@ pub const ABORT_IMPORT_FAILED: u8 = 2;
 pub const ABORT_MIRROR_LOST: u8 = 3;
 pub const ABORT_UNSUPPORTED_STATE: u8 = 4;
 /// A strict layer abandoned its pairing because the peer acknowledged none
-/// of the outbound records held at the record ceiling (`STRICT_TX_RECORDS`)
-/// within its horizon budget (`tls`'s `txrec_cap_abandoned`).
+/// of the outbound records it held at its record ceiling within its horizon
+/// budget.
 pub const ABORT_TXREC_CAP: u8 = 5;
-/// ... because its consumer consumed nothing while the redelivery caps held
-/// within the horizon budget (`tls`'s `redeliver_cap_abandoned`).
+/// ... because its consumer consumed nothing while its redelivery caps held
+/// within the horizon budget.
 pub const ABORT_REDELIVER_CAP: u8 = 6;
 /// ... because its standby left a horizon unanswered past the budget.
 pub const ABORT_HORIZON_BUDGET: u8 = 7;

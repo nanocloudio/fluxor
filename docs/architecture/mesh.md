@@ -171,9 +171,9 @@ The codec, the chain rules and the verifier are one source,
 artefact (`fluxor-abi`), so any PIC module or host tool links the same
 bytes. It takes SHA-256 and Ed25519 verification from its caller
 (`CapCrypto`), so the contract carries no crypto of its own. Golden
-vectors in `capability_vectors.rs` beside it cover valid tokens and
-chains and one vector per refusal class, and a consumer runs them to
-prove it wired the verifier as the contract means.
+vectors, a test fixture rather than part of the ABI, cover valid tokens and
+chains and one vector per refusal class; a consumer runs them to prove it
+wired the verifier as the contract means.
 
 ### Security model
 

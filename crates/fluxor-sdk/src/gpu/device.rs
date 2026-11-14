@@ -37,10 +37,8 @@
 // A submission may only wait on fences that are already live, and its own
 // fence is allocated after its waits are validated. The wait graph is
 // therefore a DAG by construction, not by a cycle detector that has to be
-// right. `REASON_DEPENDENCY_CYCLE` stays allocated in the wire contract for a
-// provider that later hands out fence names before their work exists; this
-// core cannot reach it, and a test asserts the structural property instead of
-// pretending to exercise a detector.
+// right, so the contract has no cycle refusal: a test asserts the structural
+// property instead.
 
 // ── Capacities ──────────────────────────────────────────────────────────
 //

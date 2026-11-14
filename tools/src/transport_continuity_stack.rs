@@ -17,7 +17,7 @@ use fluxor_abi::contracts::net::session_ctrl as sc;
 
 pub use fluxor_sdk::cores::session_handoff::*;
 pub use fluxor_sdk::cores::transport_continuity::*;
-pub use fluxor_sdk::cores::transport_continuity_contract::*;
+pub use fluxor_sdk::cores::transport_continuity_record::*;
 pub use fluxor_sdk::crypto::sha256::*;
 
 include!("../../modules/foundation/transport_continuity/heap_table.rs");

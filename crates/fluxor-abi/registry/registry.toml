@@ -2180,6 +2180,41 @@ manifest = true
 
 
 
+[[contract]]
+# Custody of a keyed volume's key: the provider holds the key in its own
+# key_vault namespace (a label no other module type reaches) and answers
+# these instead of handing it out. Selected by the volume's name; every
+# argument is in place (`contracts::storage::custody` has the layouts).
+name = "storage.custody"
+id = 0x28
+module_provided = true
+manifest = true
+
+  [[contract.op]]
+  name = "SEAL"
+  op = 0x00
+  gate = { handle = "global", arg = "inout", max = "any" }
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x01
+  gate = { handle = "global", arg = "inout", max = "any" }
+
+  [[contract.op]]
+  name = "CUSTODIAN"
+  op = 0x02
+  gate = { handle = "global", arg = "inout", max = "any" }
+
+  [[contract.op]]
+  name = "SPLIT"
+  op = 0x03
+  gate = { handle = "global", arg = "inout", max = "any" }
+
+  [[contract.op]]
+  name = "DRILL"
+  op = 0x04
+  gate = { handle = "global", arg = "in", max = "any" }
+
 [[msgset]]
 name = "net_tlv"
 members = ["net_proto", "datagram", "packet", "session_ctrl", "identity", "peer_identity", "mux"]

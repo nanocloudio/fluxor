@@ -742,8 +742,14 @@ pub fn fmt_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLin
 pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLintReport> {
     crate::store_sync::ensure_synced(project_root)
         .map_err(|e| crate::error::Error::Config(e.to_string()))?;
-    let targets = resolve_all_targets(project_root)?;
+    // As for the build: discovery first, so a portable-core-only repo (no
+    // module manifests, and so no `[ci].targets`, which the schema gate
+    // refuses there) lints nothing rather than failing on the absent matrix.
     let candidates = discover(project_root)?;
+    if candidates.is_empty() {
+        return Ok(ModuleLintReport::default());
+    }
+    let targets = resolve_all_targets(project_root)?;
     let scratch = project_root.join("target/fluxor/clippy");
     std::fs::create_dir_all(&scratch)?;
     let mut report = ModuleLintReport::default();
@@ -1270,12 +1276,36 @@ fn stamped_target(out_path: &Path) -> Option<String> {
 /// on bcm2712, say — changes the code as surely as a new triple does and
 /// leaves every source older than every object, so it has to invalidate
 /// the same way. Equal to the bare triple where a silicon adds nothing.
+/// `--remap-path-prefix` for a module compile: the project root becomes the
+/// project's directory name, as the SDK rlibs' sources become theirs. A panic
+/// location names its source file, and the artefact is published, so it names
+/// the file the project tree knows, not where this machine keeps it: the same
+/// source builds the same bytes in any checkout.
+fn remap_args(project_root: &Path) -> Vec<String> {
+    let name = project_root.file_name().map_or_else(
+        || "project".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let mut roots = vec![project_root.to_path_buf()];
+    if let Ok(canonical) = project_root.canonicalize() {
+        if canonical != project_root {
+            roots.push(canonical);
+        }
+    }
+    roots
+        .iter()
+        .map(|r| format!("--remap-path-prefix={}={name}", r.display()))
+        .collect()
+}
+
 fn compile_key(spec: &AbiSpec) -> String {
     // The crate type and relocation model are part of the compile (they
     // decide how a module's data is reached, `PIC_CRATE_TYPE`), so an
     // artefact built under others rebuilds. wasm builds as a cdylib whatever
     // these say, and its key stays the target.
-    let mut key = spec.module_target.to_string();
+    // Source paths are remapped to the project's name (`remap_args`); an
+    // artefact built before that carries this machine's paths and rebuilds.
+    let mut key = format!("{} remap-path-prefix", spec.module_target);
     if spec.linker.is_some() {
         key.push_str(&format!(
             " crate-type={PIC_CRATE_TYPE} relocation-model={PIC_RELOCATION_MODEL}"
@@ -1514,6 +1544,7 @@ fn compile_module_pic(
         ))
         .arg("-C")
         .arg(format!("relocation-model={PIC_RELOCATION_MODEL}"))
+        .args(remap_args(&opts.project_root))
         .args(spec.extra_rustflags)
         .args(cfg_abi_args(spec))
         .args(cfg_feature_args(cand))
@@ -2052,7 +2083,8 @@ fn compile_module_wasm(
             cand.wasm_opt_level.as_deref().unwrap_or("z")
         ))
         .arg("-C")
-        .arg("strip=symbols");
+        .arg("strip=symbols")
+        .args(remap_args(&opts.project_root));
     if !cand.wasm_target_features.is_empty() {
         let plus: Vec<String> = cand
             .wasm_target_features
@@ -2111,6 +2143,16 @@ fn compile_module_wasm(
     if !has_init || !has_step {
         let _ = std::fs::remove_file(&wasm_path);
         let _ = std::fs::remove_file(&out_path);
+        // As for a failed compile: a module that declares `wasm` owes a wasm
+        // payload, and `publish` refuses a project whose declared shelf is
+        // missing it, so the build fails here rather than at publish.
+        if cand.hardware_targets.iter().any(|t| t == "wasm") {
+            return Err(Error::Module(format!(
+                "{}: declares `wasm` target but exports no module_init_wasm + \
+                 module_step_wasm (`fluxor_rt::wasm_entry!()`)",
+                cand.name
+            )));
+        }
         return Ok(BuildOutcome::Skipped(
             "compiles for wasm32 but missing module_init_wasm + module_step_wasm exports"
                 .to_string(),
@@ -2357,6 +2399,27 @@ pub fn holds_fmod(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repo of portable cores only (a module tree with no manifests, so
+    /// no `[ci].targets`) lints nothing, as its build builds nothing.
+    #[test]
+    fn module_clippy_over_no_module_manifests_lints_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("fluxor.toml"),
+            "[project]\nname = \"p\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("modules/common")).unwrap();
+        std::fs::write(
+            root.path().join("modules/common/core.rs"),
+            "pub fn f() {}\n",
+        )
+        .unwrap();
+        let report = clippy_check_modules(root.path(), false).unwrap();
+        assert_eq!(report.checked, 0);
+        assert!(report.failed.is_empty());
+    }
 
     /// A minimal little-endian relocatable object: `.shstrtab`, a string
     /// section holding `pointee`, a symbol table whose symbol 1 names that

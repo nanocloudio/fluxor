@@ -291,8 +291,8 @@ impl Segment {
     }
 
     /// `(free blocks, largest free block)`.
-    fn free_stats(&self) -> (u16, usize) {
-        let mut free_blocks: u16 = 0;
+    fn free_stats(&self) -> (u32, usize) {
+        let mut free_blocks: u32 = 0;
         let mut largest_free: usize = 0;
         let mut offset = self.first_free_offset;
         while let Some((_, hdr)) = self.free_block(offset) {
@@ -457,16 +457,16 @@ pub struct ModuleHeap {
     /// Current allocated bytes (excluding headers).
     pub allocated: u32,
     /// Number of active allocations.
-    pub alloc_count: u16,
+    pub alloc_count: u32,
     /// Lifetime allocation count (for diagnostics).
-    pub total_allocs: u16,
+    pub total_allocs: u32,
     /// High-water mark of allocated bytes.
     pub high_water: u32,
     /// Number of failed allocation attempts.
-    pub fail_count: u16,
+    pub fail_count: u32,
     /// Allocations refused because the heap could not grow: its cap was
     /// reached, or the state arena could not supply the carve.
-    pub grow_denied: u16,
+    pub grow_denied: u32,
     /// When set, `free()` memsets the chunk's data region to zero
     /// before linking it back into the free list. Opt-in for modules
     /// that handle secrets (TLS key material, session tokens) via
@@ -525,32 +525,9 @@ pub fn heap_zero_step_bytes_total() -> u64 {
     ZERO_STEP_TOTAL.load(portable_atomic::Ordering::Relaxed)
 }
 
-/// Heap statistics queryable by modules.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct HeapStats {
-    /// The heap's size in bytes: its cap, which an elastic heap commits only
-    /// as it is used.
-    pub arena_size: u32,
-    /// Currently allocated bytes (excluding headers).
-    pub allocated: u32,
-    /// Number of active allocations.
-    pub alloc_count: u16,
-    /// Lifetime total allocations.
-    pub total_allocs: u16,
-    /// High-water mark of allocated bytes.
-    pub high_water: u32,
-    /// Number of free blocks (fragmentation indicator).
-    pub free_blocks: u16,
-    /// Padding to align the `largest_free` u32 on its natural boundary.
-    pub _pad: u16,
-    /// The largest single allocation the heap can serve next: its largest
-    /// free block, or what is still to commit when that is more. Under
-    /// heavy fragmentation this is significantly smaller than
-    /// `arena_size - allocated`, and surfacing it makes the fragmentation
-    /// visible before a single over-large request returns null.
-    pub largest_free: u32,
-}
+/// Heap statistics queryable by modules: the ABI record
+/// (`abi::heap_stats`), so the kernel and a module read one definition.
+pub use crate::abi::heap_stats::HeapStats;
 
 impl ModuleHeap {
     /// Create an empty (uninitialized) heap — for modules with no arena.
@@ -945,7 +922,7 @@ impl ModuleHeap {
         if !self.is_active() {
             return HeapStats::default();
         }
-        let mut free_blocks: u16 = 0;
+        let mut free_blocks: u32 = 0;
         let mut largest_free: usize = 0;
         for s in self.segs.iter().take(self.seg_count as usize) {
             let (n, l) = s.free_stats();
@@ -964,8 +941,9 @@ impl ModuleHeap {
             total_allocs: self.total_allocs,
             high_water: self.high_water,
             free_blocks,
-            _pad: 0,
             largest_free: largest_free.min(u32::MAX as usize) as u32,
+            fail_count: self.fail_count,
+            grow_denied: self.grow_denied,
         }
     }
 

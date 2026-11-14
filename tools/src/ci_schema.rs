@@ -70,6 +70,10 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // Both keys are required: an exemption without a reason is a
     // conformance failure, not an escape hatch.
     ("ci.hygiene.allow_crate_root", &["prefix", "reason"]),
+    // Tracked examples the examples phase does not build-check, each with
+    // the reason it cannot: both keys are required.
+    ("ci.examples", &["exemption"]),
+    ("ci.examples.exemption", &["path", "reason"]),
     ("ci.lints", &["exemption"]),
     ("ci.lints.exemption", &["crate", "reason"]),
     ("ci.templates", &["dir", "vars", "template"]),
@@ -99,6 +103,7 @@ pub fn check(project_root: &Path) -> std::result::Result<(), String> {
     check_host_tools_crate(project_root, &doc, &mut problems);
     check_inline_test_dirs(project_root, &doc, &mut problems);
     check_lint_exemptions(project_root, &doc, &mut problems);
+    check_example_exemptions(project_root, &doc, &mut problems);
     check_unknown_keys(&doc, &mut problems);
     check_signing(&doc, &mut problems);
     if let Err(e) = crate::project::bound_stacks(project_root) {
@@ -330,7 +335,11 @@ fn check_inline_test_dirs(project_root: &Path, doc: &Value, out: &mut Vec<String
 ///
 /// `[[ci.lints.exemption]] crate` is a package name (below), and the
 /// workspace-lint audit enumerates members by path, so the two are
-/// joined here — in one place, so they cannot drift apart.
+/// joined here — in one place, so they cannot drift apart. A root
+/// manifest that is also a package is a member whether `members` lists
+/// `.` or not, as cargo has it: a workspace that keeps `.` out of
+/// `members` so that `exclude` can keep path dependencies staged under
+/// it out of the workspace still has its root package.
 pub fn workspace_members(project_root: &Path) -> Vec<(String, String)> {
     let Ok(raw) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
         return Vec::new();
@@ -338,7 +347,7 @@ pub fn workspace_members(project_root: &Path) -> Vec<(String, String)> {
     let Ok(doc) = toml::from_str::<Value>(&raw) else {
         return Vec::new();
     };
-    let members = doc
+    let mut members = doc
         .get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(Value::as_array)
@@ -349,6 +358,12 @@ pub fn workspace_members(project_root: &Path) -> Vec<(String, String)> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let root_listed = members
+        .iter()
+        .any(|m| matches!(m.trim_end_matches('/'), "." | ""));
+    if doc.get("workspace").is_some() && doc.get("package").is_some() && !root_listed {
+        members.insert(0, ".".to_string());
+    }
     members
         .into_iter()
         .filter_map(|m| {
@@ -372,6 +387,52 @@ pub fn workspace_members(project_root: &Path) -> Vec<(String, String)> {
 /// package by `[package] name`, a path is one of several spellings of
 /// where it happens to sit (`.`, `tools/x`, `./tools/x`), and the audit
 /// this exists for reads `[lints]` out of a package. So: names.
+/// The examples the examples phase skips: `[[ci.examples.exemption]]` rows,
+/// each a `path` (relative to the project root) and a `reason`. Read by the
+/// phase and checked here, so the two agree.
+pub fn example_exemptions(doc: &Value) -> Vec<(String, String)> {
+    doc.get("ci")
+        .and_then(|c| c.get("examples"))
+        .and_then(|e| e.get("exemption"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    let get = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                    (get("path"), get("reason"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// An exemption names one example that exists, under `examples/`, and says
+/// why it is not checked; one that names nothing exempts nothing and is
+/// removed rather than kept.
+fn check_example_exemptions(project_root: &Path, doc: &Value, out: &mut Vec<String>) {
+    for (path, reason) in example_exemptions(doc) {
+        if path.is_empty() {
+            out.push(
+                "`[[ci.examples.exemption]]` row has no `path` — name the example it exempts"
+                    .to_string(),
+            );
+            continue;
+        }
+        if reason.trim().is_empty() {
+            out.push(format!(
+                "`[[ci.examples.exemption]] path = {path:?}` has no `reason` — an exemption \
+                 says why the example cannot be build-checked"
+            ));
+        }
+        if !path.starts_with("examples/") || !project_root.join(&path).is_file() {
+            out.push(format!(
+                "`[[ci.examples.exemption]] path = {path:?}` names no example file under \
+                 `examples/` — remove the row"
+            ));
+        }
+    }
+}
+
 fn check_lint_exemptions(project_root: &Path, doc: &Value, out: &mut Vec<String>) {
     let Some(rows) = doc
         .get("ci")
@@ -651,6 +712,33 @@ mod tests {
     }
 
     #[test]
+    fn an_example_exemption_names_an_example_and_a_reason() {
+        let f = Fixture::new("exexempt");
+        f.dir("examples/old")
+            .write("examples/old/board.yaml", "modules: []\n");
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\
+             [[ci.examples.exemption]]\npath = \"examples/old/board.yaml\"\nreason = \"r\"\n",
+        );
+        check(&f.0).unwrap();
+
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\
+             [[ci.examples.exemption]]\npath = \"examples/old/board.yaml\"\n",
+        );
+        assert!(f.err().contains("has no `reason`"));
+
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\
+             [[ci.examples.exemption]]\npath = \"examples/gone.yaml\"\nreason = \"r\"\n",
+        );
+        assert!(f.err().contains("names no example file"));
+    }
+
+    #[test]
     fn a_lint_exemption_crate_is_a_name_not_a_path() {
         let f = Fixture::new("exempt");
         f.write("Cargo.toml", "[workspace]\nmembers = [\"tools/bench\"]\n")
@@ -681,6 +769,28 @@ mod tests {
         );
         let e = f.err();
         assert!(e.contains("matches no workspace member"), "{e}");
+    }
+
+    #[test]
+    fn the_root_package_is_a_member_without_being_listed() {
+        let f = Fixture::new("rootpkg");
+        f.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tools/bench\"]\nexclude = [\"target\"]\n\
+             [package]\nname = \"p\"\nversion = \"0.0.1\"\n",
+        )
+        .write(
+            "tools/bench/Cargo.toml",
+            "[package]\nname = \"p-bench\"\nversion = \"0.0.1\"\n",
+        )
+        .write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\
+             [[ci.lints.exemption]]\ncrate = \"p\"\nreason = \"r\"\n",
+        );
+        check(&f.0).unwrap();
+        let members = workspace_members(&f.0);
+        assert_eq!(members.iter().filter(|(m, _)| m == ".").count(), 1);
     }
 
     #[test]

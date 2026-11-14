@@ -12,7 +12,7 @@ pub const MAX_CONTRACTS: usize = 64;
 /// ORed onto an opcode: dispatch to the provider below the caller.
 pub const CHAIN_NEXT: u32 = 0x10000;
 /// Contract ids the registry assigns.
-pub const CONTRACTS_ASSIGNED: usize = 40;
+pub const CONTRACTS_ASSIGNED: usize = 41;
 
 /// Op-level grants (`grants = [..]` in a manifest): the bits of the
 /// second grant word. A contract's own grant is its id's bit in the first.
@@ -762,6 +762,15 @@ pub mod metal_device {
     pub const PCIE_CFG_WRITE32: u32 = 0x24f7;
 }
 
+pub mod storage_custody {
+    pub const ID: u16 = 0x0028;
+    pub const SEAL: u32 = 0x2800;
+    pub const OPEN: u32 = 0x2801;
+    pub const CUSTODIAN: u32 = 0x2802;
+    pub const SPLIT: u32 = 0x2803;
+    pub const DRILL: u32 = 0x2804;
+}
+
 /// The contract a manifest names (`requires_contract`, `provides`).
 pub fn contract_of_name(name: &str) -> Option<u16> {
     match name {
@@ -791,6 +800,7 @@ pub fn contract_of_name(name: &str) -> Option<u16> {
         "platform_dma" => Some(0x001e),
         "platform_dma_fd" => Some(0x001f),
         "metal_device" => Some(0x0024),
+        "storage.custody" => Some(0x0028),
         _ => None,
     }
 }
@@ -839,6 +849,7 @@ pub fn contract_id(name: &str) -> Option<u16> {
         "vault_store" => Some(0x0026),
         "rp_raw" => Some(0x0027),
         "metal_device" => Some(0x0024),
+        "storage.custody" => Some(0x0028),
         _ => None,
     }
 }
@@ -886,6 +897,7 @@ pub fn contract_name(id: u16) -> Option<&'static str> {
         0x0025 => Some("diag"),
         0x0026 => Some("vault_store"),
         0x0027 => Some("rp_raw"),
+        0x0028 => Some("storage.custody"),
         _ => None,
     }
 }
@@ -906,11 +918,12 @@ pub fn module_providable(id: u16) -> bool {
             | 0x000e
             | 0x000f
             | 0x0012
+            | 0x0028
     )
 }
 
 /// How many contracts a manifest may name.
-pub const MANIFEST_CONTRACTS: usize = 26;
+pub const MANIFEST_CONTRACTS: usize = 27;
 
 /// The `i`th contract a manifest may name, in registry order.
 pub fn manifest_contract(i: usize) -> Option<&'static str> {
@@ -941,6 +954,7 @@ pub fn manifest_contract(i: usize) -> Option<&'static str> {
         23 => Some("platform_dma"),
         24 => Some("platform_dma_fd"),
         25 => Some("metal_device"),
+        26 => Some("storage.custody"),
         _ => None,
     }
 }
@@ -1563,6 +1577,11 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x27d0 => Some(OpGrant::Contract(0x0027)),
         0x27d1 => Some(OpGrant::Contract(0x0027)),
         0x27d2 => Some(OpGrant::Contract(0x0027)),
+        0x2800 => Some(OpGrant::Contract(0x0028)),
+        0x2801 => Some(OpGrant::Contract(0x0028)),
+        0x2802 => Some(OpGrant::Contract(0x0028)),
+        0x2803 => Some(OpGrant::Contract(0x0028)),
+        0x2804 => Some(OpGrant::Contract(0x0028)),
         _ => None,
     }
 }
@@ -1611,6 +1630,7 @@ pub fn contract_grant(id: u16) -> Option<OpGrant> {
         0x0025 => Some(OpGrant::Contract(0x0025)),
         0x0026 => Some(OpGrant::Grant(grant::SEAL_KEY)),
         0x0027 => Some(OpGrant::Contract(0x0027)),
+        0x0028 => Some(OpGrant::Contract(0x0028)),
         _ => None,
     }
 }
@@ -1916,6 +1936,41 @@ pub mod gate {
                 closes: false,
             }),
             0x103e => Some(OpRule {
+                handle: HandleUse::Global,
+                dir: ArgDir::In,
+                bound: Bound::Any,
+                walk: None,
+                closes: false,
+            }),
+            0x2800 => Some(OpRule {
+                handle: HandleUse::Global,
+                dir: ArgDir::InOut,
+                bound: Bound::Any,
+                walk: None,
+                closes: false,
+            }),
+            0x2801 => Some(OpRule {
+                handle: HandleUse::Global,
+                dir: ArgDir::InOut,
+                bound: Bound::Any,
+                walk: None,
+                closes: false,
+            }),
+            0x2802 => Some(OpRule {
+                handle: HandleUse::Global,
+                dir: ArgDir::InOut,
+                bound: Bound::Any,
+                walk: None,
+                closes: false,
+            }),
+            0x2803 => Some(OpRule {
+                handle: HandleUse::Global,
+                dir: ArgDir::InOut,
+                bound: Bound::Any,
+                walk: None,
+                closes: false,
+            }),
+            0x2804 => Some(OpRule {
                 handle: HandleUse::Global,
                 dir: ArgDir::In,
                 bound: Bound::Any,

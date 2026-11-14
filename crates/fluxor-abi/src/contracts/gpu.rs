@@ -8,9 +8,9 @@
 // no compatibility layer: a stream that does not decode here is not this
 // contract, and the answer is a framing fault rather than a fallback.
 //
-// Path-mounted by each side so the numbers cannot drift. The JS backend cannot
-// include Rust, so `tests/harness/tests/gpu_backend_wire.rs` reads
-// `host_shims.js` and checks its literals against these constants.
+// Every Rust side links it from `fluxor_abi`, so the numbers cannot drift.
+// The JS backend cannot, so a harness test reads `host_shims.js` and checks
+// its literals against these constants.
 //
 // ## What this contract is not
 //
@@ -20,14 +20,12 @@
 // resources*: a program pack, buffers and views, a dependency-ordered
 // submission, a fence, and a structured outcome.
 //
-// ## Mounting
+// ## Where the provider lives
 //
-// No inner attributes, so the file is `include!`-able flat alongside
-// `cores/gpu_pack.rs` and `cores/gpu_device.rs`, which read its constants
-// from the same namespace. A consumer that only needs the numbers can
-// `#[path]`-mount it as a module instead; both reaches see one definition.
-// Includers carry the usual module-scope `#![allow(dead_code)]` — no side
-// of this contract uses every constant.
+// This file is the contract alone. The portable half of a provider —
+// admission, handles, fences, budgets, the pack, the pump and replay — is a
+// library, `fluxor_sdk::gpu`, which re-exports these numbers and which the
+// Linux and wasm GPU providers link.
 //
 // ## Envelope
 //
@@ -417,30 +415,28 @@ pub const REASON_HANDLE_EXHAUSTED: u16 = 13;
 pub const REASON_FENCE_EXHAUSTED: u16 = 14;
 /// Queue depth reached.
 pub const REASON_QUEUE_FULL: u16 = 15;
-/// The declared waits would make the dependency graph cyclic.
-pub const REASON_DEPENDENCY_CYCLE: u16 = 16;
 /// A fence this work waited on failed or was cancelled.
-pub const REASON_DEPENDENCY_FAILED: u16 = 17;
+pub const REASON_DEPENDENCY_FAILED: u16 = 16;
 /// The object is referenced by in-flight work and cannot be mutated or
 /// evicted now.
-pub const REASON_IN_FLIGHT: u16 = 18;
+pub const REASON_IN_FLIGHT: u16 = 17;
 /// The device epoch ended.
-pub const REASON_DEVICE_LOST: u16 = 19;
+pub const REASON_DEVICE_LOST: u16 = 18;
 /// The request needs a feature, format or arithmetic fact this device does
 /// not advertise. Refused with the fact, never emulated silently.
-pub const REASON_UNSUPPORTED_FEATURE: u16 = 20;
+pub const REASON_UNSUPPORTED_FEATURE: u16 = 19;
 /// Program-pack identity, target, toolchain or binding layout is not
 /// acceptable to this provider.
-pub const REASON_BAD_PROGRAM: u16 = 21;
+pub const REASON_BAD_PROGRAM: u16 = 20;
 /// A candidate output would alias a public or input resource. Refused until
 /// aliasing is supported safely.
-pub const REASON_ALIASED_OUTPUT: u16 = 22;
+pub const REASON_ALIASED_OUTPUT: u16 = 21;
 /// The resource is not resident (or is still uploading) and this provider
 /// does not page it in transparently.
-pub const REASON_RESIDENCY: u16 = 23;
+pub const REASON_RESIDENCY: u16 = 22;
 /// The device timed out waiting for this work; the memory it could reach is
 /// retained until a verified reset, not reused.
-pub const REASON_TIMEOUT: u16 = 24;
+pub const REASON_TIMEOUT: u16 = 23;
 
 /// Human-readable name for a reason code. Diagnostics only — the number is
 /// the contract.
@@ -462,7 +458,6 @@ pub const fn reason_name(reason: u16) -> &'static str {
         REASON_HANDLE_EXHAUSTED => "handle-exhausted",
         REASON_FENCE_EXHAUSTED => "fence-exhausted",
         REASON_QUEUE_FULL => "queue-full",
-        REASON_DEPENDENCY_CYCLE => "dependency-cycle",
         REASON_DEPENDENCY_FAILED => "dependency-failed",
         REASON_IN_FLIGHT => "in-flight",
         REASON_DEVICE_LOST => "device-lost",

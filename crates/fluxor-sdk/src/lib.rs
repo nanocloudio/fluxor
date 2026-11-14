@@ -48,7 +48,7 @@ pub mod cores {
     pub mod session_handoff;
     pub mod table_consumer;
     pub mod transport_continuity;
-    pub mod transport_continuity_contract;
+    pub mod transport_continuity_record;
     pub mod tuple_arena;
 }
 
