@@ -217,7 +217,7 @@ pub mod kernel {
     pub const BOOT_INCARNATION: u32 = 0x002f;
     pub const PROGRAM_INFO: u32 = 0x002b;
     pub const PROGRAM_READ: u32 = 0x002c;
-    pub const SLOT_SIGNING_ROOT: u32 = 0x002d;
+    pub const SIGNING_ROOT: u32 = 0x002d;
     pub const SLOT_ADMITTED: u32 = 0x002e;
     pub const FLASH_LAYOUT: u32 = 0x002a;
     pub const MODULE_FLOW_BUDGET: u32 = 0x0046;

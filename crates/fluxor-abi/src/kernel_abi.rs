@@ -761,18 +761,18 @@ pub use super::registry::kernel::PROGRAM_INFO;
 /// and across the wasm memory split. `ENOENT` for no program in that slot.
 pub use super::registry::kernel::PROGRAM_READ;
 
-/// The root this kernel verifies graph-slot signatures against: the 32-byte
-/// Ed25519 public key compiled into the firmware. `handle = -1`, `arg`
-/// receives 32 bytes; `ENOENT` on a build with no slot root, which checks no
-/// slot signature. Ungated: the key is public, and a slot writer
+/// The signing root this kernel verifies modules and graph-slot signatures
+/// against: the 32-byte Ed25519 public key written into the kernel image.
+/// `handle = -1`, `arg` receives 32 bytes; `ENOENT` on a rootless image,
+/// which checks no signature. Ungated: the key is public, and a slot writer
 /// (`graph_slot`) checks a signature before it activates a slot rather than
 /// leaving a bad image for the next boot to discover.
-pub use super::registry::kernel::SLOT_SIGNING_ROOT;
+pub use super::registry::kernel::SIGNING_ROOT;
 
 /// Which graph slots this boot's slot selector admitted: `handle = -1`, the
 /// answer is a mask (bit 0 = slot A, bit 1 = slot B), on an RP board only
 /// (`ENOSYS` elsewhere). A slot is admitted when its header decodes, its ABI
-/// pin matches, and -- on a build with a slot root -- its signature verifies
+/// pin matches, and -- on an image with a signing root -- its signature verifies
 /// and its payload matches its digest. A slot writer that cannot afford to
 /// verify a signature every time it asks which slot is live (`graph_slot`)
 /// starts from this, and tracks the slots it erases and activates itself.

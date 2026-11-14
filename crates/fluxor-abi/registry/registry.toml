@@ -372,7 +372,7 @@ route = "class"
   gate = { handle = "global", arg = "inout", max = "any" }
 
   [[contract.op]]
-  name = "SLOT_SIGNING_ROOT"
+  name = "SIGNING_ROOT"
   op = 0x2D
   gate = { handle = "global", arg = "out", max = 32 }
 

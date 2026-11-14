@@ -72,10 +72,10 @@ fluxor build graph.yaml --emit=image --output graph.img --sign-key slot.key
 ```
 
 `--sign-key` is refused with any other `--emit` form, and the tool never
-prints the seed. A device trusts a signer when its kernel is built with
-that public key as the slot root: `FLUXOR_SLOT_ROOT_HEX`, 64 hex digits,
-read at compile time. A value that is not 64 hex digits fails the kernel
-build. A kernel built with a root:
+prints the seed. A device trusts a signer when its kernel image carries
+that public key as its signing root (`fluxor build --root`, or the
+workspace signing key's public half; see [security.md](security.md)). A
+kernel image with a root:
 
 - boots from a flash slot only when its header carries a record for the
   root that verifies and its payload matches the digest; otherwise it falls
@@ -84,7 +84,7 @@ build. A kernel built with a root:
   points) and is the same in the kernel and in `graph_slot`, so the boot
   selector and ACTIVATE agree on every image;
 - stages a RAM image only when the same holds (`-EACCES` otherwise);
-- tells `graph_slot` the root (`SLOT_SIGNING_ROOT`), which then activates
+- tells `graph_slot` the root (`SIGNING_ROOT`), which then activates
   a slot only when the same holds, so a successful activation is one the
   next boot honours.
 
@@ -253,7 +253,7 @@ The stage is RAM: two 8 MiB, 16 KiB-aligned static buffers used
 alternately A/B. `COMMIT` validates the staged image — FXSL magic and
 version, region bounds, SHA-256 over modules ‖ config against the
 header, strict ABI-surface-pin equality against the running kernel
-(`-EACCES` on mismatch), on a kernel built with a slot root the
+(`-EACCES` on mismatch), on a kernel image with a signing root the
 header's signature (`-EACCES`), and an epoch above the live one
 (`-EBUSY`) — then flips the region non-writable and executable via the
 platform HAL, re-points the static loader at it, and requests a
@@ -343,14 +343,14 @@ the pending image, not the running one. The header page (offset 0,
 which carries the magic and epoch the boot selector reads) is held in
 RAM when written and programmed only by `gs.activate`, after the epoch,
 the ABI pin, the SHA-256 over the rest of the slot and, on a kernel
-built with a slot root, the header's signature check out (a refused
+image with a signing root, the header's signature check out (a refused
 signature answers `-EACCES` and logs `[graph_slot] refused: signature`).
 A slot that was half-written or failed a check therefore has no magic
 and cannot be selected at boot. `gs.query_cfg` answers the running
 slot's config address, which stays readable until the next reset;
 `gs.query_active` answers the slot the next boot selects.
 
-On a kernel built with a slot root, `graph_slot` counts a slot live
+On a kernel image with a signing root, `graph_slot` counts a slot live
 (for `gs.query_active`, and as the epoch an activation must beat) only
 when the boot selector would admit it. Verifying a signature takes many
 steps, so it does not re-verify on every query: it starts from the
@@ -376,7 +376,7 @@ base graph's `tls` module. Binding to the running kernel is the
 ABI-surface pin; downgrade resistance is epoch monotonicity (within a
 boot on the RAM stage; against the slot it replaces on flash).
 
-On a kernel built with a slot root, the image's signature is what makes
+On a kernel image with a signing root, the image's signature is what makes
 a registry or transport compromise insufficient: a device boots, stages
 and activates only images the root's key signed, and the signed epoch
 cannot be raised to replay an old one. On a kernel built without one,

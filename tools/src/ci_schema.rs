@@ -100,6 +100,7 @@ pub fn check(project_root: &Path) -> std::result::Result<(), String> {
     check_inline_test_dirs(project_root, &doc, &mut problems);
     check_lint_exemptions(project_root, &doc, &mut problems);
     check_unknown_keys(&doc, &mut problems);
+    check_signing(&doc, &mut problems);
     if let Err(e) = crate::project::bound_stacks(project_root) {
         problems.push(e);
     }
@@ -113,6 +114,41 @@ pub fn check(project_root: &Path) -> std::result::Result<(), String> {
         "fluxor.toml does not conform to the schema:\n  {}",
         problems.join("\n  ")
     ))
+}
+
+// ── [signing] ───────────────────────────────────────────────────────────
+
+/// `[signing]` names the workspace's signing key and nothing else: `key =
+/// "${file:<path>}"`, the seed `fluxor modules build` signs with and whose
+/// public key `fluxor build` writes into kernel images as their root.
+fn check_signing(doc: &Value, out: &mut Vec<String>) {
+    let Some(signing) = doc.get("signing") else {
+        return;
+    };
+    let Some(table) = signing.as_table() else {
+        out.push("`[signing]` is a table".to_string());
+        return;
+    };
+    for (key, value) in table {
+        match key.as_str() {
+            "key" => {
+                if value
+                    .as_str()
+                    .and_then(crate::signing::file_source)
+                    .is_none()
+                {
+                    out.push(
+                        "`[signing] key` is `\"${file:<path>}\"`, the seed file `fluxor \
+                         modules keygen` makes"
+                            .to_string(),
+                    );
+                }
+            }
+            other => out.push(format!(
+                "unknown key `[signing] {other}` — `[signing]` holds only `key`"
+            )),
+        }
+    }
 }
 
 // ── always required ─────────────────────────────────────────────────────

@@ -274,11 +274,11 @@ silicon-oblivious:
   byte-compares a computed hash against the stored one. Every silicon
   ships a real comparison; the loader relies on it for module
   admission.
-- The device root-of-trust Ed25519 pubkey is provisioned at build
-  time via the `FLUXOR_SIGNING_PUBKEY_HEX` environment variable,
-  baked into the image and read by the loader's signature check. No
-  key provisioned means the `enforce_signatures` feature blocks
-  module load.
+- `signing_root() -> Option<[u8; 32]>` — the Ed25519 public key the
+  loader verifies modules and graph images against. Every platform
+  answers with the root the packager wrote into its kernel image
+  (`security::root::image_root`); the test HAL answers with one a test
+  sets.
 
 On BCM2712, `kernel::boot::dtb::read_ethernet_mac()` walks the
 firmware-provided flattened device tree for the `local-mac-address`

@@ -23,15 +23,15 @@
 //! The header page — offset 0, which carries the magic and the epoch the
 //! boot selector reads — is held in RAM when it is written, not
 //! programmed. ACTIVATE checks it (epoch above the running slot's, ABI
-//! pin, SHA-256 over the bytes already in flash, and on a kernel built with
-//! a slot root, the header's signature against that root) and only then
+//! pin, SHA-256 over the bytes already in flash, and on a kernel image with
+//! a signing root, the header's signature against that root) and only then
 //! programs it. So a slot that was erased, half-written, or failed a check
 //! has no magic, and the boot selector cannot pick it.
 //!
 //! ## Signed slots
 //!
-//! On a kernel built with a slot root (`FLUXOR_SLOT_ROOT_HEX`, read here
-//! through `SLOT_SIGNING_ROOT`) the boot selector admits only a slot whose
+//! On a kernel image with a signing root (read here through
+//! `SIGNING_ROOT`) the boot selector admits only a slot whose
 //! header is signed by that root and whose payload matches the header's
 //! digest. This module checks the same before it activates a slot, so an
 //! ACTIVATE that succeeds is one the next boot honours. It also counts a
@@ -995,14 +995,10 @@ pub extern "C" fn module_new(
         s.act_remaining = 0;
         core::ptr::write(&mut s.act_hasher, Sha256::new());
         core::ptr::write(&mut s.act_sig, Ed25519VerifyJob::empty());
-        // The slot root the kernel was built with, if any.
+        // The kernel image's signing root, if any.
         let mut root = [0u8; 32];
-        let rc = ((*s.syscalls).provider_call)(
-            -1,
-            abi::kernel_abi::SLOT_SIGNING_ROOT,
-            root.as_mut_ptr(),
-            32,
-        );
+        let rc =
+            ((*s.syscalls).provider_call)(-1, abi::kernel_abi::SIGNING_ROOT, root.as_mut_ptr(), 32);
         s.root = root;
         s.has_root = u8::from(rc == 32);
         let admitted = ((*s.syscalls).provider_call)(

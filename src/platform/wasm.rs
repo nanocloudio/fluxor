@@ -1314,8 +1314,8 @@ unsafe fn load_embedded_modules() -> usize {
         }
 
         // Run the same admission pipeline native modules go through:
-        // ABI-version, code-size, manifest-integrity, signature, and
-        // `enforce_signatures` gates all apply to hosted WASM modules
+        // ABI-version, code-size, manifest-integrity and signing-root
+        // checks all apply to hosted WASM modules
         // identically to RP/BCM. The wasm payload itself goes through
         // the host's wasmtime/browser instantiation below — the
         // kernel can't verify wasm32 instructions itself — but the

@@ -2116,6 +2116,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     // OTP holds no device key cannot seal (`None`), and its vault keeps keys
     // in RAM only: the honest outcome, not a weaker stand-in.
     seal_provenance: bcm_seal_provenance,
+    signing_root: fluxor::kernel::security::root::image_root,
     seal: bcm_seal,
     unseal: bcm_unseal,
     now_micros: bcm_now_micros,

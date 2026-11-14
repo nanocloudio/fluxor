@@ -919,7 +919,7 @@ fn cmd_combine(
 
     // Read firmware - keep as UF2 blocks to preserve non-contiguous sections like .end_block
     // Use the target's UF2 family ID so the correct chip accepts the image (e.g. RP2040 vs RP2350).
-    let (firmware_data, firmware_max_addr) =
+    let (mut firmware_data, firmware_max_addr) =
         if firmware_path.extension().is_some_and(|ext| ext == "bin") {
             let data = std::fs::read(firmware_path)?;
             if is_aarch64 {
@@ -949,6 +949,20 @@ fn cmd_combine(
     if verbose {
         let fmt = if is_aarch64 { "raw" } else { "UF2" };
         eprintln!("Firmware: {fmt} ends at 0x{firmware_max_addr:08x}");
+    }
+
+    // The signing root: written into the kernel image here, after link, so
+    // the build never bakes one in and the image admits exactly the modules
+    // signed by its key.
+    let root = crate::signing::root(&project_root)?;
+    crate::signing::write_root(
+        &mut firmware_data,
+        root,
+        &firmware_path.display().to_string(),
+    )?;
+    match root {
+        Some(r) => eprintln!("Signing root: {}", crate::signing::root_id(&r)),
+        None => eprintln!("Signing root: none (the image verifies no signature)"),
     }
 
     // Merge board hardware defaults for sections the YAML doesn't specify
@@ -1539,7 +1553,7 @@ pub fn cmd_workload_image(
 /// ABI-surface pin; with `sign_key`, an Ed25519 signature over those bytes.
 /// `graph_slot`'s ACTIVATE and the OTA staging commit recompute the digest
 /// before they accept the image, and the RP boot selector does too on a
-/// kernel built with a slot root.
+/// kernel image with a signing root.
 fn cmd_graph_image(
     config_path: &Path,
     output_path: &PathBuf,
@@ -1681,7 +1695,7 @@ fn cmd_graph_image(
     // four bytes of SHA-256 of the public key), and Ed25519 over the
     // header's first 96 bytes, which bind the payload through its digest.
     // Left erased when no key is given: an unsigned image, which only a
-    // device built without a slot root accepts.
+    // device with a rootless kernel image accepts.
     let signed = match sign_key {
         Some(key_path) => Some(sign_graph_image_header(
             &mut out[..HEADER_SIZE],

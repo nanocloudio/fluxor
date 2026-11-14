@@ -6,7 +6,7 @@
 //! the inactive one of two RAM staging buffers via `OTA_STAGE_WRITE`,
 //! then commits it with `OTA_STAGE_CTRL`. Commit validates the image —
 //! header shape, SHA-256 over the payload, ABI-surface pin against the
-//! running kernel, on a kernel built with a slot root its signature
+//! running kernel, on a kernel image with a signing root its signature
 //! (`security::slot_signature`), and an epoch above the live one — flips
 //! the region executable (cache maintenance / page permissions via
 //! `hal::ota_stage_protect`), re-points the static loader + config at the
@@ -211,11 +211,11 @@ fn commit() -> i32 {
         return errno::EACCES;
     }
 
-    // Signature: a kernel built with a slot root stages only an image signed
+    // Signature: a kernel image with a signing root stages only an image signed
     // by it. The signature covers the header, and through the digest checked
     // above, the payload; validation and the load below read the same
     // buffer, which nothing writes until the next stage begins in the other.
-    let root = crate::kernel::security::slot_signature::slot_root();
+    let root = crate::kernel::security::root::signing_root();
     if let Err(why) = crate::kernel::security::slot_signature::admits(image, root.as_ref()) {
         log::error!("[ota] commit: image refused: {why:?}");
         return errno::EACCES;

@@ -4,14 +4,14 @@
 #
 #   tools/signed-image.sh <target> <config.yaml> <out.img>
 #
-# A default build is permissive: unsigned modules load. Enforcement is
-# the `enforce_signatures` cargo feature, and the root of trust is a
-# public key compiled into the kernel (`option_env!` in
-# src/kernel/module/loader.rs). So an enforcing image is a MATCHED PAIR
-# — a kernel carrying the public key, and modules signed with the
-# private half — and assembling that pair correctly is what this script
-# is for. Mismatch it and the board boots and rejects every module,
-# which reads as a load failure rather than a key mismatch.
+# A signed image is a matched pair: modules signed by a key, and a kernel
+# image carrying that key's public half as its signing root. One key gives
+# both: `fluxor modules build` signs every module with `$FLUXOR_SIGNING_KEY`,
+# and `fluxor build` writes its public key into the image it packs. The
+# kernel is the ordinary one — a build never bakes a key in — so the root is
+# a fact of the image, not of the binary. Mismatch the pair and the board
+# boots and refuses every unsigned or foreign module, which reads as a load
+# failure; the boot log names the root (`signing: root <id>`).
 #
 # Target, graph and output path are arguments because all three are the
 # caller's to choose; add a build recipe to the project's `rig.toml`
@@ -39,16 +39,10 @@ SIGN_KEY="${SIGN_KEY:-${XDG_CONFIG_HOME:-$HOME/.config}/fluxor/signing/$TARGET.s
 
 mkdir -p "$(dirname "$SIGN_KEY")" "$(dirname "$IMG")"
 
-echo "[signed] resolving signing pubkey ($SIGN_KEY)..."
-PUBKEY="$(fluxor modules keygen -k "$SIGN_KEY")"
-echo "[signed] FLUXOR_SIGNING_PUBKEY_HEX=$PUBKEY"
+echo "[signed] signing key $SIGN_KEY, root $(fluxor modules keygen -k "$SIGN_KEY")"
+export FLUXOR_SIGNING_KEY="$SIGN_KEY"
 
-# The kernel build is `firmware.sh`'s, with the enforcement feature
-# added on top — so each target's triple and feature set stay in one
-# place.
-echo "[signed] building enforce_signatures firmware for $TARGET..."
-FLUXOR_SIGNING_PUBKEY_HEX="$PUBKEY" EXTRA_FEATURES=enforce_signatures \
-    tools/firmware.sh "$TARGET"
+tools/firmware.sh "$TARGET"
 
 # Where a target's modules live is the CLI's answer, not this script's:
 # `resolve` maps a board onto its silicon's directory. `modules build`
@@ -59,13 +53,10 @@ FLUXOR_SIGNING_PUBKEY_HEX="$PUBKEY" EXTRA_FEATURES=enforce_signatures \
 MODULES_DIR="$(fluxor modules resolve --target "$TARGET")"
 SILICON="$(basename "$(dirname "$MODULES_DIR")")"
 
-echo "[signed] building + signing modules for $SILICON..."
+echo "[signed] building and signing modules for $SILICON..."
 fluxor modules build --target "$SILICON"
-for m in "$MODULES_DIR"/*.fmod; do
-    fluxor modules sign -k "$SIGN_KEY" "$m"
-done
 
-echo "[signed] combining $CONFIG -> $IMG..."
+echo "[signed] combining $CONFIG -> $IMG with the key's root..."
 fluxor build "$CONFIG" --emit=combined \
     --firmware "target/$TARGET/firmware.bin" -o "$IMG"
-echo "[signed] done: $IMG (unsigned/tampered modules will be rejected)"
+echo "[signed] done: $IMG (unsigned/tampered modules run gated or not at all)"

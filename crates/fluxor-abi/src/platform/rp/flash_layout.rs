@@ -74,7 +74,7 @@ pub const GRAPH_SLOT_SIGNED_LEN: usize = 96;
 /// Header offset of the signature record: `[magic "SIG1"][key id: 4 bytes =
 /// the first four of SHA-256(public key)][Ed25519 signature R ‖ S: 64
 /// bytes]`, 72 bytes in all. An unsigned image leaves these bytes erased
-/// (0xFF). A kernel built with a slot root (`FLUXOR_SLOT_ROOT_HEX`) accepts
+/// (0xFF). A kernel image with a signing root accepts
 /// only an image whose record verifies against it; one built without checks
 /// no signature.
 pub const GRAPH_SLOT_SIGNATURE_OFFSET: usize = 96;

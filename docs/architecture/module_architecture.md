@@ -263,9 +263,9 @@ The runtime loader enforces a concrete module binary contract:
   code+data, an Ed25519 signature over that hash, and the signer's
   public-key fingerprint. The loader recomputes the hash at admission
   time and rejects any module whose bytes drift from the manifest
-  (`IntegrityMismatch`); with the `enforce_signatures` feature set,
-  unsigned modules and bad signatures are rejected
-  (`SignatureInvalid`). `fluxor modules sign` produces signed manifests; see
+  (`IntegrityMismatch`); on an image with a signing root, a bad
+  signature is rejected (`SignatureInvalid`) and an unsigned module runs
+  gated or not at all. `fluxor modules sign` produces signed manifests; see
   [security.md](security.md) for the trust chain and
   [network_boot.md](network_boot.md) for the deployment-time use of the
   same signing key.

@@ -346,7 +346,7 @@ fn slot_pin_admits(pin: &[u8; 32], own: &[u8; 32]) -> bool {
 }
 
 /// The slot selection, made once per boot and held in `SLOT_CHOICE`: with a
-/// slot root it verifies and hashes up to both slots, and boot asks for the
+/// signing root it verifies and hashes up to both slots, and boot asks for the
 /// layout more than once. 0 = not yet chosen, 1 = chosen.
 #[cfg(feature = "rp")]
 static SLOT_CHOSEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -394,7 +394,7 @@ fn choose_slot() -> Option<FlashLayout> {
     let own_digest = kernel_abi_surface_digest();
     // SAFETY: slot_a and slot_b are the bases of the two XIP-mapped slot
     // apertures; `decode_slot_header` reads the 256-byte header and, under
-    // a slot root, regions it has bounded inside the slot.
+    // a signing root, regions it has bounded inside the slot.
     let a = unsafe { decode_slot_header(slot_a, &own_digest) };
     // SAFETY: as above, for this board's slot B.
     let b = unsafe { decode_slot_header(slot_b, &own_digest) };
@@ -479,13 +479,13 @@ unsafe fn decode_slot_header(base: *const u8, own_digest: &[u8; 32]) -> Option<S
         return None;
     }
 
-    // A kernel built with a slot root selects only a slot signed by it whose
+    // A kernel image with a signing root selects only a slot signed by it whose
     // payload is what the signature vouches for: the signature covers the
     // digest, not the payload, so the payload is hashed here too. The
     // modules then run in place from the bytes hashed. Without a root the
     // slot is selected on its structure and pin; its payload is checked by
     // `graph_slot` before it activates the slot.
-    if let Some(root) = crate::kernel::security::slot_signature::slot_root() {
+    if let Some(root) = crate::kernel::security::root::signing_root() {
         let header = core::slice::from_raw_parts(base, flash_layout::GRAPH_SLOT_HEADER_SIZE);
         if let Err(why) = crate::kernel::security::slot_signature::admits(header, Some(&root)) {
             log::warn!("[boot] slot at {base:p} refused: {why:?}");

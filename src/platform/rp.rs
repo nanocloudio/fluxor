@@ -537,6 +537,7 @@ static RP_HAL_OPS: HalOps = HalOps {
     // holds one: read once, then soft-locked for the rest of the boot. An
     // RP2040 has no OTP and seals nothing. Unproven on hardware.
     seal_provenance: rp_seal_provenance,
+    signing_root: fluxor::kernel::security::root::image_root,
     seal: rp_seal,
     unseal: rp_unseal,
     now_micros: rp_now_micros,

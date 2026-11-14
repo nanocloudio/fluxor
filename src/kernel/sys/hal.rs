@@ -68,6 +68,10 @@ pub struct HalOps {
     /// have to be inferred from whether an encrypt call returned bytes,
     /// which it always does.
     pub seal_provenance: fn() -> SealProvenance,
+    /// The signing root modules and graph images are verified against:
+    /// every platform answers with the root written into its kernel image
+    /// (`security::root::image_root`).
+    pub signing_root: fn() -> Option<[u8; 32]>,
     /// Seal `plain` into `out` under associated data `aad`, returning the
     /// sealed length.
     ///
@@ -534,6 +538,11 @@ pub fn seal_blob_ready() -> bool {
 #[inline(always)]
 pub fn seal_provenance() -> SealProvenance {
     (ops().seal_provenance)()
+}
+
+/// See [`HalOps::signing_root`].
+pub fn signing_root() -> Option<[u8; 32]> {
+    (ops().signing_root)()
 }
 
 /// See [`HalOps::seal`].

@@ -19,23 +19,6 @@ use crate::kernel::exec::scheduler::ModuleId;
 use crate::kernel::exec::step::{Module, StepOutcome};
 use crate::kernel::sys::hal;
 
-/// The root-of-trust Ed25519 public key modules are signed against: the
-/// `FLUXOR_SIGNING_PUBKEY_HEX` build variable, 64 hex digits, compiled in.
-/// Any other value fails the build. `None` on a build without one, which
-/// verifies no module signature (and, with `enforce_signatures`, refuses
-/// every module).
-///
-/// This is build-config key provisioning, not a hardware mechanism, so it
-/// lives here with its sole consumer (the signature check below) rather than
-/// in the generic HAL.
-const MODULE_SIGNING_ROOT: Option<[u8; 32]> =
-    match crate::kernel::security::build_time_key(option_env!("FLUXOR_SIGNING_PUBKEY_HEX")) {
-        Ok(key) => key,
-        Err(crate::kernel::security::MalformedKey) => {
-            panic!("FLUXOR_SIGNING_PUBKEY_HEX must be 64 hex digits: a 32-byte Ed25519 public key")
-        }
-    };
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -129,12 +112,12 @@ pub enum LoaderError {
     AbiVersionMismatch { expected: u8, found: u8 },
     /// Integrity hash mismatch (manifest SHA-256 doesn't match code+data)
     IntegrityMismatch,
-    /// Ed25519 signature invalid or missing when enforce_signatures is set.
+    /// A signature is present and does not verify against the root.
     SignatureInvalid,
-    /// The module carries no ABI-surface attestation (manifest flag bit 4).
-    /// Every module must, signed or not: the numbers it was compiled with
-    /// are only known to be this kernel's when it says which surface it was
-    /// built against.
+    /// What the module attests does not meet the policy: it carries no
+    /// ABI-surface attestation (every module must, signed or not), or this
+    /// kernel has a signing root and the module, unverified, asked to run
+    /// ungated.
     Unattested,
     /// The module attests an ABI surface other than this kernel's: its
     /// hardcoded opcode, errno and flag numbers are another substrate's.
@@ -154,9 +137,6 @@ pub enum LoaderError {
     /// A gated module does something the gateway cannot mediate (provides a
     /// contract, owns an interrupt).
     GatedRefused(&'static str),
-    /// The module does not verify against this kernel's root key, and the
-    /// graph asked for an ungated level; an unverified module runs gated.
-    BelowSigningFloor,
     /// The platform could not build the gated module's protection domain.
     ProtectionUnavailable,
     /// The module's signed manifest does not name this kernel's runtime:
@@ -192,8 +172,9 @@ impl LoaderError {
             Self::IntegrityMismatch => log::error!("[loader] {context}: integrity hash mismatch"),
             Self::SignatureInvalid => log::error!("[loader] {context}: signature invalid"),
             Self::Unattested => log::error!(
-                "[loader] {context}: unattested module — it carries no ABI-surface attestation; \
-                 repack it with `fluxor modules build`"
+                "[loader] {context}: unattested module — it carries no ABI-surface attestation \
+                 (repack it with `fluxor modules build`), or this kernel has a signing root and \
+                 the module, not signed by it, asked to run ungated"
             ),
             Self::SurfaceMismatch => log::error!(
                 "[loader] {context}: ABI-surface mismatch — module built for a different substrate"
@@ -218,10 +199,6 @@ impl LoaderError {
             Self::GatedRefused(why) => {
                 log::error!("[loader] {context}: cannot be gated: {why}")
             }
-            Self::BelowSigningFloor => log::error!(
-                "[loader] {context}: not signed by this kernel's root key; it runs only at a gated \
-                 protection level (contained or isolated)"
-            ),
             Self::ProtectionUnavailable => log::error!(
                 "[loader] {context}: gated, and its protection domain could not be built \
                  (no free slot, or its memory cannot be covered) — not run privileged instead"
@@ -2123,8 +2100,8 @@ impl LoadedModule {
 /// trust profiles".
 ///
 /// `Flash`     — signed flash image (RP / Pi 5 production). Integrity hash
-///               + signature checks via `hal::verify_integrity` and the
-///               `enforce_signatures` feature gate.
+///               via `hal::verify_integrity`, signatures against the
+///               image's signing root (`security::root`).
 /// `Embedded`  — built-in static blob (WASM `EMBEDDED_MODULES_BLOB`, Linux
 ///               `mmap`'d `.fmod` file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2140,8 +2117,8 @@ pub enum LoadSource {
 /// blob. Trust is recorded as a typed `LoadSource` (Flash vs.
 /// Embedded), and integrity policy lives in two places: the
 /// platform's `hal::verify_integrity` (varies by source — see
-/// `docs/architecture/security.md`), and `cfg!(feature =
-/// "enforce_signatures")` which gates the Ed25519 path.
+/// `docs/architecture/security.md`), and the image's signing root
+/// (`security::root`), which decides the Ed25519 path.
 pub struct ModuleLoader {
     table_base: *const u8,
     header: Option<ModuleTableHeader>,
@@ -2607,10 +2584,9 @@ fn validate_fn_addr(addr: usize, name: &str) -> Result<(), LoaderError> {
 /// What a module's signature establishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signing {
-    /// Signed, and the signature verifies against the root key this kernel
-    /// was built with.
+    /// Signed, and the signature verifies against the image's signing root.
     RootVerified,
-    /// Unsigned, or no root key is provisioned to verify against.
+    /// Unsigned, or the image carries no signing root to verify against.
     Unverified,
 }
 
@@ -2714,21 +2690,13 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
         }
     }
     // Verify integrity hash from manifest section. Every short- or
-    // bad-magic manifest hits an explicit rejection arm before any
-    // byte read so `enforce_signatures` can never be bypassed by an
-    // undersized manifest.
+    // bad-magic manifest is refused before any byte is read.
     let manifest_size = module.header.manifest_size as usize;
     if manifest_size < 48 {
         // Manifest is absent or too small to carry an ABI-surface
         // attestation (the smallest attested manifest is its head, the stack
         // and arena blocks and the 32-byte attestation). Every module must
         // attest, signed or not.
-        if cfg!(feature = "enforce_signatures") {
-            log::error!(
-                "[loader] {name}: manifest size {manifest_size} below minimum (48) under enforce_signatures"
-            );
-            return Err(LoaderError::SignatureInvalid);
-        }
         let e = LoaderError::Unattested;
         e.log(name);
         return Err(e);
@@ -2752,9 +2720,8 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
             e.log(name);
             return Err(e);
         };
-        // `manifest_size >= 48` was checked above, so `>= 16` is trivially
-        // true — keep the explicit assertion-style read but reject any
-        // tampered manifest header explicitly under enforcement.
+        // A manifest with another magic or version carries nothing this
+        // loader can read, its attestation included.
         {
             let magic = u32::from_le_bytes([
                 manifest_data[0],
@@ -2763,33 +2730,15 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                 manifest_data[3],
             ]);
             if magic != MANIFEST_MAGIC {
-                if cfg!(feature = "enforce_signatures") {
-                    log::error!(
-                        "[loader] {name}: bad manifest magic 0x{magic:08x} under enforce_signatures"
-                    );
-                    return Err(LoaderError::SignatureInvalid);
-                }
-                // Without enforcement, an unrecognised manifest magic is
-                // "no manifest" — and a module without a manifest carries
-                // no attestation, so it is refused.
                 let e = LoaderError::Unattested;
                 e.log(name);
                 return Err(e);
             }
             {
                 // Manifest-format envelope version. The offsets below are
-                // those of the one layout this loader reads; any other
-                // version means they can't be trusted, so mirror the
-                // unrecognised-magic posture above: reject under
-                // enforcement, otherwise treat as "no manifest".
+                // those of the one layout this loader reads.
                 let manifest_version = manifest_data[4];
                 if manifest_version != EXPECTED_MANIFEST_VERSION {
-                    if cfg!(feature = "enforce_signatures") {
-                        log::error!(
-                            "[loader] {name}: manifest version={manifest_version} expected={EXPECTED_MANIFEST_VERSION} under enforce_signatures"
-                        );
-                        return Err(LoaderError::SignatureInvalid);
-                    }
                     // A layout this loader cannot read has no attestation
                     // it can find.
                     let e = LoaderError::Unattested;
@@ -2882,7 +2831,9 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                         h.copy_from_slice(&d);
                         h
                     };
-                    if let Some(pubkey) = MODULE_SIGNING_ROOT {
+                    // Without a root nothing is verified; with one, a
+                    // signature is either the root's or refused.
+                    if let Some(pubkey) = crate::kernel::security::root::signing_root() {
                         if !crate::kernel::security::crypto::ed25519::ed25519_verify(
                             &pubkey, &hash, &sig,
                         ) {
@@ -2890,14 +2841,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                             return Err(LoaderError::SignatureInvalid);
                         }
                         signing = Signing::RootVerified;
-                    } else if cfg!(feature = "enforce_signatures") {
-                        // No pubkey provisioned but enforcement demanded — reject.
-                        return Err(LoaderError::SignatureInvalid);
                     }
-                } else if cfg!(feature = "enforce_signatures") {
-                    // Unsigned module under enforcement — reject.
-                    log::error!("[loader] {name}: unsigned module rejected");
-                    return Err(LoaderError::SignatureInvalid);
                 }
                 // ABI-surface attestation, for EVERY module, signed or not:
                 // a module built against a different surface than this
@@ -3510,10 +3454,13 @@ impl DynamicModule {
         // protection regions can cover it. (The full parse follows heap init.)
         let gated = crate::kernel::exec::scheduler::params_level(params_slice).is_gated();
         // The signature sets a floor the graph cannot lower: where this
-        // kernel carries a root key, a module that does not verify against it
-        // runs gated or not at all.
-        if !gated && signing == Signing::Unverified && MODULE_SIGNING_ROOT.is_some() {
-            return Err(LoaderError::BelowSigningFloor);
+        // kernel carries a signing root, a module that does not verify
+        // against it runs gated or not at all.
+        if !gated
+            && signing == Signing::Unverified
+            && crate::kernel::security::root::signing_root().is_some()
+        {
+            return Err(LoaderError::Unattested);
         }
         // Isolation this kernel cannot give is refused, never run without it.
         #[cfg(not(any(feature = "kernel-vm", feature = "kernel-mpu")))]

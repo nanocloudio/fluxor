@@ -44,21 +44,25 @@ The loader path, implemented in `validate_module`:
 2. Compare against the manifest's stored hash via
    `hal::verify_integrity` (`src/kernel/sys/hal.rs`). Mismatch →
    `IntegrityMismatch`.
-3. If the manifest carries a signature (non-zero), read it together
-   with the signer fingerprint. Read the device's signing public key
-   (see key provisioning below). Run the kernel's own Ed25519 verify
-   (`src/kernel/security/crypto/ed25519.rs`) against the integrity
-   hash. Mismatch → `SignatureInvalid`.
-4. If the `enforce_signatures` cargo feature is set and the module is
-   unsigned or the device has no provisioned pubkey, reject.
+3. If the image carries a signing root and the manifest carries a
+   signature, verify the signature over the signing envelope against the
+   root with Ed25519. Mismatch → `SignatureInvalid`.
+4. At instantiation, a module that did not verify against a present root
+   runs only at a gated level; asked to run privileged, it is refused
+   (`Unattested`).
 
-Key provisioning is build-time configuration, not a hardware mechanism:
-the loader's `MODULE_SIGNING_ROOT` is the `FLUXOR_SIGNING_PUBKEY_HEX`
-environment variable, parsed at compile time (64 hex digits → 32 bytes
-baked into the kernel image). A value that is not 64 hex digits fails the
-build rather than producing a kernel that verifies nothing. The key lives
-with its sole consumer, the signature check, rather than in the generic
-HAL. No board reads it from OTP.
+The signing root is one 32-byte Ed25519 public key in a 40-byte item of
+the kernel image (`src/kernel/security/root.rs`, laid out by
+`abi::wire::image_root`). The kernel is built with it all zero, which is
+no root: such an image verifies nothing and logs `signing: no root;
+modules unverified` at boot. The packager writes the key after link —
+`fluxor build` into every image it packs (`--root`, else the workspace
+signing key's public half), `fluxor image root set` into any kernel image,
+the Linux binary among them — so a build never bakes a key in, and one
+binary serves a rootless and a rooted device. An image with a root logs
+`signing: root <id>`, the key's first four bytes. What binds the image to
+the device is the target's boot chain (RP2350 secure boot, Pi 5 signed
+boot, UEFI Secure Boot, the Linux binary's provenance), not this item.
 
 ### Load-source trust profiles
 
@@ -69,7 +73,7 @@ trust profiles:
 | Profile | Source | Integrity check | Signature check | Used by |
 |---|---|---|---|---|
 | **Trusted built-in** | Compiled-in `BuiltInModule` (e.g. `linux_net`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM host built-ins; bypass the loader entirely |
-| **Signed flash image** | RP / Pi 5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | If signature present, Ed25519 verify; if absent and `enforce_signatures` set, reject | Production RP2350 + Pi 5 firmware images |
+| **Signed flash image** | RP / Pi 5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | Under a signing root: a present signature must verify; an unsigned module runs gated or not at all | Production RP2350 + Pi 5 firmware images |
 | **Embedded blob** | WASM `EMBEDDED_MODULES_BLOB`, Linux `mmap`'d `.fmod` file | `hal::verify_integrity` byte-compares SHA-256 on every platform | Same as flash image when present | Linux dev runs, WASM bundles |
 | **Network / staged** | TFTP / OTA delivered image into a staging area then promoted | Same as flash image once promoted | Same | See [reconfigure.md](reconfigure.md) and [network_boot.md](network_boot.md) for the staged-image model |
 
@@ -80,11 +84,14 @@ checks to every non-built-in source.
 
 ### Signing Tool
 
-`fluxor modules sign <module.fmod> --key <seed>` rewrites the `.fmod` with a
-manifest carrying a fresh RFC 8032 Ed25519 signature. The private key is a
-raw 32-byte seed on disk; `fluxor modules keygen --key <seed>` creates one
-(mode 0600) and prints its public key, the value for
-`FLUXOR_SIGNING_PUBKEY_HEX`.
+`fluxor modules build` signs every module it builds with the workspace's
+signing key: `--sign-key`, else `$FLUXOR_SIGNING_KEY`, else `[signing] key =
+"${file:<path>}"` in `fluxor.toml`. The same key's public half is the root
+`fluxor build` writes into an image, so a workspace with a key builds a
+matched pair. `fluxor publish` refuses a module the key did not sign. `fluxor
+modules sign <module.fmod> --key <seed>` signs one module by hand. The
+private key is a raw 32-byte seed on disk; `fluxor modules keygen --key
+<seed>` creates one (mode 0600) and prints its public key, the root.
 
 ### Graph-image signatures
 
@@ -92,11 +99,10 @@ Source: `src/kernel/security/slot_signature.rs`.
 
 A graph image — what an RP flash slot holds and what the Pi 5 stages in RAM
 — can carry an Ed25519 signature over its header, which names the payload
-by its SHA-256. A kernel built with `FLUXOR_SLOT_ROOT_HEX` (a public key,
-64 hex digits; any other value fails the build) boots, stages and
+by its SHA-256. A kernel image with a signing root boots, stages and
 activates only images signed by that key whose payload matches the
-digest. This root is separate from the module signing root: one vouches
-for individual modules, the other for a whole graph. The image format,
+digest. It is the same root that verifies modules: one key vouches for
+individual modules and for a whole graph. The image format,
 the signing command and what is refused are in
 [network_boot.md](network_boot.md#graph-image-signatures).
 

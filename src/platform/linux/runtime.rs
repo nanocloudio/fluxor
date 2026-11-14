@@ -577,6 +577,7 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     now_unix_millis: linux_now_unix_millis,
     clock_sync_status: linux_clock_sync_status,
     seal_provenance: linux_seal_provenance,
+    signing_root: fluxor::kernel::security::root::image_root,
     seal_blob_write: linux_seal_blob_write,
     seal_blob_store: linux_seal_blob_store,
     seal_blob_delete: linux_seal_blob_delete,

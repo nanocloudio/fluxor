@@ -1517,6 +1517,23 @@ pub(crate) fn integration_sites_for(
             vec!["test", "--target", HARNESS_TARGET, "--no-fail-fast"],
         ));
     }
+    // A module signed by the CLI, verified by the kernel's own loader under
+    // that key's signing root: the round trip a signed image depends on,
+    // named as its own phase where the harness carries it.
+    let roundtrip = root.join("tests/harness/tests/kernel_loader_signature.rs");
+    if has_harness && roundtrip.is_file() {
+        out.push((
+            "sign-roundtrip",
+            root.join("tests/harness"),
+            vec![
+                "test",
+                "--target",
+                HARNESS_TARGET,
+                "--test",
+                "kernel_loader_signature",
+            ],
+        ));
+    }
     if host_tools.is_none() && has_cargo && has_root_tests {
         out.push((
             "cargo-test (integration)",

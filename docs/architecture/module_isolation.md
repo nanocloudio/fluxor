@@ -34,10 +34,10 @@ The config carries the provided level, and the kernel enforces exactly that
 level. The loader refuses a gated module whose protection domain it cannot
 build; it never runs one privileged instead.
 
-A signature sets a floor the graph cannot lower. On a kernel built with a
-root signing key (`FLUXOR_SIGNING_PUBKEY_HEX`), a module that does not verify
-against that key is loaded only at a gated level. A request for
-`privileged` is refused at load. A kernel built without a key has no signature
+A signature sets a floor the graph cannot lower. On a kernel image with a
+signing root ([security.md](security.md)), a module that does not verify
+against it is loaded only at a gated level. A request for
+`privileged` is refused at load (`Unattested`). A rootless image has no signature
 state to enforce, and loads modules at the level the graph gives them.
 
 ## What a gated module can reach
@@ -86,7 +86,7 @@ module controls. Before dispatch it checks every call three ways:
 Provider opcodes pass through a default-deny rule table:
 - The time, entropy, log, telemetry, report, event, arena, flash partition
   (`FLASH_LAYOUT`), program (`PROGRAM_INFO`, `PROGRAM_READ`), slot
-  (`SLOT_SIGNING_ROOT`, `SLOT_ADMITTED`) and `storage.object` opcodes are
+  (`SIGNING_ROOT`, `SLOT_ADMITTED`) and `storage.object` opcodes are
   listed, each with its direction and handle kind.
 - An opcode the table does not name is refused with `EACCES`.
 - A struct that carries pointers (the `storage.object` `PUT`, `HEAD`,

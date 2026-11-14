@@ -86,10 +86,17 @@ enum Commands {
         /// seed file, as `fluxor modules keygen --key <file>` makes and
         /// whose public key it prints. The signature covers the header's
         /// first 96 bytes (epoch, regions, payload digest, ABI pin); a
-        /// device whose kernel was built with `FLUXOR_SLOT_ROOT_HEX` set to
-        /// that public key accepts only images it verifies.
+        /// device whose kernel image carries that public key as its signing
+        /// root (`--root`) accepts only images it verifies.
         #[arg(long)]
         sign_key: Option<PathBuf>,
+        /// The signing root to write into the kernel image this build packs:
+        /// the 64-hex-digit public key modules and graph images must be
+        /// signed by. Without it the image takes the public key of the
+        /// workspace's signing key (`$FLUXOR_SIGNING_KEY`, `[signing] key`),
+        /// and without one it carries no root and verifies nothing.
+        #[arg(long, value_name = "PUBKEY_HEX")]
+        root: Option<String>,
         /// One param value, typed by the graph's declared `params:`.
         /// Repeatable; overrides `--params`. Without values a build renders
         /// each param's default and refuses a missing required one.
@@ -426,6 +433,15 @@ enum Commands {
     Modules {
         #[command(subcommand)]
         action: ModulesAction,
+    },
+
+    /// A built kernel image's signing root: the public key its loader
+    /// verifies modules and graph images against. `fluxor build` writes it
+    /// into the bare-metal images it packs; these verbs read and write it in
+    /// any kernel image, the Linux runtime binary among them.
+    Image {
+        #[command(subcommand)]
+        action: ImageAction,
     },
 
     /// Offline GPU program packs: build, inspect, validate.
@@ -925,6 +941,32 @@ enum LintAction {
 }
 
 #[derive(Subcommand)]
+enum ImageAction {
+    /// The signing root a kernel image carries.
+    Root {
+        #[command(subcommand)]
+        action: ImageRootAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageRootAction {
+    /// Print the image's signing root (`none` for a rootless image).
+    Show {
+        /// The kernel image: an ELF, a raw binary, a PE image or a UF2.
+        image: PathBuf,
+    },
+    /// Write a signing root into the image, in place.
+    Set {
+        /// The kernel image: an ELF, a raw binary, a PE image or a UF2.
+        image: PathBuf,
+        /// The 64-hex-digit public key, as `fluxor modules keygen` prints
+        /// it, or `none` to clear the root.
+        root: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ModulesAction {
     /// Build PIC / wasm modules. `--target T` builds a single target;
     /// `--all` reads the list from `fluxor.toml::[ci].targets`.
@@ -954,6 +996,12 @@ enum ModulesAction {
         /// so `#[expect]` is honest in either mode.
         #[arg(long, conflicts_with = "strict")]
         lenient: bool,
+        /// Sign every module with this key -- a 32-byte Ed25519 seed file.
+        /// Without it the workspace's signing key signs them
+        /// (`$FLUXOR_SIGNING_KEY`, `fluxor.toml` `[signing] key`), and
+        /// without one they are built unsigned.
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
         /// Project root override.
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -1034,8 +1082,8 @@ enum ModulesAction {
     },
     /// Generate / inspect an Ed25519 signing keypair.
     ///
-    /// Prints the 64-hex-char PUBLIC key to stdout (for the kernel's
-    /// `FLUXOR_SIGNING_PUBKEY_HEX` or `FLUXOR_SLOT_ROOT_HEX` build variable)
+    /// Prints the 64-hex-char PUBLIC key to stdout (a kernel image's signing
+    /// root, `fluxor build --root`)
     /// and ensures the 32-byte private seed exists at `--key` (generated 0600
     /// from the OS RNG if absent). The matching seed is what
     /// `fluxor modules sign` and `fluxor build --emit=image --sign-key`

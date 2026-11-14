@@ -278,6 +278,9 @@ pub fn publish_project_into(
     let ci_stamp = read_ci_stamp(&pr);
     let input_digests = project_input_digests(&pr)?;
     let want = |k: &str| only.is_empty() || only.contains(&k);
+    // The fingerprint every published module must carry when this
+    // workspace has a signing key.
+    let signer = crate::signing::seed(None, &pr)?.map(|s| crate::signing::fingerprint(&s));
 
     let store_root = match store_dir {
         Some(d) => d.to_path_buf(),
@@ -482,6 +485,23 @@ pub fn publish_project_into(
                                     short(&current),
                                 )));
                             }
+                        }
+                    }
+                    // A workspace that signs publishes only what it signed:
+                    // a kernel image with its root admits nothing else
+                    // ungated.
+                    if let Some(fp) = &signer {
+                        let signed_by_key =
+                            crate::modules::ModuleInfo::from_file(&fmod).is_ok_and(|i| {
+                                i.manifest.signature.is_some()
+                                    && i.manifest.signer_fp.as_ref() == Some(fp)
+                            });
+                        if !signed_by_key {
+                            return Err(Error::Module(format!(
+                                "{}: not signed by this workspace's signing key — run `fluxor \
+                                 modules build`, which signs every module with it",
+                                fmod.display()
+                            )));
                         }
                     }
                     let Some(input_hex) = input_digests.get(&name).cloned() else {

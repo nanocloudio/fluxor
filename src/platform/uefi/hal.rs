@@ -239,6 +239,7 @@ pub static HAL_OPS: HalOps = HalOps {
     now_unix_millis: || fluxor::kernel::sys::time_sync::unix_millis(now_micros()),
     clock_sync_status: || fluxor::kernel::sys::time_sync::status(now_micros()),
     seal_provenance: || hal::SealProvenance::None,
+    signing_root: fluxor::kernel::security::root::image_root,
     seal: |_, _, _| None,
     unseal: |_, _, _| None,
     seal_blob_write: |_, _| false,

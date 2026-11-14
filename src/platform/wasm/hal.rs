@@ -228,6 +228,7 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     // raises a vault's isolation tier and with it what a deployment
     // believes about keys it has not protected.
     seal_provenance: || crate::kernel::sys::hal::SealProvenance::None,
+    signing_root: crate::kernel::security::root::image_root,
     seal: |_, _, _| None,
     unseal: |_, _, _| None,
     now_micros: wasm_now_micros,

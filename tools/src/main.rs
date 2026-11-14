@@ -95,6 +95,7 @@ mod ring_plan;
 mod runtime_abi;
 mod scenario;
 mod schema;
+mod signing;
 mod stack_expand;
 mod store_cli;
 pub mod target;
@@ -170,27 +171,33 @@ fn main() {
             target,
             epoch,
             sign_key,
+            root,
             params,
             params_file,
-        } => cmd_build_dispatch(
-            path.as_ref(),
-            BuildFlags {
-                output,
-                emit,
-                check,
-                firmware,
-                module_root,
-                target,
-                epoch,
-                sign_key,
-                params: workload_src::RunParams {
-                    flags: params,
-                    file: params_file,
-                    module_root: None,
+        } => {
+            if let Some(hex) = root {
+                signing::set_root_flag(hex);
+            }
+            cmd_build_dispatch(
+                path.as_ref(),
+                BuildFlags {
+                    output,
+                    emit,
+                    check,
+                    firmware,
+                    module_root,
+                    target,
+                    epoch,
+                    sign_key,
+                    params: workload_src::RunParams {
+                        flags: params,
+                        file: params_file,
+                        module_root: None,
+                    },
                 },
-            },
-            verbose,
-        ),
+                verbose,
+            )
+        }
         Commands::Run {
             config,
             print_synthesised,
@@ -341,6 +348,9 @@ fn main() {
             command,
         } => cmd_help(make, project_root.as_deref(), command.as_deref()),
         Commands::Ci { skip, project_root } => cmd_ci(&skip, project_root.as_deref(), verbose),
+        Commands::Image {
+            action: ImageAction::Root { action },
+        } => cmd_image_root(action),
         Commands::Modules { action } => match action {
             ModulesAction::Build {
                 target,
@@ -348,13 +358,15 @@ fn main() {
                 out,
                 strict,
                 lenient,
+                sign_key,
                 project_root,
             } => cmd_modules_build(
                 target,
                 all,
                 &out,
-                strict,
-                lenient,
+                // `--lenient` is the implicit default when neither is set.
+                strict && !lenient,
+                sign_key.as_deref(),
                 project_root.as_deref(),
                 verbose,
             ),

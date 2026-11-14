@@ -19,12 +19,11 @@
 //! epoch is signed, so a signed image cannot be replayed under a higher one.
 //! Bytes 168..256 are neither signed nor read.
 //!
-//! The root is a build-time fact: `FLUXOR_SLOT_ROOT_HEX`, the 32-byte Ed25519
-//! public key in 64 hex digits, compiled in; any other value fails the build.
-//! A kernel built with a root admits only an image whose record verifies
-//! against it: at boot slot selection, at OTA staging, and (through
-//! `SLOT_SIGNING_ROOT`) at `graph_slot`'s ACTIVATE. A kernel built without
-//! one checks no signature, so it admits signed and unsigned images alike on
+//! The root is the kernel image's signing root (`security::root`), the one
+//! that verifies modules too. A kernel with a root admits only an image
+//! whose record verifies against it: at boot slot selection, at OTA staging,
+//! and (through `SIGNING_ROOT`) at `graph_slot`'s ACTIVATE. A rootless kernel
+//! checks no signature, so it admits signed and unsigned images alike on
 //! their structure, pin and epoch.
 //!
 //! The signature is checked by the kernel's strict Ed25519 verifier, which
@@ -33,20 +32,6 @@
 //! key is the compiled-in root, never read from the image.
 
 use crate::abi::platform::rp::flash_layout as fl;
-
-/// `FLUXOR_SLOT_ROOT_HEX`, parsed at compile time.
-const SLOT_ROOT: Option<[u8; 32]> = match super::build_time_key(option_env!("FLUXOR_SLOT_ROOT_HEX"))
-{
-    Ok(root) => root,
-    Err(crate::kernel::security::MalformedKey) => {
-        panic!("FLUXOR_SLOT_ROOT_HEX must be 64 hex digits: a 32-byte Ed25519 public key")
-    }
-};
-
-/// The slot root this kernel was built with, if any.
-pub fn slot_root() -> Option<[u8; 32]> {
-    SLOT_ROOT
-}
 
 /// Why a header was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -29,6 +29,7 @@ pub fn boot(ops: &'static sys::hal::HalOps) {
     sys::hal::init(ops);
     module::syscalls::init_syscall_table();
     module::syscalls::init_providers();
+    security::root::log_signing_root();
 }
 
 /// Kernel-private service registries and orchestration. Mirrors the

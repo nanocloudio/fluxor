@@ -91,6 +91,7 @@ pub mod protection;
 pub mod publish;
 pub mod render_template;
 pub mod runtime_abi;
+pub mod signing;
 // The consolidated store flow: `store_publish` (the single store-write
 // path), `store_resolve` (uniform `[[artifact]]` lockfile resolution),
 // and `store_sync` (the one-path materialiser + `workspace publish`).

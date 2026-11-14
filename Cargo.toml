@@ -290,12 +290,6 @@ host-hsm = ["host-linux", "cryptoki"]
 # feed real images into the display sink without a board codec.
 host-image = ["host-linux", "image"]
 
-# Require every loaded module to carry a valid Ed25519 signature from the
-# provisioned root-of-trust key (see hal::otp_read_signing_key). When
-# unset, the loader accepts unsigned modules; set it for production images
-# built from a signed module tree.
-enforce_signatures = []
-
 [build-dependencies]
 toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }

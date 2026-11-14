@@ -1521,8 +1521,8 @@ fn cmd_flash(config_path: &Path, module_root: Option<&Path>, verbose: bool) -> R
 /// Generate / inspect an Ed25519 signing keypair. Ensures a 32-byte private
 /// seed exists at `key_path` (generated 0600 from the OS RNG if absent, or
 /// `--force`d), then prints the matching 64-hex-char PUBLIC key to stdout —
-/// the value a kernel embeds as `FLUXOR_SIGNING_PUBKEY_HEX` (module
-/// signatures) or `FLUXOR_SLOT_ROOT_HEX` (graph-image signatures). Human
+/// the value a kernel image carries as its signing root (`fluxor build
+/// --root`), which verifies module and graph-image signatures. Human
 /// notes go to stderr so stdout is exactly the pubkey (capturable in
 /// `$(...)`).
 fn cmd_keygen(key_path: &PathBuf, force: bool) -> Result<()> {
@@ -1579,7 +1579,7 @@ fn cmd_keygen(key_path: &PathBuf, force: bool) -> Result<()> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
     let pk = crypto::derive_public_key(&seed);
-    // stdout = JUST the pubkey hex, so `FLUXOR_SIGNING_PUBKEY_HEX=$(fluxor modules keygen …)` works.
+    // stdout = JUST the pubkey hex, so `--root $(fluxor modules keygen …)` works.
     let mut s = String::with_capacity(64);
     for &b in pk.iter() {
         s.push_str(&format!("{b:02x}"));
@@ -1591,34 +1591,18 @@ fn cmd_keygen(key_path: &PathBuf, force: bool) -> Result<()> {
 /// Sign a packed .fmod module with an Ed25519 seed, appending a v2 manifest
 /// carrying the signature + signer fingerprint. Writes either in place or to
 /// `output`.
-fn cmd_sign(
-    input: &PathBuf,
-    key_path: &PathBuf,
-    output: Option<&std::path::Path>,
-    verbose: bool,
-) -> Result<()> {
-    use std::fs;
-
-    let seed_bytes = fs::read(key_path)
-        .map_err(|e| Error::Module(format!("read key {}: {}", key_path.display(), e)))?;
-    if seed_bytes.len() != 32 {
-        return Err(Error::Module(format!(
-            "key must be exactly 32 bytes, got {}",
-            seed_bytes.len()
-        )));
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes);
-
-    let fmod =
-        fs::read(input).map_err(|e| Error::Module(format!("read {}: {}", input.display(), e)))?;
+/// `fmod` signed by `seed`: the signed module, the signer's public key and
+/// its fingerprint. The integrity hash is stamped and the signature taken
+/// over the signing envelope (`fmod::signing_envelope`), the bytes the
+/// kernel loader verifies.
+pub(crate) fn sign_fmod(fmod: &[u8], seed: &[u8; 32]) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
     use modules::MODULE_HEADER_SIZE;
     if fmod.len() < MODULE_HEADER_SIZE {
         return Err(Error::Module("fmod file too small".into()));
     }
 
     // Locate the manifest section from the module header.
-    let h = fluxor_abi::wire::fmod::header::Header::read(&fmod)
+    let h = fluxor_abi::wire::fmod::header::Header::read(fmod)
         .ok_or_else(|| Error::Module("fmod file too small".into()))?;
     let code_size = h.code_size as usize;
     let data_size = h.data_size as usize;
@@ -1661,7 +1645,7 @@ fn cmd_sign(
     let mut envelope_hash = [0u8; 32];
     envelope_hash.copy_from_slice(&h.finalize());
 
-    let (pk, sig) = crypto::sign(&seed, &envelope_hash);
+    let (pk, sig) = crypto::sign(seed, &envelope_hash);
     let signer_fp = crypto::sha256(&pk);
     if !crypto::verify(&pk, &envelope_hash, &sig) {
         return Err(Error::Module("internal: round-trip verify failed".into()));
@@ -1680,6 +1664,21 @@ fn cmd_sign(
     let manifest_size_le = (new_manifest_size as u16).to_le_bytes();
     let at = fluxor_abi::wire::fmod::HEADER_MANIFEST_SIZE_AT;
     out_bytes[at..at + 2].copy_from_slice(&manifest_size_le);
+    Ok((out_bytes, pk, signer_fp))
+}
+
+fn cmd_sign(
+    input: &PathBuf,
+    key_path: &Path,
+    output: Option<&std::path::Path>,
+    verbose: bool,
+) -> Result<()> {
+    use std::fs;
+
+    let seed = crate::signing::read_seed(key_path)?;
+    let fmod =
+        fs::read(input).map_err(|e| Error::Module(format!("read {}: {}", input.display(), e)))?;
+    let (out_bytes, pk, signer_fp) = sign_fmod(&fmod, &seed)?;
 
     let out_path = output.unwrap_or(input.as_path());
     fs::write(out_path, &out_bytes)
@@ -1930,20 +1929,19 @@ fn cmd_lint_presentation(project_root_override: Option<&Path>) -> Result<()> {
 }
 
 /// `fluxor modules build` — drive the PIC / wasm module pipeline.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "CLI boolean flags map 1:1 to clap fields; collapsing them adds indirection without clarifying intent"
-)]
 fn cmd_modules_build(
     target: Option<String>,
     all: bool,
     out: &Path,
     strict: bool,
-    lenient: bool,
+    sign_key: Option<&Path>,
     project_root: Option<&Path>,
     verbose: bool,
 ) -> Result<()> {
     let project_root = resolve_project_root(project_root);
+    // Read before anything is built: a named key that is unreadable stops
+    // the build rather than leaving it unsigned.
+    let seed = crate::signing::seed(sign_key, &project_root)?;
     let out_root = if out.is_absolute() {
         out.to_path_buf()
     } else {
@@ -1972,12 +1970,20 @@ fn cmd_modules_build(
         project_root,
         selector,
         out_root,
-        // `--lenient` is the implicit default when neither flag is set.
-        strict: strict && !lenient,
+        strict,
         verbose,
     };
     let report = modules_build::run(&opts)?;
     let mut had_failure = false;
+    if let Some(seed) = seed {
+        for tr in &report.per_target {
+            let dir = opts.out_root.join(&tr.abi).join("modules");
+            let n = sign_built_modules(&dir, tr.built.iter().chain(&tr.up_to_date), &seed)?;
+            if n > 0 {
+                println!("Modules ({}/{}): signed {n}", tr.target, tr.abi);
+            }
+        }
+    }
     for tr in &report.per_target {
         println!(
             "Modules ({target}/{abi}): built {} of {}, up-to-date {}, skipped {}, failed {}",
@@ -2001,6 +2007,59 @@ fn cmd_modules_build(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `fluxor image root show|set`.
+fn cmd_image_root(action: ImageRootAction) -> Result<()> {
+    let (path, set) = match &action {
+        ImageRootAction::Show { image } => (image, None),
+        ImageRootAction::Set { image, root } => (image, Some(root.as_str())),
+    };
+    let mut bytes = std::fs::read(path)
+        .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+    if let Some(root) = set {
+        let root = match root {
+            "none" => None,
+            hex => Some(crate::signing::parse_root(hex)?),
+        };
+        crate::signing::write_root(&mut bytes, root, &path.display().to_string())?;
+        std::fs::write(path, &bytes)
+            .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
+    }
+    let root = fluxor_abi::wire::image_root::read(&bytes).map_err(|e| {
+        Error::Config(format!("{}: no single signing-root item ({e:?})", path.display()))
+    })?;
+    match root {
+        Some(r) => println!("{}", fluxor_tools::hash::hex(&r)),
+        None => println!("none"),
+    }
+    Ok(())
+}
+
+/// Sign each named module in `dir` with `seed`, leaving one it already
+/// signed alone (Ed25519 is deterministic, so re-signing would write the
+/// same bytes). How many it signed.
+fn sign_built_modules<'a>(
+    dir: &Path,
+    names: impl Iterator<Item = &'a String>,
+    seed: &[u8; 32],
+) -> Result<usize> {
+    let fp = crate::signing::fingerprint(seed);
+    let mut signed = 0;
+    for name in names {
+        let path = dir.join(format!("{name}.fmod"));
+        let info = modules::ModuleInfo::from_file(&path)?;
+        if info.manifest.signature.is_some() && info.manifest.signer_fp == Some(fp) {
+            continue;
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|e| Error::Module(format!("read {}: {e}", path.display())))?;
+        let (out, _, _) = sign_fmod(&bytes, seed)?;
+        std::fs::write(&path, out)
+            .map_err(|e| Error::Module(format!("write {}: {e}", path.display())))?;
+        signed += 1;
+    }
+    Ok(signed)
 }
 
 fn cmd_modules_clean(out: &Path) -> Result<()> {

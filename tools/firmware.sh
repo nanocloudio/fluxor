@@ -104,11 +104,6 @@ if [[ -f "$HOST_TOML" ]]; then
     LOADER_TARGET="$(toml_get build loader_target "$HOST_TOML")"
 fi
 
-# Features layered on top of the target's own, for a build that differs
-# only by an opt-in (`EXTRA_FEATURES=enforce_signatures`, from
-# signed-image.sh) — so a variant does not fork the resolution above.
-FEATURES="$FEATURES${EXTRA_FEATURES:+,$EXTRA_FEATURES}"
-
 # Resolution without the build, for anything that needs to know what this
 # script *would* do: `FIRMWARE_PLAN_ONLY=1 tools/firmware.sh <board>`.
 # This script reads the same TOMLs the CLI's target descriptors come from,

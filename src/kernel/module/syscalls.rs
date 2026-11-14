@@ -1191,14 +1191,14 @@ pub fn register_dev_query_extension(f: ExtensionFn) {
     }
 }
 
-/// `PROGRAM_INFO`, `PROGRAM_READ`, `SLOT_SIGNING_ROOT` and `SLOT_ADMITTED`:
+/// `PROGRAM_INFO`, `PROGRAM_READ`, `SIGNING_ROOT` and `SLOT_ADMITTED`:
 /// the calling module's own programs, the root graph slots are signed
 /// against, and the slots this boot admitted. A module names a program only
 /// by its slot among its own; whose programs they are comes from which module
 /// is running, never from the request.
 unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::kernel_abi::{
-        program as pg, FLASH_LAYOUT, PROGRAM_INFO, PROGRAM_READ, SLOT_ADMITTED, SLOT_SIGNING_ROOT,
+        program as pg, FLASH_LAYOUT, PROGRAM_INFO, PROGRAM_READ, SIGNING_ROOT, SLOT_ADMITTED,
     };
     use crate::abi::platform::rp::flash_layout::GRAPH_FLASH_LEN;
     use crate::kernel::exec::scheduler;
@@ -1213,7 +1213,7 @@ unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     // LE]`.
     let need = match opcode {
         FLASH_LAYOUT => GRAPH_FLASH_LEN,
-        SLOT_SIGNING_ROOT => 32,
+        SIGNING_ROOT => 32,
         PROGRAM_INFO => pg::INFO_LEN,
         PROGRAM_READ => 8,
         _ => return errno::ENOSYS,
@@ -1231,8 +1231,8 @@ unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
         #[cfg(not(feature = "rp"))]
         return errno::ENOSYS;
     }
-    if opcode == SLOT_SIGNING_ROOT {
-        return match crate::kernel::security::slot_signature::slot_root() {
+    if opcode == SIGNING_ROOT {
+        return match crate::kernel::security::root::signing_root() {
             Some(root) => {
                 core::ptr::copy_nonoverlapping(root.as_ptr(), arg, 32);
                 32
@@ -1332,7 +1332,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
         crate::abi::kernel_abi::PROGRAM_INFO
         | crate::abi::kernel_abi::PROGRAM_READ
-        | crate::abi::kernel_abi::SLOT_SIGNING_ROOT
+        | crate::abi::kernel_abi::SIGNING_ROOT
         | crate::abi::kernel_abi::SLOT_ADMITTED
         | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, arg_len),
         resource::ELASTIC_ALLOC => handle_elastic_alloc(arg, arg_len),

@@ -184,6 +184,10 @@ pub fn fe_carry(h: &mut Fe) {
     }
 }
 
+// On 32-bit ARM the u128 limb arithmetic below is long, and inlined into
+// every point operation it costs ~30 KB of flash an RP2040 kernel does not
+// have; called, it costs a branch per field operation.
+#[cfg_attr(target_arch = "arm", inline(never))]
 pub fn fe_add(a: &Fe, b: &Fe) -> Fe {
     let mut r = [
         a[0] + b[0],
@@ -198,6 +202,7 @@ pub fn fe_add(a: &Fe, b: &Fe) -> Fe {
 
 /// a - b mod p. Adds 2p per limb before subtracting so limbs never
 /// underflow (inputs keep limbs < 2^52 ≤ the 2p limb values).
+#[cfg_attr(target_arch = "arm", inline(never))]
 pub fn fe_sub(a: &Fe, b: &Fe) -> Fe {
     // 2p in radix 2^51: limb0 = 2^52 - 38, limbs 1-4 = 2^52 - 2.
     let mut r = [
@@ -218,6 +223,7 @@ pub fn fe_neg(a: &Fe) -> Fe {
 /// Schoolbook radix-51 multiplication with the 19·wraparound folded into
 /// the column sums (2^255 ≡ 19 mod p). u128 accumulators: worst-case
 /// column < 5 · 19 · 2^54 · 2^54 < 2^116.
+#[cfg_attr(target_arch = "arm", inline(never))]
 pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     let a0 = a[0] as u128;
     let a1 = a[1] as u128;
@@ -268,6 +274,7 @@ pub fn fe_carry_wide(t0: u128, mut t1: u128, mut t2: u128, mut t3: u128, mut t4:
 
 /// `a²`: the symmetric products are formed once and doubled, 15
 /// multiplies against `fe_mul`'s 25.
+#[cfg_attr(target_arch = "arm", inline(never))]
 pub fn fe_sq(a: &Fe) -> Fe {
     let a0 = a[0] as u128;
     let a1 = a[1] as u128;
@@ -289,6 +296,7 @@ pub fn fe_sq(a: &Fe) -> Fe {
 }
 
 /// `a·c` for a small constant `c < 2^20`.
+#[cfg_attr(target_arch = "arm", inline(never))]
 pub fn fe_mul_small(a: &Fe, c: u64) -> Fe {
     let c = c as u128;
     fe_carry_wide(
