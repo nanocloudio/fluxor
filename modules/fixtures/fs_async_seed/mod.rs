@@ -236,13 +236,13 @@ unsafe fn emit_fail(s: &SeedState, phase: u8, rc: i32) {
     dev_log(&*s.syscalls, 4, out.as_ptr(), pos);
 }
 
-unsafe fn fail(s: &mut SeedState, rc: i32) -> i32 {
+unsafe fn fail(s: &mut SeedState, rc: i32) -> StepReturn {
     s.finished = 1;
     s.failed = 1;
     s.verdict_rc = rc;
     s.verdict_phase = s.phase;
     emit_fail(s, s.phase, rc);
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::module_facts! { state: SeedState }
@@ -313,7 +313,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut SeedState);
     let sys = &*s.syscalls;
 
@@ -329,7 +329,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
     if s.finished != 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     s.waits += 1;
@@ -342,7 +342,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let rc =
                 (sys.provider_call)(-1, FS_OPEN_CREATE, s.path.as_mut_ptr(), s.path_len as usize);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
@@ -351,7 +351,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.progress = 0;
             s.phase = PH_WRITE;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_WRITE => {
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let total = s.size as usize;
             if off >= total {
                 s.phase = PH_SUBMIT;
-                return 0;
+                return StepReturn::Continue;
             }
             let n = if total - off > CHUNK {
                 CHUNK
@@ -374,33 +374,33 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             s.progress += rc as u32;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_SUBMIT => {
             let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, s.ticket.as_mut_ptr(), 8);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             s.phase = PH_POLL;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_POLL => {
             let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, s.ticket.as_mut_ptr(), 8);
             if rc == FENCE_PENDING || rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
@@ -409,13 +409,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             emit_durable(s);
             s.phase = PH_CLOSE;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_CLOSE => {
             let rc = (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
@@ -429,19 +429,19 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                     s.phase = PH_DONE;
                     s.finished = 1;
                     emit_done(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.idx = 0;
             }
             build_path(s);
             s.phase = PH_CREATE;
-            0
+            StepReturn::Continue
         }
 
         PH_VOPEN => {
             let rc = (sys.provider_call)(-1, FS_OPEN, s.path.as_mut_ptr(), s.path_len as usize);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 // Absent: a name whose fence polled Durable is gone.
@@ -449,14 +449,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 s.vmismatch = 0;
                 s.phase = PH_VCLOSE;
                 s.fd = -1;
-                return 0;
+                return StepReturn::Continue;
             }
             s.fd = rc;
             s.progress = 0;
             s.vmismatch = 0;
             s.phase = PH_VREAD;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_VREAD => {
@@ -469,7 +469,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                     s.vbad += 1;
                 }
                 s.phase = PH_VCLOSE;
-                return 0;
+                return StepReturn::Continue;
             }
             let n = if total - off > CHUNK {
                 CHUNK
@@ -479,13 +479,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let mut chunk = [0u8; CHUNK];
             let rc = (sys.provider_call)(s.fd, FS_READ, chunk.as_mut_ptr(), n);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc <= 0 {
                 // Short: the bytes a fence polled Durable are not there.
                 s.vmismatch += 1;
                 s.progress = total as u32;
-                return 0;
+                return StepReturn::Continue;
             }
             let got = rc as usize;
             let last = s.rounds - 1;
@@ -498,7 +498,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             s.progress += got as u32;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_VCLOSE => {
@@ -516,12 +516,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 build_path(s);
                 s.phase = PH_VOPEN;
             }
-            0
+            StepReturn::Continue
         }
 
         _ => {
             s.finished = 1;
-            0
+            StepReturn::Continue
         }
     }
 }

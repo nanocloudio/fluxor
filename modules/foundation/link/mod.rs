@@ -517,21 +517,21 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut LinkState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         match s.phase {
             Phase::Init => step_init(s),
             Phase::Filling => step_filling(s),
             Phase::Running => step_running(s),
-            Phase::Error => -1,
+            Phase::Error => StepReturn::error(-1),
         }
     }
 }
@@ -540,7 +540,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // Phase: Init — Open UART handles
 // ============================================================================
 
-unsafe fn step_init(s: &mut LinkState) -> i32 {
+unsafe fn step_init(s: &mut LinkState) -> StepReturn {
     let dev_call = (*s.syscalls).provider_call;
     let dev_open = (*s.syscalls).provider_open;
 
@@ -554,7 +554,7 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
     if tx_h < 0 {
         dev_log(&*s.syscalls, 1, b"[link] uart tx fail".as_ptr(), 19);
         s.phase = Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
     s.uart_tx_handle = tx_h;
 
@@ -562,7 +562,7 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
     if rx_h < 0 {
         dev_log(&*s.syscalls, 1, b"[link] uart rx fail".as_ptr(), 19);
         s.phase = Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
     s.uart_rx_handle = rx_h;
 
@@ -575,13 +575,13 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
 
 /// TX has no jitter buffer to fill, so it is Ready as it starts running;
 /// RX and bidir report Ready once [`step_filling`] has filled theirs.
-unsafe fn enter_service(s: &mut LinkState) -> i32 {
+unsafe fn enter_service(s: &mut LinkState) -> StepReturn {
     if s.mode == MODE_TX {
         s.phase = Phase::Running;
-        3 // StepOutcome::Ready
+        StepReturn::Ready // StepOutcome::Ready
     } else {
         s.phase = Phase::Filling;
-        0
+        StepReturn::Continue
     }
 }
 
@@ -589,7 +589,7 @@ unsafe fn enter_service(s: &mut LinkState) -> i32 {
 // Phase: Filling — RX jitter buffer fill (RX/bidir only)
 // ============================================================================
 
-unsafe fn step_filling(s: &mut LinkState) -> i32 {
+unsafe fn step_filling(s: &mut LinkState) -> StepReturn {
     let dev_call = (*s.syscalls).provider_call;
 
     poll_uart_rx(s, dev_call);
@@ -611,16 +611,16 @@ unsafe fn step_filling(s: &mut LinkState) -> i32 {
         }
         s.phase = Phase::Running;
         dev_log(&*s.syscalls, 3, b"[link] running".as_ptr(), 14);
-        return 3; // StepOutcome::Ready
+        return StepReturn::Ready; // StepOutcome::Ready
     }
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================
 // Phase: Running — main loop
 // ============================================================================
 
-unsafe fn step_running(s: &mut LinkState) -> i32 {
+unsafe fn step_running(s: &mut LinkState) -> StepReturn {
     let dev_call = (*s.syscalls).provider_call;
     let channel_read = (*s.syscalls).channel_read;
     let channel_write = (*s.syscalls).channel_write;
@@ -650,7 +650,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                 } else {
                     // UART busy — still poll RX
                     poll_uart_rx(s, dev_call);
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
         }
@@ -828,7 +828,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
     // --- Always poll UART RX ---
     poll_uart_rx(s, dev_call);
 
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================

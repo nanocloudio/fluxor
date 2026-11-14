@@ -41,7 +41,7 @@ macro_rules! wasm_entry {
             //   module_init(syscalls: *const c_void)
             //   module_new(in_chan, out_chan, ctrl_chan,
             //              params, params_len, state, state_size, syscalls) -> i32
-            //   module_step(state: *mut u8) -> i32
+            //   module_step(state: *mut u8) -> StepReturn
             //
             // The state struct stashes the `syscalls` pointer at `module_new`
             // time, so `module_step` only needs the state pointer.
@@ -157,9 +157,9 @@ macro_rules! wasm_entry {
                 if state.is_null() {
                     return -1;
                 }
-                let f: extern "C" fn(*mut core::ffi::c_void) -> i32 =
+                let f: extern "C" fn(*mut core::ffi::c_void) -> $crate::StepReturn =
                     unsafe { core::mem::transmute(module_step as *const ()) };
-                f(state as *mut core::ffi::c_void)
+                f(state as *mut core::ffi::c_void).raw()
             }
         }
     };

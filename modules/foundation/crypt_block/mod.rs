@@ -3500,10 +3500,10 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut CryptState);
         let rc = run_step(s);
@@ -3532,7 +3532,7 @@ unsafe fn release_keys(s: &mut CryptState) {
 
 /// One module step: the mount while opening, then the engine and the
 /// background work it may start.
-unsafe fn run_step(s: &mut CryptState) -> i32 {
+unsafe fn run_step(s: &mut CryptState) -> StepReturn {
     if s.phase == PHASE_OPENING {
         if s.depth == 0 && push_frame(s, Frame::new(K_MOUNT, 0, 0)) {
             s.job = JOB_MOUNT;
@@ -3540,23 +3540,23 @@ unsafe fn run_step(s: &mut CryptState) -> i32 {
         }
         pump(s);
         if s.mount_done == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         s.mount_done = 0;
         return match s.mount_rc {
             0 => {
                 s.phase = PHASE_READY;
                 dev_log(s.sys(), 3, b"[crypt_block] ready".as_ptr(), 19);
-                3
+                StepReturn::Ready
             }
             // Nothing read or written yet: the next step starts again.
-            E_AGAIN => 0,
+            E_AGAIN => StepReturn::Continue,
             rc => {
                 s.phase = PHASE_FAILED;
                 s.open_err = rc;
                 release_keys(s);
                 dev_log(s.sys(), 1, b"[crypt_block] mount failed".as_ptr(), 26);
-                rc
+                StepReturn::error(rc)
             }
         };
     }
@@ -3588,7 +3588,7 @@ unsafe fn run_step(s: &mut CryptState) -> i32 {
             pump(s);
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Host-test surface: what a test needs to reach state no request can.

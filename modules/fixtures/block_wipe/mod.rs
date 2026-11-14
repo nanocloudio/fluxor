@@ -130,7 +130,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut WipeState);
     let sys = &*s.syscalls;
     if s.phase >= 2 {
@@ -139,28 +139,28 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.since_beat = 0;
             say(s);
         }
-        return 0;
+        return StepReturn::Continue;
     }
     if s.sectors == 0 {
         finish(s, 0);
-        return 0;
+        return StepReturn::Continue;
     }
     let rc = s.blk.caps(sys);
     if rc == E_AGAIN {
-        return 0;
+        return StepReturn::Continue;
     }
     if rc != 0 {
         finish(s, rc);
-        return 0;
+        return StepReturn::Continue;
     }
     let bs = s.blk.block_size() as usize;
     if bs == 0 || bs > BLOCK_MAX {
         finish(s, -22);
-        return 0;
+        return StepReturn::Continue;
     }
     if u64::from(s.sectors) > s.blk.block_count() {
         finish(s, -22);
-        return 0;
+        return StepReturn::Continue;
     }
     if s.phase == 0 {
         let zero = [0u8; BLOCK_MAX];
@@ -173,11 +173,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let took = dev_micros(sys).wrapping_sub(t0);
             s.worst_us = s.worst_us.max(took.min(u64::from(u32::MAX)) as u32);
             if rc == E_AGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 finish(s, rc);
-                return 0;
+                return StepReturn::Continue;
             }
             s.cursor += 1;
             n += 1;
@@ -185,12 +185,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         if s.cursor >= s.sectors {
             s.phase = 1;
         }
-        return 0;
+        return StepReturn::Continue;
     }
     let rc = s.blk.flush(sys);
     if rc == E_AGAIN {
-        return 0;
+        return StepReturn::Continue;
     }
     finish(s, rc);
-    0
+    StepReturn::Continue
 }

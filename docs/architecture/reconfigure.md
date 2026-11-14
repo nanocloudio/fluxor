@@ -73,7 +73,7 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
 The pack tool detects this export and sets header flag bit 3 (`drain_capable`).
 During DRAINING, the scheduler calls `module_drain()` once (in reverse
 topological order), then continues calling `module_step()` normally. When
-your module has no more in-flight work, return `StepOutcome::Done` (1)
+your module has no more in-flight work, return `StepReturn::Done`
 from `module_step()`.
 
 ## Releasing an Owner's Resources

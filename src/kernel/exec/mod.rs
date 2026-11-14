@@ -15,4 +15,5 @@ pub mod domains;
 pub mod graph_build;
 pub mod isr_tier;
 pub mod scheduler;
+pub mod step;
 pub mod step_guard;

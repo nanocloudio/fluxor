@@ -86,7 +86,7 @@ pub fn admits(header: &[u8], root: Option<&[u8; 32]>) -> Result<(), Refusal> {
     }
     let mut sig = [0u8; 64];
     sig.copy_from_slice(&header[at + 8..at + 72]);
-    if crate::kernel::security::crypto::ed25519::verify(
+    if crate::kernel::security::crypto::ed25519::ed25519_verify(
         root,
         &header[..fl::GRAPH_SLOT_SIGNED_LEN],
         &sig,

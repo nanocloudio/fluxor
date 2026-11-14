@@ -548,14 +548,14 @@ unsafe fn on_kiss(sys: &SyscallTable, s: &mut State, i: usize, code: [u8; 4], no
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         let now_ms = dev_millis(sys);
@@ -632,7 +632,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         if !s.ep.is_ready() {
-            return 0;
+            return StepReturn::Continue;
         }
 
         match s.phase {
@@ -661,7 +661,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             _ => {}
         }
-        0
+        StepReturn::Continue
     }
 }
 

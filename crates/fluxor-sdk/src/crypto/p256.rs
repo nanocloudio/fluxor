@@ -1896,6 +1896,18 @@ pub fn decode_private_scalar(private_key: &[u8; 32]) -> Option<U256> {
     Some(d)
 }
 
+/// The uncompressed public key (0x04 || X || Y) of a 32-byte big-endian
+/// private scalar, or `None` when the scalar is outside `[1, n-1]`.
+pub fn public_key_from_scalar(private_key: &[u8; 32]) -> Option<[u8; 65]> {
+    let d = decode_private_scalar(private_key)?;
+    let (x, y) = scalar_mul_base(&d).to_affine();
+    let mut pk = [0u8; 65];
+    pk[0] = 0x04;
+    pk[1..33].copy_from_slice(&u256_to_be(&x));
+    pk[33..65].copy_from_slice(&u256_to_be(&y));
+    Some(pk)
+}
+
 /// ECDH shared secret: scalar_mult(my_private, peer_public).x
 /// peer_pub should be 65 bytes (0x04 || X || Y) or 64 bytes (X || Y)
 ///

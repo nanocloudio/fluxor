@@ -299,7 +299,7 @@ const ST_CREATE_EVENT: u8 = 2;
 const ST_SUBSCRIBE: u8 = 3;
 const ST_RUNNING: u8 = 4;
 
-fn module_step(state: *mut u8) -> i32 {
+fn module_step(state: *mut u8) -> StepReturn {
     let s = unsafe { &mut *(state as *mut ButtonState) };
     let sys = unsafe { &*s.syscalls };
 
@@ -307,17 +307,17 @@ fn module_step(state: *mut u8) -> i32 {
         ST_INIT => {
             // Claim GPIO pin as input with pull-up
             let rc = (sys.provider_call)(s.gpio_pin as i32, gpio::CLAIM, ...);
-            if rc < 0 { return rc; }
+            if rc < 0 { return StepReturn::error(rc); }
             s.state = ST_CREATE_EVENT;
-            0
+            StepReturn::Continue
         }
         ST_CREATE_EVENT => {
             // Create an event object
             let evt = (sys.provider_call)(-1, event::CREATE, core::ptr::null_mut(), 0);
-            if evt < 0 { return evt; }
+            if evt < 0 { return StepReturn::error(evt); }
             s.event_handle = evt;
             s.state = ST_SUBSCRIBE;
-            0
+            StepReturn::Continue
         }
         ST_SUBSCRIBE => {
             // Ask GPIO contract to signal our event on either edge of the pin.
@@ -332,9 +332,9 @@ fn module_step(state: *mut u8) -> i32 {
                 s.pin_handle, gpio::WATCH_EDGE,
                 args.as_ptr() as *mut u8, 5,
             );
-            if rc < 0 { return rc; }
+            if rc < 0 { return StepReturn::error(rc); }
             s.state = ST_RUNNING;
-            0
+            StepReturn::Continue
         }
         ST_RUNNING => {
             // Poll event — only does work when GPIO edge detected
@@ -347,9 +347,9 @@ fn module_step(state: *mut u8) -> i32 {
                 let level = (sys.provider_call)(s.gpio_pin as i32, gpio::GET_LEVEL, ...);
                 // ... debounce logic, emit to out_chan ...
             }
-            0 // Continue
+            StepReturn::Continue
         }
-        _ => -1,
+        _ => StepReturn::error(-1),
     }
 }
 ```

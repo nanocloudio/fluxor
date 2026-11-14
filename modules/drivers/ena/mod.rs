@@ -959,7 +959,7 @@ pub unsafe extern "C" fn module_new(
 /// Called by the scheduler with the state `module_new` initialised.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut EnaState);
     match s.phase {
         Phase::Bind => step_bind(s),
@@ -977,7 +977,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
         Phase::Announce => {
             if step_announce(s) {
-                return 3; // Ready
+                return StepReturn::Ready;
             }
         }
         Phase::Run => {
@@ -993,7 +993,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         Phase::Failed => {}
         _ => step_setup(s),
     }
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::wasm_entry!();

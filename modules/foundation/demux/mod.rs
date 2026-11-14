@@ -154,32 +154,32 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut DemuxState);
     let sys = &*s.syscalls;
 
     if s.in_chan < 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let poll = (sys.channel_poll)(s.in_chan, 0x01);
     if poll <= 0 || (poll as u32 & 0x01) == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let buf = s.frame_buf.as_mut_ptr();
     let hn = (sys.channel_read)(s.in_chan, buf, 2);
     if hn < 2 {
-        return 0;
+        return StepReturn::Continue;
     }
     let frame_len = (*buf as usize) | ((*buf.add(1) as usize) << 8);
     if frame_len == 0 || frame_len > MAX_FRAME {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let r = (sys.channel_read)(s.in_chan, buf.add(2), frame_len);
     if r < frame_len as i32 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let total = 2 + frame_len;
@@ -205,7 +205,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
 
-    2 // Burst
+    StepReturn::Burst
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

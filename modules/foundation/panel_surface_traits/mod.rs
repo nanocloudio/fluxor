@@ -151,24 +151,24 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut PanelState);
         if s.syscalls.is_null() || s.out_chan < 0 {
-            return -1;
+            return StepReturn::error(-1);
         }
         if s.emitted {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
 
         // Wait until the output channel can accept the record.
         let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
         if poll <= 0 || ((poll as u32) & POLL_OUT) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         s.prev_w_class = st::size_class_for(s.width, s.prev_w_class);
@@ -197,7 +197,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if n == EVENT_RECORD as i32 {
             s.emitted = true;
         }
-        0
+        StepReturn::Continue
     }
 }
 

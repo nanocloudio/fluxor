@@ -182,13 +182,13 @@ unsafe fn emit_fail(s: &SeedState, phase: u8, rc: i32) {
     dev_log(&*s.syscalls, 4, out.as_ptr(), pos);
 }
 
-unsafe fn fail(s: &mut SeedState, rc: i32) -> i32 {
+unsafe fn fail(s: &mut SeedState, rc: i32) -> StepReturn {
     s.finished = 1;
     s.failed = 1;
     s.verdict_rc = rc;
     s.verdict_phase = s.phase;
     emit_fail(s, s.phase, rc);
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::module_facts! { state: SeedState }
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut SeedState);
     let sys = &*s.syscalls;
 
@@ -272,7 +272,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
     if s.finished != 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     s.waits += 1;
@@ -286,7 +286,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         PH_CREATE => {
             let rc = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr().cast_mut(), path.len());
             if rc == -11 || rc == -36 {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
@@ -294,7 +294,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.fd = rc;
             s.phase = PH_WRITE;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_WRITE => {
@@ -302,7 +302,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let total = s.total as usize;
             if off >= total {
                 s.phase = PH_FSYNC;
-                return 0;
+                return StepReturn::Continue;
             }
             let n = if total - off > CHUNK {
                 CHUNK
@@ -325,27 +325,27 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
             if rc == -11 || rc == -36 {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             s.progress += rc as u32;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_FSYNC => {
             let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
             if rc == -11 || rc == -36 {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             s.phase = PH_CLOSE;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_CLOSE => {
@@ -356,7 +356,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.fd = -1;
             s.phase = PH_PUBLISH;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_PUBLISH => {
@@ -364,7 +364,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // this fence lands.
             let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_ptr().cast_mut(), path.len());
             if rc == -11 || rc == -36 {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
@@ -372,12 +372,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.phase = PH_DONE;
             s.finished = 1;
             emit_ok(s);
-            0
+            StepReturn::Continue
         }
 
         _ => {
             s.finished = 1;
-            0
+            StepReturn::Continue
         }
     }
 }

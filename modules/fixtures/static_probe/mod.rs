@@ -179,14 +179,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() || s.done != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         s.done = 1;
         let mut all = true;
@@ -235,7 +235,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if all {
             say(s, b"[static_probe] done");
         }
-        0
+        StepReturn::Continue
     }
 }
 

@@ -850,7 +850,7 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     let s = unsafe { &mut *(state as *mut St7701sState) };
     let sys = unsafe { &*s.syscalls };
 
@@ -858,7 +858,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         Phase::InitSeq => {
             // SLEEP_OUT timer (set in module_new after SPI init)
             if !unsafe { timer_expired(sys, s.timer_fd) } {
-                return 0;
+                return StepReturn::Continue;
             }
             unsafe {
                 // Raise CS from SLEEP_OUT hold, then send DISPLAY_ON with CS hold
@@ -868,20 +868,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 timer_set(sys, s.timer_fd, 120);
             }
             s.phase = Phase::SleepOut;
-            0
+            StepReturn::Continue
         }
 
         Phase::SleepOut => {
             // DISPLAY_ON timer
             if !unsafe { timer_expired(sys, s.timer_fd) } {
-                return 0;
+                return StepReturn::Continue;
             }
             unsafe {
                 spi9_cs_set(s, 1); // Raise CS from DISPLAY_ON hold
                 dev_log(sys, 3, b"[lcd] display on".as_ptr(), 16);
             }
             s.phase = Phase::AllocDmaFd;
-            2
+            StepReturn::Burst
         }
 
         Phase::AllocDmaFd => {
@@ -891,11 +891,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_log(sys, 1, b"[lcd] DMA FD alloc fail".as_ptr(), 23);
                 }
                 s.phase = Phase::Error;
-                return fd;
+                return StepReturn::error(fd);
             }
             s.dma_fd = fd;
             s.phase = Phase::ConfigurePioSync;
-            2
+            StepReturn::Burst
         }
 
         Phase::ConfigurePioSync => {
@@ -924,7 +924,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] hsync load fail".as_ptr(), 21);
                     s.phase = Phase::Error;
-                    return origin;
+                    return StepReturn::error(origin);
                 }
                 s.hsync_origin = origin as u8;
 
@@ -938,7 +938,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] vsync load fail".as_ptr(), 21);
                     s.phase = Phase::Error;
-                    return origin;
+                    return StepReturn::error(origin);
                 }
                 s.vsync_origin = origin as u8;
 
@@ -1084,7 +1084,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
 
             s.phase = Phase::ConfigurePioData;
-            2
+            StepReturn::Burst
         }
 
         Phase::ConfigurePioData => {
@@ -1106,7 +1106,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] rgb_de load fail".as_ptr(), 22);
                     s.phase = Phase::Error;
-                    return origin;
+                    return StepReturn::error(origin);
                 }
                 s.de_origin = origin as u8;
 
@@ -1116,7 +1116,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] rgb load fail".as_ptr(), 19);
                     s.phase = Phase::Error;
-                    return origin;
+                    return StepReturn::error(origin);
                 }
                 s.rgb_origin = origin as u8;
 
@@ -1253,7 +1253,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
 
             s.phase = Phase::StartSMs;
-            2
+            StepReturn::Burst
         }
 
         Phase::StartSMs => {
@@ -1275,7 +1275,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_log(sys, 3, b"[lcd] loading from channel".as_ptr(), 26);
                 }
                 s.phase = Phase::Loading;
-                return 2;
+                return StepReturn::Burst;
             }
 
             // Test pattern mode: start PIO + DMA immediately.
@@ -1318,7 +1318,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
                 }
                 s.phase = Phase::Error;
-                return rc;
+                return StepReturn::error(rc);
             }
 
             let rc =
@@ -1328,13 +1328,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
                 }
                 s.phase = Phase::Error;
-                return rc;
+                return StepReturn::error(rc);
             }
 
             s.back_is_b = 0;
             s.current_stripe = sc - 3; // stripe_count-1 and stripe_count-2 already queued
             s.phase = Phase::DmaWait;
-            0
+            StepReturn::Continue
         }
 
         Phase::Loading => {
@@ -1350,12 +1350,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let remaining = lb - s.load_row_off as usize;
                 let chan_poll = unsafe { (sys.channel_poll)(s.in_chan, POLL_IN) };
                 if chan_poll & (POLL_IN as i32) == 0 {
-                    return 0; // yield — wait for more data
+                    return StepReturn::Continue; // yield — wait for more data
                 }
                 let dst = unsafe { dst_base.add(s.load_cache_off as usize) };
                 let read = unsafe { (sys.channel_read)(s.in_chan, dst, remaining) };
                 if read <= 0 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let r = read as u16;
                 s.load_row_off += r;
@@ -1436,7 +1436,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
                 }
                 s.phase = Phase::Error;
-                return rc;
+                return StepReturn::error(rc);
             }
             let rc =
                 unsafe { dma_fd_queue(sys, s.dma_fd, s.stripe_b.as_ptr() as u32, s.stripe_pixels) };
@@ -1445,7 +1445,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
                 }
                 s.phase = Phase::Error;
-                return rc;
+                return StepReturn::error(rc);
             }
 
             if s.frame_loaded == 0 {
@@ -1460,7 +1460,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 dev_log(sys, 3, b"[lcd] cached, go".as_ptr(), 16);
             }
             s.phase = Phase::DmaWait;
-            0
+            StepReturn::Continue
         }
 
         Phase::DmaWait => {
@@ -1501,7 +1501,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
                     }
                     s.phase = Phase::Error;
-                    return rc;
+                    return StepReturn::error(rc);
                 }
                 s.back_is_b ^= 1;
 
@@ -1567,10 +1567,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
 
-            0
+            StepReturn::Continue
         }
 
-        _ => -1,
+        _ => StepReturn::error(-1),
     }
 }
 

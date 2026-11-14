@@ -145,14 +145,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut TestFaultState);
         s.step_count += 1;
 
         // Pre-fault normal operation
         if s.step_count < s.delay_steps as u32 {
-            return 0; // Continue
+            return StepReturn::Continue;
         }
 
         match s.mode {
@@ -166,10 +166,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Mode 1: Return error code
                 if s.faulted == 0 {
                     s.faulted = 1;
-                    return -1; // Error
+                    return StepReturn::error(-1); // Error
                 }
                 // After restart, will error again when step_count >= delay_steps
-                0
+                StepReturn::Continue
             }
             2 => {
                 // Mode 2: Busy-wait (advisory timeout test)
@@ -179,11 +179,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     core::hint::spin_loop();
                     i += 1;
                 }
-                0 // Continue (but may have exceeded deadline)
+                StepReturn::Continue // but may have exceeded deadline)
             }
             _ => {
                 // Mode 3+: Normal operation
-                0
+                StepReturn::Continue
             }
         }
     }

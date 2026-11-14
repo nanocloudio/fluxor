@@ -238,11 +238,11 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut BrightnessState);
         if s.syscalls.is_null() || s.in_chan < 0 || s.out_chan < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         match s.mode {
@@ -250,7 +250,7 @@ pub extern "C" fn module_step(state: *mut c_void) -> i32 {
             _ => step_sequencer(s),
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

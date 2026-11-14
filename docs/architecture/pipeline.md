@@ -107,7 +107,7 @@ fluxor_rt::module_facts! { state: ModuleState }
                                           params: *const u8, params_len: usize,
                                           state: *mut u8, state_size: usize,
                                           syscalls: *const c_void) -> i32 { ... }
-#[no_mangle] pub extern "C" fn module_step(state: *mut u8) -> i32 { ... }
+#[no_mangle] pub extern "C" fn module_step(state: *mut u8) -> StepReturn { ... }
 ```
 
 Further capabilities are manifest facts or optional entry points:

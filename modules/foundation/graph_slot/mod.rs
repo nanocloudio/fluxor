@@ -121,9 +121,6 @@ use abi::internal::flash::{
     RAW_ERASE as SYS_FLASH_RAW_ERASE, RAW_PROGRAM as SYS_FLASH_RAW_PROGRAM,
 };
 
-const CONTINUE: i32 = 0;
-const READY: i32 = 3;
-
 const NO_LIVE_SLOT: i32 = -1;
 
 // Channel protocol — defined once in the public contract.
@@ -854,17 +851,17 @@ unsafe fn emit_response(s: &State, sys: &SyscallTable, req_type: u32, value: i32
     let _ = (sys.channel_write)(s.out_chan, frame.as_ptr(), RESP_FRAME_LEN);
 }
 
-unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> StepReturn {
     if s.in_chan < 0 {
-        return CONTINUE;
+        return StepReturn::Continue;
     }
     // No request is taken while an erase is under way: the next one is
     // about the slot being erased.
     if s.erase_end != 0 && erase_step(s, sys) {
-        return CONTINUE;
+        return StepReturn::Continue;
     }
     if s.act_phase != ACT_IDLE && activate_step(s, sys) {
-        return CONTINUE;
+        return StepReturn::Continue;
     }
 
     // Best-effort fill of the request buffer.
@@ -880,7 +877,7 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
     // Process as many complete frames as we have.
     loop {
         if (s.frame_fill as usize) < FRAME_HDR {
-            return CONTINUE;
+            return StepReturn::Continue;
         }
         let ty = read_u32_le(s.frame_buf.as_ptr());
         let len = u16::from_le_bytes([s.frame_buf[4], s.frame_buf[5]]) as usize;
@@ -888,10 +885,10 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
         if total > REQ_FRAME_MAX {
             // Malformed frame — drop the buffer and resync on next fill.
             s.frame_fill = 0;
-            return CONTINUE;
+            return StepReturn::Continue;
         }
         if (s.frame_fill as usize) < total {
-            return CONTINUE;
+            return StepReturn::Continue;
         }
 
         let payload_ptr = s.frame_buf.as_ptr().add(FRAME_HDR);
@@ -920,7 +917,7 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
         }
         s.frame_fill = leftover as u16;
         if under_way {
-            return CONTINUE;
+            return StepReturn::Continue;
         }
     }
 }
@@ -1024,14 +1021,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys = &*s.syscalls;
 
@@ -1051,7 +1048,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 line.put(b" signed");
             }
             line.emit(sys);
-            return READY;
+            return StepReturn::Ready;
         }
         pump_requests(s, sys)
     }

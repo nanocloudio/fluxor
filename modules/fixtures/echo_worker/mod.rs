@@ -789,20 +789,20 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut WorkerState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         handle_ctrl(s);
         handle_data(s);
 
-        0
+        StepReturn::Continue
     }
 }
 

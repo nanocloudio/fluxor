@@ -30,6 +30,7 @@ use core::ptr::write_volatile;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 // ============================================================================
 // Intel E810 Register Offsets (BAR0)
@@ -272,12 +273,12 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut E810State);
     s.step_count = s.step_count.wrapping_add(1);
 
     if s.initialized == 0 && !init_e810(s) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // For skeleton: consider link up after init
@@ -287,7 +288,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
     if s.link_up != 0 && s.ready_signaled == 0 {
         s.ready_signaled = 1;
-        return 3; // Ready
+        return StepReturn::Ready;
     }
 
     if s.link_up != 0 {
@@ -295,7 +296,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         poll_tx(s);
     }
 
-    0 // Continue
+    StepReturn::Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

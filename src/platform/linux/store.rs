@@ -1037,7 +1037,7 @@ impl cap::CapCrypto for KernelCrypto {
         h.finalize()
     }
     fn ed25519_verify(&self, key: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
-        crate::kernel::security::crypto::ed25519::verify(key, msg, sig)
+        crate::kernel::security::crypto::ed25519::ed25519_verify(key, msg, sig)
     }
 }
 

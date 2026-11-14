@@ -295,7 +295,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut State);
     let now = dev_millis(&*s.syscalls);
     pump(s, P_QUIC, now);
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         core.tick(now, &mut out);
     }
     flush(s);
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::wasm_entry!();

@@ -103,11 +103,11 @@ unsafe fn call(sys: &SyscallTable, handle: i32, op: u32, arg: *mut u8, len: usiz
     (sys.provider_call)(handle, op, arg, len)
 }
 
-unsafe fn fail(s: &mut State, rc: i32, msg: &[u8]) -> i32 {
+unsafe fn fail(s: &mut State, rc: i32, msg: &[u8]) -> StepReturn {
     s.last_rc = rc;
     dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
     s.phase = PHASE_FAILED;
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::module_facts! { state: State }
@@ -149,14 +149,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys = &*s.syscalls;
 
@@ -230,7 +230,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     path[..STALE_PATH.len()].copy_from_slice(STALE_PATH);
                     let stale_rc = call(sys, -1, fs::UNLINK, path.as_mut_ptr(), STALE_PATH.len());
                     if stale_rc == E_AGAIN {
-                        return 0; // fat32 still mounting — retry whole phase
+                        return StepReturn::Continue; // fat32 still mounting — retry whole phase
                     }
                 }
                 let (dest, _) = file(s.file_idx);
@@ -246,13 +246,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // failure backstop; the heartbeat shows if we're
                     // stuck here.
                     s.last_rc = fd;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.fd = fd;
                 s.off = 0;
                 s.last_rc = 0;
                 s.phase = PHASE_WRITE;
-                2 // Burst — keep draining
+                StepReturn::Burst // keep draining
             }
             PHASE_WRITE => {
                 let (_, payload) = file(s.file_idx);
@@ -261,7 +261,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.chunk[..n].copy_from_slice(&payload[s.off..s.off + n]);
                 let rc = call(sys, s.fd, fs::WRITE, s.chunk.as_mut_ptr(), n);
                 if rc == E_AGAIN || rc == E_INPROGRESS {
-                    return 0; // block-ring backpressure — retry next tick
+                    return StepReturn::Continue; // block-ring backpressure — retry next tick
                 }
                 if rc < 0 {
                     return fail(s, rc, b"[gallery] WRITE failed");
@@ -270,23 +270,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if s.off >= payload.len() {
                     s.phase = PHASE_FSYNC;
                 }
-                2
+                StepReturn::Burst
             }
             PHASE_FSYNC => {
                 let rc = call(sys, s.fd, fs::FSYNC, core::ptr::null_mut(), 0);
                 if rc == E_AGAIN || rc == E_INPROGRESS {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if rc != 0 {
                     return fail(s, rc, b"[gallery] FSYNC failed");
                 }
                 s.phase = PHASE_CLOSE;
-                2
+                StepReturn::Burst
             }
             PHASE_CLOSE => {
                 let rc = call(sys, s.fd, fs::CLOSE, core::ptr::null_mut(), 0);
                 if rc == E_AGAIN || rc == E_INPROGRESS {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if rc != 0 {
                     return fail(s, rc, b"[gallery] CLOSE failed");
@@ -294,14 +294,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.file_idx += 1;
                 if s.file_idx < FILE_COUNT {
                     s.phase = PHASE_OPEN;
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 s.phase = PHASE_DONE;
                 let msg = b"[gallery] staged all files";
                 dev_log(sys, 3, msg.as_ptr(), msg.len());
-                0
+                StepReturn::Continue
             }
-            _ => 0, // DONE / FAILED — idle
+            _ => StepReturn::Continue, // DONE / FAILED — idle
         }
     }
 }

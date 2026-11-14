@@ -1183,7 +1183,7 @@ unsafe fn pump_directives(s: &mut State) {
     }
 }
 
-unsafe fn pump(s: &mut State) -> i32 {
+unsafe fn pump(s: &mut State) -> StepReturn {
     let sys = &*s.syscalls;
     pump_directives(s);
     // Drain inbound frames first (bounded per step). The bound covers a
@@ -1200,11 +1200,11 @@ unsafe fn pump(s: &mut State) -> i32 {
                 log_msg(s, b"[ota_reg] starting pull");
                 start_request(s, FETCH_MANIFEST);
             }
-            0
+            StepReturn::Continue
         }
         Phase::Connecting => {
             if s.net_out < 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             let mut payload = [0u8; CONNECT_TO_MAX];
             let tag = dev_requester_tag(sys);
@@ -1228,14 +1228,14 @@ unsafe fn pump(s: &mut State) -> i32 {
                 s.state_start_ms = dev_millis(sys);
                 s.phase = Phase::WaitConnect;
             }
-            0
+            StepReturn::Continue
         }
         Phase::WaitConnect => {
             if dev_millis(sys).wrapping_sub(s.state_start_ms) > CONNECT_TIMEOUT_MS {
                 log_err(s, b"[ota_reg] connect timeout");
                 enter_backoff(s);
             }
-            0
+            StepReturn::Continue
         }
         Phase::RecvHeader | Phase::RecvBody => {
             if s.tx_sent < s.tx_len {
@@ -1245,19 +1245,19 @@ unsafe fn pump(s: &mut State) -> i32 {
                 log_err(s, b"[ota_reg] response timeout");
                 enter_backoff(s);
             }
-            0
+            StepReturn::Continue
         }
         Phase::Idle => {
             if s.poll_s > 0 && dev_millis(sys) >= s.next_poll_ms {
                 start_request(s, FETCH_MANIFEST);
             }
-            0
+            StepReturn::Continue
         }
         Phase::Backoff => {
             if dev_millis(sys).wrapping_sub(s.state_start_ms) >= s.backoff_ms {
                 start_request(s, FETCH_MANIFEST);
             }
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -1311,14 +1311,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         pump(s)
     }

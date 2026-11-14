@@ -211,20 +211,20 @@ pub unsafe extern "C" fn module_new(
 /// wall-clock duty cycle so the load is deterministic and self-driven.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut LoadGenState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // One-shot readiness so downstream gating (if any) releases.
         if !s.signaled_ready {
             s.signaled_ready = true;
-            return 3; // StepOutcome::Ready
+            return StepReturn::Ready; // StepOutcome::Ready
         }
 
         // Count every step and periodically log this lane's progress.
@@ -237,7 +237,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // floor (worst × margin) covers it and the budget is not overrun.
         if s.burst_remaining > 0 {
             s.burst_remaining -= 1;
-            return if s.burst_remaining > 0 { 2 } else { 0 };
+            return if s.burst_remaining > 0 {
+                StepReturn::Burst
+            } else {
+                StepReturn::Continue
+            };
         }
 
         // Fresh tick: pick the phase from the wall-clock duty cycle. Use u32
@@ -250,14 +254,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let cycle = s.busy_ms.saturating_add(s.idle_ms).max(1);
         let busy = (now_ms % cycle) < s.busy_ms;
         if !busy || s.bursts_per_tick == 0 {
-            return 0; // idle tick → Continue, no burst signal
+            return StepReturn::Continue; // idle tick → Continue, no burst signal
         }
 
         // Busy tick: do the heavy work ONCE, then emit `bursts_per_tick` Burst
         // re-steps (the trivial re-steps above) so the pacer sees "busy".
         tiny_work(s);
         s.burst_remaining = s.bursts_per_tick;
-        2 // first Burst — signals busy
+        StepReturn::Burst // first Burst — signals busy
     }
 }
 

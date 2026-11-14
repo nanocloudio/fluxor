@@ -105,14 +105,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() || s.out_chan < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         s.tick = s.tick.wrapping_add(1);
@@ -128,7 +128,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // checked_rem: a runtime divisor would otherwise emit a
         // panic_const_rem_by_zero path no_std PIC can't link.
         if s.tick.checked_rem(s.emit_every) != Some(0) {
-            return 0;
+            return StepReturn::Continue;
         }
         let now = dev_millis(sys);
         let mut probe = [0u8; 12];
@@ -138,7 +138,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if rc == probe.len() as i32 {
             dev_log(sys, 3, b"[wksrc] emit".as_ptr(), 12);
         }
-        0
+        StepReturn::Continue
     }
 }
 

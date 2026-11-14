@@ -188,13 +188,13 @@ unsafe fn log_phase(s: &SelfTestState, tag: &[u8], phase: u8) {
 /// matching the cadence every other module on the lane uses.
 const BEAT_STEPS: u32 = 5000;
 
-unsafe fn fail(s: &mut SelfTestState, rc: i32) -> i32 {
+unsafe fn fail(s: &mut SelfTestState, rc: i32) -> StepReturn {
     s.finished = 1;
     s.passed = 0;
     s.verdict_rc = rc;
     s.verdict_phase = s.phase;
     emit_fail(s, s.phase, rc);
-    0
+    StepReturn::Continue
 }
 
 unsafe fn emit_fail(s: &SelfTestState, phase: u8, rc: i32) {
@@ -213,11 +213,11 @@ unsafe fn emit_fail(s: &SelfTestState, phase: u8, rc: i32) {
     dev_log(&*s.syscalls, 4, out.as_ptr(), pos);
 }
 
-unsafe fn pass(s: &mut SelfTestState) -> i32 {
+unsafe fn pass(s: &mut SelfTestState) -> StepReturn {
     s.finished = 1;
     s.passed = 1;
     emit_pass(s);
-    0
+    StepReturn::Continue
 }
 
 unsafe fn emit_pass(s: &SelfTestState) {
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut SelfTestState);
     let sys = &*s.syscalls;
 
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
     if s.finished != 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     s.waits += 1;
@@ -363,7 +363,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let mut caps = [0u8; 4];
             let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
@@ -377,20 +377,20 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 return fail(s, -38);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_MKDIR => {
             let rc = (sys.provider_call)(-1, FS_MKDIR, DIR.as_ptr().cast_mut(), DIR.len());
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             // An existing directory is success, per the contract.
             if rc < 0 && rc != -17 {
                 return fail(s, rc);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_CREATE => {
@@ -401,14 +401,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 TMP_PATH.len(),
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             s.fd = rc;
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_WRITE => {
@@ -417,7 +417,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let off = s.progress as usize;
             if off >= PAYLOAD {
                 advance(s);
-                return 0;
+                return StepReturn::Continue;
             }
             let mut chunk = [0u8; 512];
             let n = core::cmp::min(512, PAYLOAD - off);
@@ -428,26 +428,26 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             s.progress += rc as u32;
             s.waits = 0;
-            0
+            StepReturn::Continue
         }
 
         PH_FSYNC => {
             let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_CLOSE => {
@@ -457,7 +457,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             s.fd = -1;
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_FSYNC_NAME => {
@@ -471,13 +471,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 TMP_PATH.len(),
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_VERIFY => verify(s, TMP_PATH, PAYLOAD),
@@ -487,13 +487,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let n = rename_arg(&mut arg, TMP_PATH, FINAL_PATH);
             let rc = (sys.provider_call)(-1, FS_RENAME, arg.as_mut_ptr(), n);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_VERIFY_RENAMED => {
@@ -506,13 +506,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let n = truncate_arg(&mut arg, TRUNC_TO, FINAL_PATH);
             let rc = (sys.provider_call)(-1, FS_TRUNCATE, arg.as_mut_ptr(), n);
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_VERIFY_TRUNC => verify(s, FINAL_PATH, TRUNC_TO as usize),
@@ -525,13 +525,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 FINAL_PATH.len(),
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_VERIFY_GONE => {
@@ -542,7 +542,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 FINAL_PATH.len(),
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc >= 0 {
                 // The name still resolves. Close the handle before reporting,
@@ -551,7 +551,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 return fail(s, -17);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         PH_RMDIR_NAME => {
@@ -565,13 +565,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 FINAL_PATH.len(),
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 return fail(s, rc);
             }
             advance(s);
-            0
+            StepReturn::Continue
         }
 
         p if p >= PH_DONE => pass(s),
@@ -583,12 +583,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 ///
 /// A length check alone would pass on another file's cluster; the pattern is
 /// position-dependent so a read that lands on the wrong chain fails.
-unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> i32 {
+unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> StepReturn {
     let sys = &*s.syscalls;
     if s.fd < 0 {
         let rc = (sys.provider_call)(-1, FS_OPEN, path.as_ptr().cast_mut(), path.len());
         if rc == E_AGAIN || rc == E_INPROGRESS {
-            return 0;
+            return StepReturn::Continue;
         }
         if rc < 0 {
             return fail(s, rc);
@@ -608,19 +608,19 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> i32 {
         if size != len as u64 {
             return fail(s, -75); // EOVERFLOW — the entry describes another file
         }
-        return 0;
+        return StepReturn::Continue;
     }
     let off = s.progress as usize;
     if off >= len {
         (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
         s.fd = -1;
         advance(s);
-        return 0;
+        return StepReturn::Continue;
     }
     let want = core::cmp::min(512, len - off);
     let rc = (sys.provider_call)(s.fd, FS_READ, s.buf.as_mut_ptr(), want);
     if rc == E_AGAIN || rc == E_INPROGRESS {
-        return 0;
+        return StepReturn::Continue;
     }
     if rc <= 0 {
         // Short of the length the entry claims: the size field and the chain
@@ -641,7 +641,7 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> i32 {
     }
     s.progress += n as u32;
     s.waits = 0;
-    0
+    StepReturn::Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.

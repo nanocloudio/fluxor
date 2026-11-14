@@ -178,14 +178,14 @@ const GPIO_GET_LEVEL: u32 = abi::registry::gpio::GET_LEVEL;
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut ButtonState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let sys = &*s.syscalls;
@@ -195,7 +195,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let level = (sys.provider_call)(s.gpio_handle, GPIO_GET_LEVEL, core::ptr::null_mut(), 0);
         if level < 0 {
-            return 0; // GPIO error, skip
+            return StepReturn::Continue; // GPIO error, skip
         }
 
         let pressed = if s.active_low != 0 {
@@ -227,7 +227,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

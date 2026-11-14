@@ -173,7 +173,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // Reports via the return value and via deliberately-raised faults.
     unsafe {
         let s = &mut *(state as *mut IsoProbeState);
@@ -185,9 +185,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // Own-state RW always exercised on the warm-up path.
             s.sentinel = SENTINEL_MAGIC ^ s.step_count;
             if s.sentinel != (SENTINEL_MAGIC ^ s.step_count) {
-                return -100; // own state RW broken (should be impossible)
+                return StepReturn::error(-100); // own state RW broken (should be impossible)
             }
-            return 0; // Continue
+            return StepReturn::Continue;
         }
 
         match s.mode {
@@ -196,9 +196,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.sentinel = SENTINEL_MAGIC;
                 let read_back = core::ptr::read_volatile(&s.sentinel);
                 if read_back == SENTINEL_MAGIC {
-                    0 // Continue — isolation lets the module touch its own state
+                    StepReturn::Continue // isolation lets the module touch its own state
                 } else {
-                    -101
+                    StepReturn::error(-101)
                 }
             }
             // Write the kernel's gateway table: kernel-owned, mapped
@@ -207,31 +207,31 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let table = s.syscalls as *mut u32;
                 core::ptr::write_volatile(table, 0);
                 // Reaching here means the kernel's page was writable.
-                -110
+                StepReturn::error(-110)
             }
             // Read far outside any mapped region (stands in for a neighbour
             // module's state / arbitrary kernel RAM) → EL0 data abort.
             2 => {
                 let oob = (state as usize).wrapping_add(0x0040_0000) as *const u64; // +4 MiB
                 s.sink = core::ptr::read_volatile(oob);
-                -111
+                StepReturn::error(-111)
             }
             // Execute the (execute-never) state buffer → instruction abort.
             3 => {
                 let f: extern "C" fn() = core::mem::transmute::<*mut u8, extern "C" fn()>(state);
                 f();
-                -112
+                StepReturn::error(-112)
             }
             // Write the module's own (read-only at EL0) code → permission
             // abort. `module_step` is in the RO+X code region.
             4 => {
                 let code = module_step as *mut u32;
                 core::ptr::write_volatile(code, 0);
-                -113
+                StepReturn::error(-113)
             }
             // Clean finish — proves the full EL0→SVC→EL1 round-trip with a
             // terminal outcome.
-            5 => 1, // Done
+            5 => StepReturn::Done,
             // Channel authority: read a handle this module was never given.
             // The gateway must refuse it (EACCES) before touching any channel.
             // The buffer is its own state, so only the handle can be refused.
@@ -243,9 +243,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     core::mem::size_of::<u64>(),
                 );
                 if r == EACCES {
-                    -121
+                    StepReturn::error(-121)
                 } else {
-                    -120 // served a foreign channel → breach
+                    StepReturn::error(-120) // served a foreign channel → breach
                 }
             }
             // Never return: the kernel must force it out at its deadline.
@@ -264,9 +264,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     16,
                 );
                 if r == EFAULT {
-                    -122
+                    StepReturn::error(-122)
                 } else {
-                    -123 // read memory it does not own → breach
+                    StepReturn::error(-123) // read memory it does not own → breach
                 }
             }
             // Write RAM that is not the module's: the page below its own
@@ -275,14 +275,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             10 => {
                 let below = (state as usize & !0xFFF).wrapping_sub(0x1000) as *mut u32;
                 core::ptr::write_volatile(below, 0xDEAD_BEEF);
-                -125 // wrote memory it does not own → breach
+                StepReturn::error(-125) // wrote memory it does not own → breach
             }
             // Recurse with a large frame until the stack runs out: the
             // hardware bound (a limit register, a guard, or the end of the
             // module's own memory) must fault it before it writes past.
             9 => {
                 s.sink = deeper(s.sink as u32) as u64;
-                -124 // returned: the recursion was bounded by something else
+                StepReturn::error(-124) // returned: the recursion was bounded by something else
             }
             // The granted device window: the first probed step reads its
             // first register and says what it held (the window reaches the
@@ -290,7 +290,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // the next block's, which is not the module's → abort.
             11 => {
                 if s.window_size == 0 {
-                    return -130; // no window granted
+                    return StepReturn::error(-130); // no window granted
                 }
                 if s.step_count == s.delay_steps as u32 + 1 {
                     let v = core::ptr::read_volatile(s.window_base as usize as *const u32);
@@ -306,13 +306,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     dev_log(&*s.syscalls, 3, line.as_ptr(), line.len());
                     s.sink = v as u64;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let past = (s.window_base as usize + s.window_size as usize) as *const u32;
                 s.sink = core::ptr::read_volatile(past) as u64;
-                -131 // read a register beside its window → breach
+                StepReturn::error(-131) // read a register beside its window → breach
             }
-            _ => 0,
+            _ => StepReturn::Continue,
         }
     }
 }

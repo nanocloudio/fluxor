@@ -333,19 +333,19 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut MonitorState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         if s.countdown_ticks > 0 {
             s.countdown_ticks -= 1;
-            return 0;
+            return StepReturn::Continue;
         }
         s.countdown_ticks = s.round_ticks;
 
@@ -355,7 +355,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if cap <= 0 {
                 // No answer (a kernel without the query, or the permission
                 // withheld): nothing to walk. Ask again next round.
-                return 0;
+                return StepReturn::Continue;
             }
             s.slot_capacity = cap as u32;
         }
@@ -393,7 +393,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         s.cursor = i as u32;
 
-        0
+        StepReturn::Continue
     }
 }
 

@@ -152,14 +152,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut TempState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let sys = &*s.syscalls;
@@ -172,7 +172,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut ch = [TEMP_CHANNEL];
             let handle = (sys.provider_open)(HAL_ADC_CONTRACT, ADC_OPEN, ch.as_mut_ptr(), 1);
             if handle < 0 {
-                return -3;
+                return StepReturn::error(-3);
             }
             s.adc_handle = handle;
 
@@ -180,7 +180,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let timer_fd =
                 (sys.provider_open)(TIMER_CONTRACT, TIMER_CREATE, core::ptr::null_mut(), 0);
             if timer_fd < 0 {
-                return -4;
+                return StepReturn::error(-4);
             }
             s.timer_fd = timer_fd;
 
@@ -189,25 +189,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             (sys.provider_call)(s.timer_fd, TIMER_SET, delay.as_mut_ptr(), 4);
 
             s.initialized = true;
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Not currently reading: wait for timer to expire
         if !s.reading {
             let poll = dev_fd_poll(sys, s.timer_fd, POLL_IN);
             if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             // Timer expired — start ADC read
             (sys.provider_call)(s.adc_handle, ADC_READ, core::ptr::null_mut(), 0);
             s.reading = true;
-            return 0;
+            return StepReturn::Continue;
         }
 
         // ADC read in progress — poll for result
         let result = (sys.provider_call)(s.adc_handle, ADC_READ, core::ptr::null_mut(), 0);
         if result <= 0 {
-            return 0; // still pending
+            return StepReturn::Continue; // still pending
         }
 
         // Got raw ADC value — convert to millidegrees Celsius
@@ -249,7 +249,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         (sys.provider_call)(s.timer_fd, TIMER_SET, delay.as_mut_ptr(), 4);
         s.reading = false;
 
-        0
+        StepReturn::Continue
     }
 }
 

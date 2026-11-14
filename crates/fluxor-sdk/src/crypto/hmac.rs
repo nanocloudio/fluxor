@@ -63,6 +63,11 @@ pub fn hash(alg: HashAlg, data: &[u8], out: &mut [u8]) {
 
 /// HMAC computation
 pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
+    hmac_parts(alg, key, &[message], out);
+}
+
+/// HMAC over the concatenation of `parts`, without copying them together.
+pub fn hmac_parts(alg: HashAlg, key: &[u8], parts: &[&[u8]], out: &mut [u8]) {
     let block_len = alg.block_len();
     let hash_len = alg.digest_len();
 
@@ -91,7 +96,9 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
         HashAlg::Sha256 => {
             let mut h = Sha256::new();
             h.update(&ipad[..block_len]);
-            h.update(message);
+            for part in parts {
+                h.update(part);
+            }
             let d = h.finalize();
             // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
             // bounded by loop invariant or the struct's own BLOCK_LEN.
@@ -102,7 +109,9 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
         HashAlg::Sha384 => {
             let mut h = Sha384::new();
             h.update(&ipad[..block_len]);
-            h.update(message);
+            for part in parts {
+                h.update(part);
+            }
             let d = h.finalize();
             // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
             // bounded by loop invariant or the struct's own BLOCK_LEN.

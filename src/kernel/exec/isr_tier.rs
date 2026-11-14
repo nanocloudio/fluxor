@@ -160,7 +160,7 @@ impl IsrModule {
 
 /// Placeholder step function for empty slots.
 unsafe extern "C" fn empty_step(_state: *mut u8) -> i32 {
-    0 // StepOutcome::Continue
+    crate::abi::kernel_abi::step_return::CONTINUE
 }
 
 // ============================================================================

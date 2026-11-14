@@ -643,18 +643,18 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.after_ms != 0 && dev_millis(sys) < u64::from(s.after_ms) {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.op_gap_ms != 0 && s.done == 0 && s.state != 99 {
             let now = dev_millis(sys);
@@ -662,10 +662,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Announce the call, then make it once the line is away.
                 emit(s);
                 s.next_at = now + u64::from(s.op_gap_ms);
-                return 0;
+                return StepReturn::Continue;
             }
             if now < s.next_at {
-                return 0;
+                return StepReturn::Continue;
             }
             s.next_at = 0;
         }
@@ -681,17 +681,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let mut key = [0u8; MAX_WITNESS];
                     let n = first_key(sys, PREFIX, &mut s.scratch, &mut key);
                     if n == E_AGAIN {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if n < 0 {
                         s.err = -10;
                         s.state = 99;
                         emit(s);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if n == 0 {
                         s.cleared = 1;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.clear_key = key;
                     s.clear_len = n as u32;
@@ -715,13 +715,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // is asked again next step, with the same request.
                 let (key, err) = if s.put == 0 { (KEY_A, -1) } else { (KEY_B, -2) };
                 match put(sys, key, VAL_A, &mut s.fence) {
-                    WriteAnswer::Pending => return 0,
+                    WriteAnswer::Pending => return StepReturn::Continue,
                     WriteAnswer::Decided(0) => s.put += 1,
                     WriteAnswer::Decided(_) => {
                         s.err = err;
                         s.state = 99;
                         emit(s);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 if s.put == 2 {
@@ -734,13 +734,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut buf = [0u8; 256];
                 let n = get(sys, KEY_A, &mut buf);
                 if n == E_AGAIN {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if n as usize != VAL_A.len() || &buf[..VAL_A.len()] != VAL_A {
                     s.err = -3;
                     s.state = 99;
                     emit(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.got = 1;
                 s.state = 2;
@@ -749,13 +749,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // 3. LIST the prefix.
                 let n = list_count(sys, PREFIX, &mut s.scratch);
                 if n == E_AGAIN {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if n < 0 {
                     s.err = -4;
                     s.state = 99;
                     emit(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.listed = n as u32;
                 if s.listed != 2 {
@@ -763,7 +763,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.err = -5;
                     s.state = 99;
                     emit(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.state = 3;
             }
@@ -772,18 +772,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // A store with no subscriptions writes and moves on.
                 if s.want_ring == 0 {
                     match put(sys, KEY_C, VAL_C, &mut s.fence) {
-                        WriteAnswer::Pending => return 0,
+                        WriteAnswer::Pending => return StepReturn::Continue,
                         WriteAnswer::Decided(0) => {}
                         WriteAnswer::Decided(_) => {
                             s.err = -8;
                             s.state = 99;
                             emit(s);
-                            return 0;
+                            return StepReturn::Continue;
                         }
                     }
                     s.put += 1;
                     s.state = 5;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if s.event < 0 {
                     s.event = (sys.provider_call)(
@@ -796,31 +796,31 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.err = -6;
                         s.state = 99;
                         emit(s);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 if s.subscribed == 0 {
                     let h = subscribe(sys, PREFIX, s.event);
                     if h == E_AGAIN {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if h < 0 {
                         s.err = -7;
                         s.state = 99;
                         emit(s);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.sub = h;
                     s.subscribed = 1;
                 }
                 match put(sys, KEY_C, VAL_C, &mut s.fence) {
-                    WriteAnswer::Pending => return 0,
+                    WriteAnswer::Pending => return StepReturn::Continue,
                     WriteAnswer::Decided(0) => {}
                     WriteAnswer::Decided(_) => {
                         s.err = -8;
                         s.state = 99;
                         emit(s);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 s.put += 1;
@@ -852,27 +852,27 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // again without deleting again.
                 if s.del == 0 {
                     match delete(sys, KEY_B, &mut s.fence) {
-                        WriteAnswer::Pending => return 0,
+                        WriteAnswer::Pending => return StepReturn::Continue,
                         WriteAnswer::Decided(0) => {}
                         WriteAnswer::Decided(_) => {
                             s.err = -9;
                             s.state = 99;
                             emit(s);
-                            return 0;
+                            return StepReturn::Continue;
                         }
                     }
                     s.del = 1;
                 }
                 let n = list_count(sys, PREFIX, &mut s.scratch);
                 if n == E_AGAIN {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if n != 2 {
                     // a and c remain
                     s.err = -10;
                     s.state = 99;
                     emit(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.listed = n as u32;
                 witness_counts(sys, s);
@@ -892,6 +892,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             _ => {}
         }
-        0
+        StepReturn::Continue
     }
 }

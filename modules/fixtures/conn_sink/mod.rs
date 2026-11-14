@@ -679,7 +679,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut SinkState);
     s.step_count = s.step_count.wrapping_add(1);
     if s.dial_port != 0 {
@@ -695,5 +695,5 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     if s.step_count.is_multiple_of(LOG_PERIOD) {
         log_counters(s);
     }
-    0
+    StepReturn::Continue
 }

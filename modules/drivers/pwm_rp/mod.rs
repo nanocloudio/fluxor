@@ -25,6 +25,7 @@ use core::ffi::c_void;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 // ============================================================================
 // Constants
@@ -407,24 +408,24 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut PwmState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // Signal ready (once). Provider registration is handled by the
         // loader from the manifest's `provider_contracts` — no runtime syscall.
         if !s.signaled_ready {
             s.signaled_ready = true;
-            return 3; // StepOutcome::Ready
+            return StepReturn::Ready; // StepOutcome::Ready
         }
 
-        0 // Continue
+        StepReturn::Continue
     }
 }
 

@@ -331,7 +331,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut UartState);
     let mut i = 0usize;
     while i < MAX_HANDLES {
@@ -346,9 +346,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // it reports Ready.
     if s.ready_reported == 0 {
         s.ready_reported = 1;
-        return 3;
+        return StepReturn::Ready;
     }
-    0
+    StepReturn::Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

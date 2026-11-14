@@ -402,10 +402,10 @@ pub unsafe extern "C" fn module_new(
 /// Kernel module-ABI entry point: `state` is the instance block this module's
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[no_mangle]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     let s = state as *mut State;
     if !(*s).initialized {
-        return 0; // Continue (no-op)
+        return StepReturn::Continue; // no-op)
     }
 
     let sys = &*(*s).sys;
@@ -414,11 +414,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let mut cmd_buf = [0u8; CMD_HEADER_SIZE + ENTRY_KEY_MAX + ENTRY_VAL_MAX];
     let n = (sys.channel_read)((*s).in_ch, cmd_buf.as_mut_ptr(), cmd_buf.len());
     if n <= 0 {
-        return 0; // No command, continue
+        return StepReturn::Continue; // No command, continue
     }
 
     if (n as usize) < CMD_HEADER_SIZE {
-        return 0; // Malformed
+        return StepReturn::Continue; // Malformed
     }
 
     let bp = cmd_buf.as_ptr();
@@ -428,7 +428,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     if key_len == 0 || key_len > ENTRY_KEY_MAX {
         let resp = [RESP_ERROR, 22, 0, 0]; // EINVAL
         (sys.channel_write)((*s).out_ch, resp.as_ptr(), 4);
-        return 0;
+        return StepReturn::Continue;
     }
 
     let key_ptr = bp.add(CMD_HEADER_SIZE);
@@ -442,7 +442,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             if val_len > ENTRY_VAL_MAX {
                 let resp = [RESP_ERROR, 22, 0, 0];
                 (sys.channel_write)((*s).out_ch, resp.as_ptr(), 4);
-                return 0;
+                return StepReturn::Continue;
             }
             let val_ptr = cmd_buf.as_ptr().add(CMD_HEADER_SIZE + key_len);
             let ok = kv_set(&mut *s, key_ptr, key_len, val_ptr, val_len);
@@ -470,7 +470,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
-    0 // Continue
+    StepReturn::Continue
 }
 
 fluxor_rt::module_facts! { state: State, arena: 65536 }

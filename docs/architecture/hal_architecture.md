@@ -393,13 +393,13 @@ fn module_new(...) -> i32 {
     0
 }
 
-fn module_step(state: *mut u8) -> i32 {
+fn module_step(state: *mut u8) -> StepReturn {
     // Read color values from input channel and push to PIO
     let n = (sys.channel_read)(in_chan, color_buf.as_mut_ptr(), buf_max);
     if n > 0 {
         (sys.provider_call)(stream, pio::PUSH, color_buf.as_ptr(), n as usize);
     }
-    0
+    StepReturn::Continue
 }
 ```
 

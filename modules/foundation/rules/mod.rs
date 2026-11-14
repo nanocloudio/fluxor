@@ -314,14 +314,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut RulesState);
         if s.syscalls.is_null() || s.in_chan < 0 {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let sys = &*s.syscalls;
@@ -329,14 +329,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Poll input channel
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Read 4 bytes (i32 LE)
         let mut raw = [0u8; 4];
         let n = (sys.channel_read)(s.in_chan, raw.as_mut_ptr(), 4);
         if n < 4 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let value = i32::from_le_bytes(raw);
@@ -378,7 +378,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             i += 1;
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

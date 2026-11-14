@@ -1221,14 +1221,14 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut AnchorState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         match s.phase {
@@ -1238,7 +1238,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             AnchorPhase::BindingNet => {
                 if net_send_bind(s) {
                     s.phase = AnchorPhase::WaitBoundNet;
-                    return 2;
+                    return StepReturn::Burst;
                 }
             }
             AnchorPhase::WaitBoundNet => {
@@ -1252,7 +1252,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if sc_send_attach(s, aw) {
                     s.phase = AnchorPhase::WaitAttached;
                     mon_emit(s, MON_EV_ATTACH_REQ, b"", b"");
-                    return 2;
+                    return StepReturn::Burst;
                 }
             }
             AnchorPhase::WaitAttached => {
@@ -1271,18 +1271,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if sc_send_detach(s, aw, SC_DETACH_NORMAL) {
                     s.phase = AnchorPhase::WaitDetached;
                     mon_emit(s, MON_EV_DETACH_REQ, b"normal", b"");
-                    return 2;
+                    return StepReturn::Burst;
                 }
             }
             AnchorPhase::WaitDetached => {
                 poll_ctrl_all(s);
             }
             AnchorPhase::Error => {
-                return 1;
+                return StepReturn::Done;
             }
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

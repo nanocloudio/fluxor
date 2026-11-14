@@ -211,7 +211,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut ConnDemuxState);
     let sys = &*s.syscalls;
 
@@ -252,7 +252,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     }
 
     if s.in_chan < 0 || s.lane_count == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // A frame held from a prior step takes priority: retry it, and read NO
@@ -261,32 +261,36 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // pressure propagates to the source instead of dropping frames here.
     if s.pending_mask != 0 {
         flush_pending(s, sys);
-        return if s.pending_mask == 0 { 2 } else { 0 };
+        return if s.pending_mask == 0 {
+            StepReturn::Burst
+        } else {
+            StepReturn::Continue
+        };
     }
 
     let poll = (sys.channel_poll)(s.in_chan, 0x01);
     if poll <= 0 || (poll as u32 & 0x01) == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let buf = s.frame_buf.as_mut_ptr();
     // Read the 3-byte net_proto header: [msg_type][len:u16 LE].
     let hn = (sys.channel_read)(s.in_chan, buf, HDR);
     if hn < HDR as i32 {
-        return 0;
+        return StepReturn::Continue;
     }
     let payload_len = (*buf.add(1) as usize) | ((*buf.add(2) as usize) << 8);
     if payload_len > MAX_PAYLOAD {
         // Oversized / malformed — cannot route safely; drop the header and
         // resync on the next frame boundary.
         s.dropped = s.dropped.wrapping_add(1);
-        return 0;
+        return StepReturn::Continue;
     }
 
     if payload_len > 0 {
         let r = (sys.channel_read)(s.in_chan, buf.add(HDR), payload_len);
         if r < payload_len as i32 {
-            return 0;
+            return StepReturn::Continue;
         }
     }
     s.pending_total = HDR + payload_len;
@@ -322,9 +326,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // Burst (re-pass) only when the frame fully cleared; otherwise return
     // Continue so we wait for the blocked lane to drain rather than spin.
     if s.pending_mask == 0 {
-        2
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 

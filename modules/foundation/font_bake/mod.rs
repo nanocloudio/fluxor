@@ -402,20 +402,20 @@ pub unsafe extern "C" fn module_new(
 /// `state` is the block `module_new` initialised.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = &mut *(state as *mut State);
     let sys = &*s.syscalls;
     match s.phase {
         PH_READ => {
             step_read(s);
-            0
+            StepReturn::Continue
         }
         PH_BAKE => {
             step_bake(s);
-            0
+            StepReturn::Continue
         }
         PH_WRITE => {
             let done = if s.code == 0 {
@@ -431,17 +431,17 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if done {
                 s.phase = PH_EXIT;
             }
-            0
+            StepReturn::Continue
         }
         PH_EXIT => {
             let code = s.code.to_le_bytes();
             if s.exit < 0 || send(sys, s.exit, &code, &mut s.exit_sent) {
                 s.phase = PH_DONE;
-                return 1;
+                return StepReturn::Done;
             }
-            0
+            StepReturn::Continue
         }
-        _ => 1,
+        _ => StepReturn::Done,
     }
 }
 

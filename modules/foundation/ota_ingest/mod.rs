@@ -72,9 +72,6 @@ const PAGE_SIZE: usize = 256;
 /// A graph image's first four bytes, "FXSL".
 const MAGIC: [u8; 4] = GRAPH_SLOT_MAGIC.to_le_bytes();
 
-const CONTINUE: i32 = 0;
-const READY: i32 = 3;
-
 // Extra port indices (primary in/out are index 0).
 const PORT_IN_GS_RESP: u32 = 1; // graph_slot response channel
 const PORT_OUT_GS_REQ: u32 = 1; // graph_slot request channel
@@ -308,7 +305,7 @@ fn fail(s: &mut State, sys: &SyscallTable, rc: i32) {
 // State machine
 // ============================================================================
 
-unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn pump(s: &mut State, sys: &SyscallTable) -> StepReturn {
     // A failure is reported once and the ingest goes back to waiting for an
     // image: what follows on the stream (the rest of the one refused) is
     // not one, and the idle state drops it until a header's magic arrives.
@@ -322,7 +319,7 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
     match s.state {
         ST_IDLE => {
             if s.in_chan < 0 {
-                return CONTINUE;
+                return StepReturn::Continue;
             }
             // Gather the header page before erasing anything. An image
             // starts with its magic, so bytes that do not -- the padding
@@ -350,7 +347,7 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
                 s.page_fill += 1;
             }
             if (s.page_fill as usize) < PAGE_SIZE {
-                return CONTINUE;
+                return StepReturn::Continue;
             }
             s.byte_count = PAGE_SIZE as u32;
             // Where the image ends; graph_slot judges the rest of the header
@@ -359,29 +356,29 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
                 Some(end) => s.image_end = end,
                 None => {
                     fail(s, sys, if s.slot_size == 0 { E_NOSYS } else { E_INVAL });
-                    return CONTINUE;
+                    return StepReturn::Continue;
                 }
             }
             if !send_bare_request(s, sys, REQ_ERASE) {
                 fail(s, sys, E_AGAIN);
-                return CONTINUE;
+                return StepReturn::Continue;
             }
             s.state = ST_AWAIT_ERASE;
-            CONTINUE
+            StepReturn::Continue
         }
         ST_AWAIT_ERASE => {
             if let Some((echoed, rc)) = poll_response(s, sys) {
                 if echoed != REQ_ERASE {
-                    return CONTINUE;
+                    return StepReturn::Continue;
                 }
                 if rc < 0 {
                     fail(s, sys, rc);
-                    return CONTINUE;
+                    return StepReturn::Continue;
                 }
                 emit_status(s, sys, STATUS_ERASED, 0);
                 s.state = ST_STREAMING;
             }
-            CONTINUE
+            StepReturn::Continue
         }
         ST_STREAMING => {
             // Keep filling the page buffer from input.
@@ -406,20 +403,20 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
             if s.page_fill as usize == PAGE_SIZE {
                 if !send_write_request(s, sys, s.write_offset) {
                     fail(s, sys, E_AGAIN);
-                    return CONTINUE;
+                    return StepReturn::Continue;
                 }
                 s.state = ST_AWAIT_WRITE;
             }
-            CONTINUE
+            StepReturn::Continue
         }
         ST_AWAIT_WRITE => {
             if let Some((echoed, rc)) = poll_response(s, sys) {
                 if echoed != REQ_WRITE {
-                    return CONTINUE;
+                    return StepReturn::Continue;
                 }
                 if rc < 0 {
                     fail(s, sys, rc);
-                    return CONTINUE;
+                    return StepReturn::Continue;
                 }
                 s.write_offset += PAGE_SIZE as u32;
                 s.page_fill = 0;
@@ -429,19 +426,19 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
                 if s.image_end != 0 && s.write_offset >= s.image_end {
                     if !send_bare_request(s, sys, REQ_ACTIVATE) {
                         fail(s, sys, E_AGAIN);
-                        return CONTINUE;
+                        return StepReturn::Continue;
                     }
                     s.state = ST_AWAIT_ACTIVATE;
                 } else {
                     s.state = ST_STREAMING;
                 }
             }
-            CONTINUE
+            StepReturn::Continue
         }
         ST_AWAIT_ACTIVATE => {
             if let Some((echoed, rc)) = poll_response(s, sys) {
                 if echoed != REQ_ACTIVATE {
-                    return CONTINUE;
+                    return StepReturn::Continue;
                 }
                 emit_status(
                     s,
@@ -455,9 +452,9 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
                 );
                 reset_ingest(s);
             }
-            CONTINUE
+            StepReturn::Continue
         }
-        _ => CONTINUE,
+        _ => StepReturn::Continue,
     }
 }
 
@@ -524,14 +521,14 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys = &*s.syscalls;
 
@@ -540,7 +537,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.gs_req_chan = channel_port_out(sys, PORT_OUT_GS_REQ);
             s.gs_resp_chan = channel_port_in(sys, PORT_IN_GS_RESP);
             s.signaled_ready = 1;
-            return READY;
+            return StepReturn::Ready;
         }
 
         pump(s, sys)

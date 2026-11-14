@@ -5850,14 +5850,14 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut DnsState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // Module-scope metrics: cumulative byte counters, ~5s cadence, no-op
@@ -5964,9 +5964,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         expire_pending(s);
 
         if did_work {
-            2
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         } // burst when work happened, else continue
     }
 }

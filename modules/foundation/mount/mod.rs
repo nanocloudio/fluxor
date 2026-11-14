@@ -695,11 +695,11 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // The FS path is served through provider calls; the only per-tick work
     // is draining the hotplug control channel (add/remove volumes).
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: kernel passes this module's initialised state buffer.
     unsafe {
@@ -709,7 +709,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             emit_telemetry(s);
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Emit the routing counters on a wall-clock cadence. Both are cumulative

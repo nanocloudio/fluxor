@@ -4410,7 +4410,7 @@ pub fn retain_default(keepalive_ms: u32, redial_ms: u32) -> u32 {
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut State);
     let sys = &*s.syscalls;
     let now = dev_millis(sys) as u32;
@@ -4464,7 +4464,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         send_records(s);
     }
     report_session(s);
-    0
+    StepReturn::Continue
 }
 
 /// `resume`: keep an idle session's link proven, and give up on one that

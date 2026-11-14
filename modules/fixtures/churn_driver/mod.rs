@@ -462,14 +462,14 @@ unsafe fn lane0(sys: &SyscallTable, h: i32) -> i32 {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
@@ -519,7 +519,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     progress(sys, s);
                     s.phase = if s.fault != 0 { PH_FAULT } else { PH_DONE };
                     s.since_ms = 0;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let len = build(s, s.n, None);
                 let h = if len == 0 { -22 } else { admit(sys, s, len) };
@@ -537,7 +537,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         progress(sys, s);
                         s.phase = PH_DONE;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.consecutive_cf = 0;
                 s.handle = h;
@@ -554,7 +554,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let late = now.saturating_sub(s.since_ms) >= s.read_timeout_ms as u64;
                 if !got && !late {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if got {
                     s.ok += 1;
@@ -594,11 +594,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         if s.fault_idx >= 2 {
                             s.phase = PH_DONE;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.handle = h;
                     s.since_ms = now;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let mut out = [0u8; 5];
                 let _ = (sys.provider_call)(s.handle, wl::WAIT, out.as_mut_ptr(), out.len());
@@ -607,7 +607,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let el = now.saturating_sub(s.since_ms);
                 let terminal = st == wl::STATE_SIGNALLED || st == wl::STATE_EXITED;
                 if !terminal && el < 5000 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 report(
                     sys,
@@ -639,7 +639,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             _ => {}
         }
-        0
+        StepReturn::Continue
     }
 }
 

@@ -29,6 +29,7 @@ use core::ffi::c_void;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 pub use fluxor_sdk::crypto::sha256::*;
 pub use fluxor_sdk::gpu::*;
@@ -226,15 +227,15 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     // SAFETY: the scheduler passes the pointer `module_new` initialised, once
     // per step, single-threaded within this module's domain.
     let s = unsafe { &mut *(state as *mut GpuNullState) };
     if !s.ready {
-        return -1;
+        return StepReturn::error(-1);
     }
     step(s);
-    0
+    StepReturn::Continue
 }
 
 /// One cooperative step. Split out of the `extern "C"` shell so the borrow

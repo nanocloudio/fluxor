@@ -124,21 +124,21 @@ fn put_dec(msg: &mut [u8], mut len: usize, v: u64) -> usize {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         s.count = s.count.wrapping_add(1);
         let now = dev_millis(sys);
         if now == 0 {
             dev_log(sys, 1, b"[pprobe] clock_dead".as_ptr(), 19);
-            return 0;
+            return StepReturn::Continue;
         }
         // Freeze detector: a pause spans many nominal ticks, so the first
         // step after resume sees a wall-clock gap ≈ the pause window.
@@ -168,7 +168,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let len = put_dec(&mut msg, len, now);
             dev_log(sys, 3, msg.as_ptr(), len);
         }
-        0
+        StepReturn::Continue
     }
 }
 

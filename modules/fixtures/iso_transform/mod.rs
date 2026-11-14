@@ -97,12 +97,12 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut IsoTransformState);
         let sys = &*s.syscalls;
         if s.in_chan < 0 || s.out_chan < 0 {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // --- Phase 1: flush any pending transformed output FIRST. ----------
@@ -118,16 +118,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if w == E_AGAIN {
                 // Downstream FIFO full — backpressure, not an error. Hold the
                 // pending tail staged and retry next tick (consume no input).
-                return 0;
+                return StepReturn::Continue;
             }
             if w < 0 {
-                return w; // Real error — fault.
+                return StepReturn::error(w); // Real error — fault.
             }
             s.out_head += w as usize;
             if s.out_head < s.out_len {
                 // Still backpressured. Hold the remainder and retry next tick;
                 // do NOT read new input (would overwrite the staging buffer).
-                return 0;
+                return StepReturn::Continue;
             }
             // Fully flushed — reset the staging buffer to empty.
             s.out_head = 0;
@@ -142,10 +142,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // and propagates.
         let n = (sys.channel_read)(s.in_chan, s.out_buf.as_mut_ptr(), BUF_LEN);
         if n == 0 || n == E_AGAIN {
-            return 0; // nothing to read right now → Continue
+            return StepReturn::Continue; // nothing to read right now → Continue
         }
         if n < 0 {
-            return n;
+            return StepReturn::error(n);
         }
         let n = n as usize;
 
@@ -163,10 +163,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if w == E_AGAIN {
             // Downstream FIFO full — keep the freshly-staged result
             // (out_head=0, out_len=n) and retry in Phase 1 next tick.
-            return 0;
+            return StepReturn::Continue;
         }
         if w < 0 {
-            return w;
+            return StepReturn::error(w);
         }
         s.out_head = w as usize;
         if s.out_head >= s.out_len {
@@ -174,7 +174,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.out_head = 0;
             s.out_len = 0;
         }
-        0 // Continue
+        StepReturn::Continue
     }
 }
 

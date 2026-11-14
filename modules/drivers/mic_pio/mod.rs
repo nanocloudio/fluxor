@@ -202,27 +202,27 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut MicState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         match s.phase {
             MicPhase::Init => {
                 let r = step_init(s);
-                if r < 0 {
+                if r.is_error() {
                     return r;
                 }
                 step_running(s)
             }
             MicPhase::Running => step_running(s),
-            MicPhase::Error => -1,
-            _ => -1,
+            MicPhase::Error => StepReturn::error(-1),
+            _ => StepReturn::error(-1),
         }
     }
 }
@@ -231,7 +231,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // Init: allocate PIO RX stream, load program, configure
 // ============================================================================
 
-unsafe fn step_init(s: &mut MicState) -> i32 {
+unsafe fn step_init(s: &mut MicState) -> StepReturn {
     let sys = &*s.syscalls;
     let provider_open = sys.provider_open;
     let provider_call = sys.provider_call;
@@ -246,7 +246,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
     if handle < 0 {
         dev_log(sys, 1, b"[mic] alloc fail".as_ptr(), 16);
         s.phase = MicPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // Load RX PIO program
@@ -268,7 +268,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
         dev_log(sys, 1, b"[mic] load fail".as_ptr(), 15);
         (provider_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
         s.phase = MicPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // Configure RX stream (pins, clock divider, shift width)
@@ -291,7 +291,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
         dev_log(sys, 1, b"[mic] cfg fail".as_ptr(), 14);
         (provider_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
         s.phase = MicPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // Set stream rate (Q16.16)
@@ -303,14 +303,14 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
     s.phase = MicPhase::Running;
 
     dev_log(sys, 3, b"[mic] running".as_ptr(), 13);
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================
 // Running: pull captured audio and write to output channel
 // ============================================================================
 
-unsafe fn step_running(s: &mut MicState) -> i32 {
+unsafe fn step_running(s: &mut MicState) -> StepReturn {
     let sys = &*s.syscalls;
     let provider_call = sys.provider_call;
     let out_chan = s.out_chan;
@@ -324,13 +324,13 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
         &mut s.pending_out,
         &mut s.pending_offset,
     ) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Check output channel ready
     let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
     if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Check if RX buffer is ready
@@ -341,7 +341,7 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
         0,
     );
     if can_pull <= 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Get buffer pointer
@@ -353,7 +353,7 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
         4,
     );
     if buf_ptr == 0 || words <= 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let byte_count = (words as usize) * 4;
@@ -372,12 +372,12 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
     // Write to output channel
     let written = (sys.channel_write)(out_chan, s.io_buf.as_ptr(), copy_len);
     if written < 0 && written != E_AGAIN {
-        return -1;
+        return StepReturn::error(-1);
     }
 
     track_pending(written, copy_len, &mut s.pending_out, &mut s.pending_offset);
 
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================

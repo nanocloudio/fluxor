@@ -98,14 +98,14 @@ fn add_f32() -> u32 {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: the scheduler passes the state `module_new` initialised.
     let s = unsafe { &mut *(state as *mut State) };
     if s.done != 0 || s.syscalls.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     s.done = 1;
     // SAFETY: `module_new` stored the kernel's syscall table.
@@ -118,7 +118,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // SAFETY: `ran` is a live buffer of the length passed.
         unsafe { dev_log(sys, 3, ran.as_ptr(), ran.len()) };
     }
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::wasm_entry!();

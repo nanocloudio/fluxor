@@ -1164,7 +1164,7 @@ unsafe fn dtls_discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 // Out of line: `module_step` runs either this or `tcp_module_step`, and
 // inlined the two would share one frame holding both paths' buffers.
 #[inline(never)]
-unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
+unsafe fn dtls_module_step(s: &mut TlsState) -> StepReturn {
     creds_step(s);
     identity_step(s);
     let sys = &*s.syscalls;
@@ -1330,7 +1330,7 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
                         // endpoint on the shared net_out channel.
                         if !s.dtls_endpoint.owns(ep_id) {
                             dtls_discard_bytes(sys, s.cipher_in, dgram_len);
-                            return 1;
+                            return StepReturn::Done;
                         }
                         if dgram_len <= DGRAM_MAX {
                             let mut idx = dtls_find_session(s, &ip, port);
@@ -1390,5 +1390,5 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
         i += 1;
     }
 
-    1
+    StepReturn::Done
 }

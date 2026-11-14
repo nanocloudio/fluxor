@@ -1595,7 +1595,7 @@ fn ticket_digest(identity: &[u8]) -> [u8; 16] {
 /// Kernel module-ABI entry point: `state` is the instance block this module's
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     let s = &mut *(state as *mut QuicState);
     let sys = &*s.syscalls;
 
@@ -2289,7 +2289,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // StepOutcome::Continue (0). A `1` return maps to StepOutcome::Done
     // and would finalize the module; quic is a long-lived server/client
     // that must be stepped every tick to drain net_in and pump handshakes.
-    0
+    StepReturn::Continue
 }
 
 /// # Safety

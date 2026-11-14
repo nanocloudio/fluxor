@@ -607,11 +607,11 @@ unsafe fn log_once(s: &mut NvmeState, msg: &[u8]) {
     dev_log(&*s.syscalls, 3, msg.as_ptr(), msg.len());
 }
 
-unsafe fn fault(s: &mut NvmeState, code: u8, msg: &[u8]) -> i32 {
+unsafe fn fault(s: &mut NvmeState, code: u8, msg: &[u8]) -> StepReturn {
     s.state = S_FAULT;
     s.fault_code = code;
     dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
-    0
+    StepReturn::Continue
 }
 
 unsafe fn now_ms(s: &NvmeState) -> u64 {
@@ -969,11 +969,11 @@ unsafe fn zero_page(phys: u64) {
 /// returns a negative errno; we stay in this state and nudge the
 /// kernel to re-enumerate on a wall-clock cadence until the card
 /// appears.
-unsafe fn step_bind(s: &mut NvmeState) -> i32 {
+unsafe fn step_bind(s: &mut NvmeState) -> StepReturn {
     log_once(s, b"[nvme] Bind\0");
     if s.pcie_handle >= 0 {
         s.state = S_MAP_BARS;
-        return 0;
+        return StepReturn::Continue;
     }
     let sys = &*s.syscalls;
     let sel = &s.bind_str[..s.bind_len as usize];
@@ -981,7 +981,7 @@ unsafe fn step_bind(s: &mut NvmeState) -> i32 {
     if rc >= 0 {
         s.pcie_handle = rc;
         s.state = S_MAP_BARS;
-        return 0;
+        return StepReturn::Continue;
     }
     // Link may still be training; periodically force a kernel rescan
     // so the downstream card's BDF + BAR0 show up in the enumeration
@@ -991,10 +991,10 @@ unsafe fn step_bind(s: &mut NvmeState) -> i32 {
         s.last_rescan_ms = now;
         let _ = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
     }
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_map_bars(s: &mut NvmeState) -> i32 {
+unsafe fn step_map_bars(s: &mut NvmeState) -> StepReturn {
     log_once(s, b"[nvme] MapBars\0");
     let sys = &*s.syscalls;
     let bar0 = dev_pcie_device_bar_map(sys, s.pcie_handle, 0);
@@ -1004,12 +1004,12 @@ unsafe fn step_map_bars(s: &mut NvmeState) -> i32 {
     s.bar0_virt = bar0;
     s.state = S_RESET;
     s.substate = 0;
-    0
+    StepReturn::Continue
 }
 
 /// Reset: clear CC.EN + CC.SHN, poll CSTS.RDY=0.
 /// Baseline: ~50 ms typical on the rig.
-unsafe fn step_reset(s: &mut NvmeState) -> i32 {
+unsafe fn step_reset(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             log_once(s, b"[nvme] Reset\0");
@@ -1026,7 +1026,7 @@ unsafe fn step_reset(s: &mut NvmeState) -> i32 {
             reg_w32(s, REG_CC, cc & !(CC_EN | CC_SHN_MASK));
             s.wait_start_ms = now_ms(s);
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         _ => {
             let csts = reg_r32(s, REG_CSTS);
@@ -1037,12 +1037,12 @@ unsafe fn step_reset(s: &mut NvmeState) -> i32 {
                 dev_log(&*s.syscalls, 3, c"[nvme] Reset: RDY=0".as_ptr().cast(), 19);
                 s.state = S_CONFIG_QUEUES;
                 s.substate = 0;
-                return 0;
+                return StepReturn::Continue;
             }
             if now_ms(s).saturating_sub(s.wait_start_ms) > RESET_BUDGET_MS {
                 return fault(s, 4, b"[nvme] Reset timeout\0");
             }
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -1050,7 +1050,7 @@ unsafe fn step_reset(s: &mut NvmeState) -> i32 {
 /// ConfigQueues: allocate admin SQ/CQ/identify pages, program
 /// AQA/ASQ/ACQ. Each substate does one unit so the step-guard is
 /// never at risk from a slow DMA alloc.
-unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
+unsafe fn step_config_queues(s: &mut NvmeState) -> StepReturn {
     let sys = &*s.syscalls;
     match s.substate {
         0 => {
@@ -1062,7 +1062,7 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
             zero_page(p);
             s.admin_sq = p;
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         1 => {
             let p = dev_dma_alloc(sys, PAGE, PAGE);
@@ -1072,7 +1072,7 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
             zero_page(p);
             s.admin_cq = p;
             s.substate = 2;
-            0
+            StepReturn::Continue
         }
         2 => {
             let p = dev_dma_alloc(sys, PAGE, PAGE);
@@ -1082,7 +1082,7 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
             zero_page(p);
             s.identify_buf = p;
             s.substate = 3;
-            0
+            StepReturn::Continue
         }
         _ => {
             // AQA: ASQS = ACQS = ADMIN_Q_ENTRIES-1, zero-based.
@@ -1094,14 +1094,14 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
             reg_w64(s, REG_ACQ, s.admin_cq | s.dma_offset);
             s.state = S_ENABLE;
             s.substate = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
 
 /// Enable: set CC.EN with queue entry sizes, poll CSTS.RDY=1.
 /// Baseline: ~12 ms typical on the rig.
-unsafe fn step_enable(s: &mut NvmeState) -> i32 {
+unsafe fn step_enable(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             log_once(s, b"[nvme] Enable\0");
@@ -1109,7 +1109,7 @@ unsafe fn step_enable(s: &mut NvmeState) -> i32 {
             reg_w32(s, REG_CC, cc);
             s.wait_start_ms = now_ms(s);
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         _ => {
             let csts = reg_r32(s, REG_CSTS);
@@ -1123,19 +1123,19 @@ unsafe fn step_enable(s: &mut NvmeState) -> i32 {
                 s.sq_tail = 0;
                 s.cq_head = 0;
                 s.cq_phase = 1; // Initial expected phase bit (flipped each wrap).
-                return 0;
+                return StepReturn::Continue;
             }
             if now_ms(s).saturating_sub(s.wait_start_ms) > ENABLE_BUDGET_MS {
                 return fault(s, 9, b"[nvme] Enable timeout\0");
             }
-            0
+            StepReturn::Continue
         }
     }
 }
 
 /// Build Identify Controller SQE at SQ[0], ring doorbell, poll CQ[0].
 /// On completion, log VID/SN/MN/FR from the response buffer.
-unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
+unsafe fn step_identify_controller(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             log_once(s, b"[nvme] IdentifyController\0");
@@ -1166,7 +1166,7 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
             reg_w32(s, sq_doorbell(s, 0), s.sq_tail);
             s.wait_start_ms = now_ms(s);
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         _ => {
             let cqe = (s.admin_cq + (s.cq_head as u64) * CQE_BYTES as u64) as *const u32;
@@ -1176,7 +1176,7 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
                 if now_ms(s).saturating_sub(s.wait_start_ms) > ADMIN_CMD_BUDGET_MS {
                     return fault(s, 10, b"[nvme] Identify CQE timeout\0");
                 }
-                return 0; // still waiting
+                return StepReturn::Continue; // still waiting
             }
             // CQE present. Status field = DW3[31:17].
             let sc = (dw3 >> 17) & 0x7FFF;
@@ -1205,7 +1205,7 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
 
             s.state = S_IDENTIFY_NAMESPACE;
             s.substate = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -1213,7 +1213,7 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
 /// Identify Namespace (CNS=0x00). Uses its own DMA page so
 /// `identify_buf` stays untouched for re-emit at heartbeat time.
 /// Extracts namespace size + LBA format shift for later use.
-unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
+unsafe fn step_identify_namespace(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             log_once(s, b"[nvme] IdentifyNamespace\0");
@@ -1237,10 +1237,10 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
                 0,
             );
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         _ => match poll_admin_cqe(s) {
-            CqeResult::Pending => 0,
+            CqeResult::Pending => StepReturn::Continue,
             CqeResult::Timeout => fault(s, 13, b"[nvme] IdentifyNs CQE timeout\0"),
             CqeResult::Failed => fault(s, 14, b"[nvme] IdentifyNs failed\0"),
             CqeResult::Ok => {
@@ -1263,7 +1263,7 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
                 emit_ns_info(s);
                 s.state = S_CREATE_IO_CQ;
                 s.substate = 0;
-                0
+                StepReturn::Continue
             }
         },
     }
@@ -1276,7 +1276,7 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
 ///
 /// The cursor `bringup_qidx` steps 0 → io_q_count-1, re-entering
 /// this state once per queue via the transition in step_create_io_sq.
-unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
+unsafe fn step_create_io_cq(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             // Bring MSI-X up before the first CreateIoCQ so CDW11.IEN
@@ -1327,10 +1327,10 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
                 0,
             );
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         _ => match poll_admin_cqe(s) {
-            CqeResult::Pending => 0,
+            CqeResult::Pending => StepReturn::Continue,
             CqeResult::Timeout => fault(s, 16, b"[nvme] CreateIoCQ CQE timeout\0"),
             CqeResult::Failed => fault(s, 17, b"[nvme] CreateIoCQ failed\0"),
             CqeResult::Ok => {
@@ -1339,7 +1339,7 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
                 *s.io_cq_phase.as_mut_ptr().add(q) = 1;
                 s.state = S_CREATE_IO_SQ;
                 s.substate = 0;
-                0
+                StepReturn::Continue
             }
         },
     }
@@ -1349,7 +1349,7 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
 /// same-index CQ). Re-entered once per queue from step_create_io_cq.
 /// After the last SQ completes, `bringup_qidx` is reset and the
 /// state machine advances to S_READ_LBA0.
-unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
+unsafe fn step_create_io_sq(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             let q = s.bringup_qidx as usize;
@@ -1382,10 +1382,10 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
                 0,
             );
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         _ => match poll_admin_cqe(s) {
-            CqeResult::Pending => 0,
+            CqeResult::Pending => StepReturn::Continue,
             CqeResult::Timeout => fault(s, 19, b"[nvme] CreateIoSQ CQE timeout\0"),
             CqeResult::Failed => fault(s, 20, b"[nvme] CreateIoSQ failed\0"),
             CqeResult::Ok => {
@@ -1403,7 +1403,7 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
                     s.state = S_READ_LBA0;
                     s.substate = 0;
                 }
-                0
+                StepReturn::Continue
             }
         },
     }
@@ -1657,7 +1657,7 @@ pub mod sim {
 /// One-shot read of LBA 0 via the I/O queue; log boot-sector signature
 /// and the first 16 bytes. Proves the DMA + I/O queue path works
 /// end-to-end before declaring READY.
-unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
+unsafe fn step_read_lba0(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             log_once(s, b"[nvme] ReadLba0\0");
@@ -1680,10 +1680,10 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
             }
             submit_io_read(s, 0, 1, CID_READ_LBA0);
             s.substate = 1;
-            0
+            StepReturn::Continue
         }
         _ => match poll_io_cqe(s, CID_READ_LBA0) {
-            CqeResult::Pending => 0,
+            CqeResult::Pending => StepReturn::Continue,
             CqeResult::Timeout => fault(s, 22, b"[nvme] ReadLba0 CQE timeout\0"),
             CqeResult::Failed => fault(s, 23, b"[nvme] ReadLba0 failed\0"),
             CqeResult::Ok => {
@@ -1698,7 +1698,7 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
                 s.blk_phase = BLK_PHASE_IDLE;
                 s.state = S_READY;
                 s.substate = 0;
-                0
+                StepReturn::Continue
             }
         },
     }
@@ -2507,7 +2507,7 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     true
 }
 
-unsafe fn step_ready(s: &mut NvmeState) -> i32 {
+unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
     log_once(s, b"[nvme] Ready\0");
 
     // Give every `storage.block` slot its DMA page here, in this module's
@@ -2515,12 +2515,12 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
     // scope would be denied the allocation. `Ready` waits until every page
     // is in hand; the allocation retries next tick and is idempotent.
     if !v1_ensure_pages(s) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     if s.returned_ready == 0 {
         s.returned_ready = 1;
-        return 3; // signal scheduler we've reached the steady state
+        return StepReturn::Ready; // signal scheduler we've reached the steady state
     }
 
     // One-shot PCIe capability walk for observability — the heartbeat
@@ -2541,7 +2541,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
     // read in flight without either path consuming the other's CQE.
     pump_requests(s);
     if s.blk_out < 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Check for consumer seek on every tick. fat32 (and the
@@ -2576,7 +2576,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             let poll = (sys.channel_poll)(s.blk_out, POLL_OUT);
             if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
                 s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
-                return 0;
+                return StepReturn::Continue;
             }
             // Gate auto-streaming: only submit a Read SQE when there is
             // explicit consumer demand (a queued batch or a seek that
@@ -2589,7 +2589,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             // code 24).
             if s.pending_batch_valid == 0 && s.stream_armed == 0 {
                 s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
-                return 0;
+                return StepReturn::Continue;
             }
             s.stream_armed = 0;
             // Two paths into IDLE:
@@ -2617,10 +2617,10 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             s.blk_nlb = nlb;
             submit_io_read(s, lba, nlb, CID_READ_LBA0);
             s.blk_phase = BLK_PHASE_READING;
-            0
+            StepReturn::Continue
         }
         BLK_PHASE_READING => match poll_io_cqe(s, CID_READ_LBA0) {
-            CqeResult::Pending => 0,
+            CqeResult::Pending => StepReturn::Continue,
             CqeResult::Timeout => fault(s, 24, b"[nvme] block read CQE timeout\0"),
             CqeResult::Failed => fault(s, 25, b"[nvme] block read failed\0"),
             CqeResult::Ok => {
@@ -2630,13 +2630,13 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
                     // seeked LBA on the next tick.
                     s.discard_cqe = 0;
                     s.blk_phase = BLK_PHASE_IDLE;
-                    0
+                    StepReturn::Continue
                 } else {
                     s.write_offset = 0;
                     s.blk_phase = BLK_PHASE_WRITING;
                     // Burst: the data is in `read_buf`, no point sleeping
                     // a tick before pushing it to the output channel.
-                    2
+                    StepReturn::Burst
                 }
             }
         },
@@ -2650,7 +2650,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             let n = (sys.channel_write)(s.blk_out, src, remaining as usize);
             if n < 0 {
                 if n == E_AGAIN {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 return fault(s, 26, b"[nvme] blocks channel write err\0");
             }
@@ -2665,18 +2665,18 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
                 // already-bumped `current_block` for a sequential
                 // consumer) submits the next read this tick instead of
                 // waiting one tick per block.
-                2
+                StepReturn::Burst
             } else {
                 // Partial write — channel filled. Yield until the next
                 // tick so the consumer can drain.
                 s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
-                0
+                StepReturn::Continue
             }
         }
     }
 }
 
-unsafe fn step_fault(s: &mut NvmeState) -> i32 {
+unsafe fn step_fault(s: &mut NvmeState) -> StepReturn {
     log_once(s, b"[nvme] Fault\0");
     // Fault code 1 = MapBars failed (enumerate() returned 0 devices
     // because the link wasn't trained yet). Periodically re-trigger
@@ -2708,7 +2708,7 @@ unsafe fn step_fault(s: &mut NvmeState) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================
@@ -3435,10 +3435,10 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut NvmeState);
     if !io_claim(s, IO_STEP) {
-        return 0; // an ioctl holds the queue; next step
+        return StepReturn::Continue; // an ioctl holds the queue; next step
     }
     let rc = step_body(state);
     io_release(&mut *(state as *mut NvmeState));
@@ -3469,7 +3469,7 @@ unsafe fn io_release(s: &mut NvmeState) {
     io_owner(s).store(0, core::sync::atomic::Ordering::Release);
 }
 
-unsafe fn step_body(state: *mut c_void) -> i32 {
+unsafe fn step_body(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut NvmeState);
 
     s.step_count = s.step_count.wrapping_add(1);

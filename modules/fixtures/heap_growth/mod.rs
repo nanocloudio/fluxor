@@ -100,7 +100,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut State);
     let sys = &*s.syscalls;
     s.steps = s.steps.wrapping_add(1);
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         put_dec(&mut line, &mut n, s.fails);
         dev_log(sys, 3, line.as_ptr(), n);
     }
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::wasm_entry!();

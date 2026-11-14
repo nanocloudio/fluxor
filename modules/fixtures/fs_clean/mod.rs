@@ -295,7 +295,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut CleanState);
     let sys = &*s.syscalls;
 
@@ -314,13 +314,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let mut root = *b"/";
             let rc = (sys.provider_call)(-1, FS_OPENDIR, root.as_mut_ptr(), root.len());
             if rc == EAGAIN {
-                return 0; // the volume is not mounted yet
+                return StepReturn::Continue; // the volume is not mounted yet
             }
             if rc < 0 {
                 s.last_rc = rc;
                 s.phase = PH_DONE;
                 emit_result(s);
-                return 0;
+                return StepReturn::Continue;
             }
             s.dir = rc;
             s.phase = PH_READ;
@@ -328,11 +328,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         PH_READ => {
             let rc = (sys.provider_call)(s.dir, FS_READDIR, s.buf.as_mut_ptr(), s.buf.len());
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc > 0 {
                 take_batch(s, rc as usize);
-                return 0;
+                return StepReturn::Continue;
             }
             (sys.provider_call)(s.dir, FS_CLOSE, core::ptr::null_mut(), 0);
             s.dir = -1;
@@ -357,20 +357,20 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 if s.backoff > 0 {
                     s.backoff -= 1;
                     s.cursor -= 1;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n);
                 // Not yet, or taken and not yet decided: the same name, with
                 // the same bytes, on the next step.
                 if rc == EAGAIN || rc == abi::kernel_abi::errno::EINPROGRESS {
                     s.cursor -= 1; // the same name, next step
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if rc == ENOENT || rc >= 0 {
                     // Removed, or already gone.
                     s.removed += u32::from(rc >= 0);
                     s.tries = 0;
-                    return 0; // one removal per step
+                    return StepReturn::Continue; // one removal per step
                 }
                 // Refused: say so, and ask again a little later — a
                 // provider still reclaiming the last file's clusters may
@@ -384,14 +384,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                     s.failed += 1;
                     s.tries = 0;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             s.phase = PH_DONE;
             emit_result(s);
         }
         _ => {}
     }
-    0
+    StepReturn::Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.

@@ -4,7 +4,7 @@
 use crate::kernel::security::crypto::chacha20::{
     chacha20_poly1305_decrypt, chacha20_poly1305_encrypt,
 };
-use crate::kernel::security::crypto::sha256::Sha256;
+use crate::kernel::security::crypto::hmac::{hmac_parts, HashAlg};
 
 // custody_wrap — the destination-bound key wrap a vault's KEY_WRAP /
 // KEY_UNWRAP perform, as a pure core.
@@ -77,33 +77,8 @@ pub const fn kw_wrapped_len(key_len: usize) -> usize {
 }
 
 fn kw_hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let mut h = Sha256::new();
-        h.update(key);
-        k[..32].copy_from_slice(&h.finalize());
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0u8; 64];
-    let mut opad = [0u8; 64];
-    for i in 0..64 {
-        ipad[i] = k[i] ^ 0x36;
-        opad[i] = k[i] ^ 0x5c;
-    }
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    for p in parts {
-        inner.update(p);
-    }
-    let ih = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(&ih);
-    let out = outer.finalize();
-    kw_zero(&mut k);
-    kw_zero(&mut ipad);
-    kw_zero(&mut opad);
+    let mut out = [0u8; 32];
+    hmac_parts(HashAlg::Sha256, key, parts, &mut out);
     out
 }
 

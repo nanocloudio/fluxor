@@ -16,6 +16,7 @@ use core::ffi::c_void;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 #[repr(C)]
 struct State {
@@ -62,7 +63,7 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut State);
         let sys = &*s.syscalls;
@@ -70,14 +71,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut rec = [0u8; 200];
             let n = (sys.channel_read)(s.in_chan, rec.as_mut_ptr(), rec.len());
             if n <= 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.pending = [rec[0], n as u8];
         }
         if (sys.channel_write)(s.out_chan, s.pending.as_ptr(), 2) == 2 {
             s.pending = [0; 2];
         }
-        0
+        StepReturn::Continue
     }
 }
 

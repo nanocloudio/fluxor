@@ -306,14 +306,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let seq = &mut *(state as *mut Sequencer);
         if seq.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let sys = &*seq.syscalls;
@@ -387,7 +387,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let out_chan = seq.out_chan;
 
         if seq.state != SeqState::Running || seq.length == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Timing gate: don't advance until the hardware stream has played past
@@ -399,13 +399,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let (consumed, _, _, _) = dev_stream_time(sys);
                 let played = (consumed as u32).wrapping_sub(seq.hw_frame_base as u32);
                 if played < seq.next_change_frame {
-                    return 0;
+                    return StepReturn::Continue;
                 }
             } else {
                 let now_ms = dev_millis(sys) as u32;
                 let step_ms_val = (seq.step_frames * 1000) / seq.sample_rate.max(1);
                 if step_ms_val > 0 && now_ms.wrapping_sub(seq.last_advance_ms) < step_ms_val {
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
         }
@@ -424,7 +424,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 SeqMode::OneShot => {
                     if new_pos >= len || new_pos < 0 {
                         seq.state = SeqState::Finished;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 SeqMode::Loop => {
@@ -588,7 +588,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     seq.last_value_sent = seq.current_value;
                     seq.started = 1; // Enable advancement past gated notes
                     seq.loop_just_ended = 0;
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
 
@@ -599,7 +599,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     seq.last_value_sent = seq.current_value;
                     seq.started = 1;
                     seq.loop_just_ended = 0;
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
 
@@ -610,7 +610,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     seq.last_value_sent = seq.current_value;
                     seq.started = 1;
                     seq.loop_just_ended = 0;
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
 
@@ -738,7 +738,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

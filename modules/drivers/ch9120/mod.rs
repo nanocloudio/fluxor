@@ -353,7 +353,7 @@ unsafe fn build_step_cmd(s: &mut Ch9120State) {
 // Phase Step Functions
 // ============================================================================
 
-unsafe fn step_init(s: &mut Ch9120State) -> i32 {
+unsafe fn step_init(s: &mut Ch9120State) -> StepReturn {
     let sys = &*s.syscalls;
 
     // Claim reset pin as output, initially high (not in reset)
@@ -361,7 +361,7 @@ unsafe fn step_init(s: &mut Ch9120State) -> i32 {
     if rh < 0 {
         dev_log(sys, 1, b"[ch9120] reset pin claim failed".as_ptr(), 31);
         s.phase = Ch9120Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
     dev_gpio_set_mode(sys, rh, 1, 1);
     s.reset_handle = rh;
@@ -371,17 +371,17 @@ unsafe fn step_init(s: &mut Ch9120State) -> i32 {
     if ch < 0 {
         dev_log(sys, 1, b"[ch9120] cfg0 pin claim failed".as_ptr(), 30);
         s.phase = Ch9120Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
     dev_gpio_set_mode(sys, ch, 1, 1);
     s.cfg0_handle = ch;
 
     s.phase = Ch9120Phase::Reset;
     s.reset_substep = ResetSubstep::PulseLow;
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_reset(s: &mut Ch9120State) -> i32 {
+unsafe fn step_reset(s: &mut Ch9120State) -> StepReturn {
     let sys = &*s.syscalls;
     let now = dev_millis(sys);
 
@@ -410,13 +410,13 @@ unsafe fn step_reset(s: &mut Ch9120State) -> i32 {
         }
         _ => {
             s.phase = Ch9120Phase::Error;
-            return -1;
+            return StepReturn::error(-1);
         }
     }
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_enter_config(s: &mut Ch9120State) -> i32 {
+unsafe fn step_enter_config(s: &mut Ch9120State) -> StepReturn {
     let sys = &*s.syscalls;
 
     // Pull CFG0 low to enter configuration mode
@@ -427,7 +427,7 @@ unsafe fn step_enter_config(s: &mut Ch9120State) -> i32 {
     if handle < 0 {
         dev_log(sys, 1, b"[ch9120] uart open failed".as_ptr(), 25);
         s.phase = Ch9120Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
     s.uart_handle = handle;
 
@@ -437,16 +437,16 @@ unsafe fn step_enter_config(s: &mut Ch9120State) -> i32 {
     s.phase = Ch9120Phase::Configure;
 
     dev_log(sys, 3, b"[ch9120] config mode".as_ptr(), 20);
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_configure(s: &mut Ch9120State) -> i32 {
+unsafe fn step_configure(s: &mut Ch9120State) -> StepReturn {
     // All config commands done?
     if s.config_step >= NUM_CONFIG_CMDS {
         s.phase = Ch9120Phase::SaveExit;
         s.save_step = 0;
         s.cmd_substep = CmdSubstep::WriteCmd;
-        return 0;
+        return StepReturn::Continue;
     }
 
     match s.cmd_substep {
@@ -466,7 +466,7 @@ unsafe fn step_configure(s: &mut Ch9120State) -> i32 {
                 s.cmd_substep = CmdSubstep::ReadResp;
             } else if result < 0 {
                 s.phase = Ch9120Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
         }
         CmdSubstep::ReadResp => {
@@ -484,7 +484,7 @@ unsafe fn step_configure(s: &mut Ch9120State) -> i32 {
                 s.cmd_substep = CmdSubstep::Next;
             } else {
                 s.phase = Ch9120Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
         }
         CmdSubstep::Next => {
@@ -493,13 +493,13 @@ unsafe fn step_configure(s: &mut Ch9120State) -> i32 {
         }
         _ => {
             s.phase = Ch9120Phase::Error;
-            return -1;
+            return StepReturn::error(-1);
         }
     }
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_save_exit(s: &mut Ch9120State) -> i32 {
+unsafe fn step_save_exit(s: &mut Ch9120State) -> StepReturn {
     // save_step: 0=write_save, 1=wait_save, 2=write_exec, 3=wait_exec
     match s.save_step {
         0 => {
@@ -518,7 +518,7 @@ unsafe fn step_save_exit(s: &mut Ch9120State) -> i32 {
                 s.save_step = 2;
             } else if result < 0 {
                 s.phase = Ch9120Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
         }
         2 => {
@@ -538,18 +538,18 @@ unsafe fn step_save_exit(s: &mut Ch9120State) -> i32 {
                 s.phase = Ch9120Phase::ReopenUart;
             } else {
                 s.phase = Ch9120Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
         }
         _ => {
             s.phase = Ch9120Phase::Error;
-            return -1;
+            return StepReturn::error(-1);
         }
     }
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_reopen_uart(s: &mut Ch9120State) -> i32 {
+unsafe fn step_reopen_uart(s: &mut Ch9120State) -> StepReturn {
     let sys = &*s.syscalls;
 
     // Close config-mode UART
@@ -564,26 +564,26 @@ unsafe fn step_reopen_uart(s: &mut Ch9120State) -> i32 {
     if handle < 0 {
         dev_log(sys, 1, b"[ch9120] uart reopen failed".as_ptr(), 27);
         s.phase = Ch9120Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
     s.uart_handle = handle;
 
     dev_log(sys, 3, b"[ch9120] data mode".as_ptr(), 18);
     s.phase = Ch9120Phase::OpenNetif;
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_open_netif(s: &mut Ch9120State) -> i32 {
+unsafe fn step_open_netif(s: &mut Ch9120State) -> StepReturn {
     let sys = &*s.syscalls;
 
     emit_netif_state(s, NETIF_STATE_READY);
 
     dev_log(sys, 3, b"[ch9120] running".as_ptr(), 16);
     s.phase = Ch9120Phase::Running;
-    0
+    StepReturn::Continue
 }
 
-unsafe fn step_running(s: &mut Ch9120State) -> i32 {
+unsafe fn step_running(s: &mut Ch9120State) -> StepReturn {
     let uart = s.uart_handle;
     let in_ch = s.in_chan;
     let out_ch = s.out_chan;
@@ -629,9 +629,9 @@ unsafe fn step_running(s: &mut Ch9120State) -> i32 {
     }
 
     if did_work {
-        2
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 
@@ -701,14 +701,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut Ch9120State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         match s.phase {
@@ -720,10 +720,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             Ch9120Phase::ReopenUart => step_reopen_uart(s),
             Ch9120Phase::OpenNetif => step_open_netif(s),
             Ch9120Phase::Running => step_running(s),
-            Ch9120Phase::Error => -1,
+            Ch9120Phase::Error => StepReturn::error(-1),
             _ => {
                 s.phase = Ch9120Phase::Error;
-                -1
+                StepReturn::error(-1)
             }
         }
     }

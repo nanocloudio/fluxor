@@ -1596,8 +1596,8 @@ pub unsafe extern "C" fn module_new(
 /// Providers are called through `provider_call`, never stepped for work.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub extern "C" fn module_step(_state: *mut u8) -> i32 {
-    0
+pub extern "C" fn module_step(_state: *mut u8) -> StepReturn {
+    StepReturn::Continue
 }
 
 /// # Safety

@@ -174,7 +174,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut FsTapState);
     let sys = &*s.syscalls;
 
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     }
 
     if s.have_path == 0 || s.done != 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // First step (or until the open is decided): try to open the
@@ -219,7 +219,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         path[..n].copy_from_slice(&s.path[..n]);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), n);
         if fd == E_AGAIN {
-            return 0;
+            return StepReturn::Continue;
         }
         if fd < 0 {
             if fd != s.open_rc {
@@ -229,7 +229,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if fd == ERR_NOENT || fd == ERR_NOTDIR || fd == E_INVAL {
                 s.done = 1;
             }
-            return 0;
+            return StepReturn::Continue;
         }
         s.open_rc = 0;
         s.fs_fd = fd;
@@ -240,14 +240,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let space = LINE_MAX - s.fill as usize;
     if space == 0 {
         flush_line(s);
-        return 0;
+        return StepReturn::Continue;
     }
     let dst = s.line_buf.as_mut_ptr().add(s.fill as usize);
     let n = (sys.provider_call)(s.fs_fd, FS_READ, dst, space);
     // EAGAIN: provider has no bytes but the stream isn't finished
     // (async FS provider). Hold the fd and retry next tick.
     if n == -11 {
-        return 0;
+        return StepReturn::Continue;
     }
     if n <= 0 {
         // EOF (n == 0) or hard error (n < 0). Flush + close.
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         } else {
             report_errno(sys, b"[fs_tap] read failed errno=", n);
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     s.fill = (s.fill as usize + n as usize) as u16;
@@ -297,7 +297,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     if s.fill as usize >= LINE_MAX {
         flush_line(s);
     }
-    2 // Burst — keep reading while data flows.
+    StepReturn::Burst // keep reading while data flows.
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.

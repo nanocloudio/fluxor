@@ -4,7 +4,8 @@ This guide defines architecture patterns for modules that perform substantial
 CPU work per unit of data (for example emulation, decoding, rendering, or large
 state transforms).
 
-Source: `modules/mod.rs` (the step contract), with scheduler and memory
+Source: `fluxor_rt::StepReturn` and `src/kernel/exec/step.rs` (the step
+contract), with scheduler and memory
 background in [../architecture/scheduler.md](../architecture/scheduler.md)
 and [../architecture/heap.md](../architecture/heap.md).
 
@@ -21,7 +22,7 @@ Heavy modules preserve the same step contract as all modules:
 - non-blocking behaviour
 - deterministic retry behaviour under partial progress
 
-A module may return `StepOutcome::Burst` when it can productively continue
+A module may return `StepReturn::Burst` when it can productively continue
 work in the same tick, but each burst step is still bounded.
 
 ## Memory model

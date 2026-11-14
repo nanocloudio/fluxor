@@ -334,20 +334,20 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut TransportBufferState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         if s.transport == TRANSPORT_UART {
             // No endpoint to bind — the serial sink is always available.
             pump(s);
-            return 0;
+            return StepReturn::Continue;
         }
 
         // UDP: drive the shared datagram-endpoint lifecycle; forward once bound.
@@ -370,7 +370,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             discard_net_in(s);
             pump(s);
         }
-        0
+        StepReturn::Continue
     }
 }
 

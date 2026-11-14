@@ -107,28 +107,28 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.started == 0 {
             s.started = 1;
             say(s, b"[drain_probe] up");
         }
         if s.draining == 0 || s.hold != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.left > 0 {
             s.left -= 1;
-            return 0;
+            return StepReturn::Continue;
         }
         say(s, b"[drain_probe] drained");
-        1
+        StepReturn::Done
     }
 }
 

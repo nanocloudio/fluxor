@@ -1,4 +1,7 @@
-//! P-256 (secp256r1) ECDH and ECDSA for the kernel KEY_VAULT backend.
+//! P-256 (secp256r1) ECDH and ECDSA for the kernel KEY_VAULT backend on
+//! RP2040 only: it is a quarter the size of `fluxor_sdk::crypto::p256`, which
+//! every other target links, and RP2040's flash cannot hold the SDK's. It
+//! goes when the SDK has a u32-limb backend that fits.
 //!
 //! Pure Rust, no_std, no heap. Field arithmetic over
 //! p = 2^256 - 2^224 + 2^192 + 2^96 - 1. Jacobian coordinates for point
@@ -55,10 +58,6 @@
 //! placed against an optimiser reintroducing a branch, and nothing in
 //! the tree measures cycle counts.
 //!
-//! `ed25519.rs` in this directory is the other constant-time signature
-//! primitive: complete unified formulas, branchless field arithmetic,
-//! branchless table lookup, no identity special cases.
-//!
 //! ECDSA signing uses RFC 6979 deterministic nonces and normalises
 //! signatures to low-s form. Intermediate secrets are zeroised via
 //! volatile writes before returning from each primitive.
@@ -67,49 +66,7 @@
 //! immediates — harmless on kernel hosts, required on the PIC copy where
 //! ADRP-based literal pool loads miscompile.
 
-#![allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-
-use super::sha256::Sha256;
-
-// ============================================================================
-// HMAC-SHA256 (RFC 2104) — backs RFC 6979 nonce derivation.
-// ============================================================================
-
-const HMAC_BLOCK: usize = 64;
-const HMAC_OUT: usize = 32;
-
-fn hmac_sha256(key: &[u8], msg: &[u8], out: &mut [u8; HMAC_OUT]) {
-    let mut k_block = [0u8; HMAC_BLOCK];
-    if key.len() > HMAC_BLOCK {
-        let mut h = Sha256::new();
-        h.update(key);
-        let d = h.finalize();
-        k_block[..HMAC_OUT].copy_from_slice(&d);
-    } else {
-        k_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0x36u8; HMAC_BLOCK];
-    let mut opad = [0x5Cu8; HMAC_BLOCK];
-    for i in 0..HMAC_BLOCK {
-        ipad[i] ^= k_block[i];
-        opad[i] ^= k_block[i];
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(msg);
-    let inner_digest = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(&inner_digest);
-    let d = outer.finalize();
-    out.copy_from_slice(&d);
-}
+use fluxor_sdk::crypto::hmac::{hmac, HashAlg};
 
 /// Load P-256 prime.
 #[inline(never)]
@@ -482,58 +439,6 @@ fn fp_reduce(t: &[u64; 8]) -> U256 {
 fn fp_mul(a: &U256, b: &U256) -> U256 {
     let t = u256_mul_wide(a, b);
     fp_reduce(&t)
-}
-
-/// Wide squaring: a^2 → 512-bit result.
-/// Exploits symmetry: cross-products a[i]*a[j] (i≠j) computed once and doubled.
-/// 10 multiplications instead of 16 for general multiply.
-fn u256_sqr_wide(a: &U256) -> [u64; 8] {
-    let mut r = [0u128; 8];
-
-    // Cross-products (i < j only), then double
-    let mut i = 0;
-    while i < 4 {
-        let mut j = i + 1;
-        while j < 4 {
-            let prod = (a[i] as u128) * (a[j] as u128);
-            r[i + j] += prod;
-            r[i + j + 1] += r[i + j] >> 64;
-            r[i + j] &= 0xFFFFFFFFFFFFFFFF;
-            j += 1;
-        }
-        i += 1;
-    }
-
-    // Double all cross-products
-    i = 7;
-    while i > 0 {
-        r[i] = (r[i] << 1) | (r[i - 1] >> 63);
-        i -= 1;
-    }
-    r[0] <<= 1;
-
-    // Add squared terms a[i]*a[i]
-    i = 0;
-    while i < 4 {
-        let sq = (a[i] as u128) * (a[i] as u128);
-        r[i * 2] += sq & 0xFFFFFFFFFFFFFFFF;
-        r[i * 2 + 1] += r[i * 2] >> 64;
-        r[i * 2] &= 0xFFFFFFFFFFFFFFFF;
-        r[i * 2 + 1] += sq >> 64;
-        if i < 3 {
-            r[i * 2 + 2] += r[i * 2 + 1] >> 64;
-            r[i * 2 + 1] &= 0xFFFFFFFFFFFFFFFF;
-        }
-        i += 1;
-    }
-
-    let mut out = [0u64; 8];
-    i = 0;
-    while i < 8 {
-        out[i] = r[i] as u64;
-        i += 1;
-    }
-    out
 }
 
 /// Modular squaring: a^2 mod p
@@ -970,9 +875,6 @@ impl JacobianPoint {
 /// What is still not covered: the compiler and the microarchitecture.
 /// This file states what the source does, not what a given optimiser
 /// emits, and no test in the tree measures cycle counts.
-///
-/// KATs in `tests/harness/tests/kernel_crypto_p256.rs` gate correctness
-/// of the `(sign, verify, ECDH)` surface against expected outputs.
 fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
     let p_jac = JacobianPoint::from_affine(px, py);
     let mut r0 = JacobianPoint::identity();
@@ -1234,14 +1136,14 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     }
     {
         let mut tmp = [0u8; 32];
-        hmac_sha256(&k_hmac, &msg_d[..97], &mut tmp);
+        hmac(HashAlg::Sha256, &k_hmac, &msg_d[..97], &mut tmp);
         k_hmac = tmp;
     }
 
     // Step e: V = HMAC(K, V)
     {
         let mut tmp = [0u8; 32];
-        hmac_sha256(&k_hmac, &v, &mut tmp);
+        hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
         v = tmp;
     }
 
@@ -1254,14 +1156,14 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     // private_key and h1 already in place
     {
         let mut tmp = [0u8; 32];
-        hmac_sha256(&k_hmac, &msg_d[..97], &mut tmp);
+        hmac(HashAlg::Sha256, &k_hmac, &msg_d[..97], &mut tmp);
         k_hmac = tmp;
     }
 
     // Step g: V = HMAC(K, V)
     {
         let mut tmp = [0u8; 32];
-        hmac_sha256(&k_hmac, &v, &mut tmp);
+        hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
         v = tmp;
     }
 
@@ -1270,7 +1172,7 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
         // V = HMAC(K, V) — generates candidate
         {
             let mut tmp = [0u8; 32];
-            hmac_sha256(&k_hmac, &v, &mut tmp);
+            hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
             v = tmp;
         }
 
@@ -1291,12 +1193,12 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
         retry[32] = 0x00;
         {
             let mut tmp = [0u8; 32];
-            hmac_sha256(&k_hmac, &retry[..33], &mut tmp);
+            hmac(HashAlg::Sha256, &k_hmac, &retry[..33], &mut tmp);
             k_hmac = tmp;
         }
         {
             let mut tmp = [0u8; 32];
-            hmac_sha256(&k_hmac, &v, &mut tmp);
+            hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
             v = tmp;
         }
     }
@@ -1430,43 +1332,4 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
 
     // Check r == rx mod n
     rx_mod_n == r
-}
-
-/// Parse DER-encoded ECDSA signature into (r, s) raw 64 bytes
-/// Copy big-endian integer into fixed-size buffer, handling leading zeros
-fn copy_be_padded(src: &[u8], dst: &mut [u8]) {
-    // Skip leading zero bytes (DER encoding may prepend 0x00 for positive)
-    let mut start = 0;
-    while start < src.len() && src[start] == 0 && src.len() - start > dst.len() {
-        start += 1;
-    }
-    let effective = &src[start..];
-    if effective.len() > dst.len() {
-        return;
-    }
-    let offset = dst.len() - effective.len();
-    // Zero-fill prefix
-    let mut i = 0;
-    while i < offset {
-        dst[i] = 0;
-        i += 1;
-    }
-    // SAFETY: `offset + effective.len() = dst.len()` by construction; copy
-    // into the trailing `effective.len()` bytes of `dst`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            effective.as_ptr(),
-            dst.as_mut_ptr().add(offset),
-            effective.len(),
-        );
-    }
-}
-
-/// Encode raw (r,s) signature into DER format
-fn skip_leading_zeros(data: &[u8]) -> usize {
-    let mut i = 0;
-    while i < data.len() - 1 && data[i] == 0 {
-        i += 1;
-    }
-    i
 }

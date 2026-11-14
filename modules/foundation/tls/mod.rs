@@ -2264,7 +2264,7 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
 /// guarantees no concurrent step invocation, so the unique re-borrow
 /// is sound.
 #[no_mangle]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     let s = &mut *(state as *mut TlsState);
     s.step_count = s.step_count.wrapping_add(1);
     if s.transport == TRANSPORT_UDP {
@@ -2277,7 +2277,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 /// One step of TLS over a stream transport. Out of line, like
 /// `dtls_module_step`, so each transport's frame is paid only on its own path.
 #[inline(never)]
-unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
+unsafe fn tcp_module_step(s: &mut TlsState) -> StepReturn {
     // Retry any peer-identity envelopes that couldn't ship at
     // handshake completion because the consumer was backed up.
     // Runs every tick to bound delivery latency without busy-
@@ -3726,9 +3726,9 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     }
 
     if did_work {
-        2
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     } // Burst or Continue
 }
 

@@ -186,14 +186,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut SynthState);
         if s.syscalls.is_null() || s.out_chan < 0 {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         s.step_count = s.step_count.wrapping_add(1);
@@ -221,7 +221,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-unsafe fn step_inner(s: &mut SynthState) -> i32 {
+unsafe fn step_inner(s: &mut SynthState) -> StepReturn {
     let sys = &*s.syscalls;
 
     // Idle: poll for an IOCTL_NOTIFY from the consumer. The notify
@@ -241,7 +241,7 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
             s.hup_emitted = 0;
             s.streaming = 1;
         } else {
-            return 0;
+            return StepReturn::Continue;
         }
     }
 
@@ -260,7 +260,7 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
             // Drop back into the idle branch on the next step.
             s.streaming = 0;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Compute this tick's chunk: min(chunk_size, remaining).
@@ -268,7 +268,7 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
     let remaining = (s.size - s.sent) as usize;
     let want = chunk_cap.min(remaining);
     if want == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // The scratch chunk buffer is pre-zeroed at module init and
@@ -285,10 +285,10 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
     let written = (sys.channel_write)(s.out_chan, buf_ptr, want);
     if written == E_AGAIN || written == 0 {
         s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
-        return 0;
+        return StepReturn::Continue;
     }
     if written < 0 {
-        return -1;
+        return StepReturn::error(-1);
     }
     s.sent = s.sent.wrapping_add(written as u32);
     s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(written as u32);
@@ -298,12 +298,12 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
         // tick to drain the final chunk). Returning 2 keeps the
         // module hot — the next step transitions through the
         // `sent >= size` branch above and emits SET_HUP.
-        return 2;
+        return StepReturn::Burst;
     }
 
     // More to send and the channel had room — re-step in the same
     // tick to keep the pipe saturated.
-    2
+    StepReturn::Burst
 }
 
 fluxor_rt::wasm_entry!();

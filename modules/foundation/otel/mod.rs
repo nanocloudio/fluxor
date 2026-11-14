@@ -857,14 +857,14 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut OtelState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         // Delivery acks first: release/resend a retained batch before draining
         // new records or flushing a new one. The timeout sweep follows, so a
@@ -873,7 +873,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         step_ack_timeout(s);
         step_drain(s);
         step_flush(s);
-        0
+        StepReturn::Continue
     }
 }
 

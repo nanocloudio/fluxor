@@ -26,6 +26,7 @@ use core::ffi::c_void;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 /// `bridge::SELF_BRIDGES` opcode — enumerate this module's own bridge fds.
 /// ISR-safe (exempt from the §D7 provider_call deny). Mirrors
@@ -85,8 +86,8 @@ pub extern "C" fn module_new(
 /// the module ABI (the scheduler skips ISR-tier modules in `step_*`).
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(_state: *mut u8) -> i32 {
-    0 // Continue
+pub extern "C" fn module_step(_state: *mut u8) -> StepReturn {
+    StepReturn::Continue
 }
 
 /// IRQ entry point — dispatched by `isr_tier2_trampoline` from interrupt

@@ -28,6 +28,7 @@ use core::ffi::c_void;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 // ============================================================================
 // Opcodes — imported from the layered ABI, not hardcoded.
@@ -92,8 +93,6 @@ const DRAIN_WINDOW: usize = if abi::config::TARGET_CLASS == abi::config::target_
 };
 
 // StepOutcome return values.
-const CONTINUE: i32 = 0;
-const READY: i32 = 3;
 
 // Sentinel for "self index not yet resolved".
 const SELF_IDX_UNKNOWN: u16 = 0xFFFF;
@@ -549,14 +548,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys = &*s.syscalls;
 
@@ -584,7 +583,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 port_arg.as_mut_ptr(),
                 port_arg.len(),
             );
-            return READY;
+            return StepReturn::Ready;
         }
 
         match s.phase {
@@ -609,7 +608,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             _ => {}
         }
 
-        CONTINUE
+        StepReturn::Continue
     }
 }
 

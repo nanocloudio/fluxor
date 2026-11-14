@@ -4911,7 +4911,7 @@ pub unsafe extern "C" fn module_new(
 /// invocation, so the unique `&mut *` re-borrow is sound.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut IpState);
     s.step_count = s.step_count.wrapping_add(1);
 
@@ -4949,7 +4949,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // traffic) WITHOUT the immediate re-step that would starve the
             // ring (the motivating IP/NIC case).
             dev_report_step_effect(&*s.syscalls, step_effect::RUNNABLE_BACKLOG);
-            return 0; // StepOutcome::Continue
+            return StepReturn::Continue; // StepOutcome::Continue
         }
     }
 
@@ -5144,10 +5144,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // Signal Ready once IP is configured (DHCP bound or static)
     if s.ip_configured && !s.signaled_ready {
         s.signaled_ready = true;
-        return 3; // StepOutcome::Ready
+        return StepReturn::Ready; // StepOutcome::Ready
     }
 
-    0
+    StepReturn::Continue
 }
 
 /// One line of the periodic `[ip]` report, and which one is `s.report_line`.

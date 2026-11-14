@@ -235,14 +235,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut GestureState);
         if s.syscalls.is_null() || s.in_chan < 0 || s.out_chan < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let sys = &*s.syscalls;
@@ -322,7 +322,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     } else {
                         emit_mapped(sys, s.out_chan, MSG_OFF);
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 // Gesture mode: track transitions
@@ -348,7 +348,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Skip timing checks in direct mode
         if s.mode == 1 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Long press detection while held
@@ -376,7 +376,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

@@ -232,10 +232,10 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut PcieScanState);
     if s.reported != 0 {
-        return 0;
+        return StepReturn::Continue;
     }
     let sys = &*s.syscalls;
     if !table_populated(sys) && s.rescans < MAX_RESCANS {
@@ -246,12 +246,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let _ = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
         }
         if !table_populated(sys) {
-            return 0;
+            return StepReturn::Continue;
         }
     }
     report(s);
     s.reported = 1;
-    3 // Ready — unblock downstream
+    StepReturn::Ready // unblock downstream
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

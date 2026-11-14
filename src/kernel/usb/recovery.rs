@@ -164,7 +164,7 @@ impl RecoveryPolicy {
         let Some(key) = self.authorised_key else {
             return Err(RecoveryError::NoAuthorisedKey);
         };
-        if !ed25519::verify(&key, &request.signed_bytes(), &request.signature) {
+        if !ed25519::ed25519_verify(&key, &request.signed_bytes(), &request.signature) {
             return Err(RecoveryError::BadSignature);
         }
 

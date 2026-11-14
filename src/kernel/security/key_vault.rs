@@ -1391,36 +1391,11 @@ fn current_tier() -> u8 {
     }
 }
 
-/// HMAC-SHA256 (RFC 2104).
+/// HMAC-SHA256 (RFC 2104) over the concatenation of `data`.
 fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
-    use crate::kernel::security::crypto::sha256::Sha256;
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let mut h = Sha256::new();
-        h.update(key);
-        k[..32].copy_from_slice(&h.finalize());
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    for d in data {
-        inner.update(d);
-    }
-    let ih = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(&ih);
-    let out = outer.finalize();
-    zeroize(&mut k);
-    zeroize(&mut ipad);
-    zeroize(&mut opad);
+    use crate::kernel::security::crypto::hmac::{hmac_parts, HashAlg};
+    let mut out = [0u8; 32];
+    hmac_parts(HashAlg::Sha256, key, data, &mut out);
     out
 }
 
@@ -1475,7 +1450,7 @@ unsafe fn sign_bytes(slot_idx: usize, msg: &[u8], out: *mut u8, sig_len: usize) 
             let digest = h.finalize();
             p256::ecdsa_sign(&priv_key, &digest, &[0u8; 32])
         }
-        dev_key_vault::suite::ED25519 => Some(ed25519::sign(&priv_key, msg)),
+        dev_key_vault::suite::ED25519 => Some(ed25519::ed25519_sign(&priv_key, msg)),
         _ => None,
     };
     zeroize(&mut priv_key);
@@ -1731,7 +1706,7 @@ unsafe fn write_public(idx: usize, out_ptr: *mut u8, pub_len: usize) -> bool {
             _ => false,
         },
         dev_key_vault::suite::ED25519 if pub_len == 32 => {
-            let pk = ed25519::public_key(&priv_key);
+            let pk = ed25519::ed25519_public_key(&priv_key);
             core::ptr::copy_nonoverlapping(pk.as_ptr(), out_ptr, 32);
             true
         }
@@ -2243,7 +2218,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 }
                 dev_key_vault::suite::ED25519 => {
                     let msg = core::slice::from_raw_parts(arg.add(6), input_len);
-                    Some(ed25519::sign(&priv_key, msg))
+                    Some(ed25519::ed25519_sign(&priv_key, msg))
                 }
                 _ => {
                     for byte in priv_key.iter_mut() {

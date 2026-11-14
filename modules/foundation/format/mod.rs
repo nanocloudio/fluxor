@@ -432,14 +432,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut AudioFormatState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // Cache syscall function pointers to avoid borrow conflicts
@@ -457,19 +457,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut s.pending_out,
             &mut s.pending_offset,
         ) {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Check output ready
         let out_poll = (channel_poll)(out_chan, POLL_OUT);
         if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Check input available
         let in_poll = (channel_poll)(in_chan, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Calculate max input bytes we can convert based on output buffer capacity.
@@ -491,11 +491,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Read input (capped to what we can actually convert)
         let read = (channel_read)(in_chan, s.in_buf.as_mut_ptr(), max_in);
         if read == E_AGAIN || read == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if read < 0 {
             dev_log(syscalls, 1, b"[fmt] read err".as_ptr(), 14);
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let in_count = read as usize;
@@ -507,7 +507,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             process_samples(s, in_count)
         };
         if out_pairs == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let out_bytes = out_pairs * 4;
@@ -515,7 +515,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let written = (channel_write)(out_chan, s.out_buf.as_ptr(), out_bytes);
         if written < 0 && written != E_AGAIN {
             dev_log(syscalls, 1, b"[fmt] write err".as_ptr(), 15);
-            return -1;
+            return StepReturn::error(-1);
         }
 
         track_pending(
@@ -525,7 +525,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut s.pending_offset,
         );
 
-        0
+        StepReturn::Continue
     }
 }
 

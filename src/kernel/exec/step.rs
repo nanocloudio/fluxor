@@ -1,7 +1,12 @@
-//! Module trait for the poll-based runtime.
+//! What a module's step answers, and the trait the scheduler steps.
 //!
-//! All modules (PIC and built-in) implement [`Module`] for a uniform
-//! step-based execution interface. See `docs/specs/module_spec.md` for details.
+//! Every slot the scheduler runs (a loaded module, a built-in, a tee or a
+//! merge) implements [`Module`]. A loaded module answers through the
+//! `module_step` wire value, whose codes are
+//! `fluxor_abi::kernel_abi::step_return`; [`StepOutcome::from_wire`] is the
+//! one place they are read.
+
+use crate::abi::kernel_abi::step_return;
 
 /// Outcome of a single `step()` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,23 +25,30 @@ pub enum StepOutcome {
     /// One-shot signal: after returning Ready, module should return
     /// Continue/Burst as normal. The scheduler uses this to gate
     /// downstream modules until infrastructure (cyw43, ip) is ready.
-    /// PIC modules return 3 for this variant.
     Ready,
 }
 
-/// Common trait for modules in the poll-based runtime.
+impl StepOutcome {
+    /// Decode a `module_step` wire value: one of the `step_return` codes, or
+    /// anything else as the error it reports.
+    pub fn from_wire(rc: i32) -> Result<Self, i32> {
+        match rc {
+            step_return::CONTINUE => Ok(StepOutcome::Continue),
+            step_return::DONE => Ok(StepOutcome::Done),
+            step_return::BURST => Ok(StepOutcome::Burst),
+            step_return::READY => Ok(StepOutcome::Ready),
+            _ => Err(rc),
+        }
+    }
+}
+
+/// A slot the scheduler steps.
 ///
-/// Modules expose a `step()` function that advances state by one logical
-/// step without blocking, enabling cooperative multitasking.
+/// Each step advances the slot by one logical step without blocking, which
+/// is what lets every slot share one cooperative loop.
 pub trait Module {
-    /// Advance the module by one step.
-    ///
-    /// Returns:
-    /// - `Ok(StepOutcome::Continue)` - Continue running (more work to do)
-    /// - `Ok(StepOutcome::Done)` - Module completed its task (done)
-    /// - `Ok(StepOutcome::Burst)` - Re-step immediately (has more work this tick)
-    /// - `Ok(StepOutcome::Ready)` - Initialization complete, outputs meaningful
-    /// - `Err(rc)` - Error occurred (rc is the negative return code from module_step)
+    /// Advance the module by one step: the outcome, or `Err(rc)` with the
+    /// negative code the module's step returned.
     fn step(&mut self) -> Result<StepOutcome, i32>;
 
     /// Refill a pipeline input between bounded graph passes. Returns true only
@@ -52,15 +64,10 @@ pub trait Module {
         Ok(())
     }
 
-    /// Return the module's name for debugging/logging.
-    fn name(&self) -> &'static str {
-        "unknown"
-    }
+    /// The slot's name, for logging.
+    fn name(&self) -> &'static str;
 
-    /// The worst-case stack depth the module declared, in bytes; 0 when it
-    /// declared none. The composer admitted the graph against it, and the
-    /// scheduler fences each step at it.
-    fn stack_bytes(&self) -> usize {
-        0
-    }
+    /// The worst-case stack depth the slot's step needs, in bytes, which the
+    /// scheduler fences each step at; 0 runs it unfenced.
+    fn stack_bytes(&self) -> usize;
 }

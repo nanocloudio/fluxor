@@ -148,44 +148,44 @@ pub unsafe extern "C" fn module_new(
 /// Returns: 0 = continue, 1 = done, -1 = error
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut DebugState);
 
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         // An unwired input is a supported way to run this module (see the
         // manifest): the smoke test that the runtime loads and steps a
         // module. Nothing will ever arrive, so the module is done — not in
         // error.
         if s.in_chan < 0 {
-            return 1;
+            return StepReturn::Done;
         }
 
         // Read into buffer at current accumulation offset
         let remaining = INPUT_SIZE.saturating_sub(s.input_accum);
         if remaining == 0 {
             s.input_accum = 0;
-            return 0;
+            return StepReturn::Continue;
         }
 
         let dst = s.input_buf.as_mut_ptr().add(s.input_accum);
         let bytes_read = (s.sys().channel_read)(s.in_chan, dst, remaining);
 
         if bytes_read == E_AGAIN {
-            return 0;
+            return StepReturn::Continue;
         }
 
         if bytes_read < 0 {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         if bytes_read == 0 {
-            return 1; // EOF
+            return StepReturn::Done; // EOF
         }
 
         s.input_accum += bytes_read as usize;
@@ -200,7 +200,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 bytes_read as usize,
             );
             s.input_accum = 0;
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Compute hash and log when we have a full block
@@ -227,7 +227,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.input_accum = 0;
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

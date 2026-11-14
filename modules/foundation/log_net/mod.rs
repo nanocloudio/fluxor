@@ -329,14 +329,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut LogNetState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let sys = &*s.syscalls;
@@ -364,7 +364,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if !ready {
             // The endpoint's own poll reads through net_in while it binds.
-            return 0;
+            return StepReturn::Continue;
         }
 
         // ── Serving: forward the log ring over the bound endpoint ──
@@ -389,7 +389,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // returns Burst below, so the
                 // hot path is already covered.
                 dev_report_step_effect(&*s.syscalls, step_effect::WAITING);
-                return 0;
+                return StepReturn::Continue;
             }
         }
 
@@ -399,7 +399,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.send_stride > 0 {
             if s.since_send < s.send_stride {
                 s.since_send += 1;
-                return 0;
+                return StepReturn::Continue;
             }
             s.since_send = 0;
         }
@@ -409,7 +409,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let chunk_ptr = s.chunk.as_mut_ptr();
         let ret = ((*sys_ptr).provider_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
         if ret <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let len = (ret as u32) & 0xFFFF;
         let dropped = ((ret as u32) >> 16) & 0xFFFF;
@@ -451,10 +451,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // accepts it. No data is lost.
                 s.pending_len = len as u16;
             }
-            return 2;
+            return StepReturn::Burst;
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

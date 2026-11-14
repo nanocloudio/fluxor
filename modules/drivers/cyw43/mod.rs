@@ -438,14 +438,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut Cyw43State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -483,17 +483,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             Cyw43Phase::InitWifi => step_init_wifi(s),
             Cyw43Phase::RegisterNetif => step_register_netif(s),
             Cyw43Phase::Running => step_running(s),
-            Cyw43Phase::Error => -1,
+            Cyw43Phase::Error => StepReturn::error(-1),
             _ => {
                 s.phase = Cyw43Phase::Error;
-                -1
+                StepReturn::error(-1)
             }
         };
         // A halt says where it happened. Every phase turns a failed substep
         // into `Error` and `-1`, and a module that returns `-1` is retired
         // by the scheduler without a word; the phase and substep it was in
         // are the only clue there is, and they are gone with it.
-        if r < 0 && phase_before as u8 != Cyw43Phase::Error as u8 {
+        if r.is_error() && phase_before as u8 != Cyw43Phase::Error as u8 {
             let mut line = *b"[cyw43] halt phase=00 substep=000";
             let ph = phase_before as u8 as u32;
             line[19] = b'0' + ((ph / 10) % 10) as u8;
@@ -544,7 +544,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // ============================================================================
 
 /// Acquire the hardware handles the rest of bring-up drives.
-unsafe fn step_init(s: &mut Cyw43State) -> i32 {
+unsafe fn step_init(s: &mut Cyw43State) -> StepReturn {
     let sys = &*s.syscalls;
 
     match s.substep {
@@ -560,7 +560,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             if h < 0 {
                 log_error(s, b"[cyw43] pwr pin fail");
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.pwr_handle = h;
             let mut lvl = [0u8];
@@ -577,7 +577,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             if h < 0 {
                 log_error(s, b"[cyw43] cs pin fail");
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.cs_handle = h;
             let mut lvl = [1u8];
@@ -594,12 +594,12 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             if h < 0 {
                 log_error(s, b"[cyw43] pio alloc fail");
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.pio_handle = h;
 
             s.substep = 1;
-            0
+            StepReturn::Continue
         }
         1 => {
             // Load gSPI PIO program
@@ -620,7 +620,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             if r < 0 {
                 log_error(s, b"[cyw43] pio prog fail");
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             // Configure PIO pins
@@ -639,24 +639,24 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             if r < 0 {
                 log_error(s, b"[cyw43] pio cfg fail");
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             log_info(s, b"[cyw43] pio ok, powering on");
             s.phase = Cyw43Phase::PowerOn;
             s.substep = 0;
             s.last_time_ms = dev_millis(sys);
-            0
+            StepReturn::Continue
         }
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
 
 /// Power the chip on and wait out its startup time.
-unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
+unsafe fn step_power_on(s: &mut Cyw43State) -> StepReturn {
     let sys = &*s.syscalls;
 
     match s.substep {
@@ -666,7 +666,7 @@ unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
             (sys.provider_call)(s.pwr_handle, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
             s.last_time_ms = dev_millis(sys);
             s.substep = 1;
-            0
+            StepReturn::Continue
         }
         1 => {
             // Wait for power-on delay
@@ -676,11 +676,11 @@ unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
                 s.phase = Cyw43Phase::GspiInit;
                 s.substep = 0;
             }
-            0
+            StepReturn::Continue
         }
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -693,7 +693,7 @@ unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
 ///   4-5: Write F1 response delay = 4 (now in 32-bit mode, normal write)
 ///   6-7: Read TEST_RO normal to verify 32-bit mode works
 ///   8+:  ALP clock, interrupts, etc.
-unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
+unsafe fn step_gspi_init(s: &mut Cyw43State) -> StepReturn {
     let sys = &*s.syscalls;
 
     match s.substep {
@@ -701,45 +701,45 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
         0 => {
             s.last_time_ms = dev_millis(sys);
             s.substep = 1;
-            0
+            StepReturn::Continue
         }
         1 => {
             // Read TEST_RO with swap16 (chip still in 16-bit word mode)
             let r = gspi::bus_read32_swapped_start(s, REG_BUS_TEST_RO);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 2;
-            0
+            StepReturn::Continue
         }
         2 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             let test_val = gspi::rxn_u32_swapped(s);
             if test_val == TEST_PATTERN {
                 log_info(s, b"[cyw43] test_ro ok");
                 s.substep = 3;
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Retry until timeout
             let elapsed = dev_millis(sys).saturating_sub(s.last_time_ms);
             if elapsed < 1000 {
                 s.substep = 1; // retry
-                return 0;
+                return StepReturn::Continue;
             }
 
             log_error(s, b"[cyw43] test reg fail");
             s.phase = Cyw43Phase::Error;
-            -1
+            StepReturn::error(-1)
         }
 
         // ---- Step 3-4: Write combined bus config with swap16 ----
@@ -749,22 +749,22 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             if r < 0 {
                 log_error(s, b"[cyw43] bus cfg fail");
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 4;
-            0
+            StepReturn::Continue
         }
         4 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 5;
-            0
+            StepReturn::Continue
         }
 
         // ---- Step 5-6: Write F1 response delay (now in 32-bit mode) ----
@@ -773,22 +773,22 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             let r = gspi::bus_write8_start(s, REG_BUS_RESP_DELAY_F1, GSPI_RESPONSE_DELAY as u8);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 6;
-            0
+            StepReturn::Continue
         }
         6 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 7;
-            0
+            StepReturn::Continue
         }
 
         // ---- Step 7-8: Verify TEST_RO in normal 32-bit mode ----
@@ -796,29 +796,29 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             let r = gspi::bus_read32_start(s, REG_BUS_TEST_RO);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 8;
-            0
+            StepReturn::Continue
         }
         8 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             let test_val = gspi::rxn_u32(s);
             if test_val != TEST_PATTERN {
                 log_error(s, b"[cyw43] 32bit verify fail");
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 9;
-            0
+            StepReturn::Continue
         }
 
         // ---- Step 9+: ALP clock, interrupts ----
@@ -827,42 +827,42 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             let r = gspi::wrapper_write8_start(s, REG_BP_CHIP_CLOCK_CSR, BP_CLK_ALP_REQUEST as u8);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 10;
-            0
+            StepReturn::Continue
         }
         10 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.last_time_ms = dev_millis(sys);
             s.substep = 11;
-            0
+            StepReturn::Continue
         }
         11 => {
             // Poll for ALP clock available
             let r = gspi::wrapper_read8_start(s, REG_BP_CHIP_CLOCK_CSR);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 12;
-            0
+            StepReturn::Continue
         }
         12 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             let clk = gspi::rxn_u8(s) as u32;
@@ -873,33 +873,33 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
                 if now.saturating_sub(s.last_time_ms) > ALP_TIMEOUT_MS {
                     log_error(s, b"[cyw43] alp timeout");
                     s.phase = Cyw43Phase::Error;
-                    return -1;
+                    return StepReturn::error(-1);
                 }
                 s.substep = 11; // Poll again
             }
-            0
+            StepReturn::Continue
         }
         13 => {
             // Clear ALP request, force ALP (required before backplane access)
             let r = gspi::wrapper_write8_start(s, REG_BP_CHIP_CLOCK_CSR, BP_CLK_FORCE_ALP as u8);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 14;
-            0
+            StepReturn::Continue
         }
         14 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 15;
-            0
+            StepReturn::Continue
         }
         15 => {
             // Enable F2 packet available interrupt
@@ -907,19 +907,19 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             let r = gspi::bus_write32_start(s, REG_BUS_INTERRUPT_ENABLE, irq_en);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 16;
-            0
+            StepReturn::Continue
         }
         16 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             // Always proceed to ChipPrep → firmware loading.
@@ -927,12 +927,12 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             log_info(s, b"[cyw43] gspi ok, chip prep");
             s.phase = Cyw43Phase::ChipPrep;
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
 
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -947,7 +947,7 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
 ///
 /// Each backplane operation uses 2 substeps (start + poll), plus window
 /// changes (2 substeps) and 1ms delays where required by the chip.
-unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
+unsafe fn step_chip_prep(s: &mut Cyw43State) -> StepReturn {
     let sys = &*s.syscalls;
 
     match s.substep {
@@ -963,130 +963,130 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             let r = gspi::bp_set_window(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             if r > 0 {
                 s.substep = 1;
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 2;
-            0
+            StepReturn::Continue
         }
         1 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             gspi::bp_window_done(s);
             s.substep = 2;
-            0
+            StepReturn::Continue
         }
         // Dummy read of RESETCTRL
         2 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 3;
-            0
+            StepReturn::Continue
         }
         3 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 4;
-            0
+            StepReturn::Continue
         }
         // Read RESETCTRL — check if already in reset
         4 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 5;
-            0
+            StepReturn::Continue
         }
         5 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             let val = gspi::rxn_u8(s);
             if val & AI_RESETCTRL_BIT_RESET != 0 {
                 // Already in reset — skip to core_disable(SOCSRAM)
                 s.substep = 16;
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 6;
-            0
+            StepReturn::Continue
         }
         // Write 0 to IOCTRL (disable clocks)
         6 => {
             let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 7;
-            0
+            StepReturn::Continue
         }
         7 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 8;
-            0
+            StepReturn::Continue
         }
         // Readback IOCTRL
         8 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 9;
-            0
+            StepReturn::Continue
         }
         9 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
             s.substep = 10;
-            0
+            StepReturn::Continue
         }
         10 => {
             if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 11;
-            0
+            StepReturn::Continue
         }
         // Assert reset
         11 => {
@@ -1097,44 +1097,44 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             );
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 12;
-            0
+            StepReturn::Continue
         }
         12 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 13;
-            0
+            StepReturn::Continue
         }
         // Readback RESETCTRL
         13 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 14;
-            0
+            StepReturn::Continue
         }
         14 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 16;
-            0 // Skip 15, fall through to SOCSRAM
+            StepReturn::Continue // Skip 15, fall through to SOCSRAM
         }
 
         // ================================================================
@@ -1149,129 +1149,129 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             let r = gspi::bp_set_window(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             if r > 0 {
                 s.substep = 17;
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 18;
-            0
+            StepReturn::Continue
         }
         17 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             gspi::bp_window_done(s);
             s.substep = 18;
-            0
+            StepReturn::Continue
         }
         // Dummy read RESETCTRL
         18 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 19;
-            0
+            StepReturn::Continue
         }
         19 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 20;
-            0
+            StepReturn::Continue
         }
         // Read RESETCTRL — check if already in reset
         20 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 21;
-            0
+            StepReturn::Continue
         }
         21 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             let val = gspi::rxn_u8(s);
             if val & AI_RESETCTRL_BIT_RESET != 0 {
                 // Already in reset — skip to core_reset enable part
                 s.substep = 32;
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 22;
-            0
+            StepReturn::Continue
         }
         // Write 0 to IOCTRL
         22 => {
             let r = gspi::bp_write8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 23;
-            0
+            StepReturn::Continue
         }
         23 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 24;
-            0
+            StepReturn::Continue
         }
         // Readback IOCTRL
         24 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 25;
-            0
+            StepReturn::Continue
         }
         25 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.last_time_ms = dev_millis(sys);
             s.substep = 26;
-            0
+            StepReturn::Continue
         }
         26 => {
             if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 27;
-            0
+            StepReturn::Continue
         }
         // Assert reset
         27 => {
@@ -1282,44 +1282,44 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             );
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 28;
-            0
+            StepReturn::Continue
         }
         28 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 29;
-            0
+            StepReturn::Continue
         }
         // Readback RESETCTRL
         29 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 30;
-            0
+            StepReturn::Continue
         }
         30 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 32;
-            0 // Skip 31, fall through to core_reset enable
+            StepReturn::Continue // Skip 31, fall through to core_reset enable
         }
 
         // ================================================================
@@ -1336,75 +1336,75 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             );
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 33;
-            0
+            StepReturn::Continue
         }
         33 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 34;
-            0
+            StepReturn::Continue
         }
         // Readback IOCTRL
         34 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 35;
-            0
+            StepReturn::Continue
         }
         35 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 36;
-            0
+            StepReturn::Continue
         }
         // Deassert reset
         36 => {
             let r = gspi::bp_write8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 37;
-            0
+            StepReturn::Continue
         }
         37 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
             s.substep = 38;
-            0
+            StepReturn::Continue
         }
         38 => {
             if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 39;
-            0
+            StepReturn::Continue
         }
         // Remove force-clock, keep clock-enable
         39 => {
@@ -1415,53 +1415,53 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             );
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 40;
-            0
+            StepReturn::Continue
         }
         40 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 41;
-            0
+            StepReturn::Continue
         }
         // Readback IOCTRL
         41 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 42;
-            0
+            StepReturn::Continue
         }
         42 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
             s.substep = 43;
-            0
+            StepReturn::Continue
         }
         43 => {
             if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 44;
-            0
+            StepReturn::Continue
         }
 
         // ================================================================
@@ -1476,85 +1476,85 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             let r = gspi::bp_set_window(s, SOCSRAM_BASE + SOCSRAM_BANKX_INDEX);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             if r > 0 {
                 s.substep = 45;
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 46;
-            0
+            StepReturn::Continue
         }
         45 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             gspi::bp_window_done(s);
             s.substep = 46;
-            0
+            StepReturn::Continue
         }
         // Write BANKX_INDEX = 3
         46 => {
             let r = gspi::bp_write32_start(s, SOCSRAM_BASE + SOCSRAM_BANKX_INDEX, 3);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 47;
-            0
+            StepReturn::Continue
         }
         47 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 48;
-            0
+            StepReturn::Continue
         }
         // Write BANKX_PDA = 0
         48 => {
             let r = gspi::bp_write32_start(s, SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 49;
-            0
+            StepReturn::Continue
         }
         49 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             log_info(s, b"[cyw43] chip prep done, loading fw");
             s.phase = Cyw43Phase::LoadFw;
             s.substep = 0;
             s.fw_offset = 0;
-            0
+            StepReturn::Continue
         }
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
 
 /// Upload firmware into the chip's ATCM RAM.
-unsafe fn step_load_fw(s: &mut Cyw43State) -> i32 {
+unsafe fn step_load_fw(s: &mut Cyw43State) -> StepReturn {
     let fw = FIRMWARE;
     let fw_len = fw.len() as u32;
 
@@ -1579,7 +1579,7 @@ unsafe fn step_load_fw(s: &mut Cyw43State) -> i32 {
         let r = gspi::bp_write_block_sync(s, addr, fw_ptr, chunk);
         if r < 0 {
             s.phase = Cyw43Phase::Error;
-            return -1;
+            return StepReturn::error(-1);
         }
         s.fw_offset += chunk as u32;
         chunks_done += 1;
@@ -1591,12 +1591,12 @@ unsafe fn step_load_fw(s: &mut Cyw43State) -> i32 {
         s.substep = 0;
         s.fw_offset = 0;
     }
-    0
+    StepReturn::Continue
 }
 
 /// Upload NVRAM to the end of chip RAM and write its length magic word.
 /// Same loop-optimized state machine as step_load_fw.
-unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
+unsafe fn step_load_nvram(s: &mut Cyw43State) -> StepReturn {
     let nvram = NVRAM;
     let nvram_len_aligned = ((nvram.len() + 3) & !3) as u32;
     let nvram_base_addr = ATCM_RAM_BASE + CHIP_RAM_SIZE - 4 - nvram_len_aligned;
@@ -1626,14 +1626,14 @@ unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
         };
         if r < 0 {
             s.phase = Cyw43Phase::Error;
-            return -1;
+            return StepReturn::error(-1);
         }
         s.fw_offset += chunk as u32;
         chunks_done += 1;
     }
 
     if s.fw_offset < nvram_len_aligned {
-        return 0; // More chunks to upload next step
+        return StepReturn::Continue; // More chunks to upload next step
     }
 
     // Write NVRAM length magic word (sync)
@@ -1644,25 +1644,25 @@ unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
     let r = gspi::bp_set_window_sync(s, magic_addr);
     if r < 0 {
         s.phase = Cyw43Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     let magic_data = magic.to_le_bytes();
     let r = gspi::txn_write_sync(s, FUNC_BACKPLANE, magic_addr & BP_WIN_MASK, &magic_data);
     if r < 0 {
         s.phase = Cyw43Phase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     log_info(s, b"[cyw43] nvram done, wait ready");
     s.phase = Cyw43Phase::WaitReady;
     s.substep = 0;
     s.fw_offset = 0;
-    0
+    StepReturn::Continue
 }
 
 /// Upload the CLM blob through an iovar.
-unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
+unsafe fn step_load_clm(s: &mut Cyw43State) -> StepReturn {
     let clm = CLM;
     let clm_len = clm.len() as u32;
 
@@ -1674,7 +1674,7 @@ unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
                 s.fw_offset = 0;
                 let sys = &*s.syscalls;
                 s.last_time_ms = dev_millis(sys);
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Build clm_load iovar: "clmload\0" + header + chunk
@@ -1749,19 +1749,19 @@ unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
             let r = gspi::wlan_write_start(s, s.frame_buf.as_ptr(), total);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 1;
-            0
+            StepReturn::Continue
         }
         1 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             let remaining = clm_len - s.fw_offset;
@@ -1772,11 +1772,11 @@ unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
             };
             s.fw_offset += chunk;
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -1788,7 +1788,7 @@ unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
 ///   2. Enable WLAN core (FGC|CLOCK_EN → deassert reset → 1ms → CLOCK_EN → 1ms)
 ///   3. Poll HT_AVAILABLE in chip clock CSR (firmware brings this up, ~29ms)
 ///   4. Poll F2_RX_READY in bus status
-unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
+unsafe fn step_wait_ready(s: &mut Cyw43State) -> StepReturn {
     let sys = &*s.syscalls;
 
     match s.substep {
@@ -1803,129 +1803,129 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
             let r = gspi::bp_set_window(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             if r > 0 {
                 s.substep = 1;
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 2;
-            0
+            StepReturn::Continue
         }
         1 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             gspi::bp_window_done(s);
             s.substep = 2;
-            0
+            StepReturn::Continue
         }
         // Dummy read RESETCTRL
         2 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 3;
-            0
+            StepReturn::Continue
         }
         3 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 4;
-            0
+            StepReturn::Continue
         }
         // Read RESETCTRL — check if already in reset
         4 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 5;
-            0
+            StepReturn::Continue
         }
         5 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             let val = gspi::rxn_u8(s);
             if val & AI_RESETCTRL_BIT_RESET != 0 {
                 // Already in reset — skip to core_reset enable part
                 s.substep = 16;
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 6;
-            0
+            StepReturn::Continue
         }
         // Write 0 to IOCTRL (disable clocks)
         6 => {
             let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 7;
-            0
+            StepReturn::Continue
         }
         7 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 8;
-            0
+            StepReturn::Continue
         }
         // Readback IOCTRL
         8 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 9;
-            0
+            StepReturn::Continue
         }
         9 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.last_time_ms = dev_millis(sys);
             s.substep = 10;
-            0
+            StepReturn::Continue
         }
         10 => {
             if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 11;
-            0
+            StepReturn::Continue
         }
         // Assert reset
         11 => {
@@ -1936,44 +1936,44 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
             );
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 12;
-            0
+            StepReturn::Continue
         }
         12 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 13;
-            0
+            StepReturn::Continue
         }
         // Readback RESETCTRL
         13 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 14;
-            0
+            StepReturn::Continue
         }
         14 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 16;
-            0 // Fall through to enable
+            StepReturn::Continue // Fall through to enable
         }
 
         // ================================================================
@@ -1990,75 +1990,75 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
             );
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 17;
-            0
+            StepReturn::Continue
         }
         17 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 18;
-            0
+            StepReturn::Continue
         }
         // Readback IOCTRL
         18 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 19;
-            0
+            StepReturn::Continue
         }
         19 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 20;
-            0
+            StepReturn::Continue
         }
         // Deassert reset
         20 => {
             let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 21;
-            0
+            StepReturn::Continue
         }
         21 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
             s.substep = 22;
-            0
+            StepReturn::Continue
         }
         22 => {
             if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 23;
-            0
+            StepReturn::Continue
         }
         // Remove force-clock, keep clock-enable
         23 => {
@@ -2069,53 +2069,53 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
             );
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 24;
-            0
+            StepReturn::Continue
         }
         24 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 25;
-            0
+            StepReturn::Continue
         }
         // Readback IOCTRL
         25 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 26;
-            0
+            StepReturn::Continue
         }
         26 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
             s.substep = 27;
-            0
+            StepReturn::Continue
         }
         27 => {
             if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.substep = 28;
-            0
+            StepReturn::Continue
         }
 
         // ================================================================
@@ -2124,25 +2124,25 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
         28 => {
             s.last_time_ms = dev_millis(sys);
             s.substep = 29;
-            0
+            StepReturn::Continue
         }
         29 => {
             let r = gspi::wrapper_read8_start(s, REG_BP_CHIP_CLOCK_CSR);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 30;
-            0
+            StepReturn::Continue
         }
         30 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             let clk = gspi::rxn_u8(s) as u32;
@@ -2153,11 +2153,11 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
                 if now.saturating_sub(s.last_time_ms) > HT_TIMEOUT_MS {
                     log_error(s, b"[cyw43] ht timeout");
                     s.phase = Cyw43Phase::Error;
-                    return -1;
+                    return StepReturn::error(-1);
                 }
                 s.substep = 29; // Poll again
             }
-            0
+            StepReturn::Continue
         }
 
         // ================================================================
@@ -2166,25 +2166,25 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
         31 => {
             s.last_time_ms = dev_millis(sys);
             s.substep = 32;
-            0
+            StepReturn::Continue
         }
         32 => {
             let r = gspi::bus_read32_start(s, REG_BUS_STATUS);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 33;
-            0
+            StepReturn::Continue
         }
         33 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
 
             let status = gspi::rxn_u32(s);
@@ -2198,22 +2198,22 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
                     log_info(s, b"[cyw43] fw ready, led-only mode");
                     s.phase = Cyw43Phase::Running;
                     s.substep = 0;
-                    return 3; // StepOutcome::Ready
+                    return StepReturn::Ready; // StepOutcome::Ready
                 }
             } else {
                 let now = dev_millis(sys);
                 if now.saturating_sub(s.last_time_ms) > FW_READY_TIMEOUT_MS {
                     log_error(s, b"[cyw43] fw timeout");
                     s.phase = Cyw43Phase::Error;
-                    return -1;
+                    return StepReturn::error(-1);
                 }
                 s.substep = 32; // Poll again
             }
-            0
+            StepReturn::Continue
         }
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -2223,29 +2223,29 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
 /// The cyw43-driver's init sequence:
 ///   bus:txglom=0 → country → ampdu_ba_wsize=8 → ampdu_mpdu=4
 ///   → event_msgs → WLC_UP → PM=0 → GMode=1
-unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
+unsafe fn step_init_wifi(s: &mut Cyw43State) -> StepReturn {
     match s.substep {
         // ── bus:txglom=0 (disable TX glomming) ──────────────────
         0 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BUS_TXGLOM, &0u32.to_le_bytes());
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 1;
-            0
+            StepReturn::Continue
         }
         1 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 2;
-            0
+            StepReturn::Continue
         }
         // ── country=XX ──────────────────────────────────────────
         2 => {
@@ -2257,66 +2257,66 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_COUNTRY, &country);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 3;
-            0
+            StepReturn::Continue
         }
         3 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 4;
-            0
+            StepReturn::Continue
         }
         // ── ampdu_ba_wsize=8 (AMPDU block-ack window) ───────────
         4 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_AMPDU_BA_WSIZE, &8u32.to_le_bytes());
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 5;
-            0
+            StepReturn::Continue
         }
         5 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 6;
-            0
+            StepReturn::Continue
         }
         // ── ampdu_mpdu=4 (max MPDUs per AMPDU) ──────────────────
         6 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_AMPDU_MPDU, &4u32.to_le_bytes());
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 7;
-            0
+            StepReturn::Continue
         }
         7 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 8;
-            0
+            StepReturn::Continue
         }
         // ── event_msgs ──────────────────────────────────────────
         8 => {
@@ -2337,44 +2337,44 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_EVT_MASK, &evtmask);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 9;
-            0
+            StepReturn::Continue
         }
         9 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 10;
-            0
+            StepReturn::Continue
         }
         // ── WLC_UP ──────────────────────────────────────────────
         10 => {
             let r = wifi_ops::ioctl_set_u32(s, WLC_UP, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 11;
-            0
+            StepReturn::Continue
         }
         11 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 12;
-            0
+            StepReturn::Continue
         }
         // ── sup_wpa=1 (enable supplicant early so it's ready for SAE) ─
         12 => {
@@ -2383,22 +2383,22 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BSSCFG_SUP_WPA, &val);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 13;
-            0
+            StepReturn::Continue
         }
         13 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 14;
-            0
+            StepReturn::Continue
         }
         // ── sup_wpa2_eapver=-1 (accept any EAP version) ─────────
         14 => {
@@ -2410,22 +2410,22 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BSSCFG_SUP_WPA2_EAPVER, &val);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 15;
-            0
+            StepReturn::Continue
         }
         15 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 16;
-            0
+            StepReturn::Continue
         }
         // ── sup_wpa_tmo=2500 (WPA handshake timeout) ────────────
         16 => {
@@ -2435,132 +2435,132 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BSSCFG_SUP_WPA_TMO, &val);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 17;
-            0
+            StepReturn::Continue
         }
         17 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 18;
-            0
+            StepReturn::Continue
         }
         // ── PM=0 (disable power management) ─────────────────────
         18 => {
             let r = wifi_ops::ioctl_set_u32(s, WLC_SET_PM, 0);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 19;
-            0
+            StepReturn::Continue
         }
         19 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 20;
-            0
+            StepReturn::Continue
         }
         // ── GMode=1 (auto) ──────────────────────────────────────
         20 => {
             let r = wifi_ops::ioctl_set_u32(s, WLC_SET_GMODE, 1);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 21;
-            0
+            StepReturn::Continue
         }
         21 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 22;
-            0
+            StepReturn::Continue
         }
         // ── arp_ol=0 (disable ARP offloading) ────────────────────
         22 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_ARP_OL, &0u32.to_le_bytes());
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 23;
-            0
+            StepReturn::Continue
         }
         23 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 24;
-            0
+            StepReturn::Continue
         }
         // ── arp_version=0 ────────────────────────────────────────
         24 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_ARP_VERSION, &0u32.to_le_bytes());
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 25;
-            0
+            StepReturn::Continue
         }
         25 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 26;
-            0
+            StepReturn::Continue
         }
         // ── allmulti=1 (receive all multicast/broadcast frames) ──
         26 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_ALLMULTI, &1u32.to_le_bytes());
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 27;
-            0
+            StepReturn::Continue
         }
         27 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 28;
-            0
+            StepReturn::Continue
         }
         // ── Read MAC from chip via GET_VAR("cur_etheraddr") ─────
         28 => {
@@ -2568,23 +2568,23 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             let r = wifi_ops::ioctl_get_var(s, name, 6);
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.substep = 29;
-            0
+            StepReturn::Continue
         }
         29 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             s.mac_retries = 0;
             s.substep = 30;
-            0
+            StepReturn::Continue
         }
         // Poll for ioctl response containing MAC
         30 => {
@@ -2598,17 +2598,17 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
                 let r = gspi::bus_read32_start(s, REG_BUS_STATUS);
                 if r < 0 {
                     s.phase = Cyw43Phase::Error;
-                    return -1;
+                    return StepReturn::error(-1);
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             let status = gspi::rxn_u32(s);
             s.last_status = status;
@@ -2619,28 +2619,28 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
                     s.substep = 0;
                     s.wifi_state = Cyw43WifiState::Ready;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             let pkt_len = ((status >> STATUS_F2_PKT_LEN_SHIFT) & STATUS_F2_PKT_LEN_MASK) as usize;
             if pkt_len == 0 || pkt_len > MAX_FRAME_SIZE {
-                return 0;
+                return StepReturn::Continue;
             }
             let r = gspi::wlan_read_start(s, pkt_len);
             if r < 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.frame_len = pkt_len as u16;
             s.substep = 31;
-            0
+            StepReturn::Continue
         }
         31 => {
             let r = gspi::txn_poll(s);
             if r == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
-                return -1;
+                return StepReturn::error(-1);
             }
             let pkt_len = s.frame_len as usize;
             let payload = gspi::rxn_payload_ptr(s);
@@ -2654,7 +2654,7 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
                     s.substep = 0;
                     s.wifi_state = Cyw43WifiState::Ready;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             let cdc = payload.add(data_offset);
             // Check CDC cmd — skip stale SET_VAR responses from earlier init ioctls
@@ -2668,7 +2668,7 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
                     s.substep = 0;
                     s.wifi_state = Cyw43WifiState::Ready;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             // This is our GET_VAR response — check error flag
             let flags = (*cdc.add(8) as u16) | ((*cdc.add(9) as u16) << 8);
@@ -2707,17 +2707,17 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             s.phase = Cyw43Phase::RegisterNetif;
             s.substep = 0;
             s.wifi_state = Cyw43WifiState::Ready;
-            0
+            StepReturn::Continue
         }
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
 
 /// Signal the radio ready and move to the running state.
-unsafe fn step_register_netif(s: &mut Cyw43State) -> i32 {
+unsafe fn step_register_netif(s: &mut Cyw43State) -> StepReturn {
     let sys = &*s.syscalls;
 
     match s.substep {
@@ -2746,11 +2746,11 @@ unsafe fn step_register_netif(s: &mut Cyw43State) -> i32 {
                 dev_log(sys, 1, bp, p);
             }
             emit_status_event(s, MSG_RADIO_READY, &[]);
-            3 // StepOutcome::Ready
+            StepReturn::Ready // StepOutcome::Ready
         }
         _ => {
             s.substep = 0;
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -3223,7 +3223,7 @@ unsafe fn announce_mac(s: &mut Cyw43State) -> bool {
     (sys.channel_write)(s.out_chan, mac_frame.as_ptr(), 16) >= 0
 }
 
-unsafe fn step_running(s: &mut Cyw43State) -> i32 {
+unsafe fn step_running(s: &mut Cyw43State) -> StepReturn {
     s.out_stalled = false;
 
     if s.mac_announce_due != 0 && announce_mac(s) {
@@ -3297,10 +3297,10 @@ unsafe fn step_running(s: &mut Cyw43State) -> i32 {
                 log_error(s, &line);
             }
         }
-        return 2;
+        return StepReturn::Burst;
     }
     s.burst_idle = 0;
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================

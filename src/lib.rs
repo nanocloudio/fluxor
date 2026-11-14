@@ -36,14 +36,6 @@ pub mod kernel;
     feature = "host-linux",
     feature = "host-wasm"
 ))]
-#[path = "../modules/mod.rs"]
-pub mod modules;
-#[cfg(any(
-    feature = "rp",
-    feature = "aarch64-metal",
-    feature = "host-linux",
-    feature = "host-wasm"
-))]
 pub mod platform;
 
 /// The loader's handoff, for the `uefi` platform.

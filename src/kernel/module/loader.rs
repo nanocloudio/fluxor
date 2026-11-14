@@ -16,8 +16,8 @@ use crate::abi::SyscallTable;
 use crate::fnv1a32;
 use crate::kernel::boot::config::read_layout;
 use crate::kernel::exec::scheduler::ModuleId;
+use crate::kernel::exec::step::{Module, StepOutcome};
 use crate::kernel::sys::hal;
-use crate::modules::{Module, StepOutcome};
 
 /// The root-of-trust Ed25519 public key modules are signed against: the
 /// `FLUXOR_SIGNING_PUBKEY_HEX` build variable, 64 hex digits, compiled in.
@@ -2881,7 +2881,9 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                         h
                     };
                     if let Some(pubkey) = MODULE_SIGNING_ROOT {
-                        if !crate::kernel::security::crypto::ed25519::verify(&pubkey, &hash, &sig) {
+                        if !crate::kernel::security::crypto::ed25519::ed25519_verify(
+                            &pubkey, &hash, &sig,
+                        ) {
                             log::error!("[loader] {name}: signature invalid");
                             return Err(LoaderError::SignatureInvalid);
                         }
@@ -3945,13 +3947,7 @@ impl Module for DynamicModule {
             // SAFETY: step_fn and state_ptr were validated during construction
             unsafe { call_step(self.step_fn, self.state_ptr) }
         };
-        match result {
-            0 => Ok(StepOutcome::Continue),
-            1 => Ok(StepOutcome::Done),
-            2 => Ok(StepOutcome::Burst),
-            3 => Ok(StepOutcome::Ready),
-            _ => Err(result),
-        }
+        StepOutcome::from_wire(result)
     }
 
     fn post_tick_flush(&mut self) -> Result<(), i32> {

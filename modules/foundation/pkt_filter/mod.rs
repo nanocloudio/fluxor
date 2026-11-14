@@ -868,7 +868,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut FilterState);
     let sys = &*s.syscalls;
     let now = dev_millis(sys) as u32;
@@ -882,9 +882,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let rx = pass_one(s, s.rx_in, s.rx_out, now);
     let tx = pass_one(s, s.tx_in, s.tx_out, now);
     if rx || tx {
-        2 // Burst: more frames are likely queued.
+        StepReturn::Burst // more frames are likely queued.
     } else {
-        0
+        StepReturn::Continue
     }
 }
 

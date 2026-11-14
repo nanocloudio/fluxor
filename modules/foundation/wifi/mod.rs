@@ -359,10 +359,10 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut WifiConnectState);
         let sys_ptr = s.syscalls;
@@ -414,7 +414,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // the primary signal.
                 if s.radio_ready {
                     s.phase = WifiPhase::Associate;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // State-driven fallback: use the latest netif state byte
                 // if the state channel is wired (cyw43.netif_state →
@@ -573,7 +573,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

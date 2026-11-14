@@ -9862,14 +9862,14 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut Fat32State);
         if s.syscalls.is_null() || s.in_chan < 0 {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         s.tick_count = s.tick_count.wrapping_add(1);
@@ -9884,7 +9884,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             fs_pump(s);
             fs_settle_mount(s);
             fs_pump(s);
-            return 0;
+            return StepReturn::Continue;
         }
         let now_ms = dev_millis(&*s.syscalls);
         let observe_due = now_ms.wrapping_sub(s.last_observe_ms) >= FAT32_OBSERVE_INTERVAL_MS;
@@ -10001,7 +10001,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Per-tick scheduler entry. Factored out so `module_step` can wrap
 /// the call with telemetry capture; every early return inside still
 /// passes through the tlm emit path.
-unsafe fn step_inner(s: &mut Fat32State) -> i32 {
+unsafe fn step_inner(s: &mut Fat32State) -> StepReturn {
     // Run initialization if not done
     if s.init_phase != Fat32InitPhase::Done {
         return init_step(s);
@@ -10016,7 +10016,7 @@ unsafe fn step_inner(s: &mut Fat32State) -> i32 {
 
     // Requests are served by the FS_CONTRACT dispatch (`fat32_fs_dispatch`
     // exported below); the per-step path carries only deferred work.
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================
@@ -10144,7 +10144,7 @@ fn fmt_plan(total: u32, spc: u32) -> Option<(u32, u32, u32)> {
 
 /// Begin formatting the source, whose first sector carries no signature.
 /// Returns the init step's result.
-unsafe fn format_begin(s: &mut Fat32State) -> i32 {
+unsafe fn format_begin(s: &mut Fat32State) -> StepReturn {
     // The format writes through `storage.block` requests whichever way the
     // mount reads, so what it needs is a source that takes writes.
     if s.blk.caps(&*s.syscalls) != 0
@@ -10155,11 +10155,11 @@ unsafe fn format_begin(s: &mut Fat32State) -> i32 {
             s,
             b"[fat32] format needs a writable, queueing storage.block source",
         );
-        return -1;
+        return StepReturn::error(-1);
     }
     if s.blk.block_size() as usize != BLOCK_SIZE {
         log_info(s, b"[fat32] format: device block size unsupported");
-        return -1;
+        return StepReturn::error(-1);
     }
     let count = s.blk.block_count();
     let total = if count > u64::from(u32::MAX) {
@@ -10172,7 +10172,7 @@ unsafe fn format_begin(s: &mut Fat32State) -> i32 {
             s,
             b"[fat32] format: no FAT32 volume fits this source and cluster size",
         );
-        return -1;
+        return StepReturn::error(-1);
     };
     // The serial is the volume's only identity: taken from the clock and the
     // device, so two formats of one device, or one moment on two, differ.
@@ -10197,7 +10197,7 @@ unsafe fn format_begin(s: &mut Fat32State) -> i32 {
     s.partition_lba = 0;
     log_info(s, b"[fat32] formatting");
     s.init_phase = Fat32InitPhase::FormatZero;
-    0
+    StepReturn::Continue
 }
 
 /// Zero the next run of the metadata region. Sector 0 is left for the last
@@ -10213,7 +10213,7 @@ unsafe fn format_begin(s: &mut Fat32State) -> i32 {
 ///
 /// Every path stops for the step after `FMT_ZERO_STEP_US`, and nothing in it
 /// waits on the device.
-unsafe fn format_zero_step(s: &mut Fat32State) -> i32 {
+unsafe fn format_zero_step(s: &mut Fat32State) -> StepReturn {
     use abi::contracts::storage::block as blk;
     s.block_buf_lba = LBA_NONE;
     let sys = &*s.syscalls;
@@ -10246,30 +10246,30 @@ unsafe fn format_zero_step(s: &mut Fat32State) -> i32 {
             rc
         };
         if rc == E_AGAIN {
-            return 0;
+            return StepReturn::Continue;
         }
         if rc < 0 {
             log_info(s, b"[fat32] format write failed");
-            return -1;
+            return StepReturn::error(-1);
         }
         n += 1;
     }
     if s.fmt.cursor < s.fmt.zero_end {
-        return 0;
+        return StepReturn::Continue;
     }
     // Everything submitted must have landed before the metadata that names
     // it is written: a fence, polled across steps.
     match fs_fmt_fence(s) {
         0 => {}
-        1 => return 0,
+        1 => return StepReturn::Continue,
         _ => {
             log_info(s, b"[fat32] format write failed");
-            return -1;
+            return StepReturn::error(-1);
         }
     }
     s.fmt.cursor = 0;
     s.init_phase = Fat32InitPhase::FormatMeta;
-    0
+    StepReturn::Continue
 }
 
 /// Poll the format's flush fence, opening it on first use: 0 durable, 1
@@ -10343,7 +10343,7 @@ fn format_fat_head(s: &mut Fat32State) {
 
 /// Write the volume's metadata, one record per `cursor` value, and commit it
 /// with the boot sector. Resumes where an `EAGAIN` stopped it.
-unsafe fn format_meta_step(s: &mut Fat32State) -> i32 {
+unsafe fn format_meta_step(s: &mut Fat32State) -> StepReturn {
     s.block_buf_lba = LBA_NONE;
     while s.fmt.cursor < 8 {
         // One record at a time: `block_buf` is lent to a source that
@@ -10352,12 +10352,12 @@ unsafe fn format_meta_step(s: &mut Fat32State) -> i32 {
             s.blk.reap(&*s.syscalls);
             let st = s.blk.write_state(s.fmt_seq);
             if st == 1 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.fmt_seq = 0;
             if st < 0 {
                 log_info(s, b"[fat32] format write failed");
-                return -1;
+                return StepReturn::error(-1);
             }
         }
         let lba: u32 = match s.fmt.cursor {
@@ -10392,21 +10392,21 @@ unsafe fn format_meta_step(s: &mut Fat32State) -> i32 {
         if lba == LBA_NONE {
             match fs_fmt_fence(s) {
                 0 => {}
-                1 => return 0,
+                1 => return StepReturn::Continue,
                 _ => {
                     log_info(s, b"[fat32] format write failed");
-                    return -1;
+                    return StepReturn::error(-1);
                 }
             }
         } else {
             let buf = s.block_buf.as_ptr();
             let rc = s.blk.submit_write(&*s.syscalls, u64::from(lba), 1, buf);
             if rc == E_AGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 log_info(s, b"[fat32] format write failed");
-                return -1;
+                return StepReturn::error(-1);
             }
             s.fmt_seq = s.blk.last_seq();
         }
@@ -10417,11 +10417,11 @@ unsafe fn format_meta_step(s: &mut Fat32State) -> i32 {
     // directory resolved on the old volume names anything on this one.
     s.dir_cache = [DirCacheEntry::EMPTY; DIR_CACHE];
     s.init_phase = Fat32InitPhase::Idle;
-    0
+    StepReturn::Continue
 }
 
 /// Initialization state machine
-unsafe fn init_step(s: &mut Fat32State) -> i32 {
+unsafe fn init_step(s: &mut Fat32State) -> StepReturn {
     match s.init_phase {
         Fat32InitPhase::Idle => {
             s.sync_src = u8::from(writable_block_source(s));
@@ -10430,22 +10430,22 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             // the callers' steps, which the fs contract forbids.
             if s.sync_src != 0 && !s.blk.is_async() {
                 log_info(s, b"[fat32] block source does not queue (no F_ASYNC)");
-                return -1;
+                return StepReturn::error(-1);
             }
             match start_read(s, 0) {
                 0 => {}
-                1 => return 0,
-                _ => return -1,
+                1 => return StepReturn::Continue,
+                _ => return StepReturn::error(-1),
             }
             s.init_phase = Fat32InitPhase::WaitBlock0;
-            0
+            StepReturn::Continue
         }
 
         Fat32InitPhase::WaitBlock0 => {
             let res = try_read_block(s);
             if res < 0 {
                 log_info(s, b"[fat32] blk0 read fail");
-                return -1;
+                return StepReturn::error(-1);
             }
             if res == 0 {
                 // A source still attaching when the stream was sought may be
@@ -10454,7 +10454,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 if s.sync_src == 0 && writable_block_source(s) {
                     s.init_phase = Fat32InitPhase::Idle;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Try as direct FAT32 boot sector first
@@ -10463,7 +10463,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 log_info(s, b"[fat32] boot ok");
                 start_enumeration(s);
                 s.init_phase = Fat32InitPhase::ReadRoot;
-                return 2; // Burst — issue root dir seek immediately
+                return StepReturn::Burst; // issue root dir seek immediately
             }
 
             // Try as MBR with FAT32 partition
@@ -10471,7 +10471,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             if lba > 0 {
                 s.partition_lba = u64::from(lba);
                 s.init_phase = Fat32InitPhase::ReadBoot;
-                return 2; // Burst — read boot sector immediately
+                return StepReturn::Burst; // read boot sector immediately
             }
 
             // Check for GPT protective MBR (partition type 0xEE)
@@ -10483,7 +10483,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                     let ptype = *s.block_buf.as_ptr().add((446 + i * 16 + 4) as usize);
                     if ptype == 0xEE {
                         s.init_phase = Fat32InitPhase::ReadGptHeader;
-                        return 2; // Burst — read GPT header
+                        return StepReturn::Burst; // read GPT header
                     }
                     i += 1;
                 }
@@ -10494,7 +10494,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 // provider does not mount from, or another filesystem.
                 // `format` never overwrites it.
                 log_info(s, b"[fat32] no fat32");
-                return -1;
+                return StepReturn::error(-1);
             }
             // Only a first sector that is entirely zero is blank. Filesystems
             // such as ext4 and containers such as LUKS sign nothing at
@@ -10502,7 +10502,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             // data, and `format` leaves it alone.
             if s.format == 0 || s.block_buf.iter().any(|&b| b != 0) {
                 log_info(s, b"[fat32] no fat32");
-                return -1;
+                return StepReturn::error(-1);
             }
             format_begin(s)
         }
@@ -10510,52 +10510,52 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
         Fat32InitPhase::ReadBoot => {
             match start_read(s, s.partition_lba) {
                 0 => {}
-                1 => return 0,
-                _ => return -1,
+                1 => return StepReturn::Continue,
+                _ => return StepReturn::error(-1),
             }
             s.init_phase = Fat32InitPhase::WaitBoot;
-            0
+            StepReturn::Continue
         }
 
         Fat32InitPhase::WaitBoot => {
             let res = try_read_block(s);
             if res < 0 {
                 log_info(s, b"[fat32] boot read fail");
-                return -1;
+                return StepReturn::error(-1);
             }
             if res == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
 
             if !parse_boot_sector(s) {
                 log_info(s, b"[fat32] not fat32");
-                return -1;
+                return StepReturn::error(-1);
             }
             log_info(s, b"[fat32] boot ok");
             start_enumeration(s);
             s.init_phase = Fat32InitPhase::ReadRoot;
-            2 // Burst — issue root dir seek immediately
+            StepReturn::Burst // issue root dir seek immediately
         }
 
         Fat32InitPhase::ReadRoot => {
             let sector = cluster_to_sector(s, s.dir_cluster) + (s.dir_sector_in_cluster as u32);
             match start_read(s, fs_abs_lba(s, sector)) {
                 0 => {}
-                1 => return 0,
-                _ => return -1,
+                1 => return StepReturn::Continue,
+                _ => return StepReturn::error(-1),
             }
             s.init_phase = Fat32InitPhase::WaitRoot;
-            0
+            StepReturn::Continue
         }
 
         Fat32InitPhase::WaitRoot => {
             let res = try_read_block(s);
             if res < 0 {
                 log_info(s, b"[fat32] dir read fail");
-                return -1;
+                return StepReturn::error(-1);
             }
             if res == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
 
             let entries_per_sector = BLOCK_SIZE / DIR_ENTRY_SIZE;
@@ -10569,7 +10569,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
                     if first_byte == 0x00 {
                         log_info(s, b"[fat32] path not found");
-                        return -1;
+                        return StepReturn::error(-1);
                     }
 
                     s.dir_entry_in_sector += 1;
@@ -10616,7 +10616,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                         s.dir_sector_in_cluster = 0;
                         s.dir_entry_in_sector = 0;
                         s.init_phase = Fat32InitPhase::ReadRoot;
-                        return 2; // Burst — descend into subdir immediately
+                        return StepReturn::Burst; // descend into subdir immediately
                     }
                 }
             } else {
@@ -10652,7 +10652,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                         dev_log(&*s.syscalls, 3, bp, p);
                     }
                     s.init_phase = Fat32InitPhase::Done;
-                    return 2; // Burst — ready for streaming
+                    return StepReturn::Burst; // ready for streaming
                 }
             }
 
@@ -10665,18 +10665,18 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             } else {
                 s.init_phase = Fat32InitPhase::ReadRoot;
             }
-            2 // Burst — continue directory traversal
+            StepReturn::Burst // continue directory traversal
         }
 
         Fat32InitPhase::ReadDirFat => {
             let fat_sector = fat_sector_for_cluster(s, s.dir_cluster);
             match start_read(s, fs_abs_lba(s, fat_sector)) {
                 0 => {}
-                1 => return 0,
-                _ => return -1,
+                1 => return StepReturn::Continue,
+                _ => return StepReturn::error(-1),
             }
             s.init_phase = Fat32InitPhase::WaitDirFat;
-            0
+            StepReturn::Continue
         }
 
         Fat32InitPhase::WaitDirFat => {
@@ -10684,62 +10684,62 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             if res < 0 {
                 if s.dir_mode == 0 {
                     log_info(s, b"[fat32] path not found");
-                    return -1;
+                    return StepReturn::error(-1);
                 }
                 s.init_phase = Fat32InitPhase::Done;
-                return 0;
+                return StepReturn::Continue;
             }
             if res == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
 
             let offset = fat_offset_for_cluster(s, s.dir_cluster);
             if offset + 4 > BLOCK_SIZE {
                 if s.dir_mode == 0 {
                     log_info(s, b"[fat32] path not found");
-                    return -1;
+                    return StepReturn::error(-1);
                 }
                 s.init_phase = Fat32InitPhase::Done;
-                return 0;
+                return StepReturn::Continue;
             }
             let next_cluster = read_u32_le(&s.block_buf, offset) & FAT32_MASK;
 
             if !(2..FAT32_EOC).contains(&next_cluster) {
                 if s.dir_mode == 0 {
                     log_info(s, b"[fat32] path not found");
-                    return -1;
+                    return StepReturn::error(-1);
                 }
                 log_info(s, b"[fat32] enum done");
                 s.init_phase = Fat32InitPhase::Done;
-                return 0;
+                return StepReturn::Continue;
             }
 
             s.dir_cluster = next_cluster;
             s.dir_sector_in_cluster = 0;
             s.dir_entry_in_sector = 0;
             s.init_phase = Fat32InitPhase::ReadRoot;
-            2 // Burst — seek next cluster immediately
+            StepReturn::Burst // seek next cluster immediately
         }
 
         Fat32InitPhase::ReadGptHeader => {
             // GPT header is at LBA 1
             match start_read(s, 1) {
                 0 => {}
-                1 => return 0,
-                _ => return -1,
+                1 => return StepReturn::Continue,
+                _ => return StepReturn::error(-1),
             }
             s.init_phase = Fat32InitPhase::WaitGptHeader;
-            0
+            StepReturn::Continue
         }
 
         Fat32InitPhase::WaitGptHeader => {
             let res = try_read_block(s);
             if res < 0 {
                 log_info(s, b"[fat32] gpt hdr read fail");
-                return -1;
+                return StepReturn::error(-1);
             }
             if res == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Verify "EFI PART" signature at offset 0
@@ -10756,34 +10756,34 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             }
             if !valid {
                 log_info(s, b"[fat32] bad gpt hdr");
-                return -1;
+                return StepReturn::error(-1);
             }
 
             // Partition entry array start LBA: the u64 at offset 72.
             s.pending_block = u64::from(read_u32_le(&s.block_buf, 72))
                 | (u64::from(read_u32_le(&s.block_buf, 76)) << 32);
             s.init_phase = Fat32InitPhase::ReadGptEntry;
-            2 // Burst — read partition entries
+            StepReturn::Burst // read partition entries
         }
 
         Fat32InitPhase::ReadGptEntry => {
             match start_read(s, s.pending_block) {
                 0 => {}
-                1 => return 0,
-                _ => return -1,
+                1 => return StepReturn::Continue,
+                _ => return StepReturn::error(-1),
             }
             s.init_phase = Fat32InitPhase::WaitGptEntry;
-            0
+            StepReturn::Continue
         }
 
         Fat32InitPhase::WaitGptEntry => {
             let res = try_read_block(s);
             if res < 0 {
                 log_info(s, b"[fat32] gpt entry read fail");
-                return -1;
+                return StepReturn::error(-1);
             }
             if res == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Each GPT partition entry is 128 bytes, 4 per 512-byte sector.
@@ -10824,7 +10824,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                         if lba > 0 {
                             s.partition_lba = lba;
                             s.init_phase = Fat32InitPhase::ReadBoot;
-                            return 2; // Burst — read boot sector
+                            return StepReturn::Burst; // read boot sector
                         }
                     }
                 }
@@ -10834,15 +10834,15 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             // Only the four entries of the first partition-entry sector are
             // scanned; a data partition listed beyond them is not found.
             log_info(s, b"[fat32] no gpt part");
-            -1
+            StepReturn::error(-1)
         }
 
         Fat32InitPhase::FormatZero => format_zero_step(s),
         Fat32InitPhase::FormatMeta => format_meta_step(s),
 
-        Fat32InitPhase::Done => 0,
+        Fat32InitPhase::Done => StepReturn::Continue,
 
-        _ => -1,
+        _ => StepReturn::error(-1),
     }
 }
 

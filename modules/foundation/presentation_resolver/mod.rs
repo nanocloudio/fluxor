@@ -476,14 +476,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys = &*s.syscalls;
 
@@ -495,7 +495,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Retry an undelivered layout first (all-or-nothing channel write).
         if s.pending && !try_emit(s, sys) {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Drain traits records; coalesce to the most recent (resolution is a
@@ -519,7 +519,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let _ = try_emit(s, sys);
             }
         }
-        0
+        StepReturn::Continue
     }
 }
 

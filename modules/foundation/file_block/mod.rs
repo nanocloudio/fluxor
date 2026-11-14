@@ -687,26 +687,26 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut FileBlockState);
         if s.ready != 0 {
             // Queued requests advance between their consumer's calls too.
             pump(s);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.open_err < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         match open_image(s) {
             0 => {
                 dev_log(s.sys(), 3, b"[file_block] ready".as_ptr(), 18);
-                3
+                StepReturn::Ready
             }
-            E_AGAIN => 0,
+            E_AGAIN => StepReturn::Continue,
             rc => {
                 if s.fd >= 0 {
                     s.fs(s.fd, fs::CLOSE, core::ptr::null_mut(), 0);
@@ -714,7 +714,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 s.open_err = rc;
                 dev_log(s.sys(), 1, b"[file_block] image failed".as_ptr(), 25);
-                rc
+                StepReturn::error(rc)
             }
         }
     }

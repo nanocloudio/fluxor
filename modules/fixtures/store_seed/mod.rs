@@ -212,14 +212,14 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         // Unconditional heartbeat, ahead of every other check: "did this module
         // step at all" and "did it do its work" are different questions, and
@@ -230,16 +230,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_log(&*s.syscalls, 3, m.as_ptr(), m.len());
         }
         if s.written != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.after_ms != 0 && dev_millis(&*s.syscalls) < u64::from(s.after_ms) {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.too_long != 0 {
             s.written = 1;
             let m = b"[seed] PARAM TOO LONG - key or value refused, nothing written";
             dev_log(&*s.syscalls, 3, m.as_ptr(), m.len());
-            return 0;
+            return StepReturn::Continue;
         }
         // An EMPTY key is reported, not skipped. Returning quietly here is how
         // a params mistake becomes a graph that boots, looks healthy and seeds
@@ -253,7 +253,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // upstream went wrong, so it must not be the quiet one.
             let m = b"[seed] NO KEY - params did not reach the module";
             dev_log(&*s.syscalls, 3, m.as_ptr(), m.len());
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         let key = &s.key[..s.key_len as usize];
@@ -284,7 +284,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         p += 2;
         s.rc = match write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p)) {
             // Not decided yet: asked again next step, with the same request.
-            WriteAnswer::Pending => return 0,
+            WriteAnswer::Pending => return StepReturn::Continue,
             // Not ready yet (a disk-backed store mounting its volume): ask
             // again, saying so on the heartbeat's cadence.
             WriteAnswer::Decided(rc) if rc == abi::kernel_abi::errno::EAGAIN => {
@@ -292,7 +292,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let m = b"[seed] store not ready (EAGAIN), retrying";
                     dev_log(sys, 3, m.as_ptr(), m.len());
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             WriteAnswer::Decided(rc) => rc,
         };
@@ -331,6 +331,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         core::ptr::copy_nonoverlapping(key.as_ptr(), pb.add(pos), kn);
         pos += kn;
         dev_log(sys, 3, pb, pos);
-        0
+        StepReturn::Continue
     }
 }

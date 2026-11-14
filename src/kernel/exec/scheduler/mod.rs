@@ -28,6 +28,7 @@ use crate::kernel::boot::config::{
     read_config_into, Config, ModuleEntry, ModuleList, MAX_GRAPH_EDGES,
     MAX_MODULES as CONFIG_MAX_MODULES,
 };
+use crate::kernel::exec::step::StepOutcome;
 use crate::kernel::exec::step_guard::{
     self, fault_type, FaultPolicy, FaultRecord, FaultState, FaultStats, ModuleFaultInfo,
 };
@@ -44,7 +45,6 @@ use crate::kernel::module::syscalls::{get_syscall_table, is_spi_initialized};
 use crate::kernel::sys::hal;
 use crate::kernel::workload::bitmask::ModuleMask;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerTable, OWNER_SYSTEM};
-use crate::modules::StepOutcome;
 
 // ============================================================================
 // Graph Constants and Types

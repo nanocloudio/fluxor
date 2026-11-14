@@ -1119,7 +1119,7 @@ unsafe extern "C" fn gem_tx_drain_ioctl(state: *mut c_void, cmd: u32, arg: *mut 
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut GemState);
     s.step_count = s.step_count.wrapping_add(1);
 
@@ -1127,10 +1127,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         0 => {
             // Phase 0: Initialize GEM
             if !init_gem(s) {
-                return 0; // Continue, retry next step
+                return StepReturn::Continue; // retry next step
             }
             // phase is now 1 (set by init_gem)
-            0
+            StepReturn::Continue
         }
         1 => {
             // Phase 1: Wait for link
@@ -1155,9 +1155,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                     (sys.channel_write)(s.out_chan, ap, 16);
                 }
                 s.phase = 2;
-                return 3; // StepOutcome::Ready
+                return StepReturn::Ready; // StepOutcome::Ready
             }
-            0
+            StepReturn::Continue
         }
         _ => {
             // Phase 2: Running — poll RX and TX
@@ -1174,7 +1174,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if s.step_count.is_multiple_of(5_000) {
                 heartbeat(s);
             }
-            0
+            StepReturn::Continue
         }
     }
 }

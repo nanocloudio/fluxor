@@ -104,19 +104,19 @@ pub extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut IsoHeapState);
         let sys = &*s.syscalls;
         s.step_count += 1;
         if s.step_count <= s.delay_steps as u32 {
-            return 0; // Continue
+            return StepReturn::Continue;
         }
 
         // 1. Allocate from our own heap through the gateway.
         let p = (sys.heap_alloc)(CHUNK as u32);
         if p.is_null() {
-            return -100; // heap exhausted / no arena → fault
+            return StepReturn::error(-100); // heap exhausted / no arena → fault
         }
         // 2. Write a pattern across it and read it back.
         for i in 0..CHUNK {
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         for i in 0..CHUNK {
             if core::ptr::read_volatile(p.add(i)) != ((i as u8) ^ 0xA5) {
                 (sys.heap_free)(p);
-                return -101;
+                return StepReturn::error(-101);
             }
         }
         // 3. A free of memory we do not own: refused by the gateway.
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             if !q.is_null() {
                 (sys.heap_free)(q);
             }
-            return -102;
+            return StepReturn::error(-102);
         }
         (sys.heap_free)(q);
 
@@ -161,7 +161,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             n += tail.len();
             dev_log(sys, 3, line.as_ptr(), n);
         }
-        0 // Continue
+        StepReturn::Continue
     }
 }
 

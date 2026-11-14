@@ -625,7 +625,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut VirtioNetState);
     s.step_count = s.step_count.wrapping_add(1);
 
@@ -668,9 +668,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     poll_tx(s);
 
     if ready {
-        3 // Ready
+        StepReturn::Ready
     } else {
-        0 // Continue
+        StepReturn::Continue
     }
 }
 

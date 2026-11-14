@@ -108,14 +108,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut PwmOutState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let sys = &*s.syscalls;
@@ -127,24 +127,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut pin_arg = [s.pin];
             let handle = (sys.provider_open)(HAL_PWM_CONTRACT, PWM_OPEN, pin_arg.as_mut_ptr(), 1);
             if handle < 0 {
-                return -3; // PWM open failed
+                return StepReturn::error(-3); // PWM open failed
             }
             s.pwm_handle = handle;
             s.initialized = true;
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Poll input channel for brightness data
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Read brightness byte(s) — take the latest
         let mut buf = [0u8; 32];
         let n = (sys.channel_read)(s.in_chan, buf.as_mut_ptr(), buf.len());
         if n <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Use last byte as brightness (pointer arithmetic, no bounds check)
@@ -152,7 +152,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Skip if unchanged
         if brightness == s.last_brightness {
-            return 0;
+            return StepReturn::Continue;
         }
         s.last_brightness = brightness;
 
@@ -170,7 +170,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let mut duty_bytes = duty.to_le_bytes();
         (sys.provider_call)(s.pwm_handle, PWM_SET_DUTY, duty_bytes.as_mut_ptr(), 2);
 
-        0
+        StepReturn::Continue
     }
 }
 

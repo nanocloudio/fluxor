@@ -38,6 +38,7 @@ use core::ffi::c_void;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
+use fluxor_rt::StepReturn;
 
 // ============================================================================
 // Constants
@@ -242,7 +243,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut ParserState);
     let sys = &*s.syscalls;
 
@@ -251,10 +252,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let n = (sys.channel_read)(s.in_chan, buf.as_mut_ptr(), MAX_FRAME);
     if n > 0 {
         parse_and_forward(s, buf.as_ptr(), n as usize);
-        return 2; // Burst (may have more frames)
+        return StepReturn::Burst; // may have more frames)
     }
 
-    0 // Continue
+    StepReturn::Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

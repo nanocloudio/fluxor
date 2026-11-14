@@ -2210,14 +2210,14 @@ unsafe fn check_seek_request(s: &SdState) -> u32 {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut SdState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // Module-scope telemetry: emit cumulative blocks delivered on a slow
@@ -2247,17 +2247,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let res = init_poll(s);
             if res < 0 {
                 log_info(s, b"[sd] init failed");
-                return E_INIT_FAILED;
+                return StepReturn::error(E_INIT_FAILED);
             }
             if res == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             log_info(s, b"[sd] init done");
         }
 
         // A `storage.block` request runs between the stream's blocks.
         if request_step(s) {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Check for seek request (when not mid-SPI-read)
@@ -2280,7 +2280,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.mod_state = SdModPhase::Done;
                     log_info(s, b"[sd] all read");
                     end_stream(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 // Start a new read if idle (with backpressure check)
@@ -2288,7 +2288,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.out_chan >= 0 {
                         let poll = (s.sys().channel_poll)(s.out_chan, POLL_OUT);
                         if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
-                            return 0; // Channel not ready
+                            return StepReturn::Continue; // Channel not ready
                         }
                     }
                     let buf = s.block_buf.as_mut_ptr();
@@ -2335,7 +2335,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         p += fmt_u32_raw(lb.as_mut_ptr().add(p), s.rb_attempts as u32);
                     }
                     dev_log(s.sys(), 3, lb.as_ptr(), p);
-                    return E_READ_FAILED;
+                    return StepReturn::error(E_READ_FAILED);
                 }
                 if res > 0 {
                     // Block read complete — check if a seek arrived during the read
@@ -2351,11 +2351,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             WriteResult::Complete => s.current_block += 1,
                             WriteResult::Partial => s.mod_state = SdModPhase::WritingPending,
                             WriteResult::WouldBlock => s.mod_state = SdModPhase::Writing,
-                            WriteResult::Error(e) => return e,
+                            WriteResult::Error(e) => return StepReturn::error(e),
                         }
                     }
                 }
-                0
+                StepReturn::Continue
             }
 
             SdModPhase::Writing => {
@@ -2367,9 +2367,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     WriteResult::Partial => s.mod_state = SdModPhase::WritingPending,
                     WriteResult::WouldBlock => {}
-                    WriteResult::Error(e) => return e,
+                    WriteResult::Error(e) => return StepReturn::error(e),
                 }
-                0
+                StepReturn::Continue
             }
 
             SdModPhase::WritingPending => {
@@ -2381,16 +2381,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     WriteResult::Partial => {} // Still more to write
                     WriteResult::WouldBlock => {}
-                    WriteResult::Error(e) => return e,
+                    WriteResult::Error(e) => return StepReturn::error(e),
                 }
-                0
+                StepReturn::Continue
             }
 
             // The stream is over but the source stays alive: a finished module
             // is no longer stepped, and requests are served from the step.
-            SdModPhase::Done => 0,
+            SdModPhase::Done => StepReturn::Continue,
 
-            _ => -1,
+            _ => StepReturn::error(-1),
         }
     }
 }

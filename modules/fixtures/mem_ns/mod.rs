@@ -286,8 +286,8 @@ pub extern "C" fn module_new(
 /// this exists to satisfy the module ABI.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
-pub extern "C" fn module_step(_state: *mut u8) -> i32 {
-    0 // Continue
+pub extern "C" fn module_step(_state: *mut u8) -> StepReturn {
+    StepReturn::Continue
 }
 
 // ── arg-parse helpers (bounds-checked, LE) ─────────────────────────

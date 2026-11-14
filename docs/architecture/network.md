@@ -999,7 +999,7 @@ deferred-ready mechanism:
   `deferred_ready = true` in its manifest; the pack tool sets header flag bit 2
   (`deferred_ready`) on the `.fmod`.
 - The scheduler gates downstream modules until upstream ready signals
-  arrive; when a module returns `StepOutcome::Ready` (3) from a step,
+  arrive; when a module returns `StepReturn::Ready` from a step,
   its ready flag is set and downstream modules become eligible.
 
 The cyw43 driver uses this while it uploads firmware to the chip; the IP

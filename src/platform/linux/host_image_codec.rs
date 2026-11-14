@@ -165,7 +165,7 @@ fn host_image_step(state: *mut u8) -> i32 {
         // `StepOutcome::Done` (return value 1) as "module permanently
         // finished — stop stepping it." That kills cycling — bank's
         // next paced advance writes new bytes to in_chan, but codec
-        // never gets a step to read them. See `modules/mod.rs`
+        // never gets a step to read them. See `kernel::exec::step`
         // `StepOutcome` for the enum mapping.
         log::info!("[host_image] frame drained; reset for next cycle");
         st.pending.clear();

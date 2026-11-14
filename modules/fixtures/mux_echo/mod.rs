@@ -189,14 +189,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut EchoState);
         if s.syscalls.is_null() || s.mux_in < 0 {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys = &*s.syscalls;
 
@@ -211,7 +211,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // What is already read goes first; a reply the transport cannot
             // take yet holds everything behind it.
             if !handle_frames(s) {
-                return 0;
+                return StepReturn::Continue;
             }
             // Keep a partial trailing frame, at the front, for the read
             // that completes it.
@@ -222,16 +222,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             let poll = (sys.channel_poll)(s.mux_in, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             let room = BUF - s.buf_len;
             let n = (sys.channel_read)(s.mux_in, s.buf.as_mut_ptr().add(s.buf_len), room);
             if n <= 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.buf_len += n as usize;
         }
-        0
+        StepReturn::Continue
     }
 }
 

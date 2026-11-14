@@ -305,7 +305,7 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     let s = unsafe { &mut *(state as *mut Gt911State) };
     let sys = unsafe { &*s.syscalls };
 
@@ -313,7 +313,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         Gt911Phase::ResetLow => {
             // Wait 10ms with RST+INT low
             if !unsafe { timer_expired(sys, s.timer_fd) } {
-                return 0;
+                return StepReturn::Continue;
             }
             // Release RST (high), keep INT low for addr selection
             unsafe {
@@ -321,13 +321,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 timer_set(sys, s.timer_fd, 55);
             }
             s.phase = Gt911Phase::AddrSelect;
-            0
+            StepReturn::Continue
         }
 
         Gt911Phase::AddrSelect => {
             // Wait 55ms for RST rise
             if !unsafe { timer_expired(sys, s.timer_fd) } {
-                return 0;
+                return StepReturn::Continue;
             }
             // Change INT to input (release bus)
             unsafe {
@@ -335,16 +335,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 timer_set(sys, s.timer_fd, 50);
             }
             s.phase = Gt911Phase::WaitBoot;
-            0
+            StepReturn::Continue
         }
 
         Gt911Phase::WaitBoot => {
             // Wait 50ms for GT911 boot
             if !unsafe { timer_expired(sys, s.timer_fd) } {
-                return 0;
+                return StepReturn::Continue;
             }
             s.phase = Gt911Phase::OpenI2c;
-            2 // Burst
+            StepReturn::Burst
         }
 
         Gt911Phase::OpenI2c => {
@@ -372,11 +372,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             };
             if handle < 0 {
                 s.phase = Gt911Phase::Error;
-                return handle;
+                return StepReturn::error(handle);
             }
             s.i2c_handle = handle;
             s.phase = Gt911Phase::ReadIdStart;
-            2 // Burst
+            StepReturn::Burst
         }
 
         Gt911Phase::ReadIdStart => {
@@ -393,10 +393,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if rc < 0 && rc != E_INPROGRESS {
                 // EINPROGRESS is expected
                 s.phase = Gt911Phase::Error;
-                return rc;
+                return StepReturn::error(rc);
             }
             s.phase = Gt911Phase::ReadIdPoll;
-            0
+            StepReturn::Continue
         }
 
         Gt911Phase::ReadIdPoll => {
@@ -411,11 +411,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 )
             };
             if rc == 0 {
-                return 0; // Still pending
+                return StepReturn::Continue; // Still pending
             }
             if rc < 0 {
                 s.phase = Gt911Phase::Error;
-                return rc;
+                return StepReturn::error(rc);
             }
             // Product ID is at xfer_buf[4..8] (after tx_len header + tx data)
             // Expected: "911\0" or similar. Just verify non-zero.
@@ -423,7 +423,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let id_offset = 4; // 2 bytes tx_len + 2 bytes tx data
             if s.xfer_buf[id_offset] == 0 {
                 s.phase = Gt911Phase::Error;
-                return -19; // ENODEV
+                return StepReturn::error(-19); // ENODEV
             }
 
             // Create event for INT pin edge detection
@@ -436,7 +436,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 ); // EVENT_CREATE
                 if s.event_fd < 0 {
                     s.phase = Gt911Phase::Error;
-                    return s.event_fd;
+                    return StepReturn::error(s.event_fd);
                 }
 
                 // Bind event to INT pin falling edge
@@ -456,19 +456,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 ); // WATCH_EDGE
                 if wrc < 0 {
                     s.phase = Gt911Phase::Error;
-                    return wrc;
+                    return StepReturn::error(wrc);
                 }
             }
 
             s.phase = Gt911Phase::Running;
-            0
+            StepReturn::Continue
         }
 
         Gt911Phase::Running => {
             // Check if INT event fired (touch data available)
             let poll = unsafe { dev_fd_poll(sys, s.event_fd, POLL_IN) };
             if poll & (POLL_IN as i32) == 0 {
-                return 0; // No touch event pending
+                return StepReturn::Continue; // No touch event pending
             }
             // Consume the event signal
             unsafe {
@@ -482,7 +482,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             // Read status register
             s.phase = Gt911Phase::ReadStatusStart;
-            2 // Burst
+            StepReturn::Burst
         }
 
         Gt911Phase::ReadStatusStart => {
@@ -497,10 +497,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 )
             };
             if rc < 0 && rc != E_INPROGRESS {
-                return rc;
+                return StepReturn::error(rc);
             }
             s.phase = Gt911Phase::ReadStatusPoll;
-            0
+            StepReturn::Continue
         }
 
         Gt911Phase::ReadStatusPoll => {
@@ -514,12 +514,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 )
             };
             if rc == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 // I2C error — go back to waiting
                 s.phase = Gt911Phase::Running;
-                return 0;
+                return StepReturn::Continue;
             }
 
             let status = s.xfer_buf[4]; // After 2-byte header + 2-byte tx
@@ -550,13 +550,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 // Clear status register
                 s.phase = Gt911Phase::ClearStatusStart;
-                return 2; // Burst
+                return StepReturn::Burst;
             }
 
             // Cap to 5 points
             s.touch_count = if num_points > 5 { 5 } else { num_points };
             s.phase = Gt911Phase::ReadPointsStart;
-            2 // Burst
+            StepReturn::Burst
         }
 
         Gt911Phase::ReadPointsStart => {
@@ -572,10 +572,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 )
             };
             if rc < 0 && rc != E_INPROGRESS {
-                return rc;
+                return StepReturn::error(rc);
             }
             s.phase = Gt911Phase::ReadPointsPoll;
-            0
+            StepReturn::Continue
         }
 
         Gt911Phase::ReadPointsPoll => {
@@ -590,11 +590,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 )
             };
             if rc == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 s.phase = Gt911Phase::ClearStatusStart;
-                return 2;
+                return StepReturn::Burst;
             }
 
             // Parse first touch point (offset 4 after tx_len header + tx data)
@@ -630,7 +630,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
 
             s.phase = Gt911Phase::ClearStatusStart;
-            2 // Burst
+            StepReturn::Burst
         }
 
         Gt911Phase::ClearStatusStart => {
@@ -646,10 +646,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // I2C_WRITE
             };
             if rc < 0 && rc != E_INPROGRESS {
-                return rc;
+                return StepReturn::error(rc);
             }
             s.phase = Gt911Phase::ClearStatusPoll;
-            0
+            StepReturn::Continue
         }
 
         Gt911Phase::ClearStatusPoll => {
@@ -663,14 +663,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 )
             };
             if rc == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             // Done or error — return to waiting
             s.phase = Gt911Phase::Running;
-            0
+            StepReturn::Continue
         }
 
-        _ => -1,
+        _ => StepReturn::error(-1),
     }
 }
 

@@ -157,7 +157,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut ProbeState);
     let sys = &*s.syscalls;
     if s.phase >= PH_DONE {
@@ -166,30 +166,30 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.since_beat = 0;
             say(s);
         }
-        return 0;
+        return StepReturn::Continue;
     }
     let rc = s.blk.caps(sys);
     if rc == E_AGAIN {
-        return 0;
+        return StepReturn::Continue;
     }
     if rc != 0 {
         fail(s, rc);
-        return 0;
+        return StepReturn::Continue;
     }
     let bs = s.blk.block_size() as usize;
     if bs == 0 || bs > BLOCK_MAX || s.blk.block_count() == 0 {
         fail(s, E_INVAL);
-        return 0;
+        return StepReturn::Continue;
     }
     match s.phase {
         PH_READ => {
             let rc = s.blk.read(sys, 0, 1, s.block.as_mut_ptr());
             if rc == E_AGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 fail(s, rc);
-                return 0;
+                return StepReturn::Continue;
             }
             let magic = u32::from_le_bytes([s.block[0], s.block[1], s.block[2], s.block[3]]);
             let was = if magic == MAGIC {
@@ -212,52 +212,52 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 i += 1;
             }
             s.phase = PH_WRITE;
-            0
+            StepReturn::Continue
         }
         PH_WRITE => {
             let rc = s.blk.write(sys, 0, 1, s.block.as_ptr(), false);
             if rc == E_AGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 fail(s, rc);
-                return 0;
+                return StepReturn::Continue;
             }
             s.phase = PH_FLUSH;
-            0
+            StepReturn::Continue
         }
         PH_FLUSH => {
             let rc = s.blk.flush(sys);
             if rc == E_AGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 fail(s, rc);
-                return 0;
+                return StepReturn::Continue;
             }
             s.phase = PH_VERIFY;
-            0
+            StepReturn::Continue
         }
         PH_VERIFY => {
             let rc = s.blk.read(sys, 0, 1, s.block.as_mut_ptr());
             if rc == E_AGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 fail(s, rc);
-                return 0;
+                return StepReturn::Continue;
             }
             let magic = u32::from_le_bytes([s.block[0], s.block[1], s.block[2], s.block[3]]);
             let epoch = u32::from_le_bytes([s.block[4], s.block[5], s.block[6], s.block[7]]);
             if magic != MAGIC || epoch != s.epoch {
                 fail(s, E_IO);
-                return 0;
+                return StepReturn::Continue;
             }
             s.phase = PH_DONE;
             say(s);
-            0
+            StepReturn::Continue
         }
-        _ => 0,
+        _ => StepReturn::Continue,
     }
 }
 

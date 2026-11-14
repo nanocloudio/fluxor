@@ -72,14 +72,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() || s.in_chan < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         // Step-rate diagnostic: if the 200-tick period gate binds, this
@@ -94,11 +94,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let mut buf = [0u8; 12];
         let n = (sys.channel_read)(s.in_chan, buf.as_mut_ptr(), buf.len());
         if n < 12 {
-            return 0;
+            return StepReturn::Continue;
         }
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != MAGIC {
-            return 0;
+            return StepReturn::Continue;
         }
         let sent = u64::from_le_bytes([
             buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
@@ -109,7 +109,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // and make every delivery look instant — fail loudly instead.
         if now == 0 || sent == 0 {
             dev_log(sys, 1, b"[wksnk] clock_dead".as_ptr(), 18);
-            return 0;
+            return StepReturn::Continue;
         }
         let dt = now.saturating_sub(sent);
 
@@ -139,7 +139,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         msg[len..len + tail.len()].copy_from_slice(tail);
         len += tail.len();
         dev_log(sys, 3, msg.as_ptr(), len);
-        0
+        StepReturn::Continue
     }
 }
 

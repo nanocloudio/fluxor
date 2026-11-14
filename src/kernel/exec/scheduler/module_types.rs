@@ -26,9 +26,9 @@
 //! own buffer. See `docs/architecture/concurrency.md`.
 
 use super::{MAX_DOMAINS, MAX_PORTS};
+use crate::kernel::exec::step::{Module, StepOutcome};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::loader::DynamicModule;
-use crate::modules::{Module, StepOutcome};
 
 // ============================================================================
 // FAN_BUFS — per-domain scratch for Tee / Merge
@@ -137,6 +137,10 @@ impl Module for DummyModule {
     fn name(&self) -> &'static str {
         "dummy"
     }
+
+    fn stack_bytes(&self) -> usize {
+        0
+    }
 }
 
 // ============================================================================
@@ -171,18 +175,15 @@ impl BuiltInModule {
 
 impl Module for BuiltInModule {
     fn step(&mut self) -> Result<StepOutcome, i32> {
-        let rc = (self.step_fn)(self.state.as_mut_ptr());
-        match rc {
-            0 => Ok(StepOutcome::Continue),
-            1 => Ok(StepOutcome::Done),
-            2 => Ok(StepOutcome::Burst),
-            3 => Ok(StepOutcome::Ready),
-            _ => Err(rc),
-        }
+        StepOutcome::from_wire((self.step_fn)(self.state.as_mut_ptr()))
     }
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn stack_bytes(&self) -> usize {
+        0
     }
 }
 
@@ -412,6 +413,10 @@ impl Module for TeeModule {
 
     fn name(&self) -> &'static str {
         "tee"
+    }
+
+    fn stack_bytes(&self) -> usize {
+        0
     }
 }
 
@@ -766,6 +771,10 @@ impl Module for MergeModule {
 
     fn name(&self) -> &'static str {
         "merge"
+    }
+
+    fn stack_bytes(&self) -> usize {
+        0
     }
 }
 

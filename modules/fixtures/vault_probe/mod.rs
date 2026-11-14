@@ -149,7 +149,7 @@ unsafe fn report(s: &State) {
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut State);
     let sys = &*s.syscalls;
     if s.done != 0 {
@@ -158,7 +158,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.last_report_ms = now;
             report(s);
         }
-        return 0;
+        return StepReturn::Continue;
     }
     // [suite:u16][usage:u32][flags:u8][label_len:u8][label]
     // [pub_ptr:u64][pub_cap:u16][pub_len_out:u16]
@@ -180,14 +180,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let h = (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, arg.as_mut_ptr(), tail + 12);
     if h == E_AGAIN {
         s.waits = s.waits.wrapping_add(1);
-        return 0;
+        return StepReturn::Continue;
     }
     s.done = 1;
     s.last_report_ms = dev_millis(sys);
     if h < 0 {
         s.rc = h;
         report(s);
-        return 0;
+        return StepReturn::Continue;
     }
     let mut i = 0usize;
     while i < 8 {
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         s.persisted = d[7];
     }
     report(s);
-    0
+    StepReturn::Continue
 }
 
 fluxor_rt::wasm_entry!();

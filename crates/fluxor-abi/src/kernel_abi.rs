@@ -638,6 +638,20 @@ pub mod step_effect {
     pub const BURST: u8 = 4;
 }
 
+/// What `module_step` returns (wire-stable). Any other value is an error the
+/// module reports, and faults it.
+pub mod step_return {
+    /// More work is possible on later ticks.
+    pub const CONTINUE: i32 = 0;
+    /// Finished: the module is never stepped again.
+    pub const DONE: i32 = 1;
+    /// More work now: step again this tick, up to the scheduler's burst limit.
+    pub const BURST: i32 = 2;
+    /// Initialisation complete, outputs now meaningful: downstream may start.
+    /// Returned once; later steps answer `CONTINUE` or `BURST`.
+    pub const READY: i32 = 3;
+}
+
 /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
 /// Returns arena size in bytes (0 if no arena allocated).
 pub use super::registry::kernel::ARENA_GET;

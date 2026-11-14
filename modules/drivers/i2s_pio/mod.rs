@@ -231,14 +231,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut I2sState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         match s.phase {
@@ -257,20 +257,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
                 let r = step_init(s);
-                if r < 0 {
+                if r.is_error() {
                     return r;
                 }
                 step_running(s)
             }
             I2sPhase::Running => step_running(s),
-            I2sPhase::Error => -1,
-            _ => -1,
+            I2sPhase::Error => StepReturn::error(-1),
+            _ => StepReturn::error(-1),
         }
     }
 }
 
 /// Initialize PIO stream via provider_open / provider_call.
-unsafe fn step_init(s: &mut I2sState) -> i32 {
+unsafe fn step_init(s: &mut I2sState) -> StepReturn {
     let sys = &*s.syscalls;
     let provider_open = sys.provider_open;
     let provider_call = sys.provider_call;
@@ -290,7 +290,7 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
     if handle < 0 {
         dev_log(sys, 1, b"[i2s] alloc fail".as_ptr(), 16);
         s.phase = I2sPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // Load PIO program
@@ -312,7 +312,7 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
         dev_log(sys, 1, b"[i2s] load fail".as_ptr(), 15);
         (provider_call)(handle, DEV_PIO_STREAM_FREE, core::ptr::null_mut(), 0);
         s.phase = I2sPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // Configure stream (pins, clock divider, shift width)
@@ -335,7 +335,7 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
         dev_log(sys, 1, b"[i2s] config fail".as_ptr(), 17);
         (provider_call)(handle, DEV_PIO_STREAM_FREE, core::ptr::null_mut(), 0);
         s.phase = I2sPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // Set stream consumption rate for stream_time (Q16.16: sample_rate << 16)
@@ -365,7 +365,7 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
         p += 1;
         dev_log(sys, 3, bp, p);
     }
-    0
+    StepReturn::Continue
 }
 
 /// Get PIO stream buffer via provider_query.
@@ -396,7 +396,7 @@ unsafe fn pio_push(
 }
 
 /// Process audio data - loop to fill both DMA buffers
-unsafe fn step_running(s: &mut I2sState) -> i32 {
+unsafe fn step_running(s: &mut I2sState) -> StepReturn {
     let syscalls = &*s.syscalls;
     let provider_call = syscalls.provider_call;
     let provider_query = syscalls.provider_query;
@@ -493,7 +493,7 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
         if result < 0 {
             dev_log(syscalls, 1, b"[i2s] push err".as_ptr(), 14);
             s.phase = I2sPhase::Error;
-            return -1;
+            return StepReturn::error(-1);
         }
 
         buffers_filled += 1;
@@ -514,7 +514,7 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
         s.in_buf_fill = trailing as u16;
     }
 
-    0
+    StepReturn::Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

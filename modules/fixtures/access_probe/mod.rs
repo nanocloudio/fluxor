@@ -118,10 +118,10 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     let s = &mut *(state as *mut AccessProbeState);
     if s.done != 0 {
-        return 1; // Done
+        return StepReturn::Done;
     }
     s.done = 1;
     let sys = &*s.syscalls;
@@ -136,7 +136,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         dev_log(sys, 1, msg.as_ptr(), msg.len());
     }
-    1 // Done
+    StepReturn::Done
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

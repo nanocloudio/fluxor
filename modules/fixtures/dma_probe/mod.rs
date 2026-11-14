@@ -135,11 +135,11 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut DmaProbeState);
         if s.done != 0 {
-            return 1;
+            return StepReturn::Done;
         } // Done
         s.done = 1;
 
@@ -150,7 +150,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if phys == 0 {
             dev_log(sys, 1, c"[dma_probe] allocation failed".as_ptr().cast(), 28);
-            return 1;
+            return StepReturn::Done;
         }
 
         // Write magic at offset 0, read back.
@@ -199,7 +199,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_log(sys, 3, c"[dma_probe] OK".as_ptr().cast(), 14);
         }
 
-        1 // Done
+        StepReturn::Done
     }
 }
 

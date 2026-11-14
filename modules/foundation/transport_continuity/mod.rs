@@ -402,7 +402,7 @@ pub unsafe extern "C" fn module_new(
 /// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut State);
     s.step_count = s.step_count.wrapping_add(1);
     let now = dev_millis(&*s.syscalls);
@@ -433,7 +433,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         s.logged_refusals = s.core.counters.layer_refusals;
         log_refusal(s);
     }
-    0
+    StepReturn::Continue
 }
 
 /// One line per refused operation: why, and the send side an export saw.

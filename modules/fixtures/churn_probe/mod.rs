@@ -90,14 +90,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() || s.out_chan < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.mode == 0 {
@@ -111,7 +111,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let _ = (sys.channel_write)(s.out_chan, buf.as_ptr(), n as usize);
             }
         }
-        0
+        StepReturn::Continue
     }
 }
 

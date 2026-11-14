@@ -422,14 +422,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut FlashState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         let sys = &*s.syscalls;
@@ -460,7 +460,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // ---- Signal ready (once) — gates downstream modules ----
         if s.signaled_ready == 0 {
             s.signaled_ready = 1;
-            return 3; // StepOutcome::Ready
+            return StepReturn::Ready; // StepOutcome::Ready
         }
 
         let now = dev_millis(sys) as u32;
@@ -500,7 +500,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 p += fmt_u32_raw(bp.add(p), s.error_count);
                 dev_log(sys, 1, bp, p);
             }
-            return 0;
+            return StepReturn::Continue;
         }
 
         let raw_state = if level != 0 { 1u8 } else { 0u8 };
@@ -551,14 +551,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.current_blob = seek_pos as u8;
                         s.blob_write_pos = 0;
                         s.stream_phase = StreamPhase::Streaming;
-                        return 2; // Burst — start writing immediately
+                        return StepReturn::Burst; // start writing immediately
                     }
                 }
                 StreamPhase::Streaming => {
                     // Check if output channel is ready for writing
                     let poll = (sys.channel_poll)(s.stream_chan, POLL_OUT);
                     if poll <= 0 || ((poll as u32) & POLL_OUT) == 0 {
-                        return 0; // Backpressure — try next tick
+                        return StepReturn::Continue; // Backpressure — try next tick
                     }
 
                     let idx = s.current_blob as usize;
@@ -570,7 +570,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // Done — send EOF and return to idle
                         dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut(), 0);
                         s.stream_phase = StreamPhase::Idle;
-                        return 0;
+                        return StepReturn::Continue;
                     }
 
                     // Write a chunk
@@ -590,15 +590,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.blob_write_pos as usize >= blob_len {
                         dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut(), 0);
                         s.stream_phase = StreamPhase::Idle;
-                        return 0;
+                        return StepReturn::Continue;
                     }
 
-                    return 2; // Burst — keep writing
+                    return StepReturn::Burst; // keep writing
                 }
             }
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

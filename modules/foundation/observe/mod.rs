@@ -349,14 +349,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut ObserveState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // Drain the ring every step and render each record as a MON_ line.
@@ -365,7 +365,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // (MON_HIST/MON_RES) — so no separate pull round is needed.
         drain_telemetry(s);
 
-        0
+        StepReturn::Continue
     }
 }
 

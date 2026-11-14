@@ -177,20 +177,20 @@ unsafe fn emit(sys: &SyscallTable, verb: &[u8], now: u64, rc: i32) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
         if now == 0 {
             dev_log(sys, 1, b"[pdrv] clock_dead".as_ptr(), 17);
-            return 0;
+            return StepReturn::Continue;
         }
         // System-graph liveness heartbeat — must keep appearing while the
         // workload is paused (co-resident isolation).
@@ -212,7 +212,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = (sys.provider_call)(-1, OWNER_RESUME, arg.as_mut_ptr(), arg.len());
             emit(sys, b"resume", now, rc);
         }
-        0
+        StepReturn::Continue
     }
 }
 
