@@ -339,19 +339,14 @@ pub struct SchedulerState {
     pub(crate) finished: ModTable<bool>,
     /// Per-module arena allocations
     pub(crate) arenas: ModTable<ArenaInfo>,
-    /// Per-module capability class (checked on provider dispatch)
-    pub(crate) cap_class: ModTable<u8>,
+    /// Per-module grants: word 0 holds a bit per contract id, word 1 a bit
+    /// per op-level grant (`registry::grant`). The module may call an op
+    /// only when it holds the op's grant.
+    pub(crate) grants: ModTable<[u64; 2]>,
     /// Per-module type: the config entry's `name_hash`, the FNV-1a of the
     /// module's type name. Stable across boots and graph edits, so it names
     /// what a module is where the slot index names only where it sits.
     pub(crate) type_hash: ModTable<u32>,
-    /// Per-module required_caps bitmask from manifest — public contract bits only
-    pub(crate) required_caps: ModTable<u64>,
-    /// Per-module fine-grained permissions bitmap (from manifest binary
-    /// byte 15). Gates privileged opcodes by category — see the
-    /// `permission` module in `syscalls.rs`. Separate from `required_caps`
-    /// so non-contract permissions don't overload the contract bitmask.
-    pub(crate) permissions: ModTable<u16>,
     /// Per-module instance-params blob pointer + length. Populated
     /// by platform loaders that have access to the source bytes —
     /// the wasm loader uses this so modules can fetch their own
@@ -366,12 +361,10 @@ pub struct SchedulerState {
     pub(crate) in_place_writer: ModTable<bool>,
     /// Per-module deferred ready flag (header flags bit 2)
     pub(crate) deferred_ready: ModTable<bool>,
-    /// Per-module gated flag (tag 0xF5 >= contained). Gates whether the
-    /// module is routed through the protected entry; `none`/`guarded`
-    /// modules keep the direct privileged path.
-    pub(crate) isolated: ModTable<bool>,
-    /// Per-module protection level as tag 0xF5 carries it.
-    pub(crate) protection: ModTable<u8>,
+    /// Per-module protection level (tag 0xF5). A gated level routes the
+    /// module through the protected entry; a privileged one keeps the direct
+    /// call.
+    pub(crate) protection: ModTable<fluxor_contracts::isolation::Level>,
     /// Per-module device window (base, size) from tag 0xFD; size 0 = none.
     pub(crate) device_window: ModTable<(u64, u32)>,
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
@@ -625,17 +618,18 @@ impl SchedulerState {
             port_caps: crate::boot_table!(MAX_MODULES, PortCapacities::NONE, MODULE_POOL),
             finished: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
             arenas: crate::boot_table!(MAX_MODULES, ArenaInfo::empty(), MODULE_POOL),
-            cap_class: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            grants: crate::boot_table!(MAX_MODULES, [0; 2], MODULE_POOL),
             type_hash: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
-            required_caps: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
-            permissions: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             module_params_ptr: crate::boot_table!(MAX_MODULES, core::ptr::null(), MODULE_POOL),
             module_params_len: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             mailbox_safe: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
             in_place_writer: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
             deferred_ready: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
-            isolated: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
-            protection: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            protection: crate::boot_table!(
+                MAX_MODULES,
+                fluxor_contracts::isolation::Level::Privileged,
+                MODULE_POOL
+            ),
             device_window: crate::boot_table!(MAX_MODULES, (0, 0), MODULE_POOL),
             ready: crate::boot_table!(MAX_MODULES, true, MODULE_POOL),
             upstream_mask: crate::boot_table!(MAX_MODULES, ModuleMask::EMPTY, MODULE_POOL),
@@ -735,16 +729,13 @@ impl SchedulerState {
         self.port_caps.reserve(ceiling)?;
         self.finished.reserve(ceiling)?;
         self.arenas.reserve(ceiling)?;
-        self.cap_class.reserve(ceiling)?;
+        self.grants.reserve(ceiling)?;
         self.type_hash.reserve(ceiling)?;
-        self.required_caps.reserve(ceiling)?;
-        self.permissions.reserve(ceiling)?;
         self.module_params_ptr.reserve(ceiling)?;
         self.module_params_len.reserve(ceiling)?;
         self.mailbox_safe.reserve(ceiling)?;
         self.in_place_writer.reserve(ceiling)?;
         self.deferred_ready.reserve(ceiling)?;
-        self.isolated.reserve(ceiling)?;
         self.protection.reserve(ceiling)?;
         self.device_window.reserve(ceiling)?;
         self.ready.reserve(ceiling)?;
@@ -787,16 +778,13 @@ impl SchedulerState {
         m = m.max(self.port_caps.len());
         m = m.max(self.finished.len());
         m = m.max(self.arenas.len());
-        m = m.max(self.cap_class.len());
+        m = m.max(self.grants.len());
         m = m.max(self.type_hash.len());
-        m = m.max(self.required_caps.len());
-        m = m.max(self.permissions.len());
         m = m.max(self.module_params_ptr.len());
         m = m.max(self.module_params_len.len());
         m = m.max(self.mailbox_safe.len());
         m = m.max(self.in_place_writer.len());
         m = m.max(self.deferred_ready.len());
-        m = m.max(self.isolated.len());
         m = m.max(self.protection.len());
         m = m.max(self.device_window.len());
         m = m.max(self.ready.len());
@@ -837,16 +825,13 @@ impl SchedulerState {
         self.port_caps.grow(n)?;
         self.finished.grow(n)?;
         self.arenas.grow(n)?;
-        self.cap_class.grow(n)?;
+        self.grants.grow(n)?;
         self.type_hash.grow(n)?;
-        self.required_caps.grow(n)?;
-        self.permissions.grow(n)?;
         self.module_params_ptr.grow(n)?;
         self.module_params_len.grow(n)?;
         self.mailbox_safe.grow(n)?;
         self.in_place_writer.grow(n)?;
         self.deferred_ready.grow(n)?;
-        self.isolated.grow(n)?;
         self.protection.grow(n)?;
         self.device_window.grow(n)?;
         self.ready.grow(n)?;
@@ -930,17 +915,14 @@ impl SchedulerState {
             self.port_caps[i] = PortCapacities::NONE;
             self.finished[i] = false;
             self.arenas[i] = ArenaInfo::empty();
-            self.cap_class[i] = 0;
-            self.required_caps[i] = 0;
-            self.permissions[i] = 0;
+            self.grants[i] = [0; 2];
             self.mailbox_safe[i] = false;
             self.in_place_writer[i] = false;
             self.deferred_ready[i] = false;
-            if crate::kernel::module::gateway::is_gated(i) {
+            if crate::kernel::module::gateway::is_registered(i) {
                 crate::kernel::module::gateway::release(i);
             }
-            self.isolated[i] = false;
-            self.protection[i] = 0;
+            self.protection[i] = fluxor_contracts::isolation::Level::Privileged;
             self.device_window[i] = (0, 0);
             self.ready[i] = true;
             self.upstream_mask[i] = ModuleMask::EMPTY;
@@ -1249,43 +1231,19 @@ pub fn set_module_state_ptr(idx: usize, state: *mut u8) {
     }
 }
 
-/// Return the capability class of the module currently being stepped.
-/// Used by `check_contract_grant` to gate `provider_*` dispatch.
-pub fn current_module_cap_class() -> u8 {
+/// The grants of the module currently being stepped: word 0 a bit per
+/// contract id, word 1 a bit per op-level grant.
+///
+/// None outside a module's step: a live-added module can make a
+/// `provider_call` before its slot is current, leaving the "no module"
+/// sentinel, and that call holds nothing.
+pub fn current_module_grants() -> [u64; 2] {
     let idx = current_module_index();
-    // Guard the sentinel/out-of-range index: a live-added module can make a
-    // provider_call before CURRENT_MODULE_PER_CORE is set to its slot, leaving idx
-    // at the "no module" sentinel (== MAX_MODULES). Fall back to class 0 rather than
-    // index a fixed [_; MAX_MODULES] array out of bounds.
     if idx >= module_slots() {
-        return 0;
+        return [0; 2];
     }
     // SAFETY: idx bounded above; scheduler-thread-only read.
-    unsafe { SCHED.cap_class[idx] }
-}
-
-/// Return the required_caps bitmask of the module currently being stepped.
-/// Bit N set = module declared it needs contract id N in its manifest.
-/// Contract bits only — internal-orchestration permission is in
-/// `current_module_internal_permission`.
-pub fn current_module_required_caps() -> u64 {
-    let idx = current_module_index();
-    // Same sentinel guard as current_module_cap_class (a live-added module's early
-    // provider_call can read the "no module" sentinel index).
-    if idx >= module_slots() {
-        return 0;
-    }
-    // SAFETY: idx bounded above; scheduler-thread-only read.
-    unsafe { SCHED.required_caps[idx] }
-}
-
-/// Return the fine-grained permission bitmap of the module currently
-/// being stepped. Each bit corresponds to a privileged-opcode category
-/// — see the `permission` module in `syscalls.rs`.
-pub fn current_module_permissions() -> u16 {
-    let idx = current_module_index();
-    // SAFETY: scheduler-thread-only read.
-    unsafe { SCHED.permissions[idx] }
+    unsafe { SCHED.grants[idx] }
 }
 
 /// Get the code region (base, size) for a module, used for provider pointer validation.
@@ -1297,18 +1255,15 @@ pub fn module_code_region(idx: usize) -> (usize, u32) {
     unsafe { (SCHED.module_code_base[idx], SCHED.module_code_size[idx]) }
 }
 
-/// Set the capability class, required_caps, and permissions bitmap for
-/// a module (used by the Linux / bcm2712 platform loaders when they
-/// stage modules from their embedded images).
-pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u64, permissions: u16) {
+/// Set a module's grants (the platform loaders that stage modules from
+/// their own images).
+pub fn set_module_grants(idx: usize, grants: [u64; 2]) {
     if idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
-        SCHED.cap_class[idx] = cap_class;
-        SCHED.required_caps[idx] = required_caps;
-        SCHED.permissions[idx] = permissions;
+        SCHED.grants[idx] = grants;
     }
 }
 

@@ -1,62 +1,122 @@
-# The ABI number registry: every contract id, opcode, permission bit, errno,
-# poll bit, ioctl command and channel message type is declared here once.
-# `fluxor abi-regen` generates `registry_gen.rs` from it; nothing else may
+# The ABI number registry: every contract id, opcode, grant, errno, poll
+# bit, ioctl command and channel message type is declared here once.
+# `fluxor abi-regen` generates `registry.rs` from it; nothing else may
 # restate a number. A contract's id is its opcode class byte, its vtable
-# index, its `required_caps` bit and, when it mints handles, their fd tag.
+# index, its grant bit and, when it mints handles, their fd tag.
+#
+# Grants. A module may call an op only when it holds the op's grant. An op's
+# grant is its contract's own bit unless the op (or, as a default for its
+# ops, the contract) names another: `grant = "none"` needs nothing, and
+# `grant = "<name>"` needs that `[[grant]]`, a privileged family inside the
+# contract. An op the registry does not list does not exist. `reach =
+# "kernel"` marks a grant (or a contract's own bit) that a gated module may
+# not hold.
 
 [registry]
 semantic_epoch = 1
 max_contracts = 64
 chain_next = 0x10000
 
-[[permission]]
-name = "reconfigure"
+[[grant]]
+name = "kernel.serial"
 bit = 0
-doc = "Graph slot commit, boot counter, FMP routing."
+reach = "kernel"
+doc = "Write raw bytes to the board's serial port (`SERIAL_WRITE`)."
 
-[[permission]]
-name = "flash_raw"
+[[grant]]
+name = "kernel.signal_core"
 bit = 1
-doc = "Flash ERASE and PROGRAM, bounded to declared sectors."
+reach = "kernel"
+doc = "Signal another core (`SIGNAL_CORE`)."
 
-[[permission]]
-name = "platform_raw"
+[[grant]]
+name = "timer.discipline"
 bit = 2
-doc = "MMIO, NIC ring create, raw peripheral register bridges, workload spawn."
+reach = "kernel"
+doc = "Steer the kernel clock to an external time source (`DISCIPLINE`)."
 
-[[permission]]
-name = "monitor"
+[[grant]]
+name = "resource.pool_sample"
 bit = 3
-doc = "Fault monitor BIND / WAIT / ACK / REPORT / RAISE, step histograms."
+reach = "kernel"
+doc = "Sample a provider's pool for the resource ledger (`POOL_SAMPLE`)."
 
-[[permission]]
-name = "bridge"
+[[grant]]
+name = "net_policy.replace"
 bit = 4
-doc = "Cross-domain / cross-core dispatch."
+reach = "kernel"
+doc = "Replace or clear the node's network policy (`REPLACE`, `CLEAR`)."
 
-[[permission]]
-name = "pcie_device"
+[[grant]]
+name = "net_route.table"
 bit = 5
-doc = "Kernel-mediated PCIe device binding (bind/config/BAR/MSI/info on a validated device handle), distinct from raw MMIO/DMA (`platform_raw`)."
+reach = "kernel"
+doc = "Read and write the node's route table and segments (`SEGMENTS`, `ROUTES`, `HOLD`, `READ`)."
 
-[[permission]]
-name = "dma"
+[[grant]]
+name = "net_route.stack"
 bit = 6
-doc = "DMA-buffer allocation from the kernel's bounded DMA arena and cache maintenance on those buffers; narrower than raw register access (`platform_raw` still gates `MMIO_READ32`/`MMIO_WRITE32`)."
+reach = "kernel"
+doc = "Report to and take from the route table as the node's IP stack (`REPORT`, `TAKE`)."
 
-[[permission]]
-name = "observe"
+[[grant]]
+name = "workload.create"
 bit = 7
-doc = "Read-only telemetry-ring drain (`TLM_SUBSCRIBE`/`DRAIN`/`STATS`); deliberately not `monitor`, which also grants `FAULT_RAISE`."
+reach = "kernel"
+doc = "Create, run, signal and inspect workloads."
 
-[[permission]]
-name = "usb_host"
+[[grant]]
+name = "workload.net"
 bit = 8
-doc = "Kernel-mediated USB host binding on a validated controller handle; distinct from `platform_raw`, which would hand a USB driver the whole address space."
+reach = "kernel"
+doc = "Serve workloads' network lanes as the node's IP stack (`NET_*`)."
 
-[[permission]]
-name = "vault_store"
+[[grant]]
+name = "host_process.exec"
 bit = 9
+reach = "kernel"
+doc = "Run processes and terminals on the host."
+
+[[grant]]
+name = "host_mount.mount"
+bit = 10
+reach = "kernel"
+doc = "Mount, project and remove host trees."
+
+[[grant]]
+name = "reconfigure.owner"
+bit = 11
+reach = "kernel"
+doc = "Add a subgraph, and pause, resume or free an owner."
+
+[[grant]]
+name = "reconfigure.ota"
+bit = 12
+reach = "kernel"
+doc = "Stage an OTA image (`OTA_STAGE_WRITE`, `OTA_STAGE_CTRL`)."
+
+[[grant]]
+name = "metal_device.mmio"
+bit = 13
+reach = "kernel"
+doc = "Read and write device registers by physical address (`MMIO_READ32`, `MMIO_WRITE32`)."
+
+[[grant]]
+name = "metal_device.pcie"
+bit = 14
+reach = "kernel"
+doc = "Rescan PCIe and read or write any device's config space."
+
+[[grant]]
+name = "metal_device.dma"
+bit = 15
+reach = "kernel"
+doc = "Allocate DMA memory from the kernel's arena and maintain its cache."
+
+[[grant]]
+name = "seal_key"
+bit = 16
+reach = "kernel"
 doc = "Keep the key vault's durable image: the holder sees every persisted record and decides what reaches the medium."
 
 [[errno]]
@@ -78,6 +138,10 @@ value = -14
 [[errno]]
 name = "ENXIO"
 value = -6
+
+[[errno]]
+name = "EBADF"
+value = -9
 
 [[errno]]
 name = "EIO"
@@ -217,8 +281,8 @@ value = 5
 
 [[contract]]
 name = "kernel"
+grant = "none"
 id = 0x00
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -228,8 +292,8 @@ route = "class"
 
   [[contract.op]]
   name = "SERIAL_WRITE"
+  grant = "kernel.serial"
   op = 0x66
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "HANDLE_POLL"
@@ -382,11 +446,12 @@ route = "class"
 
   [[contract.op]]
   name = "SIGNAL_CORE"
+  grant = "kernel.signal_core"
   op = 0x52
-  permission = "platform_raw"
 
 [[contract]]
 name = "channel"
+grant = "none"
 id = 0x01
 manifest = true
 
@@ -416,6 +481,7 @@ manifest = true
 
 [[contract]]
 name = "timer"
+grant = "none"
 id = 0x02
 mints = true
 manifest = true
@@ -460,12 +526,13 @@ manifest = true
 
   [[contract.op]]
   name = "DISCIPLINE"
+  grant = "timer.discipline"
   op = 0x0A
-  permission = "platform_raw"
   gate = { handle = "global", arg = "in", max = 20 }
 
 [[contract]]
 name = "buffer"
+grant = "none"
 id = 0x03
 manifest = true
 
@@ -491,6 +558,7 @@ manifest = true
 
 [[contract]]
 name = "event"
+grant = "none"
 id = 0x04
 mints = true
 manifest = true
@@ -524,6 +592,7 @@ manifest = true
 
 [[contract]]
 name = "key_vault"
+reach = "kernel"
 id = 0x05
 mints = true
 
@@ -1211,14 +1280,12 @@ manifest = true
 [[contract]]
 name = "telemetry"
 id = 0x10
-permission = "observe"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
   name = "TLM_EMIT"
   op = 0x3E
-  permission = "none"
+  grant = "none"
   gate = { handle = "global", arg = "in", max = "any" }
 
   [[contract.op]]
@@ -1235,8 +1302,8 @@ route = "class"
 
 [[contract]]
 name = "resource"
+grant = "none"
 id = 0x11
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1245,8 +1312,8 @@ route = "class"
 
   [[contract.op]]
   name = "POOL_SAMPLE"
+  grant = "resource.pool_sample"
   op = 0x25
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "LEDGER_DENY"
@@ -1254,9 +1321,9 @@ route = "class"
 
 [[contract]]
 name = "runtime_params"
+grant = "none"
 id = 0x12
 module_provided = true
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1307,13 +1374,13 @@ manifest = true
 
   [[contract.op]]
   name = "REPLACE"
+  grant = "net_policy.replace"
   op = 0x02
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "CLEAR"
+  grant = "net_policy.replace"
   op = 0x03
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "READ"
@@ -1338,30 +1405,32 @@ manifest = true
 
   [[contract.op]]
   name = "SEGMENTS"
+  grant = "net_route.table"
   op = 0x02
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "ROUTES"
+  grant = "net_route.table"
   op = 0x03
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "HOLD"
+  grant = "net_route.table"
   op = 0x04
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "READ"
+  grant = "net_route.table"
   op = 0x05
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "REPORT"
+  grant = "net_route.stack"
   op = 0x06
 
   [[contract.op]]
   name = "TAKE"
+  grant = "net_route.stack"
   op = 0x07
 
 [[contract]]
@@ -1369,78 +1438,87 @@ name = "workload"
 id = 0x17
 mints = true
 manifest = true
-permission = "platform_raw"
-unlisted = "platform_raw"
 
   [[contract.op]]
   name = "CREATE"
+  grant = "workload.create"
   op = 0x00
 
   [[contract.op]]
   name = "START"
+  grant = "workload.create"
   op = 0x01
 
   [[contract.op]]
   name = "WAIT"
+  grant = "workload.create"
   op = 0x02
 
   [[contract.op]]
   name = "SIGNAL"
+  grant = "workload.create"
   op = 0x03
 
   [[contract.op]]
   name = "DESTROY"
+  grant = "workload.create"
   op = 0x04
 
   [[contract.op]]
   name = "PAUSE"
+  grant = "workload.create"
   op = 0x0B
 
   [[contract.op]]
   name = "RESUME"
+  grant = "workload.create"
   op = 0x0C
 
   [[contract.op]]
   name = "LANES"
+  grant = "workload.create"
   op = 0x0D
 
   [[contract.op]]
   name = "NET_PROVIDE"
+  grant = "workload.net"
   op = 0x0E
-  permission = "none"
 
   [[contract.op]]
   name = "NET_LANE_TAKE"
+  grant = "workload.net"
   op = 0x0F
-  permission = "none"
 
   [[contract.op]]
   name = "NET_LANE_ADMIT"
+  grant = "workload.net"
   op = 0x10
-  permission = "none"
 
   [[contract.op]]
   name = "NET_RESOLVER"
+  grant = "workload.net"
   op = 0x13
-  permission = "none"
 
   [[contract.op]]
   name = "CAPS"
+  grant = "workload.create"
   op = 0xFF
 
   [[contract.op]]
   name = "LOOKUP"
+  grant = "workload.create"
   op = 0x12
 
   [[contract.op]]
   name = "MODULE_DIGESTS"
+  grant = "workload.create"
   op = 0x11
 
 [[contract]]
 name = "host_process"
+grant = "host_process.exec"
+reach = "kernel"
 id = 0x18
-permission = "platform_raw"
-unlisted = "platform_raw"
 
   [[contract.op]]
   name = "READ"
@@ -1474,40 +1552,43 @@ unlisted = "platform_raw"
 name = "host_mount"
 id = 0x19
 manifest = true
-permission = "platform_raw"
 
   [[contract.op]]
   name = "PRIV"
   op = 0x00
-  permission = "none"
 
   [[contract.op]]
   name = "MOUNT"
+  grant = "host_mount.mount"
   op = 0x01
 
   [[contract.op]]
   name = "UMOUNT"
+  grant = "host_mount.mount"
   op = 0x02
 
   [[contract.op]]
   name = "ROOT"
   op = 0x03
-  permission = "none"
 
   [[contract.op]]
   name = "PROJECT"
+  grant = "host_mount.mount"
   op = 0x04
 
   [[contract.op]]
   name = "REMOVE_TREE"
+  grant = "host_mount.mount"
   op = 0x05
 
   [[contract.op]]
   name = "GROUP_TREE"
+  grant = "host_mount.mount"
   op = 0x06
 
   [[contract.op]]
   name = "MKDIR_MODE"
+  grant = "host_mount.mount"
   op = 0x07
 
 [[contract]]
@@ -1534,18 +1615,17 @@ manifest = true
 
 [[contract]]
 name = "usb_host"
+reach = "kernel"
 id = 0x1B
 mints = true
 manifest = true
-unlisted = "usb_host"
 
 [[contract]]
 name = "pcie_device"
+reach = "kernel"
 id = 0x1C
 mints = true
 manifest = true
-permission = "pcie_device"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1578,11 +1658,10 @@ route = "class"
 
 [[contract]]
 name = "platform_nic_ring"
+reach = "kernel"
 id = 0x1D
 mints = true
 manifest = true
-permission = "platform_raw"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1607,11 +1686,10 @@ route = "class"
 
 [[contract]]
 name = "platform_dma"
+reach = "kernel"
 id = 0x1E
 mints = true
 manifest = true
-permission = "platform_raw"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1636,11 +1714,10 @@ route = "class"
 
 [[contract]]
 name = "platform_dma_fd"
+reach = "kernel"
 id = 0x1F
 mints = true
 manifest = true
-permission = "platform_raw"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1665,9 +1742,8 @@ route = "class"
 
 [[contract]]
 name = "reconfigure"
+reach = "kernel"
 id = 0x20
-permission = "reconfigure"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1708,44 +1784,43 @@ route = "class"
 
   [[contract.op]]
   name = "APPLY_ADD"
+  grant = "reconfigure.owner"
   op = 0x47
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "FREE_OWNER"
+  grant = "reconfigure.owner"
   op = 0x48
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "OWNER_PAUSE"
+  grant = "reconfigure.owner"
   op = 0x49
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "OWNER_RESUME"
+  grant = "reconfigure.owner"
   op = 0x4A
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "OWNER_RELEASED"
+  grant = "reconfigure.owner"
   op = 0x22
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "OTA_STAGE_WRITE"
+  grant = "reconfigure.ota"
   op = 0x20
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "OTA_STAGE_CTRL"
+  grant = "reconfigure.ota"
   op = 0x21
-  permission = "platform_raw"
 
 [[contract]]
 name = "monitor"
+reach = "kernel"
 id = 0x21
-permission = "monitor"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1775,19 +1850,17 @@ route = "class"
   [[contract.op]]
   name = "ARENA_USAGE"
   op = 0x32
-  permission = "platform_raw"
 
   [[contract.op]]
   name = "ISR_METRICS"
   op = 0xE8
-  permission = "none"
+  grant = "none"
 
 [[contract]]
 name = "bridge"
+reach = "kernel"
 id = 0x22
 mints = true
-permission = "bridge"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1809,13 +1882,12 @@ route = "class"
   [[contract.op]]
   name = "SELF_BRIDGES"
   op = 0x44
-  permission = "none"
+  grant = "none"
 
 [[contract]]
 name = "flash"
+reach = "kernel"
 id = 0x23
-permission = "flash_raw"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1832,9 +1904,8 @@ route = "class"
 
 [[contract]]
 name = "diag"
+reach = "kernel"
 id = 0x25
-permission = "platform_raw"
-unlisted = "platform_raw"
 route = "class"
 
   [[contract.op]]
@@ -1844,12 +1915,13 @@ route = "class"
   [[contract.op]]
   name = "FAN_DIAG_SNAPSHOT"
   op = 0x65
-  permission = "none"
+  grant = "none"
 
 [[contract]]
 name = "vault_store"
+grant = "seal_key"
+reach = "kernel"
 id = 0x26
-permission = "vault_store"
 
   [[contract.op]]
   name = "ATTACH"
@@ -1877,10 +1949,18 @@ permission = "vault_store"
 
 [[contract]]
 name = "rp_raw"
+reach = "kernel"
 id = 0x27
-permission = "platform_raw"
-unlisted = "platform_raw"
+mints = true
 route = "class"
+
+  [[contract.op]]
+  name = "CLAIM"
+  op = 0x50
+
+  [[contract.op]]
+  name = "RELEASE"
+  op = 0x51
 
   [[contract.op]]
   name = "PWM_PIN_ENABLE"
@@ -2044,54 +2124,58 @@ route = "class"
 
 [[contract]]
 name = "metal_device"
+reach = "kernel"
 id = 0x24
 manifest = true
-permission = "platform_raw"
-unlisted = "platform_raw"
 
   [[contract.op]]
   name = "MMIO_READ32"
+  grant = "metal_device.mmio"
   op = 0xE4
 
   [[contract.op]]
   name = "MMIO_WRITE32"
+  grant = "metal_device.mmio"
   op = 0xE5
 
   [[contract.op]]
   name = "DMA_ALLOC_CONTIG"
+  grant = "metal_device.dma"
   op = 0xE6
-  permission = "dma"
 
   [[contract.op]]
   name = "CACHE_FLUSH_RANGE"
+  grant = "metal_device.dma"
   op = 0xE7
-  permission = "dma"
 
   [[contract.op]]
   name = "DMA_FLUSH"
+  grant = "metal_device.dma"
   op = 0xEA
-  permission = "dma"
 
   [[contract.op]]
   name = "DMA_INVALIDATE"
+  grant = "metal_device.dma"
   op = 0xEB
-  permission = "dma"
 
   [[contract.op]]
   name = "DMA_ALLOC_STREAMING"
+  grant = "metal_device.dma"
   op = 0xEC
-  permission = "dma"
 
   [[contract.op]]
   name = "PCIE_RESCAN"
+  grant = "metal_device.pcie"
   op = 0xF5
 
   [[contract.op]]
   name = "PCIE_CFG_READ32"
+  grant = "metal_device.pcie"
   op = 0xF6
 
   [[contract.op]]
   name = "PCIE_CFG_WRITE32"
+  grant = "metal_device.pcie"
   op = 0xF7
 
 

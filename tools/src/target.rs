@@ -149,7 +149,7 @@ impl StackBound {
 #[derive(Debug, Clone)]
 pub struct IsolationFacts {
     /// The gated levels the kernel implements here (`contained`,
-    /// `isolated`). `none` and `guarded` are implemented everywhere.
+    /// `isolated`). `privileged` is implemented everywhere.
     pub levels: Vec<crate::protection::Level>,
     pub region_model: RegionModel,
     /// Protection regions per core.

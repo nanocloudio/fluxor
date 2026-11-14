@@ -74,7 +74,6 @@ fn cmd_info_fmod(file: &Path) -> Result<()> {
         2 => "Transformer",
         3 => "Sink",
         4 => "EventHandler",
-        5 => "Protocol",
         _ => "Unknown",
     };
     println!("Module: {} ({})", file.display(), m.name);
@@ -90,20 +89,6 @@ fn cmd_info_fmod(file: &Path) -> Result<()> {
     );
     if let Some(schema) = &m.schema {
         println!("  param_schema: {} bytes", schema.len());
-    }
-    // Packed-header `required_caps` (bytes 66..74) — the value the KERNEL
-    // reads and the capability gate enforces at runtime. This is distinct
-    // from the manifest-derived mask in the `manifest:` block below: the
-    // latter is recomputed from `[[resources]]`, the former is what was
-    // actually written into the header at pack time. They should match; a
-    // mismatch (header 0x0 while the manifest declares contracts) means the
-    // module was packed without its header caps populated, and every
-    // `provider_call` to a declared contract will return ENOSYS at runtime.
-    if m.data.len() >= 74 {
-        let mut caps_bytes = [0u8; 8];
-        caps_bytes.copy_from_slice(&m.data[66..74]);
-        let header_caps = u64::from_le_bytes(caps_bytes);
-        println!("  header required_caps (runtime-enforced): 0x{header_caps:016x}");
     }
     println!("  manifest:");
     println!("{}", m.manifest.display());
@@ -230,7 +215,6 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                                     2 => "Transformer",
                                     3 => "Sink",
                                     4 => "EventHandler",
-                                    5 => "Protocol",
                                     _ => "Unknown",
                                 };
 
@@ -766,14 +750,14 @@ fn check_stack_budget(
     Ok(())
 }
 
-/// Admit the graph's gated modules (`contained`, `isolated`) against what the
-/// target and the gateway can give them, and print the level every gated
-/// module gets.
+/// Print every module's grants, then admit the graph's gated modules
+/// (`contained`, `isolated`) against what the target and the gateway can give
+/// them, and print the level every gated module gets.
 ///
 /// Refused: more isolated modules than the target has slots for; a gated
-/// module holding any permission that reaches past the gateway (raw
-/// peripherals, DMA, flash, graph reconfiguration, the fault monitor,
-/// cross-domain dispatch, PCIe, USB host); a gated module
+/// module holding any grant that reaches past the gateway (the registry's
+/// `reach = "kernel"`: raw peripherals, DMA, flash, graph reconfiguration,
+/// the fault monitor, cross-domain dispatch, PCIe, USB host); a gated module
 /// that provides a contract, whose other modules' calls would run its code
 /// privileged.
 fn check_gated_admission(
@@ -781,6 +765,21 @@ fn check_gated_admission(
     config: &serde_json::Value,
     target: &crate::target::TargetDescriptor,
 ) -> Result<()> {
+    // What each module may call, as the kernel will check it.
+    let granted: Vec<&modules::ModuleInfo> = modules
+        .iter()
+        .filter(|m| m.manifest.grants != [0, 0])
+        .collect();
+    if !granted.is_empty() {
+        println!("Grants:");
+        for m in granted {
+            println!(
+                "  {:<20} {}",
+                m.name,
+                crate::manifest::grant_names(m.manifest.grants).join(", ")
+            );
+        }
+    }
     let levels = module_levels(config, target);
     let default = graph_default_level(config, target);
     let gated: Vec<(&modules::ModuleInfo, crate::protection::Level)> = modules
@@ -819,7 +818,7 @@ fn check_gated_admission(
         .map(|(m, l)| crate::protection::Gated {
             name: m.name.as_str(),
             level: *l,
-            permissions: m.manifest.permissions.bits,
+            grants: m.manifest.grants,
             provides: &m.manifest.provides,
             code: m.code_size() as u64,
         })
@@ -869,7 +868,7 @@ fn graph_default_level(
 ) -> crate::protection::Level {
     crate::protection::resolve(&serde_json::json!({}), config, &target.isolation.levels)
         .map(|r| r.provided)
-        .unwrap_or(crate::protection::Level::None)
+        .unwrap_or(crate::protection::Level::Privileged)
 }
 
 fn cmd_combine(
@@ -1756,7 +1755,6 @@ mod state_budget_tests {
             mailbox_safe: false,
             in_place_writer: false,
             drain_capable: false,
-            permissions_bits: 0,
             schema: None,
             manifest,
             data: Vec::new(),

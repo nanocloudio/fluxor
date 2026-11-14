@@ -93,7 +93,7 @@ pub(crate) fn gate_contract_consumers() -> usize {
         &mut *p
     };
     let mut gated = 0usize;
-    // One bit per contract in `required_caps`.
+    // One bit per contract in the first grant word.
     for contract in 0..u64::BITS as usize {
         let Some(provider) = crate::kernel::module::provider::default_module_provider(contract)
         else {
@@ -106,7 +106,7 @@ pub(crate) fn gate_contract_consumers() -> usize {
         for m in 0..module_slots() {
             if m == provider
                 || sched.deferred_ready[m]
-                || sched.required_caps[m] & (1u64 << contract) == 0
+                || sched.grants[m][0] & (1u64 << contract) == 0
             {
                 continue;
             }

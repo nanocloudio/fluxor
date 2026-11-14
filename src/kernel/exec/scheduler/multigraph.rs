@@ -1401,14 +1401,14 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
         | (if s.ready { f::READY } else { 0 })
         | (if s.finished { f::FINISHED } else { 0 });
     buf[o::FAULT_STATE] = s.fault_state as u8;
-    buf[o::CAP_CLASS] = s.cap_class;
     buf[o::STEP_PERIOD] = s.step_period;
-    buf[o::PERMISSIONS..o::PERMISSIONS + 2].copy_from_slice(&s.permissions.to_le_bytes());
+    buf[o::GRANTS..o::GRANTS + 8].copy_from_slice(&s.grants[0].to_le_bytes());
+    buf[o::GRANTS + 8..o::GRANTS + 16].copy_from_slice(&s.grants[1].to_le_bytes());
     buf[o::DOMAIN_ID] = s.domain_id;
     // SAFETY: scheduler-thread-only read; module_idx bounded above.
     buf[o::PROTECTION] = unsafe {
         let p = &raw const SCHED;
-        (&(*p).protection)[module_idx]
+        (&(*p).protection)[module_idx] as u8
     };
     buf[o::RESTART_COUNT..o::RESTART_COUNT + 2].copy_from_slice(&s.restart_count.to_le_bytes());
     buf[o::INACTIVE_FOR_TICKS..o::INACTIVE_FOR_TICKS + 4]
@@ -1665,10 +1665,8 @@ pub struct ModuleStateSnapshot {
     pub ready: bool,
     /// Whether the module has finalised (`Done` / terminated).
     pub finished: bool,
-    /// Capability tier (Driver/Service/Protocol — see scheduler docs).
-    pub cap_class: u8,
-    /// Permission bitmap (per `syscalls::permission` bits).
-    pub permissions: u16,
+    /// The module's grants: contracts, then op-level grants.
+    pub grants: [u64; 2],
     /// Per-module fault state machine state.
     pub fault_state: FaultState,
     /// Step-period gate in scheduler ticks (0 = every tick, N = every
@@ -1704,8 +1702,7 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
             present: false,
             ready: false,
             finished: false,
-            cap_class: 0,
-            permissions: 0,
+            grants: [0; 2],
             fault_state: FaultState::Running,
             step_period: 0,
             restart_count: 0,
@@ -1726,8 +1723,7 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
         present,
         ready: sched.ready[module_idx],
         finished: sched.finished[module_idx],
-        cap_class: sched.cap_class[module_idx],
-        permissions: sched.permissions[module_idx],
+        grants: sched.grants[module_idx],
         fault_state: sched.fault_info[module_idx].state,
         step_period: sched.step_period[module_idx],
         restart_count: sched.fault_info[module_idx].restart_count,

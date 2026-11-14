@@ -9,10 +9,14 @@ claim.
 
 | Level | Wire value (tag `0xF5`) | The module runs | Implemented on |
 |---|---|---|---|
-| `none` | 0 | privileged, called directly | every target |
-| `guarded` | 1 | privileged, under the step guard | every target |
-| `contained` | 2 | unprivileged: its own RAM and all of flash, nothing else | rp2040, rp2350 |
-| `isolated` | 3 | unprivileged: its own RAM and its own code, nothing else | rp2040, rp2350, bcm2712 |
+| `privileged` | 0 | privileged, called directly | every target |
+| `contained` | 1 | unprivileged: its own RAM and all of flash, nothing else | rp2040, rp2350 |
+| `isolated` | 2 | unprivileged: its own RAM and its own code, nothing else | rp2040, rp2350, bcm2712 |
+
+Every level runs under the step guard, and a module at every level holds
+exactly the grants its manifest declares: a level bounds memory and
+handles, a grant bounds authority. The composer and the kernel read one
+`Level` (`fluxor_contracts::isolation`).
 
 `contained` and `isolated` are the **gated** levels. A gated module reaches
 the kernel only through the gateway, runs on a stack of its own, and is forced
@@ -32,8 +36,8 @@ build; it never runs one privileged instead.
 
 A signature sets a floor the graph cannot lower. On a kernel built with a
 root signing key (`FLUXOR_SIGNING_PUBKEY_HEX`), a module that does not verify
-against that key is loaded only at a gated level. A request for `none` or
-`guarded` is refused at load. A kernel built without a key has no signature
+against that key is loaded only at a gated level. A request for
+`privileged` is refused at load. A kernel built without a key has no signature
 state to enforce, and loads modules at the level the graph gives them.
 
 ## What a gated module can reach
@@ -223,7 +227,7 @@ A gated module that never returns is forced out at its step deadline and
 faulted.
 
 On the RP kernel, a separate liveness watchdog guards against a board that
-stops: for example, a privileged (`none`/`guarded`) module that never
+stops: for example, a `privileged` module that never
 returns, which would also stop USB.
 - It is armed once the clocks are up. The boot and every graph build run
   under its longest timeout (about 8 s on rp2040 and 16 s on rp2350), and the

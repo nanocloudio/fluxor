@@ -1447,8 +1447,8 @@ fn bcm_init_providers() {
     fluxor::kernel::module::syscalls::register_system_extension(bcm_system_extension_dispatch);
     // Metal fmod-graph `workload` (0x1A) backend: stages a workload as an
     // owned module subgraph via `apply_add`/owner/lease. Gated exactly like
-    // the Linux install — `requires_contract = "workload"` + `platform_raw` in
-    // the caller's manifest. The core logic is kernel-generic
+    // the Linux install, by the `workload.create` grant. The core logic is
+    // kernel-generic
     // (`kernel::workload::workload_graph`); this is the metal registration
     // that installs it.
     use fluxor::kernel::module::provider;
@@ -1532,7 +1532,7 @@ fn bcm_runtime_params(
 /// registers and nothing else: a 4-byte-aligned word inside one of the
 /// board's device apertures (`boot_mmu::is_device_aperture`). DRAM — the
 /// kernel's tables, module state, firmware memory — and address space with
-/// nothing behind it are refused, whatever `platform_raw` grants. The first
+/// nothing behind it are refused, whatever `metal_device.mmio` grants. The first
 /// refusal is logged.
 fn mmio_target_ok(addr: u64) -> bool {
     let ok = addr & 3 == 0 && boot_mmu::is_device_aperture(addr);

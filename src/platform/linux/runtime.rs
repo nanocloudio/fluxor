@@ -511,14 +511,14 @@ fn linux_init_providers() {
     // Platform-neutral isolated-workload surface: parses the Tier-1 spec, binds
     // to a plan-allocated owner + lease, enforces the Tier-2 options envelope
     // fail-closed, and delegates to the owner-bound host-process backend.
-    // Host-linux; gated by requires_contract = "workload" + platform_raw.
+    // Host-linux; gated by the `workload.create` and `host_process.exec` grants.
     provider::register(dev_class::WORKLOAD, linux_workload_dispatch);
     provider::register(
         dev_class::HOST_PROCESS,
         fluxor::platform::linux::workload::host_process_dispatch,
     );
     // Host mounts of block devices under the operator's mount root. Gated by
-    // requires_contract = "host_mount" + platform_raw.
+    // the `host_mount.mount` grant.
     provider::register(
         dev_class::HOST_MOUNT,
         fluxor::platform::linux::host_mount::host_mount_dispatch,

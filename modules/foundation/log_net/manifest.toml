@@ -1,6 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350", "rp2040", "linux"]
-permissions = ["platform_raw"]
+grants = ["diag"]
 # Cadence-independent telemetry forwarder (drains the log ring → UDP); its emit
 # cadence is cosmetic, not correctness-bearing. Explicit attestation to run on a
 # mechanism-(b) domain: an absent declaration is treated as unattested and is

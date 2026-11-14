@@ -75,14 +75,24 @@ unsafe fn adc_reg_write(sys: &SyscallTable, offset: u8, val: u32) {
     *bp.add(2) = v[1];
     *bp.add(3) = v[2];
     *bp.add(4) = v[3];
-    (sys.provider_call)(-1, ADC_REG_WRITE, bp, 5);
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::ADC, 0),
+        ADC_REG_WRITE,
+        bp,
+        5,
+    );
 }
 
 unsafe fn adc_reg_read(sys: &SyscallTable, offset: u8) -> u32 {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
-    (sys.provider_call)(-1, ADC_REG_READ, bp, 5);
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::ADC, 0),
+        ADC_REG_READ,
+        bp,
+        5,
+    );
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 
@@ -135,7 +145,7 @@ pub unsafe extern "C" fn adc_dispatch(
             if ch < 4 {
                 let mut pin_buf = [26 + ch];
                 (sys.provider_call)(
-                    -1,
+                    dev_raw_claim(sys, abi::platform::rp::raw_claim::family::ADC, 0),
                     abi::platform::rp::adc_raw::PIN_INIT,
                     pin_buf.as_mut_ptr(),
                     1,

@@ -138,6 +138,7 @@ use abi::platform::rp::pio_raw::{
 // Both families live under the single PLATFORM_DMA contract.
 use abi::kernel_abi::HANDLE_POLL as FD_POLL;
 use abi::platform::rp::dma_raw::{channel as dma_channel, fd as dma_fd};
+use abi::platform::rp::raw_claim;
 
 // DMA flags
 const DMA_FLAG_INCR_READ: u8 = 0x01;
@@ -181,8 +182,8 @@ struct PioProgram {
 #[repr(C)]
 struct StreamSlot {
     state: u8,
-    pio_num: u8,
-    sm_num: u8,     // assigned at configure time via pio_num default 0
+    pio: PioRef,
+    sm_num: u8,     // assigned at configure time, on PIO 0 by default
     active_buf: u8, // 0=A is front (DMA source), 1=B is front
     dma_fd: i32,
     push_pending: u8,
@@ -218,7 +219,7 @@ struct StreamSlot {
 #[repr(C)]
 struct CmdSlot {
     state: u8,
-    pio_num: u8,
+    pio: PioRef,
     sm_num: u8,
     program_loaded: u8,
     program_status: u8,
@@ -248,7 +249,7 @@ struct CmdSlot {
 #[repr(C)]
 struct RxSlot {
     state: u8,
-    pio_num: u8,
+    pio: PioRef,
     sm_num: u8,
     active_buf: u8, // which buffer DMA is filling (0=A, 1=B)
     dma_fd: i32,
@@ -292,23 +293,40 @@ struct PioState {
 // Kernel bridge helpers
 // ============================================================================
 
+/// A PIO block this module has claimed: its number and the claim's handle,
+/// which every raw PIO op on the block takes.
+#[derive(Clone, Copy)]
+struct PioRef {
+    h: i32,
+    num: u8,
+}
+
+/// Claim PIO block `num` for this module (the kernel answers a block this
+/// module already holds with the same handle). A refused claim leaves the
+/// handle negative, and every op on it is refused in turn.
+unsafe fn claim_pio(sys: &SyscallTable, num: u8) -> PioRef {
+    let mut arg = [raw_claim::family::PIO, num];
+    let h = (sys.provider_call)(-1, raw_claim::CLAIM, arg.as_mut_ptr(), 2);
+    PioRef { h, num }
+}
+
 #[inline(always)]
-unsafe fn pio_sm_exec(sys: &SyscallTable, pio_num: u8, sm: u8, instr: u16) {
+unsafe fn pio_sm_exec(sys: &SyscallTable, pio: PioRef, sm: u8, instr: u16) {
     let mut buf = [0u8; 4];
     let p = buf.as_mut_ptr();
-    *p = pio_num;
+    *p = pio.num;
     *p.add(1) = sm;
     let ib = instr.to_le_bytes();
     *p.add(2) = ib[0];
     *p.add(3) = ib[1];
-    (sys.provider_call)(-1, PIO_SM_EXEC, p, 4);
+    (sys.provider_call)(pio.h, PIO_SM_EXEC, p, 4);
 }
 
 #[inline(always)]
-unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8, value: u32) {
+unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio: PioRef, sm: u8, reg: u8, value: u32) {
     let mut buf = [0u8; 7];
     let p = buf.as_mut_ptr();
-    *p = pio_num;
+    *p = pio.num;
     *p.add(1) = sm;
     *p.add(2) = reg;
     let vb = value.to_le_bytes();
@@ -316,56 +334,57 @@ unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8, val
     *p.add(4) = vb[1];
     *p.add(5) = vb[2];
     *p.add(6) = vb[3];
-    (sys.provider_call)(-1, PIO_SM_WRITE_REG, p, 7);
+    (sys.provider_call)(pio.h, PIO_SM_WRITE_REG, p, 7);
 }
 
 #[inline(always)]
-unsafe fn pio_sm_enable(sys: &SyscallTable, pio_num: u8, sm_mask: u8, enable: bool) {
-    let mut buf = [pio_num, sm_mask, if enable { 1 } else { 0 }];
-    (sys.provider_call)(-1, PIO_SM_ENABLE, buf.as_mut_ptr(), 3);
+unsafe fn pio_sm_enable(sys: &SyscallTable, pio: PioRef, sm_mask: u8, enable: bool) {
+    let mut buf = [pio.num, sm_mask, if enable { 1 } else { 0 }];
+    (sys.provider_call)(pio.h, PIO_SM_ENABLE, buf.as_mut_ptr(), 3);
 }
 
-unsafe fn pio_instr_alloc(sys: &SyscallTable, pio_num: u8, count: u8) -> (i32, u32) {
+unsafe fn pio_instr_alloc(sys: &SyscallTable, pio: PioRef, count: u8) -> (i32, u32) {
     let mut buf = [0u8; 6];
     let p = buf.as_mut_ptr();
-    *p = pio_num;
+    *p = pio.num;
     *p.add(1) = count;
-    let origin = (sys.provider_call)(-1, PIO_INSTR_ALLOC, p, 6);
+    let origin = (sys.provider_call)(pio.h, PIO_INSTR_ALLOC, p, 6);
     let mask = u32::from_le_bytes([*p.add(2), *p.add(3), *p.add(4), *p.add(5)]);
     (origin, mask)
 }
 
-unsafe fn pio_instr_write(sys: &SyscallTable, pio_num: u8, addr: u8, instr: u16) {
+#[inline(always)]
+unsafe fn pio_instr_write(sys: &SyscallTable, pio: PioRef, addr: u8, instr: u16) {
     let mut buf = [0u8; 4];
     let p = buf.as_mut_ptr();
-    *p = pio_num;
+    *p = pio.num;
     *p.add(1) = addr;
     let ib = instr.to_le_bytes();
     *p.add(2) = ib[0];
     *p.add(3) = ib[1];
-    (sys.provider_call)(-1, PIO_INSTR_WRITE, p, 4);
+    (sys.provider_call)(pio.h, PIO_INSTR_WRITE, p, 4);
 }
 
-unsafe fn pio_instr_free(sys: &SyscallTable, pio_num: u8, mask: u32) {
+unsafe fn pio_instr_free(sys: &SyscallTable, pio: PioRef, mask: u32) {
     let mut buf = [0u8; 5];
     let p = buf.as_mut_ptr();
-    *p = pio_num;
+    *p = pio.num;
     let mb = mask.to_le_bytes();
     *p.add(1) = mb[0];
     *p.add(2) = mb[1];
     *p.add(3) = mb[2];
     *p.add(4) = mb[3];
-    (sys.provider_call)(-1, PIO_INSTR_FREE, p, 5);
+    (sys.provider_call)(pio.h, PIO_INSTR_FREE, p, 5);
 }
 
-unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) {
-    let mut buf = [pin, pio_num, pull];
-    (sys.provider_call)(-1, PIO_PIN_SETUP, buf.as_mut_ptr(), 3);
+unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio: PioRef, pull: u8) {
+    let mut buf = [pin, pio.num, pull];
+    (sys.provider_call)(pio.h, PIO_PIN_SETUP, buf.as_mut_ptr(), 3);
 }
 
-unsafe fn pio_sm_restart(sys: &SyscallTable, pio_num: u8, sm_mask: u8) {
-    let mut buf = [pio_num, sm_mask];
-    (sys.provider_call)(-1, PIO_SM_RESTART, buf.as_mut_ptr(), 2);
+unsafe fn pio_sm_restart(sys: &SyscallTable, pio: PioRef, sm_mask: u8) {
+    let mut buf = [pio.num, sm_mask];
+    (sys.provider_call)(pio.h, PIO_SM_RESTART, buf.as_mut_ptr(), 2);
 }
 
 // DMA FD helpers — open against PLATFORM_DMA_FD.
@@ -437,16 +456,16 @@ unsafe fn raw_dma_free(sys: &SyscallTable, ch: u8) {
 /// Returns origin on success, -1 on failure.
 unsafe fn load_program(
     sys: &SyscallTable,
-    pio_num: u8,
+    pio: PioRef,
     prog: &PioProgram,
     old_mask: u32,
 ) -> (i32, u32) {
     // Free old slots
     if old_mask != 0 {
-        pio_instr_free(sys, pio_num, old_mask);
+        pio_instr_free(sys, pio, old_mask);
     }
     // Allocate new
-    let (origin, mask) = pio_instr_alloc(sys, pio_num, prog.length);
+    let (origin, mask) = pio_instr_alloc(sys, pio, prog.length);
     if origin < 0 {
         return (-1, 0);
     }
@@ -455,7 +474,7 @@ unsafe fn load_program(
     while (i as usize) < prog.length as usize {
         let addr = ((origin as u8).wrapping_add(i)) & 31;
         let instr_ptr = prog.instructions.as_ptr().add(i as usize);
-        pio_instr_write(sys, pio_num, addr, core::ptr::read_volatile(instr_ptr));
+        pio_instr_write(sys, pio, addr, core::ptr::read_volatile(instr_ptr));
         i += 1;
     }
     (origin, mask)
@@ -463,15 +482,15 @@ unsafe fn load_program(
 
 /// Configure SM for TX streaming (autopull, MSB-first, join TX FIFO)
 unsafe fn configure_stream_sm(sys: &SyscallTable, slot: &StreamSlot, origin: u8) {
-    let pio_num = slot.pio_num;
+    let pio = slot.pio;
     let sm = slot.sm_num;
     let sm_mask = 1u8 << sm;
 
     // Disable SM
-    pio_sm_enable(sys, pio_num, sm_mask, false);
+    pio_sm_enable(sys, pio, sm_mask, false);
 
     // Restart SM
-    pio_sm_restart(sys, pio_num, sm_mask);
+    pio_sm_restart(sys, pio, sm_mask);
 
     // EXECCTRL: wrap boundaries + sideset config
     let wrap_bottom = origin + slot.program.wrap_target;
@@ -487,7 +506,7 @@ unsafe fn configure_stream_sm(sys: &SyscallTable, slot: &StreamSlot, origin: u8)
     if slot.program.sideset_pindirs != 0 {
         execctrl |= 1 << 29; // SIDE_PINDIR
     }
-    pio_sm_write_reg(sys, pio_num, sm, REG_EXECCTRL, execctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_EXECCTRL, execctrl);
 
     // PINCTRL: RP2350 layout
     //  [4:0]   = OUT_BASE
@@ -504,11 +523,11 @@ unsafe fn configure_stream_sm(sys: &SyscallTable, slot: &StreamSlot, origin: u8)
     pinctrl |= 1u32 << 20; // [25:20] OUT_COUNT=1
     pinctrl |= 1u32 << 26; // [28:26] SET_COUNT=1
     pinctrl |= (slot.program.sideset_bits as u32) << 29; // [31:29] SIDESET_COUNT
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, pinctrl);
 
     // CLKDIV: integer part shifted left by 16, frac by 8
     // The kernel bridge expects the raw register value
-    pio_sm_write_reg(sys, pio_num, sm, REG_CLKDIV, slot.clock_div << 8);
+    pio_sm_write_reg(sys, pio, sm, REG_CLKDIV, slot.clock_div << 8);
 
     // SHIFTCTRL: join TX, autopull, MSB-first, pull_thresh
     let mut shiftctrl: u32 = 0;
@@ -517,44 +536,44 @@ unsafe fn configure_stream_sm(sys: &SyscallTable, slot: &StreamSlot, origin: u8)
                           // OUT_SHIFTDIR=0 (shift left = MSB first) — bit 19
                           // PULL_THRESH [24:20]
     shiftctrl |= (slot.shift_bits as u32 & 0x1F) << 20;
-    pio_sm_write_reg(sys, pio_num, sm, REG_SHIFTCTRL, shiftctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_SHIFTCTRL, shiftctrl);
 
     // Set pin directions: force SET PINDIRS, 1
     // First set pinctrl for SET to point at out_pin
     let set_pinctrl = (slot.out_pin as u32) | ((slot.out_pin as u32) << 5) | (1u32 << 26);
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, set_pinctrl);
-    pio_sm_exec(sys, pio_num, sm, 0xE081); // SET PINDIRS, 1
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, set_pinctrl);
+    pio_sm_exec(sys, pio, sm, 0xE081); // SET PINDIRS, 1
 
     // SET PINS, 0 (drive low)
-    pio_sm_exec(sys, pio_num, sm, 0xE000); // SET PINS, 0
+    pio_sm_exec(sys, pio, sm, 0xE000); // SET PINS, 0
 
     // If sideset pins differ from out, set their directions too
     if slot.sideset_base != slot.out_pin && slot.program.sideset_bits > 0 {
         let ss_pinctrl = (slot.sideset_base as u32) << 5 | (slot.program.sideset_bits as u32) << 26;
-        pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, ss_pinctrl);
+        pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, ss_pinctrl);
         let ss_mask = (1u16 << slot.program.sideset_bits) - 1;
-        pio_sm_exec(sys, pio_num, sm, 0xE080 | ss_mask); // SET PINDIRS, mask
+        pio_sm_exec(sys, pio, sm, 0xE080 | ss_mask); // SET PINDIRS, mask
     }
 
     // Restore full pinctrl
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, pinctrl);
 
     // Jump to entry point (wrap top)
     let entry = origin + slot.program.wrap;
-    pio_sm_exec(sys, pio_num, sm, entry as u16); // JMP entry
+    pio_sm_exec(sys, pio, sm, entry as u16); // JMP entry
 
     // Enable
-    pio_sm_enable(sys, pio_num, sm_mask, true);
+    pio_sm_enable(sys, pio, sm_mask, true);
 }
 
 /// Configure SM for CMD mode (bidirectional: autopull+autopush, MSB-first)
 unsafe fn configure_cmd_sm(sys: &SyscallTable, slot: &CmdSlot, origin: u8) {
-    let pio_num = slot.pio_num;
+    let pio = slot.pio;
     let sm = slot.sm_num;
     let sm_mask = 1u8 << sm;
 
-    pio_sm_enable(sys, pio_num, sm_mask, false);
-    pio_sm_restart(sys, pio_num, sm_mask);
+    pio_sm_enable(sys, pio, sm_mask, false);
+    pio_sm_restart(sys, pio, sm_mask);
 
     // EXECCTRL
     let wrap_bottom = origin + slot.program.wrap_target;
@@ -568,7 +587,7 @@ unsafe fn configure_cmd_sm(sys: &SyscallTable, slot: &CmdSlot, origin: u8) {
     if slot.program.sideset_pindirs != 0 {
         execctrl |= 1 << 29;
     }
-    pio_sm_write_reg(sys, pio_num, sm, REG_EXECCTRL, execctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_EXECCTRL, execctrl);
 
     // PINCTRL: out=data, in=data, set=data, sideset=clk
     let mut pinctrl: u32 = 0;
@@ -579,10 +598,10 @@ unsafe fn configure_cmd_sm(sys: &SyscallTable, slot: &CmdSlot, origin: u8) {
     pinctrl |= 1u32 << 20; // [25:20] OUT_COUNT=1
     pinctrl |= 1u32 << 26; // [28:26] SET_COUNT=1
     pinctrl |= (slot.program.sideset_bits as u32) << 29; // [31:29] SIDESET_COUNT
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, pinctrl);
 
     // CLKDIV
-    pio_sm_write_reg(sys, pio_num, sm, REG_CLKDIV, slot.clock_div << 8);
+    pio_sm_write_reg(sys, pio, sm, REG_CLKDIV, slot.clock_div << 8);
 
     // SHIFTCTRL: autopull+autopush, MSB-first, 32-bit thresholds
     let mut shiftctrl: u32 = 0;
@@ -590,23 +609,23 @@ unsafe fn configure_cmd_sm(sys: &SyscallTable, slot: &CmdSlot, origin: u8) {
     shiftctrl |= 1 << 16; // AUTOPUSH
                           // OUT_SHIFTDIR=0, IN_SHIFTDIR=0 (MSB first)
                           // PULL_THRESH=0 (=32), PUSH_THRESH=0 (=32)
-    pio_sm_write_reg(sys, pio_num, sm, REG_SHIFTCTRL, shiftctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_SHIFTCTRL, shiftctrl);
 
     // Force data+clk pins as output LOW
     // Set data pin direction
     let set_pc = (slot.data_pin as u32) | ((slot.data_pin as u32) << 5) | (1u32 << 26);
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, set_pc);
-    pio_sm_exec(sys, pio_num, sm, 0xE081); // SET PINDIRS, 1
-    pio_sm_exec(sys, pio_num, sm, 0xE000); // SET PINS, 0
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, set_pc);
+    pio_sm_exec(sys, pio, sm, 0xE081); // SET PINDIRS, 1
+    pio_sm_exec(sys, pio, sm, 0xE000); // SET PINS, 0
 
     // Set clk pin direction
     let clk_pc = (slot.clk_pin as u32) | ((slot.clk_pin as u32) << 5) | (1u32 << 26);
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, clk_pc);
-    pio_sm_exec(sys, pio_num, sm, 0xE081); // SET PINDIRS, 1
-    pio_sm_exec(sys, pio_num, sm, 0xE000); // SET PINS, 0
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, clk_pc);
+    pio_sm_exec(sys, pio, sm, 0xE081); // SET PINDIRS, 1
+    pio_sm_exec(sys, pio, sm, 0xE000); // SET PINS, 0
 
     // Restore pinctrl
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, pinctrl);
 
     // Enable input sync bypass on data pin for reduced input latency.
     // Bypasses the 2-flipflop synchronizer — critical for gSPI RX bit alignment.
@@ -614,30 +633,30 @@ unsafe fn configure_cmd_sm(sys: &SyscallTable, slot: &CmdSlot, origin: u8) {
         let pin_mask = 1u32 << slot.data_pin;
         let mask_bytes = pin_mask.to_le_bytes();
         let mut buf = [
-            slot.pio_num,
+            slot.pio.num,
             mask_bytes[0],
             mask_bytes[1],
             mask_bytes[2],
             mask_bytes[3],
         ];
-        (sys.provider_call)(-1, PIO_INPUT_SYNC_BYPASS, buf.as_mut_ptr(), 5);
+        (sys.provider_call)(slot.pio.h, PIO_INPUT_SYNC_BYPASS, buf.as_mut_ptr(), 5);
     }
 
     // Jump to entry point (wrap_target for cmd)
     let entry = origin + slot.program.wrap_target;
-    pio_sm_exec(sys, pio_num, sm, entry as u16); // JMP entry
+    pio_sm_exec(sys, pio, sm, entry as u16); // JMP entry
 
     // SM stays disabled — enabled per-transfer
 }
 
 /// Configure SM for RX streaming (autopush, MSB-first, join RX FIFO)
 unsafe fn configure_rx_sm(sys: &SyscallTable, slot: &RxSlot, origin: u8) {
-    let pio_num = slot.pio_num;
+    let pio = slot.pio;
     let sm = slot.sm_num;
     let sm_mask = 1u8 << sm;
 
-    pio_sm_enable(sys, pio_num, sm_mask, false);
-    pio_sm_restart(sys, pio_num, sm_mask);
+    pio_sm_enable(sys, pio, sm_mask, false);
+    pio_sm_restart(sys, pio, sm_mask);
 
     // EXECCTRL
     let wrap_bottom = origin + slot.program.wrap_target;
@@ -651,7 +670,7 @@ unsafe fn configure_rx_sm(sys: &SyscallTable, slot: &RxSlot, origin: u8) {
     if slot.program.sideset_pindirs != 0 {
         execctrl |= 1 << 29;
     }
-    pio_sm_write_reg(sys, pio_num, sm, REG_EXECCTRL, execctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_EXECCTRL, execctrl);
 
     // PINCTRL: in=in_pin, sideset=sideset_base
     let mut pinctrl: u32 = 0;
@@ -660,10 +679,10 @@ unsafe fn configure_rx_sm(sys: &SyscallTable, slot: &RxSlot, origin: u8) {
     pinctrl |= (slot.in_pin as u32) << 15; // [19:15] IN_BASE
     pinctrl |= 1u32 << 26; // [28:26] SET_COUNT=1
     pinctrl |= (slot.program.sideset_bits as u32) << 29; // [31:29] SIDESET_COUNT
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, pinctrl);
 
     // CLKDIV
-    pio_sm_write_reg(sys, pio_num, sm, REG_CLKDIV, slot.clock_div << 8);
+    pio_sm_write_reg(sys, pio, sm, REG_CLKDIV, slot.clock_div << 8);
 
     // SHIFTCTRL: join RX, autopush, MSB-first, push_thresh
     let mut shiftctrl: u32 = 0;
@@ -671,7 +690,7 @@ unsafe fn configure_rx_sm(sys: &SyscallTable, slot: &RxSlot, origin: u8) {
     shiftctrl |= 1 << 16; // AUTOPUSH
                           // IN_SHIFTDIR=0 (shift left = MSB first) — bit 18
     shiftctrl |= (slot.shift_bits as u32 & 0x1F) << 20; // PUSH_THRESH [24:20]
-    pio_sm_write_reg(sys, pio_num, sm, REG_SHIFTCTRL, shiftctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_SHIFTCTRL, shiftctrl);
 
     // Setup sideset pins as outputs
     if slot.sideset_base != slot.in_pin && slot.program.sideset_bits > 0 {
@@ -679,28 +698,28 @@ unsafe fn configure_rx_sm(sys: &SyscallTable, slot: &RxSlot, origin: u8) {
         let mut ss_pin = slot.sideset_base;
         let mut n = 0u8;
         while n < slot.program.sideset_bits {
-            pio_pin_setup(sys, ss_pin, pio_num, 2); // PullUp
-                                                    // Set as output
+            pio_pin_setup(sys, ss_pin, pio, 2); // PullUp
+                                                // Set as output
             let ss_pc = (ss_pin as u32) | ((ss_pin as u32) << 5) | (1u32 << 26);
-            pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, ss_pc);
-            pio_sm_exec(sys, pio_num, sm, 0xE081); // SET PINDIRS, 1
+            pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, ss_pc);
+            pio_sm_exec(sys, pio, sm, 0xE081); // SET PINDIRS, 1
             ss_pin = ss_pin.wrapping_add(1);
             n += 1;
         }
     }
 
     // Setup input pin
-    pio_pin_setup(sys, slot.in_pin, pio_num, 2); // PullUp
+    pio_pin_setup(sys, slot.in_pin, pio, 2); // PullUp
 
     // Restore pinctrl
-    pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
+    pio_sm_write_reg(sys, pio, sm, REG_PINCTRL, pinctrl);
 
     // Jump to entry
     let entry = origin + slot.program.wrap;
-    pio_sm_exec(sys, pio_num, sm, entry as u16);
+    pio_sm_exec(sys, pio, sm, entry as u16);
 
     // Enable
-    pio_sm_enable(sys, pio_num, sm_mask, true);
+    pio_sm_enable(sys, pio, sm_mask, true);
 }
 
 // ============================================================================
@@ -853,28 +872,22 @@ pub unsafe extern "C" fn pio_dispatch(
             (*sp).out_pin = *arg.add(4);
             (*sp).sideset_base = *arg.add(5);
             (*sp).shift_bits = *arg.add(6);
-            (*sp).pio_num = 0; // default PIO0
+            (*sp).pio = claim_pio(sys, 0); // default PIO0
             (*sp).sm_num = idx as u8; // SM = slot index
             (*sp).state = SLOT_READY;
             // Try to load program now if pending
             if (*sp).program_status == 1 && (*sp).program.length > 0 {
-                let (origin, mask) =
-                    load_program(sys, (*sp).pio_num, &(*sp).program, (*sp).instr_mask);
+                let (origin, mask) = load_program(sys, (*sp).pio, &(*sp).program, (*sp).instr_mask);
                 if origin >= 0 {
                     (*sp).instr_mask = mask;
                     (*sp).instr_origin = origin as u8;
                     // Setup pin for PIO
-                    pio_pin_setup(sys, (*sp).out_pin, (*sp).pio_num, 2); // PullUp
+                    pio_pin_setup(sys, (*sp).out_pin, (*sp).pio, 2); // PullUp
                     if (*sp).sideset_base != (*sp).out_pin {
-                        pio_pin_setup(sys, (*sp).sideset_base, (*sp).pio_num, 2);
+                        pio_pin_setup(sys, (*sp).sideset_base, (*sp).pio, 2);
                         // Also setup second sideset pin if sideset_bits > 1
                         if (*sp).program.sideset_bits > 1 {
-                            pio_pin_setup(
-                                sys,
-                                (*sp).sideset_base.wrapping_add(1),
-                                (*sp).pio_num,
-                                2,
-                            );
+                            pio_pin_setup(sys, (*sp).sideset_base.wrapping_add(1), (*sp).pio, 2);
                         }
                     }
                     configure_stream_sm(sys, &*sp, origin as u8);
@@ -1006,7 +1019,7 @@ pub unsafe extern "C" fn pio_dispatch(
                 return 0;
             }
             // Stop SM
-            pio_sm_enable(sys, (*sp).pio_num, 1 << (*sp).sm_num, false);
+            pio_sm_enable(sys, (*sp).pio, 1 << (*sp).sm_num, false);
             // Free DMA FD
             if (*sp).dma_fd >= 0 {
                 dma_fd_free(sys, (*sp).dma_fd);
@@ -1014,7 +1027,7 @@ pub unsafe extern "C" fn pio_dispatch(
             }
             // Free instruction memory
             if (*sp).instr_mask != 0 {
-                pio_instr_free(sys, (*sp).pio_num, (*sp).instr_mask);
+                pio_instr_free(sys, (*sp).pio, (*sp).instr_mask);
                 (*sp).instr_mask = 0;
             }
             (*sp).state = SLOT_FREE;
@@ -1129,7 +1142,7 @@ pub unsafe extern "C" fn pio_dispatch(
                 let cp = s.cmds.as_mut_ptr().add(i);
                 if (*cp).state == SLOT_FREE {
                     (*cp).state = SLOT_ALLOCATED;
-                    (*cp).pio_num = pio_idx;
+                    (*cp).pio = claim_pio(sys, pio_idx);
                     (*cp).sm_num = sm_idx;
                     (*cp).program_loaded = 0;
                     (*cp).program_status = 0;
@@ -1187,14 +1200,13 @@ pub unsafe extern "C" fn pio_dispatch(
             (*cp).state = SLOT_READY;
             // Try program load
             if (*cp).program_status == 1 && (*cp).program.length > 0 {
-                let (origin, mask) =
-                    load_program(sys, (*cp).pio_num, &(*cp).program, (*cp).instr_mask);
+                let (origin, mask) = load_program(sys, (*cp).pio, &(*cp).program, (*cp).instr_mask);
                 if origin >= 0 {
                     (*cp).instr_mask = mask;
                     (*cp).instr_origin = origin as u8;
                     // Setup pins
-                    pio_pin_setup(sys, (*cp).data_pin, (*cp).pio_num, 1); // PullDown for DIO
-                    pio_pin_setup(sys, (*cp).clk_pin, (*cp).pio_num, 0); // None for CLK
+                    pio_pin_setup(sys, (*cp).data_pin, (*cp).pio, 1); // PullDown for DIO
+                    pio_pin_setup(sys, (*cp).clk_pin, (*cp).pio, 0); // None for CLK
                     configure_cmd_sm(sys, &*cp, origin as u8);
                     // Allocate two raw DMA channels (TX + RX for full-duplex gSPI)
                     let tx_ch = raw_dma_alloc(sys);
@@ -1289,7 +1301,7 @@ pub unsafe extern "C" fn pio_dispatch(
             let read_bits = (read_words << 5) - 1;
 
             let origin = (*cp).instr_origin;
-            let pio_n = (*cp).pio_num;
+            let pio = (*cp).pio;
             let sm_n = (*cp).sm_num;
             let dma_ch_tx = (*cp).dma_ch_tx;
             let dma_ch_rx = (*cp).dma_ch_rx;
@@ -1303,7 +1315,7 @@ pub unsafe extern "C" fn pio_dispatch(
             // to eliminate syscall latency between register writes.
             let mut xfer_args = [0u8; 28];
             let xp = xfer_args.as_mut_ptr();
-            *xp = pio_n;
+            *xp = pio.num;
             *xp.add(1) = sm_n;
             *xp.add(2) = origin;
             let wb = (write_bits as u32).to_le_bytes();
@@ -1333,7 +1345,7 @@ pub unsafe extern "C" fn pio_dispatch(
             *xp.add(23) = ra[3];
             *xp.add(24) = dma_ch_tx;
             *xp.add(25) = dma_ch_rx;
-            let rc = (sys.provider_call)(-1, PIO_CMD_XFER, xp, 28);
+            let rc = (sys.provider_call)(pio.h, PIO_CMD_XFER, xp, 28);
             if rc < 0 {
                 return rc;
             }
@@ -1414,7 +1426,7 @@ pub unsafe extern "C" fn pio_dispatch(
             if (*cp).state == SLOT_FREE {
                 return 0;
             }
-            pio_sm_enable(sys, (*cp).pio_num, 1 << (*cp).sm_num, false);
+            pio_sm_enable(sys, (*cp).pio, 1 << (*cp).sm_num, false);
             if (*cp).dma_ch_tx != 0xFF {
                 raw_dma_free(sys, (*cp).dma_ch_tx);
                 (*cp).dma_ch_tx = 0xFF;
@@ -1424,7 +1436,7 @@ pub unsafe extern "C" fn pio_dispatch(
                 (*cp).dma_ch_rx = 0xFF;
             }
             if (*cp).instr_mask != 0 {
-                pio_instr_free(sys, (*cp).pio_num, (*cp).instr_mask);
+                pio_instr_free(sys, (*cp).pio, (*cp).instr_mask);
                 (*cp).instr_mask = 0;
             }
             (*cp).state = SLOT_FREE;
@@ -1495,13 +1507,12 @@ pub unsafe extern "C" fn pio_dispatch(
             (*rp).in_pin = *arg.add(4);
             (*rp).sideset_base = *arg.add(5);
             (*rp).shift_bits = *arg.add(6);
-            (*rp).pio_num = 1; // RX typically on PIO1
+            (*rp).pio = claim_pio(sys, 1); // RX typically on PIO1
             (*rp).sm_num = 0;
             (*rp).state = SLOT_READY;
             // Try program load
             if (*rp).program_status == 1 && (*rp).program.length > 0 {
-                let (origin, mask) =
-                    load_program(sys, (*rp).pio_num, &(*rp).program, (*rp).instr_mask);
+                let (origin, mask) = load_program(sys, (*rp).pio, &(*rp).program, (*rp).instr_mask);
                 if origin >= 0 {
                     (*rp).instr_mask = mask;
                     (*rp).instr_origin = origin as u8;
@@ -1579,13 +1590,13 @@ pub unsafe extern "C" fn pio_dispatch(
             if (*rp).state == SLOT_FREE {
                 return 0;
             }
-            pio_sm_enable(sys, (*rp).pio_num, 1 << (*rp).sm_num, false);
+            pio_sm_enable(sys, (*rp).pio, 1 << (*rp).sm_num, false);
             if (*rp).dma_fd >= 0 {
                 dma_fd_free(sys, (*rp).dma_fd);
                 (*rp).dma_fd = -1;
             }
             if (*rp).instr_mask != 0 {
-                pio_instr_free(sys, (*rp).pio_num, (*rp).instr_mask);
+                pio_instr_free(sys, (*rp).pio, (*rp).instr_mask);
                 (*rp).instr_mask = 0;
             }
             (*rp).state = SLOT_FREE;
@@ -1735,8 +1746,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                     (*sp).buf_b.as_ptr()
                 };
 
-                let txf_addr = pio_txf_addr((*sp).pio_num, (*sp).sm_num);
-                let tx_dreq = ((*sp).pio_num << 3) + (*sp).sm_num;
+                let txf_addr = pio_txf_addr((*sp).pio.num, (*sp).sm_num);
+                let tx_dreq = ((*sp).pio.num << 3) + (*sp).sm_num;
 
                 // If DMA FD not created yet, create now
                 if (*sp).dma_fd < 0 {
@@ -1762,14 +1773,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
 
             // Try program load if pending and now configured
             if (*sp).program_status == 1 && (*sp).state >= SLOT_READY && (*sp).program.length > 0 {
-                let (origin, mask) =
-                    load_program(sys, (*sp).pio_num, &(*sp).program, (*sp).instr_mask);
+                let (origin, mask) = load_program(sys, (*sp).pio, &(*sp).program, (*sp).instr_mask);
                 if origin >= 0 {
                     (*sp).instr_mask = mask;
                     (*sp).instr_origin = origin as u8;
-                    pio_pin_setup(sys, (*sp).out_pin, (*sp).pio_num, 2);
+                    pio_pin_setup(sys, (*sp).out_pin, (*sp).pio, 2);
                     if (*sp).sideset_base != (*sp).out_pin {
-                        pio_pin_setup(sys, (*sp).sideset_base, (*sp).pio_num, 2);
+                        pio_pin_setup(sys, (*sp).sideset_base, (*sp).pio, 2);
                     }
                     configure_stream_sm(sys, &*sp, origin as u8);
                     (*sp).program_loaded = 1;
@@ -1818,8 +1828,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 } else {
                     (*rp).buf_b.as_mut_ptr()
                 };
-                let rxf_addr = pio_rxf_addr((*rp).pio_num, (*rp).sm_num);
-                let rx_dreq = ((*rp).pio_num << 3) + (*rp).sm_num + 4;
+                let rxf_addr = pio_rxf_addr((*rp).pio.num, (*rp).sm_num);
+                let rx_dreq = ((*rp).pio.num << 3) + (*rp).sm_num + 4;
                 let rc = dma_fd_start(
                     sys,
                     (*rp).dma_fd,
@@ -1838,8 +1848,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
 
             // Try program load if pending
             if (*rp).program_status == 1 && (*rp).state >= SLOT_READY && (*rp).program.length > 0 {
-                let (origin, mask) =
-                    load_program(sys, (*rp).pio_num, &(*rp).program, (*rp).instr_mask);
+                let (origin, mask) = load_program(sys, (*rp).pio, &(*rp).program, (*rp).instr_mask);
                 if origin >= 0 {
                     (*rp).instr_mask = mask;
                     (*rp).instr_origin = origin as u8;

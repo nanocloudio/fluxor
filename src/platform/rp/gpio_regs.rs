@@ -208,6 +208,12 @@ mod rp {
             Self(set_field(self.0, pad_field::PDE, 1, on as u32))
         }
 
+        /// Output disable: the pad never drives, as an analog input needs.
+        #[must_use]
+        pub const fn output_disable(self, on: bool) -> Self {
+            Self(set_field(self.0, pad_field::OD, 1, on as u32))
+        }
+
         /// Drive strength.
         #[must_use]
         pub const fn drive(self, drive: Drive) -> Self {

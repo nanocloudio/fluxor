@@ -57,7 +57,7 @@ pub use super::super::registry::reconfigure::TRIGGER_REBUILD;
 // without a destructive rebuild. Add and teardown only: partial
 // replacement and migration are not part of this surface.
 //
-// They require `platform_raw` (the registry's permission for them).
+// They need the `reconfigure.owner` grant.
 
 /// Add a new owner's subgraph to the running graph.
 /// handle=-1, arg = bounded binary `AddSubgraph` (magic `FLXA`, version,
@@ -143,7 +143,7 @@ pub const OWNER_RELEASED_ARG_LEN: usize = 8;
 // inactive staging buffer, then commits it. Commit validates header,
 // payload SHA-256, ABI-surface pin, and epoch monotonicity, then swaps
 // loader+config to the staged blobs and fires the rebuild bridge.
-// Gated platform_raw via the dev_system catch-all; ENOSYS on targets
+// They need the `reconfigure.ota` grant; ENOSYS on targets
 // without a RAM staging surface.
 
 /// Control the staged image. handle=-1, arg = `[cmd: u8]`:

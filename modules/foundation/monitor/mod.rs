@@ -38,7 +38,7 @@ use fluxor_rt::*;
 // A module's run state, as the verdict line names it; 3 and beyond are
 // terminated.
 fluxor_rt::name_table!(STATE_NAMES = [b"running", b"faulted", b"recovering", b"terminated"]);
-fluxor_rt::name_table!(PROTECTION_NAMES = [b"none", b"guarded", b"contained", b"isolated"]);
+fluxor_rt::name_table!(PROTECTION_NAMES = [b"privileged", b"contained", b"isolated"]);
 
 // Opcodes imported from the layered ABI — no hardcoded numbers here.
 use abi::internal::monitor::{
@@ -258,7 +258,7 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u16, out: &mut [u8]) -> u
     emit_decimal(u32_at(o::SLOT_GENERATION), out, &mut pos);
     emit_bytes(b" prot=", out, &mut pos);
     emit_bytes(
-        PROTECTION_NAMES.get(st[o::PROTECTION].min(3) as usize),
+        PROTECTION_NAMES.get(st[o::PROTECTION].min(2) as usize),
         out,
         &mut pos,
     );

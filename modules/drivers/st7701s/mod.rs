@@ -387,12 +387,22 @@ unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
 
 unsafe fn pio_gpiobase(sys: &SyscallTable, pio: u8, base16: u8) -> i32 {
     let mut arg = [pio, base16];
-    (sys.provider_call)(-1, PIO_GPIOBASE, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_GPIOBASE,
+        arg.as_mut_ptr(),
+        2,
+    )
 }
 
 unsafe fn pio_instr_alloc(sys: &SyscallTable, pio: u8, count: u8, mask_out: &mut u32) -> i32 {
     let mut arg = [pio, count, 0, 0, 0, 0];
-    let rc = (sys.provider_call)(-1, PIO_INSTR_ALLOC, arg.as_mut_ptr(), 6);
+    let rc = (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_INSTR_ALLOC,
+        arg.as_mut_ptr(),
+        6,
+    );
     if rc >= 0 {
         let p = arg.as_ptr();
         *mask_out = u32::from_le_bytes([
@@ -408,40 +418,75 @@ unsafe fn pio_instr_alloc(sys: &SyscallTable, pio: u8, count: u8, mask_out: &mut
 unsafe fn pio_instr_write(sys: &SyscallTable, pio: u8, addr: u8, instr: u16) -> i32 {
     let bytes = instr.to_le_bytes();
     let mut arg = [pio, addr, bytes[0], bytes[1]];
-    (sys.provider_call)(-1, PIO_INSTR_WRITE, arg.as_mut_ptr(), 4)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_INSTR_WRITE,
+        arg.as_mut_ptr(),
+        4,
+    )
 }
 
 unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio: u8, sm: u8, reg: u8, value: u32) -> i32 {
     let vb = value.to_le_bytes();
     let mut arg = [pio, sm, reg, vb[0], vb[1], vb[2], vb[3]];
-    (sys.provider_call)(-1, PIO_SM_WRITE_REG, arg.as_mut_ptr(), 7)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_SM_WRITE_REG,
+        arg.as_mut_ptr(),
+        7,
+    )
 }
 
 unsafe fn pio_sm_enable(sys: &SyscallTable, pio: u8, mask: u8, enable: u8) -> i32 {
     let mut arg = [pio, mask, enable];
-    (sys.provider_call)(-1, PIO_SM_ENABLE, arg.as_mut_ptr(), 3)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_SM_ENABLE,
+        arg.as_mut_ptr(),
+        3,
+    )
 }
 
 unsafe fn pio_sm_restart(sys: &SyscallTable, pio: u8, mask: u8) -> i32 {
     let mut arg = [pio, mask];
-    (sys.provider_call)(-1, PIO_SM_RESTART, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_SM_RESTART,
+        arg.as_mut_ptr(),
+        2,
+    )
 }
 
 unsafe fn pio_sm_exec(sys: &SyscallTable, pio: u8, sm: u8, instr: u16) -> i32 {
     let bytes = instr.to_le_bytes();
     let mut arg = [pio, sm, bytes[0], bytes[1]];
-    (sys.provider_call)(-1, PIO_SM_EXEC, arg.as_mut_ptr(), 4)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_SM_EXEC,
+        arg.as_mut_ptr(),
+        4,
+    )
 }
 
 unsafe fn pio_txf_write(sys: &SyscallTable, pio: u8, sm: u8, value: u32) -> i32 {
     let vb = value.to_le_bytes();
     let mut arg = [pio, sm, vb[0], vb[1], vb[2], vb[3]];
-    (sys.provider_call)(-1, PIO_TXF_WRITE, arg.as_mut_ptr(), 6)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio),
+        PIO_TXF_WRITE,
+        arg.as_mut_ptr(),
+        6,
+    )
 }
 
 unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) -> i32 {
     let mut arg = [pin, pio_num, pull];
-    (sys.provider_call)(-1, PIO_PIN_SETUP, arg.as_mut_ptr(), 3)
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PIO, pio_num),
+        PIO_PIN_SETUP,
+        arg.as_mut_ptr(),
+        3,
+    )
 }
 
 // ============================================================================

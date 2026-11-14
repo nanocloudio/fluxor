@@ -1,6 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
-permissions = ["platform_raw"]
+grants = ["workload.create"]
 
 # Workload-churn driver: admits and reaps a small workload `cycles` times
 # through the metal `workload` backend (0x1A), the way a node agent does, then

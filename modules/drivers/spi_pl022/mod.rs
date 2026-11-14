@@ -140,13 +140,23 @@ unsafe fn spi_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     *bp.add(2) = v[1];
     *bp.add(3) = v[2];
     *bp.add(4) = v[3];
-    (sys.provider_call)(bus as i32, SPI_REG_WRITE, bp, 5);
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::SPI, bus),
+        SPI_REG_WRITE,
+        bp,
+        5,
+    );
 }
 
 unsafe fn spi_bus_info(sys: &SyscallTable, bus: u8, info: &mut BusInfo) {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
-    (sys.provider_call)(bus as i32, SPI_BUS_INFO, bp, 12);
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::SPI, bus),
+        SPI_BUS_INFO,
+        bp,
+        12,
+    );
     info.dr_addr = u32::from_le_bytes([*bp, *bp.add(1), *bp.add(2), *bp.add(3)]);
     info.tx_dreq = *bp.add(4);
     info.rx_dreq = *bp.add(5);
@@ -155,7 +165,12 @@ unsafe fn spi_bus_info(sys: &SyscallTable, bus: u8, info: &mut BusInfo) {
 
 unsafe fn spi_set_enable(sys: &SyscallTable, bus: u8, enable: bool) {
     let mut buf = [if enable { 1u8 } else { 0u8 }];
-    (sys.provider_call)(bus as i32, SPI_SET_ENABLE, buf.as_mut_ptr(), 1);
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::SPI, bus),
+        SPI_SET_ENABLE,
+        buf.as_mut_ptr(),
+        1,
+    );
 }
 
 // DMA: channel family only. spi_pl022 allocates a raw DMA channel per

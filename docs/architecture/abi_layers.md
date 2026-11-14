@@ -117,11 +117,11 @@ platform) implements the vtable, and consumers reach it through
 | Contract | Id | Provider | Notes |
 |----------|----|----------|-------|
 | `FS` | `0x000D` | PIC (`fat32`, `linux_fs_dispatch`) | Filesystem dispatch: open/read/write/seek/stat/close. |
-| `PLATFORM_NIC_RING` | `0x001D` | Kernel (platform) | NIC DMA ring management: `NIC_RING_CREATE` / `INFO` / `DESTROY`. Also requires `platform_raw` permission. |
+| `PLATFORM_NIC_RING` | `0x001D` | Kernel (platform) | NIC DMA ring management: `NIC_RING_CREATE` / `INFO` / `DESTROY`. A privileged module only. |
 | `PLATFORM_DMA` | `0x001E` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. |
 | `PLATFORM_DMA_FD` | `0x001F` | Kernel (platform) | Async DMA fd with ping-pong queuing. Handle = tagged fd. Opcodes under `dma_raw::fd::*`. Separate contract from `PLATFORM_DMA`; see the DMA section below. |
-| `PCIE_DEVICE` | `0x001C` | Kernel (platform) | Handle-scoped PCIe device binding; also requires the `pcie_device` permission. |
-| `METAL_DEVICE` | `0x0028` | Kernel (bcm2712, uefi) | Device registers, DMA memory and cache maintenance for bare-metal drivers; register access requires `platform_raw`, DMA and cache ops `dma`. |
+| `PCIE_DEVICE` | `0x001C` | Kernel (platform) | Handle-scoped PCIe device binding. A privileged module only. |
+| `METAL_DEVICE` | `0x0028` | Kernel (bcm2712, uefi) | Device registers, DMA memory and cache maintenance for bare-metal drivers; register access needs `metal_device.mmio`, a PCIe rescan or config access `metal_device.pcie`, DMA and cache ops `metal_device.dma`. |
 | `STORAGE_NAMESPACE` | `0x000E` | PIC / platform | Directory-like name-keyed storage surface (opcode class 0x0Exx). See [storage_capability_surface.md](storage_capability_surface.md). |
 | `STORAGE_OBJECT` | `0x000F` | PIC / platform | Whole-blob byte-addressed storage surface (opcode class 0x0Fxx). See [storage_capability_surface.md](storage_capability_surface.md). |
 | `USB_HOST` | `0x001B` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding. The id is reserved and no platform serves it. |
@@ -149,8 +149,9 @@ First declared consumer: `modules/foundation/usb_midi_host`.
 `WORKLOAD` has two placement-resolved backends: an fmod-graph backend,
 which splices the workload's subgraph into the node's own graph under an
 owner and its leases, and a host-process backend (a host process in an
-isolation domain of its own, Linux). It is gated by `requires_contract = "workload"` and
-`platform_raw`.
+isolation domain of its own, Linux). Creating and driving a workload needs the
+`workload.create` grant; the node's IP stack serves workloads' network lanes
+with `workload.net`.
 
 The fmod-graph backend realizes the shared posture only. The host-process
 backend realizes the shared and isolated postures, and the hardened one
@@ -170,9 +171,8 @@ the workload it ends in is that owner's whoever finishes it. A workload is a
 tenant of the node: both backends refuse the null identity (`EINVAL`),
 since everything keyed on an owner's identity would see every such
 workload as one. The graph backend refuses a subgraph any of whose modules
-holds a permission other than `observe`, or is a `Protocol` module (which
-runs at `CAP_FULL` and so passes every permission check), with `EACCES`,
-checked before anything is allocated. One subgraph holds at most 64
+holds a grant that reaches past the gateway (`reach = "kernel"` in the
+registry) with `EACCES`, checked before anything is allocated. One subgraph holds at most 64
 modules and 192 edges (`MAX_ADD_MODULES`, `MAX_ADD_EDGES`); the build
 refuses a workload past either.
 
@@ -305,9 +305,8 @@ in [`src/platform/rp/providers.rs`](../../src/platform/rp/providers.rs))
 so a raw channel number passed to an fd op — or vice versa — returns
 `EINVAL` at the kernel boundary, not an opaque failure downstream.
 
-`required_caps` is a u64 bitmask in the module header at bytes 6..14,
-so every contract id in 0..63 is expressible in the manifest bitmask —
-neither DMA contract is infra-implicit and neither relies on a
+Every contract id in 0..63 is a bit of a module's first grant word, so
+both DMA contracts are granted like any other and neither relies on a
 special-case fallback.
 
 ## Internal orchestration — `internal` layer
@@ -316,28 +315,64 @@ Source: `crates/fluxor-abi/src/internal/`, `src/kernel/module/syscalls.rs`.
 
 The `internal` layer is kernel-private. It holds orchestration
 opcodes that are part of kernel plumbing, not a public extension
-surface. First-party orchestrator modules declare exactly which
-sub-surface they need via the manifest `permissions = [...]` list.
+surface. First-party orchestrator modules name exactly what they need in
+their manifest's `grants = [...]`.
 
-| Permission | Surface | Typical caller |
-|------------|---------|----------------|
-| `reconfigure` | Graph slot commit, boot counter, FMP routing | `reconfigure` |
-| `flash_raw` | Flash ERASE, PROGRAM (bounded to declared sectors) | `flash_rp`, `graph_slot` |
-| `platform_raw` | MMIO, NIC ring create, raw peripheral register bridges, workload spawn | `pwm_rp`, `nvme`, `e810`, `rp1_gem` |
-| `monitor` | Fault monitor BIND / WAIT / ACK / REPORT / RAISE, step histograms | `reconfigure`, `monitor` |
-| `bridge` | Cross-domain / cross-core dispatch | kernel-internal |
-| `pcie_device` | Kernel-mediated PCIe device binding (narrower than raw MMIO) | `nvme`, `e810` |
-| `dma` | DMA-buffer alloc and cache maintenance on those buffers | DMA-owning drivers |
-| `observe` | Read-only telemetry-ring drain (`TLM_SUBSCRIBE` / `DRAIN` / `STATS`) | `observe` |
+## Grants
 
-`check_privileged_internal_op` in
-[`src/kernel/module/syscalls.rs`](../../src/kernel/module/syscalls.rs)
-maps each privileged opcode to exactly one permission via
-`privileged_op_permission` and enforces per-category access. A module
-that declares only `flash_raw` cannot reach `platform_raw` opcodes —
-over-privilege is structurally prevented.
+A module may call an op only when it holds the op's grant, and that is the
+whole of the kernel's authority check (`check_grant` in
+[`src/kernel/module/syscalls.rs`](../../src/kernel/module/syscalls.rs)).
+The registry gives every op one of three answers:
 
-A permission says which opcodes a module may call; for the raw address
+- **nothing** (`grant = "none"`): every module may call it — logging, the
+  clocks, channels, timers, events, `RANDOM_FILL`;
+- **the contract's own grant**: its id's bit in the first grant word, held by
+  claiming the contract in `[[resources]]` or naming it in `grants`;
+- **an op-level grant**: a privileged family inside a contract, held by
+  naming it in `grants`.
+
+An op the registry does not list does not exist (`ENOSYS`); one it lists but
+the caller does not hold the grant for is refused (`EACCES`); a handle that
+is not the caller's is `EBADF`. The check runs on every path into a provider
+— by opcode class, by handle, by selector, by query key — and a gated
+module's calls through the gateway reach the same table. No module type,
+tier or name bypasses it.
+
+| Op-level grant | Lets a module | Typical holder |
+|----------------|---------------|----------------|
+| `kernel.serial` | Write raw bytes to the board's serial port | `transport_buffer` |
+| `timer.discipline` | Steer the kernel clock to an external source | `sntp` |
+| `net_policy.replace` | Replace or clear the node's packet policy | the node agent |
+| `net_route.table` | Write the node's route table and segments | the node agent |
+| `net_route.stack` | Report to and take from it as the IP stack | `ip` |
+| `workload.create` | Create, run and inspect workloads | a workload manager |
+| `workload.net` | Serve workloads' network lanes | `ip` |
+| `host_process.exec` | Run processes and terminals on the host | a Linux node |
+| `host_mount.mount` | Mount, project and remove host trees | a mount actuator |
+| `reconfigure.owner` | Add a subgraph; pause, resume or free an owner | a reconfiguration driver |
+| `reconfigure.ota` | Stage an OTA image | `ota_registry` |
+| `metal_device.mmio` | Read and write device registers | bare-metal drivers |
+| `metal_device.pcie` | Rescan PCIe, read or write config space | `nvme`, `pcie_scan` |
+| `metal_device.dma` | Allocate DMA memory and maintain its cache | DMA-owning drivers |
+| `seal_key` | Keep the key vault's durable image | `vault_store` |
+
+The kernel's own contracts are granted by name: `reconfigure`, `monitor`,
+`bridge`, `flash`, `diag`, `telemetry` and `key_vault` are contracts no
+provider is selected for, so a module that calls them lists them in
+`grants`. Every grant is the registry's (`crates/fluxor-abi/registry/registry.toml`),
+which also marks the ones a gated module may not hold (`reach = "kernel"`);
+the composer refuses such a module and the kernel refuses to add one as a
+workload.
+
+The RP raw register bridges (`rp_raw`) act only on a peripheral instance the
+caller has claimed (`raw_claim::CLAIM`): a PIO block, a PWM slice, an SPI,
+I2C or UART bus, the ADC. The first module to claim an instance holds it, a
+second is refused `EBUSY`, and every raw op names the claim as its handle.
+Pins and DMA channels are owned the same way: a raw op configures only a pin
+the caller holds and starts only a channel it allocated.
+
+A grant says which opcodes a module may call; for the raw address
 opcodes the kernel bounds the address as well. On bcm2712 a register access
 (`MMIO_READ32` / `MMIO_WRITE32`) reaches only an aligned word inside one of
 the board's device apertures, never DRAM or an empty hole, and cache
@@ -351,9 +386,10 @@ module can reach) or gets its own contract id with a vtable and
 manifest declaration. The `internal` layer is not an "add one more
 opcode" shortcut.
 
-### Manifest schema — permissions vs resources
+### Manifest schema — grants and resources
 
-Public contracts go under `[[resources]]`:
+A contract a provider in the graph serves is claimed under `[[resources]]`,
+and the claim is its grant:
 
 ```toml
 [[resources]]
@@ -361,21 +397,21 @@ requires_contract = "gpio"
 access = "exclusive"
 ```
 
-Non-contract permissions go in the top-level `permissions` list — not
-inside `[[resources]]`:
+Anything else the module may call is named in the top-level `grants` list —
+not inside `[[resources]]`:
 
 ```toml
 version = "1.0.0"
-permissions = ["reconfigure", "monitor"]
+grants = ["reconfigure", "monitor", "reconfigure.owner"]
 
 [[resources]]
 requires_contract = "gpio"
 access = "exclusive"
 ```
 
-`[[resources]]` rejects `"internal"`, `"system"`, or any permission
-name with a parser error. This keeps the two surfaces from collapsing
-back into a single overloaded list.
+`[[resources]]` rejects a grant that is not a contract a provider serves,
+pointing at `grants`; `grants` rejects a name the registry does not have.
+`fluxor modules build` packs both into the manifest's two grant words.
 
 ### Manifest schema — built-in module params (`[[params]]`)
 
@@ -529,8 +565,8 @@ rewrites this layer.
 Every ABI number is declared once, in
 [`crates/fluxor-abi/registry/registry.toml`](../../crates/fluxor-abi/registry/registry.toml), and
 generated into `abi::registry` by `fluxor abi-regen`. A contract's id is its
-opcode class byte, its vtable index, its `required_caps` bit and, when it
-mints handles, their fd tag; ids are dense from `0x00`.
+opcode class byte, its vtable index, its bit in the first grant word and,
+when it mints handles, their fd tag; ids are dense from `0x00`.
 
 - Contract `kernel` (id `0x00`) carries the kernel primitives (LOG_WRITE,
   HANDLE_POLL, ARENA_GET, RANDOM_FILL, STREAM_TIME, …), documented in
@@ -538,10 +574,9 @@ mints handles, their fd tag; ids are dense from `0x00`.
   `provider_open` it.
 - Contracts marked `route = "class"` in the registry (the kernel and the
   orchestration, telemetry, resource and raw-bridge surfaces) reach the kernel
-  by their opcode class ahead of any handle and are granted as the kernel's.
-- The opcode → permission mapping is the registry's (`abi::registry::op_permission`);
-  an opcode the registry does not list in a class that names an `unlisted`
-  permission requires that permission.
+  by their opcode class ahead of any handle.
+- The opcode → grant mapping is the registry's (`abi::registry::op_grant`);
+  an opcode the registry does not list does not exist.
 
 ## Provider registration
 
@@ -581,31 +616,13 @@ computed from its own config.
 
 Source: `src/kernel/module/syscalls.rs`.
 
-Access control has two distinct gates, and both are enforced on every
-`provider_*` call.
-
-**Contract gate** — `check_contract_grant`:
-1. **Capability tier** — `current_module_cap_class()` returns a tier
-   (Service / Service+GPIO / Service+PIO / Full). Each tier has a
-   bitmap of permitted contracts in `CAP_CONTRACT_MASK`.
-2. **Manifest grants** — a module's `required_caps` bitmap grants
-   access beyond the infra allow-list (CHANNEL, TIMER, BUFFER, EVENT,
-   KEY_VAULT, plus the kernel contract). Contracts outside
-   the allow-list that the module doesn't hold → `ENOSYS`.
-
-**Permission gate** — `check_privileged_internal_op` in the same file:
-every privileged opcode is classified into exactly one permission
-category (see the internal-layer table above) by
-`privileged_op_permission`. The module must carry the matching category
-bit in its manifest's `permissions = [...]` list, or the call returns
-`ENOSYS`. The only bypass is `CAP_FULL` (module_type = Protocol,
-kernel-trusted).
-
-There is no "`required_caps == 0` skips the check" shortcut. A module
-that declares nothing gets nothing: no HAL contracts (tier mask
-still applies), no privileged class-routed opcodes (permission gate
-refuses). This is what forces over-privilege to be declared
-explicitly rather than inherited by default.
+One gate, `check_grant`, decides every `provider_*` call: the op's grant
+(see [Grants](#grants)) against the two grant words the caller's manifest
+packs. An op answered by a handle's provider also needs that handle's
+contract. A module that declares nothing holds nothing beyond the free ops:
+no contract, no privileged family. This is what forces privilege to be
+declared explicitly rather than inherited by default — there is no tier and
+no module type that grants anything.
 
 ## Module categories
 
@@ -638,8 +655,8 @@ A small set of **first-party orchestrator modules** under this tree
 from `internal::*` and `platform::*` directly — these are the modules
 that implement kernel orchestration in PIC form, so they sit at the
 foundation layer by location but reach downward into layers normally
-reserved for drivers. They are required to declare the matching
-`permissions = [...]` entries in their manifest. Treat them as
+reserved for drivers. They are required to name the matching grants in
+their manifest's `grants = [...]`. Treat them as
 kernel-adjacent, not as typical foundation modules: new foundation
 modules must not take this shape.
 
@@ -726,14 +743,14 @@ the mechanism that keeps kernel-resident drivers accountable.
 
 Fluxor owns every shared naming and numeric namespace — `CONTENT_TYPES`
 wire bytes, `CAPABILITY_NAMES`, the ABI registry's contract names and ids,
-permission bits, fd tags. Centrality is what makes cross-repo wiring
+grants, fd tags. Centrality is what makes cross-repo wiring
 and drift-guarding possible, so the tables stay here; the question is
 only what earns an entry. Apply this two-question test to every
 proposed name:
 
 1. **Does the kernel or fluxor tooling need it to route, validate, or
    gate?** A wire byte the kernel routes by, a manifest name the config
-   compiler validates, a contract id with a vtable, a permission bit —
+   compiler validates, a contract id with a vtable, a grant —
    central, no debate.
 2. **Is it a substitution point across repo boundaries?** Could a
    producer or consumer from a *different* sibling plausibly sit on

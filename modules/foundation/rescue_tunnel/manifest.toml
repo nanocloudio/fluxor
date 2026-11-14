@@ -1,5 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "linux"]
+grants = ["key_vault"]
 # Seals and opens as packets come; nothing here is timed. IPv4 or IPv6 on
 # both sides: the fabric (the anchors' addresses) and the inner packet.
 timer_class = "agnostic"

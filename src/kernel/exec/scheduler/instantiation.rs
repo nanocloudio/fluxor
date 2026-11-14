@@ -1,6 +1,7 @@
 //! Scheduler responsibility module (real module boundary; parent statics and
 //! helpers reach us via `super`).
 use super::*;
+use fluxor_contracts::isolation::Level;
 
 // ============================================================================
 // Module Instantiation
@@ -125,14 +126,12 @@ pub(crate) fn build_module_list(config: &Config) -> Result<BuiltModuleList, i32>
     Ok((module_list, count, id_to_slot))
 }
 
-/// Pre-pass: set `SCHED.isolated[i]` for every module whose config params
-/// request a gated level (TLV tag 0xF5 >= contained), BEFORE the graph's
+/// Pre-pass: record the level of every module whose config params request a
+/// gated one (TLV tag 0xF5: contained or isolated), BEFORE the graph's
 /// edges are validated, so the zero-copy check in `prepare_graph` can refuse a
 /// gated module on a mailbox or in-place edge. The full protection TLV (fault
 /// policy, deadlines, …) is still parsed at instantiation via
-/// `parse_protection_config`; this only peeks the isolation bit. No-op off BCM2712 (EL0 isolation is BCM2712-only,
-/// but the flag itself is platform-agnostic — `module_is_isolated` callers gate
-/// on the chip feature).
+/// `parse_protection_config`; this only peeks the level.
 pub(crate) fn mark_isolated_from_params(module_list: &ModuleList, module_count: usize) {
     for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
         let entry = match slot {
@@ -142,13 +141,14 @@ pub(crate) fn mark_isolated_from_params(module_list: &ModuleList, module_count: 
         if is_internal_module(entry) {
             continue;
         }
-        if !params_request_isolation(entry.params()) {
+        let level = params_level(entry.params());
+        if !level.is_gated() {
             continue;
         }
         // SAFETY: prepare_graph context — single mutator of SCHED.
         unsafe {
             let p = &raw mut SCHED;
-            (&mut (*p).isolated)[module_idx] = true;
+            (&mut (*p).protection)[module_idx] = level;
         }
         crate::kernel::sys::hal::protection_set_enabled(true);
     }
@@ -617,33 +617,11 @@ pub(crate) static CRASH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// Wall-clock delay after boot before the crash-info read (USB serial up).
 pub(crate) const CRASH_CHECK_DELAY_MS: u64 = 30_000;
 
-/// Whether module `idx` requested `protection: isolated` (TLV 0xF5 == 2).
-/// Read by the graph-prepare pass to decide which modules get an EL0
-/// page table, and by the loader to flag the `DynamicModule` so its
-/// step routes through `mmu::protected_step`. Non-isolated modules keep
-/// the direct EL1 call path unchanged.
-pub fn module_is_isolated(idx: usize) -> bool {
-    if idx >= module_slots() {
-        return false;
-    }
-    // SAFETY: scheduler-thread-only read of a bool array; `idx` bounded.
-    unsafe { SCHED.isolated[idx] }
-}
-
-/// Protection levels as tag 0xF5 carries them. `>= CONTAINED` is gated: the
-/// module runs unprivileged and reaches the kernel only through the gateway.
-pub mod protection_level {
-    pub const NONE: u8 = 0;
-    pub const GUARDED: u8 = 1;
-    pub const CONTAINED: u8 = 2;
-    pub const ISOLATED: u8 = 3;
-}
-
 /// The protection level a module's params TLV asks for (tag 0xF5), without
-/// mutating any scheduler state; `NONE` when the tag is absent.
-pub fn params_protection_level(params: &[u8]) -> u8 {
+/// mutating any scheduler state; privileged when the tag is absent.
+pub fn params_level(params: &[u8]) -> Level {
     if params.len() < 4 {
-        return protection_level::NONE;
+        return Level::Privileged;
     }
     let mut pos = if params[0] == 0xFE { 4 } else { 0 };
     while pos + 2 <= params.len() {
@@ -657,11 +635,18 @@ pub fn params_protection_level(params: &[u8]) -> u8 {
             break;
         }
         if tag == 0xF5 && len == 1 {
-            return params[pos];
+            return level_of_wire(params[pos]);
         }
         pos += len;
     }
-    protection_level::NONE
+    Level::Privileged
+}
+
+/// The level a tag 0xF5 value stands for. The composer writes only the
+/// levels there are; a value none has is held to the strictest, never
+/// run privileged on the strength of a byte nothing wrote.
+fn level_of_wire(v: u8) -> Level {
+    Level::from_wire(v).unwrap_or(Level::Isolated)
 }
 
 /// The step deadline `idx` runs under, in microseconds: its declared
@@ -692,23 +677,15 @@ pub fn module_device_window(idx: usize) -> Option<(u64, u32)> {
 }
 
 /// The protection level `idx` was instantiated at (tag 0xF5).
-pub fn module_protection_level(idx: usize) -> u8 {
+pub fn module_level(idx: usize) -> Level {
     if idx >= module_slots() {
-        return protection_level::NONE;
+        return Level::Privileged;
     }
     // SAFETY: written at instantiation on the setup path; read-only after.
     unsafe {
         let p = &raw const SCHED;
         (&(*p).protection)[idx]
     }
-}
-
-/// Whether a module's params ask for a gated level (`contained` or
-/// `isolated`). The loader calls this before allocating state so a gated
-/// module's state and heap go where its protection regions can cover them
-/// (`loader::alloc_isolated`).
-pub fn params_request_isolation(params: &[u8]) -> bool {
-    params_protection_level(params) >= protection_level::CONTAINED
 }
 
 /// Params TLV tag carrying an instance's heap cap: the graph's
@@ -938,14 +915,12 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 }
             }
             0xF5 if len == 1 => {
-                // protection: 0=none, 1=guarded, 2=contained, 3=isolated. A
-                // gated level (>= contained) opts the graph into the
+                // The protection level. A gated one opts the graph into the
                 // platform's protection regime; the module's regions are
                 // registered at instantiation, before any of its code runs.
-                sched.protection[module_idx] = params[pos];
-                let gated = params[pos] >= protection_level::CONTAINED;
-                sched.isolated[module_idx] = gated;
-                if gated {
+                let level = level_of_wire(params[pos]);
+                sched.protection[module_idx] = level;
+                if level.is_gated() {
                     crate::kernel::sys::hal::protection_set_enabled(true);
                 }
             }

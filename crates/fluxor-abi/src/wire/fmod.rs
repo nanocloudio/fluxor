@@ -11,14 +11,15 @@
 /// offsets from here.
 pub mod header {
     /// Size of the header.
-    pub const SIZE: usize = 64;
+    pub const SIZE: usize = 56;
     /// `u32` magic, `"FXMD"`.
     pub const MAGIC: usize = 0;
     /// `u8` container version.
     pub const VERSION: usize = 4;
     /// `u8` `wire::ABI_VERSION` the module was built for.
     pub const ABI_VERSION: usize = 5;
-    /// `u8` module type (source, transformer, sink, event handler, protocol).
+    /// `u8` module type: its dataflow role (source, transformer, sink, event
+    /// handler). It carries no authority.
     pub const MODULE_TYPE: usize = 6;
     /// `u8` the [`flag`] bits.
     pub const FLAGS: usize = 7;
@@ -37,10 +38,8 @@ pub mod header {
     pub const STEP_PERIOD: usize = 22;
     /// `u8` step phase, below the period.
     pub const STEP_PHASE: usize = 23;
-    /// `u64` bitmask of the contracts the module requires (bit = contract id).
-    pub const REQUIRED_CAPS: usize = 24;
     /// `[u8; 32]` type name, NUL-padded.
-    pub const NAME: usize = 32;
+    pub const NAME: usize = 24;
     /// Bytes of [`NAME`].
     pub const NAME_LEN: usize = 32;
 
@@ -89,7 +88,6 @@ pub mod header {
         pub manifest_size: u16,
         pub step_period: u8,
         pub step_phase: u8,
-        pub required_caps: u64,
         pub name: [u8; NAME_LEN],
     }
 
@@ -101,8 +99,6 @@ pub mod header {
             }
             let mut name = [0u8; NAME_LEN];
             name.copy_from_slice(&h[NAME..NAME + NAME_LEN]);
-            let mut caps = [0u8; 8];
-            caps.copy_from_slice(&h[REQUIRED_CAPS..REQUIRED_CAPS + 8]);
             Some(Self {
                 magic: u32_at(h, MAGIC),
                 version: h[VERSION],
@@ -116,7 +112,6 @@ pub mod header {
                 manifest_size: u16_at(h, MANIFEST_SIZE),
                 step_period: h[STEP_PERIOD],
                 step_phase: h[STEP_PHASE],
-                required_caps: u64::from_le_bytes(caps),
                 name,
             })
         }
@@ -136,7 +131,6 @@ pub mod header {
             h[MANIFEST_SIZE..MANIFEST_SIZE + 2].copy_from_slice(&self.manifest_size.to_le_bytes());
             h[STEP_PERIOD] = self.step_period;
             h[STEP_PHASE] = self.step_phase;
-            h[REQUIRED_CAPS..REQUIRED_CAPS + 8].copy_from_slice(&self.required_caps.to_le_bytes());
             h[NAME..NAME + NAME_LEN].copy_from_slice(&self.name);
             h
         }
@@ -188,9 +182,9 @@ pub const MANIFEST_MAGIC: u32 = 0x464D_5846;
 
 /// Size of the manifest's fixed head: magic (4), version (1), port,
 /// resource and dependency counts (3), module version (2), hardware
-/// targets (2), flags (1), provided contracts (1), permissions (2), state
-/// size (4).
-pub const MANIFEST_HEADER_SIZE: usize = 20;
+/// targets (2), flags (1), provided contracts (1), state size (4), grants
+/// (16).
+pub const MANIFEST_HEADER_SIZE: usize = 34;
 
 /// Byte of the manifest head holding the flag bits below.
 pub const MANIFEST_FLAGS_AT: usize = 12;
@@ -198,13 +192,26 @@ pub const MANIFEST_FLAGS_AT: usize = 12;
 /// Byte of the manifest head counting the contracts the module provides.
 pub const MANIFEST_PROVIDES_AT: usize = 13;
 
-/// `u16` of the manifest head: the fine-grained permission bits.
-pub const MANIFEST_PERMISSIONS_AT: usize = 14;
-
 /// `u32` of the manifest head: one instance's state, in 64-byte units
 /// rounded up. Wide enough for any state a module can have, so the figure
 /// is always the size, never a floor.
-pub const MANIFEST_STATE_AT: usize = 16;
+pub const MANIFEST_STATE_AT: usize = 14;
+
+/// Two `u64`s of the manifest head: the module's grants. Word 0 holds a bit
+/// per contract id (its `[[resources]]` claims and the contracts its
+/// `grants` name), word 1 a bit per op-level grant (`registry::grant`).
+pub const MANIFEST_GRANTS_AT: usize = 18;
+
+/// Read the grants from a manifest head of at least
+/// [`MANIFEST_HEADER_SIZE`] bytes.
+pub fn manifest_grants(head: &[u8]) -> [u64; 2] {
+    let word = |at: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&head[at..at + 8]);
+        u64::from_le_bytes(b)
+    };
+    [word(MANIFEST_GRANTS_AT), word(MANIFEST_GRANTS_AT + 8)]
+}
 
 /// Most contracts one module provides: one provider state serves them all
 /// through one dispatch, telling them apart by opcode class.

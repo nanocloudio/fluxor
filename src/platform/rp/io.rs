@@ -191,6 +191,14 @@ pub mod gpio {
         CLAIMED[pin_num as usize].load(Ordering::Acquire)
     }
 
+    /// The module that owns a pin (`OWNER_KERNEL` when no module does).
+    pub fn gpio_owner(pin_num: u8) -> ModuleId {
+        if pin_num as usize >= MAX_GPIO {
+            return OWNER_KERNEL;
+        }
+        OWNER[pin_num as usize].load(Ordering::Acquire)
+    }
+
     /// Set the owner module for a GPIO pin.
     /// Called from syscall entry points after a successful claim.
     pub fn gpio_set_owner(pin_num: u8, owner: ModuleId) {

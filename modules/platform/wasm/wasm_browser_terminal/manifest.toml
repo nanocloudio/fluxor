@@ -1,7 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["wasm"]
 builtin = true
-permissions = ["platform_raw"]
+grants = ["diag"]
 
 # Browser DOM scrollback terminal. Drains the kernel log ring via the
 # diag-contract LOG_RING_DRAIN opcode and renders each chunk into a

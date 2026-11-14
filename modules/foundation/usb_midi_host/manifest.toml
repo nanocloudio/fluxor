@@ -1,15 +1,8 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
 capabilities = ["midi.input", "midi.output"]
-# USB host operations live in opcode class 0x15xx and are
-# `platform_raw`-gated by `privileged_op_permission` in
-# `src/kernel/syscalls.rs`. The real implementation will need
-# `permissions = ["platform_raw"]` declared in this manifest, but
-# the stub step_fn never reaches a privileged op and `platform_raw`
-# is a coarse grant covering every flash / MMIO / DMA / PCIe-config
-# opcode — pre-declaring on an inert module would authorise more
-# than the scaffold uses. The one-line manifest update lands with
-# the real implementation.
+# USB host operations are the `usb_host` contract's, granted by the
+# `[[resources]]` claim below; the stub step_fn reaches none of them.
 
 # Class-compliant USB-MIDI host. Enumerates devices on the
 # selected USB bus, claims MIDI streaming interfaces, and exposes

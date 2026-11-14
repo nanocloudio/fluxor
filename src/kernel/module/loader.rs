@@ -1913,16 +1913,18 @@ impl LoadedModule {
             Some((p, manifest_size, flags, layout))
         }
     }
-    /// The fine-grained permissions bitmap (`MANIFEST_PERMISSIONS_AT`); 0
-    /// without a manifest. See `docs/architecture/abi_layers.md` for the bits.
-    pub fn manifest_permissions(&self) -> u16 {
+    /// The module's grants (`MANIFEST_GRANTS_AT`): word 0 a bit per contract
+    /// id, word 1 a bit per op-level grant. None without a manifest.
+    pub fn manifest_grants(&self) -> [u64; 2] {
         match self.manifest_view() {
-            // SAFETY: the permissions field lies in the manifest head.
+            // SAFETY: `manifest_view` checked the head is in bounds, and the
+            // grants lie in it.
             Some((p, ..)) => unsafe {
-                let at = crate::abi::wire::fmod::MANIFEST_PERMISSIONS_AT;
-                u16::from_le_bytes([*p.add(at), *p.add(at + 1)])
+                let head =
+                    core::slice::from_raw_parts(p, crate::abi::wire::fmod::MANIFEST_HEADER_SIZE);
+                crate::abi::wire::fmod::manifest_grants(head)
             },
-            None => 0,
+            None => [0; 2],
         }
     }
     /// Look up a port's `content_type` byte by direction and the
@@ -3176,11 +3178,11 @@ pub struct DynamicModule {
     /// Optional drain function pointer (resolved from module_drain export).
     /// None if the module does not export module_drain.
     drain_fn: Option<ModuleDrainFn>,
-    /// `true` when this module declared `protection: isolated` and is
-    /// routed through `mmu::protected_step` (EL0 on BCM2712). `false`
-    /// keeps the unchanged direct EL1 call path used by `none`/`guarded`.
-    /// Set at construction from `scheduler::module_is_isolated`.
-    isolated: bool,
+    /// The module's protection level, from `scheduler::module_level` at
+    /// construction. A gated level enters through the protected step (EL0
+    /// on BCM2712, unprivileged on RP); a privileged one is called
+    /// directly.
+    level: fluxor_contracts::isolation::Level,
     /// Optional `module_isr_entry` export (Tier 2 IRQ-owned modules).
     /// `None` for cooperative modules. The scheduler's Tier 2 admission
     /// path forwards this to `isr_tier::register_tier2_module` so the
@@ -3297,7 +3299,7 @@ impl DynamicModulePending {
             state_size: self.state_size,
         };
         let idx = self.module_idx as usize;
-        let status = if crate::kernel::module::gateway::is_gated(idx) {
+        let status = if crate::kernel::module::gateway::is_registered(idx) {
             let params = if self.params_ptr.is_null() || self.params_len == 0 {
                 &[][..]
             } else {
@@ -3322,9 +3324,7 @@ impl DynamicModulePending {
                     state_ptr: self.state_ptr,
                     state_size: self.state_size as u32,
                     drain_fn: self.drain_fn,
-                    isolated: crate::kernel::exec::scheduler::module_is_isolated(
-                        self.module_idx as usize,
-                    ),
+                    level: crate::kernel::exec::scheduler::module_level(self.module_idx as usize),
                     isr_entry_fn: self.isr_entry_fn,
                     name: self.name,
                     stack_bytes: self.stack_bytes,
@@ -3385,7 +3385,7 @@ impl DynamicModule {
             state_ptr,
             state_size,
             drain_fn: None,
-            isolated: false,
+            level: fluxor_contracts::isolation::Level::Privileged,
             isr_entry_fn: None,
             name: "dynamic",
             stack_bytes: 0,
@@ -3409,7 +3409,7 @@ impl DynamicModule {
             state_ptr,
             state_size,
             drain_fn: None,
-            isolated: false,
+            level: fluxor_contracts::isolation::Level::Privileged,
             isr_entry_fn,
             name: "dynamic",
             stack_bytes: 0,
@@ -3449,7 +3449,7 @@ impl DynamicModule {
     pub unsafe fn call_drain(&self) -> i32 {
         match self.drain_fn {
             // A gated module drains unprivileged, like every other entry.
-            Some(f) if self.isolated => gated_entry(f as usize, self.state_ptr),
+            Some(f) if self.level.is_gated() => gated_entry(f as usize, self.state_ptr),
             Some(f) => call_drain(f, self.state_ptr),
             None => -1,
         }
@@ -3508,7 +3508,7 @@ impl DynamicModule {
         // (contained or isolated) never has its code run privileged, so its
         // sizes come from the manifest and its memory from where its
         // protection regions can cover it. (The full parse follows heap init.)
-        let gated = crate::kernel::exec::scheduler::params_request_isolation(params_slice);
+        let gated = crate::kernel::exec::scheduler::params_level(params_slice).is_gated();
         // The signature sets a floor the graph cannot lower: where this
         // kernel carries a root key, a module that does not verify against it
         // runs gated or not at all.
@@ -3851,7 +3851,7 @@ impl DynamicModule {
                     state_ptr,
                     state_size: required_size as u32,
                     drain_fn,
-                    isolated: crate::kernel::exec::scheduler::module_is_isolated(inst_idx),
+                    level: crate::kernel::exec::scheduler::module_level(inst_idx),
                     isr_entry_fn: exports.isr_entry_fn,
                     name,
                     stack_bytes: module.manifest_stack_bytes(),
@@ -3932,11 +3932,11 @@ impl Module for DynamicModule {
     fn step(&mut self) -> Result<StepOutcome, i32> {
         // Isolated modules drop to EL0 under their own page table via
         // `mmu::protected_step` (BCM2712). Everything else takes the
-        // direct EL1 call, so `none`/`guarded` modules keep the plain
+        // direct EL1 call, so privileged modules keep the plain
         // dispatch on the performance path. `protected_step`
         // itself re-checks that an isolated table was built and falls back
         // to a direct call otherwise, so this branch is purely a fast gate.
-        let result = if self.isolated {
+        let result = if self.level.is_gated() {
             // SAFETY: step_fn/state_ptr validated at construction; on the
             // EL0 platform the scheduler set `current_module_index()` before
             // `m.step()`, which the protected entry uses to locate the page
@@ -3954,7 +3954,7 @@ impl Module for DynamicModule {
         let Some(flush_fn) = self.post_tick_flush_fn else {
             return Ok(());
         };
-        let result = if self.isolated {
+        let result = if self.level.is_gated() {
             // SAFETY: flush_fn is a validated module export run under the
             // module's protection domain (direct dispatch where none exists).
             unsafe { gated_entry(flush_fn as usize, self.state_ptr) }
@@ -3974,7 +3974,7 @@ impl Module for DynamicModule {
         let Some(refill_fn) = self.pipeline_refill_fn else {
             return Ok(false);
         };
-        let result = if self.isolated {
+        let result = if self.level.is_gated() {
             // SAFETY: refill_fn is a validated module export run under the
             // module's protection domain (direct dispatch where none exists).
             unsafe { gated_entry(refill_fn as usize, self.state_ptr) }

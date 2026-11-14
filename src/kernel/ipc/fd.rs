@@ -139,17 +139,31 @@ pub fn timer_in_use_count() -> usize {
         .count()
 }
 
+/// The timer `fd` names, when it is the calling module's: `EINVAL` for a
+/// slot outside the table, `EBADF` for one that is free or another module's.
+/// A timer is an fd its creator owns, held to that as an event is.
+fn owned_timer(fd: i32) -> Result<&'static TimerSlot, i32> {
+    let slot = slot_of(fd);
+    if slot < 0 || slot as usize >= timers().len() {
+        return Err(errno::EINVAL);
+    }
+    let timer = &timers()[slot as usize];
+    if !timer.allocated.load(Ordering::Acquire)
+        || timer.owner.load(Ordering::Acquire)
+            != crate::kernel::exec::scheduler::current_module_id()
+    {
+        return Err(errno::EBADF);
+    }
+    Ok(timer)
+}
+
 /// Start (or restart) a timer with a delay in milliseconds.
 /// The fd must be a tagged timer handle.
 pub fn timer_set(fd: i32, delay_ms: u32) -> i32 {
-    let slot = slot_of(fd);
-    if slot < 0 || slot as usize >= timers().len() {
-        return errno::EINVAL;
-    }
-    let timer = &timers()[slot as usize];
-    if !timer.allocated.load(Ordering::Acquire) {
-        return errno::EINVAL;
-    }
+    let timer = match owned_timer(fd) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let deadline = now_ms().wrapping_add(delay_ms);
     timer.deadline_ms.store(deadline, Ordering::Release);
     timer.woken.store(false, Ordering::Release);
@@ -159,14 +173,10 @@ pub fn timer_set(fd: i32, delay_ms: u32) -> i32 {
 
 /// Cancel an active timer (stop it without destroying).
 pub fn timer_cancel(fd: i32) -> i32 {
-    let slot = slot_of(fd);
-    if slot < 0 || slot as usize >= timers().len() {
-        return errno::EINVAL;
-    }
-    let timer = &timers()[slot as usize];
-    if !timer.allocated.load(Ordering::Acquire) {
-        return errno::EINVAL;
-    }
+    let timer = match owned_timer(fd) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     timer.active.store(false, Ordering::Release);
     timer.woken.store(false, Ordering::Release);
     0
@@ -174,14 +184,10 @@ pub fn timer_cancel(fd: i32) -> i32 {
 
 /// Destroy a timer and free its slot.
 pub fn timer_destroy(fd: i32) -> i32 {
-    let slot = slot_of(fd);
-    if slot < 0 || slot as usize >= timers().len() {
-        return errno::EINVAL;
-    }
-    let timer = &timers()[slot as usize];
-    if !timer.allocated.load(Ordering::Acquire) {
-        return errno::EINVAL;
-    }
+    let timer = match owned_timer(fd) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     timer.active.store(false, Ordering::Release);
     timer.woken.store(false, Ordering::Release);
     timer.owner.store(NO_MODULE, Ordering::Release);
@@ -233,12 +239,8 @@ pub fn timer_pump(domain_id: u8) -> Option<u32> {
 }
 
 /// Non-destructive check: has this timer expired?
-fn timer_is_expired(slot: i32) -> bool {
-    if slot < 0 || slot as usize >= timers().len() {
-        return false;
-    }
-    let timer = &timers()[slot as usize];
-    if !timer.allocated.load(Ordering::Acquire) || !timer.active.load(Ordering::Acquire) {
+fn timer_is_expired(timer: &TimerSlot) -> bool {
+    if !timer.active.load(Ordering::Acquire) {
         return false;
     }
     let deadline = timer.deadline_ms.load(Ordering::Acquire);
@@ -326,9 +328,13 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
             ready as i32
         }
         FD_TAG_TIMER => {
+            let timer = match owned_timer(fd) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
             // Timer expired -> POLL_IN
             let mut ready = 0u32;
-            if (ev & POLL_IN) != 0 && timer_is_expired(slot) {
+            if (ev & POLL_IN) != 0 && timer_is_expired(timer) {
                 ready |= POLL_IN;
             }
             ready as i32

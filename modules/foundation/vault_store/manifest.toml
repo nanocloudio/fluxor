@@ -8,7 +8,7 @@ hardware_targets = ["rp2350", "rp2040", "bcm2712", "linux"]
 #
 # `vault_store`: the module holds every persisted record the vault makes,
 # sealed or (seal: none) not, and decides what reaches the medium.
-permissions = ["vault_store"]
+grants = ["seal_key"]
 
 [[ports]]
 name = "blocks"

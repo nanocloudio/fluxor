@@ -546,7 +546,7 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
             continue;
         }
         for m in [e.from_module, e.to_module] {
-            if crate::kernel::exec::scheduler::module_is_isolated(m) {
+            if crate::kernel::exec::scheduler::module_level(m).is_gated() {
                 log::error!(
                     "[graph] module {m} is gated and sits on a zero-copy edge; a gated \
                      module reaches channels only through the gateway"

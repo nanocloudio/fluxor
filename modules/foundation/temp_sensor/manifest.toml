@@ -1,4 +1,5 @@
 version = "1.0.0"
+type = "Source"
 hardware_targets = ["rp2350", "rp2040"]
 
 # Produces `SensorSample` records. Declared so a consumer can require the

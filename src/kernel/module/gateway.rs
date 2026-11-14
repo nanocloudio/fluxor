@@ -144,8 +144,10 @@ pub fn regions(module: usize) -> Option<(Region, Region, [Region; MAX_PRIVATE])>
     gated(module).map(|g| (g.code, g.stack, g.private))
 }
 
-/// Whether `module` is gated.
-pub fn is_gated(module: usize) -> bool {
+/// Whether `module`'s regions are registered with the gateway: set when a
+/// gated module is set up, cleared when it is released. Its level is the
+/// scheduler's (`scheduler::module_level`); this is the gateway's own state.
+pub fn is_registered(module: usize) -> bool {
     module < MAX_MODULES && GATED_ACTIVE[module].load(Ordering::Acquire)
 }
 
@@ -161,7 +163,7 @@ pub fn release(module: usize) {
 }
 
 fn gated(module: usize) -> Option<Gated> {
-    if !is_gated(module) {
+    if !is_registered(module) {
         return None;
     }
     // SAFETY: published by `register` with Release; read after Acquire.

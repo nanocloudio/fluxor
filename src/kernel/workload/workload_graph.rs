@@ -1160,17 +1160,17 @@ unsafe fn begin_create(
     }
     let flxa = &buf[flxa_off..flxa_off + flxa_len];
     // A workload is a tenant of the node, not part of it: none of its
-    // modules may hold a node privilege. `platform_raw` reads any register
-    // (the seal key's OTP rows among them), `dma` and `pcie_device` reach
-    // memory behind the kernel, `reconfigure`/`monitor`/`bridge`/`flash_raw`/
-    // `usb_host` act on the node itself. Only `observe` —
-    // a read-only telemetry drain — is admitted. Checked before any owner is
-    // allocated, against the modules the node would instantiate.
-    let Some(perms) = live::module_permissions(flxa) else {
+    // modules may hold a grant that reaches past the gateway, the ones that
+    // act on the node itself (registers, DMA, PCIe, reconfiguration, other
+    // workloads, the host). Checked before any owner is allocated, against
+    // the modules the node would instantiate.
+    let Some(grants) = live::module_grants(flxa) else {
         unstage(staged);
         return errno::EINVAL;
     };
-    if perms & !crate::kernel::module::syscalls::permission::OBSERVE != 0 {
+    if grants[0] & crate::abi::registry::CONTRACT_REACH_KERNEL != 0
+        || grants[1] & crate::abi::registry::grant::REACH_KERNEL != 0
+    {
         unstage(staged);
         return errno::EACCES;
     }

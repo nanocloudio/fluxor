@@ -1,7 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
 
-permissions = ["flash_raw"]
+grants = ["flash"]
 deferred_ready = true
 
 # Channel-served: FMP-framed requests in, `gs.result` answers out

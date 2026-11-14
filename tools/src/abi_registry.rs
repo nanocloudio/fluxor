@@ -2,7 +2,7 @@
 //! validated and emitted as `crates/fluxor-abi/src/registry.rs`.
 //!
 //! The TOML is the one place an ABI number is written: contract ids,
-//! opcode classes and opcodes, permission bits, errno values, poll bits and
+//! opcode classes and opcodes, grants, errno values, poll bits and
 //! fd tags. The generated file holds only scalar constants and `match`-based
 //! lookups, so it mounts into the kernel, the tools, the SDK runtime and
 //! every PIC module without putting an absolute address in anyone's
@@ -25,7 +25,7 @@ pub const REGISTRY_GEN: &str = "crates/fluxor-abi/src/registry.rs";
 pub struct Registry {
     pub registry: Header,
     #[serde(default)]
-    pub permission: Vec<Permission>,
+    pub grant: Vec<Grant>,
     #[serde(default)]
     pub errno: Vec<Errno>,
     #[serde(default)]
@@ -81,14 +81,21 @@ pub struct Header {
     pub chain_next: u32,
 }
 
+/// An op-level grant: a privileged family of ops inside a contract, held by
+/// naming it in a manifest's `grants`. Its bit is in the second grant word.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Permission {
+pub struct Grant {
     pub name: String,
     pub bit: u8,
-    /// What holding the permission lets a module do.
+    /// `"kernel"`: a gated module may not hold it. Absent: it may.
+    pub reach: Option<String>,
+    /// What holding the grant lets a module do.
     pub doc: Option<String>,
 }
+
+/// Most op-level grants: the width of the second grant word.
+pub const MAX_GRANTS: u8 = 64;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,8 +123,8 @@ pub struct Ioctl {
 pub struct Contract {
     /// Registry module name; also the manifest spelling when `manifest`.
     pub name: String,
-    /// Contract id: the opcode class byte, the vtable index, the
-    /// `required_caps` bit and, when it mints handles, their fd tag.
+    /// Contract id: the opcode class byte, the vtable index, the bit in
+    /// the first grant word and, when it mints handles, their fd tag.
     pub id: u8,
     /// Hands out tagged handles: the id is also the handle's fd tag.
     #[serde(default)]
@@ -129,12 +136,11 @@ pub struct Contract {
     /// kernel registers a module for no other contract.
     #[serde(default)]
     pub module_provided: bool,
-    /// Permission every op of the entry requires unless the op says
-    /// otherwise; absent, the ops require none.
-    pub permission: Option<String>,
-    /// Permission an op of this contract that the registry does not list
-    /// requires before the kernel looks at it.
-    pub unlisted: Option<String>,
+    /// The grant the contract's ops need unless an op says otherwise:
+    /// `"none"`, or a `[[grant]]` name. Absent: the contract's own bit.
+    pub grant: Option<String>,
+    /// `"kernel"`: a gated module may not hold the contract's own bit.
+    pub reach: Option<String>,
     /// `"class"`: routed to the kernel by its opcode class ahead of any
     /// handle; absent, routed by the handle's contract.
     pub route: Option<String>,
@@ -148,8 +154,8 @@ pub struct Op {
     pub name: String,
     /// Low byte of the opcode.
     pub op: u8,
-    /// Overrides the entry's permission; `"none"` requires none.
-    pub permission: Option<String>,
+    /// Overrides the contract's grant: `"none"`, or a `[[grant]]` name.
+    pub grant: Option<String>,
     /// Creates work or a held resource: subject to the owner admission gate.
     #[serde(default)]
     pub admission: bool,
@@ -206,12 +212,10 @@ impl Contract {
     fn opcode(&self, op: &Op) -> u32 {
         (u32::from(self.id) << 8) | u32::from(op.op)
     }
-    fn op_permission<'a>(&'a self, op: &'a Op) -> Option<&'a str> {
-        match op.permission.as_deref() {
-            Some("none") => None,
-            Some(p) => Some(p),
-            None => self.permission.as_deref(),
-        }
+    /// The grant `op` needs: `None` for the contract's own bit,
+    /// `Some("none")` for nothing, else a `[[grant]]` name.
+    fn op_grant<'a>(&'a self, op: &'a Op) -> Option<&'a str> {
+        op.grant.as_deref().or(self.grant.as_deref())
     }
 }
 
@@ -255,20 +259,29 @@ pub fn validate(r: &Registry) -> Result<()> {
             ));
         }
     }
-    let perms: BTreeSet<&str> = r.permission.iter().map(|p| p.name.as_str()).collect();
+    let grants: BTreeSet<&str> = r.grant.iter().map(|g| g.name.as_str()).collect();
     let mut seen = BTreeSet::new();
     let mut bits = BTreeSet::new();
-    for p in &r.permission {
-        if !seen.insert(p.name.as_str()) {
-            bad.push(format!("permission `{}` declared twice", p.name));
+    for g in &r.grant {
+        if !seen.insert(g.name.as_str()) {
+            bad.push(format!("grant `{}` declared twice", g.name));
         }
-        if p.bit >= 16 || !bits.insert(p.bit) {
+        if g.bit >= MAX_GRANTS || !bits.insert(g.bit) {
             bad.push(format!(
-                "permission `{}`: bit {} is taken or past 15",
-                p.name, p.bit
+                "grant `{}`: bit {} is taken or past {}",
+                g.name,
+                g.bit,
+                MAX_GRANTS - 1
             ));
         }
+        if g.reach.as_deref().is_some_and(|r| r != "kernel") {
+            bad.push(format!("grant `{}`: reach is \"kernel\" or absent", g.name));
+        }
+        if r.contract.iter().any(|c| c.name == g.name) {
+            bad.push(format!("grant `{}` is also a contract's name", g.name));
+        }
     }
+    let mut granted = BTreeSet::new();
     let mut seen = BTreeSet::new();
     for e in &r.errno {
         if !seen.insert(e.name.as_str()) {
@@ -329,10 +342,16 @@ pub fn validate(r: &Registry) -> Result<()> {
                 c.name
             ));
         }
-        for p in c.permission.iter().chain(c.unlisted.iter()) {
-            if !perms.contains(p.as_str()) {
-                bad.push(format!("contract `{}`: unknown permission `{p}`", c.name));
+        if let Some(g) = c.grant.as_deref() {
+            if g != "none" && !grants.contains(g) {
+                bad.push(format!("contract `{}`: unknown grant `{g}`", c.name));
             }
+        }
+        if c.reach.as_deref().is_some_and(|r| r != "kernel") {
+            bad.push(format!(
+                "contract `{}`: reach is \"kernel\" or absent",
+                c.name
+            ));
         }
         if c.route.as_deref().is_some_and(|r| r != "class") {
             bad.push(format!(
@@ -360,10 +379,13 @@ pub fn validate(r: &Registry) -> Result<()> {
                     c.name, op.name
                 ));
             }
-            if let Some(p) = op.permission.as_deref() {
-                if p != "none" && !perms.contains(p) {
-                    bad.push(format!("{}::{}: unknown permission `{p}`", c.name, op.name));
+            if let Some(g) = op.grant.as_deref() {
+                if g != "none" && !grants.contains(g) {
+                    bad.push(format!("{}::{}: unknown grant `{g}`", c.name, op.name));
                 }
+            }
+            if let Some(g) = c.op_grant(op) {
+                granted.insert(g);
             }
             if let Some(g) = &op.gate {
                 if !HANDLES.iter().any(|(k, _)| *k == g.handle) {
@@ -405,6 +427,11 @@ pub fn validate(r: &Registry) -> Result<()> {
                     c.name, op.name
                 ));
             }
+        }
+    }
+    for g in &r.grant {
+        if !granted.contains(g.name.as_str()) {
+            bad.push(format!("grant `{}` is needed by no op", g.name));
         }
     }
     for (i, id) in ids.keys().enumerate() {
@@ -472,7 +499,7 @@ pub fn emit(r: &Registry) -> String {
     );
     let _ = writeln!(
         w,
-        "/// Contract ids are below this: the `required_caps` width.\n\
+        "/// Contract ids are below this: the width of the first grant word.\n\
          pub const MAX_CONTRACTS: usize = {};",
         r.registry.max_contracts
     );
@@ -488,49 +515,59 @@ pub fn emit(r: &Registry) -> String {
         "/// Contract ids the registry assigns.\npub const CONTRACTS_ASSIGNED: usize = {assigned};\n"
     );
 
-    // Permissions.
+    // Grants.
     let _ = writeln!(
         w,
-        "/// Manifest permission bits (`permissions = [..]`).\npub mod permission {{"
+        "/// Op-level grants (`grants = [..]` in a manifest): the bits of the\n\
+         /// second grant word. A contract's own grant is its id's bit in the first.\n\
+         pub mod grant {{"
     );
-    for p in &r.permission {
-        if let Some(d) = &p.doc {
+    let mut by_bit: Vec<&Grant> = r.grant.iter().collect();
+    by_bit.sort_by_key(|g| g.bit);
+    for g in &by_bit {
+        if let Some(d) = &g.doc {
             let _ = writeln!(w, "    /// {d}");
         }
-        let _ = writeln!(w, "    pub const {}: u16 = 1 << {};", shout(&p.name), p.bit);
+        let _ = writeln!(w, "    pub const {}: u8 = {};", shout(&g.name), g.bit);
     }
+    let reach: u64 = r
+        .grant
+        .iter()
+        .filter(|g| g.reach.as_deref() == Some("kernel"))
+        .fold(0, |m, g| m | (1u64 << g.bit));
     let _ = writeln!(
         w,
-        "\n    /// The bit a manifest permission name stands for."
+        "\n    /// The op-level grants a gated module may not hold.\n\
+         \x20   pub const REACH_KERNEL: u64 = {reach:#x};\n"
     );
     let _ = writeln!(
         w,
-        "    pub fn of_name(name: &str) -> Option<u16> {{\n        match name {{"
+        "    /// The bit an op-level grant's name stands for.\n\
+         \x20   pub fn of_name(name: &str) -> Option<u8> {{\n        match name {{"
     );
-    for p in &r.permission {
-        let _ = writeln!(w, "            \"{}\" => Some({}),", p.name, shout(&p.name));
-    }
-    let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n");
-    let _ = writeln!(w, "    /// The manifest name of one permission bit.");
-    let _ = writeln!(
-        w,
-        "    pub fn name(bit: u16) -> Option<&'static str> {{\n        match bit {{"
-    );
-    for p in &r.permission {
-        let _ = writeln!(w, "            {} => Some(\"{}\"),", shout(&p.name), p.name);
+    for g in &by_bit {
+        let _ = writeln!(w, "            \"{}\" => Some({}),", g.name, shout(&g.name));
     }
     let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n");
-    let _ = writeln!(w, "    /// Every permission bit, in bit order.");
     let _ = writeln!(
         w,
-        "    pub fn nth(i: usize) -> Option<u16> {{\n        match i {{"
+        "    /// The name of an op-level grant's bit.\n\
+         \x20   pub fn name(bit: u8) -> Option<&'static str> {{\n        match bit {{"
     );
-    let mut by_bit: Vec<&Permission> = r.permission.iter().collect();
-    by_bit.sort_by_key(|p| p.bit);
-    for (i, p) in by_bit.iter().enumerate() {
-        let _ = writeln!(w, "            {i} => Some({}),", shout(&p.name));
+    for g in &by_bit {
+        let _ = writeln!(w, "            {} => Some(\"{}\"),", shout(&g.name), g.name);
     }
     let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n}}\n");
+    let creach: u64 = r
+        .contract
+        .iter()
+        .filter(|c| c.reach.as_deref() == Some("kernel"))
+        .fold(0, |m, c| m | (1u64 << c.id));
+    let _ = writeln!(
+        w,
+        "/// The contracts whose own grant a gated module may not hold.\n\
+         pub const CONTRACT_REACH_KERNEL: u64 = {creach:#x};\n"
+    );
 
     // Entry points.
     let _ = writeln!(
@@ -608,6 +645,16 @@ pub fn emit(r: &Registry) -> String {
          pub fn contract_of_name(name: &str) -> Option<u16> {{\n    match name {{"
     );
     for c in r.contract.iter().filter(|c| c.manifest) {
+        let _ = writeln!(w, "        \"{}\" => Some({:#06x}),", c.name, c.id);
+    }
+    let _ = writeln!(w, "        _ => None,\n    }}\n}}\n");
+    let _ = writeln!(
+        w,
+        "/// The contract a registry name stands for, whether or not a manifest\n\
+         /// may claim it: a manifest's `grants` may name any contract.\n\
+         pub fn contract_id(name: &str) -> Option<u16> {{\n    match name {{"
+    );
+    for c in &r.contract {
         let _ = writeln!(w, "        \"{}\" => Some({:#06x}),", c.name, c.id);
     }
     let _ = writeln!(w, "        _ => None,\n    }}\n}}\n");
@@ -761,7 +808,7 @@ pub fn emit(r: &Registry) -> String {
         let _ = writeln!(w, "}}\n");
     }
 
-    // Permission and admission per opcode.
+    // Grant and admission per opcode.
     let mut ops: Vec<(u32, &Contract, &Op)> = Vec::new();
     for c in &r.contract {
         for op in &c.op {
@@ -771,32 +818,43 @@ pub fn emit(r: &Registry) -> String {
     ops.sort_by_key(|(code, _, _)| *code);
     let _ = writeln!(
         w,
-        "/// The permission an opcode requires, if any. An opcode the registry\n\
-         /// does not list requires its contract's `unlisted` permission.\n\
-         pub fn op_permission(op: u32) -> Option<u16> {{\n    match op {{"
+        "/// What calling an op needs.\n\
+         #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n\
+         pub enum OpGrant {{\n\
+         \x20   /// Nothing: every module may call it.\n    Free,\n\
+         \x20   /// The contract's own grant: its id's bit in the first word.\n    Contract(u16),\n\
+         \x20   /// An op-level grant: its bit in the second word.\n    Grant(u8),\n}}\n"
+    );
+    let _ = writeln!(
+        w,
+        "/// The grant `op` needs, or `None` when the registry does not list it:\n\
+         /// an op the registry does not list does not exist.\n\
+         pub fn op_grant(op: u32) -> Option<OpGrant> {{\n    match op {{"
     );
     for (code, c, op) in &ops {
-        if let Some(p) = c.op_permission(op) {
-            let _ = writeln!(w, "        {code:#06x} => Some(permission::{}),", shout(p));
-        } else {
-            let _ = writeln!(w, "        {code:#06x} => None,");
-        }
+        let g = match c.op_grant(op) {
+            None => format!("OpGrant::Contract({:#06x})", c.id),
+            Some("none") => "OpGrant::Free".to_string(),
+            Some(g) => format!("OpGrant::Grant(grant::{})", shout(g)),
+        };
+        let _ = writeln!(w, "        {code:#06x} => Some({g}),");
     }
-    let mut unlisted: BTreeMap<u8, &str> = BTreeMap::new();
-    for c in &r.contract {
-        if let Some(u) = c.unlisted.as_deref() {
-            unlisted.insert(c.id, u);
-        }
+    let _ = writeln!(w, "        _ => None,\n    }}\n}}\n");
+    let _ = writeln!(
+        w,
+        "/// What a contract's ops need unless an op says otherwise, or `None`\n\
+         /// for an id the registry does not assign.\n\
+         pub fn contract_grant(id: u16) -> Option<OpGrant> {{\n    match id {{"
+    );
+    for c in &by_id {
+        let g = match c.grant.as_deref() {
+            None => format!("OpGrant::Contract({:#06x})", c.id),
+            Some("none") => "OpGrant::Free".to_string(),
+            Some(g) => format!("OpGrant::Grant(grant::{})", shout(g)),
+        };
+        let _ = writeln!(w, "        {:#06x} => Some({g}),", c.id);
     }
-    let _ = writeln!(w, "        _ => match op >> 8 {{");
-    for (class, p) in &unlisted {
-        let _ = writeln!(
-            w,
-            "            {class:#04x} => Some(permission::{}),",
-            shout(p)
-        );
-    }
-    let _ = writeln!(w, "            _ => None,\n        }},\n    }}\n}}\n");
+    let _ = writeln!(w, "        _ => None,\n    }}\n}}\n");
     let _ = writeln!(
         w,
         "/// Whether an opcode creates work or a held resource, and so waits on\n\

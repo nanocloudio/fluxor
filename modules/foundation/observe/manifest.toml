@@ -3,7 +3,7 @@ hardware_targets = ["bcm2712", "rp2350", "rp2040", "linux"]
 # Read-only telemetry-ring drain (TLM_SUBSCRIBE / TLM_DRAIN / TLM_STATS). The
 # collector reads records and renders text; it raises no faults and mutates no
 # graph state, so it holds `observe` and nothing wider.
-permissions = ["observe"]
+grants = ["telemetry"]
 # Ring draining is event/data driven and independent of scheduler step counts;
 # the PSTATUS cadence the collector declares is wall-clock on the kernel side.
 timer_class = "wall_clock"

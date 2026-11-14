@@ -5,7 +5,7 @@ version = "1.0.0"
 # module on a fixed-cadence domain unless it is reworked to read dev_millis.
 timer_class = "tick_counted"
 hardware_targets = ["rp2350", "rp2040", "bcm2712"]
-permissions = ["reconfigure", "monitor"]
+grants = ["reconfigure", "monitor"]
 deferred_ready = true
 
 [[ports]]

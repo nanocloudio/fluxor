@@ -1,6 +1,5 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
-permissions = ["platform_raw"]
 
 # Tier-2 (IRQ-owned) validation probe. `isr_safe` attests the step/ISR body
 # never calls a forbidden syscall from interrupt context — no heap

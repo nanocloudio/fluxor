@@ -13,7 +13,7 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 #
 # Requires the read-only `observe` permission to drain the ring
 # (TLM_SUBSCRIBE / TLM_DRAIN).
-permissions = ["observe"]
+grants = ["telemetry"]
 
 # Feature-set variants. The on-device OTLP encoder cores (`otlp_json` +
 # `otlp_proto`, selected by `encoding` 0/1) are cfg-gated behind the `otlp`

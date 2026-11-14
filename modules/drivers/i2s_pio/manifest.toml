@@ -1,4 +1,5 @@
 version = "1.0.0"
+type = "Sink"
 hardware_targets = ["rp2350"]
 # I2S DMA is the canonical sink-authored clock for rp2350 audio playback.
 capabilities = ["audio.sample", "presentation.clock"]

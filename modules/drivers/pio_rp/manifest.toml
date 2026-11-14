@@ -2,7 +2,7 @@ version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
 # The `pio` contract this driver registers itself as the provider of.
 provides = ["pio"]
-permissions = ["platform_raw"]
+grants = ["rp_raw"]
 provider_contracts = ["pio"]
 deferred_ready = true
 

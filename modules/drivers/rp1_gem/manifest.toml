@@ -1,6 +1,5 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
-permissions = ["platform_raw"]
 # Cadence-independent NIC driver: moves frames in/out, no tick-based timekeeping.
 # Explicit attestation so it may run on a mechanism-(b) domain: an absent
 # declaration is treated as unattested and is blocked there.

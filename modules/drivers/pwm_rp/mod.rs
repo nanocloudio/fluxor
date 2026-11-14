@@ -88,7 +88,8 @@ struct PwmState {
 unsafe fn raw_slice_write(sys: &SyscallTable, slice: u8, reg: u8, value: u32) -> i32 {
     let vb = value.to_le_bytes();
     let mut buf = [slice, reg, vb[0], vb[1], vb[2], vb[3]];
-    (sys.provider_call)(-1, SYS_PWM_SLICE_WRITE, buf.as_mut_ptr(), 6)
+    let h = fluxor_rt::dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PWM, slice);
+    (sys.provider_call)(h, SYS_PWM_SLICE_WRITE, buf.as_mut_ptr(), 6)
 }
 
 unsafe fn raw_pin_enable(sys: &SyscallTable, pin: u8) -> i32 {

@@ -12,7 +12,8 @@
 // machine has no hardware for is `ENOSYS`.
 //
 // A driver declares `requires_contract = "metal_device"`; register access
-// needs `platform_raw`, DMA memory and cache maintenance need `dma`.
+// needs `metal_device.mmio`, a PCIe rescan or config access
+// `metal_device.pcie`, DMA memory and cache maintenance `metal_device.dma`.
 
 /// Clean and invalidate `[addr, addr+size)` (`dc civac`). handle=-1,
 /// arg=[addr:u64 LE, size:u32 LE] (12 bytes). `EFAULT` unless the range lies

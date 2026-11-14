@@ -643,37 +643,22 @@ pub fn instantiate_one_module(
         return InstantiateResult::Error(-1);
     }
 
-    // Every module gets the same table; per-contract enforcement happens at
-    // `provider_*` dispatch time (`check_contract_grant`).
+    // Every module gets the same table; what it may call is decided per op
+    // at dispatch (`check_grant`) from the grants recorded below.
     let syscalls = get_syscall_table();
 
-    // Record capability class and manifest metadata for enforcement
     // SAFETY: instantiate_one_module runs on the scheduler thread.
     unsafe {
         let p = &raw mut SCHED;
         let sched = &mut *p;
         sched.type_hash[instantiated] = entry.name_hash;
-        sched.cap_class[instantiated] = match found_module.header.module_type {
-            5 => 3, // Protocol → CAP_FULL
-            3 => 1, // Sink → CAP_SERVICE_PIO
-            4 => 2, // EventHandler → CAP_SERVICE_GPIO
-            _ => 0, // Source, Transformer → CAP_SERVICE
-        };
-        sched.required_caps[instantiated] = found_module.header.required_caps;
-        sched.permissions[instantiated] = found_module.manifest_permissions();
-        // Boot-time record of what the capability gate will enforce for
-        // this slot: the packed .fmod HEADER value (`required_caps()`),
-        // which is what `check_contract_grant` gates on — distinct from the
-        // manifest-derived mask, which is recomputed from `[[resources]]`.
-        // A header of 0x0 for a module whose manifest declares contracts
-        // means the packer never populated the header field, and every
-        // `provider_call` to those contracts returns ENOSYS.
+        let grants = found_module.manifest_grants();
+        sched.grants[instantiated] = grants;
         log::info!(
-            "[inst] module {} caps: required_caps=0x{:016x} cap_class={} permissions=0x{:02x}",
+            "[inst] module {} grants: contracts=0x{:016x} ops=0x{:016x}",
             instantiated,
-            sched.required_caps[instantiated],
-            sched.cap_class[instantiated],
-            sched.permissions[instantiated],
+            grants[0],
+            grants[1],
         );
         // The code region provider pointers are validated against.
         sched.module_code_base[instantiated] = found_module.code_base() as usize;
@@ -734,7 +719,7 @@ pub fn instantiate_one_module(
 
     // Full instantiation via start_new, as the new module: any syscall made
     // from inside module_new() identifies it (state pointer, heap,
-    // required_caps, loader-driven provider registration). Afterwards the
+    // grants, loader-driven provider registration). Afterwards the
     // context is the caller's again — a module staging a subgraph from its
     // own syscall, or no module at boot — so result-handling logs are never
     // the new module's.

@@ -820,7 +820,7 @@ unsafe fn cache_invalidate(addr: *mut u8, size: usize) {
 /// # Safety
 /// `arg` must point to a readable buffer of at least 8 bytes for the
 /// duration of the call. Touches the global `NIC_RINGS` table; caller
-/// must hold the platform_nic_ring permission gate.
+/// must hold the platform_nic_ring contract.
 pub unsafe fn syscall_ring_create(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return crate::kernel::sys::errno::EINVAL;
@@ -837,7 +837,7 @@ pub unsafe fn syscall_ring_create(arg: *mut u8, arg_len: usize) -> i32 {
 /// # Safety
 /// `arg` must point to a readable byte for the duration of the call.
 /// Frees DMA arena allocations associated with the ring; caller must
-/// hold the platform_nic_ring permission gate.
+/// hold the platform_nic_ring contract.
 pub unsafe fn syscall_ring_destroy(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 1 {
         return crate::kernel::sys::errno::EINVAL;

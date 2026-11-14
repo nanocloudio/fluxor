@@ -8,6 +8,60 @@
 //! The composer runs it to refuse a graph before it is built; the kernel runs
 //! it at load, against the addresses it actually allocated, as the backstop.
 
+/// How a module is protected: one value per module, the same in the composer
+/// and the kernel. The discriminant is the wire value of config tag 0xF5.
+///
+/// Every level runs under the step guard and holds exactly its grants. The
+/// gated levels also run unprivileged and reach the kernel only through the
+/// gateway: `Contained` reads and executes all of XIP flash, `Isolated` only
+/// its own code.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Privileged = 0,
+    Contained = 1,
+    Isolated = 2,
+}
+
+impl Level {
+    /// Every level, weakest first.
+    pub const ALL: [Level; 3] = [Level::Privileged, Level::Contained, Level::Isolated];
+
+    /// The level a graph names.
+    pub fn parse(s: &str) -> Option<Level> {
+        match s {
+            "privileged" => Some(Level::Privileged),
+            "contained" => Some(Level::Contained),
+            "isolated" => Some(Level::Isolated),
+            _ => None,
+        }
+    }
+
+    /// The level's name in a graph.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Level::Privileged => "privileged",
+            Level::Contained => "contained",
+            Level::Isolated => "isolated",
+        }
+    }
+
+    /// The level tag 0xF5 carries; `None` for a value no level has.
+    pub const fn from_wire(v: u8) -> Option<Level> {
+        match v {
+            0 => Some(Level::Privileged),
+            1 => Some(Level::Contained),
+            2 => Some(Level::Isolated),
+            _ => None,
+        }
+    }
+
+    /// Whether a module at this level is unprivileged behind the gateway.
+    pub const fn is_gated(self) -> bool {
+        !matches!(self, Level::Privileged)
+    }
+}
+
 /// How a target's protection unit draws a region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionModel {

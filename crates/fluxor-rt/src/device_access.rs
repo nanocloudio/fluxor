@@ -323,3 +323,14 @@ pub unsafe fn device_window(params: *const u8, len: usize) -> Option<(u64, u32)>
     }
     None
 }
+
+/// Claim instance `instance` of a raw RP peripheral family
+/// (`abi::platform::rp::raw_claim::family`) for this module: the handle every
+/// raw op on that instance takes, or a negative errno (`EBUSY` when another
+/// module holds it). Claiming an instance this module already holds returns
+/// the same handle.
+#[inline(always)]
+pub unsafe fn dev_raw_claim(sys: &SyscallTable, family: u8, instance: u8) -> i32 {
+    let mut arg = [family, instance];
+    (sys.provider_call)(-1, abi::registry::rp_raw::CLAIM, arg.as_mut_ptr(), 2)
+}

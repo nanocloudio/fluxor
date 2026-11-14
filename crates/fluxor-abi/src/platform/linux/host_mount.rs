@@ -34,7 +34,8 @@
 // `fs` contract deliberately lacks — so no caller spawns a mode or removal
 // tool for it.
 //
-// Gated by `requires_contract = "host_mount"` AND `platform_raw`. Making a
+// The writes need the `host_mount.mount` grant; PRIV and ROOT the contract
+// alone. Making a
 // filesystem and checking one are userland tools; run them through the
 // process executor (`host_process::PROC_CLASS`).
 

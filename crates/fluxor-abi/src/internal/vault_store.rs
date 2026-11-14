@@ -11,7 +11,7 @@
 // graph's choice, with one implementation behind all of them.
 //
 // Every opcode takes handle=-1, rides the key-vault provider (class `key_vault`),
-// and needs the `vault_store` permission; after `ATTACH` only the attaching
+// and needs the `seal_key` grant; after `ATTACH` only the attaching
 // instance is answered. All fields are little-endian.
 //
 // The cycle:

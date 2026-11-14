@@ -50,9 +50,9 @@ pub use fluxor_abi::wire::fmod::MANIFEST_MAGIC;
 /// ride within v1 rather than bumping the integer. The current
 /// layout is:
 ///
-/// - 20-byte header (magic, version, port/resource/dependency
+/// - 34-byte header (magic, version, port/resource/dependency
 ///   counts, module_version, hardware_targets, flags, provided-contract
-///   count, 16-bit fine-grained permissions, 32-bit state_bytes_64).
+///   count, 32-bit state_bytes_64, the two 64-bit grant words).
 /// - Port records (4 bytes each): `[direction, content_type, flags,
 ///   index]`. Byte 3 is the resolved per-direction `PortSpec.index`,
 ///   matching what the config compiler wires against.
@@ -102,48 +102,33 @@ fn content_type_from_str(s: &str) -> Result<u8> {
     }))
 }
 
-// ── Contract name → u8 mapping (matches provider::contract constants) ───────
+// ── Contract and grant names ─────────────────────────────────────────────
 //
-// The manifest's `requires_contract` field names a contract by its layer
-// name, mirroring the layer boundaries documented in
-// `docs/architecture/abi_layers.md`: HAL hardware surfaces, stable module
-// contracts, and platform transport contracts (the raw register-level ones
-// gated by `platform_raw`). `contract_id_from_name` below is the accepted
-// set — one match rather than a list beside it, because a list is a second
-// place to add a name and the place nobody remembers.
-//
-// Permission names ("internal", "flash_raw", "platform_raw", etc.) are not
-// contracts and belong in the top-level `permissions = [...]` list — they
-// are rejected here with a schema-error pointing at the correct section.
+// `[[resources]] requires_contract` claims a contract a provider in the graph
+// serves; `grants = [...]` names what else the module may call: a contract
+// it reaches with no provider to select (`key_vault`, `monitor`), or an
+// op-level grant (`timer.discipline`). Both resolve against the ABI
+// registry, the one list of names.
 
-/// Width of the public contract-id space. A contract id is a bit position
-/// in the fmod header's `required_caps` (u64 at `reserved[6..14]`) and the
-/// index of the kernel's vtable registry.
+/// Width of the contract-id space: a contract id is a bit of the first
+/// grant word and the index of the kernel's vtable registry.
 pub const CONTRACT_ID_SPACE: usize = fluxor_abi::registry::MAX_CONTRACTS;
 
-/// Parse a contract name from `[[resources]].requires_contract`. Only
-/// public contract names are accepted here — `"internal"` and specific
-/// permission names like `"flash_raw"` or `"platform_raw"` are **not**
-/// contracts and must be declared under the top-level `permissions = [...]`
-/// list instead.
-///
-/// An id outside [`CONTRACT_ID_SPACE`] is unrepresentable in the header
-/// mask and unregisterable as a vtable, and is refused by
-/// [`Manifest::required_caps_mask`].
+/// Parse a contract name from `[[resources]].requires_contract`: a contract
+/// a manifest may claim. A grant that is not such a contract is pointed at
+/// `grants = [...]`.
 pub fn contract_id_from_name(s: &str) -> Result<u8> {
     let name = s.to_ascii_lowercase();
     if let Some(id) = fluxor_abi::registry::contract_of_name(&name) {
         return u8::try_from(id).map_err(|_| Error::Module(format!("contract `{s}` id {id:#x}")));
     }
-    // Anything that looks like a permission name is a manifest schema
-    // error — those go in `permissions = [...]`, not `[[resources]]`.
-    if matches!(name.as_str(), "internal" | "system")
-        || fluxor_abi::registry::permission::of_name(&name).is_some()
+    if fluxor_abi::registry::contract_id(&name).is_some()
+        || fluxor_abi::registry::grant::of_name(&name).is_some()
     {
         return Err(Error::Module(format!(
-            "`{s}` is a permission, not a contract. Declare it in the \
-             top-level `permissions = [\"{s}\", ...]` list, not under \
-             `[[resources]]`. See docs/architecture/abi_layers.md."
+            "`{s}` is a grant, not a contract a provider serves. Declare it in \
+             the top-level `grants = [\"{s}\", ...]` list, not under \
+             `[[resources]]`."
         )));
     }
     Err(Error::Module(format!(
@@ -1229,30 +1214,43 @@ pub struct HeapFromParamsOverride {
     pub included: Option<u32>,
 }
 
-/// Fine-grained module permissions. Each category gates a specific
-/// subset of orchestration / platform opcodes; a module that
-/// needs only one surface does not implicitly get the others.
-///
-/// Serialised as a little-endian u16 bitmap into the manifest binary at
-/// offset 14 (bytes 14..16); DMA is bit 7 and `observe` bit 8. Not part of
-/// the module header's flags byte.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ManifestPermissions {
-    pub bits: u16,
+/// The bit a `grants = [...]` name stands for: `(word, bit)`, word 0 for a
+/// contract (its id) and word 1 for an op-level grant.
+pub fn grant_from_name(s: &str) -> Result<(usize, u8)> {
+    let name = s.to_ascii_lowercase();
+    if let Some(id) = fluxor_abi::registry::contract_id(&name) {
+        return Ok((0, id as u8));
+    }
+    if let Some(bit) = fluxor_abi::registry::grant::of_name(&name) {
+        return Ok((1, bit));
+    }
+    let mut known: Vec<String> = (0..CONTRACT_ID_SPACE as u16)
+        .filter_map(fluxor_abi::registry::contract_name)
+        .map(str::to_string)
+        .collect();
+    known.extend(
+        (0..64u8)
+            .filter_map(fluxor_abi::registry::grant::name)
+            .map(str::to_string),
+    );
+    Err(Error::Module(match crate::text_distance::closest_match(s, &known, 3) {
+        Some(hint) => format!("unknown grant `{s}`. Did you mean `{hint}`?"),
+        None => format!("unknown grant `{s}`: grants name a contract or an op-level grant from the ABI registry"),
+    }))
 }
 
-/// Manifest permission bits, from the ABI registry.
-pub mod permission {
-    pub use fluxor_abi::registry::permission::{of_name as from_name, *};
-
-    /// The manifest names of every bit set in `bits`, in bit order.
-    pub fn names(bits: u16) -> Vec<&'static str> {
-        (0..16)
-            .filter_map(fluxor_abi::registry::permission::nth)
-            .filter(|b| bits & b != 0)
-            .filter_map(fluxor_abi::registry::permission::name)
-            .collect()
-    }
+/// The names of every grant set in `grants`, contracts first.
+pub fn grant_names(grants: [u64; 2]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = (0..64u16)
+        .filter(|b| grants[0] & (1u64 << b) != 0)
+        .filter_map(fluxor_abi::registry::contract_name)
+        .collect();
+    out.extend(
+        (0..64u8)
+            .filter(|b| grants[1] & (1u64 << b) != 0)
+            .filter_map(fluxor_abi::registry::grant::name),
+    );
+    out
 }
 
 /// Lowest tag a built-in `[[params]]` entry may claim. Tags below this
@@ -1544,7 +1542,10 @@ pub struct Manifest {
     pub facts: ModuleFacts,
     pub ports: Vec<PortSpec>,
     pub resources: Vec<ResourceClaim>,
-    pub permissions: ManifestPermissions,
+    /// What the module may call: word 0 a bit per contract (its
+    /// `[[resources]]` claims and the contracts its `grants` name), word 1 a
+    /// bit per op-level grant.
+    pub grants: [u64; 2],
     pub dependencies: Vec<Dependency>,
     pub integrity_hash: Option<[u8; 32]>,
     /// ABI wire-surface digest of the SDK/kernel tree this module was built
@@ -1724,7 +1725,7 @@ impl Default for Manifest {
             facts: ModuleFacts::default(),
             ports: Vec::new(),
             resources: Vec::new(),
-            permissions: ManifestPermissions::default(),
+            grants: [0; 2],
             dependencies: Vec::new(),
             integrity_hash: None,
             abi_surface: None,
@@ -2109,20 +2110,24 @@ fn walk_rs<F: FnMut(&Path, &str)>(root: &Path, f: &mut F) {
 }
 
 impl Manifest {
-    /// Compute the required_caps bitmask from resource claims. Each
-    /// declared contract id sets the corresponding bit in a u64; contract
-    /// ids must fall in 0..63 to be expressible, the same range the kernel
-    /// registers a vtable for (`MAX_CONTRACTS`). Non-contract permissions
-    /// live in `self.permissions` and are serialised separately into
-    /// manifest binary byte 15.
-    pub fn required_caps_mask(&self) -> Result<u64> {
+    /// Everything the module may call, as the kernel checks it: the named
+    /// grants, with every contract the `[[resources]]` claim added to the
+    /// first word.
+    pub fn grant_set(&self) -> Result<[u64; 2]> {
+        Ok([self.grants[0] | self.claimed_contracts()?, self.grants[1]])
+    }
+
+    /// The contract bits the `[[resources]]` claims set: each claimed id is
+    /// a bit of the first grant word, so it must fall below
+    /// [`CONTRACT_ID_SPACE`].
+    pub fn claimed_contracts(&self) -> Result<u64> {
         let mut mask = 0u64;
         for r in &self.resources {
             if (r.device_class as usize) < CONTRACT_ID_SPACE {
                 mask |= 1u64 << r.device_class;
             } else {
                 return Err(Error::Module(format!(
-                    "requires_contract {} (0x{:02x}) is outside the required_caps u64 range (bits 0..63).",
+                    "requires_contract {} (0x{:02x}) is outside the grant word (bits 0..63).",
                     contract_name_to_str(r.device_class),
                     r.device_class,
                 )));
@@ -2459,18 +2464,10 @@ impl Manifest {
             });
         }
 
-        let mut permissions = ManifestPermissions::default();
-        for name in toml_val.permissions.unwrap_or_default() {
-            match permission::from_name(&name) {
-                Some(bit) => permissions.bits |= bit,
-                None => {
-                    return Err(Error::Module(format!(
-                        "unknown permission: {name} — expected one of: reconfigure, \
-                         flash_raw, platform_raw, monitor, bridge \
-                         (see docs/architecture/abi_layers.md)",
-                    )));
-                }
-            }
+        let mut grants = [0u64; 2];
+        for name in toml_val.grants.unwrap_or_default() {
+            let (word, bit) = grant_from_name(&name)?;
+            grants[word] |= 1u64 << bit;
         }
 
         let mut dependencies = Vec::new();
@@ -3025,7 +3022,7 @@ impl Manifest {
             facts,
             ports,
             resources,
-            permissions,
+            grants,
             dependencies,
             integrity_hash: None, // set later by caller
             abi_surface: None,    // set by pack (attests the packing tree)
@@ -3133,11 +3130,20 @@ impl Manifest {
         buf.push(flags);
         // byte 13: provided contracts, listed after the arena block.
         buf.push(self.provider_contracts.len() as u8);
-        // bytes 14..16: fine-grained permissions bitmap (see `permission::*`).
-        // The kernel reads this directly at module instantiation.
-        buf.extend_from_slice(&self.permissions.bits.to_le_bytes());
-        // bytes 16..20: one instance's state in 64-byte units.
+        // bytes 14..18: one instance's state in 64-byte units.
         buf.extend_from_slice(&self.state_bytes_64.to_le_bytes());
+        // bytes 18..34: the grants, which the kernel checks every call
+        // against. The resource claims are contract grants too.
+        // A claim outside the word is refused when the module is packed
+        // (`grant_set`); it sets no bit here.
+        let claimed = self
+            .resources
+            .iter()
+            .filter(|r| (r.device_class as usize) < CONTRACT_ID_SPACE)
+            .fold(0u64, |m, r| m | (1u64 << r.device_class));
+        let grants = [self.grants[0] | claimed, self.grants[1]];
+        buf.extend_from_slice(&grants[0].to_le_bytes());
+        buf.extend_from_slice(&grants[1].to_le_bytes());
 
         // Ports (4 bytes each: direction, content_type, flags, index).
         // Byte 3 is the per-direction port index (0..15) the TOML
@@ -3237,12 +3243,11 @@ impl Manifest {
         let module_version = u16::from_le_bytes([data[8], data[9]]);
         let hardware_targets = u16::from_le_bytes([data[10], data[11]]);
         use fluxor_abi::wire::fmod::{
-            MANIFEST_FLAGS_AT, MANIFEST_PERMISSIONS_AT, MANIFEST_PROVIDES_AT, MANIFEST_STATE_AT,
+            manifest_grants, MANIFEST_FLAGS_AT, MANIFEST_PROVIDES_AT, MANIFEST_STATE_AT,
         };
         let flags = data[MANIFEST_FLAGS_AT];
         let provides_count = data[MANIFEST_PROVIDES_AT] as usize;
-        let at = MANIFEST_PERMISSIONS_AT;
-        let permissions_bits = u16::from_le_bytes([data[at], data[at + 1]]);
+        let grants = manifest_grants(&data[..MANIFEST_HEADER_SIZE]);
         let at = MANIFEST_STATE_AT;
         let state_bytes_64 =
             u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
@@ -3408,9 +3413,7 @@ impl Manifest {
             facts: ModuleFacts::default(), // header flag bits, not manifest bytes
             ports,
             resources,
-            permissions: ManifestPermissions {
-                bits: permissions_bits,
-            },
+            grants,
             dependencies,
             integrity_hash,
             abi_surface,
@@ -3462,9 +3465,9 @@ impl Manifest {
         let mut lines = vec![
             format!("  version: {}.{}.{}", major, minor, patch),
             format!("  hardware_targets: 0x{:04x}", self.hardware_targets),
-            match self.required_caps_mask() {
-                Ok(m) => format!("  required_caps: 0x{m:016x}"),
-                Err(e) => format!("  required_caps: <error: {e}>"),
+            match self.grant_set() {
+                Ok(g) => format!("  grants: [{}]", grant_names(g).join(", ")),
+                Err(e) => format!("  grants: <error: {e}>"),
             },
         ];
         if self.state_bytes_64 > 0 {
@@ -3521,12 +3524,6 @@ impl Manifest {
                     ));
                 }
             }
-        }
-        if self.permissions.bits != 0 {
-            lines.push(format!(
-                "  permissions: [{}]",
-                permission::names(self.permissions.bits).join(", ")
-            ));
         }
         if !self.dependencies.is_empty() {
             lines.push("  dependencies:".into());
@@ -3633,10 +3630,9 @@ struct TomlManifest {
     state_bytes_64: Option<u32>,
     ports: Option<Vec<TomlPort>>,
     resources: Option<Vec<TomlResource>>,
-    /// Top-level `permissions = ["reconfigure", "flash_raw", …]` list —
-    /// fine-grained non-contract permission categories. Distinct from
-    /// `[[resources]]` (which is for public contract access).
-    permissions: Option<Vec<String>>,
+    /// Top-level `grants = ["key_vault", "timer.discipline", …]`: what the
+    /// module may call beyond the contracts its `[[resources]]` claim.
+    grants: Option<Vec<String>>,
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
     provides: Option<Vec<String>>,
@@ -4449,8 +4445,8 @@ struct TomlPort {
 #[serde(deny_unknown_fields)]
 struct TomlResource {
     /// Public contract this module needs access to: a name
-    /// [`contract_id_from_name`] accepts. Non-contract permissions go in
-    /// the top-level `permissions = [...]` list.
+    /// [`contract_id_from_name`] accepts. Anything else the module may
+    /// call goes in the top-level `grants = [...]` list.
     #[serde(rename = "requires_contract")]
     device_class: String,
     access: String,
@@ -4950,7 +4946,7 @@ mod tests {
     }
 
     #[test]
-    fn required_caps_mask() {
+    fn grant_set_adds_the_claimed_contracts() {
         let mut m = Manifest::default();
         m.resources.push(ResourceClaim {
             device_class: fluxor_abi::registry::gpio::ID as u8,
@@ -4982,12 +4978,23 @@ mod tests {
             variants: Vec::new(),
             when: Vec::new(),
         }); // highest representable position
+        m.grants = [
+            1u64 << fluxor_abi::registry::key_vault::ID,
+            1u64 << fluxor_abi::registry::grant::TIMER_DISCIPLINE,
+        ];
         assert_eq!(
-            m.required_caps_mask().unwrap(),
-            (1u64 << fluxor_abi::registry::gpio::ID)
-                | (1u64 << fluxor_abi::registry::pio::ID)
-                | (1u64 << 0x3F)
+            m.grant_set().unwrap(),
+            [
+                (1u64 << fluxor_abi::registry::gpio::ID)
+                    | (1u64 << fluxor_abi::registry::pio::ID)
+                    | (1u64 << 0x3F)
+                    | (1u64 << fluxor_abi::registry::key_vault::ID),
+                1u64 << fluxor_abi::registry::grant::TIMER_DISCIPLINE,
+            ]
         );
+        // The packed head carries the same set, and reads back as it.
+        let back = Manifest::from_bytes(&m.to_bytes()).unwrap();
+        assert_eq!(back.grants, m.grant_set().unwrap());
     }
 
     /// A top-level key written below a `[[resources]]` header is that
@@ -5002,7 +5009,7 @@ mod tests {
     }
 
     #[test]
-    fn required_caps_mask_refuses_an_id_outside_the_space() {
+    fn grant_set_refuses_a_claim_outside_the_word() {
         let mut m = Manifest::default();
         m.resources.push(ResourceClaim {
             device_class: CONTRACT_ID_SPACE as u8,
@@ -5014,7 +5021,7 @@ mod tests {
             variants: Vec::new(),
             when: Vec::new(),
         });
-        assert!(m.required_caps_mask().is_err());
+        assert!(m.grant_set().is_err());
     }
 
     fn parse_toml(src: &str) -> Result<Manifest> {

@@ -84,14 +84,24 @@ unsafe fn uart_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     *bp.add(2) = v[1];
     *bp.add(3) = v[2];
     *bp.add(4) = v[3];
-    (sys.provider_call)(bus as i32, UART_REG_WRITE, bp, 5);
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::UART, bus),
+        UART_REG_WRITE,
+        bp,
+        5,
+    );
 }
 
 unsafe fn uart_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
-    (sys.provider_call)(bus as i32, UART_REG_READ, bp, 5);
+    (sys.provider_call)(
+        dev_raw_claim(sys, abi::platform::rp::raw_claim::family::UART, bus),
+        UART_REG_READ,
+        bp,
+        5,
+    );
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 

@@ -388,7 +388,7 @@ validators — the `presentation_groups` blocks described in
 `continuity` blocks described below. There is no generic string-matched requires→provides resolver:
 graphs wire a surface's ports explicitly, and substrate stacks are injected
 by platform stack expansion. Continuity roles do not consume bits in the
-`required_caps` device-class mask; they live in the manifest vocabulary
+grant words; they live in the manifest vocabulary
 alongside `audio.sample`.
 
 ### Target-Provided Capabilities

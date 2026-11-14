@@ -12,7 +12,7 @@ PWM Provider PIC Module
 ```toml
 version = "1.0.0"
 hardware_targets = ["rp2350"]
-permissions = ["platform_raw"]
+grants = ["rp_raw"]
 
 [[resources]]
 requires_contract = "gpio"

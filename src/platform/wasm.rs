@@ -1332,21 +1332,9 @@ unsafe fn load_embedded_modules() -> usize {
         }
 
         // The wasm platform's `host_instantiate_module` loop bypasses
-        // `scheduler::instantiate_one_module`, so cap metadata has to
-        // be staged explicitly — otherwise `check_contract_grant`
-        // rejects every non-infra contract the module declares.
-        let cap_class: u8 = match header.module_type {
-            5 => 3, // Protocol → CAP_FULL
-            3 => 1, // Sink → CAP_SERVICE_PIO
-            4 => 2, // EventHandler → CAP_SERVICE_GPIO
-            _ => 0, // Source / Transformer → CAP_SERVICE
-        };
-        scheduler::set_module_caps(
-            module_idx,
-            cap_class,
-            header.required_caps,
-            loaded.manifest_permissions(),
-        );
+        // `scheduler::instantiate_one_module`, so the grants have to be
+        // staged here, or every op that needs one is refused.
+        scheduler::set_module_grants(module_idx, loaded.manifest_grants());
         scheduler::set_module_type_hash(module_idx, entry.name_hash);
 
         let code_size = header.code_size as usize;

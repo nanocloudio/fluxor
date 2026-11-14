@@ -1,6 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
-permissions = ["platform_raw"]
+grants = ["metal_device.pcie"]
 deferred_ready = true
 
 [[ports]]

@@ -83,7 +83,6 @@ pub mod contract {
     pub const PLATFORM_DMA: u16 = crate::abi::registry::platform_dma::ID;
     pub const PLATFORM_DMA_FD: u16 = crate::abi::registry::platform_dma_fd::ID;
     pub const PCIE_DEVICE: u16 = crate::abi::registry::pcie_device::ID;
-    pub const USB_HOST: u16 = crate::abi::registry::usb_host::ID;
     pub const STREAM_CLOCK: u16 = crate::abi::registry::stream_clock::ID;
     pub const TRUST: u16 = crate::abi::registry::trust::ID;
     pub const NET_POLICY: u16 = crate::abi::registry::net_policy::ID;
@@ -129,10 +128,9 @@ pub struct ProviderVTable {
 }
 
 /// Maximum number of contracts. A contract id is simultaneously the
-/// vtable index here, the opcode's class byte, and a bit position in the
-/// fmod header's `required_caps` (`ModuleHeader::required_caps`, u64), so
-/// this ceiling and that field's width are one number and must move
-/// together.
+/// vtable index here, the opcode's class byte, and a bit position in a
+/// module's first grant word (u64), so this ceiling and that word's width
+/// are one number and must move together.
 pub const MAX_CONTRACTS: usize = 64;
 
 /// Registered vtables, indexed by contract id.

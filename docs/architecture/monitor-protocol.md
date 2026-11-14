@@ -95,8 +95,8 @@ MON_STATE mod=<idx> name=<s> state=<s> ready=<0|1> finished=<0|1> restarts=<n> d
 - `gen` — per-slot generation, bumped on reset, restart and replacement.
   Pair it across two reads: a change means the slot was reused and the
   earlier line describes a different module.
-- `prot` — the protection level the kernel enforces on the module: `none`,
-  `guarded`, `contained` or `isolated` (see
+- `prot` — the protection level the kernel enforces on the module:
+  `privileged`, `contained` or `isolated` (see
   [module_isolation.md](module_isolation.md)). This is what the target
   provides, which can be stronger than what the graph asked for.
 

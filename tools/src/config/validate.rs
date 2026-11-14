@@ -2604,7 +2604,7 @@ pub fn check_connector_addressing(config: &Value) -> Result<()> {
 }
 
 /// One keeper of the key vault's durable image per graph: the kernel answers
-/// the first instance holding `vault_store` and refuses every other, so a
+/// the first instance holding `seal_key` and refuses every other, so a
 /// second is a graph whose keys go where its author did not mean. Its block
 /// source is held to exactly one by the `blocks` port's
 /// `requires_capability = "storage.block"`.
@@ -2619,13 +2619,13 @@ pub fn validate_vault_store(config: &Value, manifests: &HashMap<String, Manifest
             // The manifest map is keyed by instance name.
             manifests
                 .get(name)
-                .filter(|mf| mf.permissions.bits & manifest::permission::VAULT_STORE != 0)
+                .filter(|mf| mf.grants[1] & (1u64 << fluxor_abi::registry::grant::SEAL_KEY) != 0)
                 .map(|_| name)
         })
         .collect();
     if keepers.len() > 1 {
         return Err(Error::Config(format!(
-            "{} keep the key vault's records (`vault_store`); a graph has one. \
+            "{} keep the key vault's records (`seal_key`); a graph has one. \
              The kernel answers the first and refuses the rest.",
             keepers.join(", ")
         )));
@@ -2636,9 +2636,8 @@ pub fn validate_vault_store(config: &Value, manifests: &HashMap<String, Manifest
 /// Coordinator exclusivity for the node's network identities.
 ///
 /// A graph is a *workload node* when it holds a workload creator — a module
-/// declaring `requires_contract = "workload"` together with `platform_raw`
-/// (one that may `CREATE`; the network stack declares the contract for its
-/// lane ops, without `platform_raw`) — or says so (`workload_node: true`).
+/// holding `workload.create` (the network stack holds `workload.net` for its
+/// lane ops, and creates nothing) — or says so (`workload_node: true`).
 /// On a workload node the kernel installs workload identities into the
 /// network stack's `addr_ctl` and held addresses come from `net.route` HOLD,
 /// so `addr_ctl` must have no other writer: a coordinator wired into it
@@ -2651,22 +2650,20 @@ pub fn validate_net_identity_writers(
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
 ) -> Result<()> {
-    const WORKLOAD: u8 = fluxor_abi::registry::workload::ID as u8;
     let declared = config
         .get("workload_node")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let creator = module_names.iter().find(|n| {
         manifests.get(n.as_str()).is_some_and(|m| {
-            m.permissions.bits & manifest::permission::PLATFORM_RAW != 0
-                && m.resources.iter().any(|r| r.device_class == WORKLOAD)
+            m.grants[1] & (1u64 << fluxor_abi::registry::grant::WORKLOAD_CREATE) != 0
         })
     });
     if !declared && creator.is_none() {
         return Ok(());
     }
     let why = match creator {
-        Some(c) => format!("`{c}` creates workloads (workload contract + platform_raw)"),
+        Some(c) => format!("`{c}` creates workloads (`workload.create`)"),
         None => "the graph declares `workload_node: true`".to_string(),
     };
     let Some(wiring) = config.get("wiring").and_then(|w| w.as_array()) else {

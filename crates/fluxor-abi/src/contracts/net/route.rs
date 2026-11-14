@@ -22,9 +22,9 @@
 // reads `refused(reason)` or `unknown`, never silently nothing.
 //
 // Every op answers `EACCES` to a module not acting with the node's
-// authority. SEGMENTS, ROUTES, HOLD and READ also need `platform_raw`;
-// REPORT and TAKE are the realizing module's, admitted from the registered
-// net-identity provider alone.
+// authority. SEGMENTS, ROUTES, HOLD and READ also need `net_route.table`;
+// REPORT and TAKE need `net_route.stack` and are the realizing module's,
+// admitted from the registered net-identity provider alone.
 //
 // Little-endian integers; addresses in network order, family-tagged and 16
 // bytes wide (IPv4 in the first four, the rest zero), so IPv6 needs no format
@@ -86,7 +86,7 @@ pub use super::super::super::registry::net_route::READ;
 /// A realizing module provider (the bare-metal network stack) reports
 /// per-entry state. handle=-1, arg = `[entry]×n` ([`entry`]), each indexed
 /// into the tables of the provider's last [`TAKE`]. Admitted only from the
-/// registered net-identity provider, without `platform_raw`; a platform that
+/// registered net-identity provider, holding `net_route.stack`; a platform that
 /// realizes the tables itself never calls it. All entries are recorded or
 /// none. Returns 0, `EINVAL` (malformed, or an index past its table),
 /// `EACCES` (not the provider), or `EAGAIN` when the tables moved since that

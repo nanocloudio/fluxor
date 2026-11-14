@@ -73,7 +73,7 @@
 //
 // The tables are the node's: REPLACE, CLEAR and ATTACH answer `EACCES` to a
 // module not acting with the node's authority, whatever it holds. REPLACE
-// and CLEAR also need `platform_raw`; PROBE, CAPS and READ need neither.
+// and CLEAR also need `net_policy.replace`; PROBE, CAPS and READ need neither.
 //
 // Little-endian lengths, big-endian addresses and ports (network order, as
 // they appear on the wire the rules describe).
@@ -154,7 +154,7 @@ pub use super::super::super::registry::net_policy::READ;
 /// module's slot is released or re-occupied. Returns 0, `EINVAL` (malformed),
 /// `ENOSPC` (more bound tables than the store holds), `EBUSY`, or `EACCES` to
 /// a caller not acting with the node's authority (attaching is a claim about
-/// the node's packet policy; it needs no `platform_raw`).
+/// the node's packet policy; it needs no `net_policy.replace`).
 ///
 /// A table is ENFORCED ([`state::ENFORCED`] in its READ state) only while an
 /// enforcer is bound for it and the generation it applied equals the stored

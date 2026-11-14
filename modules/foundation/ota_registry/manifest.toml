@@ -1,10 +1,8 @@
 version = "0.1.0"
 type = "Transformer"
 hardware_targets = ["bcm2712"]
-# OTA_STAGE_WRITE / OTA_STAGE_CTRL (0x0C20/0x0C21) classify as
-# platform_raw via the dev_system catch-all (see the permission map in
-# src/kernel/module/syscalls.rs).
-permissions = ["platform_raw"]
+# OTA_STAGE_WRITE / OTA_STAGE_CTRL need the `reconfigure.ota` grant.
+grants = ["reconfigure.ota"]
 
 # OTA registry puller — pulls a graph image (`fluxor build --emit=image`,
 # published as an `application/vnd.nanocloud.fluxor.image.v1` OCI

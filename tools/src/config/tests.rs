@@ -2756,7 +2756,7 @@ mod continuity_tests {
     /// graph that creates no workloads.
     #[test]
     fn a_workload_node_refuses_a_second_addr_ctl_writer() {
-        use crate::manifest::{permission, ResourceClaim};
+        use crate::manifest::ResourceClaim;
         let creator = Manifest {
             resources: vec![ResourceClaim {
                 device_class: fluxor_abi::registry::workload::ID as u8,
@@ -2768,13 +2768,11 @@ mod continuity_tests {
                 variants: Vec::new(),
                 when: Vec::new(),
             }],
-            permissions: crate::manifest::ManifestPermissions {
-                bits: permission::PLATFORM_RAW,
-            },
+            grants: [0, 1u64 << fluxor_abi::registry::grant::WORKLOAD_CREATE],
             ..Manifest::default()
         };
         // The network stack declares the contract for its lane ops, without
-        // platform_raw: not a creator.
+        // `workload.create`: not a creator.
         let stack = Manifest {
             resources: vec![ResourceClaim {
                 device_class: fluxor_abi::registry::workload::ID as u8,
@@ -2809,11 +2807,8 @@ mod continuity_tests {
 
     #[test]
     fn a_graph_keeps_the_vaults_records_through_one_vault_store() {
-        use crate::manifest::permission;
         let keeper = Manifest {
-            permissions: crate::manifest::ManifestPermissions {
-                bits: permission::VAULT_STORE,
-            },
+            grants: [0, 1u64 << fluxor_abi::registry::grant::SEAL_KEY],
             ..Manifest::default()
         };
         let mut m = HashMap::new();

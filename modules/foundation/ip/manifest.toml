@@ -5,6 +5,7 @@ timer_class = "wall_clock"
 # own TCP/IP stack (the transport-continuity surfaces need a stack that owns
 # its connections; `linux_net`'s host sockets cannot checkpoint one).
 hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "uefi"]
+grants = ["workload.net", "net_route.stack"]
 
 # The emission fence (`ADDR_FENCE` on `addr_ctl`): a provable cutoff for a
 # local address, reported as the frame counter at the ring hand-off.
@@ -24,8 +25,8 @@ access = "write"
 optional = true
 
 # The node's segments, peer routes and held addresses (`net_route` TAKE /
-# REPORT): ip realizes them on bare metal. Both ops are admitted from the
-# registered net-identity provider alone, without platform_raw. Where ip is
+# REPORT): ip realizes them on bare metal. Both ops need `net_route.stack`
+# and are admitted from the registered net-identity provider alone. Where ip is
 # not that provider, or the node has no net_route provider, the poll is
 # refused and ip routes through its one gateway.
 [[resources]]

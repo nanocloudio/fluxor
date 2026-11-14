@@ -32,8 +32,8 @@
 //!
 //! REPLACE, CLEAR and ATTACH answer `EACCES` to a module not acting with the
 //! node's authority (`caller_authority`), whatever it holds; REPLACE and
-//! CLEAR also need `platform_raw`, checked in the syscall layer before
-//! dispatch reaches here. PROBE, CAPS and READ are reads.
+//! CLEAR also need the `net_policy.replace` grant, checked in the syscall
+//! layer before dispatch reaches here. PROBE, CAPS and READ are reads.
 //!
 //! ## Concurrency
 //!
@@ -515,9 +515,9 @@ pub unsafe fn dispatch(
         wire::ATTACH => {
             // A bound enforcer makes its tables report ENFORCED, so attaching
             // is a claim about the node's packet policy: only a module acting
-            // with the node's authority may make it. Not platform_raw — an
-            // in-graph enforcer parses untrusted frames and deliberately does
-            // not hold it.
+            // with the node's authority may make it. Not `net_policy.replace`
+            // — an in-graph enforcer parses untrusted frames and deliberately
+            // does not hold it.
             if !node_authority() {
                 return errno::EACCES;
             }

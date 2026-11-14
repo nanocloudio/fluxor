@@ -17,7 +17,6 @@
 // name a root complex or positional index directly.
 //
 // Driver manifest declaration:
-//   permissions = ["platform_raw"]
 //
 //   [[resources]]
 //   requires_contract = "pcie_device"

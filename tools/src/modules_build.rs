@@ -186,8 +186,8 @@ struct Candidate {
     entry: PathBuf,
     manifest: PathBuf,
     hardware_targets: Vec<String>,
-    /// 1 (Source) / 2 (Transformer) / 3 (Sink) / 4 (EventHandler) /
-    /// 5 (Protocol). Pulled from `manifest.toml::type` when present.
+    /// 1 (Source) / 2 (Transformer) / 3 (Sink) / 4 (EventHandler), from
+    /// the manifest's `type`; Transformer when it names none.
     type_id: u8,
     /// Rust edition passed to `rustc --edition`. Defaults to "2021";
     /// 2024 is blocked on the SDK adopting `#[unsafe(no_mangle)]`.
@@ -323,7 +323,8 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
             let builtin = raw.builtin;
             let entry_rel = raw.entry.unwrap_or_else(|| "mod.rs".to_string());
             let entry = dir.join(&entry_rel);
-            let type_id = resolve_type_id(&name, raw.type_str.as_deref());
+            let type_id = resolve_type_id(raw.type_str.as_deref())
+                .map_err(|e| Error::Module(format!("{}: {e}", manifest.display())))?;
             let edition = raw.edition.unwrap_or_else(|| "2021".to_string());
             if !SUPPORTED_EDITIONS.contains(&edition.as_str()) {
                 return Err(Error::Module(format!(
@@ -520,43 +521,19 @@ fn cfg_feature_args(cand: &Candidate) -> Vec<String> {
     args
 }
 
-/// Resolve the module-type byte (1–5) used by `pack_fmod`.
-///
-/// Preference order:
-///   1. Manifest `type = "Source"|"Transformer"|…|"Protocol"` —
-///      authoritative when present.
-///   2. The name table below, for the drivers and sources whose
-///      manifests declare no `type`. A module declaring
-///      `type = "..."` needs no row.
-///   3. Default `Transformer` (2), which an unrecognised `type`
-///      also takes.
-fn resolve_type_id(name: &str, manifest_type: Option<&str>) -> u8 {
-    if let Some(t) = manifest_type {
-        return match t {
-            "Source" => 1,
-            "Transformer" => 2,
-            "Sink" => 3,
-            "EventHandler" => 4,
-            "Protocol" => 5,
-            _ => 2,
-        };
-    }
-    type_by_name(name)
-}
-
-/// The type byte of a module whose manifest declares no `type`.
-fn type_by_name(name: &str) -> u8 {
-    match name {
-        // Protocol (5) — drivers exposing a wire protocol surface.
-        "cyw43" | "enc28j60" | "ch9120" | "sd" | "st7701s" | "gt911" | "pwm_rp" => 5,
-        // Sink (3)
-        "i2s_pio" => 3,
-        // EventHandler (4)
-        "button" | "flash_rp" => 4,
-        // Source (1)
-        "temp_sensor" | "mic_pio" | "synth_source" => 1,
-        // Transformer (2) is the default
-        _ => 2,
+/// The module-type byte `pack_fmod` writes: the dataflow role the manifest's
+/// `type` names, `Transformer` when it names none. It carries no authority —
+/// what a module may call is its grants — so an unknown name is a manifest
+/// error rather than a default.
+fn resolve_type_id(manifest_type: Option<&str>) -> Result<u8> {
+    match manifest_type {
+        None | Some("Transformer") => Ok(2),
+        Some("Source") => Ok(1),
+        Some("Sink") => Ok(3),
+        Some("EventHandler") => Ok(4),
+        Some(t) => Err(Error::Module(format!(
+            "unknown module type `{t}`: a module is a Source, Transformer, Sink or EventHandler"
+        ))),
     }
 }
 
@@ -2998,29 +2975,16 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
     }
 
     #[test]
-    fn resolve_type_id_honours_manifest() {
-        assert_eq!(resolve_type_id("anything", Some("Source")), 1);
-        assert_eq!(resolve_type_id("anything", Some("Transformer")), 2);
-        assert_eq!(resolve_type_id("anything", Some("Sink")), 3);
-        assert_eq!(resolve_type_id("anything", Some("EventHandler")), 4);
-        assert_eq!(resolve_type_id("anything", Some("Protocol")), 5);
-        assert_eq!(resolve_type_id("anything", Some("Mystery")), 2);
-    }
-
-    #[test]
-    fn resolve_type_id_falls_back_to_the_name_table() {
-        // A manifest with no `type = "..."` takes its byte from the
-        // name table.
-        assert_eq!(resolve_type_id("cyw43", None), 5);
-        assert_eq!(resolve_type_id("enc28j60", None), 5);
-        assert_eq!(resolve_type_id("i2s_pio", None), 3);
-        assert_eq!(resolve_type_id("button", None), 4);
-        assert_eq!(resolve_type_id("flash_rp", None), 4);
-        assert_eq!(resolve_type_id("temp_sensor", None), 1);
-        assert_eq!(resolve_type_id("mic_pio", None), 1);
-        assert_eq!(resolve_type_id("synth_source", None), 1);
-        assert_eq!(resolve_type_id("ip", None), 2);
-        assert_eq!(resolve_type_id("http", None), 2);
+    fn resolve_type_id_reads_the_manifest_alone() {
+        assert_eq!(resolve_type_id(Some("Source")).unwrap(), 1);
+        assert_eq!(resolve_type_id(Some("Transformer")).unwrap(), 2);
+        assert_eq!(resolve_type_id(Some("Sink")).unwrap(), 3);
+        assert_eq!(resolve_type_id(Some("EventHandler")).unwrap(), 4);
+        assert_eq!(resolve_type_id(None).unwrap(), 2);
+        // A type carries no authority, so the old privileged one is not a
+        // type at all, and neither is a misspelling.
+        assert!(resolve_type_id(Some("Protocol")).is_err());
+        assert!(resolve_type_id(Some("Mystery")).is_err());
     }
 
     /// Discovery walks the one tier list, so a `platform/` module is

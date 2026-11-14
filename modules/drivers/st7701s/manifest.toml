@@ -1,6 +1,7 @@
 version = "1.0.0"
+type = "Sink"
 hardware_targets = ["rp2350"]
-permissions = ["platform_raw"]
+grants = ["rp_raw"]
 # DSI/PIO panel scanout: paced sink, owns the display refresh timeline so
 # it qualifies as a `presentation.clock` for solo display groups.
 capabilities = ["video.raster", "video.scanout", "display.scanout", "presentation.clock"]

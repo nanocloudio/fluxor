@@ -2388,16 +2388,12 @@ fn resolving_loader(name_hash: u32, node: &ModuleLoader) -> &ModuleLoader {
     crate::kernel::workload::code_pack::resolve(name_hash, node)
 }
 
-/// The fmod header's module type that runs at `CAP_FULL` (see the loader's
-/// cap-class mapping in `wiring.rs`).
-const MODULE_TYPE_PROTOCOL: u8 = 5;
-
-/// The union of the manifest permissions of the modules an `AddSubgraph`
-/// blob names, each resolved by `name_hash` against the node's loader; a
-/// name the loader cannot resolve adds nothing (the add itself refuses it).
-/// `None` for a malformed blob. Read before the add, so a policy on what a
-/// subgraph may hold is decided before anything is allocated.
-pub fn module_permissions(blob: &[u8]) -> Option<u16> {
+/// The union of the grants of the modules an `AddSubgraph` blob names, each
+/// resolved by `name_hash` against the node's loader; a name the loader
+/// cannot resolve adds nothing (the add itself refuses it). `None` for a
+/// malformed blob. Read before the add, so a policy on what a subgraph may
+/// hold is decided before anything is allocated.
+pub fn module_grants(blob: &[u8]) -> Option<[u64; 2]> {
     let mut c = Cur::new(blob);
     if c.u32()? != ADD_MAGIC || c.u16()? != ADD_VERSION {
         return None;
@@ -2408,23 +2404,19 @@ pub fn module_permissions(blob: &[u8]) -> Option<u16> {
     c.u8()?;
     // SAFETY: scheduler-thread context, as every caller of the add.
     let loader = unsafe { super::static_loader() };
-    let mut perms = 0u16;
+    let mut grants = [0u64; 2];
     for _ in 0..mc {
         let name_hash = c.u32()?;
         c.take(ADD_MODULE_FIXED_BYTES - 4 - 2)?;
         let plen = c.u16()? as usize;
         c.take(plen)?;
         if let Ok(m) = resolving_loader(name_hash, loader).find_by_name_hash(name_hash) {
-            // A `Protocol` module runs at `CAP_FULL`, which reaches every
-            // contract and passes every permission check: it holds them all.
-            perms |= if m.header.module_type == MODULE_TYPE_PROTOCOL {
-                u16::MAX
-            } else {
-                m.manifest_permissions()
-            };
+            let g = m.manifest_grants();
+            grants[0] |= g[0];
+            grants[1] |= g[1];
         }
     }
-    Some(perms)
+    Some(grants)
 }
 
 /// Decode a bounded binary `AddSubgraph` and apply it. On success writes the

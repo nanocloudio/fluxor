@@ -519,12 +519,11 @@ pub fn free_module_state(module_idx: usize) {
 
     // A gated module's protection domain goes with it: its slot, tables and
     // stack, and every handle the gateway minted for it.
-    if crate::kernel::module::gateway::is_gated(module_idx) {
+    if crate::kernel::module::gateway::is_registered(module_idx) {
         crate::kernel::sys::hal::protection_release_module(module_idx);
         crate::kernel::module::gateway::release(module_idx);
     }
-    sched.isolated[module_idx] = false;
-    sched.protection[module_idx] = 0;
+    sched.protection[module_idx] = fluxor_contracts::isolation::Level::Privileged;
     sched.device_window[module_idx] = (0, 0);
 
     // Reset per-module scheduler bookkeeping so reuse is clean.

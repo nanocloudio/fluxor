@@ -241,8 +241,8 @@ zero.
 Source: `src/kernel/module/ota_stage.rs`,
 `crates/fluxor-abi/src/internal/reconfigure.rs` (opcodes).
 
-Staging is a kernel surface reached through two `dev_system` opcodes,
-available to modules with the `platform_raw` permission:
+Staging is a kernel surface reached through two `reconfigure` opcodes,
+available to modules holding the `reconfigure.ota` grant:
 
 - `OTA_STAGE_WRITE` (`0x2020`) — payload `[offset: u32 LE][bytes]`.
   Forward gaps are zero-filled; backward offsets are rejected.

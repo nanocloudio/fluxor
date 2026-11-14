@@ -48,13 +48,6 @@ pub struct ModuleInfo {
         reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
     )]
     pub drain_capable: bool,
-    /// Fine-grained permission bitmap from the manifest. See
-    /// `manifest::permission` for the category bits.
-    #[allow(
-        dead_code,
-        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-    )]
-    pub permissions_bits: u16,
     /// Raw param schema bytes (if module uses define_params! macro)
     pub schema: Option<Vec<u8>>,
     /// Module manifest (always present in ABI v2)
@@ -128,8 +121,6 @@ impl ModuleInfo {
 
         let name_hash = fnv1a_hash(name.as_bytes());
 
-        let permissions_bits = manifest.permissions.bits;
-
         Ok(Self {
             name,
             name_hash,
@@ -137,7 +128,6 @@ impl ModuleInfo {
             mailbox_safe,
             in_place_writer,
             drain_capable,
-            permissions_bits,
             schema,
             manifest,
             data,
@@ -838,8 +828,6 @@ pub fn parse_modules_from_config_multi(
 // =============================================================================
 
 /// Module header size (must match firmware's `ModuleHeader::SIZE`).
-/// The reserved tail carries `required_caps` as a u64, so every contract
-/// id in 0..63 (`MAX_CONTRACTS`) is expressible in the manifest bitmask.
 pub use fluxor_abi::wire::fmod::MODULE_HEADER_SIZE;
 
 /// ABI version byte stamped into every packed module header. Sourced
@@ -1798,6 +1786,9 @@ pub fn pack_fmod(
         )));
     }
 
+    // A contract claim outside the grant word is refused here, before
+    // anything is packed.
+    module_manifest.grant_set()?;
     let manifest_bytes = module_manifest.to_bytes();
 
     // Calculate sizes
@@ -1846,7 +1837,6 @@ pub fn pack_fmod(
         manifest_size: manifest_size as u16,
         step_period: module_manifest.step_period_ticks,
         step_phase: 0,
-        required_caps: module_manifest.required_caps_mask()?,
         name: name_bytes,
     }
     .to_bytes()
@@ -1986,6 +1976,9 @@ pub fn pack_fmod_wasm(
     }
     module_manifest.abi_surface = Some(current_surface);
 
+    // A contract claim outside the grant word is refused here, before
+    // anything is packed.
+    module_manifest.grant_set()?;
     let manifest_bytes = module_manifest.to_bytes();
 
     // Layout: header + wasm code + (no data) + (no exports) + schema + manifest
@@ -2014,7 +2007,6 @@ pub fn pack_fmod_wasm(
         manifest_size: manifest_size as u16,
         step_period: module_manifest.step_period_ticks,
         step_phase: 0,
-        required_caps: module_manifest.required_caps_mask()?,
         name: name_bytes,
     }
     .to_bytes();
@@ -2719,7 +2711,6 @@ mod tests {
             mailbox_safe: false,
             in_place_writer: false,
             drain_capable: false,
-            permissions_bits: 0,
             schema: None,
             manifest: Manifest::default(),
             data: vec![0xAB; MODULE_HEADER_SIZE + code],

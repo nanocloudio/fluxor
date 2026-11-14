@@ -10,9 +10,10 @@
 //! registered net-identity provider.
 //!
 //! **Gate.** Every op needs the node's authority (`caller_authority`); the
-//! contract grant and `platform_raw` are checked in the syscall layer before
-//! dispatch reaches here (`REPORT` and `TAKE` excepted from `platform_raw`,
-//! admitted here by the caller's identity instead).
+//! grants are checked in the syscall layer before dispatch reaches here: the
+//! table ops need `net_route.table`, and `REPORT` and `TAKE` need
+//! `net_route.stack` and are admitted here from the registered net-identity
+//! provider alone.
 //!
 //! **One writer per table.** A table binds its writer — `(module slot, slot
 //! generation)` — on its first successful replace; another module gets

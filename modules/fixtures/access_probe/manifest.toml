@@ -1,6 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
-permissions = ["platform_raw", "dma"]
+grants = ["metal_device.mmio", "metal_device.dma"]
 
 # Fixture for the bounds on the raw register and cache-maintenance opcodes,
 # on QEMU virt. On its first step it asks for what must be refused — a

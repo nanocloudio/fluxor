@@ -107,14 +107,10 @@ unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize)
 // ── Handle-scoped provider dispatch ─────────────────────────────────
 //
 // Every `syscall_provider_*` wrapper fires the ISR-tier gate as its
-// FIRST check — BEFORE the contract-grant lookup, the
-// privileged-op gate, or the contract dispatch. Without this
-// ordering, an ISR-tier module calling `provider_open` on a
-// contract it has no permission for would receive `ENOSYS` (the
-// permission gate's reject) rather than `EACCES` (the ISR-tier
-// gate's reject), and a future loader bug could ride that path
-// silently. The inner `provider::*` functions also gate as
-// defense in depth.
+// FIRST check, before the grant check and the dispatch, so an ISR-tier
+// module calling an op it holds no grant for is told `EACCES` by the
+// ISR-tier gate, not by the grant check. The inner `provider::*`
+// functions also gate as defense in depth.
 
 unsafe extern "C" fn syscall_provider_open(
     contract: u32,
@@ -130,18 +126,17 @@ unsafe extern "C" fn syscall_provider_open(
     // PLATFORM_DMA, PLATFORM_DMA_FD) for handle-returning platform ops.
     if contract as u16 == crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET {
         log::warn!(
-            "[cap] module called provider_open on INTERNAL_DISPATCH_BUCKET; \
+            "[grant] module called provider_open on the kernel contract; \
              use PLATFORM_NIC_RING / PLATFORM_DMA / PLATFORM_DMA_FD instead"
         );
         return E_NOSYS;
     }
-    if let Some(rc) = check_contract_grant(contract as u16) {
-        return rc;
+    // An open names the contract it opens and an op of that contract; the
+    // provider is chosen by the first, so the second must agree with it.
+    if (open_op >> 8) & 0xFF != contract {
+        return errno::EINVAL;
     }
-    // Open-style ops can also touch privileged orchestration surface
-    // (NIC_RING_CREATE, DMA_FD_CREATE, etc.), so the permission gate
-    // applies here as well as in `provider_call`.
-    if let Some(rc) = check_privileged_internal_op(open_op) {
+    if let Some(rc) = check_grant(open_op) {
         return rc;
     }
     // Every provider_open mints a new held resource, so it is admission-gated.
@@ -166,28 +161,17 @@ unsafe extern "C" fn syscall_provider_call(
     {
         return crate::kernel::sys::errno::EACCES;
     }
-    // Contract comes from the handle's FD tag (tagged fds resolve
-    // directly via `fd_tag_contract`), falling back to the opcode's
-    // class byte for handle=-1 globals and scheduler-assigned channel
-    // fds. Non-channel contracts hand out tagged fds so `contract_of`
-    // produces an unambiguous result per handle.
-    //
-    // A kernel primitive (a class-routed contract) is routed by its opcode ahead of
-    // any handle (`provider::provider_call`), so it is granted by its class
-    // too: LOG_WRITE carries a log level in the handle slot, and checking a
-    // level-3 log against whatever handle happens to be number 3 refuses it.
-    let class = ((op >> 8) & 0xFF) as u16;
-    let contract = if crate::abi::registry::op_routes_to_kernel(op) {
-        crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET
-    } else {
-        crate::kernel::module::provider::contract_of(handle).unwrap_or(class)
-    };
-    if let Some(rc) = check_contract_grant(contract) {
+    // A kernel primitive (a class-routed contract) is routed by its opcode
+    // ahead of any handle, so its handle argument names no contract: a
+    // LOG_WRITE carries a log level there. Any other op is answered by the
+    // handle's provider, so the caller must hold that contract as well.
+    if let Some(rc) = check_grant(op) {
         return rc;
     }
-    // Privileged opcodes also require the matching permission bit.
-    if let Some(rc) = check_privileged_internal_op(op) {
-        return rc;
+    if !crate::abi::registry::op_routes_to_kernel(op) {
+        if let Some(rc) = check_handle_grant(handle) {
+            return rc;
+        }
     }
     // Admission gate on the open/create/accept/arm-class opcodes —
     // use-style ops on established handles stay state-blind so a
@@ -211,22 +195,9 @@ unsafe extern "C" fn syscall_provider_call_sel(
     {
         return crate::kernel::sys::errno::EACCES;
     }
-    // The contract is the opcode's class byte (same rule as the handle=-1
-    // path); grant-check the caller against it, then apply the same
-    // open-class admission gate `provider_call` uses.
-    let class = ((op >> 8) & 0xFF) as u16;
-    let c = if crate::abi::registry::op_routes_to_kernel(op) {
-        crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET
-    } else {
-        class
-    };
-    if let Some(rc) = check_contract_grant(c) {
-        return rc;
-    }
-    // The permission half, exactly as `provider_call` applies it: a selector
-    // names which provider answers, never what the caller may ask of it, so a
-    // platform_raw op is as privileged through a selector as through a handle.
-    if let Some(rc) = check_privileged_internal_op(op) {
+    // A selector names which provider answers, never what the caller may
+    // ask of it: the op is held to its grant as through a handle.
+    if let Some(rc) = check_grant(op) {
         return rc;
     }
     if admission_class_op(op) && admission_closed("provider_call_sel") {
@@ -250,14 +221,10 @@ unsafe extern "C" fn syscall_provider_query(
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_query") {
         return crate::kernel::sys::errno::EACCES;
     }
-    let contract =
-        crate::kernel::module::provider::contract_of(handle).unwrap_or(((key >> 8) & 0xFF) as u16);
-    if let Some(rc) = check_contract_grant(contract) {
+    if let Some(rc) = check_grant(key) {
         return rc;
     }
-    // Queries against privileged keys require the same permission
-    // bit as `provider_call` for those opcodes.
-    if let Some(rc) = check_privileged_internal_op(key) {
+    if let Some(rc) = check_handle_grant(handle) {
         return rc;
     }
     // Try the handle's vtable first; if no contract query is registered,
@@ -273,10 +240,8 @@ unsafe extern "C" fn syscall_provider_close(handle: i32) -> i32 {
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_close") {
         return crate::kernel::sys::errno::EACCES;
     }
-    if let Some(contract) = crate::kernel::module::provider::contract_of(handle) {
-        if let Some(rc) = check_contract_grant(contract) {
-            return rc;
-        }
+    if let Some(rc) = check_handle_grant(handle) {
+        return rc;
     }
     crate::kernel::module::provider::provider_close(handle)
 }
@@ -455,7 +420,7 @@ pub fn init_providers() {
         crate::kernel::module::metal_device::dispatch,
     );
     // The vault's durable store is the same router's other surface; its ops
-    // require the `vault_store` permission.
+    // need the `seal_key` grant.
     provider::register(
         crate::abi::registry::vault_store::ID,
         key_vault_provider_dispatch,
@@ -756,216 +721,65 @@ unsafe fn key_vault_provider_dispatch(
 // Generic Device Call / Query
 // ============================================================================
 
-/// The `required_caps` bit of a contract.
-const fn bit(contract: u16) -> u64 {
-    1u64 << contract
-}
-
-// Storage family: a service-tier module may reach the storage contracts
-// on the same footing as FS (already in the masks below) when — and only
-// when — it declares them in `[[resources]]` (the manifest gate in
-// `check_contract_grant` remains authoritative). This lets a service-tier
-// backend (e.g. an emulator asset bank) resolve an object
-// handle via `storage.object`/`storage.namespace` without being
-// mis-typed as a CAP_FULL `Protocol` module just to get the grant.
-const STORAGE_FAMILY: u64 = {
-    use crate::kernel::module::provider::contract as ct;
-    bit(ct::STORAGE_NAMESPACE) | bit(ct::STORAGE_OBJECT)
-};
-
-/// What every service tier may reach. PLATFORM_NIC_RING, PLATFORM_DMA,
-/// PLATFORM_DMA_FD, PCIE_DEVICE and USB_HOST are permitted at every service
-/// tier so a driver's `[[resources]]` declaration is what actually grants
-/// access; the per-opcode permission then gates the individual ops on top —
-/// `platform_raw` for the raw register surfaces, and `usb_host` for the
-/// kernel-mediated USB host ops, which carry their own grant. PROC, WORKLOAD,
-/// TRUST, NET_POLICY, HOST_MOUNT and NET_ROUTE are in the ceiling so the
-/// modules that serve a node (sector's `do`, the workload manager, `tls`, an
-/// applier, a mount actuator, the node agent) can declare them; their
-/// privileged ops additionally require `platform_raw` (see
-/// `privileged_op_permission`). The manifest `[[resources]]` gate still
-/// grants per module: these are ceilings, not grants.
-const SERVICE_CONTRACTS: u64 = {
-    use crate::kernel::module::provider::contract as ct;
-    bit(ct::INTERNAL_DISPATCH_BUCKET)
-        | bit(ct::CHANNEL)
-        | bit(ct::TIMER)
-        | bit(ct::BUFFER)
-        | bit(ct::EVENT)
-        | bit(ct::KEY_VAULT)
-        | bit(crate::abi::registry::vault_store::ID)
-        | bit(ct::FS)
-        | bit(ct::PLATFORM_NIC_RING)
-        | bit(ct::PLATFORM_DMA)
-        | bit(ct::PLATFORM_DMA_FD)
-        | bit(ct::PCIE_DEVICE)
-        | bit(crate::abi::registry::metal_device::ID)
-        | bit(ct::USB_HOST)
-        | STORAGE_FAMILY
-        | bit(crate::abi::registry::proc::ID)
-        | bit(ct::WORKLOAD)
-        | bit(ct::TRUST)
-        | bit(ct::NET_POLICY)
-        | bit(ct::HOST_MOUNT)
-        | bit(ct::NET_ROUTE)
-};
-
-/// Per-cap-class contract ceiling. Indexed by
-/// `scheduler::current_module_cap_class()`. This is a ceiling, NOT a grant:
-/// `check_contract_grant`'s manifest gate still requires each non-infra
-/// contract to be declared.
-///
-/// `pub` so the cap-class policy can be pinned by the harness test
-/// `tests/harness/tests/kernel_permissions.rs`.
-pub const CAP_CONTRACT_MASK: [u64; 4] = [
-    SERVICE_CONTRACTS, // CAP_SERVICE
-    SERVICE_CONTRACTS | bit(crate::kernel::module::provider::contract::HAL_PIO), // CAP_SERVICE_PIO
-    SERVICE_CONTRACTS | bit(crate::kernel::module::provider::contract::HAL_GPIO), // CAP_SERVICE_GPIO
-    u64::MAX, // CAP_FULL: any contract
-];
-
-/// Per-contract capability enforcement.
-///
-/// Returns `Some(E_NOSYS)` when the calling module is not permitted to
-/// touch `contract`, or `None` when the call may proceed. Applies to
-/// both routing paths: the handle-scoped `provider_*` path (contract
-/// id carried by the handle or passed to `provider_open`), and the
-/// class-byte path for handle=-1 global ops (contract id from the
-/// opcode's high byte).
-///
-/// Two layers:
-///
-/// 1. **Tier mask**: every module is assigned a capability tier
-///    (`current_module_cap_class`). Each tier's bitmask declares which
-///    contracts that tier may reach. Service tiers (0..=2) expose
-///    infra contracts + key vault; the GPIO / PIO variants add one
-///    HAL contract each; `CAP_FULL` opens everything.
-///
-/// 2. **Manifest mask**: the contract must be either on the infra
-///    allow-list (below) or in the module's declared `required_caps`
-///    set. Modules that declare nothing get nothing beyond infra +
-///    whatever the tier mask opens.
-unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
-    use crate::kernel::module::provider::contract as ct;
-
-    // host_process is the workload contract's Linux host-class companion:
-    // the READ/EXEC/TTY ops act
-    // on a workload the module already created, so they carry the SAME
-    // `requires_contract = "workload"` grant (see provider::contract::HOST_PROCESS).
-    // Without this the opcode-class-byte gate would demand a separate
-    // host_process bit that no manifest can declare (the registry does not
-    // let a manifest name it), so every host-process op would fail ENOSYS.
-    //
-    // The remap covers the CONTRACT grant only. `platform_raw` is required for
-    // this class by the registry (`unlisted = "platform_raw"` on both):
-    // executing a process and opening a PTY on the host is not a lesser
-    // privilege than creating the workload.
-    let contract = if contract == ct::HOST_PROCESS {
-        ct::WORKLOAD
-    } else {
-        contract
-    };
-
-    // A contract id outside the representable range has no bit in either
-    // ceiling below, so neither gate could test it. Refuse it here: the
-    // alternative — skipping a gate whose bit does not exist — turns both
-    // ceilings off for exactly the ids no policy has ever admitted. The
-    // range is `MAX_CONTRACTS`, which is also the width of the header's
-    // `required_caps` and of `CAP_CONTRACT_MASK`; the three are one number.
-    if contract as usize >= crate::kernel::module::provider::MAX_CONTRACTS {
-        return Some(E_NOSYS);
-    }
-    let contract_bit = 1u64 << contract;
-
-    let cap = crate::kernel::exec::scheduler::current_module_cap_class() as usize;
-    if cap < CAP_CONTRACT_MASK.len() {
-        let mask = CAP_CONTRACT_MASK[cap];
-        if (mask & contract_bit) == 0 {
-            return Some(E_NOSYS);
-        }
-    }
-
-    // Infra contracts are implicit grants — kernel services (channel,
-    // timer, buffer, event, key_vault) plus the kernel's own contract,
-    // which every class-routed op reaches (LOG_WRITE, HANDLE_POLL,
-    // RANDOM_FILL, ARENA_GET, …) — are available to any module regardless
-    // of manifest. Privileged class-routed ops (bridge, monitor,
-    // reconfigure, flash raw, platform MMIO/DMA/PCIe, …) are gated
-    // separately by `check_privileged_internal_op` against the manifest's
-    // `permissions = [...]` bitmap.
-    //
-    // PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, and PCIE_DEVICE
-    // are public contracts subject to the same declare-to-use rule as
-    // HAL_* — they are NOT in this list.
-    const INFRA_CONTRACTS: u64 = bit(ct::INTERNAL_DISPATCH_BUCKET)
-        | bit(ct::CHANNEL)
-        | bit(ct::TIMER)
-        | bit(ct::BUFFER)
-        | bit(ct::EVENT)
-        | bit(ct::KEY_VAULT)
-        | bit(crate::abi::registry::vault_store::ID);
-
-    // Manifest gate: every non-infra contract must be declared in the
-    // module's `[[resources]]` list. Channel-only consumers and app
-    // modules are unaffected because channels/timers/etc. live in
-    // INFRA_CONTRACTS.
-    let req = crate::kernel::exec::scheduler::current_module_required_caps();
-    if (INFRA_CONTRACTS & contract_bit) == 0 && (req & contract_bit) == 0 {
-        log::warn!(
-            "[syscalls] module {} contract 0x{contract:04x}: manifest gate denied — staged required_caps=0x{req:016x} (returns ENOSYS; declare `[[resources]]` requires_contract for this contract, and confirm the packed .fmod header carries the bit — `fluxor inspect` shows the manifest-derived mask, not the header field)",
-            crate::kernel::exec::scheduler::current_module_index(),
-        );
-        return Some(E_NOSYS);
-    }
-    None
-}
-
-/// Fine-grained permission categories. Each privileged opcode
-/// maps to exactly one category; a module must carry the corresponding
-/// bit in its manifest `permissions = [...]` list to reach that opcode.
-pub mod permission {
-    pub use crate::abi::registry::permission::*;
-
-    /// The manifest name of one permission bit, for the log.
-    pub fn name(bit: u16) -> &'static str {
-        crate::abi::registry::permission::name(bit).unwrap_or("<unknown>")
+/// Whether the module being stepped holds what `need` asks for.
+fn holds(need: crate::abi::registry::OpGrant) -> bool {
+    use crate::abi::registry::OpGrant;
+    let held = crate::kernel::exec::scheduler::current_module_grants();
+    match need {
+        OpGrant::Free => true,
+        OpGrant::Contract(c) => held[0] & (1u64 << c) != 0,
+        OpGrant::Grant(g) => held[1] & (1u64 << g) != 0,
     }
 }
 
-/// Classify an opcode into its required permission category.
-/// Returns `None` for implicit primitives (every module may call them).
-/// Opcode → category is authoritative: when a new opcode is added in
-/// `crates/fluxor-abi/src/internal/*` or `crates/fluxor-abi/src/platform/*`, it must be
-/// classified here or it falls through to `PLATFORM_RAW` (most
-/// restrictive, avoiding accidental privilege leakage).
-fn privileged_op_permission(op: u32) -> Option<u16> {
-    crate::abi::registry::op_permission(op)
+/// The manifest name of what `need` asks for, for the refusal's log line.
+fn grant_name(need: crate::abi::registry::OpGrant) -> &'static str {
+    use crate::abi::registry::{contract_name, grant, OpGrant};
+    match need {
+        OpGrant::Free => "",
+        OpGrant::Contract(c) => contract_name(c).unwrap_or("?"),
+        OpGrant::Grant(g) => grant::name(g).unwrap_or("?"),
+    }
 }
 
-/// Enforce privileged-opcode gating by fine-grained permission category.
-/// Called from `provider_open` / `provider_call` / `provider_call_sel` /
-/// `provider_query` for every op `privileged_op_permission` classifies. Returns `Some(E_NOSYS)` when the caller lacks the
-/// matching permission.
-///
-/// Every module that reaches a privileged op must carry the permission
-/// bit in its manifest's `permissions = [...]` list. The only bypass is
-/// `CAP_FULL` tier (module_type = Protocol, kernel-trusted).
-unsafe fn check_privileged_internal_op(op: u32) -> Option<i32> {
-    let required = privileged_op_permission(op)?;
-    let cap = crate::kernel::exec::scheduler::current_module_cap_class();
-    if cap == 3 {
+/// Refuse a call the module being stepped does not hold the grant for.
+fn refuse(what: u32, need: crate::abi::registry::OpGrant) -> Option<i32> {
+    if holds(need) {
         return None;
-    } // CAP_FULL (kernel-trusted, module_type=Protocol)
-    let held = crate::kernel::exec::scheduler::current_module_permissions();
-    if held & required == 0 {
-        log::warn!(
-            "[cap] module called 0x{:04x} without permissions = [\"{}\"]",
-            op,
-            permission::name(required),
-        );
-        return Some(E_NOSYS);
     }
-    None
+    log::warn!(
+        "[grant] module {} refused 0x{:04x}: it does not hold `{}`",
+        crate::kernel::exec::scheduler::current_module_index(),
+        what,
+        grant_name(need),
+    );
+    Some(errno::EACCES)
+}
+
+/// The one authority check: whether the module being stepped may call `op`.
+///
+/// `None` when it may. An op the registry does not list does not exist
+/// (`ENOSYS`); one it lists but the module does not hold the grant for is
+/// refused (`EACCES`). Every way into a provider applies it — by handle, by
+/// opcode class, by selector and by query key — and the gateway funnels a
+/// gated module's calls into the same table, so a gated and an ungated
+/// module meet the same rule.
+fn check_grant(op: u32) -> Option<i32> {
+    let op = op & !crate::abi::registry::CHAIN_NEXT;
+    let Some(need) = crate::abi::registry::op_grant(op) else {
+        return Some(E_NOSYS);
+    };
+    refuse(op, need)
+}
+
+/// The grant a handle's own contract asks of whoever uses the handle, so an
+/// op answered by the handle's provider is held to that contract too.
+fn check_handle_grant(handle: i32) -> Option<i32> {
+    let contract = crate::kernel::module::provider::contract_of(handle)?;
+    let Some(need) = crate::abi::registry::contract_grant(contract) else {
+        return Some(E_NOSYS);
+    };
+    refuse(contract as u32, need)
 }
 
 // ============================================================================
@@ -1521,9 +1335,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | crate::abi::kernel_abi::SLOT_SIGNING_ROOT
         | crate::abi::kernel_abi::SLOT_ADMITTED
         | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, arg_len),
-        // ── Telemetry ring. The
-        //    OBSERVE gate for the consumer ops is applied upstream by
-        //    `check_privileged_internal_op`; TLM_EMIT is ungated. ──
         resource::ELASTIC_ALLOC => handle_elastic_alloc(arg, arg_len),
         // A module provider's refusal of a pool it serves, counted by the
         // ledger; `module_deny` admits the pool's server alone.
@@ -1667,10 +1478,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // The class-routed opcodes are split across small category handlers below
 // so the top-level match stays readable and each concern is local.
 
-/// Telemetry ring ops. `TLM_EMIT` is an implicit primitive (any module);
-/// `TLM_SUBSCRIBE`/`DRAIN`/`STATS` are gated by the read-only `observe`
-/// permission upstream in `check_privileged_internal_op`. `ELASTIC_ALLOC`
-/// (`resource` contract): grant a Tier B chunk from the kernel elastic region
+/// `ELASTIC_ALLOC` (`resource` contract): grant a Tier B chunk from the kernel elastic region
 /// to the calling module. arg in `[bytes u32 LE]`, out `[ptr u64 LE]`; returns
 /// granted bytes or an accounted `ENOSPC`. EL0-isolated modules cannot reach
 /// this op at all — their SVC surface carries no `provider_call` — so grants

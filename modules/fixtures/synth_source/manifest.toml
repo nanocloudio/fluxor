@@ -1,4 +1,5 @@
 version = "1.0.0"
+type = "Source"
 hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # Synthetic byte source: emits `size` bytes on every IOCTL_NOTIFY

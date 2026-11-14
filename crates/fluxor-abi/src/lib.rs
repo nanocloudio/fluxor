@@ -54,7 +54,7 @@ pub mod wire;
 pub mod config;
 
 /// Every ABI number, generated from `abi/registry.toml` by `fluxor
-/// abi-regen`: contract ids, opcodes, permission bits, errno, poll bits,
+/// abi-regen`: contract ids, opcodes, grants, errno, poll bits,
 /// ioctl commands and fd tags, with the lookups the kernel and tools derive
 /// from them.
 pub mod registry;
@@ -208,6 +208,7 @@ pub mod platform {
         pub mod pio;
         pub mod pio_raw;
         pub mod pwm_raw;
+        pub mod raw_claim;
         pub mod spi9_raw;
         pub mod spi_raw;
         pub mod uart_raw;

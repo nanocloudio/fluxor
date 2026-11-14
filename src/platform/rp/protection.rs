@@ -312,8 +312,8 @@ pub fn register(module: usize) -> bool {
     // read and execute all of flash — it is the kernel's memory, not its
     // code, that `contained` protects — which also serves a module whose
     // code is too large for PMSAv7 to draw at its page alignment.
-    let contained = crate::kernel::exec::scheduler::module_protection_level(module)
-        == crate::kernel::exec::scheduler::protection_level::CONTAINED;
+    let contained = crate::kernel::exec::scheduler::module_level(module)
+        == fluxor_contracts::isolation::Level::Contained;
     let (code_base, code_len) = if contained {
         (chip::FLASH_BASE as u64, chip::FLASH_SIZE as u64)
     } else {

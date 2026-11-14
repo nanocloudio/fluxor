@@ -128,6 +128,13 @@ struct PeripheralConfig {
     dma_ctrl_trig: Option<std::collections::BTreeMap<String, Vec<u32>>>,
     dma_chan_abort_offset: Option<String>,
     pio_count: Option<u8>,
+    spi_bases: Option<Vec<String>>,
+    spi_dreq: Option<Vec<Vec<u8>>>,
+    i2c_bases: Option<Vec<String>>,
+    i2c_dreq: Option<Vec<Vec<u8>>>,
+    uart_bases: Option<Vec<String>>,
+    uart_dreq: Option<Vec<Vec<u8>>>,
+    adc_base: Option<String>,
     pio0_base: Option<String>,
     uart0_base: Option<String>,
     resets_uart0_bit: Option<u32>,
@@ -792,6 +799,56 @@ fn generate_chip_rs(
         "pio_count {pio_count} is outside the RP range"
     );
     emit_const(&mut g, "PIO_COUNT", "u8", &format!("{pio_count}"));
+
+    // The buses the raw bridges drive: each bus's register block and the
+    // [tx, rx] DREQs that pace DMA from it, by bus number. A bus the die
+    // does not have is `None`, so no index reaches another block.
+    for (what, bases, dreq) in [
+        ("SPI", &p.spi_bases, &p.spi_dreq),
+        ("I2C", &p.i2c_bases, &p.i2c_dreq),
+        ("UART", &p.uart_bases, &p.uart_dreq),
+    ] {
+        let lower = what.to_ascii_lowercase();
+        let bases = bases
+            .as_ref()
+            .unwrap_or_else(|| panic!("[peripherals] {lower}_bases is required"));
+        let dreq = dreq
+            .as_ref()
+            .unwrap_or_else(|| panic!("[peripherals] {lower}_dreq is required"));
+        assert_eq!(
+            bases.len(),
+            dreq.len(),
+            "{lower}_bases and {lower}_dreq differ in length"
+        );
+        emit_const(
+            &mut g,
+            &format!("{what}_COUNT"),
+            "u8",
+            &format!("{}", bases.len()),
+        );
+        g.push_str(&format!(
+            "/// The register block of {what} bus `bus`.\npub const fn {lower}_base(bus: u8) -> Option<usize> {{\n    match bus {{\n"
+        ));
+        for (i, b) in bases.iter().enumerate() {
+            g.push_str(&format!("        {i} => Some({:#010X}),\n", parse_hex(b)));
+        }
+        g.push_str("        _ => None,\n    }\n}\n");
+        g.push_str(&format!(
+            "/// The DMA DREQs of {what} bus `bus`, as (tx, rx).\npub const fn {lower}_dreq(bus: u8) -> Option<(u8, u8)> {{\n    match bus {{\n"
+        ));
+        for (i, d) in dreq.iter().enumerate() {
+            assert_eq!(d.len(), 2, "{lower}_dreq entries are [tx, rx]");
+            g.push_str(&format!("        {i} => Some(({}, {})),\n", d[0], d[1]));
+        }
+        g.push_str("        _ => None,\n    }\n}\n");
+    }
+    emit_hex_const(
+        &mut g,
+        "ADC_BASE",
+        p.adc_base
+            .as_deref()
+            .unwrap_or_else(|| panic!("[peripherals] adc_base is required")),
+    );
 
     // RP2040 has 8 PWM slices and RP2350 has 12. The bound is per silicon
     // rather than the wider of the two: a slice index the die does not

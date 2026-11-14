@@ -6,56 +6,14 @@
 //!
 //! A requested level is a floor. A target provides the weakest level it
 //! implements that is at least the one asked for, and refuses a request above
-//! everything it implements. `none` and `guarded` are implemented everywhere:
-//! every kernel steps every module under the step guard. `contained` and
+//! everything it implements. `privileged` is implemented everywhere: every
+//! kernel steps every module under the step guard. `contained` and
 //! `isolated` are implemented where a backend is compiled in, which the
 //! target publishes as `[isolation] levels`.
 
 use serde_json::Value;
 
-/// A protection level, ordered from weakest. The discriminant is the wire
-/// value of config tag 0xF5; `>= Contained` means the module is gated
-/// (unprivileged, reaching the kernel only through the gateway).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Level {
-    None = 0,
-    Guarded = 1,
-    Contained = 2,
-    Isolated = 3,
-}
-
-impl Level {
-    pub const ALL: [Level; 4] = [
-        Level::None,
-        Level::Guarded,
-        Level::Contained,
-        Level::Isolated,
-    ];
-
-    pub fn parse(s: &str) -> Option<Level> {
-        match s {
-            "none" => Some(Level::None),
-            "guarded" => Some(Level::Guarded),
-            "contained" => Some(Level::Contained),
-            "isolated" => Some(Level::Isolated),
-            _ => None,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Level::None => "none",
-            Level::Guarded => "guarded",
-            Level::Contained => "contained",
-            Level::Isolated => "isolated",
-        }
-    }
-
-    /// Whether a module at this level is unprivileged behind the gateway.
-    pub fn is_gated(self) -> bool {
-        self >= Level::Contained
-    }
-}
+pub use fluxor_contracts::isolation::Level;
 
 /// A module's trust tier, the default source of its protection level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,8 +38,7 @@ impl Tier {
     /// The level a tier implies when the graph names none.
     pub fn default_level(self) -> Level {
         match self {
-            Tier::Platform => Level::None,
-            Tier::Verified => Level::Guarded,
+            Tier::Platform | Tier::Verified => Level::Privileged,
             Tier::Community | Tier::Unsigned => Level::Isolated,
         }
     }
@@ -135,7 +92,7 @@ pub fn requested(module: &Value, config: &Value) -> Result<(Tier, Level, Source)
     match explicit {
         Some(p) => {
             let level = Level::parse(p).ok_or_else(|| {
-                format!("invalid protection '{p}' (expected none, guarded, contained or isolated)")
+                format!("invalid protection '{p}' (expected privileged, contained or isolated)")
             })?;
             Ok((tier, level, source))
         }
@@ -148,7 +105,7 @@ pub fn requested(module: &Value, config: &Value) -> Result<(Tier, Level, Source)
 pub fn provided(requested: Level, implemented: &[Level]) -> Option<Level> {
     Level::ALL
         .into_iter()
-        .find(|&l| l >= requested && (l <= Level::Guarded || implemented.contains(&l)))
+        .find(|&l| l >= requested && (!l.is_gated() || implemented.contains(&l)))
 }
 
 /// Resolve `module` against a target that implements `implemented`.
@@ -165,9 +122,9 @@ pub fn resolve(
             Source::Tier(t) => format!("is trust_tier {t:?}, which implies"),
         };
         let has = if implemented.is_empty() {
-            "none and guarded only".to_string()
+            "privileged only".to_string()
         } else {
-            let mut v: Vec<&str> = vec!["none", "guarded"];
+            let mut v: Vec<&str> = vec!["privileged"];
             v.extend(implemented.iter().map(|l| l.name()));
             v.join(", ")
         };
@@ -267,32 +224,28 @@ pub fn code_plannable(code: u64, model: fluxor_contracts::isolation::RegionModel
 pub struct Gated<'a> {
     pub name: &'a str,
     pub level: Level,
-    /// The manifest's permission bits.
-    pub permissions: u16,
+    /// The module's grants: contracts, then op-level grants.
+    pub grants: [u64; 2],
     /// Contracts the module provides.
     pub provides: &'a [String],
     /// Bytes of code, for the isolated code-region check.
     pub code: u64,
 }
 
-/// Permission bits that reach past the gateway, and their manifest names.
-pub const BEYOND_GATEWAY: &[(u16, &str)] = &[
-    (crate::manifest::permission::RECONFIGURE, "reconfigure"),
-    (crate::manifest::permission::FLASH_RAW, "flash_raw"),
-    (crate::manifest::permission::PLATFORM_RAW, "platform_raw"),
-    (crate::manifest::permission::MONITOR, "monitor"),
-    (crate::manifest::permission::BRIDGE, "bridge"),
-    (crate::manifest::permission::PCIE_DEVICE, "pcie_device"),
-    (crate::manifest::permission::DMA, "dma"),
-    (crate::manifest::permission::USB_HOST, "usb_host"),
-    (crate::manifest::permission::VAULT_STORE, "vault_store"),
-];
+/// The grants in `grants` a gated module may not hold, by name: the
+/// registry's `reach = "kernel"` contracts and op-level grants.
+pub fn beyond_gateway(grants: [u64; 2]) -> Vec<&'static str> {
+    crate::manifest::grant_names([
+        grants[0] & fluxor_abi::registry::CONTRACT_REACH_KERNEL,
+        grants[1] & fluxor_abi::registry::grant::REACH_KERNEL,
+    ])
+}
 
 /// Why a graph's gated modules cannot be admitted on a target with
 /// `isolated_slots` slots (0 = no limit stated); empty when they can.
 ///
 /// Refused: more isolated modules than there are slots; a gated module
-/// holding any permission that reaches past the gateway; a gated module that
+/// holding any grant that reaches past the gateway; a gated module that
 /// provides a contract, since other modules' calls into it would run its code
 /// privileged.
 pub fn gated_refusals(
@@ -326,14 +279,10 @@ pub fn gated_refusals(
         ));
     }
     for g in gated {
-        let held: Vec<&str> = BEYOND_GATEWAY
-            .iter()
-            .filter(|(bit, _)| g.permissions & bit != 0)
-            .map(|(_, name)| *name)
-            .collect();
+        let held = beyond_gateway(g.grants);
         if !held.is_empty() {
             out.push(format!(
-                "{} is {} but holds permission(s) {}, which reach past the gateway",
+                "{} is {} but holds {}, which reach past the gateway",
                 g.name,
                 g.level.name(),
                 held.join(", ")
@@ -423,21 +372,21 @@ mod tests {
 
     #[test]
     fn a_request_is_a_floor() {
-        use Level::{Contained, Guarded, Isolated};
+        use Level::{Contained, Isolated, Privileged};
         assert_eq!(provided(Contained, &[Isolated]), Some(Isolated));
         assert_eq!(provided(Contained, &[Contained, Isolated]), Some(Contained));
         assert_eq!(provided(Isolated, &[Contained]), Option::None);
-        assert_eq!(provided(Guarded, &[]), Some(Guarded));
-        assert_eq!(provided(Level::None, &[Isolated]), Some(Level::None));
+        assert_eq!(provided(Privileged, &[]), Some(Privileged));
+        assert_eq!(provided(Privileged, &[Isolated]), Some(Privileged));
     }
 
     #[test]
     fn module_beats_graph_beats_tier() {
-        let cfg = json!({"protection": "guarded", "default_trust_tier": "community"});
+        let cfg = json!({"protection": "privileged", "default_trust_tier": "community"});
         let m = json!({"name": "x", "protection": "contained"});
         assert_eq!(requested(&m, &cfg).unwrap().1, Level::Contained);
         let m = json!({"name": "x"});
-        assert_eq!(requested(&m, &cfg).unwrap().1, Level::Guarded);
+        assert_eq!(requested(&m, &cfg).unwrap().1, Level::Privileged);
         let cfg = json!({"default_trust_tier": "community"});
         let (tier, level, _) = requested(&m, &cfg).unwrap();
         assert_eq!((tier, level), (Tier::Community, Level::Isolated));
@@ -447,13 +396,17 @@ mod tests {
     fn the_default_tier_is_honoured_under_graph() {
         let cfg = json!({"graph": {"default_trust_tier": "verified"}});
         let m = json!({"name": "x"});
-        assert_eq!(requested(&m, &cfg).unwrap().1, Level::Guarded);
+        assert_eq!(requested(&m, &cfg).unwrap().1, Level::Privileged);
     }
 
     #[test]
     fn unknown_strings_are_errors() {
         let cfg = json!({});
         assert!(requested(&json!({"name": "x", "protection": "sandboxed"}), &cfg).is_err());
+        // `guarded` and `none` named a protection the kernel never gave: the
+        // step guard runs every module.
+        assert!(requested(&json!({"name": "x", "protection": "guarded"}), &cfg).is_err());
+        assert!(requested(&json!({"name": "x", "protection": "none"}), &cfg).is_err());
         assert!(requested(&json!({"name": "x", "trust_tier": "trusted"}), &cfg).is_err());
     }
 
@@ -463,7 +416,7 @@ mod tests {
         let g = |name| Gated {
             name,
             level: Level::Isolated,
-            permissions: 0,
+            grants: [0; 2],
             provides: &none,
             code: 1024,
         };
@@ -478,7 +431,7 @@ mod tests {
         let c = Gated {
             name: "c",
             level: Level::Contained,
-            permissions: 0,
+            grants: [0; 2],
             provides: &none,
             code: 1024,
         };
@@ -486,28 +439,30 @@ mod tests {
     }
 
     #[test]
-    fn a_gated_module_holds_no_permission_past_the_gateway() {
+    fn a_gated_module_holds_no_grant_past_the_gateway() {
         let none: Vec<String> = Vec::new();
         let raw = Gated {
             name: "drv",
             level: Level::Isolated,
-            permissions: crate::manifest::permission::PLATFORM_RAW
-                | crate::manifest::permission::DMA,
+            grants: [
+                1u64 << fluxor_abi::registry::metal_device::ID,
+                1u64 << fluxor_abi::registry::grant::METAL_DEVICE_DMA,
+            ],
             provides: &none,
             code: 1024,
         };
         let r = gated_refusals(&[raw], 0, "x", None);
-        assert!(r[0].contains("platform_raw, dma"), "{r:?}");
+        assert!(r[0].contains("metal_device, metal_device.dma"), "{r:?}");
         let observe = Gated {
             name: "obs",
             level: Level::Isolated,
-            permissions: crate::manifest::permission::OBSERVE,
+            grants: [1u64 << fluxor_abi::registry::telemetry::ID, 0],
             provides: &none,
             code: 1024,
         };
         assert!(
             gated_refusals(&[observe], 0, "x", None).is_empty(),
-            "OBSERVE is read-only"
+            "telemetry is read-only"
         );
     }
 
@@ -517,7 +472,7 @@ mod tests {
         let p = Gated {
             name: "fs",
             level: Level::Contained,
-            permissions: 0,
+            grants: [0; 2],
             provides: &provides,
             code: 1024,
         };
@@ -543,7 +498,7 @@ mod tests {
         let big = Gated {
             name: "ip",
             level: Level::Isolated,
-            permissions: 0,
+            grants: [0; 2],
             provides: &none,
             code: 40 * 1024,
         };
@@ -552,7 +507,7 @@ mod tests {
         let big = Gated {
             name: "ip",
             level: Level::Contained,
-            permissions: 0,
+            grants: [0; 2],
             provides: &none,
             code: 40 * 1024,
         };
@@ -564,7 +519,7 @@ mod tests {
         let cfg = json!({});
         let m = json!({"name": "x", "trust_tier": "community"});
         let e = resolve(&m, &cfg, &[Level::Contained]).unwrap_err();
-        assert!(e.contains("none, guarded, contained"), "{e}");
+        assert!(e.contains("privileged, contained"), "{e}");
         let r = resolve(
             &json!({"name": "x", "trust_tier": "community", "protection": "contained"}),
             &cfg,
@@ -578,7 +533,7 @@ mod tests {
     fn a_gated_modules_params_fit_its_stack_budget() {
         assert!(params_fit(Level::Isolated, PARAMS_BUDGET as usize).is_ok());
         assert!(
-            params_fit(Level::None, 4096).is_ok(),
+            params_fit(Level::Privileged, 4096).is_ok(),
             "an ungated module's params are the kernel's"
         );
         let e = params_fit(Level::Contained, PARAMS_BUDGET as usize + 1).unwrap_err();
@@ -603,7 +558,7 @@ mod tests {
         let w = (0x4000_0000, 0x4000);
         assert_eq!(window_refusal(w, Level::Isolated, true, v7), None);
         assert_eq!(window_refusal(w, Level::Contained, true, v7), None);
-        assert!(window_refusal(w, Level::Guarded, true, v7).is_some());
+        assert!(window_refusal(w, Level::Privileged, true, v7).is_some());
         assert!(window_refusal(w, Level::Isolated, false, v7).is_some());
         // 16 bytes off every boundary a 256-byte region's eighths fall on.
         assert!(window_refusal((0x4000_0010, 0x100), Level::Isolated, true, v7).is_some());

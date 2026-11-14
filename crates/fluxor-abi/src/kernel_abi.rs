@@ -284,10 +284,12 @@ pub mod errno {
     /// with a larger buffer. Used by FS_READDIR when one entry
     /// doesn't fit and no progress could be made.
     pub use super::super::registry::errno::E2BIG;
-    /// Permission denied (capability check failed).
+    /// Refused: the caller does not hold the op's grant.
     pub use super::super::registry::errno::EACCES;
     /// Resource temporarily unavailable — try again.
     pub use super::super::registry::errno::EAGAIN;
+    /// The handle is not the caller's: free, or another module's.
+    pub use super::super::registry::errno::EBADF;
     /// Resource busy.
     pub use super::super::registry::errno::EBUSY;
     /// Entry already exists. `LINK` against a name that is taken.
@@ -485,7 +487,7 @@ pub mod timer {
     /// `TRUSTED_UNIX`, its uncertainty growing with the anchor's age, until
     /// the anchor goes stale (one hour without a fresh one). `EINVAL` for an anchor that cannot be true (a
     /// Unix time before 2024, or a monotonic instant in the future).
-    /// Privileged (`platform_raw`): whoever anchors the clock decides every
+    /// Privileged (`timer.discipline`): whoever anchors the clock decides every
     /// credential's validity window. `ENOSYS` on a platform whose wall clock
     /// does not come from this anchor (bcm2712 is the one that does).
     pub use super::super::registry::timer::DISCIPLINE;
@@ -601,7 +603,7 @@ pub use super::registry::kernel::HANDLE_POLL;
 pub use super::registry::kernel::LOG_WRITE;
 /// Write raw bytes to the platform debug serial sink (binary-safe, unlike
 /// LOG_WRITE which UTF-8-filters). arg=bytes, arg_len=count. Returns bytes
-/// accepted. The telemetry `transport_buffer` sink; `platform_raw`-gated. `kernel::SERIAL_WRITE` is
+/// accepted. The telemetry `transport_buffer` sink; needs `kernel.serial`. `kernel::SERIAL_WRITE` is
 /// the slot the dispatch comment reserves for "raw UART / USB writes", beside
 /// LOG_RING_DRAIN (`diag::LOG_RING_DRAIN`) / FAN_DIAG_SNAPSHOT (`diag::FAN_DIAG_SNAPSHOT`).
 pub use super::registry::kernel::SERIAL_WRITE;
@@ -839,7 +841,7 @@ pub use super::registry::kernel::MODULE_FLOW_BUDGET;
 
 /// Raise software-generated interrupt `sgi` (0..=15) on core `core`: the
 /// stimulus a Tier-2 module that owns an SGI is tested with. handle=-1,
-/// arg=[core:u8, sgi:u8] (2 bytes). Requires `platform_raw`. Returns 0,
+/// arg=[core:u8, sgi:u8] (2 bytes). Needs `kernel.signal_core`. Returns 0,
 /// `EINVAL` for a core the machine does not have or an `sgi` above 15, or
 /// `ENOSYS` where the machine has no generic interrupt controller.
 pub use super::registry::kernel::SIGNAL_CORE;

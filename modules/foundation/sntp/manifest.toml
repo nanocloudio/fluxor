@@ -1,6 +1,6 @@
 version = "0.1.0"
 hardware_targets = ["bcm2712", "uefi", "rp2350"]
-permissions = ["platform_raw"]
+grants = ["timer.discipline"]
 
 # SNTP client (RFC 4330) that anchors the platform's wall clock on a board
 # with no RTC and no operating system to run a time protocol — the source of
@@ -26,7 +26,7 @@ permissions = ["platform_raw"]
 # `DENY` / `RSTR` stop all requests to that server, `RATE` holds it off for
 # a poll interval.
 #
-# Privileged (`platform_raw`): DISCIPLINE decides every validity window on
+# Privileged (`timer.discipline`): DISCIPLINE decides every validity window on
 # the node. Unauthenticated NTP is the same trust Linux gives chrony/timesyncd
 # by default; a signed source (roughtime / NTS) is the upgrade path.
 #

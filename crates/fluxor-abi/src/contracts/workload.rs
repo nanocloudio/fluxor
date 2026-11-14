@@ -70,7 +70,7 @@
 
 /// `CREATE` — admit and instantiate a workload from a spec (below); returns a
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
-/// workload-admit grant (`requires_contract = "workload"` + `platform_raw`).
+/// `workload.create` grant.
 /// Identity in the spec is mapped to an owner and lease-gated before any
 /// backend mechanism runs. The null identity names no one and is refused
 /// (`EINVAL`). One identity is one workload: a `CREATE` for an identity that
@@ -140,7 +140,7 @@ pub const MAX_CALLER_LANES: usize = 8;
 // `ip`) claims the role with `NET_PROVIDE` and takes the lane changes the
 // kernel queues for it with `NET_LANE_TAKE`. Only the provider may call
 // `NET_LANE_TAKE` and `NET_LANE_ADMIT`; none of the three creates anything,
-// so they need the workload contract grant but not `platform_raw`.
+// so they need `workload.net`, not `workload.create`.
 
 /// `NET_LANE_ADMIT` — may a lane's owner bind a new endpoint? `arg` is a
 /// [`net_lane::ADMIT_LEN`]-byte request: `[owner slot:u16 LE][0:u16]
@@ -177,7 +177,7 @@ pub use super::super::registry::workload::NET_PROVIDE;
 /// length, `ENOENT` when the owner carried none (the node's own upstream
 /// serves it), `ERANGE` when `arg` is too short, or `EACCES` for a caller
 /// that is not the provider. Like the lane ops it creates nothing and needs
-/// the workload contract grant but not `platform_raw`.
+/// `workload.net`, not `workload.create`.
 pub use super::super::registry::workload::NET_RESOLVER;
 
 /// The per-owner name-service context: a Tier-2 option on [`CREATE`],

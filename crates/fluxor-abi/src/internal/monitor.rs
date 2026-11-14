@@ -34,19 +34,17 @@ pub use super::super::registry::monitor::FAULT_STATS_QUERY;
 ///   [2]      flags: u8    — bit0 present, bit1 ready, bit2 finished
 ///   [3]      fault_state: u8  — 0 Running, 1 Faulted, 2 Recovering,
 ///                               3 Terminated
-///   [4]      cap_class: u8
-///   [5]      step_period: u8  — ticks between steps, 0 = every tick
-///   [6..8]   permissions: u16
-///   [8]      domain_id: u8
-///   [9]      protection: u8 — the level the kernel enforces: 0 none,
-///                               1 guarded, 2 contained, 3 isolated
-///   [10..12] restart_count: u16
-///   [12..16] inactive_for_ticks: u32 — consecutive ticks the readiness
+///   [4]      step_period: u8  — ticks between steps, 0 = every tick
+///   [5]      domain_id: u8
+///   [6]      protection: u8 — the level the kernel enforces: 0
+///                               privileged, 1 contained, 2 isolated
+///   [7]      name_len: u8 — 0 when the buffer had no room for a name
+///   [8..10]  restart_count: u16
+///   [10..14] inactive_for_ticks: u32 — consecutive ticks the readiness
 ///                               gate has blocked this module
-///   [16..20] slot_generation: u32
-///   [20]     name_len: u8 — 0 when the buffer had no room for a name
-///   [21]     0
-///   [22..]   name: name_len bytes — the module's type name
+///   [14..18] slot_generation: u32
+///   [18..34] grants: [u64; 2] — contracts, then op-level grants
+///   [34..]   name: name_len bytes — the module's type name
 /// ```
 ///
 /// Returns the number of bytes written, so a caller learns the width it
@@ -63,7 +61,7 @@ pub use super::super::registry::monitor::STEP_HISTOGRAM_QUERY;
 
 /// The fixed header `MODULE_STATE_QUERY` always writes. A variable
 /// name may follow it when the caller's buffer is larger.
-pub const MODULE_STATE_LEN: usize = 22;
+pub const MODULE_STATE_LEN: usize = 34;
 
 /// Longest module name the query will copy.
 pub const MODULE_STATE_NAME_MAX: usize = 32;
@@ -76,15 +74,14 @@ pub mod module_state_off {
     pub const IDX: usize = 0;
     pub const FLAGS: usize = 2;
     pub const FAULT_STATE: usize = 3;
-    pub const CAP_CLASS: usize = 4;
-    pub const STEP_PERIOD: usize = 5;
-    pub const PERMISSIONS: usize = 6;
-    pub const DOMAIN_ID: usize = 8;
-    pub const PROTECTION: usize = 9;
-    pub const RESTART_COUNT: usize = 10;
-    pub const INACTIVE_FOR_TICKS: usize = 12;
-    pub const SLOT_GENERATION: usize = 16;
-    pub const NAME_LEN: usize = 20;
+    pub const STEP_PERIOD: usize = 4;
+    pub const DOMAIN_ID: usize = 5;
+    pub const PROTECTION: usize = 6;
+    pub const NAME_LEN: usize = 7;
+    pub const RESTART_COUNT: usize = 8;
+    pub const INACTIVE_FOR_TICKS: usize = 10;
+    pub const SLOT_GENERATION: usize = 14;
+    pub const GRANTS: usize = 18;
 }
 
 /// `MODULE_STATE_QUERY` flag bits in output byte 2.

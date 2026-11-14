@@ -17,7 +17,33 @@ use crate::platform::rp_pio_regs as pio_regs;
 use crate::platform::rp_pio_regs::addr::SmReg;
 use crate::platform::rp_regs::{read32, write32};
 
+use crate::abi::platform::rp::raw_claim::family;
+use crate::platform::chip;
+
 const E_INVAL: i32 = errno::EINVAL;
+
+/// The handle tag of a raw instance claim: the `rp_raw` contract's.
+const RAW_TAG: i32 = crate::abi::registry::rp_raw::FD_TAG;
+
+/// IO_BANK0 function selects of the bus peripherals, the same on both dies.
+const FUNCSEL_SPI: u32 = 1;
+const FUNCSEL_UART: u32 = 2;
+const FUNCSEL_I2C: u32 = 3;
+/// `FUNCSEL` 31 detaches a pin from every peripheral (an analog input).
+const FUNCSEL_NULL: u32 = 31;
+
+/// PL022 (SPI) register offsets.
+const PL022_CR1: usize = 0x04;
+const PL022_DR: usize = 0x08;
+const PL022_CR1_SSE: u32 = 1 << 1;
+/// PL011 (UART) control register and its enables.
+const PL011_CR: usize = 0x30;
+const PL011_CR_UARTEN: u32 = 1 << 0;
+const PL011_CR_TXE: u32 = 1 << 8;
+const PL011_CR_RXE: u32 = 1 << 9;
+/// DW_apb_i2c data/command and enable registers.
+const DW_I2C_DATA_CMD: usize = 0x10;
+const DW_I2C_ENABLE: usize = 0x6C;
 const E_NOSYS: i32 = errno::ENOSYS;
 const E_NOMEM: i32 = errno::ENOMEM;
 
@@ -27,6 +53,28 @@ const E_NOMEM: i32 = errno::ENOMEM;
 
 /// Bitmap of allocated DMA channels. CH0-CH7 pre-marked at boot.
 static DMA_CHANNELS_USED: AtomicU16 = AtomicU16::new(0x00FF); // CH0-CH7 reserved
+
+/// The module each allocated channel belongs to (`NO_MODULE` for the
+/// kernel's own and for free ones). A raw channel number is a handle the
+/// allocator gave one module; no other may start, poll or free it.
+static DMA_CHANNEL_OWNER: [AtomicU16; 16] = [const { AtomicU16::new(NO_MODULE) }; 16];
+
+/// Whether channel `ch` is one the module being stepped allocated.
+fn owns_channel(ch: u8) -> bool {
+    (ch as usize) < DMA_CHANNEL_OWNER.len()
+        && DMA_CHANNEL_OWNER[ch as usize].load(Ordering::Acquire)
+            == crate::kernel::exec::scheduler::current_module_id()
+}
+
+/// Free every channel `module` allocated and still holds.
+fn release_channels_owned_by(module: ModuleId) {
+    for (ch, owner) in DMA_CHANNEL_OWNER.iter().enumerate() {
+        if owner.load(Ordering::Acquire) == module {
+            let _ = dma_abort(ch as u8);
+            let _ = dma_free_channel(ch as u8);
+        }
+    }
+}
 
 /// Channels this silicon actually implements, as a mask.
 ///
@@ -65,6 +113,10 @@ pub(crate) fn dma_alloc_channel() -> i32 {
             )
             .is_ok()
         {
+            DMA_CHANNEL_OWNER[ch as usize].store(
+                crate::kernel::exec::scheduler::current_module_id(),
+                Ordering::Release,
+            );
             return ch as i32;
         }
     }
@@ -74,6 +126,7 @@ pub(crate) fn dma_free_channel(ch: u8) -> i32 {
     if !(8..=15).contains(&ch) {
         return E_INVAL;
     }
+    DMA_CHANNEL_OWNER[ch as usize].store(NO_MODULE, Ordering::Release);
     let bit = 1u16 << ch;
     DMA_CHANNELS_USED.fetch_and(!bit, core::sync::atomic::Ordering::Release);
     0
@@ -824,19 +877,27 @@ unsafe fn rp_system_extension_dispatch(
     use crate::abi::internal::flash;
     use crate::abi::kernel_abi::SYS_CLOCK_HZ;
     use crate::abi::platform::rp::{
-        adc_raw, dma_raw, i2c_raw, pio_raw, pwm_raw, spi9_raw, spi_raw, uart_raw,
+        adc_raw, dma_raw, i2c_raw, pio_raw, pwm_raw, raw_claim, spi9_raw, spi_raw, uart_raw,
     };
     match opcode {
+        // ── Raw instance claims ─────────────────────────────────────
+        raw_claim::CLAIM => {
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
+            raw_claim_instance(*arg, *arg.add(1))
+        }
+        raw_claim::RELEASE => raw_release(handle),
         // ── Raw PWM register bridge ─────────────────────────────────
         pwm_raw::PIN_ENABLE => {
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
             let pin = *arg as usize;
-            if pin >= gpio::runtime_max_gpio() as usize {
-                return E_INVAL;
+            if let Err(e) = own_pins(&[*arg]) {
+                return e;
             }
-            // SAFETY: `pin` is bounded by the runtime GPIO count above.
+            // SAFETY: a pin of this die the caller owns.
             unsafe {
                 gpio_regs::set_function(pin as u8, PWM_FUNCSEL);
                 gpio_regs::set_pad_output(pin as u8, gpio_regs::Drive::Ma4);
@@ -848,8 +909,8 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let pin = *arg as usize;
-            if pin >= gpio::runtime_max_gpio() as usize {
-                return E_INVAL;
+            if let Err(e) = own_pins(&[*arg]) {
+                return e;
             }
             // SAFETY: as PIN_ENABLE.
             unsafe { gpio_regs::set_function(pin as u8, FUNCSEL_NONE) };
@@ -859,17 +920,17 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 6 {
                 return E_INVAL;
             }
-            let slice = *arg as usize;
+            let slice = match owned_named(handle, family::PWM, *arg) {
+                Ok(i) => i as usize,
+                Err(e) => return e,
+            };
             let reg = *arg.add(1);
             let value = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            if slice >= crate::platform::chip::PWM_SLICES as usize {
-                return E_INVAL;
-            }
             let Some(addr) = gpio_regs::pwm::reg(PWM_BASE as usize, slice, reg) else {
                 return E_INVAL;
             };
-            // SAFETY: `slice` is below this silicon's slice count and `reg` is
-            // one of the five the block defines, so the address is inside it.
+            // SAFETY: `slice` is a slice of this die the caller has claimed,
+            // and `reg` one of the five the block defines.
             unsafe { write32(addr, value) };
             0
         }
@@ -877,11 +938,11 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 2 {
                 return E_INVAL;
             }
-            let slice = *arg as usize;
+            let slice = match owned_named(handle, family::PWM, *arg) {
+                Ok(i) => i as usize,
+                Err(e) => return e,
+            };
             let reg = *arg.add(1);
-            if slice >= crate::platform::chip::PWM_SLICES as usize {
-                return E_INVAL;
-            }
             let Some(addr) = gpio_regs::pwm::reg(PWM_BASE as usize, slice, reg) else {
                 return E_INVAL;
             };
@@ -894,8 +955,9 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let sm = *arg.add(1);
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             if !pio_regs::is_state_machine(sm) {
                 return E_INVAL;
@@ -911,8 +973,9 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let sm_idx = *arg.add(1);
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             if !pio_regs::is_state_machine(sm_idx) {
                 return E_INVAL;
@@ -933,8 +996,9 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let sm_idx = *arg.add(1);
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             if !pio_regs::is_state_machine(sm_idx) {
                 return E_INVAL;
@@ -951,8 +1015,9 @@ unsafe fn rp_system_extension_dispatch(
             }
             let mask = *arg.add(1) & 0x0F;
             let enable = *arg.add(2);
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             // SAFETY: `base` is an implemented instance.
             unsafe { pio_regs::set_enabled(base, mask, enable != 0) };
@@ -964,7 +1029,10 @@ unsafe fn rp_system_extension_dispatch(
             }
             let pio_num = *arg;
             let count = *arg.add(1);
-            if pio_regs::instance(pio_num).is_none() || count == 0 || count > 32 {
+            if let Err(e) = owned_pio(handle, pio_num) {
+                return e;
+            }
+            if count == 0 || count > 32 {
                 return E_INVAL;
             }
             match pio_util::alloc_instruction_slots(pio_num, count as usize) {
@@ -987,8 +1055,9 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let slot = *arg.add(1);
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             if !pio_regs::is_instr_slot(slot) {
                 return E_INVAL;
@@ -1003,8 +1072,8 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let pio_num = *arg;
-            if pio_regs::instance(pio_num).is_none() {
-                return E_INVAL;
+            if let Err(e) = owned_pio(handle, pio_num) {
+                return e;
             }
             let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             pio_util::free_instruction_slots(pio_num, mask);
@@ -1017,10 +1086,11 @@ unsafe fn rp_system_extension_dispatch(
             let pin = *arg;
             let pio_num = *arg.add(1);
             let pull = *arg.add(2);
-            if pio_regs::instance(pio_num).is_none()
-                || pin as usize >= gpio::runtime_max_gpio() as usize
-            {
-                return E_INVAL;
+            if let Err(e) = owned_pio(handle, pio_num) {
+                return e;
+            }
+            if let Err(e) = own_pins(&[pin]) {
+                return e;
             }
             let pio_pull = match pull {
                 0 => pio_util::PioPull::None,
@@ -1036,8 +1106,8 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let pin = *arg;
-            if pin as usize >= gpio::runtime_max_gpio() as usize {
-                return E_INVAL;
+            if let Err(e) = own_pins(&[pin]) {
+                return e;
             }
             // SAFETY: a pin the caller set up for PIO; the pad's input
             // buffer is enabled by that setup, so the level is real.
@@ -1051,8 +1121,9 @@ unsafe fn rp_system_extension_dispatch(
                     return E_INVAL;
                 }
                 let base16 = *arg.add(1);
-                let Some(base) = pio_regs::instance(*arg) else {
-                    return E_INVAL;
+                let base = match owned_pio(handle, *arg) {
+                    Ok(b) => b,
+                    Err(e) => return e,
                 };
                 // SAFETY: `base` is an implemented instance, and GPIOBASE
                 // exists on this silicon (the cfg around this arm).
@@ -1069,8 +1140,9 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let sm = *arg.add(1);
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             if !pio_regs::is_state_machine(sm) {
                 return E_INVAL;
@@ -1084,8 +1156,9 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             // SAFETY: `base` is an implemented instance.
             unsafe { read32(base + pio_regs::addr::FSTAT) as i32 }
@@ -1095,8 +1168,9 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let mask = *arg.add(1) & 0x0F;
-            let Some(base) = pio_regs::instance(*arg) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             // SAFETY: `base` is an implemented instance.
             unsafe { pio_regs::restart(base, mask) };
@@ -1106,14 +1180,11 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 5 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
-            if pio_regs::instance(pio_num).is_none() {
-                return E_INVAL;
-            }
-            let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            let Some(base) = pio_regs::instance(pio_num) else {
-                return E_INVAL;
+            let base = match owned_pio(handle, *arg) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
+            let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             // SAFETY: `base` is an implemented instance.
             unsafe { set_bits_rmw(base + pio_regs::addr::INPUT_SYNC_BYPASS, mask) };
             0
@@ -1131,7 +1202,11 @@ unsafe fn rp_system_extension_dispatch(
             let pio_num = *arg;
             let sm_num = *arg.add(1) as usize;
             let origin = *arg.add(2);
-            if pio_regs::instance(pio_num).is_none() || sm_num >= pio_regs::STATE_MACHINES {
+            let base = match owned_pio(handle, pio_num) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            if sm_num >= pio_regs::STATE_MACHINES {
                 return E_INVAL;
             }
 
@@ -1146,12 +1221,12 @@ unsafe fn rp_system_extension_dispatch(
             let rx_addr =
                 u32::from_le_bytes([*arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23)]);
             let ch_tx = *arg.add(24);
-            let _ch_rx = *arg.add(25);
-
-            // Checked above; `sm_num` is a real state machine.
-            let Some(base) = pio_regs::instance(pio_num) else {
-                return E_INVAL;
-            };
+            let ch_rx = *arg.add(25);
+            // The transfer runs on two channels the caller allocated; it
+            // starts no channel another module holds.
+            if !owns_channel(ch_tx) || !owns_channel(ch_rx) {
+                return errno::EBADF;
+            }
             let sm = sm_num as u8;
             let sm_mask = 1u8 << sm_num;
 
@@ -1213,7 +1288,6 @@ unsafe fn rp_system_extension_dispatch(
             // The caller already has the shape for waiting (its
             // `TxnStep::WaitPio`); this makes the wait real. RX is armed
             // first so its DREQ is watching the FIFO before TX fills it.
-            let ch_rx = _ch_rx;
             crate::platform::rp_providers::dma_start_raw(
                 ch_rx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06,
             );
@@ -1238,6 +1312,9 @@ unsafe fn rp_system_extension_dispatch(
             }
             let ch_tx = *arg;
             let ch_rx = *arg.add(1);
+            if !owns_channel(ch_tx) || !owns_channel(ch_rx) {
+                return errno::EBADF;
+            }
             let busy = dma_busy(ch_tx) == 1 || dma_busy(ch_rx) == 1;
             if !busy {
                 compiler_fence(Ordering::SeqCst);
@@ -1273,11 +1350,17 @@ unsafe fn rp_system_extension_dispatch(
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
+            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
+                return errno::EBADF;
+            }
             dma_free_channel(crate::kernel::ipc::fd::slot_of(handle) as u8)
         }
         dma_raw::channel::START => {
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
+            }
+            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
+                return errno::EBADF;
             }
             if arg.is_null() || arg_len < 14 {
                 return E_INVAL;
@@ -1295,22 +1378,32 @@ unsafe fn rp_system_extension_dispatch(
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
+            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
+                return errno::EBADF;
+            }
             dma_busy(crate::kernel::ipc::fd::slot_of(handle) as u8)
         }
         dma_raw::channel::ABORT => {
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
+            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
+                return errno::EBADF;
+            }
             dma_abort(crate::kernel::ipc::fd::slot_of(handle) as u8)
         }
         spi9_raw::SEND => {
-            // 9-bit SPI bit-bang: send command + data using raw PAC GPIO.
+            // 9-bit SPI bit-bang: send command + data on three pins the
+            // caller owns.
             if arg.is_null() || arg_len < 5 {
                 return E_INVAL;
             }
             let cs = *arg;
             let sck = *arg.add(1);
             let sda = *arg.add(2);
+            if let Err(e) = own_pins(&[cs, sck, sda]) {
+                return e;
+            }
             let cmd = *arg.add(3);
             let data_len = *arg.add(4) as usize;
             if arg_len < 5 + data_len {
@@ -1333,6 +1426,9 @@ unsafe fn rp_system_extension_dispatch(
             let cs = *arg.add(1);
             let sck = *arg.add(2);
             let sda = *arg.add(3);
+            if let Err(e) = own_pins(&[rst, cs, sck, sda]) {
+                return e;
+            }
             spi9_pac_reset(rst, cs, sck, sda);
             0
         }
@@ -1342,47 +1438,44 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let cs = *arg;
+            if let Err(e) = own_pins(&[cs]) {
+                return e;
+            }
             let level = *arg.add(1) != 0;
             spi9_pin_set(cs, level);
             0
         }
-        // ── Raw SPI peripheral bridge ─────────────────────────────────
-        spi_raw::REG_WRITE => {
-            // handle=bus_id, arg=[offset:u8, value:u32 LE]
+        // ── Raw bus bridges: SPI, I2C, UART, ADC ──────────────────────
+        //
+        // `handle` is the caller's claim of the bus (`raw_claim::CLAIM`);
+        // its block and DREQs come from the silicon's generated tables. A
+        // register offset is word-aligned and stays inside the block.
+        spi_raw::REG_WRITE | i2c_raw::REG_WRITE | uart_raw::REG_WRITE | adc_raw::REG_WRITE => {
             if arg.is_null() || arg_len < 5 {
                 return E_INVAL;
             }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4008_0000usize
-            } else {
-                0x4009_0000usize
-            };
-            let offset = (*arg as usize) & 0xFC; // 4-byte aligned
-            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            core::ptr::write_volatile((base + offset) as *mut u32, val);
-            0
-        }
-        spi_raw::REG_READ => {
-            // handle=bus_id, arg=[offset:u8], returns value in arg[1..5]
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4008_0000usize
-            } else {
-                0x4009_0000usize
+            let base = match bus_block(handle, opcode) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
             let offset = (*arg as usize) & 0xFC;
-            let val = core::ptr::read_volatile((base + offset) as *const u32);
-            let bytes = val.to_le_bytes();
+            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            // SAFETY: `base` is a block of this die the caller has claimed,
+            // and the offset stays inside it.
+            unsafe { write32(base + offset, val) };
+            0
+        }
+        spi_raw::REG_READ | i2c_raw::REG_READ | uart_raw::REG_READ | adc_raw::REG_READ => {
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
+            let base = match bus_block(handle, opcode) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let offset = (*arg as usize) & 0xFC;
+            // SAFETY: as REG_WRITE.
+            let bytes = unsafe { read32(base + offset) }.to_le_bytes();
             *arg.add(1) = bytes[0];
             *arg.add(2) = bytes[1];
             *arg.add(3) = bytes[2];
@@ -1390,304 +1483,151 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         spi_raw::BUS_INFO => {
-            // handle=bus_id, returns [dr_addr:u32, tx_dreq:u8, rx_dreq:u8, max_freq:u32, pad:u16]
+            // returns [dr_addr:u32, tx_dreq:u8, rx_dreq:u8, max_freq:u32, pad:u16]
             if arg.is_null() || arg_len < 12 {
                 return E_INVAL;
             }
-            let bus = handle as u8;
-            if bus > 1 {
+            let bus = match owned_instance(handle, family::SPI) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let (Some(base), Some((tx_dreq, rx_dreq))) = (chip::spi_base(bus), chip::spi_dreq(bus))
+            else {
                 return E_INVAL;
-            }
-            let dr_addr: u32 = if bus == 0 { 0x4008_0008 } else { 0x4009_0008 };
-            let tx_dreq: u8 = if bus == 0 { 16 } else { 18 };
-            let rx_dreq: u8 = if bus == 0 { 17 } else { 19 };
+            };
+            let dr = ((base + PL022_DR) as u32).to_le_bytes();
             // SPI's ceiling is Fsys/2, so it moves with the system clock.
-            let max_freq: u32 = crate::platform::chip::SYS_CLK_HZ / 2;
-            let dr = dr_addr.to_le_bytes();
-            *arg = dr[0];
-            *arg.add(1) = dr[1];
-            *arg.add(2) = dr[2];
-            *arg.add(3) = dr[3];
-            *arg.add(4) = tx_dreq;
-            *arg.add(5) = rx_dreq;
-            let mf = max_freq.to_le_bytes();
-            *arg.add(6) = mf[0];
-            *arg.add(7) = mf[1];
-            *arg.add(8) = mf[2];
-            *arg.add(9) = mf[3];
-            *arg.add(10) = 0;
-            *arg.add(11) = 0;
-            0
-        }
-        spi_raw::PIN_INIT => {
-            // handle=bus_id, arg=[clk:u8, mosi:u8, miso:u8]
-            if arg.is_null() || arg_len < 3 {
-                return E_INVAL;
-            }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let funcsel: u32 = 1; // SPI function on RP2350
-            let pins = [*arg, *arg.add(1), *arg.add(2)];
-            let mut i = 0usize;
-            while i < 3 {
-                let pin = pins[i];
-                if pin != 0xFF && pin < 30 {
-                    let pad_base = 0x4003_8004usize + (pin as usize) * 4;
-                    let io_base = 0x4002_8004usize + (pin as usize) * 8;
-                    // Enable pad (IE + drive)
-                    core::ptr::write_volatile(pad_base as *mut u32, 0x56);
-                    // Set funcsel
-                    core::ptr::write_volatile(io_base as *mut u32, funcsel);
-                }
-                i += 1;
-            }
-            0
-        }
-        // ── Raw I2C peripheral bridge ──────────────────────────────────
-        i2c_raw::REG_WRITE => {
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4009_0000usize
-            } else {
-                0x4009_8000usize
-            };
-            let offset = (*arg as usize) & 0xFC;
-            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            core::ptr::write_volatile((base + offset) as *mut u32, val);
-            0
-        }
-        i2c_raw::REG_READ => {
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4009_0000usize
-            } else {
-                0x4009_8000usize
-            };
-            let offset = (*arg as usize) & 0xFC;
-            let val = core::ptr::read_volatile((base + offset) as *const u32);
-            let bytes = val.to_le_bytes();
-            *arg.add(1) = bytes[0];
-            *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2];
-            *arg.add(4) = bytes[3];
+            let mf = (chip::SYS_CLK_HZ / 2).to_le_bytes();
+            let out = [
+                dr[0], dr[1], dr[2], dr[3], tx_dreq, rx_dreq, mf[0], mf[1], mf[2], mf[3], 0, 0,
+            ];
+            core::ptr::copy_nonoverlapping(out.as_ptr(), arg, out.len());
             0
         }
         i2c_raw::BUS_INFO => {
+            // returns [data_cmd_addr:u32, tx_dreq:u8, rx_dreq:u8, pad:u16]
             if arg.is_null() || arg_len < 8 {
                 return E_INVAL;
             }
-            let bus = handle as u8;
-            if bus > 1 {
+            let bus = match owned_instance(handle, family::I2C) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let (Some(base), Some((tx_dreq, rx_dreq))) = (chip::i2c_base(bus), chip::i2c_dreq(bus))
+            else {
                 return E_INVAL;
-            }
-            let data_cmd: u32 = if bus == 0 { 0x4009_0010 } else { 0x4009_8010 }; // IC_DATA_CMD
-            let tx_dreq: u8 = if bus == 0 { 20 } else { 22 }; // I2C0_TX=20, I2C1_TX=22
-            let rx_dreq: u8 = if bus == 0 { 21 } else { 23 };
-            let dc = data_cmd.to_le_bytes();
-            *arg = dc[0];
-            *arg.add(1) = dc[1];
-            *arg.add(2) = dc[2];
-            *arg.add(3) = dc[3];
-            *arg.add(4) = tx_dreq;
-            *arg.add(5) = rx_dreq;
-            *arg.add(6) = 0;
-            *arg.add(7) = 0;
+            };
+            let dc = ((base + DW_I2C_DATA_CMD) as u32).to_le_bytes();
+            let out = [dc[0], dc[1], dc[2], dc[3], tx_dreq, rx_dreq, 0, 0];
+            core::ptr::copy_nonoverlapping(out.as_ptr(), arg, out.len());
             0
         }
+        spi_raw::PIN_INIT => {
+            // arg=[clk:u8, mosi:u8, miso:u8]; 0xFF leaves a line unused.
+            if arg.is_null() || arg_len < 3 {
+                return E_INVAL;
+            }
+            if let Err(e) = owned_instance(handle, family::SPI) {
+                return e;
+            }
+            let pad = gpio_regs::PadConfig::default()
+                .input_enable(true)
+                .drive(gpio_regs::Drive::Ma4);
+            bus_pins(&[*arg, *arg.add(1), *arg.add(2)], FUNCSEL_SPI, pad)
+        }
         i2c_raw::PIN_INIT => {
+            // arg=[sda:u8, scl:u8]: open-drain lines, pulled up.
             if arg.is_null() || arg_len < 2 {
                 return E_INVAL;
             }
-            let funcsel: u32 = 3; // I2C function on RP2350
-            let pins = [*arg, *arg.add(1)];
-            let mut i = 0usize;
-            while i < 2 {
-                let pin = pins[i];
-                if pin != 0xFF && pin < 30 {
-                    let pad_base = 0x4003_8004usize + (pin as usize) * 4;
-                    let io_base = 0x4002_8004usize + (pin as usize) * 8;
-                    // I2C needs pullup + input enable
-                    core::ptr::write_volatile(pad_base as *mut u32, 0x4E); // IE + PUE + drive=4mA
-                    core::ptr::write_volatile(io_base as *mut u32, funcsel);
-                }
-                i += 1;
+            if let Err(e) = owned_instance(handle, family::I2C) {
+                return e;
             }
-            0
+            let pad = gpio_regs::PadConfig::default()
+                .input_enable(true)
+                .schmitt(true)
+                .pull_up(true)
+                .drive(gpio_regs::Drive::Ma4);
+            bus_pins(&[*arg, *arg.add(1)], FUNCSEL_I2C, pad)
+        }
+        uart_raw::PIN_INIT => {
+            // arg=[tx:u8, rx:u8]
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
+            if let Err(e) = owned_instance(handle, family::UART) {
+                return e;
+            }
+            let pad = gpio_regs::PadConfig::default()
+                .input_enable(true)
+                .drive(gpio_regs::Drive::Ma4);
+            bus_pins(&[*arg, *arg.add(1)], FUNCSEL_UART, pad)
+        }
+        adc_raw::PIN_INIT => {
+            // arg=[pin:u8]: one of this die's ADC inputs, made analog.
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
+            if let Err(e) = owned_instance(handle, family::ADC) {
+                return e;
+            }
+            let pin = *arg;
+            if !adc_pins().contains(&pin) {
+                return E_INVAL;
+            }
+            // Analog: no digital input, never driven, no pulls.
+            let pad = gpio_regs::PadConfig::default().output_disable(true);
+            bus_pins(&[pin], FUNCSEL_NULL, pad)
         }
         i2c_raw::SET_ENABLE => {
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4009_0000usize
-            } else {
-                0x4009_8000usize
+            let base = match bus_block(handle, opcode) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
-            // IC_ENABLE at offset 0x6C
-            core::ptr::write_volatile((base + 0x6C) as *mut u32, if *arg != 0 { 1 } else { 0 });
-            0
-        }
-        // ── Raw UART peripheral bridge ─────────────────────────────────
-        uart_raw::REG_WRITE => {
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4007_0000usize
-            } else {
-                0x4007_8000usize
-            };
-            let offset = (*arg as usize) & 0xFC;
-            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            core::ptr::write_volatile((base + offset) as *mut u32, val);
-            0
-        }
-        uart_raw::REG_READ => {
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4007_0000usize
-            } else {
-                0x4007_8000usize
-            };
-            let offset = (*arg as usize) & 0xFC;
-            let val = core::ptr::read_volatile((base + offset) as *const u32);
-            let bytes = val.to_le_bytes();
-            *arg.add(1) = bytes[0];
-            *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2];
-            *arg.add(4) = bytes[3];
-            0
-        }
-        uart_raw::PIN_INIT => {
-            if arg.is_null() || arg_len < 2 {
-                return E_INVAL;
-            }
-            let funcsel: u32 = 2; // UART function on RP2350
-            let pins = [*arg, *arg.add(1)];
-            let mut i = 0usize;
-            while i < 2 {
-                let pin = pins[i];
-                if pin != 0xFF && pin < 30 {
-                    let pad_base = 0x4003_8004usize + (pin as usize) * 4;
-                    let io_base = 0x4002_8004usize + (pin as usize) * 8;
-                    core::ptr::write_volatile(pad_base as *mut u32, 0x56);
-                    core::ptr::write_volatile(io_base as *mut u32, funcsel);
-                }
-                i += 1;
-            }
+            // SAFETY: a claimed block of this die; IC_ENABLE is inside it.
+            unsafe { write32(base + DW_I2C_ENABLE, u32::from(*arg != 0)) };
             0
         }
         uart_raw::SET_ENABLE => {
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4007_0000usize
-            } else {
-                0x4007_8000usize
+            let base = match bus_block(handle, opcode) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
-            // UARTCR at offset 0x30
-            let cr = core::ptr::read_volatile((base + 0x30) as *const u32);
-            if *arg != 0 {
-                core::ptr::write_volatile((base + 0x30) as *mut u32, cr | 0x301);
-            // UARTEN + TXE + RXE
-            } else {
-                core::ptr::write_volatile((base + 0x30) as *mut u32, cr & !1); // clear UARTEN
+            // SAFETY: a claimed block of this die; UARTCR is inside it.
+            unsafe {
+                let cr = read32(base + PL011_CR);
+                let cr = if *arg != 0 {
+                    cr | PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE
+                } else {
+                    cr & !PL011_CR_UARTEN
+                };
+                write32(base + PL011_CR, cr);
             }
             0
         }
-        // ── Raw ADC peripheral bridge ──────────────────────────────────
-        adc_raw::REG_WRITE => {
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let base = 0x400A_0000usize;
-            let offset = (*arg as usize) & 0xFC;
-            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            core::ptr::write_volatile((base + offset) as *mut u32, val);
-            0
-        }
-        adc_raw::REG_READ => {
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let base = 0x400A_0000usize;
-            let offset = (*arg as usize) & 0xFC;
-            let val = core::ptr::read_volatile((base + offset) as *const u32);
-            let bytes = val.to_le_bytes();
-            *arg.add(1) = bytes[0];
-            *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2];
-            *arg.add(4) = bytes[3];
-            0
-        }
-        adc_raw::PIN_INIT => {
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            let pin = *arg;
-            if !(26..=29).contains(&pin) {
-                return E_INVAL;
-            }
-            let pad_base = 0x4003_8004usize + (pin as usize) * 4;
-            // ADC: disable digital input (IE=0), no pulls
-            core::ptr::write_volatile(pad_base as *mut u32, 0x80); // ISO=1 (analog mode)
-            0
-        }
-        // ── SPI bridge (continued) ─────────────────────────────────────
         spi_raw::SET_ENABLE => {
-            // handle=bus_id, arg=[enable:u8]
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let bus = handle as u8;
-            if bus > 1 {
-                return E_INVAL;
-            }
-            let base = if bus == 0 {
-                0x4008_0000usize
-            } else {
-                0x4009_0000usize
+            let base = match bus_block(handle, opcode) {
+                Ok(b) => b,
+                Err(e) => return e,
             };
-            let cr1 = core::ptr::read_volatile((base + 0x04) as *const u32);
-            if *arg != 0 {
-                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 | (1 << 1));
-            // SSE=1
-            } else {
-                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 & !(1 << 1));
-                // SSE=0
+            // SAFETY: a claimed block of this die; SSPCR1 is inside it.
+            unsafe {
+                let cr1 = read32(base + PL022_CR1);
+                let cr1 = if *arg != 0 {
+                    cr1 | PL022_CR1_SSE
+                } else {
+                    cr1 & !PL022_CR1_SSE
+                };
+                write32(base + PL022_CR1, cr1);
             }
             0
         }
@@ -1862,7 +1802,198 @@ static GPIO_VTABLE: crate::kernel::module::provider::ProviderVTable =
 
 /// Release all RP-specific hardware handles owned by a module.
 fn release_rp_handles(module_idx: ModuleId) {
-    // PIO handles released by PIC pio_stream module provider
-    // Release GPIO pins
+    release_raw_claims_owned_by(module_idx);
+    release_channels_owned_by(module_idx);
     gpio::release_owned_by(module_idx);
+}
+
+// ============================================================================
+// Raw peripheral claims
+// ============================================================================
+//
+// A raw register bridge acts on one peripheral instance — a PIO block, a PWM
+// slice, an SPI, I2C or UART bus, the ADC — and only on one the caller has
+// claimed. `raw_claim::CLAIM` gives the instance to the first module that
+// asks and returns a handle the kernel checks on every op; a second claimant
+// is refused. Pins are owned the same way through the GPIO table: a raw op
+// configures only a pin the caller holds, taking a free one for it.
+
+/// Instances of `f` this die has.
+const fn family_count(f: u8) -> usize {
+    match f {
+        family::PIO => chip::PIO_COUNT as usize,
+        family::PWM => chip::PWM_SLICES as usize,
+        family::SPI => chip::SPI_COUNT as usize,
+        family::I2C => chip::I2C_COUNT as usize,
+        family::UART => chip::UART_COUNT as usize,
+        family::ADC => 1,
+        _ => 0,
+    }
+}
+
+/// Where family `f`'s instances start in [`RAW_OWNER`].
+const fn family_first(f: u8) -> usize {
+    let mut i = 0u8;
+    let mut at = 0usize;
+    while i < f {
+        at += family_count(i);
+        i += 1;
+    }
+    at
+}
+
+/// Every instance of every family.
+const RAW_SLOTS: usize = family_first(family::ADC + 1);
+
+/// The module holding each instance; `NO_MODULE` when none does.
+static RAW_OWNER: [AtomicU16; RAW_SLOTS] = [const { AtomicU16::new(NO_MODULE) }; RAW_SLOTS];
+
+/// Instance `instance` of `f`'s place in [`RAW_OWNER`], if the die has it.
+fn raw_slot(f: u8, instance: u8) -> Option<usize> {
+    ((instance as usize) < family_count(f)).then(|| family_first(f) + instance as usize)
+}
+
+/// Claim instance `instance` of `f` for the module being stepped: its handle,
+/// `EBUSY` when another module holds it, `EINVAL` for one the die lacks.
+fn raw_claim_instance(f: u8, instance: u8) -> i32 {
+    let Some(slot) = raw_slot(f, instance) else {
+        return E_INVAL;
+    };
+    let me = crate::kernel::exec::scheduler::current_module_id();
+    match RAW_OWNER[slot].compare_exchange(NO_MODULE, me, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(owner) if owner == me => {}
+        Err(_) => return errno::EBUSY,
+    }
+    fd::tag_fd(RAW_TAG, (i32::from(f) << 8) | i32::from(instance))
+}
+
+/// The instance of `f` that `handle` claims for the module being stepped;
+/// `EBADF` for any handle that is not that.
+fn owned_instance(handle: i32, f: u8) -> Result<u8, i32> {
+    if handle < 0 {
+        return Err(errno::EBADF);
+    }
+    let (tag, slot) = fd::untag_fd(handle);
+    let (hf, instance) = ((slot >> 8) as u8, (slot & 0xFF) as u8);
+    if tag != RAW_TAG || hf != f {
+        return Err(errno::EBADF);
+    }
+    let owner = raw_slot(f, instance).map(|s| RAW_OWNER[s].load(Ordering::Acquire));
+    if owner != Some(crate::kernel::exec::scheduler::current_module_id()) {
+        return Err(errno::EBADF);
+    }
+    Ok(instance)
+}
+
+/// As [`owned_instance`], for an op whose argument also names the instance:
+/// the two must agree.
+fn owned_named(handle: i32, f: u8, named: u8) -> Result<u8, i32> {
+    let instance = owned_instance(handle, f)?;
+    if instance != named {
+        return Err(E_INVAL);
+    }
+    Ok(instance)
+}
+
+/// The register block of the PIO instance `pio_num` the caller has claimed.
+fn owned_pio(handle: i32, pio_num: u8) -> Result<usize, i32> {
+    owned_named(handle, family::PIO, pio_num)?;
+    pio_regs::instance(pio_num).ok_or(E_INVAL)
+}
+
+/// Release the claim `handle` names.
+fn raw_release(handle: i32) -> i32 {
+    let (_, slot) = fd::untag_fd(handle);
+    let f = (slot >> 8) as u8;
+    match owned_instance(handle, f) {
+        Ok(instance) => {
+            if let Some(s) = raw_slot(f, instance) {
+                RAW_OWNER[s].store(NO_MODULE, Ordering::Release);
+            }
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+/// Release every instance `module` claimed.
+fn release_raw_claims_owned_by(module: ModuleId) {
+    for owner in RAW_OWNER.iter() {
+        let _ = owner.compare_exchange(module, NO_MODULE, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Make each pin the caller's: one it holds, or a free one it now takes.
+/// `EBUSY` when another module holds one, `EINVAL` past the die's pins.
+fn own_pins(pins: &[u8]) -> Result<(), i32> {
+    let me = crate::kernel::exec::scheduler::current_module_id();
+    for &pin in pins {
+        if pin >= gpio::runtime_max_gpio() {
+            return Err(E_INVAL);
+        }
+        if gpio::gpio_is_claimed(pin) {
+            if gpio::gpio_owner(pin) != me {
+                return Err(errno::EBUSY);
+            }
+            continue;
+        }
+        if gpio::gpio_claim(pin) < 0 {
+            return Err(errno::EBUSY);
+        }
+        gpio::gpio_set_owner(pin, me);
+    }
+    Ok(())
+}
+
+/// The register block of the bus a bus op's `handle` claims.
+fn bus_block(handle: i32, opcode: u32) -> Result<usize, i32> {
+    use crate::abi::platform::rp::{adc_raw, i2c_raw, spi_raw, uart_raw};
+    let f = match opcode {
+        spi_raw::REG_WRITE | spi_raw::REG_READ | spi_raw::SET_ENABLE => family::SPI,
+        i2c_raw::REG_WRITE | i2c_raw::REG_READ | i2c_raw::SET_ENABLE => family::I2C,
+        uart_raw::REG_WRITE | uart_raw::REG_READ | uart_raw::SET_ENABLE => family::UART,
+        adc_raw::REG_WRITE | adc_raw::REG_READ => family::ADC,
+        _ => return Err(E_INVAL),
+    };
+    let instance = owned_instance(handle, f)?;
+    let base = match f {
+        family::SPI => chip::spi_base(instance),
+        family::I2C => chip::i2c_base(instance),
+        family::UART => chip::uart_base(instance),
+        _ => Some(chip::ADC_BASE as usize),
+    };
+    base.ok_or(E_INVAL)
+}
+
+/// Route `pins` (0xFF: an unused line) to function `funcsel` with pad
+/// `pad`, once the caller owns every one.
+fn bus_pins(pins: &[u8], funcsel: u32, pad: gpio_regs::PadConfig) -> i32 {
+    let mut used = [0u8; 4];
+    let mut n = 0;
+    for &pin in pins.iter().filter(|&&p| p != 0xFF) {
+        used[n] = pin;
+        n += 1;
+    }
+    if let Err(e) = own_pins(&used[..n]) {
+        return e;
+    }
+    for &pin in &used[..n] {
+        // SAFETY: a pin of this die the caller owns.
+        unsafe {
+            gpio_regs::write_pad(pin, pad);
+            gpio_regs::set_function(pin, funcsel);
+        }
+    }
+    0
+}
+
+/// The pins this die's ADC samples: 26–29 on the 30-pin parts, 40–47 on
+/// RP2350B.
+fn adc_pins() -> core::ops::RangeInclusive<u8> {
+    if gpio::runtime_max_gpio() > 30 {
+        40..=47
+    } else {
+        26..=29
+    }
 }

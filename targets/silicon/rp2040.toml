@@ -26,6 +26,18 @@ pio_count = 2
 pio_state_machines = 4
 dma_channels = 12
 
+# Register blocks of the SPI, I2C and UART buses and the ADC, and the DREQ
+# each bus paces DMA by, as [tx, rx] (RP2040 datasheet 2.2.2 and 2.5.3.1).
+# The raw bus bridges take every address and DREQ from here: nothing in the
+# kernel restates one, so a bus is never given another block's registers.
+spi_bases = ["0x4003c000", "0x40040000"]
+spi_dreq = [[16, 17], [18, 19]]
+i2c_bases = ["0x40044000", "0x40048000"]
+i2c_dreq = [[32, 33], [34, 35]]
+uart_bases = ["0x40034000", "0x40038000"]
+uart_dreq = [[20, 21], [22, 23]]
+adc_base = "0x4004c000"
+
 # The DMA CTRL_TRIG BUSY flag is NOT at the same bit on both chips:
 # RP2040 bit 24, RP2350 bit 26. Flash erase quiesces DMA readers by
 # polling it, so a transcribed constant would silently poll a reserved
