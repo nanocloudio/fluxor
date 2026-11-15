@@ -226,6 +226,21 @@ pub const FLAG_SIGNATURE: u8 = 0x02;
 pub const FLAG_ATTESTATION: u8 = 0x10;
 /// Manifest flag: port-capacity block (8 bytes per port) present.
 pub const FLAG_PORT_CAPACITY: u8 = 0x20;
+/// Manifest flag: conditional-grant block present, after the attestation.
+///
+/// A grant a module needs only under some configuration: the sealing path of
+/// a durable log calls the key vault, and is inert when the parameter that
+/// selects a cipher is 0. The two grant words say what the artifact may
+/// call; this block says which of those calls a configuration actually
+/// makes, so a node admitting a composition can judge the composition
+/// rather than the artifact. It is part of the signed manifest because the
+/// kernel decides admission with it — a workload supplying its own
+/// conditions would be declaring its own privileges.
+///
+/// 0x40: bits 0x04 and 0x08 are the head's `isr_safe` and `pre_tick_drain`,
+/// which this list did not name — they are set in the flags byte all the
+/// same, so a block flagged 0x04 would be claimed by every ISR-safe module.
+pub const FLAG_COND_GRANTS: u8 = 0x40;
 
 /// Size of the integrity hash and of the attestation.
 pub const DIGEST_SIZE: usize = 32;
@@ -249,8 +264,107 @@ pub struct ManifestLayout {
     pub provides: usize,
     /// Integrity hash (`FLAG_INTEGRITY`); the signature block follows it.
     pub hash: usize,
-    /// Attestation (`FLAG_ATTESTATION`); the manifest ends 32 bytes later.
+    /// Attestation (`FLAG_ATTESTATION`).
     pub attestation: usize,
+    /// Conditional-grant block (`FLAG_COND_GRANTS`): a `u8` count, then that
+    /// many [`COND_GRANT_FIXED`]-byte entries each followed by its values.
+    /// Last, so an artifact that declares none is byte-identical to one from
+    /// before the block existed.
+    pub cond_grants: usize,
+}
+
+/// One conditional-grant entry's fixed part: `u8` grant word, `u8` bit,
+/// `u16` param id, `u8` flags, `u8` value count — the values, `i64` each,
+/// follow it.
+pub const COND_GRANT_FIXED: usize = 6;
+/// Conditional-grant entry flag: the grant is needed when the parameter is
+/// absent, because the schema default satisfies the condition. Resolved by
+/// the packer, which knows the schema the kernel does not.
+pub const COND_GRANT_WHEN_UNSET: u8 = 0x01;
+
+/// One grant a configuration may or may not need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CondGrant {
+    /// Which grant word the bit belongs to: 0 contracts, 1 op-level.
+    pub word: u8,
+    /// The bit in that word.
+    pub bit: u8,
+    /// The instance parameter the condition reads.
+    pub param_id: u16,
+    /// [`COND_GRANT_WHEN_UNSET`].
+    pub flags: u8,
+    /// Offset of the entry's values within the block, and how many.
+    pub values_at: usize,
+    pub value_count: u8,
+}
+
+impl CondGrant {
+    /// Whether this grant is needed by an instance whose parameter reads
+    /// `value`, or `None` when the instance does not set it.
+    pub fn needed(&self, block: &[u8], value: Option<i64>) -> bool {
+        let Some(v) = value else {
+            return self.flags & COND_GRANT_WHEN_UNSET != 0;
+        };
+        (0..self.value_count as usize).any(|i| {
+            let at = self.values_at + i * 8;
+            block
+                .get(at..at + 8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .is_some_and(|b| i64::from_le_bytes(b) == v)
+        })
+    }
+}
+
+/// The exact length of a conditional-grant block, walked from its own count
+/// and entry sizes; `None` when it is malformed or runs past `block`.
+///
+/// The manifest's size is checked EXACTLY, not as a lower bound, because
+/// slack is corruption at best and at worst a second block appended past the
+/// canonical offset for a verifier that reads from the other end. A
+/// variable-length block keeps that property only if its length is derivable
+/// from its own bytes, which is what this walk is for: anything appended
+/// past the end it returns leaves the manifest the wrong size and is
+/// refused.
+pub fn cond_grants_block_len(block: &[u8]) -> Option<usize> {
+    let &count = block.first()?;
+    let mut at = 1usize;
+    for _ in 0..count {
+        let head = block.get(at..at + COND_GRANT_FIXED)?;
+        let end = at + COND_GRANT_FIXED + head[5] as usize * 8;
+        if end > block.len() {
+            return None;
+        }
+        at = end;
+    }
+    Some(at)
+}
+
+/// Walk a conditional-grant block, calling `f` for each entry. Stops at the
+/// first malformed entry rather than guessing, so a truncated block grants
+/// nothing conditionally instead of granting everything.
+pub fn for_each_cond_grant(block: &[u8], mut f: impl FnMut(CondGrant)) {
+    let Some(&count) = block.first() else { return };
+    let mut at = 1usize;
+    for _ in 0..count {
+        let Some(head) = block.get(at..at + COND_GRANT_FIXED) else {
+            return;
+        };
+        let value_count = head[5];
+        let values_at = at + COND_GRANT_FIXED;
+        let end = values_at + value_count as usize * 8;
+        if end > block.len() {
+            return;
+        }
+        f(CondGrant {
+            word: head[0],
+            bit: head[1],
+            param_id: u16::from_le_bytes([head[2], head[3]]),
+            flags: head[4],
+            values_at,
+            value_count,
+        });
+        at = end;
+    }
 }
 
 impl ManifestLayout {
@@ -284,6 +398,12 @@ impl ManifestLayout {
             } else {
                 0
             };
+        let cond_grants = attestation
+            + if flags & FLAG_ATTESTATION != 0 {
+                DIGEST_SIZE
+            } else {
+                0
+            };
         Self {
             capacity,
             stack,
@@ -291,6 +411,7 @@ impl ManifestLayout {
             provides,
             hash,
             attestation,
+            cond_grants,
         }
     }
 

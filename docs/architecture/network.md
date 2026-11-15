@@ -822,10 +822,13 @@ at most 512 bytes.
 
 The primitives a managed traffic fabric's packet paths are built from
 (an egress gateway, a service-chain director and a private-service
-broker), as SDK cores a module includes and decision-seam
-dispositions `ip` honours. Apart from the seam's own modules
-(`seam_shard`, `fwd_split`, `rescue_tunnel`), no module here wires the
-cores into a translator, chain hop or tunnel end — those modules are the
+broker): the NAT packet primitives as an SDK core a module links, and the
+decision-seam dispositions `ip` honours. A translator's tuple state, a
+chain hop's encapsulation and an attachment tunnel's framing and keys
+belong to the module that implements them; `ip` forwards their frames
+whole and settles only which side owns each packet. Apart from the seam's
+own modules (`seam_shard`, `fwd_split`, `rescue_tunnel`), no module here
+is a translator, chain hop or tunnel end — those modules are the
 consumer's.
 
 - **NAT44 / NAT64** (`cores/nat.rs`). In-place NAT44 rewrite of a source or
@@ -848,19 +851,6 @@ consumer's.
   network, RFC 1918, shared, loopback, link-local, 192.0.0.0/24,
   198.18.0.0/15, multicast, reserved). Fragments, IPv4 options, IPv6
   extension headers and other protocols are refused by name (`NatWhy`).
-- **Tuple arena** (`cores/tuple_arena.rs`). Endpoint-independent mapping with
-  address-and-port-dependent filtering (RFC 4787), so a return packet finds
-  its tuple only from the remote it was bound to; the outside port space of
-  each address cut into disjoint per-shard ranges, a flow's shard the hash of
-  its inside endpoint, so shards never contend; a TCP binding opens only on
-  a SYN (`NotSyn` otherwise) and idles out after `tcp_idle_ms` established,
-  `tcp_transitory_ms` while opening or closing (RFC 5382's 2 h 4 min and
-  4 min), both FINs or an RST → TIME-WAIT, UDP idle → hold; a port held live
-  or retiring is never handed out, and reuse past the horizon advances its
-  allocation generation — TCP's and UDP's separately — so a stale reference
-  never matches; exhaustion names its binder (`PortsLive`, `PortsRetiring`,
-  `Arena`); continuity import keeps a tuple's exact outside endpoint and
-  generation, and refuses a duplicate.
 - **Mirror copies** (`disposition::MIRROR` 5). The packet is delivered
   locally and one copy goes to the forward port as a forward record naming
   `MIRROR` and its arguments, within `ip`'s `packet_mirror_budget` (copies a
@@ -949,26 +939,15 @@ consumer's.
   would read the stream as `NetProto` headers and stall for everyone. A frame-level module receives through the seam (its frames are
   forwarded to it), not through a tee of `frames_rx`, which would hand
   `ip` and it every frame.
-- **Service chains** (`disposition::CHAIN` 6, `cores/chain_encap.rs`). The
-  disposition hands the whole frame to the forward port for a chain hop; the
-  encapsulation the hop writes names the chain, the generation the flow was
-  pinned under, the stage, the pinned instance, the direction and the flow
-  in canonical order (both directions one key), with a hop budget. Forward
-  walks the stages up, reverse walks the same instances down; a hop refuses
-  a header for another chain, generation, stage or instance — a fail-closed
-  drop, never a re-selection.
-- **Attachment tunnel** (`cores/attach_tunnel.rs`). A packet between a
-  consumer's attachment anchor and a producer carries the attachment's
-  context (consumer tenant, attachment id and generation, flow epoch) under
-  an HMAC-SHA256 tag with the attachment's tunnel key — a vault DERIVE under
-  the attachment and generation, so a revoked attachment's next generation
-  is another key — and a 64-packet anti-replay window (RFC 4303 §3.4.3) per
-  direction; one key serves both, so a window refuses the other direction's
-  packets (one reflected back at its sender) before they touch it. The
-  producer takes the context from the verified header alone. The tag may be
-  made where the key is: `at_seal_mac` / `at_open_mac` take the MAC as a
-  function (a vault `HMAC_SHA256` slot's `SIGN`), byte-identical to
-  `at_seal` / `at_open` under the key.
+- **Service chains** (`disposition::CHAIN` 6). The disposition hands the
+  whole frame to the forward port for a chain hop, with the chain id, stage,
+  flags and instance as its arguments. The encapsulation the hop writes,
+  and the checks each hop makes of it, are the hop's.
+- **Attachment tunnels** (`disposition::TUNNEL` 3). A director hands a
+  flow bound for a private attachment to the forward port, naming the
+  attachment and flow epoch; the tunnel end that receives it there
+  carries the packet to the producer under the attachment's own framing
+  and keys.
 
 ## Platform Stack Expansion
 

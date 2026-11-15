@@ -109,6 +109,15 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 // it reaches with no provider to select (`key_vault`, `monitor`), or an
 // op-level grant (`timer.discipline`). Both resolve against the ABI
 // registry, the one list of names.
+//
+// Either may be scoped to the builds that make the call — `[[resources]]`
+// with its own `variants = [...]`, a grant as
+// `{ name = "key_vault", variants = ["disk"] }` — and the grant set is
+// resolved against the selected variant, so a build never holds a
+// capability only another build calls. That matters because the grant set
+// is what a node enforces: a workload is refused outright for holding a
+// grant that reaches the kernel, and a capability carried by a build that
+// never calls it is refused just as hard as one it needs.
 
 /// Width of the contract-id space: a contract id is a bit of the first
 /// grant word and the index of the kernel's vtable registry.
@@ -1214,6 +1223,110 @@ pub struct HeapFromParamsOverride {
     pub included: Option<u32>,
 }
 
+/// The one-bit grant word pair naming `(word, bit)`, for a message.
+fn one_grant(word: usize, bit: u8) -> [u64; 2] {
+    let mut g = [0u64; 2];
+    if let Some(w) = g.get_mut(word) {
+        *w |= 1u64 << bit;
+    }
+    g
+}
+
+/// A grant held only by some builds: its `(word, bit)` and the
+/// `[[variant]]` names whose build makes the call.
+#[derive(Debug, Clone)]
+pub struct ScopedGrant {
+    pub word: usize,
+    pub bit: u8,
+    pub variants: Vec<String>,
+    /// `when = { <param> = [values] }` as declared: the parameter's NAME and
+    /// the values that make the call. Resolved to a tag by
+    /// [`Manifest::resolve_grant_conditions`], which has the schema.
+    pub when: Vec<(String, Vec<i64>)>,
+    /// The condition as the kernel evaluates it: the parameter's tag, the
+    /// values, and whether the schema default satisfies it (so an instance
+    /// that sets nothing still needs the grant). `None` until resolved.
+    pub resolved: Option<ResolvedCondition>,
+}
+
+/// A grant condition in the form the manifest serialises and the kernel
+/// evaluates: no names, no schema.
+#[derive(Debug, Clone)]
+pub struct ResolvedCondition {
+    pub tag: u8,
+    pub values: Vec<i64>,
+    pub when_unset: bool,
+}
+
+/// One `grants = [...]` entry: a bare name, or a table naming the
+/// `[[variant]]`s whose build makes the call — the same scoping
+/// `[[resources]]` carries, so a capability only one build needs is not
+/// claimed by every build. A capability a module holds in a build that never
+/// calls it is a capability the node must still refuse it.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+enum GrantEntry {
+    Name(String),
+    Scoped {
+        name: String,
+        #[serde(default)]
+        variants: Vec<String>,
+        /// `when = { <param> = [values] }`: the configuration that makes the
+        /// call, as a `[[resources]]` claim's `when` reads. The schema
+        /// default stands in for a parameter an instance does not set.
+        #[serde(default)]
+        when: std::collections::BTreeMap<String, Vec<toml::Value>>,
+    },
+}
+
+impl GrantEntry {
+    fn name(&self) -> &str {
+        match self {
+            Self::Name(n) => n,
+            Self::Scoped { name, .. } => name,
+        }
+    }
+
+    fn variants(&self) -> &[String] {
+        match self {
+            Self::Name(_) => &[],
+            Self::Scoped { variants, .. } => variants,
+        }
+    }
+
+    /// The `when` conditions, as `(param, values)`; integers only, because
+    /// the kernel compares numbers and has no enum tables.
+    fn when(&self) -> Result<Vec<(String, Vec<i64>)>> {
+        let Self::Scoped { name, when, .. } = self else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for (param, vals) in when {
+            let mut ints = Vec::new();
+            for v in vals {
+                match v.as_integer() {
+                    Some(i) => ints.push(i),
+                    None => {
+                        return Err(Error::Module(format!(
+                            "grant `{name}`: `when = {{ {param} = [...] }}` takes integers — \
+                             the kernel evaluates this condition and compares numbers, with no \
+                             enum table to resolve `{v}` against"
+                        )))
+                    }
+                }
+            }
+            if ints.is_empty() {
+                return Err(Error::Module(format!(
+                    "grant `{name}`: `when = {{ {param} = [] }}` names no value, so the \
+                     condition can never hold and the grant could never be admitted"
+                )));
+            }
+            out.push((param.clone(), ints));
+        }
+        Ok(out)
+    }
+}
+
 /// The bit a `grants = [...]` name stands for: `(word, bit)`, word 0 for a
 /// contract (its id) and word 1 for an op-level grant.
 pub fn grant_from_name(s: &str) -> Result<(usize, u8)> {
@@ -1546,6 +1659,10 @@ pub struct Manifest {
     /// `[[resources]]` claims and the contracts its `grants` name), word 1 a
     /// bit per op-level grant.
     pub grants: [u64; 2],
+    /// Grants a `[[variant]]` scopes (`{ name = "…", variants = […] }`), kept
+    /// as declared so [`Manifest::grant_set`] can resolve them against the
+    /// selected variant. Unscoped grants are already folded into `grants`.
+    pub scoped_grants: Vec<ScopedGrant>,
     pub dependencies: Vec<Dependency>,
     pub integrity_hash: Option<[u8; 32]>,
     /// ABI wire-surface digest of the SDK/kernel tree this module was built
@@ -1726,6 +1843,7 @@ impl Default for Manifest {
             ports: Vec::new(),
             resources: Vec::new(),
             grants: [0; 2],
+            scoped_grants: Vec::new(),
             dependencies: Vec::new(),
             integrity_hash: None,
             abi_surface: None,
@@ -2110,19 +2228,93 @@ fn walk_rs<F: FnMut(&Path, &str)>(root: &Path, f: &mut F) {
 }
 
 impl Manifest {
+    /// Whether a declaration scoped to `variants` applies to the build this
+    /// manifest describes. An empty list is every build; otherwise the
+    /// selected variant (the default one as parsed, or the one
+    /// [`Manifest::apply_variant`] chose) has to be named.
+    pub fn variant_applies(&self, variants: &[String]) -> bool {
+        variants.is_empty()
+            || self
+                .selected_variant
+                .as_deref()
+                .is_some_and(|sel| variants.iter().any(|v| v == sel))
+    }
+
+    /// Resolve each grant's `when` condition against the module's parameter
+    /// schema: the parameter's name becomes its tag, and the schema default
+    /// decides whether an instance that sets nothing still needs the grant.
+    /// The kernel has neither the schema nor the names, so this is where
+    /// that reading is made — and it is then signed with the manifest.
+    ///
+    /// Called by `pack`, before `to_bytes`. A condition naming a parameter
+    /// the schema does not declare is refused: it would otherwise never
+    /// hold, and the grant would be silently unadmittable.
+    pub fn resolve_grant_conditions(&mut self, schema: &[u8]) -> Result<()> {
+        let params = crate::modules::schema_params(schema);
+        for g in &mut self.scoped_grants {
+            let Some((param, values)) = g.when.first().cloned() else {
+                continue;
+            };
+            if g.when.len() > 1 {
+                return Err(Error::Module(format!(
+                    "grant `{}` names {} `when` conditions; one parameter at most for now, \
+                     because the manifest carries one condition per grant",
+                    grant_names(one_grant(g.word, g.bit)).join(", "),
+                    g.when.len(),
+                )));
+            }
+            let Some((tag, _ty, _name, default)) = params.iter().find(|(_, _, n, _)| *n == param)
+            else {
+                let known: Vec<&str> = params.iter().map(|(_, _, n, _)| n.as_str()).collect();
+                return Err(Error::Module(format!(
+                    "grant `{}` is conditional on parameter `{param}`, which this module's \
+                     schema does not declare{}{}. A condition on a parameter that cannot be \
+                     read never holds, so the grant could never be admitted.",
+                    grant_names(one_grant(g.word, g.bit)).join(", "),
+                    if known.is_empty() {
+                        ""
+                    } else {
+                        " — declared: "
+                    },
+                    known.join(", "),
+                )));
+            };
+            let when_unset = values.contains(&i64::from(*default));
+            g.resolved = Some(ResolvedCondition {
+                tag: *tag,
+                values,
+                when_unset,
+            });
+        }
+        Ok(())
+    }
+
     /// Everything the module may call, as the kernel checks it: the named
     /// grants, with every contract the `[[resources]]` claim added to the
-    /// first word.
+    /// first word — each resolved against the selected variant, so a build
+    /// is never granted a capability only another build calls.
     pub fn grant_set(&self) -> Result<[u64; 2]> {
-        Ok([self.grants[0] | self.claimed_contracts()?, self.grants[1]])
+        let mut g = [self.grants[0] | self.claimed_contracts()?, self.grants[1]];
+        for sg in &self.scoped_grants {
+            if self.variant_applies(&sg.variants) {
+                g[sg.word] |= 1u64 << sg.bit;
+            }
+        }
+        Ok(g)
     }
 
     /// The contract bits the `[[resources]]` claims set: each claimed id is
     /// a bit of the first grant word, so it must fall below
-    /// [`CONTRACT_ID_SPACE`].
+    /// [`CONTRACT_ID_SPACE`]. A claim a `variants = [...]` list keeps out of
+    /// this build is not one of them — the list already said which builds
+    /// make the call, and granting it to the others hands them a capability
+    /// they never use and the node would be right to refuse.
     pub fn claimed_contracts(&self) -> Result<u64> {
         let mut mask = 0u64;
         for r in &self.resources {
+            if !self.variant_applies(&r.variants) {
+                continue;
+            }
             if (r.device_class as usize) < CONTRACT_ID_SPACE {
                 mask |= 1u64 << r.device_class;
             } else {
@@ -2285,6 +2477,14 @@ impl Manifest {
                 rule.included = included;
             }
         }
+        // A claim this build does not make is not this artifact's, for the
+        // same reason an omitted port is not: whatever reads the embedded
+        // manifest back has only these bytes to go on, and a claim left
+        // listed here is re-added to the grant set by anything that
+        // recomputes it from them — which is how a variant that had the
+        // claim filtered out of its grant word still displayed it.
+        self.resources
+            .retain(|r| r.variants.is_empty() || r.variants.iter().any(|v| v == variant));
         self.capabilities.retain(|c| !omitted_caps.contains(c));
         self.capability_facts
             .retain(|c, _| !omitted_caps.contains(c));
@@ -2465,9 +2665,20 @@ impl Manifest {
         }
 
         let mut grants = [0u64; 2];
-        for name in toml_val.grants.unwrap_or_default() {
-            let (word, bit) = grant_from_name(&name)?;
-            grants[word] |= 1u64 << bit;
+        let mut scoped_grants: Vec<ScopedGrant> = Vec::new();
+        for entry in toml_val.grants.unwrap_or_default() {
+            let (word, bit) = grant_from_name(entry.name())?;
+            if entry.variants().is_empty() && entry.when()?.is_empty() {
+                grants[word] |= 1u64 << bit;
+            } else {
+                scoped_grants.push(ScopedGrant {
+                    word,
+                    bit,
+                    variants: entry.variants().to_vec(),
+                    when: entry.when()?,
+                    resolved: None,
+                });
+            }
         }
 
         let mut dependencies = Vec::new();
@@ -3012,6 +3223,31 @@ impl Manifest {
             }
         }
 
+        for sg in &scoped_grants {
+            for want in &sg.variants {
+                if !variants.iter().any(|v| &v.name == want) {
+                    let known: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+                    return Err(Error::Module(format!(
+                        "grant `{}` is scoped to variant '{want}', which no [[variant]] table \
+                         declares{}{}. A scope naming nothing silently decides the grant either \
+                         way, so it is refused here.",
+                        crate::manifest::grant_names({
+                            let mut g = [0u64; 2];
+                            g[sg.word] |= 1u64 << sg.bit;
+                            g
+                        })
+                        .join(", "),
+                        if known.is_empty() {
+                            ""
+                        } else {
+                            " — declared: "
+                        },
+                        known.join(", "),
+                    )));
+                }
+            }
+        }
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -3035,6 +3271,7 @@ impl Manifest {
             observability,
             builtin,
             selected_variant: variants.iter().find(|v| v.default).map(|v| v.name.clone()),
+            scoped_grants,
             variants,
             capacities,
             heap_from_params,
@@ -3071,6 +3308,35 @@ impl Manifest {
             .ports
             .iter()
             .any(|p| p.buffer_size != 0 || p.max_record != 0);
+        // The conditional-grant block, last in the manifest: a count, then
+        // per grant its word, bit, parameter tag, flags and values. Only
+        // resolved conditions go in — an unresolved one would be a name the
+        // kernel cannot read, so `resolve_grant_conditions` is what puts a
+        // grant here, and a manifest packed without it carries no block.
+        let mut cond_block: Vec<u8> = Vec::new();
+        let conds: Vec<(&ScopedGrant, &ResolvedCondition)> = self
+            .scoped_grants
+            .iter()
+            .filter(|g| self.variant_applies(&g.variants))
+            .filter_map(|g| g.resolved.as_ref().map(|r| (g, r)))
+            .collect();
+        if !conds.is_empty() {
+            cond_block.push(conds.len().min(u8::MAX as usize) as u8);
+            for (g, r) in &conds {
+                cond_block.push(g.word as u8);
+                cond_block.push(g.bit);
+                cond_block.extend_from_slice(&u16::from(r.tag).to_le_bytes());
+                cond_block.push(if r.when_unset {
+                    fluxor_abi::wire::fmod::COND_GRANT_WHEN_UNSET
+                } else {
+                    0
+                });
+                cond_block.push(r.values.len().min(u8::MAX as usize) as u8);
+                for v in &r.values {
+                    cond_block.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
@@ -3088,7 +3354,8 @@ impl Manifest {
             } else {
                 0
             }
-            + if has_abi_surface { 32 } else { 0 };
+            + if has_abi_surface { 32 } else { 0 }
+            + cond_block.len();
         let total = MANIFEST_HEADER_SIZE + var_size;
         let mut buf = Vec::with_capacity(total);
 
@@ -3126,22 +3393,28 @@ impl Manifest {
             | (if self.isr_safe { 4 } else { 0 })
             | (if self.pre_tick_drain { 8 } else { 0 })
             | (if has_abi_surface { 0x10 } else { 0 })
-            | (if has_port_capacity { 0x20 } else { 0 });
+            | (if has_port_capacity { 0x20 } else { 0 })
+            | (if cond_block.is_empty() {
+                0
+            } else {
+                fluxor_abi::wire::fmod::FLAG_COND_GRANTS
+            });
         buf.push(flags);
         // byte 13: provided contracts, listed after the arena block.
         buf.push(self.provider_contracts.len() as u8);
         // bytes 14..18: one instance's state in 64-byte units.
         buf.extend_from_slice(&self.state_bytes_64.to_le_bytes());
         // bytes 18..34: the grants, which the kernel checks every call
-        // against. The resource claims are contract grants too.
-        // A claim outside the word is refused when the module is packed
-        // (`grant_set`); it sets no bit here.
-        let claimed = self
-            .resources
-            .iter()
-            .filter(|r| (r.device_class as usize) < CONTRACT_ID_SPACE)
-            .fold(0u64, |m, r| m | (1u64 << r.device_class));
-        let grants = [self.grants[0] | claimed, self.grants[1]];
+        // against. The resource claims are contract grants too, and both
+        // are resolved against the selected variant — so this asks
+        // `grant_set`, the one place that knows the rule, rather than
+        // working it out again. It used to fold the claims here itself,
+        // which silently ignored every `variants = [...]` and would ignore
+        // a scoped grant outright: an artifact that disagreed with the
+        // manifest it was packed from, in the one field a node enforces.
+        // A claim outside the grant word is refused when the module is
+        // packed; it sets no bit here.
+        let grants = self.grant_set().unwrap_or([self.grants[0], self.grants[1]]);
         buf.extend_from_slice(&grants[0].to_le_bytes());
         buf.extend_from_slice(&grants[1].to_le_bytes());
 
@@ -3209,6 +3482,9 @@ impl Manifest {
         if let Some(d) = &self.abi_surface {
             buf.extend_from_slice(d);
         }
+        // Last, after the attestation: a manifest declaring no condition is
+        // byte-identical to one packed before the block existed.
+        buf.extend_from_slice(&cond_block);
 
         debug_assert_eq!(buf.len(), total);
         buf
@@ -3273,6 +3549,25 @@ impl Manifest {
                 0
             }
             + if has_abi_surface { 32 } else { 0 };
+        // The conditional-grant block is variable length, so its size comes
+        // from walking its own count — derivable from the bytes, which is
+        // what keeps the check below exact rather than a lower bound.
+        let has_cond_grants = flags & fluxor_abi::wire::fmod::FLAG_COND_GRANTS != 0;
+        let expected_size = expected_size
+            + if has_cond_grants {
+                let Some(n) = data
+                    .get(expected_size..)
+                    .and_then(fluxor_abi::wire::fmod::cond_grants_block_len)
+                else {
+                    return Err(Error::Module(
+                        "the manifest flags a conditional-grant block it does not carry whole"
+                            .to_string(),
+                    ));
+                };
+                n
+            } else {
+                0
+            };
 
         // EXACT size, not a lower bound: the serializer emits exact sizes,
         // so slack is at best corruption and at worst a substitution attack
@@ -3405,6 +3700,9 @@ impl Manifest {
 
         Ok(Manifest {
             module_version,
+            // Resolved at pack time: an artifact carries the grant set its
+            // build holds, never the declaration it came from.
+            scoped_grants: Vec::new(),
             hardware_targets,
             state_bytes_64,
             stack_bytes_64,
@@ -3632,7 +3930,7 @@ struct TomlManifest {
     resources: Option<Vec<TomlResource>>,
     /// Top-level `grants = ["key_vault", "timer.discipline", …]`: what the
     /// module may call beyond the contracts its `[[resources]]` claim.
-    grants: Option<Vec<String>>,
+    grants: Option<Vec<GrantEntry>>,
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
     provides: Option<Vec<String>>,
@@ -5067,6 +5365,278 @@ name = "full"
 features = ["wav", "mp3", "image"]
 default = true
 "#;
+
+    /// A `variants = [...]` list on a `[[resources]]` claim or a `grants`
+    /// entry keeps that capability out of the builds that never call it.
+    /// This is what the kernel enforces, so a build granted a capability
+    /// only another build uses is refused by a node for a capability it
+    /// does not need.
+    const SCOPED_GRANT_MANIFEST: &str = r#"
+version = "1.0.0"
+grants = ["fs", { name = "key_vault", variants = ["disk"] }]
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "trust"
+access = "read"
+variants = ["disk"]
+
+[[variant]]
+name = "volatile"
+features = ["volatile"]
+
+[[variant]]
+name = "disk"
+features = ["disk"]
+default = true
+"#;
+
+    #[test]
+    fn scoped_grants_and_claims_follow_the_selected_variant() {
+        let kv = grant_from_name("key_vault").expect("key_vault");
+        let trust = grant_from_name("trust").expect("trust");
+        let fs = grant_from_name("fs").expect("fs");
+
+        // The default variant is `disk`, which does make both calls.
+        let disk = parse_toml(SCOPED_GRANT_MANIFEST).expect("parse");
+        let g = disk.grant_set().expect("grant_set");
+        assert_ne!(
+            g[kv.0] & (1u64 << kv.1),
+            0,
+            "disk seals, so it holds key_vault"
+        );
+        assert_ne!(g[trust.0] & (1u64 << trust.1), 0, "disk claims trust");
+        assert_ne!(
+            g[fs.0] & (1u64 << fs.1),
+            0,
+            "an unscoped grant is every build's"
+        );
+
+        // The volatile build compiles both paths out: it must hold neither.
+        let mut vol = parse_toml(SCOPED_GRANT_MANIFEST).expect("parse");
+        vol.apply_variant("volatile").expect("apply volatile");
+        let g = vol.grant_set().expect("grant_set");
+        assert_eq!(
+            g[kv.0] & (1u64 << kv.1),
+            0,
+            "the volatile build never seals, so it must not hold key_vault"
+        );
+        assert_eq!(
+            g[trust.0] & (1u64 << trust.1),
+            0,
+            "a [[resources]] claim scoped to another variant is not this build's"
+        );
+        assert_ne!(
+            g[fs.0] & (1u64 << fs.1),
+            0,
+            "an unscoped grant stays whichever variant is built"
+        );
+    }
+
+    /// The packed bytes are what a node enforces, so they have to carry the
+    /// same set the manifest resolves — `to_bytes` worked the claims out
+    /// again on its own and ignored every variant scope, which made an
+    /// artifact disagree with its own manifest in exactly that field.
+    #[test]
+    fn packed_grants_are_the_manifests_resolved_set_per_variant() {
+        let kv = grant_from_name("key_vault").expect("key_vault");
+        let trust = grant_from_name("trust").expect("trust");
+
+        let disk = parse_toml(SCOPED_GRANT_MANIFEST).expect("parse");
+        let packed = Manifest::from_bytes(&disk.to_bytes()).expect("round trip");
+        assert_eq!(
+            packed.grants,
+            disk.grant_set().expect("grant_set"),
+            "the disk artifact must carry the set its manifest resolves"
+        );
+        assert_ne!(packed.grants[kv.0] & (1u64 << kv.1), 0, "disk seals");
+
+        let mut vol = parse_toml(SCOPED_GRANT_MANIFEST).expect("parse");
+        vol.apply_variant("volatile").expect("apply volatile");
+        let packed = Manifest::from_bytes(&vol.to_bytes()).expect("round trip");
+        assert_eq!(
+            packed.grants,
+            vol.grant_set().expect("grant_set"),
+            "the volatile artifact must carry the set its manifest resolves"
+        );
+        assert_eq!(
+            packed.grants[kv.0] & (1u64 << kv.1),
+            0,
+            "the volatile artifact must not carry key_vault"
+        );
+        assert_eq!(
+            packed.grants[trust.0] & (1u64 << trust.1),
+            0,
+            "nor a [[resources]] claim scoped to the disk build"
+        );
+    }
+
+    /// A decoded artifact has only its own bytes to go on, so its resource
+    /// table may not list a claim its grant word does not carry: anything
+    /// recomputing the set from the table would hand the build back a
+    /// capability the variant filtered out.
+    #[test]
+    fn a_variants_artifact_does_not_out_claim_its_grant_word() {
+        let mut vol = parse_toml(SCOPED_GRANT_MANIFEST).expect("parse");
+        vol.apply_variant("volatile").expect("apply volatile");
+        let packed = Manifest::from_bytes(&vol.to_bytes()).expect("round trip");
+        let word = packed.grants;
+        let recomputed = packed.grant_set().expect("grant_set");
+        assert_eq!(
+            recomputed, word,
+            "recomputing a decoded artifact's grants must change nothing"
+        );
+        for r in &packed.resources {
+            assert_ne!(
+                word[0] & (1u64 << r.device_class),
+                0,
+                "the table lists a claim the grant word does not carry"
+            );
+        }
+    }
+
+    /// A `when` condition reaches the artifact as the kernel reads it: the
+    /// parameter's tag, its values, and whether the schema default satisfies
+    /// it. The kernel has no schema and no names, so if this resolution is
+    /// wrong or missing the grant is simply never admitted.
+    #[test]
+    fn a_grant_condition_is_resolved_against_the_schema_and_packed() {
+        use fluxor_abi::wire::fmod::{
+            for_each_cond_grant, ManifestLayout, COND_GRANT_WHEN_UNSET, FLAG_COND_GRANTS,
+        };
+        let src = r#"
+version = "1.0.0"
+grants = [{ name = "key_vault", when = { aead = [1, 2] } }]
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+"#;
+        // schema: magic 'SP', one param `aead`, type 1, default 0, tag 7
+        let mut schema = vec![0x53, 0x50, 0x00, 1];
+        schema.extend_from_slice(&[7, 1, 0, 0, 0, 0]);
+        schema.push(4);
+        schema.extend_from_slice(b"aead");
+
+        let mut m = parse_toml(src).expect("parse");
+        m.resolve_grant_conditions(&schema).expect("resolve");
+        let r = m.scoped_grants[0].resolved.as_ref().expect("resolved");
+        assert_eq!(r.tag, 7, "the parameter's name became its tag");
+        assert_eq!(r.values, vec![1, 2]);
+        assert!(
+            !r.when_unset,
+            "the default is 0, which is not a sealing suite, so an instance              that sets nothing does not need the vault"
+        );
+
+        let bytes = m.to_bytes();
+        let flags = bytes[12];
+        assert_ne!(flags & FLAG_COND_GRANTS, 0, "the block is flagged");
+        let layout = ManifestLayout::read(&bytes).expect("layout");
+        let mut seen = Vec::new();
+        for_each_cond_grant(&bytes[layout.cond_grants..], |g| {
+            seen.push((g.word, g.bit, g.param_id, g.flags));
+            let block = &bytes[layout.cond_grants..];
+            assert!(g.needed(block, Some(1)), "aead = 1 seals");
+            assert!(g.needed(block, Some(2)), "aead = 2 seals");
+            assert!(!g.needed(block, Some(0)), "aead = 0 does not");
+            assert!(
+                !g.needed(block, None),
+                "nor does an instance that sets none"
+            );
+        });
+        let kv = grant_from_name("key_vault").expect("key_vault");
+        assert_eq!(seen, vec![(kv.0 as u8, kv.1, 7u16, 0u8)]);
+
+        // A default that DOES satisfy the condition sets the unset flag, so
+        // an instance configuring nothing still needs the grant.
+        let mut schema2 = vec![0x53, 0x50, 0x00, 1];
+        schema2.extend_from_slice(&[7, 1, 1, 0, 0, 0]);
+        schema2.push(4);
+        schema2.extend_from_slice(b"aead");
+        let mut m2 = parse_toml(src).expect("parse");
+        m2.resolve_grant_conditions(&schema2).expect("resolve");
+        let b2 = m2.to_bytes();
+        let l2 = ManifestLayout::read(&b2).expect("layout");
+        for_each_cond_grant(&b2[l2.cond_grants..], |g| {
+            assert_ne!(g.flags & COND_GRANT_WHEN_UNSET, 0);
+            assert!(g.needed(&b2[l2.cond_grants..], None));
+        });
+    }
+
+    /// The manifest's size is checked exactly, to refuse anything appended
+    /// past the canonical offset. A variable-length block keeps that only if
+    /// its length comes from its own bytes — so a conditional-grant manifest
+    /// must round-trip, and one byte more must not.
+    #[test]
+    fn a_conditional_grant_manifest_is_exactly_its_size() {
+        let src = r#"
+version = "1.0.0"
+grants = [{ name = "key_vault", when = { aead = [1, 2] } }]
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+"#;
+        let mut schema = vec![0x53, 0x50, 0x00, 1];
+        schema.extend_from_slice(&[3, 1, 0, 0, 0, 0]);
+        schema.push(4);
+        schema.extend_from_slice(b"aead");
+        let mut m = parse_toml(src).expect("parse");
+        m.resolve_grant_conditions(&schema).expect("resolve");
+        m.abi_surface = Some([7u8; 32]);
+        let bytes = m.to_bytes();
+
+        let back = Manifest::from_bytes(&bytes).expect("a conditional manifest round-trips");
+        assert_eq!(back.grants, m.grant_set().expect("grant_set"));
+
+        let mut slack = bytes.clone();
+        slack.push(0);
+        assert!(
+            Manifest::from_bytes(&slack).is_err(),
+            "a byte appended past the block must be refused, as it would be past an attestation"
+        );
+    }
+
+    #[test]
+    fn a_grant_condition_on_an_unknown_parameter_is_refused() {
+        let src = r#"
+version = "1.0.0"
+grants = [{ name = "key_vault", when = { aeed = [1] } }]
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+"#;
+        let mut schema = vec![0x53, 0x50, 0x00, 1];
+        schema.extend_from_slice(&[7, 1, 0, 0, 0, 0]);
+        schema.push(4);
+        schema.extend_from_slice(b"aead");
+        let mut m = parse_toml(src).expect("parse");
+        let err = m
+            .resolve_grant_conditions(&schema)
+            .expect_err("must refuse");
+        let msg = format!("{err}");
+        assert!(msg.contains("aeed"), "names the bad parameter: {msg}");
+        assert!(msg.contains("aead"), "and what is declared: {msg}");
+    }
+
+    #[test]
+    fn a_grant_scoped_to_an_undeclared_variant_is_refused() {
+        let src = SCOPED_GRANT_MANIFEST.replace(r#"variants = ["disk"]"#, r#"variants = ["dsk"]"#);
+        let err = parse_toml(&src).expect_err("a scope naming no variant must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dsk"),
+            "the refusal names the bad scope: {msg}"
+        );
+    }
 
     /// apply_variant filters omitted ports from the embedded manifest
     /// while retained ports keep their already-resolved indices —

@@ -1,7 +1,7 @@
 // nat — checksum-, ICMP- and PMTU-correct NAT44 and NAT64 packet primitives.
 //
-// What a translator writes, as functions of the packet and the mapping a
-// tuple table (`cores/tuple_arena.rs`) chose. Nothing here holds state: the
+// What a translator writes, as functions of the packet and the mapping its
+// tuple table chose. Nothing here holds state: the
 // mapping, the address pool and the policy are the caller's.
 //
 // NAT44 (RFC 3022 / RFC 4787 / RFC 5508) rewrites in place. Addresses and

@@ -298,8 +298,8 @@ pub mod disposition {
     pub const MIRROR: u8 = 5;
     /// Hand the frame to the forward port for the next stage of a service
     /// chain. `[chain_id: u16 LE] [stage: u8] [flags: u8] [instance: u16
-    /// LE]` — the chain encapsulation (`cores/chain_encap.rs`) is the
-    /// consumer's to write; the seam only settles the packet's owner.
+    /// LE]` — the chain encapsulation is the consumer's to write; the seam
+    /// only settles the packet's owner.
     pub const CHAIN: u8 = 6;
 
     /// Forward-and-copy: OR'd into `TUNNEL`, `DSR` or `CHAIN`, the

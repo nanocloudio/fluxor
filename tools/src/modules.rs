@@ -1254,7 +1254,7 @@ fn check_heap_rule_base(
 /// `(tag, type id, name, default)` of each param a `define_params!` schema
 /// declares (`[S][P][version][count]`, then per param its tag, type id, u32
 /// default, length-prefixed name and enum table).
-fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String, u32)> {
+pub(crate) fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String, u32)> {
     let mut out = Vec::new();
     if schema.len() < 4 || schema[..2] != [0x53, 0x50] {
         return out;
@@ -1789,6 +1789,9 @@ pub fn pack_fmod(
     // A contract claim outside the grant word is refused here, before
     // anything is packed.
     module_manifest.grant_set()?;
+    // A grant's `when` names a parameter; the manifest carries its tag and
+    // the schema's default reading of it, because the kernel has neither.
+    module_manifest.resolve_grant_conditions(schema_data)?;
     let manifest_bytes = module_manifest.to_bytes();
 
     // Calculate sizes
@@ -1979,6 +1982,9 @@ pub fn pack_fmod_wasm(
     // A contract claim outside the grant word is refused here, before
     // anything is packed.
     module_manifest.grant_set()?;
+    // A grant's `when` names a parameter; the manifest carries its tag and
+    // the schema's default reading of it, because the kernel has neither.
+    module_manifest.resolve_grant_conditions(schema_data)?;
     let manifest_bytes = module_manifest.to_bytes();
 
     // Layout: header + wasm code + (no data) + (no exports) + schema + manifest

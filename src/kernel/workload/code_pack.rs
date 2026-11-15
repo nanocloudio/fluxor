@@ -206,7 +206,10 @@ pub fn stage(pack: &[u8]) -> Result<Staged, i32> {
         core::ptr::write_bytes(base.add(pack.len()), 0, len - pack.len());
     }
     let mut ldr = ModuleLoader::new();
-    if ldr.init_from_blob_with_len(base, pack.len()).is_err() {
+    if let Err(e) = ldr.init_from_blob_with_len(base, pack.len()) {
+        // The CREATE answers only EINVAL; this names which part of the
+        // module table the loader refused.
+        log::warn!("[live] code pack refused: {e:?}");
         return Err(errno::EINVAL);
     }
     st.loaders[id] = ldr;

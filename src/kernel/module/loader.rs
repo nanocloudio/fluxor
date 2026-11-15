@@ -1890,6 +1890,26 @@ impl LoadedModule {
             Some((p, manifest_size, flags, layout))
         }
     }
+    /// The module's conditional-grant block (`FLAG_COND_GRANTS`), or `None`
+    /// when it declares no condition — which is every module packed before
+    /// the block existed, and every one whose grants are unconditional.
+    ///
+    /// The bytes are part of the signed manifest, which is why admission may
+    /// decide with them: a workload supplying its own conditions would be
+    /// declaring its own privileges.
+    pub fn manifest_cond_grants(&self) -> Option<&[u8]> {
+        use crate::abi::wire::fmod::FLAG_COND_GRANTS;
+        let (p, size, flags, layout) = self.manifest_view()?;
+        if flags & FLAG_COND_GRANTS == 0 || layout.cond_grants >= size {
+            return None;
+        }
+        // SAFETY: `manifest_view` established the manifest spans `size`
+        // bytes from `p` inside the mapping, and `cond_grants < size`.
+        Some(unsafe {
+            core::slice::from_raw_parts(p.add(layout.cond_grants), size - layout.cond_grants)
+        })
+    }
+
     /// The module's grants (`MANIFEST_GRANTS_AT`): word 0 a bit per contract
     /// id, word 1 a bit per op-level grant. None without a manifest.
     pub fn manifest_grants(&self) -> [u64; 2] {
@@ -2861,7 +2881,27 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     return Err(e);
                 }
                 let attn_offset = manifest_layout.attestation;
-                if manifest_size != attn_offset + 32 {
+                // The conditional-grant block follows the attestation, so
+                // the canonical size includes it. Its length is walked from
+                // its own count, which keeps this an EXACT check: anything
+                // appended past the block's end leaves the manifest the
+                // wrong size and is refused here, as a second attestation
+                // copy would be.
+                let cond_len = if flags & crate::abi::wire::fmod::FLAG_COND_GRANTS != 0 {
+                    let block = manifest_data.get(manifest_layout.cond_grants..);
+                    match block.and_then(crate::abi::wire::fmod::cond_grants_block_len) {
+                        Some(n) => n,
+                        None => {
+                            log::error!(
+                                "[loader] {name}: conditional-grant flag with no whole block"
+                            );
+                            return Err(LoaderError::Unattested);
+                        }
+                    }
+                } else {
+                    0
+                };
+                if manifest_size != attn_offset + 32 + cond_len {
                     log::error!(
                         "[loader] {name}: attestation flag with non-canonical manifest size"
                     );

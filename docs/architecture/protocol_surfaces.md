@@ -165,7 +165,7 @@ The director answers with one `CMD_PKT_DISPOSE` (0x53) on `packet_in`:
 | `TUNNEL` | hand the whole frame to `packet_fwd` as `MSG_PKT_FORWARD` (0x65) | attach id, flow epoch |
 | `DSR` | as TUNNEL | endpoint id, rewrite id |
 | `MIRROR` | resume the transport path AND forward one copy as TUNNEL does, within `packet_mirror_budget` copies a second; a copy not made is reported (`MSG_PKT_MIRROR_LOST` 0x68) | mirror id, flow epoch |
-| `CHAIN` | as TUNNEL, for a service-chain hop (`cores/chain_encap.rs` is the hop's encapsulation) | chain id, stage, flags, instance |
+| `CHAIN` | as TUNNEL, for a service-chain hop (the hop writes its own encapsulation) | chain id, stage, flags, instance |
 | `TUNNEL`/`DSR`/`CHAIN` \| `COPY` (0x80) | forward-and-copy: the frame forwarded as the base disposition says, and one copy as a `MIRROR` record within the same `packet_mirror_budget` (a copy not made is reported as a `MIRROR`'s is) — how a tunnelled, direct-return or chained flow is mirrored | the base's six bytes, then a `MIRROR`'s six (`DISPOSE_COPY_LEN` 17) |
 
 Ownership follows the disposition: a buffer has one owner at a time and

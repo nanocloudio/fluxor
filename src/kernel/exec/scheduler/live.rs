@@ -2393,6 +2393,66 @@ fn resolving_loader(name_hash: u32, node: &ModuleLoader) -> &ModuleLoader {
 /// cannot resolve adds nothing (the add itself refuses it). `None` for a
 /// malformed blob. Read before the add, so a policy on what a subgraph may
 /// hold is decided before anything is allocated.
+/// A parameter's value from an encoded param blob, as an `i64`: the blob is
+/// `[0xFE + 3]?` then `tag, len, value…` records, ending at tag `0xFF`
+/// (`params_node_tag` walks the same shape). `None` when the instance does
+/// not set it, which is what `COND_GRANT_WHEN_UNSET` answers for.
+fn param_i64(params: &[u8], tag: u8) -> Option<i64> {
+    if params.len() < 4 {
+        return None;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let t = params[pos];
+        let len = params[pos + 1] as usize;
+        pos += 2;
+        if t == 0xFF {
+            return None;
+        }
+        let v = params.get(pos..pos + len)?;
+        if t == tag {
+            if len == 0 || len > 8 {
+                return None;
+            }
+            let mut b = [0u8; 8];
+            b[..len].copy_from_slice(v);
+            // Sign-extend, so a negative value reads as one.
+            let shift = 64 - len * 8;
+            return Some((i64::from_le_bytes(b) << shift) >> shift);
+        }
+        pos += len;
+    }
+    None
+}
+
+/// The grants one module of an add contributes, given the params it will be
+/// instantiated with: its manifest words, less every conditional grant whose
+/// condition this configuration does not meet.
+///
+/// A grant stays in the words so a configured instance can still make the
+/// call; what the condition narrows is ADMISSION — what the node agrees to
+/// run. Lying about a parameter to dodge a grant buys nothing: the kernel
+/// instantiates with the parameter it just read, so a workload claiming it
+/// does not seal gets a build that does not seal.
+fn effective_module_grants(
+    m: &crate::kernel::module::loader::LoadedModule,
+    params: &[u8],
+) -> [u64; 2] {
+    let mut g = m.manifest_grants();
+    let Some(block) = m.manifest_cond_grants() else {
+        return g;
+    };
+    crate::abi::wire::fmod::for_each_cond_grant(block, |c| {
+        if c.needed(block, param_i64(params, c.param_id as u8)) {
+            return;
+        }
+        if let Some(w) = g.get_mut(c.word as usize) {
+            *w &= !(1u64 << c.bit);
+        }
+    });
+    g
+}
+
 pub fn module_grants(blob: &[u8]) -> Option<[u64; 2]> {
     let mut c = Cur::new(blob);
     if c.u32()? != ADD_MAGIC || c.u16()? != ADD_VERSION {
@@ -2409,9 +2469,11 @@ pub fn module_grants(blob: &[u8]) -> Option<[u64; 2]> {
         let name_hash = c.u32()?;
         c.take(ADD_MODULE_FIXED_BYTES - 4 - 2)?;
         let plen = c.u16()? as usize;
-        c.take(plen)?;
+        // The params are read, not stepped over: a grant may be conditional
+        // on the configuration, and this is the configuration.
+        let params = c.take(plen)?;
         if let Ok(m) = resolving_loader(name_hash, loader).find_by_name_hash(name_hash) {
-            let g = m.manifest_grants();
+            let g = effective_module_grants(&m, params);
             grants[0] |= g[0];
             grants[1] |= g[1];
         }

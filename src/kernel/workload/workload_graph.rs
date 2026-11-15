@@ -1139,7 +1139,11 @@ unsafe fn begin_create(
             });
             if !ok {
                 code_pack::release(staged);
-                return errno::EACCES;
+                // ENOEXEC, not EACCES: the staged bytes are not the module
+                // they claim to be — nothing is being denied, the payload is
+                // wrong. A caller told this can fetch the code again, which
+                // is the only refusal here that fetching can mend.
+                return errno::ENOEXEC;
             }
             if !code_pack::seal(staged) {
                 code_pack::release(staged);
@@ -1172,6 +1176,14 @@ unsafe fn begin_create(
         || grants[1] & crate::abi::registry::grant::REACH_KERNEL != 0
     {
         unstage(staged);
+        // EACCES is this refusal's alone: of everything that can refuse a
+        // create, this is the only one that is a permission. It is also the
+        // only one nothing can mend — the pack would have to be built with
+        // different grants — so a caller told EACCES should stop, where
+        // ENOEXEC invites fetching the code again and EBUSY invites
+        // waiting. They shared this code once, and a caller that could not
+        // tell them apart re-fetched a correct image for as long as it was
+        // retried.
         return errno::EACCES;
     }
     // The creator's own lanes (FLXA `Caller` edges): each lands at the add's
@@ -1519,7 +1531,10 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             LeaseGate::Refused
         ) {
             let _ = live::free_owner(owner);
-            return errno::EACCES;
+            // EBUSY, not EACCES: this workload may hold the endpoint, it is
+            // simply taken. A caller told this can wait or ask for another
+            // port; told EACCES it would read a policy it cannot satisfy.
+            return errno::EBUSY;
         }
     }
 

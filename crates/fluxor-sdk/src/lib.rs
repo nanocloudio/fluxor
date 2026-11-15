@@ -41,15 +41,12 @@ pub mod gpu;
 
 pub mod cores {
     //! State machines more than one module runs.
-    pub mod attach_tunnel;
-    pub mod chain_encap;
     pub mod nat;
     pub mod nonce_reservation;
     pub mod session_handoff;
     pub mod table_consumer;
     pub mod transport_continuity;
     pub mod transport_continuity_record;
-    pub mod tuple_arena;
 }
 
 pub mod assets {
