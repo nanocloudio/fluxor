@@ -140,8 +140,11 @@ fn decode_to_rgb565(
     Ok(out)
 }
 
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
 #[cfg(feature = "host-image")]
-fn host_image_step(state: *mut u8) -> i32 {
+unsafe fn host_image_step(state: *mut u8) -> i32 {
     let st = unsafe { instance_state::<HostImageState>(state) };
 
     if st.failed {

@@ -28,11 +28,10 @@
 // mutable host fs).
 
 // This file is `include!`'d into `src/platform/linux.rs`, sharing its flat
-// namespace — so `fs`, `Path`, and `tag_fd` are already in scope from there;
+// namespace — so `fs` and `Path` are already in scope from there;
 // only the names not already imported are pulled in here.
 use fluxor::abi::contracts::storage::namespace as dev_ns;
 use fluxor::abi::fence as dev_fence;
-use fluxor::kernel::ipc::fd::{slot_of, FD_TAG_STORAGE_NAMESPACE};
 use fluxor::kernel::sys::errno;
 use std::time::UNIX_EPOCH;
 
@@ -97,18 +96,15 @@ fn ns_fs_path(key: &str) -> &str {
 }
 
 /// `LIST` — render one page of `prefix`'s immediate children, in ascending
-/// name order, into the caller's output buffer. `arg` is the
+/// name order, into `data`. `arg` is the
 /// `namespace::LIST` request and the page is written by
 /// `namespace::list::PageWriter`. The cursor is the last name a page
 /// returned and the next page resumes strictly after it, so a file created or
 /// removed between pages never shifts the entries behind the cursor. A child
 /// whose name is not UTF-8 is not expressible in the contract and is not
 /// listed.
-unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() {
-        return errno::EINVAL;
-    }
-    let Some(req) = dev_ns::list::parse_request(core::slice::from_raw_parts(arg, arg_len)) else {
+fn ns_list(arg: &mut [u8], out: &mut [u8]) -> i32 {
+    let Some(req) = dev_ns::list::parse_request(arg) else {
         return errno::EINVAL;
     };
     let Ok(prefix) = core::str::from_utf8(req.prefix) else {
@@ -150,7 +146,6 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
     }
     names.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
     let mut page = dev_ns::list::PageWriter::new(out);
     let mut last: Option<&str> = None;
     let mut more = false;
@@ -180,21 +175,19 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
     let Some(n) = page.finish(cursor) else {
         return errno::ENOMEM;
     };
-    let fbuf =
-        core::slice::from_raw_parts_mut(req.fence_out_ptr as *mut u8, req.fence_out_cap as usize);
-    let _ = dev_fence::Fence::Volatile.encode(fbuf);
+    dev_fence::trailer::put(arg, &dev_fence::Fence::Volatile);
     n as i32
 }
 
 /// `STAT` — write `[size:u64][mtime:u64][kind:u8][etag_len:u8][etag]` for the
-/// LOOKUP-bound handle's path.
-unsafe fn ns_stat(raw: i32, out_ptr: *mut u8, out_cap: usize) -> i32 {
+/// LOOKUP-bound handle's path into `out`.
+unsafe fn ns_stat(raw: i32, out: &mut [u8]) -> i32 {
     let idx = raw as usize;
     let slots = &*core::ptr::addr_of!(LINUX_NS_SLOTS);
     if idx >= NS_MAX_OPEN || !ns_owned(&slots[idx]) {
         return errno::EINVAL;
     }
-    if out_ptr.is_null() || out_cap < 8 + 8 + 1 + 1 {
+    if out.len() < dev_ns::stat::FIXED_LEN {
         return errno::EINVAL;
     }
     let path = slots[idx].path.clone();
@@ -216,43 +209,24 @@ unsafe fn ns_stat(raw: i32, out_ptr: *mut u8, out_cap: usize) -> i32 {
     };
     // etag: fnv1a64(path) ⊕ size ⊕ mtime → 8 stable bytes.
     let etag = fnv1a64(path.as_bytes()) ^ size ^ mtime.rotate_left(17);
-    let etag_bytes = etag.to_le_bytes();
-
-    let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
-    out[0..8].copy_from_slice(&size.to_le_bytes());
-    out[8..16].copy_from_slice(&mtime.to_le_bytes());
-    out[16] = kind;
-    let mut written = 18usize;
-    let etag_len = if out_cap >= 18 + etag_bytes.len() {
-        out[18..18 + etag_bytes.len()].copy_from_slice(&etag_bytes);
-        written += etag_bytes.len();
-        etag_bytes.len()
-    } else {
-        0
-    };
-    out[17] = etag_len as u8;
-    written as i32
+    match dev_ns::stat::encode(out, size, mtime, kind, &etag.to_le_bytes()) {
+        Some(n) => n as i32,
+        None => errno::EINVAL,
+    }
 }
 
 /// `LOOKUP` — bind a handle to `arg`'s UTF-8 path. Lenient: any path (incl.
 /// the empty root prefix, which binds the CWD) gets a handle; the real
 /// existence check happens in `STAT`. A scanner walking from the root opens
 /// `LOOKUP("")`, so empty must succeed.
-unsafe fn ns_lookup(path_ptr: *mut u8, path_len: usize) -> i32 {
-    if path_len > NS_MAX_PATH {
+unsafe fn ns_lookup(path: &[u8]) -> i32 {
+    if path.len() > NS_MAX_PATH {
         return errno::EINVAL;
     }
-    let path = if path_len == 0 {
-        String::new()
-    } else if path_ptr.is_null() {
+    let Ok(path) = core::str::from_utf8(path) else {
         return errno::EINVAL;
-    } else {
-        let bytes = core::slice::from_raw_parts(path_ptr, path_len);
-        match core::str::from_utf8(bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => return errno::EINVAL,
-        }
     };
+    let path = path.to_string();
     let slots = &mut *core::ptr::addr_of_mut!(LINUX_NS_SLOTS);
     let idx = match slots.iter().position(|s| !s.in_use) {
         Some(i) => i,
@@ -261,7 +235,7 @@ unsafe fn ns_lookup(path_ptr: *mut u8, path_len: usize) -> i32 {
     slots[idx].path = path;
     slots[idx].in_use = true;
     slots[idx].opener = fluxor::kernel::exec::scheduler::caller_owner();
-    tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)
+    idx as i32
 }
 
 /// `CLOSE` — free the LOOKUP slot.
@@ -276,55 +250,68 @@ unsafe fn ns_close(raw: i32) -> i32 {
 }
 
 /// Dispatch entry registered for the STORAGE_NAMESPACE contract from
-/// `linux_init_providers`. `provider_call` passes tagged handles through
-/// unchanged (mirrors the FS/object siblings); strip to the raw slot. LIST is
-/// prefix-driven from `arg`, so a tagged or -1 handle is both fine.
-unsafe fn linux_namespace_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// `linux_init_providers`. A handle op arrives with the slot's index. LIST is
+/// prefix-driven from `arg`, so an index or -1 is both fine.
+fn linux_namespace_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    mut data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     // A workload's namespace is its own store's: never the host filesystem
     // and never the node's store.
     let owner = fluxor::kernel::exec::scheduler::caller_owner();
     if fluxor::platform::linux::owner_root::rooted(owner) {
-        let Some(store) = fluxor::platform::linux::owner_root::store_for(owner) else {
+        // SAFETY: platform dispatch runs on the scheduler thread alone, the
+        // one thread that touches the owner roots' stores.
+        let Some(store) = (unsafe { fluxor::platform::linux::owner_root::store_for(owner) }) else {
             return errno::EACCES;
         };
         return fluxor::platform::linux::store::dispatch_namespace_on(
-            store, handle, opcode, arg, arg_len,
+            store, handle, opcode, arg, data,
         );
     }
     // Control-plane store mode (FLUXOR_STORE_DIR set): the versioned store backs
     // storage.namespace here (LIST/SUBSCRIBE + revision fence). Otherwise this
     // provider is the filesystem-backed enumeration surface below.
-    if fluxor::platform::linux::store::store_active() {
-        return fluxor::platform::linux::store::dispatch_namespace(handle, opcode, arg, arg_len);
+    // SAFETY: platform dispatch runs on the scheduler thread alone.
+    if unsafe { fluxor::platform::linux::store::store_active() } {
+        return fluxor::platform::linux::store::dispatch_namespace(handle, opcode, arg, data);
     }
 
-    let raw = slot_of(handle);
+    let raw = handle;
 
     // Per-handle fence introspection (provider_query LAST_FENCE path).
     if opcode == dev_fence::QUERY_OP {
-        if arg.is_null() || arg_len < dev_fence::WIRE_MAX_LEN {
+        if arg.len() < dev_fence::WIRE_MAX_LEN {
             return errno::EINVAL;
         }
         let idx = raw as usize;
-        let slots = &*core::ptr::addr_of!(LINUX_NS_SLOTS);
-        if idx >= NS_MAX_OPEN || !ns_owned(&slots[idx]) {
+        // SAFETY: scheduler thread only, the one that touches the slot table.
+        let owned = unsafe {
+            let slots = &*core::ptr::addr_of!(LINUX_NS_SLOTS);
+            idx < NS_MAX_OPEN && ns_owned(&slots[idx])
+        };
+        if !owned {
             return errno::ENOSYS;
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match dev_fence::Fence::Volatile.encode(buf) {
+        return match dev_fence::Fence::Volatile.encode(arg) {
             Some(n) => n as i32,
             None => errno::EINVAL,
         };
     }
 
     match opcode {
-        dev_ns::LOOKUP => ns_lookup(arg, arg_len),
-        dev_ns::STAT => ns_stat(raw, arg, arg_len),
-        dev_ns::LIST => ns_list(arg, arg_len),
-        dev_ns::CLOSE => ns_close(raw),
+        // SAFETY: scheduler thread only, the one that touches the slot table.
+        dev_ns::LOOKUP => unsafe { ns_lookup(arg) },
+        // SAFETY: as LOOKUP.
+        dev_ns::STAT => unsafe { ns_stat(raw, arg) },
+        dev_ns::LIST => ns_list(arg, data.as_mut()),
+        // SAFETY: as LOOKUP.
+        dev_ns::CLOSE => unsafe { ns_close(raw) },
         // Read-only enumeration surface: no mutation or change ops. LIST is
         // directory-shaped (namespace.rs::caps).
-        dev_ns::CAPS => dev_ns::caps::CHILD_NAMES as i32,
+        dev_ns::CAPS => fluxor::abi::kernel_abi::caps_word::answer(arg, dev_ns::caps::CHILD_NAMES),
         _ => errno::ENOSYS,
     }
 }

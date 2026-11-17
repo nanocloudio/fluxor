@@ -106,62 +106,48 @@ surface at build time, naming both.
 Two volumes coexist by declaring distinct **instance selectors**. A
 provider module (a `fat32`) sets a `volume:` param; it exports
 `module_provider_selector`, and the loader registers it as an
-instance-keyed layer rather than the default. The kernel exposes one
-syscall for reaching a keyed layer:
+instance-keyed layer rather than the default. A consumer reaches a keyed
+layer by binding to it once:
 
-- `provider_call_sel(sel, sel_len, op_handle, op, …)` hashes the selector
-  name, finds the layer carrying it, and dispatches, with the contract
-  taken from the opcode's class byte exactly as the `handle == -1` path
-  does. The caller names the target volume inline on every op; there is
-  no bound token to cache. Resolving by selector per call is what keeps
-  it sound under live graph mutation: a freed-then-reused module index
-  cannot alias a stale binding.
+- `provider_open(contract, kernel::BIND, [NAME][len u8][name])` hashes the
+  selector name, finds the layer carrying it, and returns a bound handle.
+  Every op through that handle reaches that layer (a NAME bind delivers
+  `handle = -1` to the provider), and a handle an op through it mints is
+  routed to the same provider. `provider_close` drops the binding without
+  asking the provider anything. A bind to a name no layer carries is
+  `ENODEV`. The bound handle is a route, so it carries a generation: once
+  its layer goes (a live removal), the handle names nothing (`EBADF`) and a
+  freed-then-reused module index never aliases it.
 
-The selector name `platform` is reserved: `provider_call_sel("platform",
-…)` reaches the platform's own (kernel-registered) provider of the
-opcode's contract, beneath every module layer — the host filesystem on
+The selector name `platform` is reserved: a bind to `platform` reaches
+the platform's own (kernel-registered) provider of the contract, beneath
+every module layer — the host filesystem on
 Linux, even when the graph carries a `fat32` of its own as the default.
 No module may register it: the loader's registration is refused
 (`EACCES`) and `validate_single_provider` rejects `volume: platform` on
 a provider first. `file_block`'s `volume: platform` is how an image file
 on the host sits under a graph-local filesystem built on it.
 
-Every provider of `fs` hands out handles tagged `FD_TAG_FS`, and the
-kernel routes an `fs` op by that tag. An `fs` op on a handle without it — a
-descriptor field never opened (0), or a bare slot number — is refused
-`EBADF` before it reaches a provider, rather than landing on whichever file
-holds that slot now, another module's.
-On Linux a handle also carries its slot's generation, bumped each time the
-slot is claimed: a handle kept past its close (a second close, a stale copy)
-answers `EBADF` rather than reaching the file that took the slot next.
-
-A handle minted through any selector is **routed**: the kernel returns
-its own handle in the provider's place — same contract tag, a slot in
-its route table — and records which provider minted it and what that
-provider called it. Every later op on it, through `provider_call` or
-`provider_call_sel`, reaches that provider with the provider's own
-(untagged) slot, whatever the default layer is. `provider_call_sel`
-refuses (`EBADF`) a handle minted through another selector, and a
-handle no selector minted; a route dies with its owner's layer, a
-departing consumer's routes are closed at their owners, and a graph
-reset forgets them all.
-
-Two `storage.namespace` ops carry subscription handles in their argument
-bytes rather than as `op_handle`: `CHANGES` names the subscription a read
-serves, and `TAKE_RUNG` answers with the handles that rang. Through a
-selector the kernel translates both at the boundary: a routed subscription
-in a `CHANGES` request reaches the provider as the handle it minted (one
-this selector's provider did not mint is `EBADF`, before the provider is
-called), and each handle a `TAKE_RUNG` answer names is rewritten to the
-caller's routed handle for it. A subscription to a keyed store, or to the
-platform's own beneath a graph-local default, therefore rings and reads
-exactly as one to the default store does.
+Every handle an `fs` provider answers is wrapped by the kernel in a route
+(`abi_layers.md`, Handles): the provider answers its own index, the module is
+given a handle naming the route, and every later op on the handle reaches
+that provider with its index, whatever the default layer is. A value no
+route names — a descriptor field never opened (0), a bare slot number, a
+handle kept past its close — is refused `EBADF` before it reaches a
+provider, rather than landing on whichever file holds that slot now. A
+route answers only its minter's owner; it dies with its provider's layer, a
+departing consumer's routes are closed at their providers, and a graph reset
+forgets them all. A handle minted through a bound handle (a keyed volume,
+or `platform` beneath a graph-local default) is routed to the same provider,
+so a subscription to a keyed store rings and reads exactly as one to the
+default store does.
 
 The **`mount` module** (`modules/foundation/mount/`) is the policy layer.
 It registers as the default (unkeyed) FS provider and carries a
 `mounts: "/boot=sd0;/data=nvme0"` table. On `FS_OPEN(path)` it
 longest-prefix-matches the path to a volume, forwards the prefix-stripped
-path to that volume via `provider_call_sel`, keeps the routed handle it
+path to that volume through the handle it bound to that volume's name,
+keeps the routed handle it
 gets back, and hands the consumer a handle of its own, so later
 handle-bound ops (`FS_READ` / `FS_CLOSE` / …) come back to it (which is
 what lets an unmount revoke them) and are forwarded to the owning
@@ -183,7 +169,7 @@ and are not written to the module's binary manifest.
 - `selector_table = "<param>"`: the param holds `;`-separated
   `prefix=volume` entries, and the claim reaches every volume they name.
   `mount` declares `selector_table = "mounts"` on its own `fs` claim: the
-  kernel checks the grant of the module that calls `provider_call_sel`, and
+  kernel checks the grant of the module that binds and calls the volume, and
   a provider's dispatch runs as the provider, so the check is on `mount`'s
   claim, not on the consumer whose op it forwards. A volume `mount`'s
   hotplug channel adds as it runs is not checked.
@@ -257,8 +243,8 @@ Ready, when that provider is deferred-ready; a module that is
 deferred-ready itself is not held. A keyed provider is never waited for.
 The loader registers a provider when its `module_new` returns, so a keyed
 `fat32` is reachable before its volume is mounted and answers `EAGAIN`
-until it is; `provider_call_sel` answers `ENODEV` for a name no layer
-carries, and the caller retries. `file_block` is deferred-ready and
+until it is; a bind answers `ENODEV` for a name no layer carries, and the
+caller retries. `file_block` is deferred-ready and
 reports Ready only once its open has succeeded, which is how a
 filesystem built on it waits.
 
@@ -283,13 +269,13 @@ on that volume: the next op fails `ENODEV` and frees the slot, the
 storage handle lease / revocation contract enforced at the handle
 authority (this module, which owns every consumer-facing FS handle). An
 add installs a mount; like every mount, its volume is reached by name on
-each call, so nothing is bound until an op arrives. Media
+each call through a binding made when the mount is installed. Media
 detection is platform-specific and outside the module's scope; the module
 only consumes the control messages.
 
 ### Where instance-keying applies — and where it does not
 
-Instance-keying (`provider_call_sel` plus a policy router like `mount`)
+Instance-keying (a NAME bind plus a policy router like `mount`)
 is for logical, contract-dispatched service surfaces: the storage
 surfaces (`file.data`, and, when routed, `storage.namespace` /
 `storage.object`), tenant-scoped stores, and similar. It is deliberately
@@ -325,49 +311,61 @@ contract id, so every dispatched surface needs its own class byte:
 | `0x0F`     | `STORAGE_OBJECT`                            | `0x0F00..0x0FFF` — whole-blob byte-addressed surface (`object.rs`) |
 | `0x28`     | `storage_custody::ID`                       | `0x2800..0x28FF` — custody of a keyed volume's key (`custody.rs`) |
 
-`storage.block` has no class byte. Its requests are channel ioctls on the
-source's `blocks` channel (§1.1). Class byte `0x03` is `BUFFER`, not a
-storage surface — namespace and object opcodes sit in their own class bytes
-to avoid the collision.
+`storage.block` (`0x2A`) is an edge contract: it has no default provider
+and is never reached by class byte. A consumer binds it through its
+`blocks` port (§1.1) and every op goes to the source at the other end of
+that edge.
 
 ### 1.1 `storage.block` v1
 
 Source: `crates/fluxor-abi/src/contracts/storage/block.rs`; consumer client:
 `crates/fluxor-rt/src/block.rs`.
 
-A block source is the channel wired to a consumer's `blocks` input. A
+A block source is the module wired to a consumer's `blocks` input. A
 consumer port that declares `requires_capability = "storage.block"` must be
-wired from exactly one module that provides it. Every request is one fixed
-record:
+wired from exactly one module that provides it. The consumer binds once —
+`provider_open(storage.block, kernel::BIND, [PORT][in][index])` — and
+calls every op through the bound handle; the source is handed its own port
+ref on the edge as the handle. Every request is one fixed record:
 
-| Ioctl | Argument | Result |
+| Op | Argument | Result |
 | --- | --- | --- |
-| `CAPS` `0x4E56_0009` | capability record (40 B, written) | its length, or `EAGAIN` before attach |
-| `EXEC` `0x4E56_000C` | request (40 B) + completion (80 B, written) | the completion's status |
-| `SUBMIT` `0x4E56_000A` | request | 0, `EAGAIN` when full, or a refusal |
-| `REAP` `0x4E56_000B` | completion (written) | 1 when one was written, 0 when none |
-| `READ_STREAM` `0x4E56_0002` | request, op `READ` | data streamed on the channel |
+| `DESCRIBE` `0x2A00` | description record (40 B, written) | 0, or `EAGAIN` before attach |
+| `SUBMIT` `0x2A01` | request (40 B) | 0, `EAGAIN` when full, or a refusal |
+| `REAP` `0x2A02` | completion (80 B, written) | 1 when one was written, 0 when none |
+| `EXEC` `0x2A03` | request + completion (written) | the completion's status |
+| `READ_STREAM` `0x2A04` | request, op `READ` | data streamed on the channel |
+
+The description's `F_*` flags are the contract's capability bits. They
+qualify the geometry beside them and exist only once the device has
+attached, so they travel in that one record and the contract has no separate
+`CAPS`.
 
 - **Ops:** `READ`, `WRITE`, `FLUSH`, `DISCARD`.
 - **Flags:** `FUA` makes a write durable before it completes. `PREFLUSH`
   flushes every write reaped before the request was submitted, then runs it.
-- **Units:** every count and address is in logical blocks of the size `CAPS`
-  reports; addresses are 64-bit.
+- **Units:** every count and address is in logical blocks of the size
+  `DESCRIBE` reports; addresses are 64-bit.
 - **Ordering:** requests in flight are unordered. A `FLUSH` covers writes
   whose completions were reaped before it was submitted.
-- **Lengths:** a source's handler is given a pointer and never a length, so
-  the kernel holds every caller, gated or not, to exactly the record each
-  command carries; any other length is `EINVAL` before a handler runs.
-- **Buffers:** a buffer is lent until its completion is reaped, except a
-  write buffer on a source reporting `F_WRITE_COPIES`, which is released at
-  `SUBMIT`. The kernel keeps a ledger of lent buffers (128 at once; a
-  `SUBMIT` beyond it is `EAGAIN`) and refuses a tag already in flight on the
-  channel with `EINVAL`. A consumer torn down while buffers are still lent is
-  **quarantined**: its memory, its module slot and the channels carrying the
-  lends are kept, nothing steps it, and the kernel reaps its completions each
-  tick. When the last is back, the memory is released, the channels are
-  closed and the slot is free. A source that never completes keeps the
-  memory it was lent, which is a leak and not a corruption.
+- **Lengths:** every op's `arg` is one flat record whose bound the registry
+  declares; the kernel holds every caller, gated or not, to it before a
+  source runs.
+- **Buffers:** a request names no address. The consumer opens one `lend`
+  over its block cache on the bound handle (`lend::OPEN`, a cookie of its
+  choosing) and each request names `[cookie][offset][buf_len]` inside it.
+  The source resolves the span (`lend::RESOLVE`, grant `lend.borrow`),
+  bounds-checks it, moves the data and returns the borrow (`lend::RETURN`)
+  before the completion becomes reapable — at `SUBMIT` for a write on a
+  source reporting `F_WRITE_COPIES`. `EXEC` carries its buffer as the call's
+  `data` span instead. A consumer torn down while a span is still borrowed
+  has the memory under it **quarantined** until the borrow returns, so a
+  source that never completes keeps the memory it was lent, which is a leak
+  and not a corruption.
+- **Stream:** `READ_STREAM` restarts the source's stream on the edge at the
+  request's LBA; the blocks arrive on the `blocks` channel. A consumer
+  flushes its input (`channel::FLUSH`) before it, so nothing of the
+  abandoned stream is read as the new one.
 - **Fences:** each successful completion carries the strongest `Fence` the
   source achieved (§2): `LocalDurable` for a flush, a FUA write, or any write
   on a device with no volatile cache; `Volatile` for other writes; none for a
@@ -377,14 +375,14 @@ record:
   limits, queue depth, device id, and whether the source writes, flushes,
   honours FUA natively, discards (and reads back zeros), pipelines, streams,
   or copies write data at submit.
-- **Gated callers:** the gateway walks a request's buffer against the
-  caller's own memory and refuses every other module-registered ioctl
-  (`module_isolation.md`).
+- **Gated callers:** the gateway checks each op's `arg` against the
+  registry's shape and the caller's own memory, and a lend's span against
+  the caller's memory when it is opened (`module_isolation.md`).
 
 | Source | Serves |
 | --- | --- |
 | `nvme` | everything; 8 requests in flight on I/O queue 0 |
-| `sd` | one-block `SUBMIT`/`REAP` reads and writes (queue depth 1, writes copied at submit and on the card when they complete, `EXEC` answers `ENOSYS`), beside its sector stream |
+| `sd` | one-block `SUBMIT`/`REAP` reads and writes (queue depth 1, writes copied at submit and on the card when they complete, `EXEC` answers `ENOSYS`), and `READ_STREAM` to restart the sector stream beside them at an LBA |
 | `flash_rp` (`store`) | the RP flash's 16 KiB data store in 4 KiB erase-sector blocks: reads, and writes that complete `LocalDurable` (queue depth 1, `EXEC` answers `ENOSYS`) |
 | `file_block` | everything over one file reached through `fs` |
 | `crypt_block` | everything, as authenticated encryption over the source wired to its `lower` input |
@@ -400,7 +398,7 @@ of these rules.
 `SUBMIT`/`REAP` when the source reports `F_ASYNC` and `EXEC` otherwise,
 answers `FLUSH` only after the source's `FLUSH` completes, and honours `FUA`
 natively or as write-then-flush. Transmission flags, size and block size come
-from `CAPS`. One client at a time; see its README.
+from `DESCRIBE`. One client at a time; see its README.
 
 ublk is the intended Linux frontend and NBD the portability fallback, but the
 ublk gate is closed on the reference Pi 5 host: its kernel
@@ -595,13 +593,16 @@ when the bit it needs is clear.
 
 ### The object-model tier
 
-`STAT_OBJECT`, `LINK` and `SYMLINK` cover what an inode-based filesystem
-carries and FAT32 does not: `STAT`'s 32-byte form (`ino`, `nlink`), a second
-name for a file, and symbolic links. A provider answers only what its format
-holds and clears the bit otherwise — FAT32 clears all three, which is honest
-rather than degraded. The host provider serves `STAT_OBJECT`, `RMDIR`,
-`LINK` and `SYMLINK` to the node because `fstat`, `link(2)` and
-`readlink(2)` already answer them.
+`STAT` answers one 32-byte record, `[size u64][mtime u64][ino u64][nlink
+u32][0 u32]`; `ino` is 0 where the volume has no stable file identity and
+`nlink` 0 where names are not counted. `LINK` and `SYMLINK` cover what an
+inode-based filesystem carries and FAT32 does not: a second name for a file,
+and symbolic links. A provider answers only what its format holds and clears
+the bit otherwise — FAT32 clears both and reports `ino` 0, `nlink` 1, which
+is honest rather than degraded. The host provider serves `RMDIR`, `LINK` and
+`SYMLINK` and a real `ino` to the node because `fstat`, `link(2)` and
+`readlink(2)` already answer them. `SEEK` takes exactly `[offset u64]` and
+answers 0.
 
 The contract carries no permission model: no user, group or mode bits. Who
 may reach a file is decided by which owner's root the provider resolves it in
@@ -1082,7 +1083,7 @@ a caller must not conclude a write outlived a power cut.
 ### Subscriptions
 
 Source: `crates/fluxor-abi/src/contracts/storage/namespace.rs` (`SUBSCRIBE`,
-`TAKE_RUNG`, `CHANGES` and their codecs), `crates/fluxor-sdk/src/cores/table_consumer.rs`
+`CHANGES` and their codecs), `crates/fluxor-sdk/src/cores/table_consumer.rs`
 (the consumer every table follows), `modules/fixtures/mem_ns` (a provider
 small enough to read whole).
 
@@ -1091,45 +1092,30 @@ consumer's channel: no key, value or record is pushed anywhere, and a
 consumer needs no self-wired port to receive one. It learns that something
 under its prefix changed, and reads what it needs, in bounded pages.
 
-- **One event.** The consumer creates a kernel event once
-  (`kernel_abi::event::CREATE`) and names it in every `SUBSCRIBE`
-  (`[prefix][event][flags]`). The store refuses (`EINVAL`) an event the
-  caller's module does not own (`query_key::EVENT_OWNER`), and stamps the
-  subscription with the caller's owner record and module occupancy
-  (`CALLER_MODULE`: slot index and generation). A repeat with the same
-  owner, occupancy, event and prefix returns the same handle, so a module
-  re-running its subscribe path cannot leak, and two consumers of one prefix
-  share one subscription. A full table is swept of dead subscriptions before
-  it refuses; a refusal is `ENOMEM`, and the platform stores count it against
-  their `store_subs` (`owner_store_subs` for a workload's own store) pool and
-  name it in the log. `mem_ns` also holds each owner to a quota of its table.
-- **One rung bit per subscription.** A change under the prefix that finds
-  the bit clear sets it and signals the event; one that finds it set does
-  nothing, so a burst of writes costs one wake. Before every signal the store
-  checks that the occupancy still stands (`MODULE_LIVE`) and still owns the
-  event; a subscription whose module has finished, restarted or lost its
-  slot, or whose event slot is free or another module's, is dropped and never
-  signalled (a module destroying its event closes the subscriptions that name
-  it first). A handle answers its opener alone: to any other owner
-  or module it is as if not open, and its `LAST_FENCE` is `ENOSYS` — a
-  subscription is a doorbell, not a view, and each read carries its own
-  fence. A subscription ends with its subscriber: releasing an owner closes
-  every subscription it holds on the platform stores, and a subscription
-  whose occupancy ended is freed at its next change or by a sweep.
-- **The consumer's step**: `event::POLL` (test-and-clear), then `TAKE_RUNG`
-  on the event, which names the caller's rung subscriptions and clears their
-  bits (more than fit: `more` is set and the event signalled again), marking
-  each one *pending*; then a `CHANGES` read of each pending one. *Pending* is
+- **A signalling handle.** `SUBSCRIBE` (`[prefix][flags]`) mints a
+  subscription handle that signals (`abi_layers.md`, Handles): the store
+  answers its own index, and the kernel hands it the subscription's doorbell
+  (`kernel::BIND_DOORBELL`). A refusal is `ENOMEM`, and the platform stores
+  count it against their `store_subs` (`owner_store_subs` for a workload's
+  own store) pool and name it in the log; `mem_ns` also holds each owner to
+  a quota of its table. Each `SUBSCRIBE` is its own subscription.
+- **A ring per change.** A change under the prefix rings the subscription's
+  doorbell — the platform stores directly, `mem_ns` with
+  `kernel::DOORBELL_RING` — and a burst of rings before the consumer polls
+  costs one wake. The handle is its minter's alone: the kernel refuses it to
+  any other owner, and its `LAST_FENCE` is `ENOSYS` — a subscription is a
+  doorbell, not a view, and each read carries its own fence. A subscription
+  ends with its handle: closing it, or releasing its minter, closes the
+  store's index and frees the doorbell, so a ring after it rings nothing.
+- **The consumer's step**: `HANDLE_POLL` on each subscription (`POLL_IN` once
+  per ring: the poll takes it), marking each that rang *pending*; then a
+  `CHANGES` read of each pending one, through its handle. *Pending* is
   cleared only by a page whose `more` is clear. Whatever the interleaving, a
-  change is followed by a completed read that observes it: if the bit was
-  clear the signal follows the change; if set, the take that clears it is
-  still to come, and the read follows the take.
-- **What the consumer owes.** `POLL` consumes the signal, and a set bit sends
-  no other, so a take that fails clears nothing and is asked again on the
-  next step whether or not the event fires; so is one that answered `more`.
-  A read that fails leaves the consumer pending, with its token where it
-  was, so it reads again rather than waiting for a change that may never
-  come.
+  change is followed by a completed read that observes it: the ring follows
+  the change, and the read follows the poll that took the ring.
+- **What the consumer owes.** A read that fails leaves the consumer pending,
+  with its token where it was, so it reads again rather than waiting for a
+  change that may never come.
 
 `CHANGES` answers one bounded page per call. Where it resumes is a token:
 
@@ -1162,8 +1148,8 @@ from `mem_ns`.
 A `since` older than the store can answer is `LOST` — the 410 of a watch —
 and the consumer relists; so is a `since` past anything the store has issued
 (a store that restarted empty). `EAGAIN` means "not now" (a busy device, a
-spent walk budget); a read that names its subscription (`sub`) is rung again
-when the store can answer, so a consumer woken only by its event never stalls
+spent walk budget); a read through its subscription is rung again when the
+store can answer, so a consumer woken only by its subscriptions never stalls
 on a wait. The key stores and `mem_ns` answer every read inside the call and
 never answer `EAGAIN`.
 
@@ -1174,17 +1160,15 @@ never answer `EAGAIN`.
 | bcm2712 store | 128 revisions (`HISTORY`) | the retained history; a relist page, one pass of the object table per record |
 | `mem_ns` | 32 entries (`LOG_CAP`) | 16 entries or bindings (`SCAN_BUDGET`) |
 
-`table_consumer` is that protocol for a table: subscribe, take, read pages
+`table_consumer` is that protocol for a table: subscribe, poll, read pages
 from the token and apply them by key, and on a cold start or `LOST` relist
 into a shadow table that is swapped in only when the last page lands — a
 table swapped in place is a torn table for any reader mid-scan. A module with
-several tables takes once per step for all of them on its one event and then
-advances each. A refused `SUBSCRIBE` other than `EAGAIN` is asked again after
+several tables steps each; each polls its own subscription. A refused `SUBSCRIBE` other than `EAGAIN` is asked again after
 a backoff, so a full table is not asked, and refused, on every step. Every
 store op goes to the store the consumer is given: the contract's default, or
 by selector a keyed volume or `platform`; a module names it by a `str` param
-it declares as its `storage.namespace` claim's `selector_param`, and tables
-following different stores are taken once per store.
+it declares as its `storage.namespace` claim's `selector_param`.
 
 ### Listing names
 
@@ -1220,7 +1204,7 @@ meets one in range refuses with `EOVERFLOW` rather than skip it.
 
 `namespace::LIST` names come in two shapes, and a provider states its
 shape in `CAPS` with `caps::CHILD_NAMES`. A key-shaped provider (the key
-stores, `mem_ns`; the bit clear, as for a provider without `CAPS`) lists
+stores, `mem_ns`; the bit clear) lists
 whole keys under the prefix, so its cursor starts with the prefix. A
 directory-shaped provider (the filesystem and wasm namespaces; the bit set)
 lists the prefix's immediate children by name, so its cursor is a child

@@ -22,27 +22,12 @@
 // not kernel resources. 256 concurrent endpoints per provider is
 // the ceiling.
 //
-// Endpoint authority: an `ep_id` is an index, not an authority. The graph
-// model permits several consumer modules to feed one provider command
-// channel — the kernel merges them into a single stream — and channel reads
-// carry no producer identity, so an index alone cannot say who sent the
-// command. The owner tag supplies that: CMD_DG_BIND records an `owner_tag`
-// against the endpoint, and CMD_DG_SEND_TO / CMD_DG_CLOSE present the tag
-// they claim. The provider admits a command only when the presented tag
-// equals the recorded one, and refuses a mismatch with `EPERM`.
-//
-// The tag is the consumer module's own owner slot, read from the kernel
-// (`kernel_abi::OWNER_TAG`) — the same value, on the same axis, that
-// `net_proto`'s `NET_CMD_BIND` already carries. It is asserted in the frame,
-// not proved: it says which owner the consumer named at bind, and is not an
-// unguessable capability.
-//
-// An absent tag reads as tag 0. Owner slot 0 is the host, so a base-graph
-// module binds untagged and its endpoint accepts untagged commands from any
-// consumer on the shared channel; that is the whole of what an untagged
-// command permits, and it is why the tag separates owners rather than
-// individual modules. Any endpoint bound with a nonzero tag is reachable only
-// by a command carrying that exact tag, tagged or otherwise.
+// Endpoint authority: an `ep_id` is an index, not an authority. The
+// provider records against each endpoint the owner the kernel attests for
+// the channel its bind arrived on (`channel::FACTS`'s producer owner), and
+// admits a send or close on it only from a channel of that same owner
+// (`EPERM` otherwise). No record names an owner: a consumer cannot claim
+// one it is not.
 //
 // Address families: `af = 4` is IPv4 (4-byte address); `af = 6` is IPv6
 // (16-byte address). Addresses are wire-order big-endian so the IP
@@ -77,11 +62,30 @@ pub const BIND_FLAG_RX_ONLY: u8 = 0x01;
 // ─── Upstream: consumer → provider ─────────────────────────────────
 
 /// Bind a new datagram endpoint to a local port.
-/// Payload: [port: u16 LE] [flags: u8] [owner_tag: u16 LE]?
+/// Payload: `[port: u16 LE][flags: u8]` ([`BIND_LEN`] bytes exactly).
 /// Port 0 requests ephemeral allocation. Provider responds with
-/// MSG_DG_BOUND carrying the allocated ep_id and local_port. A trailing
-/// `owner_tag` stamps the endpoint's owner; absent means tag 0.
+/// MSG_DG_BOUND carrying the allocated ep_id and local_port.
 pub use super::super::super::registry::msg::datagram::CMD_DG_BIND;
+/// `CMD_DG_BIND` payload length.
+pub const BIND_LEN: usize = 2 + 1;
+
+/// `(port, flags)` of a `CMD_DG_BIND` payload, or `None` unless it is
+/// exactly one.
+#[inline]
+pub fn bind_parts(p: &[u8]) -> Option<(u16, u8)> {
+    if p.len() != BIND_LEN {
+        return None;
+    }
+    Some((u16::from_le_bytes([p[0], p[1]]), p[2]))
+}
+
+/// A `CMD_DG_BIND` payload.
+#[inline]
+#[must_use]
+pub fn bind(port: u16, flags: u8) -> [u8; BIND_LEN] {
+    let b = port.to_le_bytes();
+    [b[0], b[1], flags]
+}
 
 /// Send a datagram from `ep_id` to the given destination. Source
 /// is always the endpoint's bound port; there is no per-frame source
@@ -90,33 +94,13 @@ pub use super::super::super::registry::msg::datagram::CMD_DG_BIND;
 /// IPv4 payload: [ep_id: u8] [af: u8 = 4] [addr: 4 bytes BE] [port: u16 LE] [data...]
 /// IPv6 payload: [ep_id: u8] [af: u8 = 6] [addr: 16 bytes BE] [port: u16 LE] [data...]
 /// Name payload: [ep_id: u8] [af: u8 = 1] [len: u8] [name: len bytes] [port: u16 LE] [data...]
-///
-/// Owner-tagged form — `OWNER_TAG_MARK` sits where `af` sits, so the two
-/// shapes are told apart at a fixed offset and the tag never has to be
-/// distinguished from the variable-length data:
-///
-/// [ep_id: u8] [OWNER_TAG_MARK] [owner_tag: u16 LE] [af: u8] [addr] [port: u16 LE] [data...]
 pub use super::super::super::registry::msg::datagram::CMD_DG_SEND_TO;
 
 /// Close an endpoint and release its resources.
-/// Payload: [ep_id: u8], or the owner-tagged form
-/// [ep_id: u8] [OWNER_TAG_MARK] [owner_tag: u16 LE].
+/// Payload: `[ep_id: u8]` (1 byte exactly).
 pub use super::super::super::registry::msg::datagram::CMD_DG_CLOSE;
-
-/// Marker byte introducing the owner tag on CMD_DG_SEND_TO and
-/// CMD_DG_CLOSE. It occupies the byte that otherwise holds `af`, and is
-/// distinct from every defined address family, so the tagged and untagged
-/// shapes are unambiguous without a length rule over variable-length data.
-pub const OWNER_TAG_MARK: u8 = 0xFF;
-
-/// Bytes the owner-tag field adds ahead of the untagged payload:
-/// `[OWNER_TAG_MARK][owner_tag: u16 LE]`.
-pub const OWNER_TAG_FIELD: usize = 1 + 2;
-
-/// Tag value meaning "no owner" — the host wildcard. It is what an absent
-/// tag decodes to, and an endpoint recorded with it is reachable by any
-/// consumer sharing the provider's command channel.
-pub const OWNER_TAG_NONE: u16 = 0;
+/// `CMD_DG_CLOSE` payload length.
+pub const CLOSE_LEN: usize = 1;
 
 // ─── Downstream: provider → consumer ───────────────────────────────
 
@@ -133,11 +117,18 @@ pub use super::super::super::registry::msg::datagram::MSG_DG_BOUND;
 /// datagram against the wrong id — three binds raise three BOUNDs, and
 /// whoever reads first wins.
 /// A consumer that requested a specific port claims a BOUND only when
-/// `local_port` matches it. Callers bounds-check `payload.len() >= 3`.
+/// `local_port` matches it. `None` unless the payload is exactly
+/// [`BOUND_LEN`] bytes.
 #[inline]
-pub fn dg_bound_parts(payload: &[u8]) -> (u8, u16) {
-    (payload[0], u16::from_le_bytes([payload[1], payload[2]]))
+pub fn dg_bound_parts(payload: &[u8]) -> Option<(u8, u16)> {
+    if payload.len() != BOUND_LEN {
+        return None;
+    }
+    Some((payload[0], u16::from_le_bytes([payload[1], payload[2]])))
 }
+
+/// `MSG_DG_BOUND` payload length.
+pub const BOUND_LEN: usize = 1 + 2;
 
 /// Received datagram. Source address and port are always present.
 ///
@@ -149,8 +140,10 @@ pub use super::super::super::registry::msg::datagram::MSG_DG_RX_FROM;
 /// Payload: [ep_id: u8].
 pub use super::super::super::registry::msg::datagram::MSG_DG_CLOSED;
 
-/// Endpoint error. Payload: [ep_id: u8] [errno: i8].
+/// Endpoint error. Payload: [ep_id: u8] [errno: i8] ([`ERROR_LEN`] bytes).
 pub use super::super::super::registry::msg::datagram::MSG_DG_ERROR;
+/// `MSG_DG_ERROR` payload length.
+pub const ERROR_LEN: usize = 2;
 
 // ─── Payload layout helpers ────────────────────────────────────────
 

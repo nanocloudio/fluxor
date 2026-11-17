@@ -21,18 +21,25 @@ name = "decide_in"
 direction = "input"
 content_type = "NetProto"
 required = true
+# A decision record whole, header included (`module_facts!` states the same).
+accepts_record = 67
 
 [[ports]]
 name = "fwd_in"
 direction = "input"
 index = 1
 content_type = "NetProto"
+# A forwarded frame with its record prefix, header included: the largest
+# `ip.packet_fwd` writes.
+accepts_record = 1600
 
 [[ports]]
 name = "dispose_out"
 direction = "output"
 content_type = "NetProto"
 required = true
+# The largest disposition (`CMD_PKT_DISPOSE` with a mirror), header included.
+max_record = 20
 
 # Module-scope observability — exempt.
 [observability]

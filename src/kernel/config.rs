@@ -107,6 +107,10 @@ mod profile_linux {
     /// eight carves reach any cap.
     pub const HEAP_SEGMENTS: usize = 8;
 
+    /// Lends open at once: a block cache per storage consumer, a buffer per
+    /// long transfer.
+    pub const LENDS: usize = 64;
+
     /// Each kernel pool's DEFAULT reserve: what the boot plan adds to the
     /// pool's derived size when the boot config's capacity envelope (FXEV)
     /// carries no entry for it. A pool the graph cannot size (events,
@@ -137,7 +141,7 @@ mod profile_linux {
         (res::POOL_STORE_GRANTS, 64),
         (res::POOL_SANDBOXES, 64),
         (res::POOL_TTY_SESSIONS, 8),
-        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_HANDLES, 128),
         (res::POOL_NET_POLICY_TABLES, 8),
         (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
         (res::POOL_OWNER_STORE_SUBS, 16),
@@ -146,6 +150,7 @@ mod profile_linux {
         (res::POOL_NET_ROUTE_SEGMENTS, 16),
         (res::POOL_NET_ROUTE_PEERS, 256),
         (res::POOL_NET_ROUTE_HELD, 256),
+        (res::POOL_LENDS, LENDS),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -211,6 +216,10 @@ mod profile_bcm2712 {
     /// between checks of its remaining slack (~10 us on a Cortex-A76).
     pub const ZERO_CHUNK_BYTES: usize = 64 * 1024;
 
+    /// Lends open at once: a block cache per storage consumer, a buffer per
+    /// long transfer.
+    pub const LENDS: usize = 64;
+
     /// Each kernel pool's DEFAULT reserve (see the Linux profile): what the
     /// boot plan adds to a pool's derived size when the boot config's
     /// capacity envelope (FXEV) carries no entry for it, or its size for a
@@ -225,12 +234,13 @@ mod profile_bcm2712 {
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
         (res::POOL_STORE_READS, 32),
-        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_HANDLES, 128),
         (res::POOL_NET_POLICY_TABLES, 8),
         (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
         (res::POOL_NET_ROUTE_SEGMENTS, 16),
         (res::POOL_NET_ROUTE_PEERS, 256),
         (res::POOL_NET_ROUTE_HELD, 256),
+        (res::POOL_LENDS, LENDS),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -284,6 +294,10 @@ mod profile_uefi {
     /// Bytes one slack claim zeroes (see the BCM2712 profile).
     pub const ZERO_CHUNK_BYTES: usize = 64 * 1024;
 
+    /// Lends open at once: a block cache per storage consumer, a buffer per
+    /// long transfer.
+    pub const LENDS: usize = 64;
+
     /// Each kernel pool's default reserve (see the Linux profile).
     pub const DEFAULT_RESERVES: &[(u16, usize)] = &[
         (res::POOL_MODULE_SLOTS, 256),
@@ -292,12 +306,13 @@ mod profile_uefi {
         (res::POOL_STATE_FREE_LIST, 32),
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
-        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_HANDLES, 128),
         (res::POOL_NET_POLICY_TABLES, 8),
         (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
         (res::POOL_NET_ROUTE_SEGMENTS, 16),
         (res::POOL_NET_ROUTE_PEERS, 256),
         (res::POOL_NET_ROUTE_HELD, 256),
+        (res::POOL_LENDS, LENDS),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -354,6 +369,10 @@ mod profile_wasm {
     /// the channel table one per edge.
     pub const GRAPH_EDGES: usize = 128;
 
+    /// Lends open at once: a block cache per storage consumer, a buffer per
+    /// long transfer.
+    pub const LENDS: usize = 16;
+
     /// The pools this profile holds as static tables, `(pool, size)`: the
     /// ceiling every boot plan must fit. The composer reads this table as the
     /// profile's data (`tools/src/capacity.rs`).
@@ -363,13 +382,14 @@ mod profile_wasm {
         (res::POOL_OWNERS, 1),
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
-        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_HANDLES, 128),
         (res::POOL_STATE_FREE_LIST, 32),
         (res::POOL_NET_POLICY_TABLES, 2),
         (res::POOL_NET_POLICY_TABLE_BYTES, 2048),
         (res::POOL_NET_ROUTE_SEGMENTS, 0),
         (res::POOL_NET_ROUTE_PEERS, 0),
         (res::POOL_NET_ROUTE_HELD, 0),
+        (res::POOL_LENDS, LENDS),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
@@ -448,6 +468,10 @@ mod profile_rp {
     /// within it.
     pub const GRAPH_EDGES: usize = 128;
 
+    /// Lends open at once: a block cache per storage consumer, a buffer per
+    /// long transfer.
+    pub const LENDS: usize = 8;
+
     /// Each kernel pool's DEFAULT reserve (see the Linux profile): what the
     /// boot plan adds to a pool's derived size when the boot config's
     /// capacity envelope (FXEV) carries no entry for it, or its size for a
@@ -463,12 +487,16 @@ mod profile_rp {
         (res::POOL_STATE_FREE_LIST, 32),
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
-        (res::POOL_TRACKED_HANDLES, 128),
+        // Routes past the platform's own tables (the plan's derived part):
+        // the handles module providers mint. The rig's pico graphs hold at
+        // most 3 (a cyw43 PIO command handle on `pio_rp`, `ip`'s binding).
+        (res::POOL_HANDLES, 16),
         (res::POOL_NET_POLICY_TABLES, 0),
         (res::POOL_NET_POLICY_TABLE_BYTES, 2048),
         (res::POOL_NET_ROUTE_SEGMENTS, 0),
         (res::POOL_NET_ROUTE_PEERS, 0),
         (res::POOL_NET_ROUTE_HELD, 0),
+        (res::POOL_LENDS, LENDS),
         (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
         (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
         (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),

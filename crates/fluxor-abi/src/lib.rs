@@ -54,9 +54,8 @@ pub mod wire;
 pub mod config;
 
 /// Every ABI number, generated from `abi/registry.toml` by `fluxor
-/// abi-regen`: contract ids, opcodes, grants, errno, poll bits,
-/// ioctl commands and fd tags, with the lookups the kernel and tools derive
-/// from them.
+/// abi-regen`: contract ids, opcodes, grants, errno, poll bits and the
+/// handle word, with the lookups the kernel and tools derive from them.
 pub mod registry;
 
 pub mod kernel_abi;
@@ -107,6 +106,13 @@ pub mod contracts {
         /// platform or a module provider and reported per entry.
         pub mod route;
         pub mod session_ctrl;
+        /// The continuity cursors between a record layer and its consumer.
+        pub mod stream_cursor;
+        /// The retransmission hand-off between a transport and a consumer
+        /// that keeps its own copy of what it sends.
+        pub mod stream_retx;
+        /// A stream's trace context, handed up its stages.
+        pub mod stream_trace;
         /// The single-flow continuity surface's frames, magics and versions.
         pub mod transport_continuity;
         /// The records that drive a WebSocket connector from outside it:
@@ -118,10 +124,16 @@ pub mod contracts {
     /// bundle, descriptor revision, idempotency identity, observed activation
     /// and fenced status.
     pub mod agent;
+    /// The `AudioSample` stream's records: PCM frames and the in-band format
+    /// record that states their rate.
+    pub mod audio_sample;
     /// The exchange records every request and its answer travel in, between
     /// any requester and any provider, and the collector a provider uses to
     /// take requests whole.
     pub mod exchange;
+    /// HTTP as a binding of the exchange records: the method table, the
+    /// status-to-outcome map, and header lines as meta.
+    pub mod exchange_http;
     /// The GPU contract's wire: the pack envelope, the binding table, the
     /// device's capability words and the command records. The device model
     /// that runs it (`fluxor_sdk::gpu`) is library code, not ABI.
@@ -130,6 +142,9 @@ pub mod contracts {
     pub mod resource;
     /// Generic stream-clock capability (audio/media clock query).
     pub mod stream_clock;
+    /// A consumer restarts the stream its upstream producer writes at a
+    /// position it names (an edge contract).
+    pub mod stream_select;
     /// Observability telemetry envelope (metric / span signals).
     pub mod telemetry;
     /// The platform's own verdict on a certificate chain.
@@ -166,6 +181,9 @@ pub mod contracts {
     /// map, advances, OpenType layout tables, and strikes in a
     /// `GLYPH_FORMATS` variant. Read in place.
     pub mod glyph_pack;
+    /// Decode an encoded image held in a store to raw pixels at a named
+    /// size: the job's records and output formats.
+    pub mod image_decode;
     /// Block-per-acquisition surface — the `MeasurementStream` content type's
     /// record. `sensor` carries one reading; this carries a block of samples
     /// whose individual readings are not separately meaningful.

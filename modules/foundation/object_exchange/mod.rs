@@ -34,6 +34,11 @@
 //! off. Names are opaque bytes, so the concatenation alone keeps every target
 //! inside the scope.
 //!
+//! It speaks the exchange's HTTP binding (`exchange_http.rs`): a request's
+//! verb is its method, its meta fields are its header fields, and every
+//! answer carries its HTTP status as the detail, the outcome computed from
+//! it.
+//!
 //! A header this module does not act on must not change what the request
 //! means, so before anything is routed every header is checked against the
 //! method (`refused_header`): a conditional, retention or encryption header
@@ -51,6 +56,7 @@ use fluxor_abi as abi;
 use fluxor_rt::*;
 
 use abi::contracts::exchange as ex;
+use abi::contracts::exchange_http::{self as http, method, status, Http};
 use abi::contracts::mesh::capability as cap;
 use abi::contracts::storage::handle::STORAGE_KEY_MAX;
 use abi::contracts::storage::object as obj;
@@ -97,52 +103,47 @@ const _: () = assert!(
 /// request, whichever is longer: kept whole while the provider may be asked
 /// again.
 const ARG_LEN: usize = {
-    let put = 2
-        + NAME_MAX
-        + 1
-        + CT_MAX
-        + 8
-        + 8
-        + 1
-        + 1
-        + ETAG_MAX
-        + obj::KEPT_FIXED_LEN
-        + obj::KEY_REF_MAX
-        + 8
-        + 2;
-    let list = obj::list::REQUEST_FIXED_LEN + 2 * NAME_MAX;
+    let put = obj::put::arg_len(NAME_MAX, CT_MAX, ETAG_MAX, obj::KEY_REF_MAX);
+    let list = obj::list::arg_len(NAME_MAX, NAME_MAX);
+    let delete = obj::delete::arg_len(NAME_MAX, ETAG_MAX);
+    assert!(put >= delete && put >= obj::retain::ARG_MAX && put >= obj::COMMIT_ARG_LEN);
     if put > list {
         put
     } else {
         list
     }
 };
-/// A response's header block: `content-length`, a hex entity tag of the
-/// longest a `HEAD` record carries, a hex fence, a `content-range`,
-/// `retain-until`, `legal-hold` and `key-ref`; or a listing's encoded `next`
-/// cursor and a hex fence.
-const HEADERS_LEN: usize = 1280;
+const _: () = assert!(
+    WINDOW >= obj::head::RECORD_MAX,
+    "a HEAD record fits the window"
+);
+/// A response's meta: its `content-type`, `content-length`, a hex entity tag
+/// of the longest a `HEAD` record carries, a hex fence, a `content-range`,
+/// `retain-until`, `legal-hold` and `key-ref`; or a listing's content type,
+/// encoded `next` cursor and a hex fence.
+const META_LEN: usize = 1536;
 const _: () = {
-    let line = 2 + 2; // `: ` and the line's end.
+    let line = ex::META_FIELD_FIXED;
     let number = 20; // The longest `u64`.
     let fence = 5 + line + 2 * WIRE_MAX_LEN;
-    let read = (14 + line + number)
+    let read = (12 + line + CT_MAX)
+        + (14 + line + number)
         + (4 + line + 2 * u8::MAX as usize)
         + fence
         + (13 + line + 8 + 3 * number)
         + (12 + line + number)
         + (10 + line + 2)
         + (7 + line + obj::KEY_REF_MAX);
-    let listing = fence + 4 + line + 3 * NAME_MAX;
-    assert!(HEADERS_LEN >= read && HEADERS_LEN >= listing);
+    let listing = (12 + line + 10) + fence + 4 + line + 3 * NAME_MAX;
+    assert!(META_LEN >= read && META_LEN >= listing);
 };
 /// Steps between telemetry reports.
 const TLM_PERIOD: u32 = 4096;
 /// Longest `scope`: a key prefix, bounded as keys are.
 const SCOPE_MAX: usize = obj::grant::SCOPE_MAX;
-/// A `PRESENT` request: the refusal byte, the scope and the chain, each
-/// behind its length.
-const PRESENT_LEN: usize = 1 + 2 + SCOPE_MAX + 2 + cap::MAX_CHAIN_BYTES;
+/// A `PRESENT` request and its chain, kept together: the `arg` (the refusal
+/// byte and the scope behind its length), then the chain, its `data`.
+const PRESENT_LEN: usize = obj::grant::PRESENT_ARG_MAX + cap::MAX_CHAIN_BYTES;
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -151,7 +152,7 @@ const PRESENT_LEN: usize = 1 + 2 + SCOPE_MAX + 2 + cap::MAX_CHAIN_BYTES;
 enum Phase {
     Free,
     /// A bodiless terminal HEAD waits for the outbox: `status`, `raised`,
-    /// and the `reply` headers.
+    /// and the `reply` fields.
     Reply,
     /// An ABORT (`abort_reason`) waits for the outbox.
     Abort,
@@ -205,11 +206,11 @@ enum Authority {
     Refused,
 }
 
-/// Extra headers a `Reply` carries.
+/// Extra meta fields a `Reply` carries.
 mod reply {
-    /// `fence:` — the fence the provider reported.
+    /// `fence` — the fence the provider reported.
     pub const FENCE: u8 = 1;
-    /// `content-range: bytes */<size>` — an unsatisfiable range.
+    /// `content-range` `bytes */<size>` — an unsatisfiable range.
     pub const RANGE: u8 = 2;
 }
 
@@ -226,6 +227,7 @@ enum RangeSpec {
 struct Exchange {
     phase: Phase,
     id: ExchangeId,
+    /// The request's HTTP method.
     method: u8,
     /// Response-body bytes the requester has granted and not yet received.
     resp_credit: u32,
@@ -341,7 +343,7 @@ struct State {
     tlm: [u64; metric::COUNT],
     rin: [u8; RECORD_MAX],
     rout: [u8; RECORD_MAX],
-    hdr: [u8; HEADERS_LEN],
+    meta: [u8; META_LEN],
     // The capability.
     auth: Authority,
     /// The grant every call names: the store's answer to `PRESENT`, or `-1`.
@@ -393,35 +395,41 @@ mod params_def {
 
 // ── Small writers and parsers ─────────────────────────────────────────────
 
-/// Appends to a byte buffer; `over` records that something did not fit, so a
-/// header block is never sent short.
+/// Renders a response's meta, a field at a time: numbers in decimal, bytes
+/// in hex, names percent-encoded. The run is never sent short: whatever did
+/// not fit makes [`ex::MetaWriter::finish`] answer `None`.
 struct W<'a> {
-    buf: &'a mut [u8],
-    len: usize,
-    over: bool,
+    m: ex::MetaWriter<'a>,
 }
 
 impl<'a> W<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
         W {
-            buf,
-            len: 0,
-            over: false,
+            m: ex::MetaWriter::new(buf),
         }
     }
 
+    /// Start the field `key`; its value follows.
+    fn field(&mut self, key: &[u8]) {
+        self.m.begin(key);
+    }
+
+    /// End the field begun last.
+    fn end(&mut self) {
+        self.m.end();
+    }
+
     fn put(&mut self, b: &[u8]) {
-        match self.buf.get_mut(self.len..self.len + b.len()) {
-            Some(d) => {
-                d.copy_from_slice(b);
-                self.len += b.len();
-            }
-            None => self.over = true,
-        }
+        self.m.push(b);
     }
 
     fn byte(&mut self, b: u8) {
         self.put(&[b]);
+    }
+
+    /// The run's length, or `None` when it is not whole.
+    fn finish(&self) -> Option<usize> {
+        self.m.finish()
     }
 
     fn dec(&mut self, mut v: u64) {
@@ -450,12 +458,11 @@ impl<'a> W<'a> {
 
     /// `name` percent-encoded, whole or not at all.
     fn encoded(&mut self, name: &[u8]) {
-        let rest = self.buf.get_mut(self.len..).unwrap_or(&mut []);
-        let (n, done) = encode_from(name, 0, rest);
+        let (n, done) = encode_from(name, 0, self.m.spare());
         if done {
-            self.len += n;
+            self.m.advance(n);
         } else {
-            self.over = true;
+            self.m.refuse();
         }
     }
 }
@@ -477,7 +484,7 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Whether a name byte is written `%XX` in a listing line, a `next` header
+/// Whether a name byte is written `%XX` in a listing line, a `next` field
 /// and a listing query value: the bytes that would end or split one of
 /// those, and `%` itself.
 fn escaped(c: u8) -> bool {
@@ -580,22 +587,22 @@ fn contains_ignoring_case(hay: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-/// Whether a header block says something `method` would otherwise drop, which
-/// would change what the request means. Refused: an `if-*` that is not
+/// Whether a request's meta says something `method` would otherwise drop,
+/// which would change what the request means. Refused: an `if-*` that is not
 /// `if-match` or `if-none-match`; those two on a method that does not honour
 /// them; a name that speaks of retention, a hold, an object lock, a key
 /// reference, immutability or encryption, in either `-` or `_` spelling, other
 /// than the names `method` honours; `content-range`, since a put replaces the
-/// whole object; and any of the six names `ex::header` would read only the
+/// whole object; and any of the six names `ex::meta_get` would read only the
 /// first of, given twice. Every other header is the transport's, and changes
 /// nothing.
-fn refused_header(method: u8, headers: &[u8]) -> bool {
-    let put = method == ex::METHOD_PUT;
-    let patch = method == ex::METHOD_PATCH;
-    let conditional = put || method == ex::METHOD_DELETE;
+fn refused_header(verb: u8, meta: &[u8]) -> bool {
+    let put = verb == method::PUT;
+    let patch = verb == method::PATCH;
+    let conditional = put || verb == method::DELETE;
     // One bit each for the names that may not repeat.
     let mut seen = 0u8;
-    for (name, _) in ex::header_lines(headers) {
+    for (name, _) in ex::meta_fields(meta) {
         let is = |exact: &[u8]| name.eq_ignore_ascii_case(exact);
         let (bit, honoured) = if is(b"if-match") {
             (1, conditional)
@@ -654,7 +661,7 @@ fn parse_legal_hold(v: &[u8]) -> Option<bool> {
 }
 
 /// Whether a `key-ref` can travel as a header value: visible ASCII only, so it
-/// cannot end the line or split the block it is written into.
+/// cannot end the line or split the block an HTTP server writes it into.
 fn is_visible(v: &[u8]) -> bool {
     v.iter().all(|c| c.is_ascii_graphic())
 }
@@ -663,17 +670,17 @@ fn is_visible(v: &[u8]) -> bool {
 /// own answer, so none is marked RAISED.
 fn status_of(rc: i32, write: bool) -> u16 {
     match rc {
-        errno::ENXIO | errno::ENOENT => 404,
-        errno::EEXIST => 412,
+        errno::ENXIO | errno::ENOENT => status::NOT_FOUND,
+        errno::EEXIST => status::PRECONDITION_FAILED,
         // On a write's decision, `EAGAIN` is a lost `ETAG` precondition.
-        errno::EAGAIN if write => 412,
-        errno::EACCES => 403,
-        errno::ERETAINED => 423,
-        errno::EINVAL => ex::status::BAD_REQUEST,
-        errno::E2BIG | errno::ENOSPC => ex::status::TOO_LARGE,
-        errno::EBUSY | errno::ENOMEM | errno::EAGAIN => ex::status::BUSY,
-        errno::ENOSYS | errno::ENOTSUP => 501,
-        _ => ex::status::FAILED,
+        errno::EAGAIN if write => status::PRECONDITION_FAILED,
+        errno::EACCES => status::FORBIDDEN,
+        errno::ERETAINED => status::LOCKED,
+        errno::EINVAL => status::BAD_REQUEST,
+        errno::E2BIG | errno::ENOSPC => status::PAYLOAD_TOO_LARGE,
+        errno::EBUSY | errno::ENOMEM | errno::EAGAIN => status::SERVICE_UNAVAILABLE,
+        errno::ENOSYS | errno::ENOTSUP => status::NOT_IMPLEMENTED,
+        _ => status::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -753,11 +760,10 @@ fn bind(s: &mut State) -> Result<(), &'static [u8]> {
     if !obj::grant::valid_scope(scope) {
         return Err(b"[object_exchange] scope is not a key prefix ending `/`");
     }
-    // [refusal][scope_len][scope][chain_len][chain], the chain decoded in
-    // place.
-    let at = 3 + sl;
+    // [refusal][scope_len][scope] then the chain, decoded in place.
+    let at = obj::grant::present_arg_len(sl);
     let text = s.cap_text.get(..cl).unwrap_or(&[]);
-    let Some(chain_out) = s.present.get_mut(at + 2..) else {
+    let Some(chain_out) = s.present.get_mut(at..) else {
         return Err(b"[object_exchange] capability is not fxcap1 text");
     };
     let Some(n) = cap::decode_text(text, chain_out) else {
@@ -766,11 +772,12 @@ fn bind(s: &mut State) -> Result<(), &'static [u8]> {
     if cap::Chain::parse(chain_out.get(..n).unwrap_or(&[])).is_err() {
         return Err(b"[object_exchange] capability is not a capability chain");
     }
-    s.present[0] = 0;
-    s.present[1..3].copy_from_slice(&(sl as u16).to_le_bytes());
-    s.present[3..at].copy_from_slice(scope);
-    s.present[at..at + 2].copy_from_slice(&(n as u16).to_le_bytes());
-    s.present_len = (at + 2 + n) as u16;
+    let mut head = [0u8; obj::grant::PRESENT_ARG_MAX];
+    if obj::grant::encode_present(&mut head, scope) != Some(at) {
+        return Err(b"[object_exchange] scope is not a key prefix ending `/`");
+    }
+    s.present[..at].copy_from_slice(&head[..at]);
+    s.present_len = (at + n) as u16;
     s.auth = Authority::Presenting;
     Ok(())
 }
@@ -790,8 +797,24 @@ unsafe fn authorize(s: &mut State) {
 /// and logged once.
 unsafe fn present(s: &mut State) {
     s.present[obj::grant::REFUSAL_AT] = 0;
+    let at = obj::grant::present_arg_len(usize::from(s.scope_len));
     let len = usize::from(s.present_len);
-    let rc = call(s.syscalls, -1, obj::PRESENT, s.present.as_mut_ptr(), len);
+    let split = s
+        .present
+        .get_mut(..len)
+        .and_then(|p| p.split_at_mut_checked(at));
+    let rc = match split {
+        Some((arg, chain)) => call_data(
+            s.syscalls,
+            -1,
+            obj::PRESENT,
+            arg.as_mut_ptr(),
+            arg.len(),
+            chain.as_mut_ptr(),
+            chain.len(),
+        ),
+        None => errno::EINVAL,
+    };
     s.auth = match rc {
         errno::EAGAIN | errno::EINPROGRESS => Authority::Presenting,
         errno::ENOMEM | errno::EBUSY => {
@@ -920,7 +943,30 @@ fn count(s: &mut State, m: usize, n: u64) {
 // ── Provider calls ────────────────────────────────────────────────────────
 
 unsafe fn call(sys: *const SyscallTable, handle: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
-    ((*sys).provider_call)(handle, op, arg, len)
+    ((*sys).provider_call)(handle, op, arg, len, core::ptr::null_mut(), 0)
+}
+
+/// A call with a `data` span: the op's body, range or page.
+unsafe fn call_data(
+    sys: *const SyscallTable,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    ((*sys).provider_call)(handle, op, arg, len, data, data_len)
+}
+
+/// The fence the trailer of `arg` carries, encoded as `put_fence` reads it;
+/// all zero (no fence) when it carries none.
+fn trailer_fence(arg: &[u8]) -> [u8; WIRE_MAX_LEN] {
+    let mut out = [0u8; WIRE_MAX_LEN];
+    if let Some(f) = abi::fence::trailer::get(arg) {
+        let _ = f.encode(&mut out);
+    }
+    out
 }
 
 /// Release whatever provider handle exchange `i` holds: a streamed put is
@@ -940,7 +986,7 @@ unsafe fn release(s: &mut State, i: usize) {
 
 /// End exchange `i` with a bodiless terminal HEAD, sent once the outbox is
 /// clear. After its response has begun, the exchange is aborted instead.
-unsafe fn finish(s: &mut State, i: usize, status: u16, raised: bool, headers: u8) {
+unsafe fn finish(s: &mut State, i: usize, code: u16, raised: bool, fields: u8) {
     release(s, i);
     let e = &mut s.ex[i];
     if e.head_sent {
@@ -948,9 +994,9 @@ unsafe fn finish(s: &mut State, i: usize, status: u16, raised: bool, headers: u8
         e.phase = Phase::Abort;
         return;
     }
-    e.status = status;
+    e.status = code;
     e.raised = raised;
-    e.reply = headers;
+    e.reply = fields;
     e.phase = Phase::Reply;
 }
 
@@ -1036,41 +1082,40 @@ unsafe fn emit_one(s: &mut State, i: usize) -> bool {
     }
 }
 
-/// The `fence:` header for the fence in `fence`, when it decodes.
+/// The `fence` field for the fence in `fence`, when it decodes.
 fn put_fence(w: &mut W<'_>, fence: &[u8; WIRE_MAX_LEN]) {
     if let Some((_, n)) = Fence::decode(fence) {
-        w.put(b"fence: ");
+        w.field(b"fence");
         w.hex(fence.get(..n).unwrap_or(&[]));
-        w.put(b"\r\n");
+        w.end();
     }
 }
 
 unsafe fn emit_reply(s: &mut State, i: usize) {
     let e = &s.ex[i];
-    let (id, status, raised, flags, size) = (e.id, e.status, e.raised, e.reply, e.size);
-    let mut w = W::new(&mut s.hdr);
+    let (id, code, raised, flags, size) = (e.id, e.status, e.raised, e.reply, e.size);
+    let mut w = W::new(&mut s.meta);
     if flags & reply::FENCE != 0 {
         put_fence(&mut w, &e.fence);
     }
     if flags & reply::RANGE != 0 {
-        w.put(b"content-range: bytes */");
+        w.field(b"content-range");
+        w.put(b"bytes */");
         w.dec(size);
-        w.put(b"\r\n");
+        w.end();
     }
-    let hl = if w.over { 0 } else { w.len };
-    if status >= 400 {
+    let ml = w.finish().unwrap_or(0);
+    if code >= status::BAD_REQUEST {
         count(s, metric::ERRORS, 1);
     }
     free(s, i);
-    let head = ex::ResponseHead {
-        id,
-        flags: if raised { ex::flag::RAISED } else { 0 },
-        status,
-        content_type: &[],
-        headers: s.hdr.get(..hl).unwrap_or(&[]),
-        body: &[],
+    let Some(mut head) = http::head(id, code, s.meta.get(..ml).unwrap_or(&[]), &[]) else {
+        return;
     };
-    if let Some(n) = ex::write_response_head(&head, &mut s.rout) {
+    if raised {
+        head.flags = ex::flag::RAISED;
+    }
+    if let Some(n) = ex::write_response_head::<Http>(&head, &mut s.rout) {
         send(s, id, n);
     }
 }
@@ -1096,11 +1141,16 @@ unsafe fn read_range(
 ) -> Result<usize, ()> {
     let mut got = 0usize;
     while got < want {
-        let mut arg = [0u8; 20];
-        arg[..8].copy_from_slice(&(offset + got as u64).to_le_bytes());
-        arg[8..12].copy_from_slice(&((want - got) as u32).to_le_bytes());
-        arg[12..20].copy_from_slice(&(out.add(got) as u64).to_le_bytes());
-        let rc = call(sys, handle, obj::RANGE_GET, arg.as_mut_ptr(), arg.len());
+        let mut arg = obj::range_get::encode(offset + got as u64);
+        let rc = call_data(
+            sys,
+            handle,
+            obj::RANGE_GET,
+            arg.as_mut_ptr(),
+            arg.len(),
+            out.add(got),
+            want - got,
+        );
         if rc == errno::EAGAIN {
             break;
         }
@@ -1154,7 +1204,7 @@ unsafe fn emit_stream(s: &mut State, i: usize) -> bool {
     true
 }
 
-/// The response HEAD of a read: its status, the object's content type, and
+/// The response HEAD of a read: its status, the object's `content-type`,
 /// `content-length`, `etag`, `fence`, (for a range) `content-range`, and what
 /// the store keeps with the object: `retain-until`, `legal-hold` and `key-ref`.
 unsafe fn emit_stream_head(s: &mut State, i: usize) -> bool {
@@ -1162,67 +1212,70 @@ unsafe fn emit_stream_head(s: &mut State, i: usize) -> bool {
     // The record is in the exchange's own buffer, which nothing below writes.
     let record: &[u8] = core::slice::from_raw_parts(s.ex[i].buf.as_ptr(), head_len);
     let Some((_, ct, etag, kept)) = obj::range::decode_head(record) else {
-        finish(s, i, ex::status::FAILED, true, 0);
+        finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
         emit_reply(s, i);
         return true;
     };
     let e = &s.ex[i];
     let partial = e.range != RangeSpec::Whole;
-    let mut w = W::new(&mut s.hdr);
-    w.put(b"content-length: ");
+    let mut w = W::new(&mut s.meta);
+    if !ct.is_empty() {
+        w.field(ex::META_CONTENT_TYPE);
+        w.put(ct);
+        w.end();
+    }
+    w.field(b"content-length");
     w.dec(e.end - e.offset);
-    w.put(b"\r\n");
+    w.end();
     if !etag.is_empty() {
-        w.put(b"etag: ");
+        w.field(b"etag");
         w.hex(etag);
-        w.put(b"\r\n");
+        w.end();
     }
     put_fence(&mut w, &e.fence);
     if partial {
-        w.put(b"content-range: bytes ");
+        w.field(b"content-range");
+        w.put(b"bytes ");
         w.dec(e.offset);
         w.byte(b'-');
         w.dec(e.end.saturating_sub(1));
         w.byte(b'/');
         w.dec(e.size);
-        w.put(b"\r\n");
+        w.end();
     }
     if kept.retain_until_ms != 0 {
-        w.put(b"retain-until: ");
+        w.field(b"retain-until");
         w.dec(kept.retain_until_ms);
-        w.put(b"\r\n");
+        w.end();
     }
     if kept.legal_hold {
-        w.put(b"legal-hold: on\r\n");
+        w.field(b"legal-hold");
+        w.put(b"on");
+        w.end();
     }
     if !kept.key_ref.is_empty() {
-        w.put(b"key-ref: ");
+        w.field(b"key-ref");
         w.put(kept.key_ref);
-        w.put(b"\r\n");
+        w.end();
     }
-    let (hl, over) = (w.len, w.over);
+    let ml = w.finish();
     let id = e.id;
-    let head = ex::ResponseHead {
-        id,
-        flags: 0,
-        status: if partial { 206 } else { 200 },
-        content_type: ct,
-        headers: s.hdr.get(..hl).unwrap_or(&[]),
-        body: &[],
-    };
-    let written = if over {
-        None
+    let code = if partial {
+        status::PARTIAL_CONTENT
     } else {
-        ex::write_response_head(&head, &mut s.rout)
+        status::OK
     };
+    let written = ml
+        .and_then(|ml| http::head(id, code, s.meta.get(..ml).unwrap_or(&[]), &[]))
+        .and_then(|head| ex::write_response_head::<Http>(&head, &mut s.rout));
     let Some(n) = written else {
-        finish(s, i, ex::status::FAILED, true, 0);
+        finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
         emit_reply(s, i);
         return true;
     };
     let e = &s.ex[i];
     let left = e.end - e.offset;
-    let has_body = e.method != ex::METHOD_HEAD && left > 0;
+    let has_body = e.method != method::HEAD && left > 0;
     let want = if has_body {
         left.min(u64::from(e.resp_credit))
             .min((RECORD_MAX - n) as u64) as usize
@@ -1235,7 +1288,7 @@ unsafe fn emit_stream_head(s: &mut State, i: usize) -> bool {
         match read_range(s.syscalls, handle, offset, out, want) {
             Ok(g) => g,
             Err(()) => {
-                finish(s, i, ex::status::FAILED, true, 0);
+                finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
                 emit_reply(s, i);
                 return true;
             }
@@ -1301,34 +1354,27 @@ unsafe fn emit_list(s: &mut State, i: usize) -> bool {
     // The page is in the exchange's own buffer, which nothing below writes.
     let page_bytes: &[u8] = core::slice::from_raw_parts(e.buf.as_ptr(), usize::from(e.page_len));
     let Some(page) = obj::list::decode_page(page_bytes) else {
-        finish(s, i, ex::status::FAILED, true, 0);
+        finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
         emit_reply(s, i);
         return true;
     };
     let at = if first {
-        let mut w = W::new(&mut s.hdr);
+        let mut w = W::new(&mut s.meta);
+        w.field(ex::META_CONTENT_TYPE);
+        w.put(b"text/plain");
+        w.end();
         put_fence(&mut w, &e.fence);
         if !page.is_last() {
-            w.put(b"next: ");
+            w.field(b"next");
             w.encoded(page.cursor().get(usize::from(s.scope_len)..).unwrap_or(&[]));
-            w.put(b"\r\n");
+            w.end();
         }
-        let (hl, over) = (w.len, w.over);
-        let head = ex::ResponseHead {
-            id,
-            flags: 0,
-            status: 200,
-            content_type: b"text/plain",
-            headers: s.hdr.get(..hl).unwrap_or(&[]),
-            body: &[],
-        };
-        let written = if over {
-            None
-        } else {
-            ex::write_response_head(&head, &mut s.rout)
-        };
+        let written = w
+            .finish()
+            .and_then(|ml| http::head(id, status::OK, s.meta.get(..ml).unwrap_or(&[]), &[]))
+            .and_then(|head| ex::write_response_head::<Http>(&head, &mut s.rout));
         let Some(n) = written else {
-            finish(s, i, ex::status::FAILED, true, 0);
+            finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
             emit_reply(s, i);
             return true;
         };
@@ -1420,12 +1466,12 @@ fn withdraw(s: &mut State, id: &ExchangeId) {
 
 /// Answer `id` at once with a refusal raised here. False when the outbox is
 /// full, and the record that needs it must wait.
-unsafe fn refuse_now(s: &mut State, id: ExchangeId, status: u16) -> bool {
+unsafe fn refuse_now(s: &mut State, id: ExchangeId, code: u16) -> bool {
     if s.outbox.holding() {
         return false;
     }
     count(s, metric::ERRORS, 1);
-    if let Some(n) = ex::write_refusal(&id, status, &mut s.rout) {
+    if let Some(n) = http::write_refusal(&id, code, &mut s.rout) {
         send(s, id, n);
     }
     true
@@ -1436,13 +1482,14 @@ unsafe fn take(s: &mut State) -> bool {
     // The record stays in `rin` until it is taken; nothing below reads into
     // `rin`.
     let raw: &[u8] = core::slice::from_raw_parts(s.rin.as_ptr(), s.held_len);
-    let Some(rec) = ex::parse_request(raw) else {
-        // A HEAD whose lengths disagree with its record still names its
-        // exchange, and is owed an answer; anything else malformed has
+    let Ok(rec) = ex::parse_request::<Http>(raw) else {
+        // A HEAD that breaks a rule — lengths that disagree with its record,
+        // a verb that is not this binding's or not its op's — still names
+        // its exchange, and is owed an answer; anything else malformed has
         // nowhere to send one.
         if ex::record_kind(raw) == Some(ex::kind::HEAD) {
             if let Some(id) = ex::record_id(raw) {
-                return refuse_now(s, id, ex::status::BAD_REQUEST);
+                return refuse_now(s, id, status::BAD_REQUEST);
             }
         }
         return true;
@@ -1458,7 +1505,7 @@ unsafe fn take(s: &mut State) -> bool {
                     .position(|e| e.phase != Phase::Free && e.id == h.id)
                     .or_else(|| s.ex.iter().position(|e| e.phase == Phase::Free))
             else {
-                if !refuse_now(s, h.id, ex::status::BUSY) {
+                if !refuse_now(s, h.id, status::SERVICE_UNAVAILABLE) {
                     return false;
                 }
                 count(s, metric::REFUSED, 1);
@@ -1528,60 +1575,63 @@ unsafe fn begin(s: &mut State, i: usize, h: &ex::RequestHead<'_>) {
     e.reset();
     e.phase = Phase::Reply;
     e.id = h.id;
-    e.method = h.method;
+    e.method = h.verb;
     e.resp_credit = h.resp_credit;
     let more = h.flags & ex::flag::MORE != 0;
-    let refused_flags = ex::flag::WEBSOCKET | ex::flag::WEBTRANSPORT | ex::flag::BROADCAST;
-    if h.flags & refused_flags != 0 || refused_header(h.method, h.headers) {
-        return finish(s, i, ex::status::BAD_REQUEST, true, 0);
+    // A call is all this front answers: a publish names no object, a
+    // session has no store operation to carry, and a fan-out reaches one
+    // store.
+    if h.op != ex::op::CALL || h.flags & ex::flag::BROADCAST != 0 || refused_header(h.verb, h.meta)
+    {
+        return finish(s, i, status::BAD_REQUEST, true, 0);
     }
     let sl = usize::from(s.scope_len);
-    let outcome = match (h.method, route(h.target, NAME_MAX - sl)) {
-        (ex::METHOD_GET, Some(Target::List(q))) => begin_list(s, i, q),
+    let outcome = match (h.verb, route(h.target, NAME_MAX - sl)) {
+        (method::GET, Some(Target::List(q))) => begin_list(s, i, q),
         // `/?…` is the listing's own target, so no object name starts `?`.
-        (_, Some(Target::List(_))) | (_, None) => Err(ex::status::BAD_REQUEST),
-        (method, Some(Target::Object(rest))) => {
+        (_, Some(Target::List(_))) | (_, None) => Err(status::BAD_REQUEST),
+        (verb, Some(Target::Object(rest))) => {
             // The object is `<scope><rest>`: the scope is the front's root.
             let e = &mut s.ex[i];
             e.name[..sl].copy_from_slice(&s.scope[..sl]);
             e.name[sl..sl + rest.len()].copy_from_slice(rest);
             e.name_len = (sl + rest.len()) as u16;
-            match method {
-                ex::METHOD_GET | ex::METHOD_HEAD => begin_read(s, i, h.headers),
-                ex::METHOD_PUT => begin_put(s, i, h.headers, h.body, more),
-                ex::METHOD_DELETE => begin_delete(s, i, h.headers),
-                ex::METHOD_PATCH => begin_retain(s, i, h.headers, h.body, more),
-                _ => Err(ex::status::BAD_REQUEST),
+            match verb {
+                method::GET | method::HEAD => begin_read(s, i, h.meta),
+                method::PUT => begin_put(s, i, h.meta, h.body, more),
+                method::DELETE => begin_delete(s, i, h.meta),
+                method::PATCH => begin_retain(s, i, h.meta, h.body, more),
+                _ => Err(status::BAD_REQUEST),
             }
         }
     };
-    if let Err(status) = outcome {
-        finish(s, i, status, true, 0);
+    if let Err(code) = outcome {
+        finish(s, i, code, true, 0);
     }
 }
 
-fn begin_read(s: &mut State, i: usize, headers: &[u8]) -> Result<(), u16> {
+fn begin_read(s: &mut State, i: usize, meta: &[u8]) -> Result<(), u16> {
     let e = &mut s.ex[i];
-    e.range = match ex::header(headers, b"range") {
-        Some(v) if e.method == ex::METHOD_GET => parse_range(v).ok_or(ex::status::BAD_REQUEST)?,
+    e.range = match ex::meta_get(meta, b"range") {
+        Some(v) if e.method == method::GET => parse_range(v).ok_or(status::BAD_REQUEST)?,
         _ => RangeSpec::Whole,
     };
     e.phase = Phase::Meta;
     Ok(())
 }
 
-/// The precondition a write's headers state: `if-none-match: *` is ABSENT,
+/// The precondition a write's meta states: `if-none-match: *` is ABSENT,
 /// `if-match: <hex etag>` (quoted or not) is ETAG, neither is ANY. The etag
 /// goes into `etag`; returns `(precondition, etag_len)`.
 fn precondition(
-    headers: &[u8],
+    meta: &[u8],
     allow_absent: bool,
     etag: &mut [u8; ETAG_MAX],
 ) -> Result<(u8, usize), u16> {
-    let bad = ex::status::BAD_REQUEST;
+    let bad = status::BAD_REQUEST;
     match (
-        ex::header(headers, b"if-none-match"),
-        ex::header(headers, b"if-match"),
+        ex::meta_get(meta, b"if-none-match"),
+        ex::meta_get(meta, b"if-match"),
     ) {
         (Some(_), Some(_)) => Err(bad),
         (Some(b"*"), None) if allow_absent => Ok((obj::precondition::ABSENT, 0)),
@@ -1608,57 +1658,32 @@ fn precondition(
     }
 }
 
-/// Lays out a provider request in an exchange's `arg`.
-struct ArgW<'a> {
-    arg: &'a mut [u8; ARG_LEN],
-    at: usize,
-}
-
-impl ArgW<'_> {
-    fn put(&mut self, b: &[u8]) -> Result<(), u16> {
-        let d = self
-            .arg
-            .get_mut(self.at..self.at + b.len())
-            .ok_or(ex::status::FAILED)?;
-        d.copy_from_slice(b);
-        self.at += b.len();
-        Ok(())
-    }
-}
-
 /// A put: single-shot when the HEAD carries the whole body, streamed when
 /// the body continues (`more`). `content-type` is stored with the object,
-/// `content-length` is the streamed put's size hint, `if-none-match: *` or
+/// `content-length` is checked to be digits, `if-none-match: *` or
 /// `if-match` make the write conditional, and `key-ref`, `retain-until` and
 /// `legal-hold` are for the store to keep with the object.
-fn begin_put(
-    s: &mut State,
-    i: usize,
-    headers: &[u8],
-    inline: &[u8],
-    more: bool,
-) -> Result<(), u16> {
-    let bad = ex::status::BAD_REQUEST;
-    let ct = ex::header(headers, b"content-type").unwrap_or(b"");
+fn begin_put(s: &mut State, i: usize, meta: &[u8], inline: &[u8], more: bool) -> Result<(), u16> {
+    let bad = status::BAD_REQUEST;
+    let ct = ex::meta_get(meta, ex::META_CONTENT_TYPE).unwrap_or(b"");
     if ct.len() > CT_MAX {
         return Err(bad);
     }
     let mut etag = [0u8; ETAG_MAX];
-    let (pre, etag_len) = precondition(headers, true, &mut etag)?;
-    let expected = match ex::header(headers, b"content-length") {
-        Some(v) => digits(v).ok_or(bad)?,
-        None => 0,
-    };
-    let key_ref = match ex::header(headers, b"key-ref") {
+    let (pre, etag_len) = precondition(meta, true, &mut etag)?;
+    if let Some(v) = ex::meta_get(meta, b"content-length") {
+        digits(v).ok_or(bad)?;
+    }
+    let key_ref = match ex::meta_get(meta, b"key-ref") {
         Some(v) if v.is_empty() || v.len() > obj::KEY_REF_MAX || !is_visible(v) => return Err(bad),
         Some(v) => v,
         None => b"",
     };
-    let retain_until_ms = match ex::header(headers, b"retain-until") {
+    let retain_until_ms = match ex::meta_get(meta, b"retain-until") {
         Some(v) => parse_retain_until(v).ok_or(bad)?,
         None => 0,
     };
-    let legal_hold = match ex::header(headers, b"legal-hold") {
+    let legal_hold = match ex::meta_get(meta, b"legal-hold") {
         Some(v) => parse_legal_hold(v).ok_or(bad)?,
         None => false,
     };
@@ -1668,7 +1693,7 @@ fn begin_put(
         legal_hold,
     };
     if inline.len() > WINDOW {
-        return Err(ex::status::TOO_LARGE);
+        return Err(status::PAYLOAD_TOO_LARGE);
     }
     count(s, metric::BYTES_IN, inline.len() as u64);
     let e = &mut s.ex[i];
@@ -1677,33 +1702,21 @@ fn begin_put(
     e.buf[..inline.len()].copy_from_slice(inline);
     e.stash_len = inline.len() as u32;
     let name_len = usize::from(e.name_len);
-    let body_ptr = e.buf.as_ptr() as u64;
-    let fence_ptr = e.fence.as_mut_ptr() as u64;
-    let mut a = ArgW {
-        arg: &mut e.arg,
-        at: 0,
+    let req = obj::put::Request {
+        key: e.name.get(..name_len).unwrap_or(&[]),
+        content_type: ct,
+        precondition: pre,
+        etag: etag.get(..etag_len).unwrap_or(&[]),
+        kept,
     };
-    a.put(&(name_len as u16).to_le_bytes())?;
-    a.put(e.name.get(..name_len).unwrap_or(&[]))?;
-    a.put(&[ct.len() as u8])?;
-    a.put(ct)?;
-    if more {
-        a.put(&expected.to_le_bytes())?;
+    // A streamed put opens with the record alone; a single-shot put carries
+    // the fence trailer, and its body (the stash) travels in `data`.
+    let n = if more {
+        obj::put::encode_record(&mut e.arg, &req)
     } else {
-        a.put(&body_ptr.to_le_bytes())?;
-        a.put(&(inline.len() as u64).to_le_bytes())?;
-    }
-    a.put(&[pre, etag_len as u8])?;
-    a.put(etag.get(..etag_len).unwrap_or(&[]))?;
-    let n = kept
-        .encode(a.arg.get_mut(a.at..).unwrap_or(&mut []))
-        .ok_or(ex::status::FAILED)?;
-    a.at += n;
-    if !more {
-        a.put(&fence_ptr.to_le_bytes())?;
-        a.put(&(WIRE_MAX_LEN as u16).to_le_bytes())?;
-    }
-    e.arg_len = a.at as u16;
+        obj::put::encode(&mut e.arg, &req)
+    };
+    e.arg_len = n.ok_or(status::INTERNAL_SERVER_ERROR)? as u16;
     if more {
         e.body_open = true;
         e.phase = Phase::PutOpen;
@@ -1714,23 +1727,18 @@ fn begin_put(
 }
 
 /// A delete, conditional on `if-match` when it names an etag.
-fn begin_delete(s: &mut State, i: usize, headers: &[u8]) -> Result<(), u16> {
+fn begin_delete(s: &mut State, i: usize, meta: &[u8]) -> Result<(), u16> {
     let mut etag = [0u8; ETAG_MAX];
-    let (pre, etag_len) = precondition(headers, false, &mut etag)?;
+    let (pre, etag_len) = precondition(meta, false, &mut etag)?;
     let e = &mut s.ex[i];
     let name_len = usize::from(e.name_len);
-    let fence_ptr = e.fence.as_mut_ptr() as u64;
-    let mut a = ArgW {
-        arg: &mut e.arg,
-        at: 0,
+    let req = obj::delete::Request {
+        key: e.name.get(..name_len).unwrap_or(&[]),
+        precondition: pre,
+        etag: etag.get(..etag_len).unwrap_or(&[]),
     };
-    a.put(&(name_len as u16).to_le_bytes())?;
-    a.put(e.name.get(..name_len).unwrap_or(&[]))?;
-    a.put(&[pre, etag_len as u8])?;
-    a.put(etag.get(..etag_len).unwrap_or(&[]))?;
-    a.put(&fence_ptr.to_le_bytes())?;
-    a.put(&(WIRE_MAX_LEN as u16).to_le_bytes())?;
-    e.arg_len = a.at as u16;
+    let n = obj::delete::encode_request(&mut e.arg, &req).ok_or(status::INTERNAL_SERVER_ERROR)?;
+    e.arg_len = n as u16;
     e.phase = Phase::Delete;
     Ok(())
 }
@@ -1740,19 +1748,19 @@ fn begin_delete(s: &mut State, i: usize, headers: &[u8]) -> Result<(), u16> {
 fn begin_retain(
     s: &mut State,
     i: usize,
-    headers: &[u8],
+    meta: &[u8],
     inline: &[u8],
     more: bool,
 ) -> Result<(), u16> {
-    let bad = ex::status::BAD_REQUEST;
+    let bad = status::BAD_REQUEST;
     if more || !inline.is_empty() {
         return Err(bad);
     }
-    let retain_until_ms = match ex::header(headers, b"retain-until") {
+    let retain_until_ms = match ex::meta_get(meta, b"retain-until") {
         Some(v) => parse_retain_until(v).ok_or(bad)?,
         None => 0,
     };
-    let hold = match ex::header(headers, b"legal-hold") {
+    let hold = match ex::meta_get(meta, b"legal-hold") {
         Some(v) if parse_legal_hold(v).ok_or(bad)? => obj::hold::SET,
         Some(_) => obj::hold::CLEAR,
         None => obj::hold::LEAVE,
@@ -1765,10 +1773,8 @@ fn begin_retain(
         key: e.name.get(..usize::from(e.name_len)).unwrap_or(&[]),
         retain_until_ms,
         hold,
-        fence_out_ptr: e.fence.as_mut_ptr() as u64,
-        fence_out_cap: WIRE_MAX_LEN as u16,
     };
-    let n = obj::retain::encode_request(&mut e.arg, &req).ok_or(ex::status::FAILED)?;
+    let n = obj::retain::encode_request(&mut e.arg, &req).ok_or(status::INTERNAL_SERVER_ERROR)?;
     e.arg_len = n as u16;
     e.phase = Phase::Retain;
     Ok(())
@@ -1780,7 +1786,7 @@ fn begin_retain(
 /// is asked for `<scope><prefix>` and, when `after` names a key,
 /// `<scope><after>`; either longer than the key bound is refused `400`.
 fn begin_list(s: &mut State, i: usize, query: &[u8]) -> Result<(), u16> {
-    let bad = ex::status::BAD_REQUEST;
+    let bad = status::BAD_REQUEST;
     let sl = usize::from(s.scope_len);
     let scope = s.scope.get(..sl).unwrap_or(&[]);
     let mut prefix = [0u8; NAME_MAX];
@@ -1825,12 +1831,8 @@ fn begin_list(s: &mut State, i: usize, query: &[u8]) -> Result<(), u16> {
         prefix: prefix.get(..sl + pl.unwrap_or(0)).unwrap_or(&[]),
         cursor: after.get(..cursor_len).unwrap_or(&[]),
         max_keys: max.unwrap_or(obj::LIST_PAGE_MAX),
-        out_ptr: e.buf.as_mut_ptr() as u64,
-        out_cap: WINDOW as u32,
-        fence_out_ptr: e.fence.as_mut_ptr() as u64,
-        fence_out_cap: WIRE_MAX_LEN as u16,
     };
-    let n = obj::list::encode_request(&mut e.arg, &req).ok_or(ex::status::FAILED)?;
+    let n = obj::list::encode_request(&mut e.arg, &req).ok_or(status::INTERNAL_SERVER_ERROR)?;
     e.arg_len = n as u16;
     e.phase = Phase::List;
     Ok(())
@@ -1859,10 +1861,12 @@ unsafe fn body(s: &mut State, i: usize, data: &[u8], last: bool) {
     // Straight to the stream while nothing of the body waits; behind what
     // waits otherwise.
     if phase == Phase::PutBody && e.stash_len == 0 && len > 0 {
-        let rc = call(
+        let rc = call_data(
             s.syscalls,
             e.handle,
             obj::PUT_STREAMED_WRITE,
+            core::ptr::null_mut(),
+            0,
             data.as_ptr() as *mut u8,
             len,
         );
@@ -1895,8 +1899,8 @@ unsafe fn drive(s: &mut State, i: usize) {
         match s.auth {
             Authority::None | Authority::Granted => {}
             Authority::Presenting => return,
-            Authority::Busy => return finish(s, i, ex::status::BUSY, false, 0),
-            Authority::Refused => return finish(s, i, 403, false, 0),
+            Authority::Busy => return finish(s, i, status::SERVICE_UNAVAILABLE, false, 0),
+            Authority::Refused => return finish(s, i, status::FORBIDDEN, false, 0),
         }
     }
     match s.ex[i].phase {
@@ -1918,28 +1922,29 @@ unsafe fn drive(s: &mut State, i: usize) {
 unsafe fn meta(s: &mut State, i: usize) {
     let e = &mut s.ex[i];
     let name_len = usize::from(e.name_len);
-    let mut arg = [0u8; 2 + NAME_MAX + 22];
-    arg[..2].copy_from_slice(&(name_len as u16).to_le_bytes());
-    arg[2..2 + name_len].copy_from_slice(&e.name[..name_len]);
-    let p = 2 + name_len;
-    arg[p..p + 8].copy_from_slice(&(e.buf.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 12].copy_from_slice(&(WINDOW as u32).to_le_bytes());
-    arg[p + 12..p + 20].copy_from_slice(&(e.fence.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 20..p + 22].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
-    let rc = call(s.syscalls, s.grant, obj::HEAD, arg.as_mut_ptr(), p + 22);
+    let mut arg = [0u8; obj::head::ARG_LEN];
+    if obj::head::encode_request(&mut arg, &e.name[..name_len]).is_none() {
+        return finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
+    }
+    let rc = call(s.syscalls, s.grant, obj::HEAD, arg.as_mut_ptr(), arg.len());
     if rc == errno::EAGAIN {
         return;
     }
     if rc < 0 {
         return finish(s, i, status_of(rc, false), false, 0);
     }
+    // The record is answered in place; it is kept in the exchange's buffer
+    // with the fence it was read at.
+    let n = (rc as usize).min(obj::head::RECORD_MAX).min(WINDOW);
+    e.buf[..n].copy_from_slice(&arg[..n]);
+    e.fence = trailer_fence(&arg);
     // A key reference another writer stored that is not a header value is not
     // one this front can answer.
     let size = obj::range::decode_head(e.buf.get(..rc as usize).unwrap_or(&[]))
         .filter(|(_, _, _, kept)| is_visible(kept.key_ref))
         .map(|(h, _, _, _)| h.size);
     let Some(size) = size else {
-        return finish(s, i, ex::status::FAILED, true, 0);
+        return finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
     };
     e.head_len = rc as u16;
     e.size = size;
@@ -1950,12 +1955,12 @@ unsafe fn meta(s: &mut State, i: usize) {
         _ => None,
     };
     let Some((start, end)) = bounds else {
-        return finish(s, i, 416, false, reply::RANGE);
+        return finish(s, i, status::RANGE_NOT_SATISFIABLE, false, reply::RANGE);
     };
     e.offset = start;
     e.end = end;
     // A `HEAD`, or an empty object read whole, has no body to open.
-    e.phase = if e.method == ex::METHOD_HEAD || start == end {
+    e.phase = if e.method == method::HEAD || start == end {
         Phase::Stream
     } else {
         Phase::Open
@@ -1966,13 +1971,11 @@ unsafe fn meta(s: &mut State, i: usize) {
 /// the `HEAD` record was read at, since it names what is served.
 unsafe fn open(s: &mut State, i: usize) {
     let e = &mut s.ex[i];
-    let h = call(
-        s.syscalls,
-        s.grant,
-        obj::GET,
-        e.name.as_mut_ptr(),
-        usize::from(e.name_len),
-    );
+    let mut arg = [0u8; obj::key::ARG_MAX];
+    let Some(len) = obj::key::encode(&mut arg, &e.name[..usize::from(e.name_len)]) else {
+        return finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
+    };
+    let h = call(s.syscalls, s.grant, obj::GET, arg.as_mut_ptr(), len);
     if h == errno::EAGAIN {
         return;
     }
@@ -1997,9 +2000,21 @@ unsafe fn open(s: &mut State, i: usize) {
 unsafe fn put_one(s: &mut State, i: usize) {
     let e = &mut s.ex[i];
     let (arg, len) = (e.arg.as_mut_ptr(), usize::from(e.arg_len));
-    match obj::write_answer(call(s.syscalls, s.grant, obj::PUT, arg, len)) {
+    let (body, body_len) = (e.buf.as_mut_ptr(), e.stash_len as usize);
+    match obj::write_answer(call_data(
+        s.syscalls,
+        s.grant,
+        obj::PUT,
+        arg,
+        len,
+        body,
+        body_len,
+    )) {
         obj::WriteAnswer::Pending => {}
-        obj::WriteAnswer::Decided(0) => finish(s, i, 200, false, reply::FENCE),
+        obj::WriteAnswer::Decided(0) => {
+            e.fence = trailer_fence(&e.arg[..len]);
+            finish(s, i, status::OK, false, reply::FENCE)
+        }
         obj::WriteAnswer::Decided(rc) => finish(s, i, status_of(rc, true), false, 0),
     }
 }
@@ -2045,10 +2060,12 @@ unsafe fn put_drain(s: &mut State, i: usize) {
         } else {
             e.stash_len
         } as usize;
-        let rc = call(
+        let rc = call_data(
             s.syscalls,
             e.handle,
             obj::PUT_STREAMED_WRITE,
+            core::ptr::null_mut(),
+            0,
             e.buf.as_mut_ptr(),
             n,
         );
@@ -2065,10 +2082,8 @@ unsafe fn put_drain(s: &mut State, i: usize) {
         e.stash_retry = 0;
     }
     if e.put_last {
-        let fence_ptr = e.fence.as_mut_ptr() as u64;
-        e.arg[..8].copy_from_slice(&fence_ptr.to_le_bytes());
-        e.arg[8..10].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
-        e.arg_len = 10;
+        e.arg[..obj::COMMIT_ARG_LEN].fill(0);
+        e.arg_len = obj::COMMIT_ARG_LEN as u16;
         e.phase = Phase::PutCommit;
         return put_commit(s, i);
     }
@@ -2092,7 +2107,8 @@ unsafe fn put_commit(s: &mut State, i: usize) {
     call(s.syscalls, h, obj::CLOSE, core::ptr::null_mut(), 0);
     e.handle = -1;
     if rc == 0 {
-        finish(s, i, 200, false, reply::FENCE);
+        e.fence = trailer_fence(&e.arg[..len]);
+        finish(s, i, status::OK, false, reply::FENCE);
     } else {
         finish(s, i, status_of(rc, true), false, 0);
     }
@@ -2103,7 +2119,10 @@ unsafe fn delete(s: &mut State, i: usize) {
     let (arg, len) = (e.arg.as_mut_ptr(), usize::from(e.arg_len));
     match obj::write_answer(call(s.syscalls, s.grant, obj::DELETE, arg, len)) {
         obj::WriteAnswer::Pending => {}
-        obj::WriteAnswer::Decided(0) => finish(s, i, 204, false, reply::FENCE),
+        obj::WriteAnswer::Decided(0) => {
+            e.fence = trailer_fence(&e.arg[..len]);
+            finish(s, i, status::NO_CONTENT, false, reply::FENCE)
+        }
         obj::WriteAnswer::Decided(rc) => finish(s, i, status_of(rc, true), false, 0),
     }
 }
@@ -2115,19 +2134,25 @@ unsafe fn retain(s: &mut State, i: usize) {
     let (arg, len) = (e.arg.as_mut_ptr(), usize::from(e.arg_len));
     match obj::write_answer(call(s.syscalls, s.grant, obj::RETAIN, arg, len)) {
         obj::WriteAnswer::Pending => {}
-        obj::WriteAnswer::Decided(0) => finish(s, i, 200, false, reply::FENCE),
+        obj::WriteAnswer::Decided(0) => {
+            e.fence = trailer_fence(&e.arg[..len]);
+            finish(s, i, status::OK, false, reply::FENCE)
+        }
         obj::WriteAnswer::Decided(rc) => finish(s, i, status_of(rc, false), false, 0),
     }
 }
 
 unsafe fn list(s: &mut State, i: usize) {
     let e = &mut s.ex[i];
-    let rc = call(
+    let len = usize::from(e.arg_len);
+    let rc = call_data(
         s.syscalls,
         s.grant,
         obj::LIST,
         e.arg.as_mut_ptr(),
-        usize::from(e.arg_len),
+        len,
+        e.buf.as_mut_ptr(),
+        WINDOW,
     );
     if rc == errno::EAGAIN {
         return;
@@ -2135,13 +2160,14 @@ unsafe fn list(s: &mut State, i: usize) {
     if rc < 0 {
         return finish(s, i, status_of(rc, false), false, 0);
     }
+    e.fence = trailer_fence(&e.arg[..len]);
     let n = rc as usize;
     let scope = s.scope.get(..usize::from(s.scope_len)).unwrap_or(&[]);
     let carried = n <= WINDOW
         && obj::list::decode_page(e.buf.get(..n).unwrap_or(&[]))
             .is_some_and(|page| within(&page, scope));
     if !carried {
-        return finish(s, i, ex::status::FAILED, true, 0);
+        return finish(s, i, status::INTERNAL_SERVER_ERROR, true, 0);
     }
     e.page_len = n as u16;
     e.phase = Phase::ListOut;

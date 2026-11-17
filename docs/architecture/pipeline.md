@@ -258,8 +258,12 @@ An edge's ring is the largest of its producer port's `buffer_size`, its
 consumer port's and the wiring entry's `buffer_bytes`, rounded up to a
 power of two (64 bytes at least); an edge that none of the three sizes
 gets the default 8192 bytes, and a request over 4 MiB is refused rather
-than clamped. A producer port whose `max_record` is larger than its ring
-is refused too: a write larger than the ring could never succeed. A
+than clamped. A producer port whose `max_record` does not fit its ring
+is refused too: a write larger than the ring could never succeed. On a
+ring (any edge outside a mailbox group) a record costs its length plus a
+two-byte length prefix per 65535 bytes (`ring_size::record_bytes`), so
+`max_record` is measured with its prefixes; a mailbox's record is the
+whole buffer. A
 mailbox group's ring is its largest member's, opened once and aliased by
 every member whose consumer is mailbox-safe; a member whose consumer is
 not opens a ring of its own at the group's size. The tee or merge on a
@@ -283,23 +287,58 @@ hundred bytes for control channels, 2048 bytes for PCM audio, several KiB
 for network frames, and tens of KiB for mailbox video frames — a ring
 sized to the records its edge carries.
 
+### Ends
+
+Every channel has one producer and one consumer, bound by the kernel from
+the edge it carries when the graph is wired (`channel_bind_edge`); a
+channel a module opens itself (`channel::OPEN`) has the opener at both
+ends, and a tap's channel is written by the kernel alone. Every op checks
+the caller's end:
+
+| Side | Ops |
+|------|-----|
+| Consumer | `channel_read`, `channel_peek`, `channel_discard`, `RECORD_LEN`, `ACQUIRE_READ`, `RELEASE_READ`, `ACQUIRE_INPLACE` |
+| Producer | `channel_write`, `SET_HUP`, `WRITABLE`, `ACQUIRE_WRITE` |
+| Either | `channel_poll`, `FLUSH`, `CLOSE`, `RELEASE_WRITE` (its lend's holder only) |
+
+Anyone else gets `EBADF`. In a mailbox alias chain the in-place module
+between producer and consumer is the chain's relay and acts from the
+consumer side. The kernel's own code acts from every end.
+
 ### FIFO Mode
 
 The default channel mode is FIFO with copy semantics. `channel_write`
-copies bytes into the ring buffer; `channel_read` copies bytes out.
-This is the right mode for byte-stream producers that build their
-output incrementally: a decoder emitting partial frames, a sensor
-emitting timestamped readings, a network driver pushing variable-size
-packets.
+copies one record into the ring, whole or not at all (`EAGAIN` when it
+does not fit now); `channel_read` copies bytes out. This is the right
+mode for byte-stream producers that build their output incrementally: a
+decoder emitting partial frames, a sensor emitting timestamped readings,
+a network driver pushing variable-size packets.
+
+#### Record boundaries
+
+The ring keeps every write's boundary: each write is stored as
+`[len u16 LE][payload]`, and a write over 65535 bytes is stored as
+several records. Reads, peeks and discards are a byte stream over the
+payload that consume prefixes as they cross them, so a consumer that
+frames by its own headers reads exactly what the producer wrote. A
+consumer that frames by records asks `channel::RECORD_LEN`: the unread
+bytes of the record at the head (`EAGAIN` when nothing is buffered). The
+prefix costs ring space — a ring of N bytes takes a write of at most
+N − 2, and a write of the ring's whole capacity is refused —
+and `WRITABLE` answers the largest single write that fits now. The
+cross-domain pump moves a producer's channel record by record, so the
+consumer's channel keeps the same boundaries.
 
 ### Mailbox Mode (Zero-Copy)
 
 For workloads where a producer can fill a complete buffer in one step
 and the consumer can process it without copying, channels support
-mailbox mode. Producer and consumer exchange ownership of the same
-underlying buffer through `buffer_acquire_*` / `buffer_release_*`
-syscalls. No copy occurs; the buffer stays in place and the consumer
-reads it directly.
+mailbox mode: the channel holds one record, lent rather than copied
+through the channel ops `ACQUIRE_WRITE` / `RELEASE_WRITE` /
+`ACQUIRE_READ` / `RELEASE_READ` / `ACQUIRE_INPLACE` (SDK helpers
+`dev_buffer_*`). No copy occurs; the buffer stays in place and the
+consumer reads it directly. `channel_read` / `channel_write` work on a
+mailbox too, copying.
 
 ```
   FIFO copy        mailbox (zero-copy alias chain)
@@ -311,17 +350,57 @@ reads it directly.
 Mailbox mode is enabled per edge by setting a `buffer_group` value in
 the wiring. All edges in the same group share one underlying buffer.
 
-#### State machine
+#### The record machine
 
-A mailbox buffer moves through the states defined in
-`src/kernel/ipc/buffer_pool.rs`: `FREE`, `PRODUCER` (acquired for
-write), `STREAMING` (producer filling), `READY` (released for
-consumption), `CONSUMER` (acquired for read), and `READY_PROCESSED`
-(an in-place writer has transformed the buffer). `acquire_inplace`
-accepts only `READY`, and an in-place release moves the buffer to
-`READY_PROCESSED`, which prevents a second in-place module from
-re-processing the same buffer. When the final consumer releases, the
-buffer returns to the free/streaming cycle.
+The record moves through four states (`src/kernel/ipc/buffer_pool.rs`):
+
+```
+            acquire_write              publish(len>0)             acquire_read
+   IDLE ─────────────────► WRITING ─────────────────► READY ─────────────────► READING
+    ▲  ◄── cancel_write ──────┘ ▲                       │ ▲                      │
+    │     (len == 0)            │ acquire_inplace       │ └──── cancel_read ─────┤
+    │                           └─ (READY && !processed)┘     (bit untouched)    │
+    │◄────────────────────────── release_read ──────────────────────────────────┘
+    │◄── FLUSH (READY only; processed = 0)       FLUSH on WRITING/READING = EBUSY
+```
+
+- A lend (WRITING or READING) names its **holder**, and ends only with
+  it: the holder's release or cancel, the holder's retirement (its write
+  lend is cancelled, its read lend returned unconsumed), or the channel's
+  close, which abandons the memory rather than hand it to the next
+  channel. Another module's release answers `EBUSY`.
+- `FLUSH` never ends a lend: on a WRITING or READING record it answers
+  `EBUSY` and changes nothing. On a READY record it drops the record.
+- The `processed` bit is set when a WRITING that began as an in-place
+  acquire publishes, and cleared when the record leaves READY for IDLE.
+  `ACQUIRE_INPLACE` takes only a READY record that is not processed, so
+  at most one in-place transform runs per record. A peek of a mailbox is
+  an acquire and a cancel, so it never races an in-place writer on
+  another core and never clears the bit.
+
+#### One commit path
+
+Every successful write — copied or lent, ring or mailbox, its reader
+gone or not — commits through one step: the channel's WROTE is set, its
+tap gets a copy, the record becomes visible, and the consumer's wake is
+latched. A lent write's only exit from WRITING is that publish. A
+channel whose reader has retired commits every write and keeps none of
+it (a mailbox record left READY when the reader retires is dropped).
+
+#### Lengths
+
+- A write of 0 bytes publishes nothing and returns 0; `RELEASE_WRITE(0)`
+  cancels the lend (WRITING → IDLE) and returns 0. `RELEASE_WRITE(n)`
+  returns `n`; a length past the buffer's capacity is `EINVAL`, the lend
+  kept.
+- A read that fits no byte (`len == 0`, or nothing buffered) returns
+  `EAGAIN`.
+- A mailbox read needs room for the whole record: a shorter buffer is
+  `EINVAL` and the record stays READY. A copied write larger than the
+  buffer is `EINVAL`, its lend given back.
+- A mailbox discard drops whole records: `n` at least the record's
+  length releases it and returns the length, `0 < n < record` is
+  `EINVAL`, `n == 0` returns 0.
 
 #### Capability flags
 
@@ -331,7 +410,7 @@ via header flags (`reserved[0]` in the `.fmod` header):
 | Bit | Name | Meaning |
 |-----|------|--------|
 | 0 | `mailbox_safe` | Module can consume from a mailbox channel |
-| 1 | `in_place_writer` | Module uses `buffer_acquire_inplace` to transform the buffer |
+| 1 | `in_place_writer` | Module uses `ACQUIRE_INPLACE` to transform the record |
 | 2 | `deferred_ready` | Module needs init time before downstream may run |
 | 3 | `drain_capable` | Module exports `module_drain` for live reconfigure |
 | 4 | `isr_module` | Module defines `module_isr_entry` |
@@ -344,8 +423,8 @@ config's mailbox chains are consistent; a module without
 
 #### Constraints
 
-- At most one in-place transform per alias chain (the `READY_PROCESSED`
-  state prevents double-processing)
+- At most one in-place transform per alias chain (the `processed` bit
+  prevents double-processing)
 - No alias chain passes through a tee/merge helper. Over a port whose
   content type is `Framed` (or a port declared `framed = true`) the runner
   gives every edge around the helper a `buffer_group` of its own, so each
@@ -354,6 +433,40 @@ config's mailbox chains are consistent; a module without
 - Buffer sizing for grouped edges is the maximum of all port hints
   across the group, so the channel is large enough for the most
   demanding consumer
+
+### Stream state: HUP, ERR, WROTE, FLUSH
+
+A channel has one source of HUP: the producer's `SET_HUP` (end of
+stream), or the producer's retirement (`producer_gone`, set by the
+scheduler for every output of a module it retires, with ERR beside it
+when the module failed). `channel_poll` reports HUP for either, ERR when
+the producer failed, and WROTE once anything was written since the last
+flush. `FLUSH`, from either end, starts the stream over: it drops what
+is buffered, the owed discard and WROTE, and the stated HUP; HUP from a
+retired producer and ERR stay. A mailbox polls OUT while its record is
+IDLE or its reader is gone.
+
+### Signals between a pair
+
+The kernel carries no sideband word beside a channel. What a pair of
+modules tells each other travels in the contract the pair speaks:
+
+- **A consumer selecting what its producer streams** (a seek, a file or
+  blob index): the `stream_select` edge contract. The consumer binds once
+  — `provider_open(stream_select, kernel::BIND, [PORT][in][index])` — and
+  calls `SELECT` with `[position u64]` through the bound handle; the
+  producer at the other end of that port serves it, restarts its stream at
+  the position and ends the item with `SET_HUP`. The consumer flushes its
+  input first. A block source is selected through `storage.block`'s
+  `READ_STREAM` instead, which carries the LBA.
+- **A producer stating its stream's format** (a sample rate): an in-band
+  record on the data edge. On an `AudioSample` edge a record of exactly
+  six bytes, `[0xA5F0 u16][sample_rate u32]`
+  (`contracts::audio_sample::format`), states the rate of the frames
+  after it; sample records are whole 4-byte frames, so no sample record
+  is ever six bytes. The consumer reads record by record
+  (`RECORD_LEN`, or one mailbox record at a time), and a stage between
+  producer and sink forwards the format record as it arrives.
 
 ### FIFO → Mailbox Boundary Rule
 
@@ -365,14 +478,14 @@ consuming the FIFO input:
 // Correct: reserve the output buffer first
 if (!(channel_poll(in_chan, POLL_IN) & POLL_IN)) return 0;  // nothing to move
 u32 cap = 0;
-u8 *buf = buffer_acquire_write(out_chan, &cap);
+u8 *buf = dev_buffer_acquire_write(out_chan, &cap);
 if (!buf) return 0;          // do not read input — output not ready
 int read = channel_read(in_chan, buf, cap);
-buffer_release_write(out_chan, read > 0 ? read : 0);
+dev_buffer_release_write(out_chan, read > 0 ? read : 0);
 ```
 
-A release always publishes: a release of zero bytes hands the consumer an
-empty message, so the input is polled before the output is acquired.
+A release of zero bytes cancels the lend and publishes nothing, so a
+transformer that read nothing gives its output back unused.
 
 FIFO reads are destructive. If the module reads input but then cannot
 acquire the mailbox output, the data is lost; there is no recovery

@@ -101,6 +101,7 @@
 //! exactly that path.
 
 use crate::abi::platform::linux::host_mount as hm;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -396,15 +397,15 @@ fn mount_ns_is_own() -> bool {
     }
 }
 
-/// The `PRIV` answer: the privilege bits this runtime holds. `SYS_ADMIN`
+/// The `CAPS` word: the privilege bits this runtime holds. `SYS_ADMIN`
 /// only when it can mount in its own mount namespace ([`can_mount`]).
-fn privileges() -> i32 {
+fn privileges() -> u32 {
     let mut p = 0;
     if can_mount() {
-        p |= hm::PRIV_SYS_ADMIN;
+        p |= hm::caps::SYS_ADMIN;
     }
     if holds_cap(CAP_CHOWN) {
-        p |= hm::PRIV_CHOWN;
+        p |= hm::caps::CHOWN;
     }
     p
 }
@@ -940,18 +941,18 @@ fn check_umount(arg: &[u8]) -> Result<Work, i32> {
     }))
 }
 
-/// Provider dispatch for `host_mount`. `handle = -1` for every op.
-///
-/// # Safety
-/// `arg` must be null or valid for reads and writes of `arg_len` bytes.
-pub unsafe fn host_mount_dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    let bytes = if arg.is_null() {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(arg, arg_len)
-    };
+/// Provider dispatch for `host_mount`. `handle = -1` for every op. `CAPS`
+/// answers its word in `arg`; every other request is `data` in, and ROOT's
+/// answer is `data` out.
+pub fn host_mount_dispatch(
+    _handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
+) -> i32 {
+    let bytes = data.as_mut();
     match opcode {
-        hm::PRIV => privileges(),
+        hm::CAPS => crate::abi::kernel_abi::caps_word::answer(arg, privileges()),
         hm::MOUNT => run_off_thread(hm::MOUNT, bytes, || check_mount(bytes)),
         hm::UMOUNT => run_off_thread(hm::UMOUNT, bytes, || check_umount(bytes)),
         hm::PROJECT => run_off_thread(hm::PROJECT, bytes, || check_project(bytes)),

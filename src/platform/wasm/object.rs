@@ -61,10 +61,10 @@ use crate::abi::contracts::storage::handle as dev_obj_handle;
 use crate::abi::contracts::storage::object as dev_obj;
 use crate::abi::contracts::storage::object::precondition as obj_precondition;
 use crate::abi::fence as dev_fence;
-use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_OBJECT};
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 
-const MAX_OPEN_OBJECTS: usize = 16;
+pub(super) const MAX_OPEN_OBJECTS: usize = 16;
 /// Longest object key: the contract's one bound, so a key `PUT` writes is
 /// one `storage.namespace` can list. A slot keeps a bounded copy of its key
 /// to re-issue a ranged GET across `EAGAIN` retries without the caller's
@@ -145,26 +145,6 @@ extern "C" {
     /// queued behind the same chain as `host_object_put`, so a delete
     /// cannot race a write of the same key.
     fn host_object_delete(key_ptr: *const u8, key_len: usize) -> i32;
-
-    /// Range-fetch `url[..url_len]` (`Range: bytes=offset-…`) and decode
-    /// the result to a `width`×`height` RGB565 buffer in the browser.
-    /// Returns a non-negative job handle for `host_image_decode_recv` /
-    /// `host_image_decode_close`, or a negative errno.
-    fn host_image_decode_url(
-        url_ptr: *const u8,
-        url_len: usize,
-        offset: u64,
-        length: u64,
-        width: u32,
-        height: u32,
-    ) -> i32;
-
-    /// Drain the decoded RGB565 buffer. Returns bytes copied, `-1` while
-    /// the decode is still pending, `-2` on error, `0` once drained.
-    fn host_image_decode_recv(handle: i32, buf: *mut u8, len: usize) -> i32;
-
-    /// Release a decode job. Idempotent.
-    fn host_image_decode_close(handle: i32) -> i32;
 }
 
 /// Register the provider with the kernel so any module declaring
@@ -176,124 +156,51 @@ pub fn register() {
     provider::register(dev_class::STORAGE_OBJECT, wasm_object_dispatch);
 }
 
-unsafe fn wasm_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    // `provider_call` passes tagged handles through `dispatch` unchanged
-    // (see `kernel/provider.rs` + the `fs.rs` sibling): `alloc_slot`
-    // returns `tag_fd(FD_TAG_STORAGE_OBJECT, slot)`, so every per-handle
-    // op (QUERY/RANGE_GET/CLOSE) arrives tagged. Strip the tag here to
-    // recover the raw OBJECTS slot — without it the tag bits push every
-    // index past `MAX_OPEN_OBJECTS` and RANGE_GET/CLOSE after a GET fail
-    // with EINVAL. GET/HEAD ignore `handle`; stripping a -1 is harmless.
-    let handle = slot_of(handle);
-    // Per-handle fence: the browser fetch model is volatile (no
-    // durability tier), so every open handle advertises Volatile.
-    if opcode == dev_fence::QUERY_OP {
-        if arg.is_null() || arg_len < dev_fence::WIRE_MAX_LEN {
-            return errno::EINVAL;
+fn wasm_object_dispatch(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
+    // Every per-handle op arrives with the OBJECTS slot's index
+    // `alloc_slot` returned; ops that take `handle = -1` ignore it.
+    // SAFETY: provider dispatch runs on the one wasm thread, which alone
+    // touches the slot table; the host bindings take only slices of `arg`,
+    // `data` and the slot table, each valid for the call.
+    unsafe {
+        // Per-handle fence: the browser fetch model is volatile (no
+        // durability tier), so every open handle advertises Volatile.
+        if opcode == dev_fence::QUERY_OP {
+            let objs = &*core::ptr::addr_of!(OBJECTS);
+            if !objs.get(handle as usize).is_some_and(|s| s.in_use) {
+                return errno::ENOSYS;
+            }
+            return match dev_fence::Fence::Volatile.encode(arg) {
+                Some(n) => n as i32,
+                None => errno::EINVAL,
+            };
         }
-        let slot_idx = handle as usize;
-        let objs = &*core::ptr::addr_of!(OBJECTS);
-        if slot_idx >= MAX_OPEN_OBJECTS || !objs[slot_idx].in_use {
-            return errno::ENOSYS;
+        match opcode {
+            dev_obj::PUT => obj_put(arg, data.as_slice()),
+            dev_obj::GET => obj_get(arg),
+            dev_obj::HEAD => obj_head(arg),
+            dev_obj::RANGE_GET => obj_range_get(handle, arg, data.as_mut()),
+            dev_obj::DELETE => obj_delete(arg),
+            dev_obj::CLOSE => obj_close(handle),
+            // Unconditional writes to the persistent tier; no listing, no
+            // condition, no kept field, no streamed put, no grants.
+            dev_obj::CAPS => crate::abi::kernel_abi::caps_word::answer(arg, dev_obj::caps::WRITE),
+            // See the module docs: the origin cannot be enumerated.
+            dev_obj::LIST => errno::ENOSYS,
+            _ => errno::ENOSYS,
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match dev_fence::Fence::Volatile.encode(buf) {
-            Some(n) => n as i32,
-            None => errno::EINVAL,
-        };
-    }
-    match opcode {
-        dev_obj::PUT => obj_put(arg, arg_len),
-        dev_obj::GET => obj_get(arg, arg_len),
-        dev_obj::HEAD => obj_head(arg, arg_len),
-        dev_obj::RANGE_GET => obj_range_get(handle, arg, arg_len),
-        dev_obj::DELETE => obj_delete(arg, arg_len),
-        dev_obj::CLOSE => obj_close(handle),
-        // See the module docs: the origin cannot be enumerated.
-        dev_obj::LIST => errno::ENOSYS,
-        dev_obj::IMG_DECODE => img_decode(arg, arg_len),
-        dev_obj::IMG_RECV => img_recv(handle, arg, arg_len),
-        dev_obj::IMG_CLOSE => img_close(handle),
-        _ => errno::ENOSYS,
     }
 }
 
-/// `IMG_DECODE` — range-fetch + decode an embedded image to RGB565.
-/// `arg` = `[offset:u64][length:u64][width:u16][height:u16][url…]`.
-/// Returns a tagged handle (for `IMG_RECV` / `IMG_CLOSE`) or errno.
-unsafe fn img_decode(arg: *mut u8, arg_len: usize) -> i32 {
-    const HDR: usize = 8 + 8 + 2 + 2;
-    if arg.is_null() || arg_len <= HDR {
-        return errno::EINVAL;
-    }
-    let offset = read_u64(arg, 0);
-    let length = read_u64(arg, 8);
-    let mut wb = [0u8; 2];
-    core::ptr::copy_nonoverlapping(arg.add(16), wb.as_mut_ptr(), 2);
-    let width = u16::from_le_bytes(wb) as u32;
-    let mut hb = [0u8; 2];
-    core::ptr::copy_nonoverlapping(arg.add(18), hb.as_mut_ptr(), 2);
-    let height = u16::from_le_bytes(hb) as u32;
-    let url = core::slice::from_raw_parts(arg.add(HDR), arg_len - HDR);
-
-    // Reuse the OBJECTS slot table for the handle mapping (url as key).
-    let fd = alloc_slot(url);
-    if fd < 0 {
-        return fd;
-    }
-    let idx = slot_of(fd) as usize;
-    let objs = &mut *core::ptr::addr_of_mut!(OBJECTS);
-    let h = host_image_decode_url(url.as_ptr(), url.len(), offset, length, width, height);
-    if h < 0 {
-        objs[idx].in_use = false;
-        return errno::ENODEV;
-    }
-    objs[idx].host_handle = h;
-    fd
+/// Read a little-endian `u64` from `b[off..off+8]`; the caller has checked
+/// the length.
+fn read_u64(b: &[u8], off: usize) -> u64 {
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&b[off..off + 8]);
+    u64::from_le_bytes(v)
 }
 
-/// `IMG_RECV` — drain the decoded RGB565 into `arg[..arg_len]`. Returns
-/// bytes copied, `EAGAIN` while decoding, `OK` (0) once drained, or errno.
-unsafe fn img_recv(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    let idx = handle as usize;
-    let objs = &mut *core::ptr::addr_of_mut!(OBJECTS);
-    if idx >= MAX_OPEN_OBJECTS || !objs[idx].in_use || arg.is_null() {
-        return errno::EINVAL;
-    }
-    let h = objs[idx].host_handle;
-    let n = host_image_decode_recv(h, arg, arg_len);
-    if n > 0 {
-        n
-    } else if n == -1 {
-        errno::EAGAIN // decode still pending
-    } else if n == 0 {
-        errno::OK // fully drained
-    } else {
-        errno::ERROR // decode failed
-    }
-}
-
-/// `IMG_CLOSE` — release a decode handle.
-unsafe fn img_close(handle: i32) -> i32 {
-    let idx = handle as usize;
-    let objs = &mut *core::ptr::addr_of_mut!(OBJECTS);
-    if idx < MAX_OPEN_OBJECTS && objs[idx].in_use {
-        if objs[idx].host_handle >= 0 {
-            host_image_decode_close(objs[idx].host_handle);
-        }
-        objs[idx].in_use = false;
-    }
-    errno::OK
-}
-
-/// Read a little-endian `u64` from `ptr[off..off+8]`.
-unsafe fn read_u64(ptr: *const u8, off: usize) -> u64 {
-    let mut b = [0u8; 8];
-    core::ptr::copy_nonoverlapping(ptr.add(off), b.as_mut_ptr(), 8);
-    u64::from_le_bytes(b)
-}
-
-/// Allocate a slot bound to `key`, returning a tagged FD or errno.
+/// Allocate a slot bound to `key`, returning its index or errno.
 unsafe fn alloc_slot(key: &[u8]) -> i32 {
     if key.is_empty() || key.len() > MAX_KEY_LEN {
         return errno::EINVAL;
@@ -310,136 +217,68 @@ unsafe fn alloc_slot(key: &[u8]) -> i32 {
     slot.open_offset = 0;
     slot.open_end = 0;
     slot.in_use = true;
-    tag_fd(FD_TAG_STORAGE_OBJECT, slot_idx as i32)
+    slot_idx as i32
 }
 
-/// `PUT` — single-shot write to the persistent (OPFS) tier. `arg` is:
-///
-/// ```text
-///   [key_len:u16 LE][key]
-///   [content_type_len:u8][content_type]
-///   [body_ptr:u64 LE][body_len:u64 LE]
-///   [precondition:u8][etag_len:u8][etag]
-///   [key_ref_len:u8][key_ref][retain_until_ms:u64 LE][legal_hold:u8]
-///   [fence_out_ptr:u64 LE][fence_out_cap:u16 LE]
-/// ```
+/// `PUT` — single-shot write to the persistent (OPFS) tier: `arg` is the
+/// `object::PUT` record and its fence trailer, `data` the body.
 ///
 /// We forward `key` and `body` to `host_object_put` (which stages then
 /// background-persists to OPFS) and write a `Volatile` fence into the
-/// caller's fence buffer on success. `content_type` is parsed for layout
-/// but not enforced (no etag store). A nonzero `if_match` requests a
-/// conditional overwrite the wasm tier cannot honor yet, so it is
-/// REJECTED with `ENOSYS` rather than silently performing an
-/// unconditional PUT and reporting the guard as satisfied — matching the
-/// linux provider, which also rejects conditional PUT until etag
-/// enforcement lands.
-unsafe fn obj_put(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
-        return errno::EINVAL;
-    }
-    let key_len = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
-    };
-    if key_len == 0 || key_len > MAX_KEY_LEN {
-        return errno::EINVAL;
-    }
-    // Walk the variable-width prefix, bounds-checking each field before
-    // advancing so a short/truncated arg can never read past the buffer.
-    let mut p = 2 + key_len;
-    if arg_len < p + 1 {
-        return errno::EINVAL;
-    }
-    let ct_len = *arg.add(p) as usize;
-    p += 1 + ct_len;
-    if arg_len < p + 8 + 8 + 1 {
-        return errno::EINVAL;
-    }
-    let body_ptr = read_u64(arg, p) as usize as *const u8;
-    p += 8;
-    let body_len = read_u64(arg, p) as usize;
-    p += 8;
-    let precondition = *arg.add(p);
-    let etag_len = *arg.add(p + 1) as usize;
-    p += 2 + etag_len;
-    if arg_len < p {
-        return errno::EINVAL;
-    }
-    let Some((kept, after_kept)) =
-        dev_obj::Kept::parse(core::slice::from_raw_parts(arg, arg_len), p)
-    else {
+/// trailer on success. `content_type` is parsed for layout but not kept
+/// (no etag store). A precondition other than `ANY`, or any field for the
+/// store to keep, asks for a guarantee this tier cannot make, so it is
+/// REFUSED with `ENOSYS` rather than silently downgraded — the contract
+/// requires that, because downgrading a conditional write to an
+/// unconditional one turns a refusal into a lost update, and a retained
+/// write to a deletable one.
+unsafe fn obj_put(arg: &mut [u8], body: &[u8]) -> i32 {
+    let Some(req) = dev_obj::put::parse(arg) else {
         return errno::EINVAL;
     };
-    p = after_kept;
-    if arg_len < p + 8 + 2 {
+    if req.key.is_empty() || req.key.len() > MAX_KEY_LEN {
         return errno::EINVAL;
     }
-    // Anything but `ANY`, and any field for the store to keep, asks for a
-    // guarantee this tier cannot make, so it is REFUSED rather than silently
-    // downgraded — the contract requires that, because downgrading a
-    // conditional write to an unconditional one turns a refusal into a lost
-    // update, and a retained write to a deletable one.
-    if precondition != obj_precondition::ANY || !kept.is_none() {
+    if req.precondition != obj_precondition::ANY || !req.kept.is_none() {
         return errno::ENOSYS;
     }
-    let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;
-    p += 8;
-    let fence_out_cap = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
-    };
-    if !fence_ok(fence_out_ptr, fence_out_cap) {
-        return errno::EINVAL;
-    }
-
     // A key that is not UTF-8 is not one a listing can name.
-    let key_ptr = arg.add(2);
-    if core::str::from_utf8(core::slice::from_raw_parts(key_ptr, key_len)).is_err() {
+    if core::str::from_utf8(req.key).is_err() {
         return errno::EINVAL;
     }
-    let rc = host_object_put(key_ptr, key_len, body_ptr, body_len);
+    let rc = host_object_put(req.key.as_ptr(), req.key.len(), body.as_ptr(), body.len());
     if rc < 0 {
         return errno::ENODEV;
     }
-
     // PUT acceptance carries the strongest fence the commit achieved;
     // the browser write tier is best-effort, so that is Volatile.
-    write_fence_out(fence_out_ptr, fence_out_cap);
+    let _ = dev_fence::trailer::put(arg, &dev_fence::Fence::Volatile);
     errno::OK
 }
 
-/// `GET` — `arg` is the UTF-8 key; reserve a handle bound to it. The
-/// first `RANGE_GET` issues the actual ranged fetch.
-unsafe fn obj_get(key_ptr: *mut u8, key_len: usize) -> i32 {
-    if key_ptr.is_null() || key_len == 0 {
-        return errno::EINVAL;
+/// `GET` — `arg` is the `[key_len:u16][key]` record; reserve a handle bound
+/// to the key. The first `RANGE_GET` issues the actual ranged fetch.
+unsafe fn obj_get(arg: &[u8]) -> i32 {
+    match dev_obj::key::parse(arg) {
+        Some(key) => alloc_slot(key),
+        None => errno::EINVAL,
     }
-    let key = core::slice::from_raw_parts(key_ptr, key_len);
-    alloc_slot(key)
 }
 
-/// `RANGE_GET` — `arg` is `[offset:u64 LE][length:u32 LE][out_ptr:u64 LE]`.
-/// Reads up to `length` bytes from `offset` into `out_ptr`, returning
-/// the byte count (possibly less near the tail), `EAGAIN` while the
-/// fetch is pending, or negative errno.
-unsafe fn obj_range_get(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 + 4 + 8 {
+/// `RANGE_GET` — `arg` is `[offset:u64 LE]`, `out` the caller's `data`.
+/// Reads up to `out.len()` bytes from `offset` into `out`, returning the
+/// byte count (possibly less near the tail), `EAGAIN` while the fetch is
+/// pending, or negative errno.
+unsafe fn obj_range_get(handle: i32, arg: &[u8], out: &mut [u8]) -> i32 {
+    let Some(offset) = dev_obj::range_get::parse(arg) else {
         return errno::EINVAL;
-    }
+    };
     let slot_idx = handle as usize;
     let objs = &mut *core::ptr::addr_of_mut!(OBJECTS);
     if slot_idx >= MAX_OPEN_OBJECTS || !objs[slot_idx].in_use {
         return errno::EINVAL;
     }
-    let offset = read_u64(arg, 0);
-    let length = {
-        let mut b = [0u8; 4];
-        core::ptr::copy_nonoverlapping(arg.add(8), b.as_mut_ptr(), 4);
-        u32::from_le_bytes(b) as u64
-    };
-    let out_ptr = read_u64(arg, 12) as usize as *mut u8;
+    let length = out.len() as u64;
     if length == 0 {
         return errno::OK; // empty window — nothing to read.
     }
@@ -459,8 +298,7 @@ unsafe fn obj_range_get(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
             host_object_close(slot.host_handle);
             slot.host_handle = -1;
         }
-        let key_ptr = slot.key.as_ptr();
-        let h = host_object_range_open(key_ptr, slot.key_len, offset, length);
+        let h = host_object_range_open(slot.key.as_ptr(), slot.key_len, offset, length);
         if h < 0 {
             return errno::ENODEV;
         }
@@ -469,7 +307,7 @@ unsafe fn obj_range_get(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
         slot.open_end = offset + length;
     }
 
-    let n = host_object_recv(slot.host_handle, out_ptr, length as usize);
+    let n = host_object_recv(slot.host_handle, out.as_mut_ptr(), out.len());
     if n > 0 {
         // Advance the cursor so the next sequential call reuses the
         // stream. `range::Cursor` mirrors this accounting in tests.
@@ -490,46 +328,22 @@ unsafe fn obj_range_get(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
 }
 
 /// `HEAD` — read size + mtime without opening a stream. `arg` is the
-/// `object::HEAD` layout; we fill the caller's out buffer with a
-/// `range::encode_head` record and write a Volatile fence.
-unsafe fn obj_head(arg: *mut u8, arg_len: usize) -> i32 {
-    // [key_len:u16][key][out_ptr:u64][out_cap:u32][fence_out_ptr:u64][fence_out_cap:u16]
-    if arg.is_null() || arg_len < 2 {
-        return errno::EINVAL;
-    }
-    let key_len = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
+/// `object::HEAD` request; the key is taken first, then the
+/// `range::encode_head` record is written over `arg` and a Volatile fence
+/// into its trailer.
+unsafe fn obj_head(arg: &mut [u8]) -> i32 {
+    let mut key = [0u8; MAX_KEY_LEN];
+    let key_len = match dev_obj::head::parse_request(arg) {
+        Some(k) if k.len() <= MAX_KEY_LEN => {
+            key[..k.len()].copy_from_slice(k);
+            k.len()
+        }
+        _ => return errno::EINVAL,
     };
-    let fixed = 2 + key_len + 8 + 4 + 8 + 2;
-    if arg_len < fixed || key_len == 0 || key_len > MAX_KEY_LEN {
-        return errno::EINVAL;
-    }
-    let key_ptr = arg.add(2);
-    let mut p = 2 + key_len;
-    let out_ptr = read_u64(arg, p) as usize as *mut u8;
-    p += 8;
-    let out_cap = {
-        let mut b = [0u8; 4];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 4);
-        u32::from_le_bytes(b) as usize
-    };
-    p += 4;
-    let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;
-    p += 8;
-    let fence_out_cap = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
-    };
-    if !fence_ok(fence_out_ptr, fence_out_cap) {
-        return errno::EINVAL;
-    }
 
     // Idempotent per key: a retry after EAGAIN re-finds the same
     // in-flight HEAD on the host side.
-    let h = host_object_head(key_ptr, key_len);
+    let h = host_object_head(key.as_ptr(), key_len);
     if h < 0 {
         return errno::ENODEV;
     }
@@ -544,125 +358,46 @@ unsafe fn obj_head(arg: *mut u8, arg_len: usize) -> i32 {
     }
     host_object_close(h);
 
-    let size = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-    let mtime = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+    let size = read_u64(&meta, 0);
+    let mtime = read_u64(&meta, 8);
 
-    if out_ptr.is_null() {
+    let Some(out) = dev_obj::head::answer_area(arg) else {
         return errno::EINVAL;
-    }
-    let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
+    };
     let written =
         match dev_obj::range::encode_head(out, size, mtime, &[], &[], dev_obj::Kept::none()) {
             Some(n) => n,
             None => return errno::ENOMEM,
         };
-
-    write_fence_out(fence_out_ptr, fence_out_cap);
+    let _ = dev_fence::trailer::put(arg, &dev_fence::Fence::Volatile);
     written as i32
 }
 
-/// True when `[ptr, ptr+len)` lies inside this module's linear memory.
-///
-/// Every pointer this provider writes through arrives inside a caller's
-/// argument buffer, and not all of them address the memory being
-/// written. Reached through the module bridge, `obj_put`'s
-/// `fence_out_ptr` is a CHILD-module address: the child and the kernel
-/// each own a separate linear memory, so the same integer names a
-/// different place in each. Writing the fence through it either corrupts
-/// unrelated kernel memory or, when the offset is past the kernel's own
-/// memory, traps — a small write at a modest offset of a large memory,
-/// failing for no reason visible at the call site.
-///
-/// The module bridge in `host_shims.js` serves a child's `PUT` from the
-/// child's memory and rewrites the pointers its other requests embed to
-/// kernel scratch, so a pointer that still fails this check was never
-/// rewritten. Refusing it keeps that a refusal rather than a trap.
-#[inline]
-fn in_linear_memory(ptr: *const u8, len: usize) -> bool {
-    if ptr.is_null() || len == 0 {
-        return false;
-    }
-    // `memory_size` is in 64 KiB pages.
-    let bytes = core::arch::wasm32::memory_size(0).saturating_mul(64 * 1024);
-    let start = ptr as usize;
-    match start.checked_add(len) {
-        Some(end) => end <= bytes,
-        None => false,
-    }
-}
-
-/// Write `fence` into a caller-supplied buffer, if the buffer is one this
-/// memory actually has. A caller that supplied a pointer we cannot write
-/// gets no fence rather than a trap; the operation itself already
-/// succeeded and its result does not depend on the advertisement.
-#[inline]
-/// Whether a caller's fence buffer can receive a fence: at least
-/// `WIRE_MAX_LEN` bytes, inside this module's memory. An op with one that
-/// cannot is refused `EINVAL` before it acts.
-fn fence_ok(fence_out_ptr: *mut u8, fence_out_cap: usize) -> bool {
-    fence_out_cap >= dev_fence::WIRE_MAX_LEN
-        && in_linear_memory(fence_out_ptr as *const u8, dev_fence::WIRE_MAX_LEN)
-}
-
-/// Write a `Volatile` fence into a buffer `fence_ok` accepted.
-unsafe fn write_fence_out(fence_out_ptr: *mut u8, fence_out_cap: usize) {
-    let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
-    let _ = dev_fence::Fence::Volatile.encode(fbuf);
-}
-
-/// `DELETE` — remove a key from the write tier.
-///
-/// `arg` is `[key_len:u16][key][precondition:u8][etag_len:u8][etag]
-/// [fence_out_ptr:u64][fence_out_cap:u16]`.
+/// `DELETE` — remove a key from the write tier. `arg` is the
+/// `object::DELETE` request and its fence trailer.
 ///
 /// Preconditions are REFUSED rather than ignored. This tier keys bytes
 /// and holds no etag to compare, and the contract is explicit that a
 /// provider which cannot offer a condition must refuse it with `ENOSYS`
 /// — silently downgrading a conditional delete to an unconditional one
 /// turns a refusal into a lost update.
-unsafe fn obj_delete(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
+unsafe fn obj_delete(arg: &mut [u8]) -> i32 {
+    let Some(req) = dev_obj::delete::parse_request(arg) else {
         return errno::EINVAL;
-    }
-    let key_len = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
     };
-    if key_len == 0 || key_len > MAX_KEY_LEN {
+    if req.key.is_empty() || req.key.len() > MAX_KEY_LEN {
         return errno::EINVAL;
     }
-    let mut p = 2 + key_len;
-    if arg_len < p + 2 {
-        return errno::EINVAL;
-    }
-    let precondition = *arg.add(p);
-    let etag_len = *arg.add(p + 1) as usize;
-    p += 2 + etag_len;
-    if precondition != dev_obj::precondition::ANY {
+    if req.precondition != dev_obj::precondition::ANY {
         return errno::ENOSYS;
     }
-    if arg_len < p + 8 + 2 {
-        return errno::EINVAL;
-    }
-    let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;
-    let fence_out_cap = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg.add(p + 8), b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
-    };
-    if !fence_ok(fence_out_ptr, fence_out_cap) {
-        return errno::EINVAL;
-    }
-
-    let rc = host_object_delete(arg.add(2) as *const u8, key_len);
+    let rc = host_object_delete(req.key.as_ptr(), req.key.len());
     if rc < 0 {
         return rc;
     }
-
     // Volatile for the same reason PUT is: acceptance is synchronous and
     // the backing removal commits behind the call.
-    write_fence_out(fence_out_ptr, fence_out_cap);
+    let _ = dev_fence::trailer::put(arg, &dev_fence::Fence::Volatile);
     0
 }
 

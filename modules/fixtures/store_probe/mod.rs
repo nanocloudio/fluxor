@@ -16,8 +16,8 @@
 //!   2 GET      read one back and byte-compare it
 //!   3 LIST     enumerate the prefix, expect both
 //!   4 SUBSCRIBE + PUT, then wait for the ring — the wake a source depends
-//!     on: the store signals the probe's own event, TAKE_RUNG names the
-//!     subscription, and a CHANGES read finds the write
+//!     on: the store rings the subscription's doorbell, the subscription
+//!     handle polls ready, and a CHANGES read finds the write
 //!   5 DELETE   remove one, LIST again, expect one
 //!
 //! A write the store has not decided (`EINPROGRESS`) is asked again next
@@ -77,11 +77,8 @@ const OBJ_CLOSE: u32 = abi::contracts::storage::object::CLOSE;
 use abi::contracts::storage::object::{write_answer, WriteAnswer};
 
 const ENOENT: i32 = abi::kernel_abi::errno::ENOENT;
-/// Room for an encoded fence (`fence::WIRE_MAX_LEN`).
-const FENCE_CAP: usize = 64;
 const NS_LIST: u32 = abi::contracts::storage::namespace::LIST;
 const NS_SUBSCRIBE: u32 = abi::contracts::storage::namespace::SUBSCRIBE;
-const NS_TAKE_RUNG: u32 = abi::contracts::storage::namespace::TAKE_RUNG;
 const NS_CHANGES: u32 = abi::contracts::storage::namespace::CHANGES;
 
 const PREFIX: &[u8] = b"/probe/";
@@ -94,9 +91,6 @@ const VAL_C: &[u8] = b"{\"kind\":\"Probe\",\"n\":3}";
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    /// The probe's own kernel event, which the store signals when the
-    /// subscription rings. Created in state 3; -1 before.
-    event: i32,
     /// The subscription handle SUBSCRIBE returned; -1 before.
     sub: i32,
     out_chan: i32,
@@ -148,15 +142,10 @@ struct State {
     /// subscribe again), 1 subscribed, 2 rung and reading, 3 rung but the
     /// read did not find the write.
     subscribed: u32,
-    /// A TAKE_RUNG is owed: the last failed or answered `more`.
-    take_owed: u32,
     /// Whether to prove SUBSCRIBE (`subscribe`, default 1). A store with no
     /// subscriptions -- `fs_object` -- is walked with it 0: step 4 then
     /// writes without subscribing, and the verdict does not ask for a ring.
     want_ring: u32,
-    /// Where a write's fence lands. In the state, not on the stack, so a
-    /// write asked again names the same buffer: the same request.
-    fence: [u8; FENCE_CAP],
     scratch: [u8; 1024],
 }
 
@@ -222,69 +211,85 @@ unsafe fn witness_counts(sys: &SyscallTable, s: &mut State) {
     s.wit_b = one(&s.wit_b_pfx[..s.wit_b_len as usize], s.wit_b);
 }
 
-unsafe fn put(
-    sys: &SyscallTable,
-    key: &[u8],
-    val: &[u8],
-    fence: &mut [u8; FENCE_CAP],
-) -> WriteAnswer {
-    // [key_len:u16][key][ct_len:u8][body_ptr:u64][body_len:u64]
-    // [precondition:u8][etag_len:u8][key_ref_len:u8][retain_until_ms:u64]
-    // [legal_hold:u8][fence_ptr:u64][fence_cap:u16]
-    let mut arg = [0u8; 320];
-    let mut p = 0usize;
-    arg[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p] = 0; // content_type_len
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(val.as_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(val.len() as u64).to_le_bytes());
-    p += 8;
-    arg[p] = 0; // precondition ANY
-    arg[p + 1] = 0; // etag_len
-    p += 2;
-    p += 10; // no key_ref, no retention, no hold: already zero
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-    p += 2;
-    write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p))
+unsafe fn put(sys: &SyscallTable, key: &[u8], val: &[u8]) -> WriteAnswer {
+    use abi::contracts::storage::object::{precondition, put, Kept};
+    let mut arg = [0u8; put::arg_len(abi::contracts::storage::handle::STORAGE_KEY_MAX, 0, 0, 0)];
+    let req = put::Request {
+        key,
+        content_type: &[],
+        precondition: precondition::ANY,
+        etag: &[],
+        kept: Kept::none(),
+    };
+    let Some(len) = put::encode(&mut arg, &req) else {
+        return WriteAnswer::Decided(E_INVAL);
+    };
+    write_answer((sys.provider_call)(
+        -1,
+        OBJ_PUT,
+        arg.as_mut_ptr(),
+        len,
+        val.as_ptr() as *mut u8,
+        val.len(),
+    ))
 }
 
 unsafe fn get(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> i32 {
-    let mut karg = [0u8; 192];
-    karg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, karg.as_mut_ptr(), key.len());
+    use abi::contracts::storage::object::{key as okey, range_get};
+    let mut karg = [0u8; okey::ARG_MAX];
+    let Some(klen) = okey::encode(&mut karg, key) else {
+        return E_INVAL;
+    };
+    let h = (sys.provider_call)(
+        -1,
+        OBJ_GET,
+        karg.as_mut_ptr(),
+        klen,
+        core::ptr::null_mut(),
+        0,
+    );
     if h < 0 {
         return h;
     }
-    let mut rarg = [0u8; 20];
-    rarg[8..12].copy_from_slice(&(dst.len() as u32).to_le_bytes());
-    rarg[12..20].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
-    let n = (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20);
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    let mut rarg = range_get::encode(0);
+    let n = (sys.provider_call)(
+        h,
+        OBJ_RANGE_GET,
+        rarg.as_mut_ptr(),
+        rarg.len(),
+        dst.as_mut_ptr(),
+        dst.len(),
+    );
+    (sys.provider_call)(
+        h,
+        OBJ_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     n
 }
 
-unsafe fn delete(sys: &SyscallTable, key: &[u8], fence: &mut [u8; FENCE_CAP]) -> WriteAnswer {
-    let mut arg = [0u8; 224];
-    let mut p = 0usize;
-    arg[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p] = 0; // precondition ANY
-    arg[p + 1] = 0; // etag_len
-    p += 2;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-    p += 2;
-    write_answer((sys.provider_call)(-1, OBJ_DELETE, arg.as_mut_ptr(), p))
+unsafe fn delete(sys: &SyscallTable, key: &[u8]) -> WriteAnswer {
+    use abi::contracts::storage::object::{delete, precondition};
+    let mut arg = [0u8; delete::arg_len(abi::contracts::storage::handle::STORAGE_KEY_MAX, 0)];
+    let req = delete::Request {
+        key,
+        precondition: precondition::ANY,
+        etag: &[],
+    };
+    let Some(len) = delete::encode_request(&mut arg, &req) else {
+        return WriteAnswer::Decided(E_INVAL);
+    };
+    write_answer((sys.provider_call)(
+        -1,
+        OBJ_DELETE,
+        arg.as_mut_ptr(),
+        len,
+        core::ptr::null_mut(),
+        0,
+    ))
 }
 
 /// LIST every page of `prefix`; returns the number of entries counted, or a
@@ -292,7 +297,6 @@ unsafe fn delete(sys: &SyscallTable, key: &[u8], fence: &mut [u8; FENCE_CAP]) ->
 /// returned.
 unsafe fn list_count(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 {
     use abi::contracts::storage::namespace::list;
-    let mut fence = [0u8; abi::fence::WIRE_MAX_LEN];
     let mut cursor = [0u8; abi::contracts::storage::handle::STORAGE_KEY_MAX];
     let mut cursor_len = 0usize;
     let mut count = 0i32;
@@ -302,17 +306,19 @@ unsafe fn list_count(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 
         let req = list::Request {
             prefix,
             cursor: &cursor[..cursor_len],
-            out_ptr: page.as_mut_ptr() as u64,
-            out_cap: page.len() as u32,
-            fence_out_ptr: fence.as_mut_ptr() as u64,
-            fence_out_cap: fence.len() as u16,
         };
-        let mut arg =
-            [0u8; list::REQUEST_FIXED_LEN + 2 * abi::contracts::storage::handle::STORAGE_KEY_MAX];
+        let mut arg = [0u8; list::ARG_MAX];
         let Some(len) = list::encode_request(&mut arg, &req) else {
             return E_INVAL;
         };
-        let n = (sys.provider_call)(-1, NS_LIST, arg.as_mut_ptr(), len);
+        let n = (sys.provider_call)(
+            -1,
+            NS_LIST,
+            arg.as_mut_ptr(),
+            len,
+            page.as_mut_ptr(),
+            page.len(),
+        );
         if n < 0 {
             return n;
         }
@@ -334,21 +340,22 @@ unsafe fn list_count(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 
 /// written, or a negative errno.
 unsafe fn list_page(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 {
     use abi::contracts::storage::namespace::list;
-    let mut fence = [0u8; abi::fence::WIRE_MAX_LEN];
     let req = list::Request {
         prefix,
         cursor: &[],
-        out_ptr: page.as_mut_ptr() as u64,
-        out_cap: page.len() as u32,
-        fence_out_ptr: fence.as_mut_ptr() as u64,
-        fence_out_cap: fence.len() as u16,
     };
-    let mut arg =
-        [0u8; list::REQUEST_FIXED_LEN + 2 * abi::contracts::storage::handle::STORAGE_KEY_MAX];
+    let mut arg = [0u8; list::ARG_MAX];
     let Some(len) = list::encode_request(&mut arg, &req) else {
         return E_INVAL;
     };
-    (sys.provider_call)(-1, NS_LIST, arg.as_mut_ptr(), len)
+    (sys.provider_call)(
+        -1,
+        NS_LIST,
+        arg.as_mut_ptr(),
+        len,
+        page.as_mut_ptr(),
+        page.len(),
+    )
 }
 
 /// The key of the first entry LIST returns under `prefix`, copied into
@@ -366,15 +373,18 @@ unsafe fn first_key(sys: &SyscallTable, prefix: &[u8], page: &mut [u8], out: &mu
     };
     // A directory-shaped store names an entry relative to the prefix; a
     // key-shaped one names the whole key. The contract says which by
-    // `CHILD_NAMES`, and a provider that answers no `CAPS` is key-shaped.
-    let caps = (sys.provider_call)(
+    // `CHILD_NAMES`.
+    let mut caps = [0u8; abi::kernel_abi::caps_word::LEN];
+    let rc = (sys.provider_call)(
         -1,
         abi::contracts::storage::namespace::CAPS,
+        caps.as_mut_ptr(),
+        caps.len(),
         core::ptr::null_mut(),
         0,
     );
-    let child_names =
-        caps >= 0 && (caps as u32) & abi::contracts::storage::namespace::caps::CHILD_NAMES != 0;
+    let child_names = rc == 0
+        && u32::from_le_bytes(caps) & abi::contracts::storage::namespace::caps::CHILD_NAMES != 0;
     let head = if child_names { prefix } else { &[][..] };
     match decoded.entries().next() {
         None => 0,
@@ -413,63 +423,38 @@ unsafe fn log_names(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) {
     dev_log(sys, 3, line.as_ptr(), pos);
 }
 
-unsafe fn subscribe(sys: &SyscallTable, prefix: &[u8], event: i32) -> i32 {
+unsafe fn subscribe(sys: &SyscallTable, prefix: &[u8]) -> i32 {
     use abi::contracts::storage::namespace::subscribe;
-    let mut arg = [0u8; 224];
+    let mut arg = [0u8; subscribe::ARG_MAX];
     // No ring at subscribe — we want the ring the WRITE causes.
-    let req = subscribe::Request {
-        prefix,
-        event,
-        flags: 0,
-    };
+    let req = subscribe::Request { prefix, flags: 0 };
     let Some(len) = subscribe::encode(&mut arg, &req) else {
         return E_INVAL;
     };
-    (sys.provider_call)(-1, NS_SUBSCRIBE, arg.as_mut_ptr(), len)
-}
-
-/// Whether `event` fired and TAKE_RUNG names `sub` among its rung
-/// subscriptions: 1 rang, 0 not (yet), or a negative errno. `owed` carries a
-/// take that failed or answered `more` to the next call, which takes again
-/// whether or not the event fired: POLL consumed the signal, and a rung bit
-/// left set sends no other.
-unsafe fn rang(sys: &SyscallTable, event: i32, sub: i32, owed: &mut u32) -> i32 {
-    use abi::contracts::storage::namespace::take;
-    let fired = (sys.provider_call)(
-        event,
-        abi::kernel_abi::event::POLL,
+    (sys.provider_call)(
+        -1,
+        NS_SUBSCRIBE,
+        arg.as_mut_ptr(),
+        len,
         core::ptr::null_mut(),
         0,
-    );
-    if fired <= 0 && *owed == 0 {
-        return fired;
+    )
+}
+
+/// Whether subscription `sub` rang since the last poll: 1 rang, 0 not
+/// (yet), or a negative errno. `HANDLE_POLL` takes the ring.
+unsafe fn rang(sys: &SyscallTable, sub: i32) -> i32 {
+    let rc = dev_fd_poll(sys, sub, POLL_IN);
+    if rc < 0 {
+        return rc;
     }
-    *owed = 1;
-    let mut out = [0u8; take::HEAD_LEN + 4 * 8];
-    let req = take::Request {
-        event,
-        out_ptr: out.as_mut_ptr() as u64,
-        out_cap: out.len() as u32,
-    };
-    let mut arg = [0u8; take::REQUEST_LEN];
-    let Some(len) = take::encode(&mut arg, &req) else {
-        return E_INVAL;
-    };
-    let n = (sys.provider_call)(-1, NS_TAKE_RUNG, arg.as_mut_ptr(), len);
-    if n < 0 {
-        return n;
-    }
-    let Some((more, mut handles)) = take::decode(&out[..n as usize]) else {
-        return E_INVAL;
-    };
-    *owed = u32::from(more);
-    let named = handles.any(|h| h == sub);
-    i32::from(named)
+    i32::from(rc as u32 & POLL_IN != 0)
 }
 
 /// Relist `prefix` through CHANGES, every page, and report whether `key`
 /// came back with `val`: 1 found, 0 not, or a negative errno. A watcher
-/// reads what it was rung for; this is that read.
+/// reads what it was rung for, through its subscription `sub`; this is that
+/// read.
 unsafe fn changes_has(
     sys: &SyscallTable,
     prefix: &[u8],
@@ -479,7 +464,6 @@ unsafe fn changes_has(
     page: &mut [u8],
 ) -> i32 {
     use abi::contracts::storage::namespace::changes;
-    let mut fence = [0u8; abi::fence::WIRE_MAX_LEN];
     let mut token = [0u8; changes::TOKEN_MAX];
     let mut token_len = 0usize;
     let mut found = 0;
@@ -488,18 +472,20 @@ unsafe fn changes_has(
         pages += 1;
         let req = changes::Request {
             prefix,
-            sub,
             token: &token[..token_len],
-            out_ptr: page.as_mut_ptr() as u64,
-            out_cap: page.len() as u32,
-            fence_out_ptr: fence.as_mut_ptr() as u64,
-            fence_out_cap: fence.len() as u16,
         };
-        let mut arg = [0u8; changes::REQUEST_FIXED_LEN + 256 + changes::TOKEN_MAX];
+        let mut arg = [0u8; changes::ARG_MAX];
         let Some(len) = changes::encode_request(&mut arg, &req) else {
             return E_INVAL;
         };
-        let n = (sys.provider_call)(-1, NS_CHANGES, arg.as_mut_ptr(), len);
+        let n = (sys.provider_call)(
+            sub,
+            NS_CHANGES,
+            arg.as_mut_ptr(),
+            len,
+            page.as_mut_ptr(),
+            page.len(),
+        );
         if n < 0 {
             return n;
         }
@@ -611,7 +597,6 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.event = -1;
         s.sub = -1;
         s.out_chan = out_chan;
         s.step = 0;
@@ -634,7 +619,6 @@ pub unsafe extern "C" fn module_new(
         s.cleared = 0;
         s.clear_len = 0;
         s.subscribed = 0;
-        s.take_owed = 0;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
         0
@@ -697,7 +681,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     s.clear_len = n as u32;
                 }
                 let key = s.clear_key;
-                match delete(sys, &key[..s.clear_len as usize], &mut s.fence) {
+                match delete(sys, &key[..s.clear_len as usize]) {
                     WriteAnswer::Pending => {}
                     // Gone either way: clearing wants the key absent, and a
                     // DELETE whose answer a fault lost finds it so when asked
@@ -714,7 +698,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // 1. PUT two objects. A write the store has not decided yet
                 // is asked again next step, with the same request.
                 let (key, err) = if s.put == 0 { (KEY_A, -1) } else { (KEY_B, -2) };
-                match put(sys, key, VAL_A, &mut s.fence) {
+                match put(sys, key, VAL_A) {
                     WriteAnswer::Pending => return StepReturn::Continue,
                     WriteAnswer::Decided(0) => s.put += 1,
                     WriteAnswer::Decided(_) => {
@@ -771,7 +755,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // 4. SUBSCRIBE, then write — the wake every source depends on.
                 // A store with no subscriptions writes and moves on.
                 if s.want_ring == 0 {
-                    match put(sys, KEY_C, VAL_C, &mut s.fence) {
+                    match put(sys, KEY_C, VAL_C) {
                         WriteAnswer::Pending => return StepReturn::Continue,
                         WriteAnswer::Decided(0) => {}
                         WriteAnswer::Decided(_) => {
@@ -785,22 +769,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     s.state = 5;
                     return StepReturn::Continue;
                 }
-                if s.event < 0 {
-                    s.event = (sys.provider_call)(
-                        -1,
-                        abi::kernel_abi::event::CREATE,
-                        core::ptr::null_mut(),
-                        0,
-                    );
-                    if s.event < 0 {
-                        s.err = -6;
-                        s.state = 99;
-                        emit(s);
-                        return StepReturn::Continue;
-                    }
-                }
                 if s.subscribed == 0 {
-                    let h = subscribe(sys, PREFIX, s.event);
+                    let h = subscribe(sys, PREFIX);
                     if h == E_AGAIN {
                         return StepReturn::Continue;
                     }
@@ -813,7 +783,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     s.sub = h;
                     s.subscribed = 1;
                 }
-                match put(sys, KEY_C, VAL_C, &mut s.fence) {
+                match put(sys, KEY_C, VAL_C) {
                     WriteAnswer::Pending => return StepReturn::Continue,
                     WriteAnswer::Decided(0) => {}
                     WriteAnswer::Decided(_) => {
@@ -829,10 +799,10 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             4 => {
                 // Wait for the ring. It must ARRIVE, not merely have been
                 // accepted: SUBSCRIBE returning a handle proves nothing about
-                // whether a change ever signals the event. Once it rings, the
+                // whether a change ever rings it. Once it rings, the
                 // read it asks for must find the write. A read the store
                 // answers "not yet" is asked again next step.
-                if s.subscribed == 1 && rang(sys, s.event, s.sub, &mut s.take_owed) == 1 {
+                if s.subscribed == 1 && rang(sys, s.sub) == 1 {
                     s.subscribed = 2;
                 }
                 if s.subscribed == 2 {
@@ -851,7 +821,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // 5. DELETE one, LIST again. A LIST the store defers is asked
                 // again without deleting again.
                 if s.del == 0 {
-                    match delete(sys, KEY_B, &mut s.fence) {
+                    match delete(sys, KEY_B) {
                         WriteAnswer::Pending => return StepReturn::Continue,
                         WriteAnswer::Decided(0) => {}
                         WriteAnswer::Decided(_) => {

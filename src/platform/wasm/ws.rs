@@ -413,7 +413,10 @@ unsafe fn pump_ws_out(st: &mut WsState) {
     }
 }
 
-fn ws_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn ws_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this
     // module instance, holding the `*mut WsState` written by `build`; every
     // buffer touched below lives inside that allocation, and the host

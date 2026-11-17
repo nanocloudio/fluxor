@@ -1269,7 +1269,7 @@ pub unsafe fn free_private(ptr: *mut u8, size: usize) {
 /// declared (committed whole, or the segments an elastic heap carved), and
 /// on a protection-unit target the private region that holds all of them.
 /// Detached from its slot so the release can wait for whoever else may still
-/// be using a buffer inside it (see `block_lend`).
+/// be using memory inside it (see `ipc::lend`).
 pub struct ModuleMemory {
     state: (*mut u8, usize),
     arena: (*mut u8, usize),
@@ -1574,7 +1574,10 @@ fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> 
 /// log + continue).
 ///
 /// `size` must match the original `alloc_state(size)` call.
-pub fn validate_state_canary(ptr: *const u8, size: usize) -> bool {
+///
+/// # Safety
+/// `ptr` is null or was returned by `alloc_state(size)` and not freed.
+pub unsafe fn validate_state_canary(ptr: *const u8, size: usize) -> bool {
     if ptr.is_null() {
         return true;
     }
@@ -1610,7 +1613,8 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     // slack) — the free path releases the true footprint regardless
     // of user-visible size. Validate the trailing canary first; for
     // zero-sized regions the canary lives at `ptr + 0`.
-    if !validate_state_canary(ptr as *const u8, size) {
+    // SAFETY: the caller's contract: `ptr` came from `alloc_state(size)`.
+    if !unsafe { validate_state_canary(ptr as *const u8, size) } {
         log::error!(
             "[loader] STATE CANARY CLOBBERED at {ptr:p} (size={size}) — \
              module overran its state buffer",
@@ -1732,7 +1736,7 @@ unsafe fn insert_clean(offset: usize, size: usize) {
 pub fn reset_state_arena() {
     // Every module's memory goes at once, and the ledger of buffers lent
     // from it with it, and every heap's segments.
-    crate::kernel::module::block_lend::reset();
+    crate::kernel::ipc::lend::reset();
     crate::kernel::mem::heap::reset_all();
     // SAFETY: at a rebuild no module is live; the lock orders this against
     // any allocation still finishing on another core.
@@ -2427,8 +2431,13 @@ impl ModuleLoader {
     /// (RP / BCM / Linux / WASM) byte-compares the recomputed digest against
     /// the manifest-stored value; the test harness can override the verdict
     /// via `set_verify_integrity_mode`.
-    pub fn init_from_blob(&mut self, blob: *const u8) -> Result<(), LoaderError> {
-        self.init_from_blob_with_len(blob, MAX_MODULES_BLOB_SIZE)
+    ///
+    /// # Safety
+    /// As [`init_from_blob_with_len`] with `blob_len = MAX_MODULES_BLOB_SIZE`:
+    /// the table's declared size bounds every read.
+    pub unsafe fn init_from_blob(&mut self, blob: *const u8) -> Result<(), LoaderError> {
+        // SAFETY: the caller's contract.
+        unsafe { self.init_from_blob_with_len(blob, MAX_MODULES_BLOB_SIZE) }
     }
 
     /// Length-aware counterpart to [`init_from_blob`]. `blob_len` is the
@@ -2445,7 +2454,11 @@ impl ModuleLoader {
     /// `size`. A malformed module-header claiming `code_size >
     /// entry.size` would otherwise produce out-of-bounds reads when
     /// the instantiator walks past the header.
-    pub fn init_from_blob_with_len(
+    ///
+    /// # Safety
+    /// `[blob, blob + blob_len)` is mapped and readable, stays so and
+    /// unchanged for as long as the loader reads modules from it.
+    pub unsafe fn init_from_blob_with_len(
         &mut self,
         blob: *const u8,
         blob_len: usize,

@@ -59,19 +59,24 @@ unsafe fn cont_vault_open_or_generate(
     label: &[u8],
     pub_out: &mut [u8],
 ) -> i32 {
-    let mut arg = [0u8; 8 + kv::MAX_LABEL + 12];
-    if label.len() > kv::MAX_LABEL {
+    let mut arg = [0u8; kv::open::MAX_ARG];
+    let req = kv::open::Request {
+        suite,
+        usage,
+        flags: 0,
+        label,
+    };
+    let Some(n) = kv::open::encode(&mut arg, &req) else {
         return -1;
-    }
-    arg[0..2].copy_from_slice(&suite.to_le_bytes());
-    arg[2..6].copy_from_slice(&usage.to_le_bytes());
-    arg[6] = 0;
-    arg[7] = label.len() as u8;
-    arg[8..8 + label.len()].copy_from_slice(label);
-    let t = 8 + label.len();
-    arg[t..t + 8].copy_from_slice(&(pub_out.as_mut_ptr() as u64).to_le_bytes());
-    arg[t + 8..t + 10].copy_from_slice(&(pub_out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, arg.as_mut_ptr(), t + 12);
+    };
+    let rc = (sys.provider_call)(
+        -1,
+        kv::OPEN_OR_GENERATE,
+        arg.as_mut_ptr(),
+        n,
+        pub_out.as_mut_ptr(),
+        pub_out.len(),
+    );
     if rc < 0 {
         -1
     } else {
@@ -82,7 +87,14 @@ unsafe fn cont_vault_open_or_generate(
 /// Free a vault handle.
 unsafe fn cont_vault_destroy(sys: &SyscallTable, handle: i32) {
     if handle >= 0 {
-        let _ = (sys.provider_call)(handle, kv::DESTROY, core::ptr::null_mut(), 0);
+        let _ = (sys.provider_call)(
+            handle,
+            kv::DESTROY,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -109,21 +121,28 @@ unsafe fn cont_derive_key(s: &mut QuicState, flow: &[u8; CONT_FLOW_ID_BYTES], ep
     if master < 0 {
         return -1;
     }
-    use kv::derive as d;
-    let ctx_len = CONT_FLOW_ID_BYTES + 4;
-    let mut arg = [0u8; d::LABEL + 16 + CONT_FLOW_ID_BYTES + 4];
-    arg[d::TARGET_SUITE..d::TARGET_SUITE + 2].copy_from_slice(&kv::suite::AEAD_KEY.to_le_bytes());
-    let usage = kv::usage::SEAL | kv::usage::OPEN | kv::usage::WRAP;
-    arg[d::TARGET_USAGE..d::TARGET_USAGE + 4].copy_from_slice(&usage.to_le_bytes());
-    arg[d::LABEL_LEN] = CONT_KEY_LABEL.len() as u8;
-    arg[d::CONTEXT_LEN..d::CONTEXT_LEN + 2].copy_from_slice(&(ctx_len as u16).to_le_bytes());
-    let l = d::LABEL;
-    arg[l..l + CONT_KEY_LABEL.len()].copy_from_slice(CONT_KEY_LABEL);
-    let c = l + CONT_KEY_LABEL.len();
-    arg[c..c + CONT_FLOW_ID_BYTES].copy_from_slice(flow);
-    arg[c + CONT_FLOW_ID_BYTES..c + ctx_len].copy_from_slice(&epoch.to_le_bytes());
+    let mut ctx = [0u8; CONT_FLOW_ID_BYTES + 4];
+    ctx[..CONT_FLOW_ID_BYTES].copy_from_slice(flow);
+    ctx[CONT_FLOW_ID_BYTES..].copy_from_slice(&epoch.to_le_bytes());
+    let mut arg = [0u8; kv::derive::LABEL + 16 + CONT_FLOW_ID_BYTES + 4];
+    let req = kv::derive::Request {
+        suite: kv::suite::AEAD_KEY,
+        usage: kv::usage::SEAL | kv::usage::OPEN | kv::usage::WRAP,
+        label: CONT_KEY_LABEL,
+        context: &ctx,
+    };
+    let Some(n) = kv::derive::encode(&mut arg, &req) else {
+        return -1;
+    };
     let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(master, kv::DERIVE, arg.as_mut_ptr(), c + ctx_len);
+    let rc = (sys.provider_call)(
+        master,
+        kv::DERIVE,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         -1
     } else {
@@ -296,6 +315,11 @@ unsafe fn handle_custody(s: &mut QuicState, p: &[u8]) {
     let epoch = u32::from_le_bytes([p[16], p[17], p[18], p[19]]);
     let op = p[20];
     let body = &p[21..];
+    if op == cu::ATTEST && custody_attest_pending(s) && p.len() == CUSTODY_ATTEST_CMD_LEN {
+        s.continuity.attest_held[..p.len()].copy_from_slice(p);
+        s.continuity.attest_held_len = p.len() as u8;
+        return;
+    }
     let r = match op {
         cu::ATTEST => custody_attest(s, &flow, epoch, body),
         cu::WRAP => custody_wrap(s, &flow, epoch, body),
@@ -309,7 +333,54 @@ unsafe fn handle_custody(s: &mut QuicState, p: &[u8]) {
 
 type CustodyResult = Result<(), (u8, u8)>;
 
-/// ATTEST `[challenge:32]`: a fresh recipient under `name`, attested.
+/// A custody ATTEST whose record the custody identity is signing
+/// (`ContinuityState::attest`). The vault signs as a job of several calls,
+/// so the SIGN is issued once a step (`custody_attest_step`) and the
+/// evidence answered when the signature arrives.
+#[derive(Clone, Copy)]
+pub struct CustodyAttest {
+    /// The recipient the record attests; -1 when no ATTEST is in flight.
+    recipient: i32,
+    name: [u8; CONT_FLOW_ID_BYTES],
+    epoch: u32,
+    /// When the ATTEST arrived (`dev_millis`).
+    since_ms: u64,
+    rpub: [u8; sc::custody::PUB_LEN],
+    record: [u8; sc::custody::RECORD_LEN],
+    /// The record's SHA-256: the input every SIGN of the job repeats.
+    digest: [u8; 32],
+}
+
+pub const NO_CUSTODY_ATTEST: CustodyAttest = CustodyAttest {
+    recipient: -1,
+    name: [0; CONT_FLOW_ID_BYTES],
+    epoch: 0,
+    since_ms: 0,
+    rpub: [0; sc::custody::PUB_LEN],
+    record: [0; sc::custody::RECORD_LEN],
+    digest: [0; 32],
+};
+
+/// An ATTEST command's payload: the flow header, the op and the challenge.
+/// One that arrives while another is being signed is held whole until
+/// that one is answered (`ContinuityState::attest_held`).
+pub const CUSTODY_ATTEST_CMD_LEN: usize = sc::FLOW_HEADER_LEN + 1 + 32;
+
+/// Milliseconds the custody identity's signature may take before the
+/// ATTEST is refused. Wall-clock, not steps: how many steps the vault's
+/// job needs depends on the target, how many a second holds on the
+/// graph's tick. Generous against the slowest target's P-256 signature, so
+/// only a vault that has stopped answering is given up on.
+const CUSTODY_SIGN_MS: u64 = 30_000;
+
+/// Whether an ATTEST is being signed.
+fn custody_attest_pending(s: &QuicState) -> bool {
+    s.continuity.attest.recipient >= 0
+}
+
+/// ATTEST `[challenge:32]`: a fresh recipient under `name`, its record
+/// taken from the vault and handed to the custody identity to sign; the
+/// evidence is answered by `custody_attest_step` when the signature arrives.
 unsafe fn custody_attest(
     s: &mut QuicState,
     name: &[u8; CONT_FLOW_ID_BYTES],
@@ -321,71 +392,134 @@ unsafe fn custody_attest(
     if body.len() != 32 {
         return Err((sc::STATUS_CORRUPT, cu::why::EVIDENCE));
     }
-    let signer = custody_signer(s);
-    if signer < 0 {
+    if custody_signer(s) < 0 {
         return Err(vault);
     }
     // A later ATTEST under the same name replaces the recipient.
     if let Some(i) = cont_key_find(s, &[KEY_RECIPIENT], name, epoch) {
         cont_key_free(s, i);
     }
-    let Some(slot) = cont_key_alloc(s) else {
-        return Err(vault);
-    };
     let sys = &*s.syscalls;
-    // GENERATE: [suite:u16][usage:u32][flags:u8][_pad:u8]
-    //           [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
-    let mut rpub = [0u8; cu::PUB_LEN];
-    let mut g = [0u8; 20];
-    g[0..2].copy_from_slice(&kv::suite::P256.to_le_bytes());
-    let usage = kv::usage::AGREE | kv::usage::EXPORT_PUBLIC;
-    g[2..6].copy_from_slice(&usage.to_le_bytes());
-    g[8..16].copy_from_slice(&(rpub.as_mut_ptr() as u64).to_le_bytes());
-    g[16..18].copy_from_slice(&(cu::PUB_LEN as u16).to_le_bytes());
-    let recipient = (sys.provider_call)(-1, kv::GENERATE, g.as_mut_ptr(), g.len());
-    if recipient < 0 || u16::from_le_bytes([g[18], g[19]]) as usize != cu::PUB_LEN {
-        cont_vault_destroy(sys, recipient);
-        return Err(vault);
-    }
-    // ATTEST_KEY: [challenge:32][signer:i32][_pad:u32][out_ptr:u64]
-    //             [out_cap:u32][out_len_out:u32]
-    let mut ev = [0u8; cu::EVIDENCE_MAX];
-    let mut rec = [0u8; cu::RECORD_LEN + cu::SIG_MAX];
-    let mut a = [0u8; kv::attest_key::ARG_LEN];
-    a[..32].copy_from_slice(body);
-    a[kv::attest_key::SIGNER..kv::attest_key::SIGNER + 4].copy_from_slice(&signer.to_le_bytes());
-    a[kv::attest_key::OUT_PTR..kv::attest_key::OUT_PTR + 8]
-        .copy_from_slice(&(rec.as_mut_ptr() as u64).to_le_bytes());
-    a[kv::attest_key::OUT_CAP..kv::attest_key::OUT_CAP + 4]
-        .copy_from_slice(&(rec.len() as u32).to_le_bytes());
-    let rc = (sys.provider_call)(recipient, kv::ATTEST_KEY, a.as_mut_ptr(), a.len());
-    let n = u32::from_le_bytes([
-        a[kv::attest_key::OUT_LEN],
-        a[kv::attest_key::OUT_LEN + 1],
-        a[kv::attest_key::OUT_LEN + 2],
-        a[kv::attest_key::OUT_LEN + 3],
-    ]) as usize;
-    if rc < 0 || n <= cu::RECORD_LEN || n > rec.len() {
-        cont_vault_destroy(sys, recipient);
-        return Err(vault);
-    }
-    let sig_len = n - cu::RECORD_LEN;
-    ev[..cu::RECORD_LEN].copy_from_slice(&rec[..cu::RECORD_LEN]);
-    ev[cu::RECIPIENT..cu::RECIPIENT + cu::PUB_LEN].copy_from_slice(&rpub);
-    ev[cu::SIGNER..cu::SIGNER + cu::PUB_LEN].copy_from_slice(&s.continuity.signer_pub);
-    ev[cu::SIG_LEN..cu::SIG_LEN + 2].copy_from_slice(&(sig_len as u16).to_le_bytes());
-    ev[cu::SIG..cu::SIG + sig_len].copy_from_slice(&rec[cu::RECORD_LEN..n]);
-    cont_key_put(s, slot, KEY_RECIPIENT, name, epoch, recipient);
-    custody_reply(
-        s,
-        name,
-        epoch,
-        cu::ATTEST,
-        sc::STATUS_OK,
+    let mut job = NO_CUSTODY_ATTEST;
+    let mut g = kv::generate::encode(
+        kv::suite::P256,
+        kv::usage::AGREE | kv::usage::EXPORT_PUBLIC,
         0,
-        &ev[..cu::SIG + sig_len],
     );
+    let recipient = (sys.provider_call)(
+        -1,
+        kv::GENERATE,
+        g.as_mut_ptr(),
+        g.len(),
+        job.rpub.as_mut_ptr(),
+        job.rpub.len(),
+    );
+    if recipient < 0 || kv::generate::len(&g) != Some(cu::PUB_LEN) {
+        cont_vault_destroy(sys, recipient);
+        return Err(vault);
+    }
+    // The vault's record of the recipient over the challenge, which the
+    // custody identity signs (P-256: ECDSA over the record's SHA-256).
+    let mut a = [0u8; kv::attest_key::ARG_LEN];
+    a.copy_from_slice(body);
+    let rc = (sys.provider_call)(
+        recipient,
+        kv::ATTEST_KEY,
+        a.as_mut_ptr(),
+        a.len(),
+        job.record.as_mut_ptr(),
+        cu::RECORD_LEN,
+    );
+    if rc != cu::RECORD_LEN as i32 {
+        cont_vault_destroy(sys, recipient);
+        return Err(vault);
+    }
+    job.digest = sha256(&job.record);
+    job.recipient = recipient;
+    job.name = *name;
+    job.epoch = epoch;
+    job.since_ms = dev_millis(sys);
+    s.continuity.attest = job;
     Ok(())
+}
+
+/// Advance the ATTEST in flight: one SIGN of the custody identity's job a
+/// step, the identical call each time, until it answers the signature —
+/// then the recipient is kept under its name and the evidence answered —
+/// or refuses, or outlasts `CUSTODY_SIGN_MS`. An ATTEST held meanwhile is
+/// handled once this one is answered.
+unsafe fn custody_attest_step(s: &mut QuicState) {
+    use sc::custody as cu;
+    if !custody_attest_pending(s) {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let job = s.continuity.attest;
+    let mut sig = [0u8; cu::SIG_MAX];
+    sig[..32].copy_from_slice(&job.digest);
+    let mut arg = kv::sign::encode(kv::sign_mode::DIGEST, 32);
+    let rc = (sys.provider_call)(
+        s.continuity.signer,
+        kv::SIGN,
+        arg.as_mut_ptr(),
+        arg.len(),
+        sig.as_mut_ptr(),
+        sig.len(),
+    );
+    let sig_len = if rc == E_AGAIN || rc == abi::errno::EBUSY {
+        if dev_millis(sys).wrapping_sub(job.since_ms) <= CUSTODY_SIGN_MS {
+            return;
+        }
+        0
+    } else if rc == cu::SIG_MAX as i32 {
+        cu::SIG_MAX
+    } else {
+        0
+    };
+    s.continuity.attest = NO_CUSTODY_ATTEST;
+    let slot = if sig_len == 0 {
+        None
+    } else {
+        cont_key_alloc(s)
+    };
+    match slot {
+        Some(slot) => {
+            let mut ev = [0u8; cu::EVIDENCE_MAX];
+            ev[..cu::RECORD_LEN].copy_from_slice(&job.record);
+            ev[cu::RECIPIENT..cu::RECIPIENT + cu::PUB_LEN].copy_from_slice(&job.rpub);
+            ev[cu::SIGNER..cu::SIGNER + cu::PUB_LEN].copy_from_slice(&s.continuity.signer_pub);
+            ev[cu::SIG_LEN..cu::SIG_LEN + 2].copy_from_slice(&(sig_len as u16).to_le_bytes());
+            ev[cu::SIG..cu::SIG + sig_len].copy_from_slice(&sig[..sig_len]);
+            cont_key_put(s, slot, KEY_RECIPIENT, &job.name, job.epoch, job.recipient);
+            custody_reply(
+                s,
+                &job.name,
+                job.epoch,
+                cu::ATTEST,
+                sc::STATUS_OK,
+                0,
+                &ev[..cu::SIG + sig_len],
+            );
+        }
+        None => {
+            cont_vault_destroy(&*s.syscalls, job.recipient);
+            custody_reply(
+                s,
+                &job.name,
+                job.epoch,
+                cu::ATTEST,
+                sc::STATUS_NO_CAPACITY,
+                cu::why::VAULT,
+                &[],
+            );
+        }
+    }
+    let held = s.continuity.attest_held_len as usize;
+    if held != 0 {
+        let cmd = s.continuity.attest_held;
+        s.continuity.attest_held_len = 0;
+        handle_custody(s, &cmd[..held]);
+    }
 }
 
 /// WRAP `[challenge:32][evidence]`: the flow's sealing key, wrapped to the
@@ -433,17 +567,22 @@ unsafe fn custody_wrap(
         return refuse(cu::why::RECIPIENT);
     }
     let sys = &*s.syscalls;
-    // VERIFY with the signer's public key: [hash_len:u16][sig_len:u16]
-    // [pub_len:u16][_pad:u16][hash][sig][pub].
+    // VERIFY with the signer's public key: `data` = digest ‖ sig ‖ pub.
     let digest = sha256(record);
-    let mut v = [0u8; 8 + 32 + cu::SIG_MAX + cu::PUB_LEN];
-    v[0..2].copy_from_slice(&32u16.to_le_bytes());
-    v[2..4].copy_from_slice(&(cu::SIG_MAX as u16).to_le_bytes());
-    v[4..6].copy_from_slice(&(cu::PUB_LEN as u16).to_le_bytes());
-    v[8..40].copy_from_slice(&digest);
-    v[40..40 + cu::SIG_MAX].copy_from_slice(sig);
-    v[40 + cu::SIG_MAX..].copy_from_slice(signer);
-    if (sys.provider_call)(-1, kv::VERIFY, v.as_mut_ptr(), v.len()) != 1 {
+    let mut v = [0u8; 32 + cu::SIG_MAX + cu::PUB_LEN];
+    v[..32].copy_from_slice(&digest);
+    v[32..32 + cu::SIG_MAX].copy_from_slice(sig);
+    v[32 + cu::SIG_MAX..].copy_from_slice(signer);
+    let mut va = kv::verify::encode(32, cu::SIG_MAX as u16, cu::PUB_LEN as u16);
+    if (sys.provider_call)(
+        -1,
+        kv::VERIFY,
+        va.as_mut_ptr(),
+        va.len(),
+        v.as_mut_ptr(),
+        v.len(),
+    ) != 1
+    {
         return refuse(cu::why::SIGNATURE);
     }
     // The flow must be a live connection of this instance at this epoch:
@@ -458,20 +597,22 @@ unsafe fn custody_wrap(
     if key < 0 {
         return Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT));
     }
-    // KEY_WRAP: [dest_pub_len:u16][dest_pub][attest_digest:32]
-    //           [out_ptr:u64][out_cap:u16][out_len_out:u16]
     let mut blob = [0u8; cu::WRAPPED_LEN];
-    let mut w = [0u8; 2 + cu::PUB_LEN + 32 + 12];
-    w[0..2].copy_from_slice(&(cu::PUB_LEN as u16).to_le_bytes());
-    w[2..2 + cu::PUB_LEN].copy_from_slice(recipient);
-    let c = 2 + cu::PUB_LEN;
-    w[c..c + 32].copy_from_slice(&record[ak::R_COMPOSITION..ak::R_COMPOSITION + 32]);
-    w[c + 32..c + 40].copy_from_slice(&(blob.as_mut_ptr() as u64).to_le_bytes());
-    w[c + 40..c + 42].copy_from_slice(&(blob.len() as u16).to_le_bytes());
+    let mut dest = [0u8; kv::wrap::EPH_PUB_LEN];
+    dest.copy_from_slice(recipient);
+    let mut attest = [0u8; 32];
+    attest.copy_from_slice(&record[ak::R_COMPOSITION..ak::R_COMPOSITION + 32]);
+    let mut w = kv::key_wrap::encode(&dest, &attest);
     let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(key, kv::KEY_WRAP, w.as_mut_ptr(), w.len());
-    let n = u16::from_le_bytes([w[c + 42], w[c + 43]]) as usize;
-    if rc < 0 || n != cu::WRAPPED_LEN {
+    let rc = (sys.provider_call)(
+        key,
+        kv::KEY_WRAP,
+        w.as_mut_ptr(),
+        w.len(),
+        blob.as_mut_ptr(),
+        blob.len(),
+    );
+    if rc != cu::WRAPPED_LEN as i32 {
         return Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT));
     }
     custody_reply(s, flow, epoch, cu::WRAP, sc::STATUS_OK, 0, &blob);
@@ -496,11 +637,16 @@ unsafe fn custody_unwrap(
     };
     let recipient = s.continuity.keys[ri].handle;
     let sys = &*s.syscalls;
-    // KEY_UNWRAP: [blob_len:u16][blob]
-    let mut u = [0u8; 2 + cu::WRAPPED_LEN];
-    u[0..2].copy_from_slice(&(cu::WRAPPED_LEN as u16).to_le_bytes());
-    u[2..].copy_from_slice(blob);
-    let key = (sys.provider_call)(recipient, kv::KEY_UNWRAP, u.as_mut_ptr(), u.len());
+    let mut u = [0u8; cu::WRAPPED_LEN];
+    u.copy_from_slice(blob);
+    let key = (sys.provider_call)(
+        recipient,
+        kv::KEY_UNWRAP,
+        core::ptr::null_mut(),
+        0,
+        u.as_mut_ptr(),
+        u.len(),
+    );
     if key < 0 {
         return Err((sc::STATUS_CORRUPT, cu::why::VAULT));
     }
@@ -508,12 +654,17 @@ unsafe fn custody_unwrap(
     // held.
     cont_vault_destroy(sys, recipient);
     s.continuity.keys[ri] = EMPTY_CONT_KEY;
-    // It must be a sealing key, as the primary's are; DESCRIBE:
-    // [suite_out:u16][usage_out:u32][tier_out:u8][persisted_out:u8].
-    let mut d = [0u8; 8];
-    let rc = (sys.provider_call)(key, kv::DESCRIBE, d.as_mut_ptr(), d.len());
-    let suite = u16::from_le_bytes([d[0], d[1]]);
-    let usage = u32::from_le_bytes([d[2], d[3], d[4], d[5]]);
+    // It must be a sealing key, as the primary's are.
+    let mut d = [0u8; kv::describe::ARG_LEN];
+    let rc = (sys.provider_call)(
+        key,
+        kv::DESCRIBE,
+        d.as_mut_ptr(),
+        d.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    let (suite, usage) = kv::describe::parse(&d).map_or((0, 0), |x| (x.suite, x.usage));
     if rc < 0
         || suite != kv::suite::AEAD_KEY
         || usage & (kv::usage::SEAL | kv::usage::OPEN) != kv::usage::SEAL | kv::usage::OPEN

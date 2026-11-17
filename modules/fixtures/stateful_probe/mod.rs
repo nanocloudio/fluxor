@@ -117,7 +117,7 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
-    in_chan: i32,
+    _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
     params: *const u8,
@@ -140,7 +140,8 @@ pub unsafe extern "C" fn module_new(
             core::mem::size_of::<ProbeState>(),
         );
         s.syscalls = syscalls as *const SyscallTable;
-        s.blk.bind(in_chan);
+        // `EXEC` only: nothing is lent.
+        s.blk.bind(0, core::ptr::null_mut(), 0);
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
@@ -168,7 +169,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
         return StepReturn::Continue;
     }
-    let rc = s.blk.caps(sys);
+    let rc = s.blk.describe(sys);
     if rc == E_AGAIN {
         return StepReturn::Continue;
     }

@@ -160,24 +160,29 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
         return StepReturn::Continue;
     }
-    // [suite:u16][usage:u32][flags:u8][label_len:u8][label]
-    // [pub_ptr:u64][pub_cap:u16][pub_len_out:u16]
     let ll = s.label_len as usize;
-    let mut arg = [0u8; 8 + MAX_LABEL + 12];
+    let mut arg = [0u8; kv::open::MAX_ARG];
     let mut pub_out = [0u8; 64];
-    arg[0..2].copy_from_slice(&kv::suite::ED25519.to_le_bytes());
-    arg[2..6].copy_from_slice(&USAGE.to_le_bytes());
-    arg[7] = ll as u8;
-    let mut i = 0usize;
-    while i < ll {
-        arg[8 + i] = s.label[i];
-        i += 1;
-    }
-    let tail = 8 + ll;
-    let pp = pub_out.as_mut_ptr() as u64;
-    arg[tail..tail + 8].copy_from_slice(&pp.to_le_bytes());
-    arg[tail + 8..tail + 10].copy_from_slice(&64u16.to_le_bytes());
-    let h = (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, arg.as_mut_ptr(), tail + 12);
+    let req = kv::open::Request {
+        suite: kv::suite::ED25519,
+        usage: USAGE,
+        flags: 0,
+        label: &s.label[..ll],
+    };
+    let Some(n) = kv::open::encode(&mut arg, &req) else {
+        s.done = 1;
+        s.rc = -22;
+        report(s);
+        return StepReturn::Continue;
+    };
+    let h = (sys.provider_call)(
+        -1,
+        kv::OPEN_OR_GENERATE,
+        arg.as_mut_ptr(),
+        n,
+        pub_out.as_mut_ptr(),
+        pub_out.len(),
+    );
     if h == E_AGAIN {
         s.waits = s.waits.wrapping_add(1);
         return StepReturn::Continue;
@@ -194,11 +199,20 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         s.pub_key[i] = pub_out[i];
         i += 1;
     }
-    // [suite_out:u16][usage_out:u32][tier_out:u8][persisted_out:u8]
-    let mut d = [0u8; 8];
-    if (sys.provider_call)(h, kv::DESCRIBE, d.as_mut_ptr(), d.len()) == 8 {
-        s.tier = d[6];
-        s.persisted = d[7];
+    let mut d = [0u8; kv::describe::ARG_LEN];
+    if (sys.provider_call)(
+        h,
+        kv::DESCRIBE,
+        d.as_mut_ptr(),
+        d.len(),
+        core::ptr::null_mut(),
+        0,
+    ) >= 0
+    {
+        if let Some(described) = kv::describe::parse(&d) {
+            s.tier = described.tier;
+            s.persisted = described.persisted;
+        }
     }
     report(s);
     StepReturn::Continue

@@ -240,8 +240,10 @@ The far side also writes each request HEAD's `peer` itself: the session's
 verified key fingerprint under `require_peer`, empty without it. What the
 requester put there is never passed on, so a provider authorises on the
 peer the transport proved. A HEAD that no longer fits one record once its
-`peer` is written is answered `413` (RAISED) and never reaches the
-provider; a request HEAD that does not parse is answered `400`.
+`peer` is written is answered `TOO_LARGE` (RAISED) and never reaches the
+provider; a request HEAD that does not parse, or breaks the exchange's
+rules for `op` and `verb`, is answered `REFUSED`. The relay reads no
+binding: every verb, outcome, detail and RAISED crosses as written.
 
 ### Session loss
 
@@ -295,14 +297,14 @@ The exchange contract's LINK is the requester's whole account of a session.
 
 | Limit | Value | On reaching it |
 |---|---|---|
-| `OPEN_EXCHANGES_MAX` | 256 on host-class targets, 32 on MCUs, across every session | a request HEAD past it is answered `503`, marked RAISED, and never reaches the provider; records that follow for it are dropped |
+| `OPEN_EXCHANGES_MAX` | 256 on host-class targets, 32 on MCUs, across every session | a request HEAD past it is answered `BUSY`, marked RAISED, and never reaches the provider; records that follow for it are dropped |
 | `SESSIONS_MAX` | 8 on host-class targets, 4 on MCUs | `sessions` past it is refused at construction |
 | record | the exchange contract's `RECORD_MAX` | a larger record is refused by the edge, never cut |
 | channels | `PORT_CHANNELS`, 8, beside an endpoint as without one (the table holds `MAX_CHANNELS`, 10) | a longer table is refused at construction |
 
 ### Counters
 
-`x_refused` (requests the far side answered itself: `503`, `413`, `400`),
+`x_refused` (requests the far side answered itself: `BUSY`, `TOO_LARGE`, `REFUSED`),
 `x_aborted` (ABORTs written for exchanges a session left open),
 `x_discarded` (records an endpoint dropped as belonging to an ended
 exchange). Per instance: `sessions` (opened, ever), `sessions_replaced`,

@@ -179,7 +179,10 @@ struct CliInState {
 /// chronicle_cli); this is the missing half of that pair.
 const ARGS_WRITE_RETRIES: u32 = 20_000;
 
-fn cli_in_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn cli_in_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `CliInState` by the loader.
     let st = unsafe { instance_state::<CliInState>(state) };
 
@@ -430,7 +433,10 @@ fn channel_drained(chan: i32) -> bool {
     r < 0 || (r as u32 & channel::POLL_IN) == 0
 }
 
-fn cli_out_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn cli_out_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `CliOutState` by the loader.
     let st = unsafe { instance_state::<CliOutState>(state) };
 

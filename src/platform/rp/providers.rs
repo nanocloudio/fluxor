@@ -6,8 +6,8 @@
 
 use portable_atomic::{compiler_fence, AtomicU16, Ordering};
 
-use crate::kernel::ipc::fd;
 use crate::kernel::module::syscalls::{register_dev_query_extension, register_system_extension};
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use crate::platform::chip::PWM_BASE;
 use crate::platform::rp_dma as dma;
@@ -22,9 +22,6 @@ use crate::platform::chip;
 
 const E_INVAL: i32 = errno::EINVAL;
 
-/// The handle tag of a raw instance claim: the `rp_raw` contract's.
-const RAW_TAG: i32 = crate::abi::registry::rp_raw::FD_TAG;
-
 /// IO_BANK0 function selects of the bus peripherals, the same on both dies.
 const FUNCSEL_SPI: u32 = 1;
 const FUNCSEL_UART: u32 = 2;
@@ -36,7 +33,8 @@ const FUNCSEL_NULL: u32 = 31;
 const PL022_CR1: usize = 0x04;
 const PL022_DR: usize = 0x08;
 const PL022_CR1_SSE: u32 = 1 << 1;
-/// PL011 (UART) control register and its enables.
+/// PL011 (UART) data and control registers, and the control enables.
+const PL011_DR: usize = 0x00;
 const PL011_CR: usize = 0x30;
 const PL011_CR_UARTEN: u32 = 1 << 0;
 const PL011_CR_TXE: u32 = 1 << 8;
@@ -132,52 +130,220 @@ pub(crate) fn dma_free_channel(ch: u8) -> i32 {
     0
 }
 
-pub(crate) unsafe fn dma_start_raw(
-    ch: u8,
-    read_addr: u32,
-    write_addr: u32,
-    count: u32,
-    dreq: u8,
-    flags: u8,
-) -> i32 {
-    if !dma::is_implemented(ch) {
-        return E_INVAL;
-    }
-    let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
-    if used & (1u16 << ch) == 0 {
-        return E_INVAL;
-    }
+// ============================================================================
+// DMA transfers over lends
+// ============================================================================
+//
+// A transfer moves memory to or from one peripheral FIFO. The peripheral side
+// is the FIFO its DREQ paces, on an instance the caller holds a raw claim on
+// (`fifo_of`); the memory side is a span the caller lent on the handle the
+// transfer runs on (`lend::OPEN`), named `[cookie][offset]` (`lent_at`).
+// Nobody names an address.
 
+/// `flags` bit: the memory side advances each unit.
+const FLAG_INCR: u8 = crate::abi::platform::rp::dma_raw::flags::INCR;
+
+/// A transfer's peripheral side: the FIFO register `dreq` paces, and whether
+/// the transfer moves memory into it.
+#[derive(Clone, Copy)]
+struct Fifo {
+    addr: u32,
+    to_peripheral: bool,
+}
+
+/// The FIFO `dreq` paces, on a PIO block, SPI, UART or I2C instance the
+/// caller holds a raw claim on. `EBADF` for an instance it does not hold,
+/// `EINVAL` for a DREQ no FIFO of this die answers to.
+fn fifo_of(dreq: u8) -> Result<Fifo, i32> {
+    let held = |f: u8, instance: u8| -> Result<(), i32> {
+        let me = crate::kernel::exec::scheduler::current_module_id();
+        match raw_slot(f, instance).map(|s| RAW_OWNER[s].load(Ordering::Acquire)) {
+            Some(owner) if owner == me => Ok(()),
+            _ => Err(errno::EBADF),
+        }
+    };
+    // PIO block n paces TX of state machine sm at 8n + sm, RX at 8n + 4 + sm.
+    let pio_num = dreq >> 3;
+    if (pio_num as usize) < chip::PIO_COUNT as usize {
+        held(family::PIO, pio_num)?;
+        let base = pio_regs::instance(pio_num).ok_or(E_INVAL)?;
+        let sm = (dreq & 3) as usize;
+        let rx = dreq & 4 != 0;
+        let addr = if rx {
+            pio_regs::addr::rxf(base, sm)
+        } else {
+            pio_regs::addr::txf(base, sm)
+        };
+        return Ok(Fifo {
+            addr: addr as u32,
+            to_peripheral: !rx,
+        });
+    }
+    type Bus = (
+        u8,
+        fn(u8) -> Option<usize>,
+        fn(u8) -> Option<(u8, u8)>,
+        usize,
+        u8,
+    );
+    let buses: [Bus; 3] = [
+        (
+            family::SPI,
+            chip::spi_base,
+            chip::spi_dreq,
+            PL022_DR,
+            chip::SPI_COUNT,
+        ),
+        (
+            family::UART,
+            chip::uart_base,
+            chip::uart_dreq,
+            PL011_DR,
+            chip::UART_COUNT,
+        ),
+        (
+            family::I2C,
+            chip::i2c_base,
+            chip::i2c_dreq,
+            DW_I2C_DATA_CMD,
+            chip::I2C_COUNT,
+        ),
+    ];
+    for (f, base_of, dreq_of, fifo, count) in buses {
+        for instance in 0..count {
+            let Some((tx, rx)) = dreq_of(instance) else {
+                continue;
+            };
+            if dreq != tx && dreq != rx {
+                continue;
+            }
+            held(f, instance)?;
+            let base = base_of(instance).ok_or(E_INVAL)?;
+            return Ok(Fifo {
+                addr: (base + fifo) as u32,
+                to_peripheral: dreq == tx,
+            });
+        }
+    }
+    Err(E_INVAL)
+}
+
+/// The transfer unit `flags` names and its width in bytes.
+fn unit_of(flags: u8) -> Option<(dma::DataSize, usize)> {
+    use crate::abi::platform::rp::dma_raw::flags as f;
+    match flags & f::SIZE_MASK {
+        f::SIZE_BYTE => Some((dma::DataSize::Byte, 1)),
+        f::SIZE_HALF => Some((dma::DataSize::HalfWord, 2)),
+        f::SIZE_WORD => Some((dma::DataSize::Word, 4)),
+        _ => None,
+    }
+}
+
+/// The address `offset` bytes into the span the caller lent on `handle`
+/// under `cookie`, when `bytes` from there lie inside it and the lend lets
+/// the transfer read it (`to_peripheral`) or write it.
+fn lent_at(
+    handle: i32,
+    cookie: u32,
+    offset: u32,
+    bytes: usize,
+    to_peripheral: bool,
+) -> Result<u32, i32> {
+    use crate::kernel::ipc::lend;
+    let me = crate::kernel::exec::scheduler::current_module_id();
+    let (addr, len, dir) = lend::resolve_kernel(handle, cookie, me).ok_or(errno::ENOENT)?;
+    let need = if to_peripheral {
+        lend::dir::IN
+    } else {
+        lend::dir::OUT
+    };
+    if dir & need == 0 {
+        return Err(errno::EACCES);
+    }
+    let end = (offset as usize).checked_add(bytes).ok_or(E_INVAL)?;
+    if end > len {
+        return Err(E_INVAL);
+    }
+    u32::try_from(addr + offset as usize).map_err(|_| E_INVAL)
+}
+
+/// A decoded transfer: `[cookie u32][offset u32][count u32][dreq u8]
+/// [flags u8]` against the lends on `handle`.
+struct Transfer {
+    read: u32,
+    write: u32,
+    count: u32,
+    fifo: Fifo,
+    ctrl: dma::CtrlTrig,
+}
+
+fn le32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn transfer_of(handle: i32, ch: u8, arg: &[u8]) -> Result<Transfer, i32> {
+    let (Some(cookie), Some(offset), Some(count), Some(&dreq), Some(&flags)) = (
+        le32(arg, 0),
+        le32(arg, 4),
+        le32(arg, 8),
+        arg.get(12),
+        arg.get(13),
+    ) else {
+        return Err(E_INVAL);
+    };
+    let (size, width) = unit_of(flags).ok_or(E_INVAL)?;
+    let fifo = fifo_of(dreq)?;
+    let incr = flags & FLAG_INCR != 0;
+    let bytes = if incr {
+        (count as usize).checked_mul(width).ok_or(E_INVAL)?
+    } else {
+        width
+    };
+    let mem = lent_at(handle, cookie, offset, bytes, fifo.to_peripheral)?;
+    let (read, write) = if fifo.to_peripheral {
+        (mem, fifo.addr)
+    } else {
+        (fifo.addr, mem)
+    };
+    let ctrl = dma::CtrlTrig::default()
+        .enable(true)
+        .incr_read(incr && fifo.to_peripheral)
+        .incr_write(incr && !fifo.to_peripheral)
+        .data_size(size)
+        .treq_sel(dreq)
+        .chain_to(ch);
+    Ok(Transfer {
+        read,
+        write,
+        count,
+        fifo,
+        ctrl,
+    })
+}
+
+/// Program and start channel `ch`.
+///
+/// # Safety
+/// `ch` is an implemented, allocated channel, and `t`'s memory side lies
+/// inside a span lent for this transfer.
+unsafe fn dma_start_raw(ch: u8, t: &Transfer) -> i32 {
+    if !dma::is_implemented(ch) || DMA_CHANNELS_USED.load(Ordering::Acquire) & (1u16 << ch) == 0 {
+        return E_INVAL;
+    }
     let c = ch as usize;
     // SAFETY: `ch` is an implemented, allocated channel, so every address
-    // below is inside this silicon's DMA block.
+    // below is inside this silicon's DMA block; the caller's contract covers
+    // the memory the channel will touch.
     unsafe {
-        write32(chan(c, dma::addr::READ_ADDR), read_addr);
-        write32(chan(c, dma::addr::WRITE_ADDR), write_addr);
-        write32(chan(c, dma::addr::TRANS_COUNT), dma::trans_count(count));
+        write32(chan(c, dma::addr::READ_ADDR), t.read);
+        write32(chan(c, dma::addr::WRITE_ADDR), t.write);
+        write32(chan(c, dma::addr::TRANS_COUNT), dma::trans_count(t.count));
         compiler_fence(Ordering::SeqCst);
         // CTRL_TRIG last: writing it starts the transfer.
-        write32(chan(c, dma::addr::CTRL_TRIG), ctrl_for(ch, dreq, flags).0);
+        write32(chan(c, dma::addr::CTRL_TRIG), t.ctrl.0);
     }
     compiler_fence(Ordering::SeqCst);
     0
-}
-
-/// The shared `CTRL_TRIG` value for a channel configured from the syscall's
-/// `flags` byte. One definition for the three call sites that build it.
-fn ctrl_for(ch: u8, dreq: u8, flags: u8) -> dma::CtrlTrig {
-    let data_size = if flags & 0x04 != 0 {
-        dma::DataSize::Word
-    } else {
-        dma::DataSize::HalfWord
-    };
-    dma::CtrlTrig::default()
-        .enable(true)
-        .incr_read(flags & 0x01 != 0)
-        .incr_write(flags & 0x02 != 0)
-        .data_size(data_size)
-        .treq_sel(dreq)
-        .chain_to(ch)
 }
 
 /// Address of channel `ch`'s register at `reg`.
@@ -190,17 +356,13 @@ fn dma_busy(ch: u8) -> i32 {
     if !dma::is_implemented(ch) {
         return E_INVAL;
     }
-    // SAFETY: `ch` is implemented on this silicon.
-    if channel_is_busy(ch) {
-        1
-    } else {
-        0
-    }
+    i32::from(channel_is_busy(ch))
 }
 
 /// Whether a channel is mid-transfer.
 fn channel_is_busy(ch: u8) -> bool {
-    // SAFETY: callers check `is_implemented` first.
+    // SAFETY: callers check `is_implemented` first; CTRL_TRIG is a read-only
+    // status read here.
     dma::CtrlTrig(unsafe { read32(chan(ch as usize, dma::addr::CTRL_TRIG)) }).busy()
 }
 
@@ -208,8 +370,8 @@ pub(crate) fn dma_abort(ch: u8) -> i32 {
     if !dma::is_implemented(ch) {
         return E_INVAL;
     }
-    // Bounded: the previous spin on BUSY never gave up, so a channel that did
-    // not acknowledge the abort hung whoever asked.
+    // Bounded: a channel that does not acknowledge the abort fails the call
+    // rather than hanging whoever asked.
     if dma::abort(ch, DMA_ABORT_LIMIT) {
         0
     } else {
@@ -220,24 +382,30 @@ pub(crate) fn dma_abort(ch: u8) -> i32 {
 /// Spin budget for a channel to acknowledge an abort, in poll iterations.
 const DMA_ABORT_LIMIT: u32 = 100_000;
 
-pub(crate) unsafe fn dma_restart_raw(ch: u8, read_addr: u32, count: u32) -> i32 {
+/// Re-trigger `ch` from `read` for `count` units, keeping the rest of its
+/// configuration.
+///
+/// # Safety
+/// `ch` is an implemented channel the caller owns, configured to move memory
+/// to a FIFO, and `read` starts a span lent for `count` units.
+unsafe fn dma_restart_raw(ch: u8, read: u32, count: u32) -> i32 {
     if !dma::is_implemented(ch) {
         return E_INVAL;
     }
     let c = ch as usize;
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: `ch` is implemented. AL3_READ_ADDR_TRIG is written last because
-    // writing it re-triggers the channel.
+    // SAFETY: the caller's contract. AL3_READ_ADDR_TRIG is written last
+    // because writing it re-triggers the channel.
     unsafe {
         write32(chan(c, dma::addr::AL3_TRANS_COUNT), dma::trans_count(count));
-        write32(chan(c, dma::addr::AL3_READ_ADDR_TRIG), read_addr);
+        write32(chan(c, dma::addr::AL3_READ_ADDR_TRIG), read);
     }
     compiler_fence(Ordering::SeqCst);
     0
 }
 
 // ============================================================================
-// DMA FD operations (ping-pong DMA channels as fd)
+// DMA fds: a ping-pong channel pair
 // ============================================================================
 
 use portable_atomic::AtomicBool;
@@ -254,6 +422,13 @@ struct DmaFdSlot {
     channel_b: AtomicU8,
     active_is_b: AtomicBool,
     pending: AtomicBool,
+    /// The last `START` moved memory to a FIFO, so `QUEUE` and `RESTART`
+    /// (which reload the read side) apply.
+    to_peripheral: AtomicBool,
+    /// Bytes per unit of the last `START`, and whether its memory side
+    /// advances.
+    width: AtomicU8,
+    incr: AtomicBool,
 }
 
 impl DmaFdSlot {
@@ -265,6 +440,9 @@ impl DmaFdSlot {
             channel_b: AtomicU8::new(0xFF),
             active_is_b: AtomicBool::new(false),
             pending: AtomicBool::new(false),
+            to_peripheral: AtomicBool::new(false),
+            width: AtomicU8::new(0),
+            incr: AtomicBool::new(false),
         }
     }
 
@@ -283,11 +461,33 @@ impl DmaFdSlot {
             self.channel_b.load(Ordering::Acquire)
         }
     }
+
+    fn clear(&self) {
+        self.channel_a.store(0xFF, Ordering::Release);
+        self.channel_b.store(0xFF, Ordering::Release);
+        self.pending.store(false, Ordering::Release);
+        self.active_is_b.store(false, Ordering::Release);
+        self.to_peripheral.store(false, Ordering::Release);
+        self.owner.store(NO_MODULE, Ordering::Release);
+        self.allocated.store(false, Ordering::Release);
+    }
 }
 
 static DMA_FD_SLOTS: [DmaFdSlot; MAX_DMA_FDS] = [const { DmaFdSlot::new() }; MAX_DMA_FDS];
 
-pub fn dma_fd_create() -> i32 {
+/// The index a DMA fd answers: [`DMA_FD_BASE`] plus its slot, a band no DMA
+/// channel number shares, so a lend opened on one never resolves through the
+/// other.
+const DMA_FD_BASE: i32 = 0x100;
+
+/// The fd slot a DMA fd index names, if it is one.
+fn fd_slot(index: i32) -> Option<&'static DmaFdSlot> {
+    usize::try_from(index.checked_sub(DMA_FD_BASE)?)
+        .ok()
+        .and_then(|i| DMA_FD_SLOTS.get(i))
+}
+
+fn dma_fd_create() -> i32 {
     let ch_a = dma_alloc_channel();
     if ch_a < 0 {
         return ch_a;
@@ -309,7 +509,7 @@ pub fn dma_fd_create() -> i32 {
             dma.channel_b.store(ch_b as u8, Ordering::Release);
             dma.active_is_b.store(false, Ordering::Release);
             dma.pending.store(false, Ordering::Release);
-            return fd::tag_fd(fd::FD_TAG_DMA, i as i32);
+            return DMA_FD_BASE + i as i32;
         }
     }
     dma_free_channel(ch_a as u8);
@@ -317,136 +517,125 @@ pub fn dma_fd_create() -> i32 {
     errno::ENOMEM
 }
 
-pub fn dma_fd_start(
-    fd_handle: i32,
-    read_addr: u32,
-    write_addr: u32,
-    count: u32,
-    dreq: u8,
-    flags: u8,
-) -> i32 {
-    let slot = fd::slot_of(fd_handle);
-    if slot < 0 || slot as usize >= MAX_DMA_FDS {
-        return E_INVAL;
+/// The fd slot `fd_handle` names, when the module being stepped created it.
+fn owned_fd(fd_handle: i32) -> Result<&'static DmaFdSlot, i32> {
+    let dma = fd_slot(fd_handle).ok_or(errno::EBADF)?;
+    if !dma.allocated.load(Ordering::Acquire)
+        || dma.owner.load(Ordering::Acquire) != crate::kernel::exec::scheduler::current_module_id()
+    {
+        return Err(errno::EBADF);
     }
-    let dma = &DMA_FD_SLOTS[slot as usize];
-    if !dma.allocated.load(Ordering::Acquire) {
-        return E_INVAL;
-    }
+    Ok(dma)
+}
+
+fn dma_fd_start(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
+    let dma = owned_fd(fd_handle)?;
     let ch_a = dma.channel_a.load(Ordering::Acquire);
     let ch_b = dma.channel_b.load(Ordering::Acquire);
-    // SAFETY: ch_a is allocated to this fd_handle; dma_start_raw programs the
-    // DMA registers for an allocated channel only.
-    let rc = unsafe { dma_start_raw(ch_a, read_addr, write_addr, count, dreq, flags) };
+    let t = transfer_of(fd_handle, ch_a, arg)?;
+    let width = unit_of(arg[13]).map_or(0, |(_, w)| w as u8);
+    // SAFETY: `ch_a` is allocated to this fd, and `t`'s memory side was
+    // checked against the caller's lend.
+    let rc = unsafe { dma_start_raw(ch_a, &t) };
     if rc < 0 {
-        return rc;
+        return Err(rc);
     }
-    // SAFETY: ch_b is allocated to the same fd_handle (ping-pong pair); it is
-    // not currently running until dma_fd_queue chains to it.
+    // The pair's other channel takes the same FIFO and configuration, armed
+    // but not started: `QUEUE` chains into it. AL1_CTRL, not CTRL_TRIG, so
+    // configuring it does not start it.
+    let b = ch_b as usize;
+    // SAFETY: `ch_b` is allocated to this fd and idle until chained to.
     unsafe {
-        dma_preconfigure_inactive(ch_b, write_addr, dreq, flags);
+        write32(chan(b, dma::addr::WRITE_ADDR), t.write);
+        write32(chan(b, dma::addr::READ_ADDR), t.read);
+        write32(chan(b, dma::addr::AL1_CTRL), t.ctrl.chain_to(ch_b).0);
     }
     dma.active_is_b.store(false, Ordering::Release);
     dma.pending.store(false, Ordering::Release);
-    rc
+    dma.to_peripheral
+        .store(t.fifo.to_peripheral, Ordering::Release);
+    dma.width.store(width, Ordering::Release);
+    dma.incr.store(arg[13] & FLAG_INCR != 0, Ordering::Release);
+    Ok(rc)
 }
 
-unsafe fn dma_preconfigure_inactive(ch: u8, write_addr: u32, dreq: u8, flags: u8) {
-    let c = ch as usize;
-    // AL1_CTRL, not CTRL_TRIG: this channel must be configured without being
-    // started, since the point is for the active channel to chain into it.
-    //
-    // SAFETY: the caller's contract is that `ch` is an allocated channel of
-    // this fd's ping-pong pair, so both addresses are inside this silicon's
-    // DMA block and no other owner is writing them.
-    unsafe {
-        write32(chan(c, dma::addr::WRITE_ADDR), write_addr);
-        write32(chan(c, dma::addr::AL1_CTRL), ctrl_for(ch, dreq, flags).0);
+/// `[cookie u32][offset u32][count u32]` of a `QUEUE` or `RESTART`: the read
+/// side and count, for an fd whose `START` moved memory to a FIFO.
+fn reload_of(fd_handle: i32, dma: &DmaFdSlot, arg: &[u8]) -> Result<(u32, u32), i32> {
+    let (Some(cookie), Some(offset), Some(count)) = (le32(arg, 0), le32(arg, 4), le32(arg, 8))
+    else {
+        return Err(E_INVAL);
+    };
+    if !dma.to_peripheral.load(Ordering::Acquire) {
+        return Err(E_INVAL);
     }
+    let width = usize::from(dma.width.load(Ordering::Acquire));
+    let bytes = if dma.incr.load(Ordering::Acquire) {
+        (count as usize).checked_mul(width).ok_or(E_INVAL)?
+    } else {
+        width
+    };
+    Ok((lent_at(fd_handle, cookie, offset, bytes, true)?, count))
 }
 
-pub fn dma_fd_queue(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
-    let slot = fd::slot_of(fd_handle);
-    if slot < 0 || slot as usize >= MAX_DMA_FDS {
-        return E_INVAL;
-    }
-    let dma = &DMA_FD_SLOTS[slot as usize];
-    if !dma.allocated.load(Ordering::Acquire) {
-        return E_INVAL;
-    }
+fn dma_fd_queue(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
+    let dma = owned_fd(fd_handle)?;
+    let (read, count) = reload_of(fd_handle, dma, arg)?;
     let active = dma.active_ch();
     let inactive = dma.inactive_ch();
-    {
-        let (a, i) = (active as usize, inactive as usize);
-        // SAFETY: both channels belong to this fd's allocated ping-pong pair,
-        // so both are implemented and owned here.
-        unsafe {
-            write32(chan(i, dma::addr::READ_ADDR), read_addr);
-            write32(chan(i, dma::addr::TRANS_COUNT), dma::trans_count(count));
-            compiler_fence(Ordering::SeqCst);
-            // Point the running channel at the one just loaded, editing
-            // through AL1_CTRL so the edit does not itself re-trigger it.
-            let ctrl = dma::CtrlTrig(read32(chan(a, dma::addr::AL1_CTRL)));
-            write32(chan(a, dma::addr::AL1_CTRL), ctrl.chain_to(inactive).0);
-            compiler_fence(Ordering::SeqCst);
-            if !channel_is_busy(active) {
-                // The active channel finished before the chain was armed, so
-                // nothing will follow it; start the loaded channel directly.
-                write32(chan(i, dma::addr::AL3_TRANS_COUNT), dma::trans_count(count));
-                write32(chan(i, dma::addr::AL3_READ_ADDR_TRIG), read_addr);
-                write32(chan(a, dma::addr::AL1_CTRL), ctrl.chain_to(active).0);
-                dma.active_is_b
-                    .store(!dma.active_is_b.load(Ordering::Acquire), Ordering::Release);
-            }
+    let (a, i) = (active as usize, inactive as usize);
+    // SAFETY: both channels belong to this fd's allocated ping-pong pair, so
+    // both are implemented and owned here; `read` lies in the caller's lend.
+    unsafe {
+        write32(chan(i, dma::addr::READ_ADDR), read);
+        write32(chan(i, dma::addr::TRANS_COUNT), dma::trans_count(count));
+        compiler_fence(Ordering::SeqCst);
+        // Point the running channel at the one just loaded, editing through
+        // AL1_CTRL so the edit does not itself re-trigger it.
+        let ctrl = dma::CtrlTrig(read32(chan(a, dma::addr::AL1_CTRL)));
+        write32(chan(a, dma::addr::AL1_CTRL), ctrl.chain_to(inactive).0);
+        compiler_fence(Ordering::SeqCst);
+        if !channel_is_busy(active) {
+            // The active channel finished before the chain was armed, so
+            // nothing will follow it; start the loaded channel directly.
+            write32(chan(i, dma::addr::AL3_TRANS_COUNT), dma::trans_count(count));
+            write32(chan(i, dma::addr::AL3_READ_ADDR_TRIG), read);
+            write32(chan(a, dma::addr::AL1_CTRL), ctrl.chain_to(active).0);
+            dma.active_is_b
+                .store(!dma.active_is_b.load(Ordering::Acquire), Ordering::Release);
         }
     }
     dma.pending.store(true, Ordering::Release);
-    0
+    Ok(0)
 }
 
-pub fn dma_fd_restart(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
-    let slot = fd::slot_of(fd_handle);
-    if slot < 0 || slot as usize >= MAX_DMA_FDS {
-        return E_INVAL;
-    }
-    let dma = &DMA_FD_SLOTS[slot as usize];
-    if !dma.allocated.load(Ordering::Acquire) {
-        return E_INVAL;
-    }
-    let ch = dma.active_ch();
-    // SAFETY: `ch` is the dma_fd's allocated active channel.
-    unsafe { dma_restart_raw(ch, read_addr, count) }
+fn dma_fd_restart(fd_handle: i32, arg: &[u8]) -> Result<i32, i32> {
+    let dma = owned_fd(fd_handle)?;
+    let (read, count) = reload_of(fd_handle, dma, arg)?;
+    // SAFETY: the fd's active channel, moving memory to a FIFO; `read` lies
+    // in the caller's lend.
+    Ok(unsafe { dma_restart_raw(dma.active_ch(), read, count) })
 }
 
-pub fn dma_fd_free(fd_handle: i32) -> i32 {
-    let slot = fd::slot_of(fd_handle);
-    if slot < 0 || slot as usize >= MAX_DMA_FDS {
-        return E_INVAL;
-    }
-    let dma = &DMA_FD_SLOTS[slot as usize];
-    if !dma.allocated.load(Ordering::Acquire) {
-        return E_INVAL;
-    }
+fn dma_fd_free(fd_handle: i32) -> i32 {
+    let dma = match owned_fd(fd_handle) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
     let ch_a = dma.channel_a.load(Ordering::Acquire);
     let ch_b = dma.channel_b.load(Ordering::Acquire);
     dma_abort(ch_a);
     dma_abort(ch_b);
     dma_free_channel(ch_a);
     dma_free_channel(ch_b);
-    dma.channel_a.store(0xFF, Ordering::Release);
-    dma.channel_b.store(0xFF, Ordering::Release);
-    dma.pending.store(false, Ordering::Release);
-    dma.active_is_b.store(false, Ordering::Release);
-    dma.owner.store(NO_MODULE, Ordering::Release);
-    dma.allocated.store(false, Ordering::Release);
+    dma.clear();
     0
 }
 
-fn dma_fd_poll_ready(slot: i32) -> bool {
-    if slot < 0 || slot as usize >= MAX_DMA_FDS {
+fn dma_fd_poll_ready(index: i32) -> bool {
+    let Some(dma) = fd_slot(index) else {
         return false;
-    }
-    let dma = &DMA_FD_SLOTS[slot as usize];
+    };
     if !dma.allocated.load(Ordering::Acquire) {
         return false;
     }
@@ -468,30 +657,22 @@ fn dma_fd_poll_ready(slot: i32) -> bool {
     true
 }
 
-pub fn release_dma_fds_owned_by(module_idx: ModuleId) {
+fn release_dma_fds_owned_by(module_idx: ModuleId) {
     for dma in DMA_FD_SLOTS.iter() {
-        if !dma.allocated.load(Ordering::Acquire) {
+        if !dma.allocated.load(Ordering::Acquire) || dma.owner.load(Ordering::Acquire) != module_idx
+        {
             continue;
         }
-        if dma.owner.load(Ordering::Acquire) != module_idx {
-            continue;
+        for ch in [
+            dma.channel_a.load(Ordering::Acquire),
+            dma.channel_b.load(Ordering::Acquire),
+        ] {
+            if ch != 0xFF {
+                dma_abort(ch);
+                dma_free_channel(ch);
+            }
         }
-        let ch_a = dma.channel_a.load(Ordering::Acquire);
-        let ch_b = dma.channel_b.load(Ordering::Acquire);
-        if ch_a != 0xFF {
-            dma_abort(ch_a);
-            dma_free_channel(ch_a);
-        }
-        if ch_b != 0xFF {
-            dma_abort(ch_b);
-            dma_free_channel(ch_b);
-        }
-        dma.channel_a.store(0xFF, Ordering::Release);
-        dma.channel_b.store(0xFF, Ordering::Release);
-        dma.pending.store(false, Ordering::Release);
-        dma.active_is_b.store(false, Ordering::Release);
-        dma.owner.store(NO_MODULE, Ordering::Release);
-        dma.allocated.store(false, Ordering::Release);
+        dma.clear();
     }
 }
 
@@ -505,8 +686,6 @@ pub fn release_dma_fds_owned_by(module_idx: ModuleId) {
 
 pub fn init() {
     init_rp_providers();
-    // Register DMA FD poll function with the fd subsystem
-    fd::register_dma_fd_poll(dma_fd_poll_ready);
     // Register provider_query extension for GPIO and SYS_CLOCK_HZ
     register_dev_query_extension(rp_dev_query_extension);
 }
@@ -535,15 +714,9 @@ pub fn is_gpio_registered(pin_num: u8) -> bool {
     gpio::gpio_is_claimed(pin_num)
 }
 
-/// Convenience syscall: claim + configure as output
-/// Returns handle on success, <0 on error
-///
-/// # Safety
-/// `extern "C"` syscall ABI shim invoked by PIC modules. Takes no
-/// pointers; marked `unsafe` only to match the syscall-table signature.
-/// All side effects route through the GPIO submodule's own checked
-/// claim/release/set_mode paths.
-pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
+/// Claim `pin_num` for the module being stepped and drive it as an output.
+/// Returns its handle, or a negative errno.
+fn gpio_request_output(pin_num: u8) -> i32 {
     let handle = gpio::gpio_claim(pin_num);
     if handle < 0 {
         log::error!("[gpio] request_output pin {pin_num} claim failed rc={handle}");
@@ -559,31 +732,23 @@ pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     handle
 }
 
-/// Convenience syscall: claim + configure as input with pull
-/// pull: 0=none, 1=up, 2=down
-/// Returns handle on success, <0 on error
+/// Claim `pin_num` for the module being stepped as an input with pull
+/// `pull` (0 none, 1 up, 2 down). Returns its handle, or a negative errno.
 ///
-/// BOOTSEL is a separate capability — use the `flash_rp` driver,
-/// not a synthetic GPIO pin. This entry point handles real GPIO
-/// pins only.
-///
-/// # Safety
-/// `extern "C"` syscall ABI shim invoked by PIC modules. Takes no
-/// pointers; marked `unsafe` only to match the syscall-table signature.
-pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i32 {
+/// BOOTSEL is a separate capability — the `flash_rp` driver — not a
+/// synthetic GPIO pin.
+fn gpio_request_input(pin_num: u8, pull: u8) -> i32 {
     let handle = gpio::gpio_claim(pin_num);
     if handle < 0 {
         return handle;
     }
     gpio::gpio_set_owner(pin_num, crate::kernel::exec::scheduler::current_module_id());
-    // Set pull configuration
     let pin_pull = match pull {
         1 => gpio::PinPull::Up,
         2 => gpio::PinPull::Down,
         _ => gpio::PinPull::None,
     };
     gpio::gpio_set_pull(handle, pin_pull);
-    // Configure as input
     let result = gpio::gpio_set_mode(handle, gpio::PinMode::Input, false);
     if result < 0 {
         gpio::gpio_release(handle);
@@ -592,96 +757,109 @@ pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i3
     handle
 }
 
-/// GPIO get level wrapper.
-unsafe extern "C" fn syscall_gpio_get_level(handle: i32) -> i32 {
-    if !gpio::gpio_check_owner(handle) {
-        return E_INVAL;
-    }
-    gpio::gpio_get_level(handle)
-}
-
 // ============================================================================
 // Per-class provider dispatchers (RP-specific)
 // ============================================================================
 
-unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
     use crate::abi::contracts::hal::gpio as dev_gpio;
-    // Strip FD_TAG_HAL_GPIO so the inner ops see a raw pin number.
-    // No-op on the -1 sentinel for open-style opcodes.
-    let handle = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
+    // `handle` is the pin a claim names, or `WATCH_BASE` plus the pin for an
+    // edge watch.
+    if let Some(pin) = watched_pin(handle) {
+        return watch_dispatch(pin, opcode, arg);
+    }
+    let owned = || gpio::gpio_check_owner(handle);
     match opcode {
         dev_gpio::CLAIM => {
-            if arg.is_null() || arg_len < 1 {
+            let Some(&pin) = arg.first() else {
                 return E_INVAL;
-            }
-            let result = gpio::syscall_gpio_claim(*arg);
+            };
+            // SAFETY: a pointer-free syscall entry point.
+            let result = unsafe { gpio::syscall_gpio_claim(pin) };
             if result >= 0 {
-                gpio::gpio_set_owner(*arg, crate::kernel::exec::scheduler::current_module_id());
+                gpio::gpio_set_owner(pin, crate::kernel::exec::scheduler::current_module_id());
             }
             result
         }
-        dev_gpio::SET_OUTPUT => {
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            syscall_gpio_request_output(*arg)
-        }
-        dev_gpio::SET_INPUT => {
-            if arg.is_null() || arg_len < 2 {
-                return E_INVAL;
-            }
-            syscall_gpio_request_input(*arg, *arg.add(1))
-        }
+        dev_gpio::SET_OUTPUT => match arg.first() {
+            Some(&pin) => gpio_request_output(pin),
+            None => E_INVAL,
+        },
+        dev_gpio::SET_INPUT => match arg {
+            [pin, pull, ..] => gpio_request_input(*pin, *pull),
+            _ => E_INVAL,
+        },
         dev_gpio::RELEASE => {
-            if !gpio::gpio_check_owner(handle) {
+            if !owned() {
                 return E_INVAL;
             }
-            gpio::syscall_gpio_release(handle)
+            // SAFETY: a pointer-free syscall entry point.
+            unsafe { gpio::syscall_gpio_release(handle) }
         }
-        dev_gpio::SET_MODE => {
-            if !gpio::gpio_check_owner(handle) {
+        dev_gpio::SET_MODE => match arg {
+            [mode, level, ..] if owned() => {
+                // SAFETY: a pointer-free syscall entry point.
+                unsafe { gpio::syscall_gpio_set_mode(handle, *mode, *level) }
+            }
+            _ => E_INVAL,
+        },
+        dev_gpio::SET_PULL => match arg {
+            [pull, ..] if owned() => {
+                // SAFETY: a pointer-free syscall entry point.
+                unsafe { gpio::syscall_gpio_set_pull(handle, *pull) }
+            }
+            _ => E_INVAL,
+        },
+        dev_gpio::SET_LEVEL => match arg {
+            [level, ..] if owned() => {
+                // SAFETY: a pointer-free syscall entry point.
+                unsafe { gpio::syscall_gpio_set_level(handle, *level) }
+            }
+            _ => E_INVAL,
+        },
+        dev_gpio::GET_LEVEL => {
+            if !owned() {
                 return E_INVAL;
             }
-            if arg.is_null() || arg_len < 2 {
-                return E_INVAL;
-            }
-            gpio::syscall_gpio_set_mode(handle, *arg, *arg.add(1))
+            gpio::gpio_get_level(handle)
         }
-        dev_gpio::SET_PULL => {
-            if !gpio::gpio_check_owner(handle) {
-                return E_INVAL;
-            }
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            gpio::syscall_gpio_set_pull(handle, *arg)
-        }
-        dev_gpio::SET_LEVEL => {
-            if !gpio::gpio_check_owner(handle) {
-                return E_INVAL;
-            }
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            gpio::syscall_gpio_set_level(handle, *arg)
-        }
-        dev_gpio::GET_LEVEL => syscall_gpio_get_level(handle),
-        dev_gpio::WATCH_EDGE => {
-            if !gpio::gpio_check_owner(handle) {
-                return E_INVAL;
-            }
-            if arg.is_null() || arg_len < 5 {
-                return E_INVAL;
-            }
-            let edge = *arg;
-            let evt = i32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            gpio::gpio_watch_edge(handle as u8, edge, evt)
-        }
+        // `[edge u8]`: the watch's index, which the kernel wraps in a
+        // signalling handle and hands the doorbell its edges ring.
+        dev_gpio::WATCH_EDGE => match arg {
+            [edge, ..] if owned() => match gpio::gpio_watch_edge(handle as u8, *edge) {
+                0 => WATCH_BASE + handle,
+                e => e,
+            },
+            _ => E_INVAL,
+        },
         _ => E_NOSYS,
+    }
+}
+
+/// The index an edge watch answers: [`WATCH_BASE`] plus the pin, a band no
+/// pin claim shares.
+const WATCH_BASE: i32 = 0x100;
+
+/// The pin a watch index names, if it is one.
+fn watched_pin(index: i32) -> Option<u8> {
+    u8::try_from(index.checked_sub(WATCH_BASE)?)
+        .ok()
+        .filter(|&p| p < gpio::runtime_max_gpio())
+}
+
+/// An op on an edge watch: the kernel's doorbell for it, or its release.
+fn watch_dispatch(pin: u8, opcode: u32, arg: &[u8]) -> i32 {
+    use crate::abi::kernel_abi::doorbell;
+    if !gpio::gpio_check_owner(i32::from(pin)) {
+        return errno::EBADF;
+    }
+    match opcode {
+        doorbell::BIND_DOORBELL => match doorbell::parse_bind(arg) {
+            Some((d, _)) => gpio::gpio_bind_doorbell(pin, d as i32),
+            None => E_INVAL,
+        },
+        crate::abi::contracts::hal::gpio::RELEASE => gpio::gpio_unwatch(pin),
+        _ => errno::EBADF,
     }
 }
 
@@ -692,7 +870,7 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
 // ============================================================================
 
 /// Set a pin as SIO output with initial level.
-unsafe fn spi9_gpio_init(pin: u8, high: bool) {
+fn spi9_gpio_init(pin: u8, high: bool) {
     use crate::platform::rp_gpio_regs as gpio_regs;
 
     // SAFETY: the caller owns `pin` for the duration of the bit-banged
@@ -761,14 +939,14 @@ unsafe fn set_bits_rmw(addr: usize, bits: u32) {
 
 /// Set a SIO output pin level.
 #[inline(always)]
-unsafe fn spi9_pin_set(pin: u8, high: bool) {
+fn spi9_pin_set(pin: u8, high: bool) {
     // SAFETY: as `spi9_gpio_init`; the pin is already configured as an output.
     unsafe { crate::platform::rp_gpio_regs::set_level(pin, high) };
 }
 
 /// Busy-wait for `us` microseconds using the RP hardware TIMER.
 #[inline(always)]
-unsafe fn spi9_timer_us(us: u32) {
+fn spi9_timer_us(us: u32) {
     // The monotonic clock, not a private read of the timer block: one source
     // for every timestamp in the kernel, so this cannot drift from what the
     // scheduler believes the time is.
@@ -778,18 +956,18 @@ unsafe fn spi9_timer_us(us: u32) {
 
 /// Busy-wait ~100 us using hardware TIMER.
 #[inline(always)]
-unsafe fn spi9_pac_delay() {
+fn spi9_pac_delay() {
     spi9_timer_us(100);
 }
 
 /// Busy-wait ~N ms using hardware TIMER.
 #[inline(always)]
-unsafe fn spi9_pac_delay_ms(ms: u32) {
+fn spi9_pac_delay_ms(ms: u32) {
     spi9_timer_us(ms * 1000);
 }
 
 /// Send one 9-bit SPI word. Clock idle low, data on rising edge, MSB first.
-unsafe fn spi9_pac_write_word(sck: u8, sda: u8, word: u16) {
+fn spi9_pac_write_word(sck: u8, sda: u8, word: u16) {
     for i in (0..=8i32).rev() {
         spi9_pin_set(sda, (word & (1u16 << i as u32)) != 0);
         spi9_timer_us(10); // Data setup time before rising edge
@@ -801,20 +979,12 @@ unsafe fn spi9_pac_write_word(sck: u8, sda: u8, word: u16) {
 }
 
 /// Send 9-bit SPI command + data bytes, CS-framed.
-unsafe fn spi9_pac_send(
-    cs: u8,
-    sck: u8,
-    sda: u8,
-    cmd: u8,
-    data: *const u8,
-    data_len: usize,
-    hold_cs: bool,
-) {
+fn spi9_pac_send(cs: u8, sck: u8, sda: u8, cmd: u8, data: &[u8], hold_cs: bool) {
     spi9_pin_set(cs, false);
     spi9_timer_us(5); // CS setup time before first clock
     spi9_pac_write_word(sck, sda, cmd as u16); // DC=0 for command
-    for i in 0..data_len {
-        spi9_pac_write_word(sck, sda, 0x0100 | *data.add(i) as u16); // DC=1 for data
+    for &b in data {
+        spi9_pac_write_word(sck, sda, 0x0100 | b as u16); // DC=1 for data
     }
     if !hold_cs {
         spi9_timer_us(5); // CS hold time after last clock
@@ -823,7 +993,7 @@ unsafe fn spi9_pac_send(
 }
 
 /// Reset sequence + SIO pin init for 9-bit SPI.
-unsafe fn spi9_pac_reset(rst: u8, cs: u8, sck: u8, sda: u8) {
+fn spi9_pac_reset(rst: u8, cs: u8, sck: u8, sda: u8) {
     spi9_gpio_init(cs, true);
     spi9_gpio_init(sck, false);
     spi9_gpio_init(sda, false);
@@ -844,35 +1014,26 @@ unsafe fn spi9_pac_reset(rst: u8, cs: u8, sck: u8, sda: u8) {
 // Handles hardware-specific system opcodes (PWM, PIO registers, DMA, SPI9)
 // delegated from system_provider_dispatch's catch-all arm.
 
-/// Handle-family discriminators for `PLATFORM_DMA` (channel number
-/// tagged with FD_TAG_DMA_CHANNEL, from `channel::ALLOC`) and
-/// `PLATFORM_DMA_FD` (FD_TAG_DMA-tagged fd, from `fd::CREATE`).
-/// The two families have disjoint tag values; handlers reject a
-/// wrong-family handle with EINVAL. A raw untagged slot (tag 0) is
-/// accepted from callers that bypass `provider_open`.
-#[inline]
-fn is_dma_channel_handle(h: i32) -> bool {
-    if h < 0 {
-        return false;
+/// The channel a `PLATFORM_DMA` index names, when the module being stepped
+/// allocated it.
+fn owned_channel(handle: i32) -> Result<u8, i32> {
+    let ch = u8::try_from(handle).map_err(|_| errno::EBADF)?;
+    if !owns_channel(ch) {
+        return Err(errno::EBADF);
     }
-    let (tag, _slot) = crate::kernel::ipc::fd::untag_fd(h);
-    tag == crate::kernel::ipc::fd::FD_TAG_DMA_CHANNEL || tag == 0
+    Ok(ch)
 }
 
-#[inline]
-fn is_dma_fd_handle(h: i32) -> bool {
-    if h < 0 {
-        return false;
-    }
-    let (tag, _slot) = crate::kernel::ipc::fd::untag_fd(h);
-    tag == crate::kernel::ipc::fd::FD_TAG_DMA
+/// The `i32` result of a call that answers either a value or an errno.
+fn rc(r: Result<i32, i32>) -> i32 {
+    r.unwrap_or_else(|e| e)
 }
 
-unsafe fn rp_system_extension_dispatch(
+fn rp_system_extension_dispatch(
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
 ) -> i32 {
     use crate::abi::internal::flash;
     use crate::abi::kernel_abi::SYS_CLOCK_HZ;
@@ -882,19 +1043,19 @@ unsafe fn rp_system_extension_dispatch(
     match opcode {
         // ── Raw instance claims ─────────────────────────────────────
         raw_claim::CLAIM => {
-            if arg.is_null() || arg_len < 2 {
+            if arg.len() < 2 {
                 return E_INVAL;
             }
-            raw_claim_instance(*arg, *arg.add(1))
+            raw_claim_instance(arg[0], arg[1])
         }
         raw_claim::RELEASE => raw_release(handle),
         // ── Raw PWM register bridge ─────────────────────────────────
         pwm_raw::PIN_ENABLE => {
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
-            let pin = *arg as usize;
-            if let Err(e) = own_pins(&[*arg]) {
+            let pin = arg[0] as usize;
+            if let Err(e) = own_pins(&[arg[0]]) {
                 return e;
             }
             // SAFETY: a pin of this die the caller owns.
@@ -905,11 +1066,11 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         pwm_raw::PIN_DISABLE => {
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
-            let pin = *arg as usize;
-            if let Err(e) = own_pins(&[*arg]) {
+            let pin = arg[0] as usize;
+            if let Err(e) = own_pins(&[arg[0]]) {
                 return e;
             }
             // SAFETY: as PIN_ENABLE.
@@ -917,15 +1078,15 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         pwm_raw::SLICE_WRITE => {
-            if arg.is_null() || arg_len < 6 {
+            if arg.len() < 6 {
                 return E_INVAL;
             }
-            let slice = match owned_named(handle, family::PWM, *arg) {
+            let slice = match owned_named(handle, family::PWM, arg[0]) {
                 Ok(i) => i as usize,
                 Err(e) => return e,
             };
-            let reg = *arg.add(1);
-            let value = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
+            let reg = arg[1];
+            let value = u32::from_le_bytes([arg[2], arg[3], arg[4], arg[5]]);
             let Some(addr) = gpio_regs::pwm::reg(PWM_BASE as usize, slice, reg) else {
                 return E_INVAL;
             };
@@ -935,14 +1096,14 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         pwm_raw::SLICE_READ => {
-            if arg.is_null() || arg_len < 2 {
+            if arg.len() < 2 {
                 return E_INVAL;
             }
-            let slice = match owned_named(handle, family::PWM, *arg) {
+            let slice = match owned_named(handle, family::PWM, arg[0]) {
                 Ok(i) => i as usize,
                 Err(e) => return e,
             };
-            let reg = *arg.add(1);
+            let reg = arg[1];
             let Some(addr) = gpio_regs::pwm::reg(PWM_BASE as usize, slice, reg) else {
                 return E_INVAL;
             };
@@ -951,29 +1112,29 @@ unsafe fn rp_system_extension_dispatch(
         }
         // ── Raw PIO register bridge ───────────────────────────────────
         pio_raw::SM_EXEC => {
-            if arg.is_null() || arg_len < 4 {
+            if arg.len() < 4 {
                 return E_INVAL;
             }
-            let sm = *arg.add(1);
-            let base = match owned_pio(handle, *arg) {
+            let sm = arg[1];
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
             if !pio_regs::is_state_machine(sm) {
                 return E_INVAL;
             }
-            let instr = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
+            let instr = u16::from_le_bytes([arg[2], arg[3]]);
             // SAFETY: `base` is an implemented instance and `sm` a real
             // state machine, both checked above.
             unsafe { pio_regs::write_sm_reg(base, sm, SmReg::Instr, instr as u32) };
             0
         }
         pio_raw::SM_WRITE_REG => {
-            if arg.is_null() || arg_len < 7 {
+            if arg.len() < 7 {
                 return E_INVAL;
             }
-            let sm_idx = *arg.add(1);
-            let base = match owned_pio(handle, *arg) {
+            let sm_idx = arg[1];
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
@@ -982,40 +1143,40 @@ unsafe fn rp_system_extension_dispatch(
             }
             // ADDR is read-only, so it is not writable even though
             // SM_READ_REG names it.
-            let reg = match SmReg::from_syscall(*arg.add(2)) {
+            let reg = match SmReg::from_syscall(arg[2]) {
                 Some(SmReg::Addr) | None => return E_INVAL,
                 Some(r) => r,
             };
-            let value = u32::from_le_bytes([*arg.add(3), *arg.add(4), *arg.add(5), *arg.add(6)]);
+            let value = u32::from_le_bytes([arg[3], arg[4], arg[5], arg[6]]);
             // SAFETY: checked instance and state machine, as SM_EXEC.
             unsafe { pio_regs::write_sm_reg(base, sm_idx, reg, value) };
             0
         }
         pio_raw::SM_READ_REG => {
-            if arg.is_null() || arg_len < 3 {
+            if arg.len() < 3 {
                 return E_INVAL;
             }
-            let sm_idx = *arg.add(1);
-            let base = match owned_pio(handle, *arg) {
+            let sm_idx = arg[1];
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
             if !pio_regs::is_state_machine(sm_idx) {
                 return E_INVAL;
             }
-            let Some(reg) = SmReg::from_syscall(*arg.add(2)) else {
+            let Some(reg) = SmReg::from_syscall(arg[2]) else {
                 return E_INVAL;
             };
             // SAFETY: checked instance and state machine, as SM_EXEC.
             unsafe { pio_regs::read_sm_reg(base, sm_idx, reg) as i32 }
         }
         pio_raw::SM_ENABLE => {
-            if arg.is_null() || arg_len < 3 {
+            if arg.len() < 3 {
                 return E_INVAL;
             }
-            let mask = *arg.add(1) & 0x0F;
-            let enable = *arg.add(2);
-            let base = match owned_pio(handle, *arg) {
+            let mask = arg[1] & 0x0F;
+            let enable = arg[2];
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
@@ -1024,11 +1185,11 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         pio_raw::INSTR_ALLOC => {
-            if arg.is_null() || arg_len < 2 {
+            if arg.len() < 2 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
-            let count = *arg.add(1);
+            let pio_num = arg[0];
+            let count = arg[1];
             if let Err(e) = owned_pio(handle, pio_num) {
                 return e;
             }
@@ -1037,13 +1198,10 @@ unsafe fn rp_system_extension_dispatch(
             }
             match pio_util::alloc_instruction_slots(pio_num, count as usize) {
                 Some((origin, mask)) => {
-                    // Write mask back to arg[2..6] so caller can free later
-                    if arg_len >= 6 {
-                        let mask_bytes = mask.to_le_bytes();
-                        *arg.add(2) = mask_bytes[0];
-                        *arg.add(3) = mask_bytes[1];
-                        *arg.add(4) = mask_bytes[2];
-                        *arg.add(5) = mask_bytes[3];
+                    // The mask goes back in arg[2..6] so the caller can free
+                    // the slots later.
+                    if let Some(out) = arg.get_mut(2..6) {
+                        out.copy_from_slice(&mask.to_le_bytes());
                     }
                     origin as i32
                 }
@@ -1051,41 +1209,41 @@ unsafe fn rp_system_extension_dispatch(
             }
         }
         pio_raw::INSTR_WRITE => {
-            if arg.is_null() || arg_len < 4 {
+            if arg.len() < 4 {
                 return E_INVAL;
             }
-            let slot = *arg.add(1);
-            let base = match owned_pio(handle, *arg) {
+            let slot = arg[1];
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
             if !pio_regs::is_instr_slot(slot) {
                 return E_INVAL;
             }
-            let instr = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
+            let instr = u16::from_le_bytes([arg[2], arg[3]]);
             // SAFETY: checked instance and instruction slot.
             unsafe { write32(pio_regs::addr::instr_mem(base, slot as usize), instr as u32) };
             0
         }
         pio_raw::INSTR_FREE => {
-            if arg.is_null() || arg_len < 5 {
+            if arg.len() < 5 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
+            let pio_num = arg[0];
             if let Err(e) = owned_pio(handle, pio_num) {
                 return e;
             }
-            let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            let mask = u32::from_le_bytes([arg[1], arg[2], arg[3], arg[4]]);
             pio_util::free_instruction_slots(pio_num, mask);
             0
         }
         pio_raw::PIN_SETUP => {
-            if arg.is_null() || arg_len < 3 {
+            if arg.len() < 3 {
                 return E_INVAL;
             }
-            let pin = *arg;
-            let pio_num = *arg.add(1);
-            let pull = *arg.add(2);
+            let pin = arg[0];
+            let pio_num = arg[1];
+            let pull = arg[2];
             if let Err(e) = owned_pio(handle, pio_num) {
                 return e;
             }
@@ -1102,10 +1260,10 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         pio_raw::PIN_LEVEL => {
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
-            let pin = *arg;
+            let pin = arg[0];
             if let Err(e) = own_pins(&[pin]) {
                 return e;
             }
@@ -1117,11 +1275,11 @@ unsafe fn rp_system_extension_dispatch(
             // PIO GPIOBASE: RP2350 only (register absent on RP2040 PAC)
             #[cfg(not(feature = "chip-rp2040"))]
             {
-                if arg.is_null() || arg_len < 2 {
+                if arg.len() < 2 {
                     return E_INVAL;
                 }
-                let base16 = *arg.add(1);
-                let base = match owned_pio(handle, *arg) {
+                let base16 = arg[1];
+                let base = match owned_pio(handle, arg[0]) {
                     Ok(b) => b,
                     Err(e) => return e,
                 };
@@ -1136,27 +1294,27 @@ unsafe fn rp_system_extension_dispatch(
             }
         }
         pio_raw::TXF_WRITE => {
-            if arg.is_null() || arg_len < 6 {
+            if arg.len() < 6 {
                 return E_INVAL;
             }
-            let sm = *arg.add(1);
-            let base = match owned_pio(handle, *arg) {
+            let sm = arg[1];
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
             if !pio_regs::is_state_machine(sm) {
                 return E_INVAL;
             }
-            let value = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
+            let value = u32::from_le_bytes([arg[2], arg[3], arg[4], arg[5]]);
             // SAFETY: checked instance and state machine.
             unsafe { write32(pio_regs::addr::txf(base, sm as usize), value) };
             0
         }
         pio_raw::FSTAT_READ => {
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
-            let base = match owned_pio(handle, *arg) {
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
@@ -1164,11 +1322,11 @@ unsafe fn rp_system_extension_dispatch(
             unsafe { read32(base + pio_regs::addr::FSTAT) as i32 }
         }
         pio_raw::SM_RESTART => {
-            if arg.is_null() || arg_len < 2 {
+            if arg.len() < 2 {
                 return E_INVAL;
             }
-            let mask = *arg.add(1) & 0x0F;
-            let base = match owned_pio(handle, *arg) {
+            let mask = arg[1] & 0x0F;
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
@@ -1177,31 +1335,31 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         pio_raw::INPUT_SYNC_BYPASS => {
-            if arg.is_null() || arg_len < 5 {
+            if arg.len() < 5 {
                 return E_INVAL;
             }
-            let base = match owned_pio(handle, *arg) {
+            let base = match owned_pio(handle, arg[0]) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
-            let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            let mask = u32::from_le_bytes([arg[1], arg[2], arg[3], arg[4]]);
             // SAFETY: `base` is an implemented instance.
             unsafe { set_bits_rmw(base + pio_regs::addr::INPUT_SYNC_BYPASS, mask) };
             0
         }
         pio_raw::CMD_TRANSFER => {
-            // Atomic PIO cmd transfer: setup SM + DMA in one call (no syscall latency between steps)
-            // arg layout (28 bytes):
-            //   [0] pio_num, [1] sm_num, [2] origin, [3] reserved
-            //   [4..8] write_bits (u32 LE), [8..12] read_bits (u32 LE)
-            //   [12..16] tx_addr (u32 LE), [16..20] tx_words (u32 LE)
-            //   [20..24] rx_addr (u32 LE), [24] dma_ch_tx, [25] dma_ch_rx, [26..28] reserved
-            if arg.is_null() || arg_len < 28 {
+            // One gSPI command frame: set the state machine up and start both
+            // DMA directions in one call, with no syscall latency between the
+            // steps. `arg` is [`pio_raw::cmd_transfer`]: the TX words and the
+            // RX words lie in one span the caller lent on `handle` (its claim
+            // of the PIO block).
+            use pio_raw::cmd_transfer as ct;
+            if arg.len() < ct::LEN {
                 return E_INVAL;
             }
-            let pio_num = *arg;
-            let sm_num = *arg.add(1) as usize;
-            let origin = *arg.add(2);
+            let pio_num = arg[ct::PIO];
+            let sm_num = arg[ct::SM] as usize;
+            let origin = arg[ct::ORIGIN];
             let base = match owned_pio(handle, pio_num) {
                 Ok(b) => b,
                 Err(e) => return e,
@@ -1209,24 +1367,45 @@ unsafe fn rp_system_extension_dispatch(
             if sm_num >= pio_regs::STATE_MACHINES {
                 return E_INVAL;
             }
-
-            let write_bits =
-                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let read_bits =
-                u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            let tx_addr =
-                u32::from_le_bytes([*arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15)]);
-            let tx_words =
-                u32::from_le_bytes([*arg.add(16), *arg.add(17), *arg.add(18), *arg.add(19)]);
-            let rx_addr =
-                u32::from_le_bytes([*arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23)]);
-            let ch_tx = *arg.add(24);
-            let ch_rx = *arg.add(25);
+            let field = |at: usize| le32(arg, at).unwrap_or(0);
+            let write_bits = field(ct::WRITE_BITS);
+            let read_bits = field(ct::READ_BITS);
+            let cookie = field(ct::LEND);
+            let tx_words = field(ct::TX_WORDS);
+            let ch_tx = arg[ct::CH_TX];
+            let ch_rx = arg[ct::CH_RX];
             // The transfer runs on two channels the caller allocated; it
             // starts no channel another module holds.
             if !owns_channel(ch_tx) || !owns_channel(ch_rx) {
                 return errno::EBADF;
             }
+            // RX runs even for a write-only transaction: the PIO program
+            // expects the full TX→RX cycle to complete.
+            let rx_words = if read_bits > 0 {
+                (read_bits + 1).div_ceil(32)
+            } else {
+                1
+            };
+            let tx = match lent_at(
+                handle,
+                cookie,
+                field(ct::TX_OFFSET),
+                tx_words as usize * 4,
+                true,
+            ) {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let rx = match lent_at(
+                handle,
+                cookie,
+                field(ct::RX_OFFSET),
+                rx_words as usize * 4,
+                false,
+            ) {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
             let sm = sm_num as u8;
             let sm_mask = 1u8 << sm_num;
 
@@ -1266,36 +1445,54 @@ unsafe fn rp_system_extension_dispatch(
                 (txf, rxf)
             };
 
-            let tx_dreq = (pio_num << 3) + sm_num as u8;
+            let tx_dreq = (pio_num << 3) + sm;
             let rx_dreq = tx_dreq + 4;
+            let word = |ch: u8, dreq: u8, to_peripheral: bool| {
+                dma::CtrlTrig::default()
+                    .enable(true)
+                    .incr_read(to_peripheral)
+                    .incr_write(!to_peripheral)
+                    .data_size(dma::DataSize::Word)
+                    .treq_sel(dreq)
+                    .chain_to(ch)
+            };
 
             compiler_fence(Ordering::SeqCst);
-
-            // Sequential TX then RX on a single DMA channel. RX must run
-            // even for write-only transactions — the PIO program expects
-            // the full TX→RX cycle to complete.
-            let rx_words = if read_bits > 0 {
-                (read_bits + 1).div_ceil(32)
-            } else {
-                1
-            };
 
             // Both directions at once, on their own channels, and return
             // without waiting. At 25 MHz a full gSPI frame is half a
             // millisecond, and the module calling this does several per step
             // during association: spinning on each would put a step at
             // 1-1.6 ms, over the scheduler's budget at the default tick.
-            // The caller already has the shape for waiting (its
-            // `TxnStep::WaitPio`); this makes the wait real. RX is armed
-            // first so its DREQ is watching the FIFO before TX fills it.
-            crate::platform::rp_providers::dma_start_raw(
-                ch_rx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06,
-            );
+            // RX is armed first so its DREQ is watching the FIFO before TX
+            // fills it.
+            let rx_t = Transfer {
+                read: rxf_addr,
+                write: rx,
+                count: rx_words,
+                fifo: Fifo {
+                    addr: rxf_addr,
+                    to_peripheral: false,
+                },
+                ctrl: word(ch_rx, rx_dreq, false),
+            };
+            // SAFETY: `ch_rx` is the caller's channel; `rx` lies in its lend.
+            unsafe { dma_start_raw(ch_rx, &rx_t) };
             compiler_fence(Ordering::SeqCst);
             if tx_words > 0 {
-                crate::platform::rp_providers::dma_start_raw(
-                    ch_tx, tx_addr, txf_addr, tx_words, tx_dreq, 0x05,
-                );
+                let tx_t = Transfer {
+                    read: tx,
+                    write: txf_addr,
+                    count: tx_words,
+                    fifo: Fifo {
+                        addr: txf_addr,
+                        to_peripheral: true,
+                    },
+                    ctrl: word(ch_tx, tx_dreq, true),
+                };
+                // SAFETY: `ch_tx` is the caller's channel; `tx` lies in its
+                // lend.
+                unsafe { dma_start_raw(ch_tx, &tx_t) };
                 compiler_fence(Ordering::SeqCst);
             }
             xfer_note_started(ch_tx);
@@ -1307,11 +1504,9 @@ unsafe fn rp_system_extension_dispatch(
             // have stopped. A transfer that has run longer than any frame
             // can take is aborted and reported, rather than polled for ever
             // by a caller that has no other way to know.
-            if arg.is_null() || arg_len < 2 {
+            let [ch_tx, ch_rx, ..] = *arg else {
                 return E_INVAL;
-            }
-            let ch_tx = *arg;
-            let ch_rx = *arg.add(1);
+            };
             if !owns_channel(ch_tx) || !owns_channel(ch_rx) {
                 return errno::EBADF;
             }
@@ -1336,96 +1531,67 @@ unsafe fn rp_system_extension_dispatch(
         }
         // ── PLATFORM_DMA: channel family ──────────────────────────────
         //
-        // Handle-type rule: `channel::ALLOC` is the only opener in this
-        // family; its returned handle is a raw DMA channel number
-        // (0..15). Every follow-up op requires that handle and rejects
-        // tagged fds from the `fd::*` family.
-        //
-        // Cross-family rejection: a tagged DMA fd has bits >= 15 set
-        // (FD_TAG_DMA=7 shifted by TAG_SHIFT=27). `is_dma_channel_handle`
-        // refuses any such handle outright — so passing `fd::CREATE`'s
-        // return value to `channel::FREE` fails fast with EINVAL.
+        // `channel::ALLOC` answers the channel number (8..15), which the
+        // kernel wraps in a handle; every follow-up op is handed it back.
         dma_raw::channel::ALLOC => dma_alloc_channel(),
-        dma_raw::channel::FREE => {
-            if !is_dma_channel_handle(handle) {
-                return E_INVAL;
+        // The channel number a handle holds, for a platform op that names
+        // the channels it owns (a PIO command transfer).
+        dma_raw::channel::CHANNEL => match (owned_channel(handle), arg.first_mut()) {
+            (Ok(ch), Some(out)) => {
+                *out = ch;
+                0
             }
-            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
-                return errno::EBADF;
-            }
-            dma_free_channel(crate::kernel::ipc::fd::slot_of(handle) as u8)
-        }
-        dma_raw::channel::START => {
-            if !is_dma_channel_handle(handle) {
-                return E_INVAL;
-            }
-            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
-                return errno::EBADF;
-            }
-            if arg.is_null() || arg_len < 14 {
-                return E_INVAL;
-            }
-            let ch = crate::kernel::ipc::fd::slot_of(handle) as u8;
-            let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let write_addr =
-                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            let dreq = *arg.add(12);
-            let flags = *arg.add(13);
-            dma_start_raw(ch, read_addr, write_addr, count, dreq, flags)
-        }
-        dma_raw::channel::BUSY => {
-            if !is_dma_channel_handle(handle) {
-                return E_INVAL;
-            }
-            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
-                return errno::EBADF;
-            }
-            dma_busy(crate::kernel::ipc::fd::slot_of(handle) as u8)
-        }
-        dma_raw::channel::ABORT => {
-            if !is_dma_channel_handle(handle) {
-                return E_INVAL;
-            }
-            if !owns_channel(crate::kernel::ipc::fd::slot_of(handle) as u8) {
-                return errno::EBADF;
-            }
-            dma_abort(crate::kernel::ipc::fd::slot_of(handle) as u8)
-        }
+            (Ok(_), None) => E_INVAL,
+            (Err(e), _) => e,
+        },
+        dma_raw::channel::FREE => match owned_channel(handle) {
+            Ok(ch) => dma_free_channel(ch),
+            Err(e) => e,
+        },
+        dma_raw::channel::START => rc(owned_channel(handle).and_then(|ch| {
+            let t = transfer_of(handle, ch, arg)?;
+            // SAFETY: `ch` is the caller's channel; `t`'s memory side was
+            // checked against the caller's lend on it.
+            Ok(unsafe { dma_start_raw(ch, &t) })
+        })),
+        dma_raw::channel::BUSY => match owned_channel(handle) {
+            Ok(ch) => dma_busy(ch),
+            Err(e) => e,
+        },
+        dma_raw::channel::ABORT => match owned_channel(handle) {
+            Ok(ch) => dma_abort(ch),
+            Err(e) => e,
+        },
         spi9_raw::SEND => {
             // 9-bit SPI bit-bang: send command + data on three pins the
             // caller owns.
-            if arg.is_null() || arg_len < 5 {
+            if arg.len() < 5 {
                 return E_INVAL;
             }
-            let cs = *arg;
-            let sck = *arg.add(1);
-            let sda = *arg.add(2);
+            let cs = arg[0];
+            let sck = arg[1];
+            let sda = arg[2];
             if let Err(e) = own_pins(&[cs, sck, sda]) {
                 return e;
             }
-            let cmd = *arg.add(3);
-            let data_len = *arg.add(4) as usize;
-            if arg_len < 5 + data_len {
+            let cmd = arg[3];
+            let data_len = arg[4] as usize;
+            let Some(data) = arg.get(5..5 + data_len) else {
                 return E_INVAL;
-            }
-            let hold_cs = if arg_len > 5 + data_len {
-                *arg.add(5 + data_len) != 0
-            } else {
-                false
             };
-            spi9_pac_send(cs, sck, sda, cmd, arg.add(5), data_len, hold_cs);
+            let hold_cs = arg.get(5 + data_len).is_some_and(|&h| h != 0);
+            spi9_pac_send(cs, sck, sda, cmd, data, hold_cs);
             0
         }
         spi9_raw::RESET => {
             // 9-bit SPI reset: RST high->low->high + init SIO pins
-            if arg.is_null() || arg_len < 4 {
+            if arg.len() < 4 {
                 return E_INVAL;
             }
-            let rst = *arg;
-            let cs = *arg.add(1);
-            let sck = *arg.add(2);
-            let sda = *arg.add(3);
+            let rst = arg[0];
+            let cs = arg[1];
+            let sck = arg[2];
+            let sda = arg[3];
             if let Err(e) = own_pins(&[rst, cs, sck, sda]) {
                 return e;
             }
@@ -1434,14 +1600,14 @@ unsafe fn rp_system_extension_dispatch(
         }
         spi9_raw::CS_SET => {
             // Set CS pin level: arg=[cs_pin:u8, level:u8]
-            if arg.is_null() || arg_len < 2 {
+            if arg.len() < 2 {
                 return E_INVAL;
             }
-            let cs = *arg;
+            let cs = arg[0];
             if let Err(e) = own_pins(&[cs]) {
                 return e;
             }
-            let level = *arg.add(1) != 0;
+            let level = arg[1] != 0;
             spi9_pin_set(cs, level);
             0
         }
@@ -1451,40 +1617,40 @@ unsafe fn rp_system_extension_dispatch(
         // its block and DREQs come from the silicon's generated tables. A
         // register offset is word-aligned and stays inside the block.
         spi_raw::REG_WRITE | i2c_raw::REG_WRITE | uart_raw::REG_WRITE | adc_raw::REG_WRITE => {
-            if arg.is_null() || arg_len < 5 {
+            if arg.len() < 5 {
                 return E_INVAL;
             }
             let base = match bus_block(handle, opcode) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
-            let offset = (*arg as usize) & 0xFC;
-            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            let offset = (arg[0] as usize) & 0xFC;
+            let val = u32::from_le_bytes([arg[1], arg[2], arg[3], arg[4]]);
             // SAFETY: `base` is a block of this die the caller has claimed,
             // and the offset stays inside it.
             unsafe { write32(base + offset, val) };
             0
         }
         spi_raw::REG_READ | i2c_raw::REG_READ | uart_raw::REG_READ | adc_raw::REG_READ => {
-            if arg.is_null() || arg_len < 5 {
+            if arg.len() < 5 {
                 return E_INVAL;
             }
             let base = match bus_block(handle, opcode) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
-            let offset = (*arg as usize) & 0xFC;
+            let offset = (arg[0] as usize) & 0xFC;
             // SAFETY: as REG_WRITE.
             let bytes = unsafe { read32(base + offset) }.to_le_bytes();
-            *arg.add(1) = bytes[0];
-            *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2];
-            *arg.add(4) = bytes[3];
+            arg[1] = bytes[0];
+            arg[2] = bytes[1];
+            arg[3] = bytes[2];
+            arg[4] = bytes[3];
             0
         }
         spi_raw::BUS_INFO => {
-            // returns [dr_addr:u32, tx_dreq:u8, rx_dreq:u8, max_freq:u32, pad:u16]
-            if arg.is_null() || arg_len < 12 {
+            // returns [tx_dreq u8][rx_dreq u8][0 u16][max_freq u32]
+            if arg.len() < 8 {
                 return E_INVAL;
             }
             let bus = match owned_instance(handle, family::SPI) {
@@ -1495,18 +1661,15 @@ unsafe fn rp_system_extension_dispatch(
             else {
                 return E_INVAL;
             };
-            let dr = ((base + PL022_DR) as u32).to_le_bytes();
+            let _ = base;
             // SPI's ceiling is Fsys/2, so it moves with the system clock.
             let mf = (chip::SYS_CLK_HZ / 2).to_le_bytes();
-            let out = [
-                dr[0], dr[1], dr[2], dr[3], tx_dreq, rx_dreq, mf[0], mf[1], mf[2], mf[3], 0, 0,
-            ];
-            core::ptr::copy_nonoverlapping(out.as_ptr(), arg, out.len());
+            arg[..8].copy_from_slice(&[tx_dreq, rx_dreq, 0, 0, mf[0], mf[1], mf[2], mf[3]]);
             0
         }
         i2c_raw::BUS_INFO => {
-            // returns [data_cmd_addr:u32, tx_dreq:u8, rx_dreq:u8, pad:u16]
-            if arg.is_null() || arg_len < 8 {
+            // returns [tx_dreq u8][rx_dreq u8][0 u16]
+            if arg.len() < 4 {
                 return E_INVAL;
             }
             let bus = match owned_instance(handle, family::I2C) {
@@ -1517,14 +1680,13 @@ unsafe fn rp_system_extension_dispatch(
             else {
                 return E_INVAL;
             };
-            let dc = ((base + DW_I2C_DATA_CMD) as u32).to_le_bytes();
-            let out = [dc[0], dc[1], dc[2], dc[3], tx_dreq, rx_dreq, 0, 0];
-            core::ptr::copy_nonoverlapping(out.as_ptr(), arg, out.len());
+            let _ = base;
+            arg[..4].copy_from_slice(&[tx_dreq, rx_dreq, 0, 0]);
             0
         }
         spi_raw::PIN_INIT => {
             // arg=[clk:u8, mosi:u8, miso:u8]; 0xFF leaves a line unused.
-            if arg.is_null() || arg_len < 3 {
+            if arg.len() < 3 {
                 return E_INVAL;
             }
             if let Err(e) = owned_instance(handle, family::SPI) {
@@ -1533,11 +1695,11 @@ unsafe fn rp_system_extension_dispatch(
             let pad = gpio_regs::PadConfig::default()
                 .input_enable(true)
                 .drive(gpio_regs::Drive::Ma4);
-            bus_pins(&[*arg, *arg.add(1), *arg.add(2)], FUNCSEL_SPI, pad)
+            bus_pins(&[arg[0], arg[1], arg[2]], FUNCSEL_SPI, pad)
         }
         i2c_raw::PIN_INIT => {
             // arg=[sda:u8, scl:u8]: open-drain lines, pulled up.
-            if arg.is_null() || arg_len < 2 {
+            if arg.len() < 2 {
                 return E_INVAL;
             }
             if let Err(e) = owned_instance(handle, family::I2C) {
@@ -1548,11 +1710,11 @@ unsafe fn rp_system_extension_dispatch(
                 .schmitt(true)
                 .pull_up(true)
                 .drive(gpio_regs::Drive::Ma4);
-            bus_pins(&[*arg, *arg.add(1)], FUNCSEL_I2C, pad)
+            bus_pins(&[arg[0], arg[1]], FUNCSEL_I2C, pad)
         }
         uart_raw::PIN_INIT => {
             // arg=[tx:u8, rx:u8]
-            if arg.is_null() || arg_len < 2 {
+            if arg.len() < 2 {
                 return E_INVAL;
             }
             if let Err(e) = owned_instance(handle, family::UART) {
@@ -1561,17 +1723,17 @@ unsafe fn rp_system_extension_dispatch(
             let pad = gpio_regs::PadConfig::default()
                 .input_enable(true)
                 .drive(gpio_regs::Drive::Ma4);
-            bus_pins(&[*arg, *arg.add(1)], FUNCSEL_UART, pad)
+            bus_pins(&[arg[0], arg[1]], FUNCSEL_UART, pad)
         }
         adc_raw::PIN_INIT => {
             // arg=[pin:u8]: one of this die's ADC inputs, made analog.
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
             if let Err(e) = owned_instance(handle, family::ADC) {
                 return e;
             }
-            let pin = *arg;
+            let pin = arg[0];
             if !adc_pins().contains(&pin) {
                 return E_INVAL;
             }
@@ -1580,7 +1742,7 @@ unsafe fn rp_system_extension_dispatch(
             bus_pins(&[pin], FUNCSEL_NULL, pad)
         }
         i2c_raw::SET_ENABLE => {
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
             let base = match bus_block(handle, opcode) {
@@ -1588,11 +1750,11 @@ unsafe fn rp_system_extension_dispatch(
                 Err(e) => return e,
             };
             // SAFETY: a claimed block of this die; IC_ENABLE is inside it.
-            unsafe { write32(base + DW_I2C_ENABLE, u32::from(*arg != 0)) };
+            unsafe { write32(base + DW_I2C_ENABLE, u32::from(arg[0] != 0)) };
             0
         }
         uart_raw::SET_ENABLE => {
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
             let base = match bus_block(handle, opcode) {
@@ -1602,7 +1764,7 @@ unsafe fn rp_system_extension_dispatch(
             // SAFETY: a claimed block of this die; UARTCR is inside it.
             unsafe {
                 let cr = read32(base + PL011_CR);
-                let cr = if *arg != 0 {
+                let cr = if arg[0] != 0 {
                     cr | PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE
                 } else {
                     cr & !PL011_CR_UARTEN
@@ -1612,7 +1774,7 @@ unsafe fn rp_system_extension_dispatch(
             0
         }
         spi_raw::SET_ENABLE => {
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
             let base = match bus_block(handle, opcode) {
@@ -1622,7 +1784,7 @@ unsafe fn rp_system_extension_dispatch(
             // SAFETY: a claimed block of this die; SSPCR1 is inside it.
             unsafe {
                 let cr1 = read32(base + PL022_CR1);
-                let cr1 = if *arg != 0 {
+                let cr1 = if arg[0] != 0 {
                     cr1 | PL022_CR1_SSE
                 } else {
                     cr1 & !PL022_CR1_SSE
@@ -1633,137 +1795,99 @@ unsafe fn rp_system_extension_dispatch(
         }
         flash::SIDEBAND => {
             use crate::abi::internal::flash::sideband_op as flash_sideband_op;
-            if arg.is_null() || arg_len < 1 {
+            if arg.is_empty() {
                 return E_INVAL;
             }
-            match *arg {
+            match arg[0] {
                 flash_sideband_op::READ_CS => {
                     crate::platform::rp_flash::xip_lock::flash_sideband_read_cs()
                 }
                 flash_sideband_op::XIP_READ => {
-                    if arg_len < 6 {
-                        return E_INVAL;
-                    }
-                    let offset =
-                        u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+                    // [op u8][offset u32] in; the bytes read go to `data`.
                     const FLASH_SIZE: u32 = crate::platform::chip::FLASH_SIZE;
-                    let data_len = arg_len - 5;
-                    if offset >= FLASH_SIZE {
+                    let Some(offset) = le32(arg, 1) else {
+                        return E_INVAL;
+                    };
+                    let out = data.as_mut();
+                    if out.is_empty() || offset >= FLASH_SIZE {
                         return E_INVAL;
                     }
-                    let avail = (FLASH_SIZE - offset) as usize;
-                    let copy_len = if data_len < avail { data_len } else { avail };
-                    let xip_src = (0x1000_0000u32 + offset) as *const u8;
-                    core::ptr::copy_nonoverlapping(xip_src, arg.add(5), copy_len);
-                    copy_len as i32
+                    let n = out.len().min((FLASH_SIZE - offset) as usize);
+                    // SAFETY: XIP maps the whole flash read-only at
+                    // 0x1000_0000; `offset + n` stays inside it.
+                    let src = unsafe {
+                        core::slice::from_raw_parts((0x1000_0000u32 + offset) as *const u8, n)
+                    };
+                    out[..n].copy_from_slice(src);
+                    n as i32
                 }
                 _ => E_NOSYS,
             }
         }
         flash::RAW_ERASE => {
-            if arg.is_null() || arg_len < 4 {
+            if arg.len() < 4 {
                 return E_INVAL;
             }
-            let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let offset = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]);
             crate::platform::rp_flash::store::raw_erase(offset)
         }
         flash::RAW_PROGRAM => {
-            if arg.is_null() || arg_len < 4 + 256 {
+            // [offset u32][page; 256]
+            let (Some(offset), Some(page)) = (le32(arg, 0), arg.get(4..4 + 256)) else {
                 return E_INVAL;
-            }
-            let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            crate::platform::rp_flash::store::raw_program(offset, arg.add(4))
+            };
+            crate::platform::rp_flash::store::raw_program(offset, page)
         }
         // ── PLATFORM_DMA: fd family ──────────────────────────────────
         //
-        // Handle-type rule: `fd::CREATE` is the only opener in this
-        // family; its returned handle is a tagged DMA fd (FD_TAG_DMA).
-        // Every follow-up op rejects raw channel numbers via
-        // `is_dma_fd_handle` so passing `channel::ALLOC`'s return value
-        // to `fd::START` fails fast with EINVAL.
+        // `fd::CREATE` answers the fd's index (`DMA_FD_BASE` plus its slot),
+        // which the kernel wraps in a handle; every follow-up op is handed
+        // it back.
         dma_raw::fd::CREATE => dma_fd_create(),
-        dma_raw::fd::START => {
-            if !is_dma_fd_handle(handle) {
-                return E_INVAL;
-            }
-            if arg.is_null() || arg_len < 14 {
-                return E_INVAL;
-            }
-            let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let write_addr =
-                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            let dreq = *arg.add(12);
-            let flags = *arg.add(13);
-            dma_fd_start(handle, read_addr, write_addr, count, dreq, flags)
-        }
-        dma_raw::fd::RESTART => {
-            if !is_dma_fd_handle(handle) {
-                return E_INVAL;
-            }
-            if arg.is_null() || arg_len < 8 {
-                return E_INVAL;
-            }
-            let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            dma_fd_restart(handle, read_addr, count)
-        }
-        dma_raw::fd::FREE => {
-            if !is_dma_fd_handle(handle) {
-                return E_INVAL;
-            }
-            dma_fd_free(handle)
-        }
-        dma_raw::fd::QUEUE => {
-            if !is_dma_fd_handle(handle) {
-                return E_INVAL;
-            }
-            if arg.is_null() || arg_len < 8 {
-                return E_INVAL;
-            }
-            let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            dma_fd_queue(handle, read_addr, count)
-        }
+        dma_raw::fd::START => rc(dma_fd_start(handle, arg)),
+        dma_raw::fd::RESTART => rc(dma_fd_restart(handle, arg)),
+        dma_raw::fd::QUEUE => rc(dma_fd_queue(handle, arg)),
+        dma_raw::fd::FREE => dma_fd_free(handle),
         // ── SYS_CLOCK_HZ ──
-        SYS_CLOCK_HZ => {
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
+        SYS_CLOCK_HZ => match arg.get_mut(..4) {
+            Some(out) => {
+                out.copy_from_slice(&crate::platform::rp_clocks::measured_sys_hz().to_le_bytes());
+                0
             }
-            *(arg as *mut u32) = crate::platform::rp_clocks::measured_sys_hz();
-            0
-        }
+            None => E_INVAL,
+        },
         _ => E_NOSYS,
     }
 }
 
 // ============================================================================
-// RP provider_query extension (GPIO + SYS_CLOCK_HZ)
+// RP provider_query: GPIO levels, SYS_CLOCK_HZ
 // ============================================================================
 
-unsafe fn rp_dev_query_extension(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32 {
-    use crate::abi::contracts::hal::gpio as dev_gpio;
+/// `provider_query` on a GPIO handle: `handle` is the pin its claim names.
+fn gpio_query(handle: i32, key: u32, _out: &mut [u8]) -> i32 {
+    match key {
+        crate::abi::contracts::hal::gpio::GET_LEVEL if gpio::gpio_check_owner(handle) => {
+            gpio::gpio_get_level(handle)
+        }
+        crate::abi::contracts::hal::gpio::GET_LEVEL => E_INVAL,
+        _ => E_NOSYS,
+    }
+}
+
+fn rp_dev_query_extension(_handle: i32, key: u32, out: &mut [u8]) -> i32 {
     use crate::abi::kernel_abi::SYS_CLOCK_HZ;
     use crate::kernel::module::provider::contract as dev_class;
     let class = ((key >> 8) & 0xFF) as u16;
     match class {
-        dev_class::GPIO => match key {
-            dev_gpio::GET_LEVEL => {
-                if !gpio::gpio_check_owner(handle) {
-                    return E_INVAL;
-                }
-                gpio::gpio_get_level(handle)
-            }
-            _ => E_NOSYS,
-        },
         dev_class::INTERNAL_DISPATCH_BUCKET => match key {
-            SYS_CLOCK_HZ => {
-                if out.is_null() || out_len < 4 {
-                    return E_INVAL;
+            SYS_CLOCK_HZ => match out.get_mut(..4) {
+                Some(o) => {
+                    o.copy_from_slice(&crate::platform::rp_clocks::measured_sys_hz().to_le_bytes());
+                    0
                 }
-                *(out as *mut u32) = crate::platform::rp_clocks::measured_sys_hz();
-                0
-            }
+                None => E_INVAL,
+            },
             _ => E_NOSYS,
         },
         _ => E_NOSYS,
@@ -1778,27 +1902,86 @@ unsafe fn rp_dev_query_extension(handle: i32, key: u32, out: *mut u8, out_len: u
 fn init_rp_providers() {
     use crate::kernel::module::provider::{self, contract as dev_class};
     provider::register(dev_class::HAL_GPIO, gpio_provider_dispatch);
-    // Handle-scoped vtable routes tracked GPIO handles by contract id;
-    // the class-byte registration above is the fallback for handle=-1
-    // global ops.
+    // The vtables give each platform handle its close (and a DMA fd its
+    // poll); the dispatch is the class registration's.
     provider::register_vtable(&GPIO_VTABLE);
+    provider::register_vtable(&DMA_VTABLE);
+    provider::register_vtable(&DMA_FD_VTABLE);
+    provider::register_vtable(&RAW_VTABLE);
+    provider::register_platform_handle_slots(platform_handle_slots);
     // PIO, SPI, I2C, UART, ADC, PWM providers are registered by the
     // loader when their PIC module's manifest names it in `provider_contracts`.
     // Register system extension for hardware opcodes (raw register bridges)
     register_system_extension(rp_system_extension_dispatch);
 }
 
-// Handle-scoped vtable for HAL GPIO. `call` delegates to
-// `gpio_provider_dispatch`; open-style opcodes (CLAIM, SET_INPUT,
-// SET_OUTPUT) return a pin handle that `provider_open` tracks. Close
-// invokes RELEASE.
+// HAL GPIO: open-style opcodes (CLAIM, SET_INPUT, SET_OUTPUT) answer the
+// pin, WATCH_EDGE a watch index; close is RELEASE on either.
 static GPIO_VTABLE: crate::kernel::module::provider::ProviderVTable =
     crate::kernel::module::provider::ProviderVTable {
         contract: crate::kernel::module::provider::contract::HAL_GPIO,
         call: gpio_provider_dispatch,
-        query: None,
+        query: Some(gpio_query),
         default_close_op: crate::abi::contracts::hal::gpio::RELEASE,
+        poll: None,
     };
+
+/// The class-routed platform contracts reach the kernel bucket; their vtables
+/// give their handles a close and, for a DMA fd, a poll.
+fn class_routed_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    crate::kernel::module::provider::dispatch(
+        crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET,
+        handle,
+        op,
+        arg,
+        data,
+    )
+}
+
+static DMA_VTABLE: crate::kernel::module::provider::ProviderVTable =
+    crate::kernel::module::provider::ProviderVTable {
+        contract: crate::abi::registry::platform_dma::ID,
+        call: class_routed_call,
+        query: None,
+        default_close_op: crate::abi::platform::rp::dma_raw::channel::FREE,
+        poll: None,
+    };
+
+/// `HANDLE_POLL` on a DMA fd: readable when its active channel is idle.
+fn dma_fd_poll(index: i32, events: u32) -> i32 {
+    if events & crate::abi::kernel_abi::poll::IN != 0 && dma_fd_poll_ready(index) {
+        crate::abi::kernel_abi::poll::IN as i32
+    } else {
+        0
+    }
+}
+
+static DMA_FD_VTABLE: crate::kernel::module::provider::ProviderVTable =
+    crate::kernel::module::provider::ProviderVTable {
+        contract: crate::abi::registry::platform_dma_fd::ID,
+        call: class_routed_call,
+        query: None,
+        default_close_op: crate::abi::platform::rp::dma_raw::fd::FREE,
+        poll: Some(dma_fd_poll),
+    };
+
+static RAW_VTABLE: crate::kernel::module::provider::ProviderVTable =
+    crate::kernel::module::provider::ProviderVTable {
+        contract: crate::abi::registry::rp_raw::ID,
+        call: class_routed_call,
+        query: None,
+        default_close_op: crate::abi::platform::rp::raw_claim::RELEASE,
+        poll: None,
+    };
+
+/// Handles the RP platform's own provider tables can hand out at once: a
+/// claim and a watch per pin, an allocatable DMA channel each, the DMA fds, a
+/// claim per raw peripheral instance, and the kernel vault's key slots.
+fn platform_handle_slots() -> usize {
+    let pins = gpio::runtime_max_gpio() as usize;
+    let channels = (implemented_channel_mask() & 0xFF00).count_ones() as usize;
+    2 * pins + channels + MAX_DMA_FDS + RAW_SLOTS + crate::kernel::security::key_vault::MAX_SLOTS
+}
 
 /// Release all RP-specific hardware handles owned by a module.
 fn release_rp_handles(module_idx: ModuleId) {
@@ -1853,7 +2036,8 @@ fn raw_slot(f: u8, instance: u8) -> Option<usize> {
     ((instance as usize) < family_count(f)).then(|| family_first(f) + instance as usize)
 }
 
-/// Claim instance `instance` of `f` for the module being stepped: its handle,
+/// Claim instance `instance` of `f` for the module being stepped: its index
+/// (`[family u8][instance u8]`, which the kernel wraps in a handle),
 /// `EBUSY` when another module holds it, `EINVAL` for one the die lacks.
 fn raw_claim_instance(f: u8, instance: u8) -> i32 {
     let Some(slot) = raw_slot(f, instance) else {
@@ -1865,7 +2049,7 @@ fn raw_claim_instance(f: u8, instance: u8) -> i32 {
         Err(owner) if owner == me => {}
         Err(_) => return errno::EBUSY,
     }
-    fd::tag_fd(RAW_TAG, (i32::from(f) << 8) | i32::from(instance))
+    (i32::from(f) << 8) | i32::from(instance)
 }
 
 /// The instance of `f` that `handle` claims for the module being stepped;
@@ -1874,9 +2058,8 @@ fn owned_instance(handle: i32, f: u8) -> Result<u8, i32> {
     if handle < 0 {
         return Err(errno::EBADF);
     }
-    let (tag, slot) = fd::untag_fd(handle);
-    let (hf, instance) = ((slot >> 8) as u8, (slot & 0xFF) as u8);
-    if tag != RAW_TAG || hf != f {
+    let (hf, instance) = ((handle >> 8) as u8, (handle & 0xFF) as u8);
+    if handle >> 16 != 0 || hf != f {
         return Err(errno::EBADF);
     }
     let owner = raw_slot(f, instance).map(|s| RAW_OWNER[s].load(Ordering::Acquire));
@@ -1904,8 +2087,7 @@ fn owned_pio(handle: i32, pio_num: u8) -> Result<usize, i32> {
 
 /// Release the claim `handle` names.
 fn raw_release(handle: i32) -> i32 {
-    let (_, slot) = fd::untag_fd(handle);
-    let f = (slot >> 8) as u8;
+    let f = (handle >> 8) as u8;
     match owned_instance(handle, f) {
         Ok(instance) => {
             if let Some(s) = raw_slot(f, instance) {

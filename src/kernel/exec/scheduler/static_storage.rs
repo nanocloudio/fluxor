@@ -115,9 +115,8 @@ pub unsafe fn populate_static_state(
         let p = &raw mut STATIC_CONFIG;
         &mut *p
     };
-    loader
-        .init_from_blob(modules_ptr)
-        .map_err(|_| "loader init failed")?;
+    // SAFETY: caller supplied a valid module table per `# Safety`.
+    unsafe { loader.init_from_blob(modules_ptr) }.map_err(|_| "loader init failed")?;
     // SAFETY: caller supplied valid (config_ptr, config_len) per `# Safety`.
     if !unsafe {
         crate::kernel::boot::config::read_config_from_ptr_with_len(config_ptr, config_len, config)
@@ -159,8 +158,8 @@ pub unsafe fn populate_static_state_with_len(
         let p = &raw mut STATIC_CONFIG;
         &mut *p
     };
-    loader
-        .init_from_blob_with_len(modules_ptr, modules_len)
+    // SAFETY: caller supplied `modules_len` mapped bytes per `# Safety`.
+    unsafe { loader.init_from_blob_with_len(modules_ptr, modules_len) }
         .map_err(|_| "loader init failed")?;
     if !crate::kernel::boot::config::read_config_from_slice(config_blob, config) {
         return Err("config parse failed");

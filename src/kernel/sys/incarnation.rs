@@ -26,7 +26,7 @@ pub fn get() -> [u8; 16] {
         .is_ok()
     {
         let mut buf = [0u8; 16];
-        let rc = crate::kernel::sys::hal::csprng_fill(buf.as_mut_ptr(), buf.len());
+        let rc = crate::kernel::sys::hal::csprng_fill(&mut buf);
         if rc >= 0 && buf != [0u8; 16] {
             // SAFETY: the only writer, gated by the 0→1 transition above.
             unsafe { core::ptr::write(core::ptr::addr_of_mut!(VALUE), buf) };

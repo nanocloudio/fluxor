@@ -2,53 +2,50 @@
 //
 // Layer: internal (unstable, kernel-private).
 
-/// Get bridge info. handle=bridge_fd, arg=16-byte output buffer.
+/// Get bridge info. handle=the bridge, arg=16-byte output buffer.
 /// Returns: [type:u8, 0:u8, from:u16 LE, to:u16 LE, 0:u16, drops:u32 LE,
 /// seq:u32 LE]
 pub use super::super::registry::bridge::INFO;
-/// Poll bridge readiness. handle=bridge_fd. Returns 1 if readable, 0 if not.
+/// Poll bridge readiness. handle=the bridge. Returns 1 if readable, 0 if not.
 pub use super::super::registry::bridge::POLL;
 /// Read data from a bridge channel.
-/// handle=bridge_fd, arg=output buffer. Returns bytes read, -EAGAIN if empty/no new.
+/// handle=the bridge, `data` = the output buffer. Returns bytes read, -EAGAIN if empty/no new.
 pub use super::super::registry::bridge::READ;
 /// Write data to a bridge channel.
-/// handle=bridge_fd, arg=data bytes. Returns 0 on success, -EAGAIN if ring full.
+/// handle=the bridge, `data` = the bytes to write. Returns 0 on success, -EAGAIN if ring full.
 pub use super::super::registry::bridge::WRITE;
 
-/// Enumerate the *calling* module's own bridge endpoints. handle is ignored
-/// (pass -1); `arg` is an output buffer of at least `SELF_BRIDGES_BUF_LEN`
-/// bytes. On success the buffer is filled as:
-///   [0]    = in_count  (u8)
-///   [1]    = out_count (u8)
-///   [2..4] = reserved (0)
-///   [4..]  = `in_count` input bridge fds (i32 LE), then `out_count` output
-///            bridge fds (i32 LE)
-/// Each returned fd is a tagged bridge handle usable directly with
-/// `WRITE` / `READ` / `POLL` / `INFO`. Returns the number of bytes written, or
-/// a negative errno (`-EINVAL` if the buffer is too small, `-ENODEV` if the
-/// caller is not an ISR-tier module with wired bridges).
+/// One of the *calling* module's own bridge endpoints, as a handle.
+/// `handle = -1`, `arg` = `[dir u8][index u8]` ([`SELF_BRIDGE_ARG_LEN`]):
+/// `dir` [`DIR_IN`] or [`DIR_OUT`], `index` the endpoint's position among the
+/// module's bridges of that direction. Returns the bridge's handle, usable
+/// with `WRITE` / `READ` / `POLL` / `INFO` and `HANDLE_POLL`; `ENOENT` past
+/// the module's last bridge of `dir`, `ENODEV` when the caller is not an
+/// ISR-tier module with wired bridges.
 ///
 /// This is the module-facing half of the ISR-tier I/O contract: an ISR-tier
-/// module (Tier 1b / Tier 2) discovers its bridge endpoints here, then moves
-/// data through them with the bridge ops above — all of which are exempt from
-/// the §D7 ISR-context syscall deny because the underlying ring operations are
-/// lock-free and allocation-free. Lives in the kernel-primitive opcode range
-/// because it is a "self" query like `SELF_INDEX`, not a
-/// per-handle bridge operation.
-pub use super::super::registry::bridge::SELF_BRIDGES;
+/// module (Tier 1b / Tier 2) takes its bridge handles in `module_new`, then
+/// moves data through them with the bridge ops above — exempt from the §D7
+/// ISR-context syscall deny because the underlying ring operations are
+/// lock-free and allocation-free. Taking a handle mints a kernel route, which
+/// is scheduler work: call it from `module_new`, never from the ISR entry.
+pub use super::super::registry::bridge::SELF_BRIDGE;
 
-/// Maximum bridge endpoints per ISR-tier module (matches the kernel's
-/// `isr_tier::MODULE_MAX_BRIDGES`); sizes the `SELF_BRIDGES` output buffer.
+/// [`SELF_BRIDGE`]'s argument length.
+pub const SELF_BRIDGE_ARG_LEN: usize = 2;
+/// [`SELF_BRIDGE`] `dir`: a bridge the module reads.
+pub const DIR_IN: u8 = 0;
+/// [`SELF_BRIDGE`] `dir`: a bridge the module writes.
+pub const DIR_OUT: u8 = 1;
+
+/// Maximum bridge endpoints per ISR-tier module and direction (matches the
+/// kernel's `isr_tier::MODULE_MAX_BRIDGES`).
 pub const MAX_BRIDGES_PER_MODULE: usize = 4;
 
-/// Minimum `SELF_BRIDGES` output buffer length: 4-byte header + up to
-/// `MAX_BRIDGES_PER_MODULE` input + output fds (4 bytes each).
-pub const SELF_BRIDGES_BUF_LEN: usize = 4 + (MAX_BRIDGES_PER_MODULE * 2) * 4;
-
-/// True for the bridge ops an ISR-tier module may call from interrupt context
-/// (the §D7 syscall deny exempts these). The underlying `RingBridge`
-/// push/pop/peek and the `SELF_BRIDGES` enumeration are lock-free and
-/// allocation-free, so they are safe to invoke from `module_isr_entry`.
+/// True for the bridge ops an ISR-tier module may call (the §D7 syscall deny
+/// exempts these). The underlying `RingBridge` push/pop/peek are lock-free
+/// and allocation-free, so the data ops are safe to invoke from
+/// `module_isr_entry`.
 pub const fn is_isr_safe(op: u32) -> bool {
-    matches!(op, WRITE | READ | POLL | INFO | SELF_BRIDGES)
+    matches!(op, WRITE | READ | POLL | INFO | SELF_BRIDGE)
 }

@@ -9,7 +9,7 @@
 // orchestration lives in `internal/*`; chip-specific raw registers
 // live in `platform/*`.
 //
-// Vocabulary: the POSIX-derived low-level terms here — `fd` (tagged handle),
+// Vocabulary: the POSIX-derived low-level terms here — `fd` (a handle),
 // `errno` (negative error code), poll flags — are universally understood
 // primitives at the kernel/module boundary, not an orchestrator's
 // vocabulary. Tenancy is Fluxor's own: `owner`, `workload`, `lease`,
@@ -80,19 +80,20 @@ impl ChannelAddr {
 ///
 /// All provider dispatch goes through the handle-scoped
 /// `provider_open` / `provider_call` / `provider_query` / `provider_close`
-/// quartet. Channel I/O and heap are direct typed syscalls. Handles
-/// returned by `provider_open` are tracked against their contract;
-/// subsequent calls route via the bound contract's vtable. Tagged fds
-/// (event / timer / DMA-fd) self-identify via their high-bit tag. Global
-/// `handle = -1` ops and scheduler-assigned channel fds route by the
-/// opcode's contract bits.
+/// quartet. Channel I/O and heap are direct typed syscalls. Every handle is
+/// a kernel-minted word naming its contract ([`handle`]), so a call on one
+/// reaches that contract's vtable; `handle = -1` ops route by the opcode's
+/// contract bits.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SyscallTable {
     pub version: u32,
-    /// Read from a channel. Returns bytes read, 0 on empty, <0 on error.
+    /// Read from a channel. Returns bytes read, `EAGAIN` when nothing is
+    /// buffered or `len == 0`, <0 on error.
     pub channel_read: unsafe extern "C" fn(handle: i32, buf: *mut u8, len: usize) -> i32,
-    /// Write to a channel. Returns bytes written, 0 on full, <0 on error.
+    /// Write one record to a channel, whole or not at all. Returns `len`,
+    /// `EAGAIN` when it does not fit now, 0 for `len == 0` (nothing is
+    /// published), <0 on error.
     pub channel_write: unsafe extern "C" fn(handle: i32, data: *const u8, len: usize) -> i32,
     /// Poll a channel for readiness. Returns bitmask of ready events.
     pub channel_poll: unsafe extern "C" fn(handle: i32, events: u32) -> i32,
@@ -123,11 +124,20 @@ pub struct SyscallTable {
     ) -> i32,
 
     /// Invoke an operation on a handle from `provider_open`, or a global
-    /// op with `handle = -1`. The kernel looks up the handle's bound
-    /// contract (when tracked) and routes to its vtable; for untracked
-    /// handles and globals the opcode's high byte identifies the contract.
-    pub provider_call:
-        unsafe extern "C" fn(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32,
+    /// op with `handle = -1`. Every op takes the same six words: one handle
+    /// slot, one flat `arg` record (its direction and maximum are the
+    /// registry's; a small answer is written back into it) and one bulk
+    /// `data` span, valid for this call only. Neither carries an address
+    /// or a handle: a second object is named by a cookie, and memory that
+    /// must outlive the call is a `lend`.
+    pub provider_call: unsafe extern "C" fn(
+        handle: i32,
+        op: u32,
+        arg: *mut u8,
+        arg_len: usize,
+        data: *mut u8,
+        data_len: usize,
+    ) -> i32,
 
     /// Query introspection state on a handle. See `kernel_abi::query_key`
     /// for well-known keys.
@@ -141,7 +151,8 @@ pub struct SyscallTable {
     /// without consuming them: from a FIFO, the head of its stream; from a
     /// mailbox, the head of its pending record, which stays pending.
     /// Returns the number of bytes copied (0 when nothing is buffered), or
-    /// `EINVAL` for a null buffer or an invalid handle.
+    /// `EINVAL` for a null buffer, `EBADF` for a handle that is not the
+    /// caller's input.
     ///
     /// Used by frame-aware consumers that inspect a header (message type,
     /// payload length, connection id) before committing to consume the
@@ -161,31 +172,14 @@ pub struct SyscallTable {
     /// losing the records is not.
     pub telemetry_enabled: *const u32,
 
-    /// Call the provider of the opcode's contract selected by name (`sel`):
-    /// an instance-keyed layer (a volume string, resolved by the shared
-    /// `provider_selector::hash`), or for the reserved name `platform` the
-    /// platform's own provider beneath every module layer. The contract is
-    /// the opcode's class byte, as on the `handle = -1` path. `op_handle` is
-    /// `-1` for an open-style op; a handle that op mints comes back routed —
-    /// it names its minting provider, so later ops on it, here or through
-    /// `provider_call`, reach that provider. A non-negative `op_handle` must
-    /// be one minted through the same `sel` (`EBADF` otherwise). Returns the
-    /// provider's result, or `EINVAL` / `ENODEV` (nothing carries `sel`).
-    pub provider_call_sel: unsafe extern "C" fn(
-        sel: *const u8,
-        sel_len: usize,
-        op_handle: i32,
-        op: u32,
-        arg: *mut u8,
-        arg_len: usize,
-    ) -> i32,
-
     /// Drop the next `len` bytes of a channel's stream without copying
     /// them. On a FIFO, what is buffered goes at once and the rest is
     /// dropped from the front of each later write as it arrives; returns
-    /// `len`, or `EINVAL` for a bad handle or a `len` past `i32::MAX`. On a
-    /// mailbox the unit is the record: a non-zero `len` releases the pending
-    /// record whole and returns its length, or `EAGAIN` when none is pending.
+    /// `len`, or `EINVAL` for a `len` past `i32::MAX`. On a mailbox the unit
+    /// is the record: `len` at least the pending record's releases it whole
+    /// and returns its length, a shorter non-zero `len` is `EINVAL` (no
+    /// partial record is left), and `EAGAIN` when none is pending. `len == 0`
+    /// returns 0.
     ///
     /// The consuming half of a whole-frame read: a frame-aware consumer
     /// peeks the header, peeks the frame once it is all buffered, and
@@ -210,14 +204,11 @@ unsafe impl Sync for SyscallTable {}
 // by name. Reordering, inserting, or removing a field silently breaks any
 // module built against a different layout (it jumps through the wrong
 // function pointer). These asserts pin the layout so any such change fails
-// the build. New fields are only ever APPENDED at the end (never inserted or
-// reordered), so a module built against an older, shorter layout keeps every
-// offset it knows and simply never reaches the new tail slots — an
-// extension, not a version break. Layout is one `u32` slot
-// (version, padded to pointer width), 11 function pointers, a telemetry gate
-// pointer, 1 provider-instance routing pointer and the channel discard
-// pointer = 15 pointer-sized slots, which holds on both 64-bit (native) and
-// 32-bit wasm builds.
+// the build; the table is part of the ABI surface the digest covers. Layout
+// is one `u32` slot (version, padded to pointer width), 11 function
+// pointers, a telemetry gate pointer and the channel discard pointer = 14
+// pointer-sized slots, which holds on both 64-bit (native) and 32-bit wasm
+// builds.
 const _: () = {
     // Every positional field is pinned, not just the first/last + size — a
     // size-preserving reorder (e.g. swapping channel_read and channel_write)
@@ -236,9 +227,8 @@ const _: () = {
     assert!(core::mem::offset_of!(SyscallTable, provider_close) == p * 10);
     assert!(core::mem::offset_of!(SyscallTable, channel_peek) == p * 11);
     assert!(core::mem::offset_of!(SyscallTable, telemetry_enabled) == p * 12);
-    assert!(core::mem::offset_of!(SyscallTable, provider_call_sel) == p * 13);
-    assert!(core::mem::offset_of!(SyscallTable, channel_discard) == p * 14);
-    assert!(core::mem::size_of::<SyscallTable>() == p * 15);
+    assert!(core::mem::offset_of!(SyscallTable, channel_discard) == p * 13);
+    assert!(core::mem::size_of::<SyscallTable>() == p * 14);
 };
 
 /// Poll event flags (used with `handle_poll` / `channel_poll`).
@@ -260,7 +250,7 @@ pub mod poll {
     /// Space available for writing.
     pub use super::super::registry::poll::OUT;
     /// The channel has carried at least one byte since it was last
-    /// flushed. Sticky: once set it stays set until `IOCTL_FLUSH`
+    /// flushed. Sticky: once set it stays set until `channel::FLUSH`
     /// begins a new stream.
     ///
     /// This is what makes [`HUP`] answerable. `HUP | WROTE` is a stream
@@ -348,10 +338,8 @@ pub mod errno {
     pub use super::super::registry::errno::ENOTCONN;
     /// Operation not supported (e.g. wrong pin mode).
     pub use super::super::registry::errno::ENOTSUP;
-    /// A value is too large for the width the caller asked it in. Used by
-    /// FS_STAT when a file's size does not fit the 32-bit output form, so
-    /// the caller learns to ask again with a wider buffer rather than
-    /// receiving a clamped number it cannot distinguish from a real one.
+    /// A value is too large for the field that must carry it (a name past
+    /// `STORAGE_KEY_MAX` in a listing), refused rather than clamped.
     pub use super::super::registry::errno::EOVERFLOW;
     /// The caller's buffer is too small, and the call has written the
     /// exact requirement into the layout's `*_len_out` field.
@@ -374,33 +362,114 @@ pub mod errno {
 // Channel primitive
 // ─────────────────────────────────────────────────────────────────────
 //
-// The channel ring-buffer contract. `channel_read` / `channel_write` /
-// `channel_poll` are direct syscalls on the SyscallTable; the opcodes
-// below open and close channels, find ports and carry ioctl sideband.
+// A channel joins one producer to one consumer: a ring (FIFO) or, for an
+// aliased edge, a mailbox holding one record. `channel_read` /
+// `channel_write` / `channel_peek` / `channel_discard` / `channel_poll` are
+// direct syscalls on the SyscallTable; the opcodes below are the rest of the
+// object. Every op is checked against the caller's end: reads, peeks,
+// discards, `RECORD_LEN` and the read and in-place lends are the consumer's;
+// writes, `SET_HUP`, `WRITABLE` and the write lend the producer's; `POLL` and
+// `FLUSH` either end's. `EBADF` for anyone else.
 //
-// Channel ioctl commands the kernel handles (stable ABI values, passed in
-// the ioctl `cmd` parameter rather than as opcodes; `runtime/consts.rs`
-// names them for modules):
-//   1 = NOTIFY:      store an auxiliary u32 (arg: *const u32)
-//                    Use case: seek position, file index, producer signal
-//   2 = POLL_NOTIFY: read-and-clear the auxiliary u32 (arg: *mut u32)
-//                    Returns OK if a value was pending, EAGAIN if not
-//   3 = FLUSH:       clear the ring buffer and reset flags (no arg)
-//   4 = SET_HUP:     set the HUP flag (seen via handle_poll with poll::HUP)
-//   5 = WRITABLE:    bytes a write can place in the ring now (arg: *mut u32);
-//                    0 for a full ring and for a mailbox channel, which has
-//                    no ring to measure
+// Records. Every write is one record (a write over 65535 bytes is several),
+// and a ring keeps each record's boundary: `RECORD_LEN` answers the unread
+// bytes of the record at the head. Reads, peeks and discards stay a byte
+// stream over the records' payload. A record costs its length plus two bytes
+// of ring, so a ring of N bytes takes a write of at most N - 2.
+//
+// Zero lengths. A write of 0 bytes publishes nothing and returns 0; a read
+// that fits no byte (`len == 0`, or nothing buffered) returns `EAGAIN`; a
+// peek or discard of 0 returns 0. On a mailbox a read needs room for the whole record (a shorter
+// buffer is `EINVAL`, the record left in place), and a discard drops the
+// record whole: `n >= record` returns the record's length, `0 < n < record`
+// is `EINVAL`.
+//
+// The mailbox's record is IDLE, WRITING, READY or READING. A lend (WRITING or
+// READING) is its acquirer's until it releases or cancels it, it retires, or
+// the channel closes: `FLUSH` answers `EBUSY` while one is out.
 pub mod channel {
+    /// The consumer's lend of the READY record for modification, when no
+    /// in-place writer has processed it yet (READY → WRITING);
+    /// `RELEASE_WRITE` then hands it on, marked processed. Argument: an
+    /// [`acquired`] record.
+    pub use super::super::registry::channel::ACQUIRE_INPLACE;
+    /// The consumer's lend of the READY record for reading (READY →
+    /// READING). Argument: an [`acquired`] record.
+    pub use super::super::registry::channel::ACQUIRE_READ;
+    /// The producer's lend of the mailbox record for writing (IDLE →
+    /// WRITING). Argument: an [`acquired`] record, written by the kernel.
+    pub use super::super::registry::channel::ACQUIRE_WRITE;
     pub use super::super::registry::channel::CLOSE;
-    pub use super::super::registry::channel::IOCTL;
+    pub use super::super::registry::channel::FACTS;
+    /// Either end: drop what is buffered and start the stream over — the
+    /// ring's bytes or the mailbox's READY record, the owed discard and
+    /// `WROTE`, and `HUP` unless the producer is gone (`ERR` stays). `EBUSY`
+    /// while the mailbox record is lent.
+    pub use super::super::registry::channel::FLUSH;
+    /// `arg` = the ring's capacity in bytes, `u32` LE, a power of two within
+    /// the ring bounds; empty for the default ring. The opener is both ends.
     pub use super::super::registry::channel::OPEN;
     pub use super::super::registry::channel::PORT;
-    /// Bind a module-provided ioctl handler to this channel.
-    /// Arg layout: `{ state_ptr: u64 LE, handler_fn: u64 LE }` (16 B).
-    /// Any `channel_ioctl` cmd not handled by the kernel's built-in set
-    /// (NOTIFY / POLL_NOTIFY / FLUSH / SET_HUP / WRITABLE) is forwarded to
-    /// `handler_fn(state_ptr, cmd, arg)`. `handler_fn = 0` clears.
-    pub use super::super::registry::channel::REGISTER_IOCTL;
+    /// The consumer: the unread bytes of the record at the head, as the
+    /// call's result (on a mailbox, the READY record's length); `EAGAIN`
+    /// when nothing is buffered.
+    pub use super::super::registry::channel::RECORD_LEN;
+    /// The lend's holder ends a read lend, consuming the record (READING →
+    /// IDLE). No argument.
+    pub use super::super::registry::channel::RELEASE_READ;
+    /// The lend's holder publishes the record (WRITING → READY) and the call
+    /// returns its length. Argument: `u32` LE, the record's length, at most
+    /// the capacity `ACQUIRE_WRITE` reported (`EINVAL` past it, the lend
+    /// kept). A length of `0` cancels the lend (WRITING → IDLE), publishes
+    /// nothing and returns 0. `EBUSY` from anyone but the lend's holder.
+    pub use super::super::registry::channel::RELEASE_WRITE;
+    /// The producer: end of stream, seen as `poll::HUP` (a tap of the
+    /// channel sees it too). No argument.
+    pub use super::super::registry::channel::SET_HUP;
+    /// The producer: `arg` out `u32` LE, the largest write the ring takes
+    /// now; 0 for a full ring and for a mailbox, which has no ring to
+    /// measure.
+    pub use super::super::registry::channel::WRITABLE;
+
+    /// The record the three acquires fill in. The call's result is the
+    /// status and never the address: a pointer does not fit the `i32` a call
+    /// returns on a 64-bit target.
+    ///
+    /// Result `0`: acquired. `EAGAIN`: the mailbox is not available now
+    /// (write: its record is not IDLE and `LEN` is the capacity; read and
+    /// in-place: no record is ready). `ENOTSUP`: the channel is not a
+    /// mailbox. `EINVAL`: an argument shorter than [`SIZE`] (nothing is
+    /// acquired then). `EBADF`: no such channel, or not the caller's end.
+    pub mod acquired {
+        /// Total length, in bytes.
+        pub const SIZE: usize = 16;
+        /// `u64` LE — the buffer's address; `0` unless the result was `0`.
+        pub const PTR: usize = 0;
+        /// `u32` LE — write: the buffer's capacity (also for a busy
+        /// mailbox); read and in-place: the record's length; `0` otherwise.
+        pub const LEN: usize = 8;
+    }
+
+    /// `FACTS`' answer, written into `arg`: `[producer_owner u16 LE]
+    /// [flags u8][0 u8]`, about a channel the caller is an end of (handle =
+    /// the channel; `EBADF` for one it is not).
+    ///
+    /// `producer_owner` is the owner slot of the module that writes the
+    /// channel (0 = the host), as the kernel knows it: a provider reading
+    /// commands off the channel admits them as that owner, never as one a
+    /// record names. A channel fed by a fan-in is written by the merge the
+    /// graph inserted, which belongs to the graph's owner.
+    pub mod facts {
+        /// Answer length.
+        pub const LEN: usize = 4;
+        pub const PRODUCER_OWNER: usize = 0;
+        pub const FLAGS: usize = 2;
+        /// Every consumer reading this channel (through a fan, every one
+        /// it fans to) declares `retains_send` on its port: it keeps its
+        /// own copy of what it sends until the provider reports it
+        /// acknowledged. Set by the composer on the graph's edges.
+        pub const RETAINS_SEND: u8 = 0x01;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -465,7 +534,7 @@ pub mod timer {
 
     /// Cancel timer. handle=timer_fd.
     pub use super::super::registry::timer::CANCEL;
-    /// Create a timer fd. handle=-1. Returns tagged timer fd.
+    /// Create a timer. handle=-1. Returns the timer's handle.
     ///
     /// A timer is an fd in every sense that matters: `SET` arms it, the
     /// generic fd `POLL` reports `POLL_IN` once it has fired, and the KERNEL
@@ -528,55 +597,26 @@ pub mod timer {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Buffer primitive (zero-copy slot acquisition)
-// ─────────────────────────────────────────────────────────────────────
-pub mod buffer {
-    /// Acquire the channel's pending message for modification (READY →
-    /// PRODUCER); `RELEASE_WRITE` then hands it on. Argument: an [`acquired`]
-    /// record, written by the kernel.
-    pub use super::super::registry::buffer::ACQUIRE_INPLACE;
-    /// Acquire the channel's pending message for reading (READY → CONSUMER).
-    /// Argument: an [`acquired`] record, written by the kernel.
-    pub use super::super::registry::buffer::ACQUIRE_READ;
-    /// Acquire the channel's buffer for writing (STREAMING → PRODUCER).
-    /// Argument: an [`acquired`] record, written by the kernel.
-    pub use super::super::registry::buffer::ACQUIRE_WRITE;
-    /// Return the message buffer (CONSUMER → STREAMING). No argument.
-    pub use super::super::registry::buffer::RELEASE_READ;
-    /// Publish the written buffer (PRODUCER → READY). Argument: `u32` LE, the
-    /// length of the message in bytes (at most the capacity `ACQUIRE_WRITE`
-    /// reported). A length of `0` publishes an empty message; an argument
-    /// shorter than 4 bytes is `EINVAL` and publishes nothing.
-    pub use super::super::registry::buffer::RELEASE_WRITE;
-
-    /// The record the three acquire operations fill in. The call's result is
-    /// the status and never the address: a pointer does not fit the `i32` a
-    /// call returns on a 64-bit target.
-    ///
-    /// Result `0`: acquired. `EAGAIN`: the channel is a mailbox that is not
-    /// available now (write: the buffer holds an earlier message and `LEN` is
-    /// its capacity; read and in-place: no message is ready). `ENOTSUP`: the
-    /// channel is not a mailbox. `EINVAL`: no such channel, or an argument
-    /// shorter than [`SIZE`] (nothing is acquired then).
-    pub mod acquired {
-        /// Total length, in bytes.
-        pub const SIZE: usize = 16;
-        /// `u64` LE — the buffer's address; `0` unless the result was `0`.
-        pub const PTR: usize = 0;
-        /// `u32` LE — write: the buffer's capacity (also for a busy
-        /// mailbox); read and in-place: the message length; `0` otherwise.
-        pub const LEN: usize = 8;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────
 // Event primitive (single-bit ISR→module wake signal)
 // ─────────────────────────────────────────────────────────────────────
 pub mod event {
     /// Bind an event handle to a hardware IRQ number.
-    /// handle=event_handle, arg=[irq_number:u32 LE], arg_len=4.
-    /// The kernel signals the event when the IRQ fires (ISR-safe).
+    /// handle=event_handle, arg=[irq_number:u32 LE][ack:u8] (5 bytes). The
+    /// kernel signals the event
+    /// when the IRQ fires (ISR-safe), first acknowledging the device behind
+    /// the line when `ack` says how. `EINVAL` for an `ack` the machine has no
+    /// such device behind `irq` for.
     pub use super::super::registry::event::BIND_IRQ;
+    /// How the kernel quiets the device behind a [`BIND_IRQ`] line before it
+    /// signals the event.
+    pub mod ack {
+        /// The driver acknowledges the device itself.
+        pub const NONE: u8 = 0;
+        /// The line is a virtio-mmio transport's: the kernel writes its
+        /// `InterruptStatus` back to `InterruptACK`. Which transport raises
+        /// the line is the machine's fact, not the caller's.
+        pub const VIRTIO_MMIO: u8 = 1;
+    }
     /// Create event. handle=-1, arg=unused. Returns event handle (>=0) or <0 on error.
     pub use super::super::registry::event::CREATE;
     /// Destroy event and free slot. handle=event. Returns 0 or <0.
@@ -599,13 +639,13 @@ pub mod event {
 
 /// Poll any handle. handle=fd, arg[0]=events mask. Returns poll result bitmask.
 pub use super::registry::kernel::HANDLE_POLL;
-/// Log message. handle=log_level, arg=message, arg_len=message length.
+/// Log message. handle=log_level, no `arg`, `data` in = the message.
 pub use super::registry::kernel::LOG_WRITE;
 /// Write raw bytes to the platform debug serial sink (binary-safe, unlike
-/// LOG_WRITE which UTF-8-filters). arg=bytes, arg_len=count. Returns bytes
+/// LOG_WRITE which UTF-8-filters). No `arg`, `data` in = the bytes. Returns bytes
 /// accepted. The telemetry `transport_buffer` sink; needs `kernel.serial`. `kernel::SERIAL_WRITE` is
 /// the slot the dispatch comment reserves for "raw UART / USB writes", beside
-/// LOG_RING_DRAIN (`diag::LOG_RING_DRAIN`) / FAN_DIAG_SNAPSHOT (`diag::FAN_DIAG_SNAPSHOT`).
+/// LOG_RING_DRAIN (`diag::LOG_RING_DRAIN`).
 pub use super::registry::kernel::SERIAL_WRITE;
 
 /// Query downstream latency for current module. handle=-1. Returns u32 frames.
@@ -654,15 +694,16 @@ pub mod step_return {
     pub const READY: i32 = 3;
 }
 
-/// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
-/// Returns arena size in bytes (0 if no arena allocated).
+/// Get module's arena allocation. handle=-1; `arg` out = `[addr:u64 LE]
+/// [size:u32 LE]` (an address answer; both 0 when the module has no arena).
+/// Returns 0.
 pub use super::registry::kernel::ARENA_GET;
 
 /// Fill buffer with cryptographically secure random bytes.
-/// handle=-1, arg=output buffer, arg_len=requested byte count.
+/// handle=-1, no `arg`, `data` out = the bytes to fill.
 /// Returns 0 on success, or a negative errno. A fill is all-or-nothing:
 /// there is no partial success to report a byte count for, and a caller
-/// that gets 0 has every one of `arg_len` bytes.
+/// that gets 0 has every byte of `data`.
 /// Entropy comes from whatever the platform calls a CSPRNG — a hardware
 /// TRNG where one exists, the host CSPRNG where the kernel is hosted.
 pub use super::registry::kernel::RANDOM_FILL;
@@ -678,11 +719,10 @@ pub use super::registry::kernel::SYS_CLOCK_HZ;
 /// telemetry lines, and by orchestration modules to name themselves.
 pub use super::registry::kernel::SELF_INDEX;
 
-/// Copy the calling module's per-instance params blob into `out`.
-/// handle=-1; arg=output buffer of size `out_len`. Returns the number
-/// of bytes written (≤ out_len) on success, or negative errno. Calling
-/// with `arg=null` or `out_len=0` returns the natural size without
-/// copying — used to size a buffer before the read. The blob shape
+/// Copy the calling module's per-instance params blob into `data`.
+/// handle=-1, no `arg`. Returns the number of bytes written (≤ the length
+/// of `data`) on success, or negative errno. An empty `data` returns the
+/// natural size without copying — used to size a buffer before the read. The blob shape
 /// is the manifest TLV: `[0xFE 0x01 len_lo len_hi {tag len value}*
 /// 0xFF]`.
 ///
@@ -692,24 +732,6 @@ pub use super::registry::kernel::SELF_INDEX;
 /// module memory split rules out the direct path. The opcode is
 /// honoured on every target.
 pub use super::registry::kernel::MODULE_INSTANCE_PARAMS;
-
-/// Query the calling module's owner slot (`owner_tag`).
-/// handle=-1, arg=NULL. Returns the module's owner slot (0..MAX_OWNERS-1)
-/// on success, negative errno on failure. Slot 0 is `OWNER_SYSTEM` — a
-/// base-graph / host-owned module — which is the legitimate "host / wildcard"
-/// owner_tag, not an error.
-///
-/// This is the self-identity read behind metal owner-scoped binds. `apply_add`
-/// stamps every module of a `net=own` workload with its owner
-/// (`set_module_owner`, post-`owners.alloc`), so a bind-emitting module (http,
-/// a DG binder) reads its owner slot here and appends it as the trailing
-/// `owner_tag` on `NET_CMD_BIND` / `DG_CMD_BIND` — the field the ip module's
-/// bind admission resolves to the workload's owned address. Ungated
-/// self-query
-/// (same permission class as `SELF_INDEX` / `MODULE_INSTANCE_PARAMS`); a
-/// module can only ever read its OWN owner, never another's. Without it the
-/// module syscall ABI exposes no way to learn the calling owner at all.
-pub use super::registry::kernel::OWNER_TAG;
 
 /// Register the CALLING module as the node's net-identity provider (the
 /// module owning the shared network stack that realizes `net::identity`
@@ -744,21 +766,21 @@ pub use super::registry::kernel::BOOT_INCARNATION;
 /// program in that slot. Ungated self-query: the kernel finds the programs by the calling
 /// module, so a module can only ever name its own.
 ///
-/// The address is where the bytes can be read in place: flash on an XIP
-/// board, the loaded bundle elsewhere, and 0 where the module cannot
-/// dereference kernel memory (wasm), which reads through [`PROGRAM_READ`]
-/// instead. An isolated module is granted read-only, never-executable
-/// access to its region (`region_addr`, `region_len`): an MPU region of
-/// exactly that span on RP, its pages EL0 read-only on the Pi 5.
+/// The record opens with an address answer `[addr u64][len u32]`: where the
+/// bytes can be read in place (flash on an XIP board, the loaded bundle
+/// elsewhere), or `0, 0` where the module cannot dereference kernel memory
+/// (wasm), which reads through [`PROGRAM_READ`] instead; the size is
+/// stated either way. An isolated module is granted read-only,
+/// never-executable access to the region over its programs: an MPU region
+/// of exactly that span on RP, its pages EL0 read-only on the Pi 5; the
+/// record says where it ends, as bytes from `addr`.
 pub use super::registry::kernel::PROGRAM_INFO;
 
-/// Copy bytes of one of the calling module's programs into `arg`.
-/// `handle = -1`; on entry `arg` holds `[slot: u8][0; 3][offset: u32 LE]`
-/// and `arg_len` is the bytes wanted (at least 8); on return the buffer
-/// holds program bytes from `offset` and the call answers how many (0 at
-/// the end). The request rides in the buffer it is answered in, so the call
-/// carries no pointer and is served the same through the isolation gateway
-/// and across the wasm memory split. `ENOENT` for no program in that slot.
+/// Copy bytes of one of the calling module's programs into `data`.
+/// `handle = -1`; `arg` holds `[slot: u8][0; 3][offset: u32 LE]` and `data`
+/// is as many bytes as are wanted; the call fills it with program bytes from
+/// `offset` and answers how many (0 at the end). `ENOENT` for no program in
+/// that slot.
 pub use super::registry::kernel::PROGRAM_READ;
 
 /// The signing root this kernel verifies modules and graph-slot signatures
@@ -826,17 +848,34 @@ pub mod program {
     pub const ENTRY_LEN: usize = 64;
     pub const OWNER_ALIGN: usize = 4096;
     pub const PROGRAM_ALIGN: usize = 32;
-    /// Bytes `PROGRAM_INFO` writes: `[addr: u64][size: u32][kind: u32]
-    /// [region_addr: u64][region_len: u32][0: u32][format: 32]`.
+    /// Bytes `PROGRAM_INFO` writes: `[addr: u64][len: u32][kind: u32]
+    /// [size: u32][region_end: u32][0: 8][format: 32]`.
     pub const INFO_LEN: usize = 64;
+    /// `PROGRAM_INFO` field offsets.
+    pub mod info {
+        /// `u64` LE — where the program can be read in place, or 0.
+        pub const ADDR: usize = 0;
+        /// `u32` LE — the bytes readable at `ADDR`: the program's size, or 0
+        /// with `ADDR` 0.
+        pub const LEN: usize = 8;
+        /// `u32` LE — the program's kind.
+        pub const KIND: usize = 12;
+        /// `u32` LE — the program's size, whether or not it is readable in
+        /// place.
+        pub const SIZE: usize = 16;
+        /// `u32` LE — bytes from `ADDR` to the end of the region an isolated
+        /// reader is granted over its programs; 0 with `ADDR` 0.
+        pub const REGION_END: usize = 20;
+        /// `[u8; 32]` — the producer's format digest.
+        pub const FORMAT: usize = 32;
+    }
 }
 
 /// Per-step flow-budget grant for one of the calling module's ports.
-/// `arg[0] = port index`; optional `arg[1] = direction` (`0` output,
-/// `1` input). Input requests may carry the raw channel descriptor in
-/// `arg[2..6]` to resolve a runtime bridge/repacking alias. The provider handle
-/// is always global (`-1`) because raw channel descriptors are untagged. A
-/// one-byte request (`arg_len == 1`) is an output-port query.
+/// `handle = -1`; `arg = [port index: u8][direction: u8]` (`0` output, `1`
+/// input). An input port's budget is resolved through the channel the
+/// calling module reads that port by, which the kernel looks up itself, so
+/// a bridge or a repacking stage in front of it changes nothing.
 pub use super::registry::kernel::MODULE_FLOW_BUDGET;
 
 /// Raise software-generated interrupt `sgi` (0..=15) on core `core`: the
@@ -859,19 +898,11 @@ pub use super::registry::kernel::GET_HW_ETHERNET_MAC;
 // Uniform introspection surface for `provider_query`. Contracts may
 // define additional keys in a contract-specific numeric range.
 pub mod query_key {
-    /// Capability bitfield (returns u32, contract-specific)
-    pub use super::super::registry::kernel::QUERY_CAPABILITIES as CAPABILITIES;
     /// Contract id (returns u8)
     pub use super::super::registry::kernel::QUERY_CLASS as CLASS;
-    /// Error count since last reset (returns u32)
-    pub use super::super::registry::kernel::QUERY_ERROR_COUNT as ERROR_COUNT;
     /// Heap statistics: the `heap_stats` record, exactly `heap_stats::LEN`
     /// bytes. handle=-1 queries the calling module's heap.
     pub use super::super::registry::kernel::QUERY_HEAP_STATS as HEAP_STATS;
-    /// Human-readable name (returns null-terminated string)
-    pub use super::super::registry::kernel::QUERY_NAME as NAME;
-    /// Current state (returns u8, contract-specific)
-    pub use super::super::registry::kernel::QUERY_STATE as STATE;
 
     /// Most recent `contracts::fence::Fence` advertised on this
     /// handle. Cross-class: any storage / file / namespace / object
@@ -918,63 +949,66 @@ pub mod query_key {
     /// lazily — before acting on the module's behalf — instead of relying on
     /// a release notification's timing.
     pub use super::super::registry::kernel::QUERY_MODULE_LIVE as MODULE_LIVE;
-
-    /// The module occupancy that owns event `handle` (a tagged event fd):
-    /// writes the [`CALLER_MODULE`] record of the owning module and returns
-    /// 8; `ENOENT` when the event is not allocated or no module owns it,
-    /// `EINVAL` when `handle` is not an event fd. A module's events are freed
-    /// when its occupancy ends, so the record names the occupancy that
-    /// created the event. A provider that signals a subscriber's event
-    /// checks it before every signal, so an event slot freed and taken by
-    /// another module never wakes the wrong one.
-    pub use super::super::registry::kernel::QUERY_EVENT_OWNER as EVENT_OWNER;
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// File-descriptor tagging
+// Handles
 // ─────────────────────────────────────────────────────────────────────
 //
-// Every handle Fluxor hands back to a module is a tagged i32: bit 31
-// clear, so a handle never reads as an errno; a contract tag above the
-// slot; the slot below. A contract that mints handles tags them with its
-// own id, so the kernel resolves `(handle) -> contract` from the tag alone.
-// Tag 0 is untagged: a channel port or a raw integer. PIC module providers
-// (fat32, a log-structured store, …) self-tag the handles they return from
-// open-style ops; the layout and the helpers are the registry's.
-pub mod fd {
-    pub use super::super::registry::fd::*;
+// Every handle a module holds is a word the kernel minted:
+// `0 | contract | generation | index` (`handle::encode`). A native object
+// (a channel, event, timer or lend) is named by its slot in the kernel's own
+// table; any other handle by a route the kernel keeps to the provider that
+// serves it. A provider — kernel, platform or module — returns and receives
+// only its own index, a non-negative `i32` it chooses. A handle whose
+// generation is not its slot's current one names nothing (`EBADF`).
+pub mod handle {
+    pub use super::super::registry::handle::*;
+}
 
-    /// Channel ports are untagged.
-    pub const FD_TAG_CHANNEL: i32 = UNTAGGED;
-    pub const FD_TAG_EVENT: i32 = super::super::registry::event::FD_TAG;
-    pub const FD_TAG_TIMER: i32 = super::super::registry::timer::FD_TAG;
-    pub const FD_TAG_DMA: i32 = super::super::registry::platform_dma_fd::FD_TAG;
-    pub const FD_TAG_BRIDGE: i32 = super::super::registry::bridge::FD_TAG;
-    pub const FD_TAG_KEY_VAULT: i32 = super::super::registry::key_vault::FD_TAG;
-    pub const FD_TAG_PCIE_DEVICE: i32 = super::super::registry::pcie_device::FD_TAG;
-    pub const FD_TAG_NIC_RING: i32 = super::super::registry::platform_nic_ring::FD_TAG;
-    pub const FD_TAG_DMA_CHANNEL: i32 = super::super::registry::platform_dma::FD_TAG;
-    pub const FD_TAG_FS: i32 = super::super::registry::fs::FD_TAG;
-    pub const FD_TAG_HAL_GPIO: i32 = super::super::registry::gpio::FD_TAG;
-    pub const FD_TAG_HAL_SPI: i32 = super::super::registry::spi::FD_TAG;
-    pub const FD_TAG_HAL_I2C: i32 = super::super::registry::i2c::FD_TAG;
-    pub const FD_TAG_HAL_UART: i32 = super::super::registry::uart::FD_TAG;
-    pub const FD_TAG_HAL_ADC: i32 = super::super::registry::adc::FD_TAG;
-    pub const FD_TAG_HAL_PWM: i32 = super::super::registry::pwm::FD_TAG;
-    pub const FD_TAG_HAL_PIO: i32 = super::super::registry::pio::FD_TAG;
-    pub const FD_TAG_STORAGE_NAMESPACE: i32 = super::super::registry::storage_namespace::FD_TAG;
-    pub const FD_TAG_STORAGE_OBJECT: i32 = super::super::registry::storage_object::FD_TAG;
-    pub const FD_TAG_USB_HOST: i32 = super::super::registry::usb_host::FD_TAG;
-    pub const FD_TAG_WORKLOAD: i32 = super::super::registry::workload::FD_TAG;
+/// A doorbell: how a provider signals the module that minted a signalling
+/// handle (an op the registry marks `signals`). The kernel hands the provider
+/// one per handle through `kernel::BIND_DOORBELL`; the provider rings it with
+/// `kernel::DOORBELL_RING`. The minter's handle then polls ready once and the
+/// minter is woken. A doorbell of a closed handle rings nothing.
+pub mod doorbell {
+    pub use super::super::registry::kernel::{BIND_DOORBELL, DOORBELL_RING};
+
+    /// `BIND_DOORBELL`'s argument: `[doorbell u32][contract u16][0 u16]`.
+    pub const BIND_ARG_LEN: usize = 8;
+    /// `DOORBELL_RING`'s argument: `[doorbell u32]`.
+    pub const RING_ARG_LEN: usize = 4;
+
+    /// The `BIND_DOORBELL` argument handing `doorbell` for a handle of
+    /// `contract`.
+    pub const fn bind_arg(doorbell: u32, contract: u16) -> [u8; BIND_ARG_LEN] {
+        let d = doorbell.to_le_bytes();
+        let c = contract.to_le_bytes();
+        [d[0], d[1], d[2], d[3], c[0], c[1], 0, 0]
+    }
+
+    /// `(doorbell, contract)` of a `BIND_DOORBELL` argument.
+    pub fn parse_bind(arg: &[u8]) -> Option<(u32, u16)> {
+        let b: &[u8; BIND_ARG_LEN] = arg.get(..BIND_ARG_LEN)?.try_into().ok()?;
+        Some((
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            u16::from_le_bytes([b[4], b[5]]),
+        ))
+    }
+
+    /// The `DOORBELL_RING` argument for `doorbell`.
+    pub const fn ring_arg(doorbell: u32) -> [u8; RING_ARG_LEN] {
+        doorbell.to_le_bytes()
+    }
 }
 
 /// Provider instance selectors — the shared hash the kernel and modules
 /// both compute so a provider's declared selector string and the name a
-/// `provider_call_sel("name", …)` carries resolve to the same u32 key.
+/// `BIND` by name carries resolve to the same u32 key.
 pub mod provider_selector {
     /// FNV-1a hash of a short selector string (a volume / instance name
     /// such as `"nvme0"` or `"boot"`). Single source of truth for both
-    /// sides of `provider_call_sel`; keep it a `const fn` so a module can fold
+    /// sides of a `BIND` by name; keep it a `const fn` so a module can fold
     /// its selector at compile time. Hash `0` is reserved to mean "unkeyed
     /// / default provider" — an input that happens to hash to `0` is
     /// nudged to `1` so it never aliases the default.
@@ -992,6 +1026,88 @@ pub mod provider_selector {
         } else {
             h
         }
+    }
+}
+
+/// `kernel::BIND`: open a handle bound to one provider of a contract
+/// (`provider_open(contract, BIND, arg)`). Every op on the handle reaches
+/// that provider; a handle an op on it mints is bound to the same one. The
+/// handle names a provider, never a resource, so closing it closes nothing
+/// the provider holds.
+/// The one capability-discovery shape. Every contract with capability bits
+/// has a `CAPS` op at low byte `0xFF`: `handle = -1` or a bound handle, no
+/// `data`, `arg` out exactly [`caps_word::LEN`] bytes holding the `u32` LE
+/// word, returning 0. Every provider of such a contract implements it, so
+/// `ENOSYS` from `CAPS` means no provider.
+pub mod caps_word {
+    /// The `CAPS` argument's exact length.
+    pub const LEN: usize = 4;
+    /// Every `CAPS` op's low byte.
+    pub const OP_LOW: u8 = 0xFF;
+
+    /// Write `word` into a `CAPS` argument: 0, or `EINVAL` when `arg` is not
+    /// exactly [`LEN`] bytes.
+    pub fn answer(arg: &mut [u8], word: u32) -> i32 {
+        if arg.len() != LEN {
+            return super::errno::EINVAL;
+        }
+        arg.copy_from_slice(&word.to_le_bytes());
+        0
+    }
+
+    /// The word a `CAPS` call answered into `arg`.
+    pub fn parse(arg: &[u8]) -> Option<u32> {
+        let b: [u8; LEN] = arg.try_into().ok()?;
+        Some(u32::from_le_bytes(b))
+    }
+}
+
+pub mod bind {
+    pub use super::super::registry::kernel::BIND;
+
+    /// `[NAME][len u8][name]`: the instance-keyed layer registered under
+    /// `name` (its `provider_selector::hash`), or for `platform` the
+    /// platform's own provider beneath every module layer.
+    pub const NAME: u8 = 1;
+    /// `[PORT][port_type u8][index u8]`: the module at the other end of one
+    /// of the caller's ports, which serves an edge contract on it.
+    pub const PORT: u8 = 2;
+    /// Longest name a `NAME` bind carries.
+    pub const NAME_MAX: usize = 32;
+    /// Longest `BIND` argument.
+    pub const ARG_MAX: usize = 2 + NAME_MAX;
+
+    /// Port types a `PORT` bind names, as `channel::PORT` numbers them.
+    pub const PORT_IN: u8 = 0;
+    pub const PORT_OUT: u8 = 1;
+    pub const PORT_CTRL: u8 = 2;
+
+    /// The `NAME` argument for `name` in `out`; its length, or `None` for a
+    /// name that is empty or longer than [`NAME_MAX`].
+    pub fn name(name: &[u8], out: &mut [u8; ARG_MAX]) -> Option<usize> {
+        if name.is_empty() || name.len() > NAME_MAX {
+            return None;
+        }
+        out[0] = NAME;
+        out[1] = name.len() as u8;
+        out[2..2 + name.len()].copy_from_slice(name);
+        Some(2 + name.len())
+    }
+
+    /// The `PORT` argument for the caller's port `index` of `port_type`.
+    pub const fn port(port_type: u8, index: u8) -> [u8; 3] {
+        [PORT, port_type, index]
+    }
+
+    /// What a provider is handed as the handle of an op that reached it
+    /// through a `PORT` bind: its own port on that edge.
+    pub const fn port_ref(port_type: u8, index: u8) -> i32 {
+        ((port_type as i32) << 8) | index as i32
+    }
+
+    /// The `(port_type, index)` a provider's port reference names.
+    pub const fn split_port_ref(r: i32) -> (u8, u8) {
+        (((r >> 8) & 0xFF) as u8, (r & 0xFF) as u8)
     }
 }
 

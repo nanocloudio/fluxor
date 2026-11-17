@@ -1,4 +1,5 @@
 use fluxor::abi::contracts::trust as wire;
+use fluxor::kernel::module::user_span::UserSpan;
 use fluxor::kernel::sys::errno;
 use std::sync::OnceLock;
 
@@ -78,56 +79,26 @@ fn roots() -> &'static Roots {
     })
 }
 
-/// Everything a VERIFY asked, decoded from the flat arg.
+/// Everything a VERIFY asked, decoded from the request in `data`.
 struct Request<'a> {
     purpose: u8,
     name: &'a [u8],
     unix_seconds: u64,
     chain: Vec<&'a [u8]>,
-    out_at: usize,
 }
 
 fn decode(arg: &[u8]) -> Option<Request<'_>> {
-    let purpose = *arg.get(wire::offset::PURPOSE)?;
-    let name_len = usize::from(*arg.get(wire::offset::NAME_LEN)?);
-    let cert_count = usize::from(*arg.get(wire::offset::CERT_COUNT)?);
-    if name_len > wire::MAX_NAME || cert_count > wire::MAX_CHAIN || cert_count == 0 {
-        return None;
-    }
-    let seconds_at = wire::offset::UNIX_SECONDS;
-    let seconds = u64::from_le_bytes(arg.get(seconds_at..seconds_at + 8)?.try_into().ok()?);
-    let name = arg.get(wire::offset::NAME..wire::offset::NAME + name_len)?;
-    let mut at = wire::offset::NAME + name_len;
-    let mut chain = Vec::with_capacity(cert_count);
-    for _ in 0..cert_count {
-        let len = usize::from(u16::from_le_bytes(arg.get(at..at + 2)?.try_into().ok()?));
-        at += 2;
-        if len == 0 || len > wire::MAX_CERT {
-            return None;
-        }
-        chain.push(arg.get(at..at + len)?);
-        at += len;
-    }
-    // The caller must have left room for the answer.
-    if arg.len() < at + wire::OUT_LEN {
-        return None;
-    }
+    let r = wire::parse_request(arg)?;
     Some(Request {
-        purpose,
-        name,
-        unix_seconds: seconds,
-        chain,
-        out_at: at,
+        purpose: r.purpose,
+        name: r.name,
+        unix_seconds: r.unix_seconds,
+        chain: r.certs().collect(),
     })
 }
 
-fn answer(arg: &mut [u8], at: usize, result: u8, checks: u8, reason: u8) {
-    if let Some(out) = arg.get_mut(at..at + wire::OUT_LEN) {
-        out[0] = result;
-        out[1] = checks;
-        out[2] = reason;
-        out[3] = 0;
-    }
+fn answer(out: &mut [u8], result: u8, checks: u8, reason: u8) {
+    out.copy_from_slice(&[result, checks, reason, 0]);
 }
 
 /// Map a verifier error onto the contract's advisory vocabulary. rustls does
@@ -170,39 +141,26 @@ const CHECKS_APPLIED: u8 = wire::check::PATH
     | wire::check::EKU
     | wire::check::CONSTRAINTS;
 
-/// PROBE and VERIFY for class `trust`, on `handle = -1`.
+/// VERIFY for class `trust`, on `handle = -1`.
 ///
-/// Returns 1 for PROBE, 0 for a VERIFY that produced a verdict — written
-/// into the caller's trailing out block, never returned in the status —
-/// `EINVAL` for a handle-scoped call or an arg that does not decode, and
-/// `ENOSYS` for any other opcode. A verdict is an answer: 0 is returned for
-/// a refusal exactly as for a pass.
-///
-/// # Safety
-/// `arg` points to at least `arg_len` bytes owned by the caller for the
-/// duration of the call, as the provider contract requires. The buffer is
-/// borrowed only for this call and the only bytes written are the four the
-/// request's own header located.
-pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// VERIFY reads the request from `data` and writes the verdict
+/// `[result u8][checks u8][reason u8][0 u8]` into `arg`. Returns 0 for a
+/// VERIFY that produced a verdict — never returned in the status — `EINVAL` for a handle-scoped call, an `arg` shorter than the
+/// verdict or a request that does not decode, and `ENOSYS` for any other
+/// opcode. A verdict is an answer: 0 is returned for a refusal exactly as
+/// for a pass.
+pub fn dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     if handle >= 0 {
         return errno::EINVAL;
     }
     match opcode {
-        wire::PROBE => {
-            // Present even when the store could not be read: a graph that
-            // asked for system trust should start and then refuse chains,
-            // not silently compose against a different trust source.
-            1
-        }
         wire::VERIFY => {
-            if arg.is_null() || arg_len == 0 {
-                return errno::EINVAL;
-            }
-            let buffer = core::slice::from_raw_parts_mut(arg, arg_len);
-            let Some(request) = decode(buffer) else {
+            let Some(buffer) = arg.get_mut(..wire::OUT_LEN) else {
                 return errno::EINVAL;
             };
-            let out_at = request.out_at;
+            let Some(request) = decode(data.as_slice()) else {
+                return errno::EINVAL;
+            };
             if request.purpose != wire::purpose::SERVER {
                 // This provider answers for SERVER only: the verifier it
                 // holds is a server-certificate verifier, so a CLIENT
@@ -210,7 +168,6 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
                 // than judged under server policy.
                 answer(
                     buffer,
-                    out_at,
                     wire::result::REFUSED,
                     0,
                     wire::reason::BAD_PURPOSE,
@@ -222,7 +179,6 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
                 // refuse rather than verify a chain with expiry skipped.
                 answer(
                     buffer,
-                    out_at,
                     wire::result::REFUSED,
                     0,
                     wire::reason::NO_TIME,
@@ -232,7 +188,6 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
             let Some(verifier) = roots().verifier.clone() else {
                 answer(
                     buffer,
-                    out_at,
                     wire::result::REFUSED,
                     0,
                     wire::reason::UNKNOWN_CA,
@@ -246,7 +201,6 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
             let Ok(name) = core::str::from_utf8(request.name) else {
                 answer(
                     buffer,
-                    out_at,
                     wire::result::REFUSED,
                     0,
                     wire::reason::NAME_MISMATCH,
@@ -256,7 +210,6 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
             let Ok(server_name) = rustls_pki_types::ServerName::try_from(name) else {
                 answer(
                     buffer,
-                    out_at,
                     wire::result::REFUSED,
                     0,
                     wire::reason::NAME_MISMATCH,
@@ -285,7 +238,6 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
                 Ok(_) => {
                     answer(
                         buffer,
-                        out_at,
                         wire::result::TRUSTED,
                         CHECKS_APPLIED,
                         wire::reason::NONE,
@@ -296,7 +248,6 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
                     let reason = reason_of(&e);
                     answer(
                         buffer,
-                        out_at,
                         wire::result::REFUSED,
                         CHECKS_APPLIED,
                         reason,

@@ -1,6 +1,5 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "linux"]
-grants = ["key_vault"]
 # Seals and opens as packets come; nothing here is timed. IPv4 or IPv6 on
 # both sides: the fabric (the anchors' addresses) and the inner packet.
 timer_class = "agnostic"
@@ -47,12 +46,15 @@ index = 1
 direction = "input"
 content_type = "NetProto"
 buffer_size = 16384
+# A sealed datagram whole, header included (`module_facts!` DG_RECORD).
+accepts_record = 1664
 
 [[ports]]
 name = "dg_out"
 direction = "output"
 content_type = "NetProto"
 buffer_size = 16384
+max_record = 1664
 
 [[ports]]
 name = "frames_out"
@@ -64,6 +66,12 @@ buffer_size = 16384
 [[resources]]
 requires_contract = "channel"
 access = "read"
+
+# The cell's key held in the vault (`key_label`): tags made there.
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+active_when_params = ["key_label"]
 
 [observability]
 exempt = "a tunnel end — the packets it carries are observed by ip on both hosts; its refusals are counted on its heartbeat"

@@ -223,8 +223,9 @@ host_object_close / host_object_put / host_object_delete
 // storage.namespace provider (§5).
 host_ns_stat / host_ns_list
 
-// Image decode (createImageBitmap + OffscreenCanvas).
-host_image_decode_open / host_image_decode_url /
+// Image decode (createImageBitmap + OffscreenCanvas): the
+// wasm_browser_image_codec built-in and the image_decode provider (§5).
+host_image_decode_open / host_image_decode_object /
 host_image_decode_size / host_image_decode_recv /
 host_image_decode_close
 
@@ -457,21 +458,24 @@ fetches, instantiate one module per URL.
 
 `wasm_browser_http` (`src/platform/wasm/http.rs`) is the browser as an
 HTTP exchange provider: a provider of the exchange contract
-(`exchange.md`) declaring `stream.ordered_ack.exchange`, answering with
-the same records and statuses a socket-backed HTTP client does, so a
+(`exchange.md`) speaking its HTTP binding and declaring
+`stream.ordered_ack.exchange`, answering with the same records and
+statuses a socket-backed HTTP client does, so a
 requester moves between the two by wiring alone. Request records arrive
 on `request_in`; each request is collected whole (`fetch()` takes its
 body in one piece, up to `PAYLOAD_MAX`), and the page's `fetch()`
 performs it. The answer leaves on `response_out` under the request's
-exchange id: a response HEAD with the status, the content type, the
-response's other header fields and the first body bytes, then BODY
+exchange id: a response HEAD with the status as its detail, the
+response's header fields (the content type among them) as meta and the
+first body bytes, then BODY
 records as the rest arrives, never past the requester's credit.
 
 A request's target is a path and the `origin` param names where (empty
 means the page's origin); a request may name its authority in a `host`
 header, which must match a set origin and is dialled over https when
-none is set. A target with its own scheme or host, an unknown method,
-CONNECT, a publish, a broadcast or an upgrade is answered 400; a request
+none is set. A target with its own scheme or host, anything but a call
+with a method (a publish, a CONNECT or an upgrade), a broadcast, or a
+header value that would split its line is answered 400; a request
 past what it collects 413; more exchanges at once than it holds 503; a
 fetch that fails before the response head, or a head too large for one
 record, 502. A fetch that fails after the head aborts the exchange; an
@@ -576,6 +580,17 @@ the next page; `STAT`
 returns size, mtime, kind, and an etag (a stable FNV hash synthesised
 per key for written entries, or the manifest-supplied etag for shipped
 content).
+
+### `image_decode` provider — `src/platform/wasm/image_decode.rs`
+
+`DECODE` names a byte range of an object by its key. The shim reads that
+range the way the `storage.object` provider reads a key (the written store,
+then `asset://`, then a ranged `fetch()` of the origin), decodes it with
+`createImageBitmap`, scales it to the requested size on an
+`OffscreenCanvas` and packs it as RGB565. The encoded bytes never enter
+wasm memory. `RECV` answers `EAGAIN` until the pixels exist, then drains
+them; a missing or short range, or bytes the browser cannot decode, is
+`EIO`.
 
 `modules/foundation/object_bank` composes the two surfaces into a
 storage-backed asset bank: enumerate a prefix via `storage.namespace`

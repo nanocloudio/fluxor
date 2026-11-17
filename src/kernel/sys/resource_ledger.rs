@@ -97,7 +97,7 @@ pub fn pool_name(pool: u16) -> &'static str {
         res::POOL_STORE_GRANTS => "store_grants",
         res::POOL_SANDBOXES => "sandboxes",
         res::POOL_TTY_SESSIONS => "tty_sessions",
-        res::POOL_TRACKED_HANDLES => "tracked_handles",
+        res::POOL_HANDLES => "handles",
         res::POOL_STATE_FREE_LIST => "state_free_list",
         res::POOL_NET_POLICY_TABLES => "net_policy_tables",
         res::POOL_NET_POLICY_TABLE_BYTES => "net_policy_table_bytes",
@@ -107,6 +107,7 @@ pub fn pool_name(pool: u16) -> &'static str {
         res::POOL_NET_ROUTE_SEGMENTS => "net_route_segments",
         res::POOL_NET_ROUTE_PEERS => "net_route_peers",
         res::POOL_NET_ROUTE_HELD => "net_route_held",
+        res::POOL_LENDS => "lends",
         _ => "unknown",
     }
 }
@@ -146,13 +147,14 @@ fn sample_cur(pool: u16) -> u64 {
         res::POOL_CONFIG_ARENA => crate::kernel::boot::config::config_params_usage().0 as u64,
         res::POOL_CHANNELS => crate::kernel::ipc::channel::in_use_count() as u64,
         res::POOL_EVENTS => crate::kernel::ipc::event::in_use_count() as u64,
-        res::POOL_TIMERS => crate::kernel::ipc::fd::timer_in_use_count() as u64,
+        res::POOL_TIMERS => crate::kernel::ipc::timer::timer_in_use_count() as u64,
         res::POOL_OWNERS => {
             crate::kernel::exec::scheduler::ownership::owners().active_workload_count() as u64
         }
         res::POOL_MODULE_SLOTS => crate::kernel::exec::scheduler::active_module_count() as u64,
         res::POOL_ELASTIC_REGION => crate::kernel::mem::elastic::region_usage().0 as u64,
-        res::POOL_TRACKED_HANDLES => crate::kernel::module::provider::tracked_in_use() as u64,
+        res::POOL_HANDLES => crate::kernel::module::provider::routed_handles_in_use() as u64,
+        res::POOL_LENDS => crate::kernel::ipc::lend::in_use() as u64,
         res::POOL_STATE_FREE_LIST => {
             crate::kernel::module::loader::state_free_list_usage().0 as u64
         }
@@ -300,9 +302,11 @@ pub fn pool_domain(pool: u16) -> Option<u64> {
         res::POOL_MODULE_SLOTS => crate::kernel::config::MAX_MODULES,
         res::POOL_CHANNELS => crate::kernel::exec::scheduler::MAX_CHANNELS,
         res::POOL_OWNERS => crate::kernel::workload::owner::MAX_OWNERS,
-        // Event and timer handles name their slot in a tagged fd's slot
-        // field.
-        res::POOL_EVENTS | res::POOL_TIMERS => crate::abi::kernel_abi::fd::SLOT_MASK as usize + 1,
+        // Event, timer and routed handles name their slot in the handle's
+        // index field.
+        res::POOL_EVENTS | res::POOL_TIMERS | res::POOL_HANDLES => {
+            crate::abi::kernel_abi::handle::INDEX_LIMIT
+        }
         #[cfg(feature = "host-linux")]
         res::POOL_SANDBOXES => crate::platform::linux::host_backend::MAX_SANDBOXES,
         #[cfg(feature = "host-linux")]

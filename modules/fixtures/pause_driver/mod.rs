@@ -204,12 +204,26 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         arg[2..6].copy_from_slice(&s.generation.to_le_bytes());
         if !s.paused && now >= s.pause_at_ms as u64 {
             s.paused = true;
-            let rc = (sys.provider_call)(-1, OWNER_PAUSE, arg.as_mut_ptr(), arg.len());
+            let rc = (sys.provider_call)(
+                -1,
+                OWNER_PAUSE,
+                arg.as_mut_ptr(),
+                arg.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             emit(sys, b"pause", now, rc);
         }
         if s.paused && !s.resumed && now >= s.resume_at_ms as u64 {
             s.resumed = true;
-            let rc = (sys.provider_call)(-1, OWNER_RESUME, arg.as_mut_ptr(), arg.len());
+            let rc = (sys.provider_call)(
+                -1,
+                OWNER_RESUME,
+                arg.as_mut_ptr(),
+                arg.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             emit(sys, b"resume", now, rc);
         }
         StepReturn::Continue

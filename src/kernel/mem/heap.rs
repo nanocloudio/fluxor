@@ -759,13 +759,17 @@ impl ModuleHeap {
         let found = self
             .segment_of(ptr)
             .and_then(|i| self.segs[i].allocated_block(ptr).map(|b| (i, b)));
-        let Some((seg, (offset, _, hdr))) = found else {
+        let Some((seg, (offset, hdr_ptr, hdr))) = found else {
             log::error!(
                 "[heap] free: 0x{:x} is not a live allocation of this heap",
                 ptr as usize
             );
             return;
         };
+        // From here on the block is reached through the heap's own header,
+        // never through the pointer the module handed in.
+        // SAFETY: the data region follows the validated header in the segment.
+        let ptr = unsafe { hdr_ptr.cast::<u8>().add(HEADER_SIZE) };
         let freed_size = hdr.data_size();
 
         // Validate the trailing canary before releasing the chunk.
@@ -818,6 +822,8 @@ impl ModuleHeap {
         let Some((seg, (offset, hdr_ptr, hdr))) = found else {
             return core::ptr::null_mut();
         };
+        // SAFETY: as `free`: the data region follows the validated header.
+        let ptr = unsafe { hdr_ptr.cast::<u8>().add(HEADER_SIZE) };
         let old_size = hdr.data_size();
         // Include canary cost in the new alignment when enabled —
         // an in-place grow that omitted this would write the new

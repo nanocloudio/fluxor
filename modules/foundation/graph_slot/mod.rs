@@ -378,7 +378,14 @@ unsafe fn epoch_to_beat(s: &State, pending: u8) -> Option<u64> {
 
 unsafe fn sys_erase_sector(sys: &SyscallTable, offset: u32) -> i32 {
     let mut arg = offset.to_le_bytes();
-    (sys.provider_call)(-1, SYS_FLASH_RAW_ERASE, arg.as_mut_ptr(), 4)
+    (sys.provider_call)(
+        -1,
+        SYS_FLASH_RAW_ERASE,
+        arg.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn sys_program_page(sys: &SyscallTable, offset: u32, page: *const u8) -> i32 {
@@ -394,7 +401,14 @@ unsafe fn sys_program_page(sys: &SyscallTable, offset: u32, page: *const u8) -> 
         core::ptr::write_volatile(p.add(4 + i), *page.add(i));
         i += 1;
     }
-    (sys.provider_call)(-1, SYS_FLASH_RAW_PROGRAM, buf.as_mut_ptr(), 4 + PAGE_SIZE)
+    (sys.provider_call)(
+        -1,
+        SYS_FLASH_RAW_PROGRAM,
+        buf.as_mut_ptr(),
+        4 + PAGE_SIZE,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 // ============================================================================
@@ -971,6 +985,8 @@ pub extern "C" fn module_new(
             abi::kernel_abi::FLASH_LAYOUT,
             layout.as_mut_ptr(),
             layout.len(),
+            core::ptr::null_mut(),
+            0,
         );
         match abi::platform::rp::flash_layout::GraphFlash::decode(&layout).filter(|_| rc >= 0) {
             Some(g) => {
@@ -997,13 +1013,21 @@ pub extern "C" fn module_new(
         core::ptr::write(&mut s.act_sig, Ed25519VerifyJob::empty());
         // The kernel image's signing root, if any.
         let mut root = [0u8; 32];
-        let rc =
-            ((*s.syscalls).provider_call)(-1, abi::kernel_abi::SIGNING_ROOT, root.as_mut_ptr(), 32);
+        let rc = ((*s.syscalls).provider_call)(
+            -1,
+            abi::kernel_abi::SIGNING_ROOT,
+            root.as_mut_ptr(),
+            32,
+            core::ptr::null_mut(),
+            0,
+        );
         s.root = root;
         s.has_root = u8::from(rc == 32);
         let admitted = ((*s.syscalls).provider_call)(
             -1,
             abi::kernel_abi::SLOT_ADMITTED,
+            core::ptr::null_mut(),
+            0,
             core::ptr::null_mut(),
             0,
         );

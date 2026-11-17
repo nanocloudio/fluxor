@@ -284,7 +284,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
 
     match s.phase {
         PH_CREATE => {
-            let rc = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr().cast_mut(), path.len());
+            let rc = (sys.provider_call)(
+                -1,
+                FS_OPEN_CREATE,
+                path.as_ptr().cast_mut(),
+                path.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == -11 || rc == -36 {
                 return StepReturn::Continue;
             }
@@ -323,7 +330,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 };
                 i += 1;
             }
-            let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_WRITE,
+                chunk.as_mut_ptr(),
+                n,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == -11 || rc == -36 {
                 return StepReturn::Continue;
             }
@@ -336,7 +350,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_FSYNC => {
-            let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_FSYNC,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == -11 || rc == -36 {
                 return StepReturn::Continue;
             }
@@ -349,7 +370,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_CLOSE => {
-            let rc = (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc < 0 {
                 return fail(s, rc);
             }
@@ -362,7 +390,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         PH_PUBLISH => {
             // The bytes are durable; the NAME that finds them is not until
             // this fence lands.
-            let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_ptr().cast_mut(), path.len());
+            let rc = (sys.provider_call)(
+                -1,
+                FS_FSYNC_NAME,
+                path.as_ptr().cast_mut(),
+                path.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == -11 || rc == -36 {
                 return StepReturn::Continue;
             }

@@ -36,7 +36,7 @@
 pub use super::super::registry::vault_store::ATTACH;
 
 /// One piece of a slot as the medium holds it. arg:
-/// `[phase:u8][slot:u8][_pad:2][offset:u32][ptr:u64][len:u32][_pad:4]`.
+/// `[phase:u8][slot:u8][_pad:2][offset:u32]`; `data` in = the piece.
 /// Pieces of one pass arrive in order from offset 0; the pass ends at
 /// `image_len`. Returns 0; `-EINVAL` out of order or out of phase; `-EIO`
 /// when a `FILL` ends with bytes that are not the image its `SCAN` chose
@@ -52,8 +52,9 @@ pub use super::super::registry::vault_store::DECIDE;
 /// newest, `-EAGAIN` before the load finished.
 pub use super::super::registry::vault_store::PENDING;
 
-/// Copy part of image `seq`. arg: `[seq:u64][offset:u32][len:u32][ptr:u64]`.
-/// Returns 0; `-EAGAIN` when the image is no longer `seq` (ask `PENDING`
+/// Copy part of image `seq`. arg: `[seq:u64][offset:u32]`; `data` out =
+/// the piece, as many bytes as `data` holds. Returns 0; `-EINVAL` for a
+/// piece past the image's end; `-EAGAIN` when the image is no longer `seq` (ask `PENDING`
 /// again).
 pub use super::super::registry::vault_store::READ;
 
@@ -87,9 +88,9 @@ pub const DECIDE_EMPTY: i32 = 2;
 
 /// Argument sizes.
 pub const ATTACH_LEN: usize = 8;
-pub const LOAD_LEN: usize = 24;
+pub const LOAD_LEN: usize = 8;
 pub const PENDING_LEN: usize = 16;
-pub const READ_LEN: usize = 24;
+pub const READ_LEN: usize = 12;
 pub const DONE_LEN: usize = 16;
 
 /// Whether `op` is one of these opcodes.

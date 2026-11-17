@@ -20,8 +20,6 @@
 //! `CURRENT_MODULE_PER_CORE[c]` is an atomic array indexed by
 //! `hal::core_id()`. See `docs/architecture/concurrency.md`.
 
-use core::ptr::null;
-
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::kernel::boot::config::{
@@ -34,7 +32,7 @@ use crate::kernel::exec::step_guard::{
 };
 use crate::kernel::ipc::channel;
 use crate::kernel::ipc::channel::{
-    channel_set_flags, channel_set_mailbox, channel_set_reader_gone, POLL_ERR, POLL_HUP,
+    channel_producer_gone, channel_set_mailbox, channel_set_reader_gone,
 };
 use crate::kernel::ipc::ring_size as rings;
 use crate::kernel::module::loader::{
@@ -293,6 +291,11 @@ pub struct Edge {
     /// channel by the platform's cross-domain bridging instead
     /// (delivery-side wake).
     pub wake_on_write: bool,
+    /// The consumer port declares `retains_send` (`GraphEdge::retains_send`).
+    /// A fan's bridge edge out of the fanned producer carries it only when
+    /// every fanned edge does, so `channel::FACTS` on the producer's channel
+    /// answers for every consumer it reaches.
+    pub retains_send: bool,
     /// This edge references a **pre-existing shared channel** it neither
     /// opened nor owns — an attachable-lane merge's spare input lane.
     /// `channel` is pre-assigned to that spare-lane id;
@@ -335,6 +338,7 @@ impl Edge {
             rate_class: 0,
             bridge_slot: -1,
             wake_on_write: false,
+            retains_send: false,
             shared_channel: false,
             tap: false,
             tap_source: -1,
@@ -365,6 +369,7 @@ impl Edge {
             rate_class: 0,
             bridge_slot: -1,
             wake_on_write: false,
+            retains_send: false,
             shared_channel: false,
             tap: false,
             tap_source: -1,
@@ -484,6 +489,9 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         // ring for it — the producer must write into the lane the merge
         // already reads. No boot edge sets this.
         if edge.shared_channel {
+            // The lane's consumer is the merge that cached it; this edge
+            // names its producer.
+            channel::channel_set_producer(edge.channel, edge.from_module as ModuleId);
             continue;
         }
         // Check for buffer group aliasing
@@ -496,7 +504,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             if safe {
                 // Alias: reuse existing channel for this group
                 edge.channel = group_channels[group];
-                // aliased to existing group channel
+                bind_edge_ends(edge);
                 continue;
             } else {
                 // skip alias — module not mailbox_safe
@@ -531,17 +539,26 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             );
             return -1;
         };
+        // A ring keeps each record's length beside it; a mailbox's record is
+        // the whole buffer.
         let (_, max_record) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
-        if max_record > granted {
+        let footprint = if group > 0 {
+            u64::from(max_record)
+        } else {
+            rings::record_bytes(max_record)
+        };
+        if footprint > u64::from(granted) {
             log::error!(
                 "[graph] edge {}→{}: producer port {} declares max_record={} \
-                 but the ring grants {} bytes (requested {}); an all-or-nothing \
-                 write larger than the ring can never succeed. Raise the edge's \
-                 buffer_bytes / the port's buffer_size, or lower max_record.",
+                 ({} bytes of ring with its length prefixes) but the ring grants \
+                 {} bytes (requested {}); an all-or-nothing write larger than the \
+                 ring can never succeed. Raise the edge's buffer_bytes / the \
+                 port's buffer_size, or lower max_record.",
                 edge.from_module,
                 edge.to_module,
                 edge.from_port_index,
                 max_record,
+                footprint,
                 granted,
                 buf_size,
             );
@@ -551,23 +568,17 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         // An unsized edge opens with no config and takes the kernel's
         // default ring; a sized one passes its granted ring, which
         // `channel_open` accepts only as a power of two in range.
-        let producer_mod = edge.from_module as ModuleId;
         let chan = if buf_size > 0 {
-            let config = granted.to_le_bytes();
-            channel::channel_open_for_module(
-                channel::CHANNEL_TYPE_PIPE,
-                config.as_ptr(),
-                4,
-                producer_mod,
-            )
+            channel::channel_open(&granted.to_le_bytes())
         } else {
-            channel::channel_open_for_module(channel::CHANNEL_TYPE_PIPE, null(), 0, producer_mod)
+            channel::channel_open(&[])
         };
 
         if chan < 0 {
             return -1;
         }
         edge.channel = chan;
+        bind_edge_ends(edge);
         count += 1;
 
         // Record channel handle and enable mailbox mode for grouped edges.
@@ -579,6 +590,24 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         }
     }
     count
+}
+
+/// Bind `edge`'s ends on its channel: its producer writes it, its consumer
+/// reads it. A tap's channel is written by the kernel's mirror alone.
+fn bind_edge_ends(edge: &Edge) {
+    let end = |m: usize| {
+        if m < module_slots() {
+            m as ModuleId
+        } else {
+            NO_MODULE
+        }
+    };
+    let producer = if edge.tap {
+        NO_MODULE
+    } else {
+        end(edge.from_module)
+    };
+    channel::channel_bind_edge(edge.channel, producer, end(edge.to_module));
 }
 
 /// Validate buffer group constraints after module instantiation.
@@ -632,6 +661,9 @@ pub fn close_channels(edges: &[Edge]) {
         // handle. Detaching a workload just drops the edge, reverting the
         // lane to producer-less/free.
         if edge.shared_channel {
+            // The lane's consumer is the merge that cached it; this edge
+            // names its producer.
+            channel::channel_set_producer(edge.channel, edge.from_module as ModuleId);
             continue;
         }
         if edge.channel >= 0 {
@@ -723,8 +755,8 @@ impl NameArena {
 
 pub mod module_types;
 pub use module_types::{
-    BuiltInModule, DummyModule, MergeModule, ModuleSlot, TeeModule, FAN_FRAMES_PER_STEP,
-    FRAME_KIND_NET, FRAME_KIND_RECORD,
+    BuiltInModule, BuiltInStepFn, DummyModule, MergeModule, ModuleSlot, TeeModule,
+    FAN_FRAMES_PER_STEP, FRAME_KIND_NET, FRAME_KIND_RECORD,
 };
 
 /// Live graph mutation (add owner / free owner).

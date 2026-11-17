@@ -29,6 +29,7 @@ use fluxor_rt::*;
 
 const MAX_HANDLES: usize = 8;
 const MAX_BUSES: usize = 2;
+const XFER_MAX: usize = abi::contracts::hal::i2c::XFER_MAX;
 
 // DW I2C register offsets
 const IC_CON: u8 = 0x00;
@@ -68,11 +69,13 @@ struct I2cHandle {
     _pad2: u16,
 }
 
-// Transfer state for async operations
+/// One handle's transfer. `buf` holds the bytes to write, copied in when the
+/// transfer starts, and then the bytes read, from 0: every write byte is in
+/// the TX FIFO before the first read command, so a received byte never
+/// lands on one still to be sent.
 #[repr(C)]
 struct I2cTransfer {
-    tx_ptr: u32,
-    rx_ptr: u32,
+    buf: [u8; XFER_MAX],
     tx_len: u16,
     rx_len: u16,
     tx_pos: u16, // bytes written to TX FIFO so far
@@ -80,7 +83,7 @@ struct I2cTransfer {
     pending: u8, // 1 = waiting to start
     active: u8,  // 1 = FIFO transfer in progress
     op_type: u8, // 0=write, 1=read, 2=write_read
-    _pad: u8,
+    done: u8,    // 1 = finished, `result` not yet polled
     result: i32,
 }
 
@@ -125,6 +128,8 @@ unsafe fn i2c_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
         abi::registry::rp_raw::I2C_REG_WRITE,
         bp,
         5,
+        core::ptr::null_mut(),
+        0,
     );
 }
 
@@ -137,6 +142,8 @@ unsafe fn i2c_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
         abi::registry::rp_raw::I2C_REG_READ,
         bp,
         5,
+        core::ptr::null_mut(),
+        0,
     );
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
@@ -148,6 +155,8 @@ unsafe fn i2c_set_enable(sys: &SyscallTable, bus: u8, enable: bool) {
         abi::registry::rp_raw::I2C_SET_ENABLE,
         buf.as_mut_ptr(),
         1,
+        core::ptr::null_mut(),
+        0,
     );
 }
 
@@ -229,6 +238,7 @@ unsafe fn poll_i2c_transfer(s: &mut I2cState, idx: usize) {
         let _ = i2c_reg_read(sys, bus, IC_CLR_TX_ABRT);
         (*tp).result = -5; // EIO
         (*tp).active = 0;
+        (*tp).done = 1;
         return;
     }
 
@@ -243,11 +253,7 @@ unsafe fn poll_i2c_transfer(s: &mut I2cState, idx: usize) {
         0 => {
             // Write: push data bytes
             if tx_pos < total_tx && (status & STAT_TFNF) != 0 {
-                let byte = if (*tp).tx_ptr != 0 {
-                    *(((*tp).tx_ptr as usize + tx_pos) as *const u8)
-                } else {
-                    0
-                };
+                let byte = (*tp).buf[tx_pos];
                 let last = tx_pos + 1 == total_tx;
                 let cmd = (byte as u32) | if last { CMD_STOP } else { 0 };
                 i2c_reg_write(sys, bus, IC_DATA_CMD, cmd);
@@ -260,6 +266,7 @@ unsafe fn poll_i2c_transfer(s: &mut I2cState, idx: usize) {
                 if txflr == 0 && (status & STAT_ACTIVITY) == 0 {
                     (*tp).result = total_tx as i32;
                     (*tp).active = 0;
+                    (*tp).done = 1;
                 }
             }
         }
@@ -275,24 +282,19 @@ unsafe fn poll_i2c_transfer(s: &mut I2cState, idx: usize) {
             let rx_pos = (*tp).rx_pos as usize;
             if rx_pos < total_rx && (status & STAT_RFNE) != 0 {
                 let byte = i2c_reg_read(sys, bus, IC_DATA_CMD) as u8;
-                if (*tp).rx_ptr != 0 {
-                    *(((*tp).rx_ptr as usize + rx_pos) as *mut u8) = byte;
-                }
+                (*tp).buf[rx_pos] = byte;
                 (*tp).rx_pos = (rx_pos + 1) as u16;
             }
             if (*tp).rx_pos as usize >= total_rx {
                 (*tp).result = total_rx as i32;
                 (*tp).active = 0;
+                (*tp).done = 1;
             }
         }
         2 => {
             // Write+Read: write phase, then restart + read phase
             if tx_pos < total_tx && (status & STAT_TFNF) != 0 {
-                let byte = if (*tp).tx_ptr != 0 {
-                    *(((*tp).tx_ptr as usize + tx_pos) as *const u8)
-                } else {
-                    0
-                };
+                let byte = (*tp).buf[tx_pos];
                 // No STOP after write — restart before read
                 i2c_reg_write(sys, bus, IC_DATA_CMD, byte as u32);
                 (*tp).tx_pos = (tx_pos + 1) as u16;
@@ -311,19 +313,19 @@ unsafe fn poll_i2c_transfer(s: &mut I2cState, idx: usize) {
             let rx_pos = (*tp).rx_pos as usize;
             if rx_pos < total_rx && (status & STAT_RFNE) != 0 {
                 let byte = i2c_reg_read(sys, bus, IC_DATA_CMD) as u8;
-                if (*tp).rx_ptr != 0 {
-                    *(((*tp).rx_ptr as usize + rx_pos) as *mut u8) = byte;
-                }
+                (*tp).buf[rx_pos] = byte;
                 (*tp).rx_pos = (rx_pos + 1) as u16;
             }
             if (*tp).rx_pos as usize >= total_rx && (*tp).tx_pos as usize >= total_tx + total_rx {
-                (*tp).result = (total_tx + total_rx) as i32;
+                (*tp).result = total_rx as i32;
                 (*tp).active = 0;
+                (*tp).done = 1;
             }
         }
         _ => {
             (*tp).result = -38;
             (*tp).active = 0;
+            (*tp).done = 1;
         }
     }
 }
@@ -337,13 +339,27 @@ const I2C_CLOSE: u32 = abi::registry::i2c::CLOSE;
 const I2C_WRITE: u32 = abi::registry::i2c::WRITE;
 const I2C_READ: u32 = abi::registry::i2c::READ;
 const I2C_WRITE_READ: u32 = abi::registry::i2c::WRITE_READ;
+const I2C_POLL: u32 = abi::registry::i2c::POLL;
 const I2C_CLAIM: u32 = abi::registry::i2c::CLAIM;
 const I2C_RELEASE: u32 = abi::registry::i2c::RELEASE;
 
+/// The slot an open handle names, if it is open.
+unsafe fn live_idx(s: &I2cState, handle: i32) -> Option<usize> {
+    if handle < 0 {
+        return None;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_HANDLES || (*s.handles.as_ptr().add(idx)).in_use == 0 {
+        return None;
+    }
+    Some(idx)
+}
+
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
-/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
-/// (may be null when `arg_len` is 0) valid for the call.
+/// module's `module_new` initialised, `arg` points to `arg_len` bytes and
+/// `data` to `data_len` bytes (either may be null when its length is 0),
+/// both valid for the call.
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn i2c_dispatch(
@@ -352,121 +368,129 @@ pub unsafe extern "C" fn i2c_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     let s = &mut *(state as *mut I2cState);
+    let arg: &[u8] = if arg.is_null() {
+        &[]
+    } else {
+        core::slice::from_raw_parts(arg, arg_len)
+    };
+
+    if opcode == I2C_OPEN {
+        let Some((bus, addr)) = abi::contracts::hal::i2c::open::decode(arg) else {
+            return E_INVAL;
+        };
+        if bus as usize >= MAX_BUSES {
+            return E_INVAL;
+        }
+        let mut i = 0usize;
+        while i < MAX_HANDLES {
+            let idx = (s.next_handle as usize + i) % MAX_HANDLES;
+            let hp = s.handles.as_mut_ptr().add(idx);
+            if (*hp).in_use == 0 {
+                (*hp).in_use = 1;
+                (*hp).bus_id = bus;
+                (*hp).addr = addr;
+                (*hp).owner = 0;
+                s.next_handle = ((idx + 1) % MAX_HANDLES) as u8;
+                let tp = s.transfers.as_mut_ptr().add(idx);
+                (*tp).pending = 0;
+                (*tp).active = 0;
+                (*tp).done = 0;
+                (*tp).result = 0;
+                return idx as i32;
+            }
+            i += 1;
+        }
+        return E_BUSY;
+    }
+
+    let Some(idx) = live_idx(s, handle) else {
+        return E_INVAL;
+    };
+    let tp = s.transfers.as_mut_ptr().add(idx);
 
     match opcode {
-        I2C_OPEN => {
-            // arg=[bus:u8, addr:u16 LE] (3 bytes)
-            if arg.is_null() || arg_len < 3 {
-                return -22;
-            }
-            let bus = *arg;
-            if bus as usize >= MAX_BUSES {
-                return -22;
-            }
-            let addr = u16::from_le_bytes([*arg.add(1), *arg.add(2)]);
-            let mut i = 0usize;
-            while i < MAX_HANDLES {
-                let idx = (s.next_handle as usize + i) % MAX_HANDLES;
-                let hp = s.handles.as_mut_ptr().add(idx);
-                if (*hp).in_use == 0 {
-                    (*hp).in_use = 1;
-                    (*hp).bus_id = bus;
-                    (*hp).addr = addr;
-                    (*hp).owner = 0;
-                    s.next_handle = ((idx + 1) % MAX_HANDLES) as u8;
-                    let tp = s.transfers.as_mut_ptr().add(idx);
-                    (*tp).pending = 0;
-                    (*tp).active = 0;
-                    (*tp).result = 0;
-                    return idx as i32;
-                }
-                i += 1;
-            }
-            -16 // EBUSY
-        }
         I2C_CLOSE => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
-            let hp = s.handles.as_mut_ptr().add(idx);
-            (*hp).in_use = 0;
+            (*s.handles.as_mut_ptr().add(idx)).in_use = 0;
+            (*tp).pending = 0;
+            (*tp).active = 0;
+            (*tp).done = 0;
             0
         }
         I2C_WRITE | I2C_READ | I2C_WRITE_READ => {
-            // WRITE: arg=[tx_ptr:u32, tx_len:u16] (6 bytes)
-            // READ:  arg=[rx_ptr:u32, rx_len:u16] (6 bytes)
-            // WRITE_READ: arg=[tx_ptr:u32, tx_len:u16, rx_ptr:u32, rx_len:u16] (12 bytes)
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
-            let tp = s.transfers.as_mut_ptr().add(idx);
             if (*tp).pending != 0 || (*tp).active != 0 {
-                return -16;
+                return E_BUSY;
             }
-
-            if opcode == I2C_WRITE {
-                if arg.is_null() || arg_len < 6 {
-                    return -22;
-                }
-                (*tp).tx_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-                (*tp).tx_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-                (*tp).rx_ptr = 0;
-                (*tp).rx_len = 0;
-                (*tp).op_type = 0;
-            } else if opcode == I2C_READ {
-                if arg.is_null() || arg_len < 6 {
-                    return -22;
-                }
-                (*tp).rx_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-                (*tp).rx_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-                (*tp).tx_ptr = 0;
-                (*tp).tx_len = 0;
-                (*tp).op_type = 1;
+            let tx_len = if opcode == I2C_READ { 0 } else { data_len };
+            let rx_len = if opcode == I2C_WRITE {
+                0
             } else {
-                if arg.is_null() || arg_len < 12 {
-                    return -22;
+                match abi::contracts::hal::i2c::read::decode(arg) {
+                    Some(n) => n as usize,
+                    None => return E_INVAL,
                 }
-                (*tp).tx_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-                (*tp).tx_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-                (*tp).rx_ptr =
-                    u32::from_le_bytes([*arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9)]);
-                (*tp).rx_len = u16::from_le_bytes([*arg.add(10), *arg.add(11)]);
-                (*tp).op_type = 2;
+            };
+            if tx_len > XFER_MAX || rx_len > XFER_MAX {
+                return E_INVAL;
             }
+            if (opcode != I2C_READ && (tx_len == 0 || data.is_null()))
+                || (opcode != I2C_WRITE && rx_len == 0)
+            {
+                return E_INVAL;
+            }
+            if tx_len > 0 {
+                core::ptr::copy_nonoverlapping(data, (*tp).buf.as_mut_ptr(), tx_len);
+            }
+            (*tp).tx_len = tx_len as u16;
+            (*tp).rx_len = rx_len as u16;
+            (*tp).op_type = if opcode == I2C_WRITE {
+                0
+            } else if opcode == I2C_READ {
+                1
+            } else {
+                2
+            };
+            (*tp).done = 0;
             (*tp).result = 0;
             (*tp).pending = 1;
-            0 // pending — caller polls via transfer result
+            0
+        }
+        I2C_POLL => {
+            if (*tp).pending != 0 || (*tp).active != 0 {
+                return E_AGAIN;
+            }
+            if (*tp).done == 0 {
+                return 0;
+            }
+            (*tp).done = 0;
+            let rx_len = (*tp).rx_len as usize;
+            if (*tp).result > 0 && rx_len > 0 && !data.is_null() {
+                let n = if rx_len < data_len { rx_len } else { data_len };
+                core::ptr::copy_nonoverlapping((*tp).buf.as_ptr(), data, n);
+            }
+            (*tp).result
         }
         I2C_CLAIM => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
             let bus = (*s.handles.as_ptr().add(idx)).bus_id as usize;
             let bi = s.buses.as_mut_ptr().add(bus);
-            if (*bi).bus_owner >= 0 && (*bi).bus_owner != handle as i8 {
-                return -16;
+            if (*bi).bus_owner >= 0 && (*bi).bus_owner != idx as i8 {
+                return E_BUSY;
             }
-            (*bi).bus_owner = handle as i8;
+            (*bi).bus_owner = idx as i8;
             0
         }
         I2C_RELEASE => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
             let bus = (*s.handles.as_ptr().add(idx)).bus_id as usize;
             let bi = s.buses.as_mut_ptr().add(bus);
-            if (*bi).bus_owner == handle as i8 {
+            if (*bi).bus_owner == idx as i8 {
                 (*bi).bus_owner = -1;
             }
             0
         }
-        _ => -38,
+        _ => E_NOSYS,
     }
 }
 

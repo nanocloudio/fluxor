@@ -1,11 +1,12 @@
 //! `wasm_browser_http` built-in: the browser as an HTTP exchange provider.
 //!
-//! A provider of the exchange contract (`contracts/exchange.rs`): request
-//! records arrive on `request_in`, the page's `fetch()` performs each one, and
-//! the answer leaves on `response_out` under the request's own exchange id — a
-//! response HEAD carrying the status, the content type, the response's other
-//! header fields and the first body bytes, then BODY records while more of the
-//! body arrives, sent only as far as the requester's credit reaches.
+//! A provider of the exchange contract (`contracts/exchange.rs`) speaking its
+//! HTTP binding (`contracts/exchange_http.rs`): request records arrive on
+//! `request_in`, the page's `fetch()` performs each one, and the answer leaves
+//! on `response_out` under the request's own exchange id — a response HEAD
+//! carrying the status as its detail, the response's header fields as meta
+//! and the first body bytes, then BODY records while more of the body
+//! arrives, sent only as far as the requester's credit reaches.
 //!
 //! A request is collected whole before it is performed: `fetch()` takes its
 //! body in one piece. A request's target is a path and the `origin` param names
@@ -18,9 +19,9 @@
 //! the enforcement behind both: a fetch the page may not make fails, and a
 //! failed fetch is a peer that could not be reached.
 //!
-//! What it answers itself: 400 for a request it cannot perform (a method the
-//! browser cannot issue, a publish, a fan-out, an upgrade, a target that names
-//! its own host); 413 for a request past what it collects; 503 when more
+//! What it answers itself: 400 for a request it cannot perform (anything but
+//! a call with a method, a fan-out, a target that names its own host, a
+//! header value that would split its line); 413 for a request past what it collects; 503 when more
 //! exchanges arrive at once than it holds; 502 when the fetch fails before the
 //! response head, or the head is too large to carry back. A fetch that fails
 //! after the head is an ABORT — the body the requester already holds is not the
@@ -33,8 +34,10 @@
 //! `*mut HttpState`.
 
 use crate::abi::contracts::exchange::{
-    self as ex, abort, flag, header, header_lines, method_name, status, Collector, ExchangeId,
-    METHOD_CONNECT, METHOD_PUBLISH, PAYLOAD_MAX, RECORD_MAX, RESP_HEAD_FIXED,
+    self as ex, abort, flag, op, Collector, ExchangeId, PAYLOAD_MAX, RECORD_MAX, RESP_HEAD_FIXED,
+};
+use crate::abi::contracts::exchange_http::{
+    self as http, header_lines_from_meta, meta_from_header_lines, method_name, status, Http,
 };
 use crate::kernel::exec::scheduler;
 use crate::kernel::ipc::channel;
@@ -81,18 +84,24 @@ extern "C" {
 const SLOTS: usize = 2;
 /// The largest target a request may name.
 const TARGET_MAX: usize = 2048;
-/// The largest request header block.
-const HEADERS_MAX: usize = 2048;
+/// The largest request meta.
+const META_MAX: usize = 2048;
 /// The largest origin a graph may name.
 const ORIGIN_MAX: usize = 256;
 /// Records taken off `request_in` per step.
 const RECORDS_PER_STEP: usize = 8;
 /// A control record: a CREDIT, or a refusal (a response HEAD without body).
 const CTL_MAX: usize = ex::HDR + RESP_HEAD_FIXED + 4;
-/// The largest header block a response HEAD can carry beside its fixed part.
+/// The largest meta a response HEAD can carry beside its fixed part, and the
+/// largest header block the page's response head may be. A request's header
+/// block is composed in the same buffer before the request goes: a field
+/// takes one byte more as a header line than as meta, and is at least four
+/// bytes as meta, so `META_MAX` of meta is a block of at most
+/// `META_MAX * 5 / 4`.
 const PAGE_HEAD_MAX: usize = RECORD_MAX - ex::HDR - RESP_HEAD_FIXED;
+const _: () = assert!(META_MAX * 5 / 4 <= PAGE_HEAD_MAX);
 
-type Requests = Collector<SLOTS, TARGET_MAX, HEADERS_MAX, PAYLOAD_MAX>;
+type Requests = Collector<Http, SLOTS, TARGET_MAX, META_MAX, PAYLOAD_MAX>;
 
 const PHASE_IDLE: u8 = 0;
 /// The request is with the page; nothing has been answered.
@@ -129,7 +138,8 @@ pub(crate) struct HttpState {
     requests: Requests,
     /// One inbound record.
     rec: [u8; RECORD_MAX],
-    /// The response's header block as the page reports it.
+    /// The request's header block as the page is handed it, then the
+    /// response's as the page reports it.
     page_head: [u8; PAGE_HEAD_MAX],
     /// The record being composed for the exchange being performed.
     out: [u8; RECORD_MAX],
@@ -221,7 +231,7 @@ unsafe fn flush_out(st: &mut HttpState) -> bool {
 
 /// Refuse an exchange with a status this provider raised, in `out`.
 fn answer_status(st: &mut HttpState, id: &ExchangeId, code: u16) {
-    if let Some(n) = ex::write_refusal(id, code, &mut st.out) {
+    if let Some(n) = http::write_refusal(id, code, &mut st.out) {
         st.out_len = n as u32;
     }
 }
@@ -256,7 +266,7 @@ unsafe fn take_requests(st: &mut HttpState) {
             }
         }
         if let Some((id, why)) = st.requests.take_refusal() {
-            if let Some(len) = ex::write_refusal(&id, why.status(), &mut st.ctl) {
+            if let Some(len) = ex::write_refusal(&id, why.outcome(), &mut st.ctl) {
                 st.ctl_len = len as u32;
             }
         }
@@ -285,19 +295,20 @@ unsafe fn start(st: &mut HttpState) {
     let Some(req) = st.requests.request(at) else {
         return;
     };
-    let method = method_name(req.method);
-    // A browser cannot CONNECT, a publish is not an HTTP request, a fan-out
-    // to one origin is a delivery that did not happen, an upgrade has no
-    // fetch() to carry it, and a target naming its own host is a request the
-    // graph did not authorise.
-    let refused = method.is_empty()
-        || req.method == METHOD_CONNECT
-        || req.method == METHOD_PUBLISH
-        || req.flags & (flag::BROADCAST | flag::WEBSOCKET | flag::WEBTRANSPORT) != 0
-        || !path_ok(req.target);
+    let method = method_name(req.verb);
+    // fetch() performs a call with a method: a publish is not an HTTP
+    // request, a session (a CONNECT, an upgrade) has no fetch() to carry it,
+    // a fan-out to one origin is a delivery that did not happen, and a target
+    // naming its own host is a request the graph did not authorise.
+    let block = header_lines_from_meta(req.meta, &mut st.page_head);
+    let refused = req.op != op::CALL
+        || method.is_empty()
+        || req.flags & flag::BROADCAST != 0
+        || !path_ok(req.target)
+        || block.is_none();
     // Where the request goes: the graph's origin, checked against a `host`
     // the request names; or, with no origin, the named host over https.
-    let authority = header(req.headers, b"host").unwrap_or(&[]);
+    let authority = ex::meta_get(req.meta, b"host").unwrap_or(&[]);
     let origin = &st.origin[..st.origin_len as usize];
     let mut open_origin = [0u8; ORIGIN_MAX];
     let mut open_len = 0usize;
@@ -331,8 +342,8 @@ unsafe fn start(st: &mut HttpState) {
         origin_len,
         req.target.as_ptr(),
         req.target.len(),
-        req.headers.as_ptr(),
-        req.headers.len(),
+        st.page_head.as_ptr(),
+        block.unwrap_or(0),
         req.body.as_ptr(),
         req.body.len(),
     );
@@ -363,9 +374,10 @@ fn credit(st: &HttpState) -> usize {
 }
 
 /// The head has arrived: compose the response HEAD in `out`, its body still
-/// to come. A header block that does not fit one record is answered 502 —
-/// whole or not at all, since a block clipped to fit would still parse and a
-/// requester could not tell the field it wanted is the one that was dropped.
+/// to come. A header block whose meta does not fit one record, or a status
+/// the binding does not carry, is answered 502 — whole or not at all, since a
+/// block clipped to fit would still parse and a requester could not tell the
+/// field it wanted is the one that was dropped.
 unsafe fn compose_head(st: &mut HttpState, code: u16) {
     let n = host_http_head(st.handle, st.page_head.as_mut_ptr(), PAGE_HEAD_MAX);
     let block = if n < 0 {
@@ -379,48 +391,22 @@ unsafe fn compose_head(st: &mut HttpState, code: u16) {
         answer_status(st, &id, status::BAD_GATEWAY);
         return;
     };
-    let content_type = header(block, b"content-type").unwrap_or(&[]);
-    // Every other field goes in the HEAD's header block, in the page's order.
-    let mut hdrs_at = ex::HDR + RESP_HEAD_FIXED + content_type.len();
-    let hdrs_start = hdrs_at;
-    let mut fits = content_type.len() <= u8::MAX as usize && hdrs_at <= RECORD_MAX;
-    for (name, value) in header_lines(block) {
-        if !fits {
-            break;
+    // The fields go in place as the HEAD's meta, in the page's order, and the
+    // fixed part is sealed in front of them.
+    let meta_at = ex::HDR + RESP_HEAD_FIXED;
+    let meta_len = meta_from_header_lines(block, &mut st.out[meta_at..]);
+    let sealed = match (meta_len, http::outcome_of(code)) {
+        (Some(ml), Some(outcome)) => {
+            ex::seal_response_in_place::<Http>(&st.id, 0, outcome, code, ml, 0, &mut st.out)
         }
-        if name.eq_ignore_ascii_case(b"content-type") {
-            continue;
-        }
-        let end = hdrs_at + name.len() + 2 + value.len() + 2;
-        if end > RECORD_MAX {
-            fits = false;
-            break;
-        }
-        let parts: [&[u8]; 4] = [name, b": ", value, b"\r\n"];
-        for part in parts {
-            st.out[hdrs_at..hdrs_at + part.len()].copy_from_slice(part);
-            hdrs_at += part.len();
-        }
-    }
-    if !fits {
+        _ => None,
+    };
+    let Some(hdrs_at) = sealed else {
         let id = st.id;
         finish(st);
         answer_status(st, &id, status::BAD_GATEWAY);
         return;
-    }
-    // The fixed part goes in front of the fields already in place, and the
-    // content type between them; `write_response_head` would copy the fields
-    // over themselves, so the prefix is laid down by hand.
-    let hdr_len = hdrs_at - hdrs_start;
-    let p = ex::HDR;
-    st.out[0] = ex::kind::HEAD;
-    st.out[1] = 0;
-    st.out[2..ex::HDR].copy_from_slice(&st.id.0);
-    st.out[p..p + 2].copy_from_slice(&code.to_le_bytes());
-    st.out[p + 2] = content_type.len() as u8;
-    st.out[p + 3..p + 5].copy_from_slice(&(hdr_len as u16).to_le_bytes());
-    let ct_at = p + RESP_HEAD_FIXED;
-    st.out[ct_at..ct_at + content_type.len()].copy_from_slice(content_type);
+    };
     st.body_at = hdrs_at as u32;
     st.body_len = 0;
     st.phase = PHASE_HEAD;
@@ -546,7 +532,10 @@ fn seal_body(st: &mut HttpState, more: bool) {
     }
 }
 
-fn http_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn http_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this
     // module instance, holding the `*mut HttpState` written by `build`; every
     // buffer touched below lives inside that allocation, and the host

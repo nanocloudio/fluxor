@@ -8,7 +8,7 @@ timer_class = "wall_clock"
 # the probe holds no provider handle across steps, and every request it makes
 # is rebuilt from its state -- a write the store had not decided is asked
 # again with the same bytes, which the store recognises. A subscription does
-# not survive a restart (the restart releases the event it rings), so the
+# not survive a restart (the restart closes its handle), so the
 # attestation holds only for an instance with `subscribe: 0`: its demand is
 # counted from that param below, and the composer refuses
 # `fault_policy: restart` to an instance that subscribes.
@@ -26,12 +26,6 @@ access = "write"
 requires_contract = "storage.namespace"
 access = "write"
 
-# The subscription rings the probe's own kernel event: the store writes no
-# channel of the probe's, so no port receives it.
-[[resources]]
-requires_contract = "event"
-access = "write"
-
 [[ports]]
 name = "status"
 direction = "output"
@@ -41,8 +35,8 @@ buffer_size = 8192
 [observability]
 exempt = "store contract probe; its '[stp]' heartbeat is the observable, consumed by the rig scenario's pass rules"
 
-# One store subscription and the kernel event it rings, while `subscribe`
-# (tag 5, default 1) is set; none with `subscribe: 0`.
+# One store subscription — a handle whose doorbell is a kernel event slot —
+# while `subscribe` (tag 5, default 1) is set; none with `subscribe: 0`.
 [capacities]
 demand_from_params = [
   { pool = "store_subs", tags = [5] },

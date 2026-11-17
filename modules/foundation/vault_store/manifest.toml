@@ -15,7 +15,7 @@ name = "blocks"
 direction = "input"
 content_type = "OctetStream"
 required = true
-requires_capability = "storage.block"
+contract = "storage.block"
 
 [observability]
 exempt = "its '[vault_store]' load / write-failure lines and the kernel's '[vault] store' lines are the observable"

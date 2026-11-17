@@ -237,12 +237,26 @@ unsafe fn dev_gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
 
 unsafe fn dev_gpio_set_mode(sys: &SyscallTable, handle: i32, mode: u8, initial: u8) -> i32 {
     let mut arg = [mode, initial];
-    (sys.provider_call)(handle, DEV_GPIO_SET_MODE, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(
+        handle,
+        DEV_GPIO_SET_MODE,
+        arg.as_mut_ptr(),
+        2,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn dev_gpio_set_level(sys: &SyscallTable, handle: i32, level: u8) -> i32 {
     let mut arg = [level];
-    (sys.provider_call)(handle, DEV_GPIO_SET_LEVEL, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(
+        handle,
+        DEV_GPIO_SET_LEVEL,
+        arg.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn dev_uart_open(sys: &SyscallTable, bus: u8) -> i32 {
@@ -251,19 +265,43 @@ unsafe fn dev_uart_open(sys: &SyscallTable, bus: u8) -> i32 {
 }
 
 unsafe fn dev_uart_close(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.provider_call)(handle, DEV_UART_CLOSE, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        handle,
+        DEV_UART_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
+/// Queue `len` bytes at `data` for sending; the bytes the UART took.
 unsafe fn dev_uart_write(sys: &SyscallTable, handle: i32, data: *const u8, len: usize) -> i32 {
-    (sys.provider_call)(handle, DEV_UART_WRITE, data as *mut u8, len)
+    (sys.provider_call)(
+        handle,
+        DEV_UART_WRITE,
+        core::ptr::null_mut(),
+        0,
+        data as *mut u8,
+        len,
+    )
 }
 
+/// Take up to `len` received bytes into `buf`; the bytes taken.
 unsafe fn dev_uart_read(sys: &SyscallTable, handle: i32, buf: *mut u8, len: usize) -> i32 {
-    (sys.provider_call)(handle, DEV_UART_READ, buf, len)
+    (sys.provider_call)(handle, DEV_UART_READ, core::ptr::null_mut(), 0, buf, len)
 }
 
+/// Bytes still queued for sending; 0 once all have gone to the UART.
 unsafe fn dev_uart_poll(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.provider_call)(handle, DEV_UART_POLL, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        handle,
+        DEV_UART_POLL,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Emit an MSG_NETIF_STATE frame on netif_state_chan. No-op if unwired
@@ -455,14 +493,15 @@ unsafe fn step_configure(s: &mut Ch9120State) -> StepReturn {
             let len = s.cmd_len as usize;
             let handle = s.uart_handle;
             let sys = &*s.syscalls;
-            dev_uart_write(sys, handle, s.cmd_buf.as_ptr(), len);
-            s.cmd_substep = CmdSubstep::WaitWrite;
+            if dev_uart_write(sys, handle, s.cmd_buf.as_ptr(), len) == len as i32 {
+                s.cmd_substep = CmdSubstep::WaitWrite;
+            }
         }
         CmdSubstep::WaitWrite => {
             let handle = s.uart_handle;
             let sys = &*s.syscalls;
             let result = dev_uart_poll(sys, handle);
-            if result > 0 {
+            if result == 0 {
                 s.cmd_substep = CmdSubstep::ReadResp;
             } else if result < 0 {
                 s.phase = Ch9120Phase::Error;
@@ -478,7 +517,7 @@ unsafe fn step_configure(s: &mut Ch9120State) -> StepReturn {
         CmdSubstep::WaitRead => {
             let handle = s.uart_handle;
             let sys = &*s.syscalls;
-            let result = dev_uart_poll(sys, handle);
+            let result = dev_uart_read(sys, handle, s.resp_buf.as_mut_ptr(), RESP_BUF_SIZE);
             if result >= 0 {
                 // CH9120 may not echo all commands — advance regardless.
                 s.cmd_substep = CmdSubstep::Next;
@@ -507,14 +546,15 @@ unsafe fn step_save_exit(s: &mut Ch9120State) -> StepReturn {
             let handle = s.uart_handle;
             let len = s.cmd_len as usize;
             let sys = &*s.syscalls;
-            dev_uart_write(sys, handle, s.cmd_buf.as_ptr(), len);
-            s.save_step = 1;
+            if dev_uart_write(sys, handle, s.cmd_buf.as_ptr(), len) == len as i32 {
+                s.save_step = 1;
+            }
         }
         1 => {
             let handle = s.uart_handle;
             let sys = &*s.syscalls;
             let result = dev_uart_poll(sys, handle);
-            if result > 0 {
+            if result == 0 {
                 s.save_step = 2;
             } else if result < 0 {
                 s.phase = Ch9120Phase::Error;
@@ -526,17 +566,18 @@ unsafe fn step_save_exit(s: &mut Ch9120State) -> StepReturn {
             let handle = s.uart_handle;
             let len = s.cmd_len as usize;
             let sys = &*s.syscalls;
-            dev_uart_write(sys, handle, s.cmd_buf.as_ptr(), len);
-            s.save_step = 3;
+            if dev_uart_write(sys, handle, s.cmd_buf.as_ptr(), len) == len as i32 {
+                s.save_step = 3;
+            }
         }
         3 => {
             let handle = s.uart_handle;
             let sys = &*s.syscalls;
             let result = dev_uart_poll(sys, handle);
-            if result >= 0 {
+            if result == 0 {
                 // CMD_EXEC triggers chip reset; may not get response
                 s.phase = Ch9120Phase::ReopenUart;
-            } else {
+            } else if result < 0 {
                 s.phase = Ch9120Phase::Error;
                 return StepReturn::error(-1);
             }
@@ -591,38 +632,44 @@ unsafe fn step_running(s: &mut Ch9120State) -> StepReturn {
     let sys = &*sysp;
     let mut did_work = false;
 
-    // 1. Drain any pending UART TX from previous step
+    // 1. Send what the UART did not take last step
     if s.tx_pending > 0 {
-        let result = dev_uart_poll(sys, uart);
-        if result != 0 {
+        let off = s.tx_offset as usize;
+        let left = s.tx_pending as usize - off;
+        let took = dev_uart_write(sys, uart, s.tx_buf.as_ptr().add(off), left);
+        if took > 0 {
+            s.tx_offset += took as u16;
+            did_work = true;
+        }
+        if s.tx_offset >= s.tx_pending {
             s.tx_pending = 0;
             s.tx_offset = 0;
         }
     }
 
-    // 2. Check UART RX → output channel
+    // 2. UART RX → output channel
     if out_ch >= 0 {
-        dev_uart_read(sys, uart, s.rx_buf.as_mut_ptr(), DATA_BUF_SIZE);
-        let result = dev_uart_poll(sys, uart);
-        if result > 0 {
-            let bytes = result as usize;
-            let poll = (sys.channel_poll)(out_ch, POLL_OUT);
-            if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-                (sys.channel_write)(out_ch, s.rx_buf.as_ptr(), bytes);
+        let poll = (sys.channel_poll)(out_ch, POLL_OUT);
+        if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
+            let result = dev_uart_read(sys, uart, s.rx_buf.as_mut_ptr(), DATA_BUF_SIZE);
+            if result > 0 {
+                (sys.channel_write)(out_ch, s.rx_buf.as_ptr(), result as usize);
                 did_work = true;
             }
         }
     }
 
-    // 3. Check input channel → UART TX
+    // 3. Input channel → UART TX
     if in_ch >= 0 && s.tx_pending == 0 {
         let poll = (sys.channel_poll)(in_ch, POLL_IN);
         if poll > 0 && (poll as u32 & POLL_IN) != 0 {
             let bytes = (sys.channel_read)(in_ch, s.tx_buf.as_mut_ptr(), DATA_BUF_SIZE);
             if bytes > 0 {
-                dev_uart_write(sys, uart, s.tx_buf.as_ptr(), bytes as usize);
-                s.tx_pending = bytes as u16;
-                s.tx_offset = 0;
+                let took = dev_uart_write(sys, uart, s.tx_buf.as_ptr(), bytes as usize);
+                if took < bytes {
+                    s.tx_pending = bytes as u16;
+                    s.tx_offset = if took > 0 { took as u16 } else { 0 };
+                }
                 did_work = true;
             }
         }

@@ -18,7 +18,7 @@
 //
 //   NATIVE CORE (every backend implements; the Fluxor lifecycle model):
 //     CREATE / START / WAIT / SIGNAL(portable subset) / DESTROY / PAUSE /
-//     RESUME / CAPS, plus the Tier-1 CREATE header (identity, posture,
+//     RESUME / CAPS / OPTIONS, plus the Tier-1 CREATE header (identity, posture,
 //     resource envelope, network identity/endpoints). Native semantics: a
 //     workload is an owned execution context with a reversible frozen
 //     state; "exit" means the owner is gone; SIG_TERM means drain, SIG_KILL
@@ -57,7 +57,7 @@
 //
 // Handle binding (normative): a workload acts for the owner whose module
 // created it. Every op that takes its handle — START, WAIT, SIGNAL, PAUSE,
-// RESUME, DESTROY, LANES, and a host class's ops that carry the handle —
+// RESUME, DESTROY, LANE, and a host class's ops that carry the handle —
 // and LOOKUP and DESTROY by identity answer a caller of any other owner
 // `EACCES`. A caller acting with the node's authority (the node agent, or
 // an owner admitted with it) acts on every workload. The binding is the
@@ -112,13 +112,24 @@ pub use super::super::registry::workload::DESTROY;
 // The host-process mechanics (exec, PTY, read) are the `host_process`
 // contract, `abi::platform::linux::host_process`.
 
-/// `LANES` — the caller's own lanes into a workload it staged from an fmod
-/// graph: the edges whose FLXA endpoint is the caller (kind 4). Writes
-/// `[count:u8]` then `count × ([key:u8][to_caller:i32 LE][from_caller:i32
-/// LE])`: the channel the caller reads for the key's edge into it, and the
-/// one it writes for the key's edge out of it, -1 for a direction the graph
-/// does not have. Returns the bytes written.
-pub use super::super::registry::workload::LANES;
+/// `LANE` — one of the caller's own lanes into a workload it staged from an
+/// fmod graph: an edge whose FLXA endpoint is the caller (kind 4).
+/// `handle` = the workload; `arg` = `[key:u8][dir:u8]` ([`lane::ARG_LEN`]):
+/// the edge's `Endpoint` key and [`lane::TO_CALLER`] (the channel the caller
+/// reads for the key's edge into it) or [`lane::FROM_CALLER`] (the one it
+/// writes for the key's edge out of it). Returns that channel's handle;
+/// `ENOENT` for a key or direction the graph does not have.
+pub use super::super::registry::workload::LANE;
+
+/// [`LANE`]'s argument.
+pub mod lane {
+    /// `[key:u8][dir:u8]`.
+    pub const ARG_LEN: usize = 2;
+    /// The channel the caller reads: the key's edge into it.
+    pub const TO_CALLER: u8 = 0;
+    /// The channel the caller writes: the key's edge out of it.
+    pub const FROM_CALLER: u8 = 1;
+}
 /// `PAUSE` — freeze a workload (reversible; not a terminal state). Each
 /// backend realizes it with its own freeze mechanism (host-process: the
 /// process freezer; metal: its own quiesce). Idempotent: PAUSE on a paused
@@ -185,8 +196,7 @@ pub use super::super::registry::workload::NET_RESOLVER;
 /// `[family:u8][server:16][n_search:u8]` then `n_search × ([len:u8][name])`
 /// — the server the owner's queries go to (`NET_FAM_IPV4`, the address in
 /// the first four bytes), and the search list a short name is tried under,
-/// in order. A backend that realizes it lists it in [`CAPS`]'s namespace
-/// directory; one that does not answers a required entry `ENOSYS`.
+/// in order. A backend that realizes it lists it in [`OPTIONS`]; one that does not answers a required entry `ENOSYS`.
 pub mod resolver {
     pub const NS: &[u8] = b"net";
     pub const KEY: &[u8] = b"resolver";
@@ -200,8 +210,8 @@ pub mod resolver {
 /// [`env::NS`], key [`env::KEY`], value `NAME=VALUE` (the name up to the
 /// first `=`, never empty; the value may be empty), repeatable, a later
 /// entry for a name replacing an earlier one. A backend that realizes it
-/// lists it in [`CAPS`]'s namespace directory; one that does not answers a
-/// required entry `ENOSYS`.
+/// lists it in [`OPTIONS`]; one that does not answers a required entry
+/// `ENOSYS`.
 ///
 /// A host process takes the entries into its environment, over the source's
 /// own. A graph workload (`SOURCE_FMOD_GRAPH`, `SOURCE_FMOD_PACK`) takes
@@ -266,7 +276,7 @@ pub mod env {
 /// to the owner's storage, it is reachable whatever the owner's storage
 /// grant, and the owner's release leaves it as it was. A rename between a
 /// volume and anything else is `EXDEV`. A backend that realizes it lists it
-/// in [`CAPS`]; one that does not answers a required entry `ENOSYS`, so a
+/// in [`OPTIONS`]; one that does not answers a required entry `ENOSYS`, so a
 /// consumer marks every volume required.
 pub mod volume {
     pub const NS: &[u8] = b"mount";
@@ -293,7 +303,7 @@ pub mod volume {
 /// other workload's nor the node's reach them — but are kept in the node's
 /// store under the node's sealing key, and so stay with the node.
 ///
-/// A backend that realizes it lists it in [`CAPS`] (the graph backend on a
+/// A backend that realizes it lists it in [`OPTIONS`] (the graph backend on a
 /// Linux host); one that does not answers a required entry `ENOSYS`, so a
 /// consumer marks it required.
 pub mod vault {
@@ -333,14 +343,19 @@ pub mod net_lane {
     pub const PROVIDE_LEN: usize = 1;
 }
 
-/// `CAPS` — backend capability discovery. Writes the fixed prefix
-/// `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]` then a
-/// namespace-directory the caller consults *before* flagging a Tier-2 entry
-/// required:
-///   `[ns_count:u16] then ns_count × ([ns_len:u8][ns bytes][key_count:u16] then
-///    key_count × ([key_len:u8][key bytes]))`.
-/// `postures`/`source_kinds`/`ops`/`net` are bitmaps over the constants below.
+/// `CAPS` — backend capability discovery. `handle = -1` (or a bound handle);
+/// `arg` out is exactly 4 bytes, the `u32` LE [`caps`] word; no `data`.
+/// Returns 0. Every backend implements it; `ENOSYS` from `CAPS` means there
+/// is no backend.
 pub use super::super::registry::workload::CAPS;
+
+/// `OPTIONS` — the Tier-2 `(namespace, key)` entries the backend realizes,
+/// which a caller consults *before* flagging an entry required. `handle =
+/// -1`; no `arg`; `data` out receives the directory
+///   `[ns_count:u16] then ns_count × ([ns_len:u8][ns bytes][key_count:u16]
+///    then key_count × ([key_len:u8][key bytes]))`.
+/// Returns its length, or `ERANGE` when `data` cannot hold it.
+pub use super::super::registry::workload::OPTIONS;
 
 // ---- posture ladder — Tier-1 `posture` field values ----
 
@@ -375,8 +390,8 @@ pub const SOURCE_FMOD_GRAPH: u8 = 0;
 /// pins, then the FLXA subgraph whose modules resolve in the pack first and
 /// the node's image second.
 ///
-/// The pack is an FXMT module table (`fluxor build`'s modules blob) in the
-/// caller's memory, copied during CREATE. Every module in it is admitted only
+/// The pack is an FXMT module table (`fluxor build`'s modules blob), the
+/// call's `data`, copied during CREATE. Every module in it is admitted only
 /// when its full `.fmod` bytes hash to one of the pins — the digest an OCI
 /// layer is addressed by — or it carries a signature the node's signing root
 /// verifies; otherwise CREATE fails `EACCES`. A kernel built to enforce
@@ -388,17 +403,14 @@ pub const SOURCE_FMOD_PACK: u8 = 2;
 /// The head of a [`SOURCE_FMOD_PACK`] source section, little-endian:
 /// ```text
 /// off  size  field
-///   0    8   pack_ptr    address of the FXMT module table
-///   8    4   pack_len    its length in bytes
-///  12    2   pin_count   SHA-256 pins that follow, 32 bytes each
-///  14    2   0
+///   0    2   pin_count   SHA-256 pins that follow, 32 bytes each
+///   2    2   0
 /// ```
-/// Then `pin_count * 32` pin bytes, then the FLXA subgraph.
+/// Then `pin_count * 32` pin bytes, then the FLXA subgraph. The module table
+/// itself is the CREATE call's `data`.
 pub mod pack_ref {
-    pub const SIZE: usize = 16;
-    pub const PTR: usize = 0;
-    pub const LEN: usize = 8;
-    pub const PIN_COUNT: usize = 12;
+    pub const SIZE: usize = 4;
+    pub const PIN_COUNT: usize = 0;
     pub const PIN_SIZE: usize = 32;
 }
 
@@ -412,8 +424,8 @@ pub use super::super::registry::workload::LOOKUP;
 /// `MODULE_DIGESTS` — what the node's own image holds, so an orchestrator can
 /// pin a workload against it: writes `[count:u16 LE][0:u16]` then `count`
 /// records `[name_hash:u32 LE][sha256 of the module's full .fmod bytes:32]`
-/// into the caller's buffer (`arg`, `arg_len`), as many as fit; returns the
-/// total count. Not workload-scoped (handle -1).
+/// into `data`, as many as fit; returns the total count. Not
+/// workload-scoped (handle -1).
 pub use super::super::registry::workload::MODULE_DIGESTS;
 /// One [`MODULE_DIGESTS`] record.
 pub const MODULE_DIGEST_RECORD: usize = 36;
@@ -514,7 +526,7 @@ pub const NET_ISO_OWN: u8 = 1;
 /// [ns_len:u8][ns bytes][key_len:u8][key bytes][flags:u8][val_len:u16 LE][val bytes]
 /// ```
 /// `flags` bit 0 = [`OPT_REQUIRED`]. A *required* entry whose (namespace, key)
-/// the target backend does not advertise via `CAPS` **fails admission**
+/// the target backend does not advertise via [`OPTIONS`] **fails admission**
 /// (`ENOSYS`) — never silently dropped. Advisory entries a
 /// backend does not understand are ignored.
 pub mod opt {
@@ -522,43 +534,55 @@ pub mod opt {
     pub const OPT_REQUIRED: u8 = 0x01;
 }
 
-/// `workload` provider capability bitmap. `provider_call(handle, CAPS, out,
-/// out_len)` writes the discovery structure documented on [`CAPS`]. These are
-/// bit positions within its `postures` / `source_kinds` / `ops` bitmaps.
+/// [`CAPS`] bits. One `u32` of four bytes: the postures realized (bits
+/// 0..=7, bit `p` for posture `p`), the source kinds accepted (bits 8..=15,
+/// bit `8 + k` for kind `k`; kinds past the native ones are backend-defined),
+/// the optional ops (bits 16..=23) and the Tier-1 network fields realized
+/// (bits 24..=31).
 pub mod caps {
-    // `postures` bitmap
-    pub const POSTURE_SHARED: u8 = 1 << 0;
-    pub const POSTURE_ISOLATED: u8 = 1 << 1;
-    pub const POSTURE_HARDENED: u8 = 1 << 2;
+    /// The bit for posture `p` ([`super::POSTURE_SHARED`] …).
+    pub const fn posture(p: u8) -> u32 {
+        if p < 8 {
+            1 << p
+        } else {
+            0
+        }
+    }
+    /// The bit for source kind `k` ([`super::SOURCE_FMOD_GRAPH`] …).
+    pub const fn source_kind(k: u8) -> u32 {
+        if k < 8 {
+            1 << (8 + k)
+        } else {
+            0
+        }
+    }
 
-    // `source_kinds` bitmap
-    pub const SOURCE_FMOD_GRAPH: u8 = 1 << 0;
-    // bit 1: the linux host-process bundle
-    // (`abi::platform::linux::host_process::CAPS_SOURCE_HOST_PROCESS`).
-    pub const SOURCE_FMOD_PACK: u8 = 1 << 2;
-    // bits 3+ backend-defined.
+    pub const POSTURE_SHARED: u32 = posture(super::POSTURE_SHARED);
+    pub const POSTURE_ISOLATED: u32 = posture(super::POSTURE_ISOLATED);
+    pub const POSTURE_HARDENED: u32 = posture(super::POSTURE_HARDENED);
 
-    // `ops` bitmap — optional opcodes beyond the mandatory create/start/wait/
-    // signal/destroy set. SIGNAL itself is mandatory to *accept*; its bit
-    // asserts real-signal delivery semantics. Bits 0..2 are reserved and MUST
-    // NOT be allocated: those positions belong to the 0x1B host-process class,
-    // whose opcodes this contract also leaves unused.
+    pub const SOURCE_FMOD_GRAPH: u32 = source_kind(super::SOURCE_FMOD_GRAPH);
+    pub const SOURCE_FMOD_PACK: u32 = source_kind(super::SOURCE_FMOD_PACK);
+
+    // Optional ops beyond the mandatory create/start/wait/signal/destroy
+    // set. SIGNAL itself is mandatory to *accept*; its bit asserts
+    // real-signal delivery semantics.
     /// SIGNAL is delivered by the backend's real signal mechanism,
     /// not merely recorded as a stop request.
-    pub const SIGNAL: u16 = 1 << 3;
+    pub const SIGNAL: u32 = 1 << 16;
     /// Backend implements the [`super::PAUSE`]/[`super::RESUME`] pair. The
     /// bit claims the backend can freeze AT ALL; a specific workload whose
     /// freeze mechanism could not be set up may still return `ENOSYS`.
-    pub const PAUSE: u16 = 1 << 4;
+    pub const PAUSE: u32 = 1 << 17;
     /// Backend answers [`super::LOOKUP`] and [`super::DESTROY`] by identity,
     /// and its `CREATE` may answer `EINPROGRESS` between batches.
-    pub const LOOKUP: u16 = 1 << 5;
+    pub const LOOKUP: u32 = 1 << 18;
 
-    // `net` bitmap — which Tier-1 network fields the backend realizes. A
-    // CREATE that asks for an unadvertised bit fails admission (`ENOSYS`),
-    // never runs with silently-weaker network isolation.
+    // Tier-1 network fields. A CREATE that asks for an unadvertised bit
+    // fails admission (`ENOSYS`), never runs with silently-weaker network
+    // isolation.
     /// Backend realizes `NET_ISO_OWN` (own network domain per workload).
-    pub const NET_ISO_OWN: u8 = 1 << 0;
+    pub const NET_ISO_OWN: u32 = 1 << 24;
     /// Backend realizes a `NET_FAM_*` network identity (address/segment).
-    pub const NET_IDENTITY: u8 = 1 << 1;
+    pub const NET_IDENTITY: u32 = 1 << 25;
 }

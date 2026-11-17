@@ -147,16 +147,23 @@ impl Module for DummyModule {
 // BuiltInModule
 // ============================================================================
 
+/// A built-in module's step: called with the module's own state buffer.
+///
+/// # Safety
+/// The argument is the stepped module's [`BuiltInModule::state`] buffer
+/// (64 bytes), exclusively the step's for its duration.
+pub type BuiltInStepFn = unsafe fn(*mut u8) -> i32;
+
 /// Built-in module: step function pointer + opaque state.
 /// Used for statically-linked modules on platforms without PIC loading.
 pub struct BuiltInModule {
     pub name: &'static str,
-    step_fn: fn(*mut u8) -> i32,
+    step_fn: BuiltInStepFn,
     pub state: [u8; 64], // Fixed-size state (enough for channel handles + counters)
 }
 
 impl BuiltInModule {
-    pub fn new(name: &'static str, step_fn: fn(*mut u8) -> i32) -> Self {
+    pub fn new(name: &'static str, step_fn: BuiltInStepFn) -> Self {
         Self {
             name,
             step_fn,
@@ -168,14 +175,16 @@ impl BuiltInModule {
     /// scheduler's Tier 1b admission path to forward the function
     /// pointer to `isr_tier::register_tier1b_module`, which fires it
     /// from the polled-timer ISR rather than the cooperative loop.
-    pub fn step_fn(&self) -> fn(*mut u8) -> i32 {
+    pub fn step_fn(&self) -> BuiltInStepFn {
         self.step_fn
     }
 }
 
 impl Module for BuiltInModule {
     fn step(&mut self) -> Result<StepOutcome, i32> {
-        StepOutcome::from_wire((self.step_fn)(self.state.as_mut_ptr()))
+        // SAFETY: the step is handed this module's own state buffer, borrowed
+        // exclusively through `&mut self` for the call.
+        StepOutcome::from_wire(unsafe { (self.step_fn)(self.state.as_mut_ptr()) })
     }
 
     fn name(&self) -> &'static str {
@@ -389,8 +398,7 @@ impl Module for TeeModule {
 
         // SAFETY: `read_amount <= buf.len()` (computed above); the kernel
         // syscall fills up to `read_amount` bytes.
-        let read =
-            unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), read_amount) };
+        let read = unsafe { channel::channel_read(self.in_chan, buf.as_mut_ptr(), read_amount) };
         if read <= 0 {
             return Ok(StepOutcome::Continue);
         }
@@ -399,8 +407,7 @@ impl Module for TeeModule {
         for idx in 0..self.out_count {
             // SAFETY: `len <= read_amount <= buf.len()`; output rings were
             // pre-checked for `out_space >= read_amount`.
-            let wrote =
-                unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), len) };
+            let wrote = unsafe { channel::channel_write(self.out_chans[idx], buf.as_ptr(), len) };
             if wrote != read {
                 // Output space was pre-checked; a short write would
                 // mean the kernel's atomic-FIFO contract was broken.
@@ -462,8 +469,7 @@ impl TeeModule {
         // it; a record larger than the scratch is a topology error, as it is
         // for a framed fan, and is reported rather than spun on.
         // SAFETY: `buf` is `FAN_BUF_SIZE` bytes.
-        let read =
-            unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), buf.len()) };
+        let read = unsafe { channel::channel_read(self.in_chan, buf.as_mut_ptr(), buf.len()) };
         if read == channel::CHAN_EINVAL {
             return Err(-4);
         }
@@ -474,8 +480,7 @@ impl TeeModule {
         for idx in 0..self.out_count {
             // SAFETY: `len <= buf.len()`; every output was polled free above
             // and this tee is its only producer, so the write lands whole.
-            let wrote =
-                unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), len) };
+            let wrote = unsafe { channel::channel_write(self.out_chans[idx], buf.as_ptr(), len) };
             if wrote != read {
                 return Err(-2);
             }
@@ -566,15 +571,14 @@ impl TeeModule {
 
         // SAFETY: `total <= buf.len()` (checked above) and `avail >= total`;
         // the kernel guarantees the frame is atomic on the ring.
-        let read = unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), total) };
+        let read = unsafe { channel::channel_read(self.in_chan, buf.as_mut_ptr(), total) };
         if read != total as i32 {
             return Err(-5);
         }
         for idx in 0..self.out_count {
             // SAFETY: each output ring was pre-checked for `>= total` bytes
             // writable above; `buf[..total]` is the just-read frame.
-            let wrote =
-                unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), total) };
+            let wrote = unsafe { channel::channel_write(self.out_chans[idx], buf.as_ptr(), total) };
             if wrote != total as i32 {
                 return Err(-2);
             }
@@ -741,17 +745,15 @@ impl Module for MergeModule {
             }
 
             // SAFETY: `read_amount <= buf.len()` (computed above).
-            let read =
-                unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), read_amount) };
+            let read = unsafe { channel::channel_read(chan, buf.as_mut_ptr(), read_amount) };
             if read <= 0 {
                 continue;
             }
 
             // SAFETY: `read <= read_amount <= out_space`; output ring
             // pre-checked to have `read_amount` writable bytes.
-            let wrote = unsafe {
-                channel::syscall_channel_write(self.out_chan, buf.as_ptr(), read as usize)
-            };
+            let wrote =
+                unsafe { channel::channel_write(self.out_chan, buf.as_ptr(), read as usize) };
             if wrote != read {
                 // Output space was pre-checked; a short write would
                 // mean the kernel's atomic-FIFO contract was broken.
@@ -817,7 +819,7 @@ impl MergeModule {
             }
             // SAFETY: `buf` is `FAN_BUF_SIZE` bytes; see the tee for why a
             // refused read is an error and not a retry.
-            let read = unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), buf.len()) };
+            let read = unsafe { channel::channel_read(chan, buf.as_mut_ptr(), buf.len()) };
             if read == channel::CHAN_EINVAL {
                 return Err(-4);
             }
@@ -826,9 +828,8 @@ impl MergeModule {
             }
             // SAFETY: the output was polled free above and is this merge's
             // alone, so the write lands whole.
-            let wrote = unsafe {
-                channel::syscall_channel_write(self.out_chan, buf.as_ptr(), read as usize)
-            };
+            let wrote =
+                unsafe { channel::channel_write(self.out_chan, buf.as_ptr(), read as usize) };
             if wrote != read {
                 return Err(-2);
             }
@@ -902,13 +903,12 @@ impl MergeModule {
 
             // SAFETY: `total <= buf.len()`; full frame guaranteed by
             // `avail >= total` and kernel-atomic frame writes.
-            let read = unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), total) };
+            let read = unsafe { channel::channel_read(chan, buf.as_mut_ptr(), total) };
             if read != total as i32 {
                 return Err(-5);
             }
             // SAFETY: output ring pre-checked for `>= total` writable bytes.
-            let wrote =
-                unsafe { channel::syscall_channel_write(self.out_chan, buf.as_ptr(), total) };
+            let wrote = unsafe { channel::channel_write(self.out_chan, buf.as_ptr(), total) };
             if wrote != total as i32 {
                 return Err(-2);
             }

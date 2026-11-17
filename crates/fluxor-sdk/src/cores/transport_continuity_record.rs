@@ -494,11 +494,11 @@ pub struct TsState {
     pub next_delivery: u64,
     pub delivery_acked: u64,
     /// The consumer's cursor its acknowledgement through `delivery_acked`
-    /// carried (`net_proto::CMD_DELIVERED`, opaque here; 0 for none): what
+    /// carried (`stream_cursor::CMD_CURSOR_DELIVERED`, opaque here; 0 for none): what
     /// a host that takes the connection over hands its own consumer
-    /// (`net_proto::MSG_RESUMED`).
+    /// (`stream_cursor::MSG_CURSOR_RESUMED`).
     pub consumer_cursor: u64,
-    /// The clear byte that acknowledgement carried (`CMD_DELIVERED`'s
+    /// The clear byte that acknowledgement carried (`CMD_CURSOR_DELIVERED`'s
     /// `in_bytes`): the consumer had consumed the stream's first
     /// `cursor_at` bytes, at most one delivery's part past `in_bytes`.
     pub cursor_at: u64,
@@ -510,7 +510,7 @@ pub struct TsState {
     pub deliv: [TsDelivery; TS_DELIV_MAX],
     pub next_production: u64,
     /// The consumer's clear bytes the records through `next_production - 1`
-    /// carry: the output horizon (`net_proto::MSG_HORIZON`) the connection
+    /// carry: the output horizon (`stream_cursor::MSG_CURSOR_HORIZON`) the connection
     /// holds, in its consumer's numbering, so a host that takes the
     /// connection over continues that numbering and tells its consumer how
     /// far the old one's output reached.
@@ -1918,7 +1918,7 @@ pub fn md_rx_record(
 /// [cursor_at u64]` — every delivery through `cursor` consumed (each
 /// whole: its plaintext ends at or before `cursor_at`), and the consumer's
 /// own cursor and the clear byte its acknowledgement carried
-/// (`net_proto::CMD_DELIVERED`; 0 for none).
+/// (`stream_cursor::CMD_CURSOR_DELIVERED`; 0 for none).
 pub fn md_delivery_ack(
     out: &mut [u8],
     cursor: u64,

@@ -30,9 +30,7 @@
 
 use core::ffi::c_void;
 
-use abi::contracts::hal::spi::{
-    OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs,
-};
+use abi::contracts::hal::spi::{open as spi_open, transfer_start};
 use abi::SyscallTable;
 use fluxor_abi as abi;
 
@@ -82,7 +80,12 @@ struct Enc28State {
     rx_buf: [u8; MTU],
     /// Transmit buffer
     tx_buf: [u8; MTU],
+    /// The byte a single-byte write sends: lent on the SPI handle.
+    spi_byte: u8,
 }
+
+/// Cookie of the lend of `spi_byte` on the SPI handle.
+const SPI_LEND: u32 = 1;
 
 impl Enc28State {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -145,59 +148,72 @@ unsafe fn dev_gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
 /// Set GPIO mode.
 unsafe fn dev_gpio_set_mode(sys: &SyscallTable, handle: i32, mode: u8, initial: u8) -> i32 {
     let mut arg = [mode, initial];
-    (sys.provider_call)(handle, DEV_GPIO_SET_MODE, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(
+        handle,
+        DEV_GPIO_SET_MODE,
+        arg.as_mut_ptr(),
+        2,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Set GPIO level.
 unsafe fn dev_gpio_set_level(sys: &SyscallTable, handle: i32, level: u8) -> i32 {
     let mut arg = [level];
-    (sys.provider_call)(handle, DEV_GPIO_SET_LEVEL, arg.as_mut_ptr(), 1)
-}
-
-/// Open SPI via provider_open(HAL_SPI, OPEN).
-unsafe fn dev_spi_open(sys: &SyscallTable, bus: u8, cs_handle: i32, freq_hz: u32, mode: u8) -> i32 {
-    let mut args = SpiOpenArgs {
-        cs_handle,
-        freq_hz,
-        bus,
-        mode,
-        _pad: [0; 2],
-    };
-    (sys.provider_open)(
-        HAL_SPI_CONTRACT,
-        DEV_SPI_OPEN,
-        &mut args as *mut _ as *mut u8,
-        core::mem::size_of::<SpiOpenArgs>(),
+    (sys.provider_call)(
+        handle,
+        DEV_GPIO_SET_LEVEL,
+        arg.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
-/// Start SPI transfer.
+/// Open SPI via provider_open(HAL_SPI, OPEN). The driver frames each
+/// transaction with its own chip-select claim, so the provider gets none.
+unsafe fn dev_spi_open(sys: &SyscallTable, bus: u8, freq_hz: u32, mode: u8) -> i32 {
+    let args = spi_open::encode(&spi_open::Open {
+        bus,
+        cs_pin: spi_open::NO_CS,
+        mode,
+        freq_hz,
+    });
+    (sys.provider_open)(HAL_SPI_CONTRACT, DEV_SPI_OPEN, args.as_ptr(), args.len())
+}
+
+/// Start an SPI transfer of `len` bytes at `offset` in the lend `lend` on
+/// `handle`.
 unsafe fn dev_spi_transfer_start(
     sys: &SyscallTable,
     handle: i32,
-    tx: *const u8,
-    rx: *mut u8,
+    lend: u32,
+    offset: u32,
     len: usize,
     fill: u8,
 ) -> i32 {
-    let mut args = SpiTransferStartArgs {
-        tx,
-        rx,
-        len: len as u32,
-        fill,
-        _pad: [0; 3],
-    };
+    let mut args = transfer_start::encode(lend, offset, len as u32, fill);
     (sys.provider_call)(
         handle,
         DEV_SPI_TRANSFER_START,
-        &mut args as *mut _ as *mut u8,
-        core::mem::size_of::<SpiTransferStartArgs>(),
+        args.as_mut_ptr(),
+        args.len(),
+        core::ptr::null_mut(),
+        0,
     )
 }
 
 /// Poll SPI transfer.
 unsafe fn dev_spi_transfer_poll(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.provider_call)(handle, DEV_SPI_TRANSFER_POLL, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        handle,
+        DEV_SPI_TRANSFER_POLL,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 // ============================================================================
@@ -215,16 +231,9 @@ unsafe fn cs_high(s: &Enc28State) {
 }
 
 /// Write a single byte via SPI (blocking)
-unsafe fn spi_write_byte(s: &Enc28State, byte: u8) -> i32 {
-    let tx = [byte];
-    let result = dev_spi_transfer_start(
-        s.sys(),
-        s.spi_handle,
-        tx.as_ptr(),
-        core::ptr::null_mut(),
-        1,
-        0xFF,
-    );
+unsafe fn spi_write_byte(s: &mut Enc28State, byte: u8) -> i32 {
+    s.spi_byte = byte;
+    let result = dev_spi_transfer_start(s.sys(), s.spi_handle, SPI_LEND, 0, 1, 0xFF);
     if result < 0 {
         return result;
     }
@@ -240,7 +249,7 @@ unsafe fn spi_write_byte(s: &Enc28State, byte: u8) -> i32 {
 }
 
 /// Soft reset the chip
-unsafe fn soft_reset(s: &Enc28State) {
+unsafe fn soft_reset(s: &mut Enc28State) {
     cs_low(s);
     spi_write_byte(s, ENC_SOFT_RESET);
     cs_high(s);
@@ -318,11 +327,15 @@ pub unsafe extern "C" fn module_new(
 
         // Open SPI via provider_call (10MHz, mode 0)
         let bus = s.spi_bus;
-        let spi_handle = dev_spi_open(sys, bus, cs_handle, 10_000_000, 0);
+        let spi_handle = dev_spi_open(sys, bus, 10_000_000, 0);
         if spi_handle < 0 {
             return -5;
         }
         s.spi_handle = spi_handle;
+        // The one byte a write sends, read by the SPI provider.
+        if dev_lend_open(sys, spi_handle, LEND_IN, SPI_LEND, &mut s.spi_byte, 1) < 0 {
+            return -5;
+        }
 
         0
     }

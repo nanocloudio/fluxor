@@ -564,7 +564,14 @@ unsafe fn step_init(s: &mut Cyw43State) -> StepReturn {
             }
             s.pwr_handle = h;
             let mut lvl = [0u8];
-            (sys.provider_call)(h, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+            (sys.provider_call)(
+                h,
+                dev_gpio::SET_LEVEL,
+                lvl.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
 
             // Claim CS pin (output, initially high = deasserted)
             let mut cs_arg = [s.cs_pin];
@@ -581,7 +588,14 @@ unsafe fn step_init(s: &mut Cyw43State) -> StepReturn {
             }
             s.cs_handle = h;
             let mut lvl = [1u8];
-            (sys.provider_call)(h, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+            (sys.provider_call)(
+                h,
+                dev_gpio::SET_LEVEL,
+                lvl.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
 
             // Allocate PIO command slot — tracked against HAL_PIO.
             let mut alloc_arg = [s.pio_idx, 0u8];
@@ -603,19 +617,27 @@ unsafe fn step_init(s: &mut Cyw43State) -> StepReturn {
         }
         1 => {
             // Load gSPI PIO program
-            let load_args = abi::platform::rp::pio::LoadProgramArgs {
-                program: GSPI_PIO_PROGRAM.as_ptr(),
-                program_len: GSPI_PIO_PROGRAM.len() as u32,
-                wrap_target: GSPI_PIO_WRAP_TARGET,
-                wrap: GSPI_PIO_WRAP,
-                sideset_bits: GSPI_PIO_SIDESET_BITS,
-                options: 0,
-            };
+            let mut load_arg = abi::platform::rp::pio::load_program::encode(
+                GSPI_PIO_WRAP_TARGET,
+                GSPI_PIO_WRAP,
+                GSPI_PIO_SIDESET_BITS,
+                0,
+            );
+            let mut program = [0u8; 2 * GSPI_PIO_PROGRAM.len()];
+            let mut i = 0usize;
+            while i < GSPI_PIO_PROGRAM.len() {
+                let w = GSPI_PIO_PROGRAM[i].to_le_bytes();
+                program[2 * i] = w[0];
+                program[2 * i + 1] = w[1];
+                i += 1;
+            }
             let r = (sys.provider_call)(
                 s.pio_handle,
                 dev_pio::CMD_LOAD_PROGRAM,
-                &load_args as *const _ as *mut u8,
-                core::mem::size_of::<abi::platform::rp::pio::LoadProgramArgs>(),
+                load_arg.as_mut_ptr(),
+                load_arg.len(),
+                program.as_mut_ptr(),
+                program.len(),
             );
             if r < 0 {
                 log_error(s, b"[cyw43] pio prog fail");
@@ -635,6 +657,8 @@ unsafe fn step_init(s: &mut Cyw43State) -> StepReturn {
                 dev_pio::CMD_CONFIGURE,
                 &cfg_args as *const _ as *mut u8,
                 core::mem::size_of::<abi::platform::rp::pio::CmdConfigureArgs>(),
+                core::ptr::null_mut(),
+                0,
             );
             if r < 0 {
                 log_error(s, b"[cyw43] pio cfg fail");
@@ -663,7 +687,14 @@ unsafe fn step_power_on(s: &mut Cyw43State) -> StepReturn {
         0 => {
             // Assert power (high)
             let mut lvl = [1u8];
-            (sys.provider_call)(s.pwr_handle, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+            (sys.provider_call)(
+                s.pwr_handle,
+                dev_gpio::SET_LEVEL,
+                lvl.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
             s.last_time_ms = dev_millis(sys);
             s.substep = 1;
             StepReturn::Continue
@@ -704,8 +735,12 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> StepReturn {
             StepReturn::Continue
         }
         1 => {
-            // Read TEST_RO with swap16 (chip still in 16-bit word mode)
+            // Read TEST_RO with swap16 (chip still in 16-bit word mode).
+            // The PIO provider may still be setting the bus up: retried.
             let r = gspi::bus_read32_swapped_start(s, REG_BUS_TEST_RO);
+            if r == abi::errno::EAGAIN {
+                return StepReturn::Continue;
+            }
             if r < 0 {
                 s.phase = Cyw43Phase::Error;
                 return StepReturn::error(-1);
@@ -2798,7 +2833,14 @@ unsafe fn step_rx(s: &mut Cyw43State) {
             && s.last_status & (STATUS_F2_PKT_AVAILABLE | STATUS_F3_PKT_AVAILABLE) == 0
             && {
                 let sys = &*s.syscalls;
-                (sys.provider_call)(s.pio_handle, dev_pio::CMD_LEVEL, core::ptr::null_mut(), 0) == 0
+                (sys.provider_call)(
+                    s.pio_handle,
+                    dev_pio::CMD_LEVEL,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                ) == 0
             };
         if !idle_line {
             let r = gspi::bus_read32_start(s, REG_BUS_STATUS);

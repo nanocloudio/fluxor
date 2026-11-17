@@ -53,36 +53,29 @@ pub const SLOT_DATA_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
 //   where they were: the ring full on the producer side, or the consumer's
 //   channel without room for the next frame. Nothing is lost, but a sustained
 //   rate means the destination is under-served.
-// * `SIDEBAND_AUX_OVERWRITES` — a consumer's `IOCTL_NOTIFY` value replaced by
-//   a newer one before the producer pump forwarded it. The sideband is one
-//   slot and coalescing by design (a seek to position N: the later wins).
 //
-// `cross_domain_stats()` reads all three and `cross_domain_stats_reset()`
-// zeroes them.
+// `cross_domain_stats()` reads both and `cross_domain_stats_reset()` zeroes
+// them.
 
 use portable_atomic::AtomicU64;
 
 pub static CROSS_DOMAIN_DROPS: AtomicU64 = AtomicU64::new(0);
 pub static CROSS_DOMAIN_BACKPRESSURE: AtomicU64 = AtomicU64::new(0);
-pub static SIDEBAND_AUX_OVERWRITES: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot the three cross-domain counters.
-/// Returns `(drops, backpressure, sideband_overwrites)`.
-pub fn cross_domain_stats() -> (u64, u64, u64) {
+/// Snapshot the cross-domain counters: `(drops, backpressure)`.
+pub fn cross_domain_stats() -> (u64, u64) {
     use portable_atomic::Ordering;
     (
         CROSS_DOMAIN_DROPS.load(Ordering::Relaxed),
         CROSS_DOMAIN_BACKPRESSURE.load(Ordering::Relaxed),
-        SIDEBAND_AUX_OVERWRITES.load(Ordering::Relaxed),
     )
 }
 
-/// Zero the three cross-domain counters, for a diagnostic window.
+/// Zero the cross-domain counters, for a diagnostic window.
 pub fn cross_domain_stats_reset() {
     use portable_atomic::Ordering;
     CROSS_DOMAIN_DROPS.store(0, Ordering::Relaxed);
     CROSS_DOMAIN_BACKPRESSURE.store(0, Ordering::Relaxed);
-    SIDEBAND_AUX_OVERWRITES.store(0, Ordering::Relaxed);
 }
 
 /// Per-domain queue depth, indexed by destination `domain_id`. The
@@ -410,12 +403,6 @@ pub struct CrossDomainEdge {
     pub local_out_handle: i32,
     /// Local channel handle on the consumer side (module reads from this).
     pub local_in_handle: i32,
-    /// Aux-u32 value posted by the consumer via `IOCTL_NOTIFY` on its
-    /// local input handle, forwarded by the producer-side pump via
-    /// `IOCTL_NOTIFY` on the producer's local output handle. Bridges
-    /// seek-style sideband signals across domain boundaries.
-    /// `u32::MAX` = no aux pending.
-    pub pending_aux: core::sync::atomic::AtomicU32,
 }
 
 impl CrossDomainEdge {
@@ -430,7 +417,6 @@ impl CrossDomainEdge {
             channel_idx: 0,
             local_out_handle: -1,
             local_in_handle: -1,
-            pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 }
@@ -556,7 +542,7 @@ pub fn bridge_edges() -> Result<usize, &'static str> {
             None => return Err("cross-domain SPSC rings exhausted; cannot bridge edge"),
         };
 
-        let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+        let in_ch = channel::channel_open(&[]);
         if in_ch < 0 {
             return Err("consumer-side channel alloc failed for cross-domain edge");
         }
@@ -587,13 +573,18 @@ pub fn bridge_edges() -> Result<usize, &'static str> {
                 channel_idx: cross_ch_idx as u8,
                 local_out_handle: edge_snapshot.channel,
                 local_in_handle: in_ch,
-                pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
             })
         };
         if registered.is_none() {
             return Err("cross-domain edge table full; cannot bridge edge");
         }
 
+        // The pump writes the consumer's channel; the consumer reads it.
+        channel::channel_bind_edge(
+            in_ch,
+            crate::kernel::exec::scheduler::NO_MODULE,
+            to as crate::kernel::exec::scheduler::ModuleId,
+        );
         sched.edges[e].consumer_channel = in_ch;
         // Delivery-side wake: for a `wake: true` cross-domain edge, bind
         // the CONSUMER-local channel — the consumer-side pump delivers
@@ -659,10 +650,9 @@ pub fn flow(from: usize, to: usize) -> (u32, u32) {
 /// `channel_write` writes what fits, so a frame written into too little room
 /// would lose its tail.
 ///
-/// `IOCTL_NOTIFY` sideband (seek requests and the like) is bridged via
-/// `edge.pending_aux`: the consumer-side pump drains the consumer's
-/// local input aux and stores it there; the producer-side pump drains
-/// it and replays it onto the producer's local output aux.
+/// A frame is one record of the producer's channel: the producer side reads
+/// record by record (`channel_record_len`), so the consumer's channel gets
+/// the producer's writes with their boundaries.
 pub fn pump(domain_id: usize) {
     let n_cross = cross_edge_count();
     let mut ei = 0;
@@ -677,7 +667,7 @@ pub fn pump(domain_id: usize) {
         };
 
         // Producer side. Check remote SPSC space first — `channel_read`
-        // commits the local mailbox frame, so consuming the producer's
+        // consumes the producer's record, so consuming the producer's
         // frame before knowing the SPSC ring has room would be a real
         // drop. If the ring is full we leave the frame in the producer
         // mailbox; the producer module sees back-pressure on its output
@@ -692,14 +682,19 @@ pub fn pump(domain_id: usize) {
                     CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
+                let rec = crate::kernel::ipc::channel::channel_record_len(edge.local_out_handle);
+                if rec <= 0 {
+                    break; // nothing buffered
+                }
                 let mut buf = [0u8; SLOT_DATA_SIZE];
+                let want = (rec as usize).min(buf.len());
                 // SAFETY: `buf` is `SLOT_DATA_SIZE` bytes on the stack;
-                // channel_read writes ≤ `buf.len()` bytes.
+                // channel_read writes ≤ `want <= buf.len()` bytes.
                 let n = unsafe {
                     crate::kernel::ipc::channel::channel_read(
                         edge.local_out_handle,
                         buf.as_mut_ptr(),
-                        buf.len(),
+                        want,
                     )
                 };
                 if n <= 0 {
@@ -714,15 +709,6 @@ pub fn pump(domain_id: usize) {
                 let mi = flow_index(edge.from_domain as usize, edge.to_domain as usize);
                 XPUMP_PROD[mi].fetch_add(1, Ordering::Relaxed);
                 moved += 1;
-            }
-            let aux = edge.pending_aux.swap(u32::MAX, Ordering::AcqRel);
-            if aux != u32::MAX {
-                let mut val = aux;
-                let _ = crate::kernel::ipc::channel::channel_ioctl(
-                    edge.local_out_handle,
-                    crate::kernel::ipc::channel::IOCTL_NOTIFY,
-                    &mut val as *mut u32 as *mut u8,
-                );
             }
         }
 
@@ -744,9 +730,18 @@ pub fn pump(domain_id: usize) {
                 let Some(slot_len) = ch.try_peek_len() else {
                     break; // ring empty
                 };
-                if crate::kernel::ipc::channel::channel_writable_bytes(edge.local_in_handle)
-                    < slot_len
+                let room = if crate::kernel::ipc::channel::channel_is_mailbox(edge.local_in_handle)
                 {
+                    // A mailbox takes the next record once its last is read.
+                    crate::kernel::ipc::channel::channel_poll(
+                        edge.local_in_handle,
+                        crate::kernel::ipc::channel::POLL_OUT,
+                    ) > 0
+                } else {
+                    crate::kernel::ipc::channel::channel_writable_bytes(edge.local_in_handle)
+                        >= slot_len
+                };
+                if !room {
                     CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
@@ -767,21 +762,6 @@ pub fn pump(domain_id: usize) {
                 let mi = flow_index(edge.from_domain as usize, edge.to_domain as usize);
                 XPUMP_CONS[mi].fetch_add(1, Ordering::Relaxed);
                 moved += 1;
-            }
-            let mut val: u32 = 0;
-            let rc = crate::kernel::ipc::channel::channel_ioctl(
-                edge.local_in_handle,
-                crate::kernel::ipc::channel::IOCTL_POLL_NOTIFY,
-                &mut val as *mut u32 as *mut u8,
-            );
-            if rc == crate::kernel::ipc::channel::CHAN_OK && val != u32::MAX {
-                // `pending_aux` is one slot: a newer notification replaces
-                // one the producer pump has not yet forwarded (the later
-                // wins), and the overwrite is counted.
-                let prev = edge.pending_aux.swap(val, Ordering::AcqRel);
-                if prev != u32::MAX {
-                    SIDEBAND_AUX_OVERWRITES.fetch_add(1, Ordering::Relaxed);
-                }
             }
         }
         ei += 1;

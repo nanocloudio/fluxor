@@ -21,23 +21,29 @@ use super::host_backend::{
 };
 use crate::abi::contracts::workload as wl;
 use crate::abi::platform::linux::host_process as hp;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::workload::owner::OwnerHandle;
 
 // Host-process opcodes (`hp::EXEC`/`hp::TTY_*`, class `host_process`): the host class
 // numbers them and owns the consts. Only their arg/out wire formats — backend
 // detail, not contract surface — are documented here:
 //
-// Workload-scoped ops carry `[workload_fd: i32 LE]` before the payloads below
-// (handle = -1 calls; the kernel routes handle-tagged calls by tag→class).
+// Workload-scoped ops name the workload by its 16-byte identity at the head
+// of `arg` (handle = -1 calls).
 //
+// * `READ` — `arg` = `[identity]`; `data` out = merged stdout/stderr;
+//   return = bytes.
 // * `EXEC` — one-shot: run a command inside a workload and capture
-//   its output. Payload in = command line; out = `[out_len:u32][output…]`;
+//   its output. `arg` in = `[identity][cmd_len:u32]`, out =
+//   `[identity][out_len:u32]`; `data` in = command line, out = output;
 //   return = exit code.
-// * `TTY_OPEN` (`host_process::TTY_OPEN`) — start an interactive PTY session. Payload =
-//   `[rows:u16][cols:u16][cmd…]`; return = session id.
+// * `TTY_OPEN` (`host_process::TTY_OPEN`) — start an interactive PTY session.
+//   `arg` = `[identity][rows:u16][cols:u16]`; `data` = command line; return =
+//   session id.
 // * `TTY_STEP` — pump a session: write stdin, drain output, poll
-//   exit. `arg` in = `[sid:u32][wlen:u32][stdin…]`; out =
-//   `[rlen:u32][state:u8][code:i32][out…]`.
+//   exit. `arg` in = `[sid:u32][wlen:u32]`, out =
+//   `[sid:u32][rlen:u32][state:u8][code:i32]`; `data` in = stdin, out =
+//   output.
 // * `TTY_RESIZE` — `arg` = `[sid:u32][rows:u16][cols:u16]`.
 // * `TTY_CLOSE` — kill+reap+free a session. `arg` = `[sid:u32]`;
 //   return = exit code.
@@ -152,7 +158,7 @@ fn host_backend_honors_posture(posture: u8) -> bool {
 
 /// The postures [`CAPS`](wl::CAPS) advertises: those
 /// [`host_backend_honors_posture`] realizes.
-fn host_backend_postures() -> u8 {
+fn host_backend_postures() -> u32 {
     let mut p = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
     if host_backend_honors_posture(wl::POSTURE_HARDENED) {
         p |= wl::caps::POSTURE_HARDENED;
@@ -236,7 +242,7 @@ fn parse_bind(val: &[u8]) -> Option<super::host_backend::VolumeBind> {
 /// IPv4 identity. An IPv6 identity is not realized, so it fails admission
 /// (`ENOSYS`) per the same fail-closed rule — never a silently-unaddressed
 /// workload.
-fn host_backend_net_caps() -> u8 {
+fn host_backend_net_caps() -> u32 {
     wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY
 }
 /// Whether this host can freeze at all: cgroup2 is mounted (`cgroup.freeze`
@@ -419,12 +425,12 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
 
 /// `CREATE` on the host-process backend: admit + instantiate a workload from
 /// the Tier-1 header + the variable-length source-ref / endpoint / options
-/// sections. Returns a tagged `FD_TAG_WORKLOAD` handle or a negative errno.
+/// sections. Returns the workload slot's index or a negative errno.
 /// An owner this call allocates is freed again when the call refuses, so a
 /// refused CREATE leaves nothing.
-unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
+unsafe fn workload_create(arg: &[u8]) -> i32 {
     let mut allocated: Option<OwnerHandle> = None;
-    let rc = workload_create_as(arg, arg_len, &mut allocated);
+    let rc = workload_create_as(arg, &mut allocated);
     if rc < 0 {
         if let Some(owner) = allocated {
             free_allocated_owner(owner);
@@ -433,18 +439,13 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     rc
 }
 
-unsafe fn workload_create_as(
-    arg: *const u8,
-    arg_len: usize,
-    allocated: &mut Option<OwnerHandle>,
-) -> i32 {
-    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_WORKLOAD};
+unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) -> i32 {
     use crate::kernel::sys::errno;
 
-    if arg.is_null() || arg_len < wl::CREATE_HEADER_SIZE {
+    let arg_len = buf.len();
+    if arg_len < wl::CREATE_HEADER_SIZE {
         return errno::EINVAL;
     }
-    let buf = core::slice::from_raw_parts(arg, arg_len);
 
     let mut identity = [0u8; 16];
     identity.copy_from_slice(&buf[0..16]);
@@ -701,7 +702,7 @@ unsafe fn workload_create_as(
         allocated: allocated.is_some(),
         holder: crate::kernel::exec::scheduler::caller_owner(),
     };
-    tag_fd(FD_TAG_WORKLOAD, widx as i32)
+    widx as i32
 }
 
 /// The sandbox behind workload slot `raw`, for the calling module: `EINVAL`
@@ -725,99 +726,122 @@ fn portable_signo(signo: u32) -> Option<u8> {
     }
 }
 
-/// First slot of the module-graph backend's handles. A workload whose source
+/// The host-process workload slot whose owner carries `identity`.
+unsafe fn slot_by_identity(identity: &[u8]) -> Option<usize> {
+    let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
+    let owners = crate::kernel::exec::scheduler::owners();
+    (0..slots.len()).find(|&i| {
+        slots[i].in_use
+            && owners
+                .lookup(slots[i].owner)
+                .is_some_and(|e| e.owner_uid[..] == *identity)
+    })
+}
+
+/// First index of the module-graph backend's workloads. A workload whose source
 /// is an fmod graph is staged into this runtime's own live graph by the
 /// kernel's module-graph backend, the one bare metal runs; its slots are
 /// offset here so they never collide with the host-process backend's.
 const GRAPH_SLOT_BASE: i32 = 0x1000;
 
-/// `workload` provider dispatch. CREATE is `handle = -1`; lifecycle ops carry
-/// the `FD_TAG_WORKLOAD` handle (stripped to a slot by `slot_of`).
+/// `workload` provider dispatch. CREATE is `handle = -1`; lifecycle ops are
+/// handed the workload's index (what its handle's route carries).
 ///
 /// Two backends answer, chosen by the CREATE's source kind: a host-process
 /// bundle runs as an isolated host process, and an fmod graph is staged into
-/// the live graph by `kernel::workload::workload_graph`.
-/// # Safety
-/// Single-threaded platform dispatch only: touches `static mut` provider
-/// state without synchronization. `arg` must be null or valid for reads
-/// and writes of `arg_len` bytes for the duration of the call.
-pub unsafe fn linux_workload_dispatch(
+/// the live graph by `kernel::workload::workload_graph`. Single-threaded
+/// platform dispatch: the `static mut` provider state is touched only on the
+/// scheduler thread.
+pub fn linux_workload_dispatch(
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
 ) -> i32 {
-    use crate::kernel::ipc::fd::slot_of;
+    // SAFETY: provider dispatch runs on the scheduler thread, the only
+    // thread touching the workload and backend tables.
+    unsafe { workload_dispatch_on_thread(handle, opcode, arg, data) }
+}
+
+/// [`linux_workload_dispatch`]'s body.
+///
+/// # Safety
+/// Scheduler thread only: touches `static mut` provider state without
+/// synchronization.
+unsafe fn workload_dispatch_on_thread(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
+) -> i32 {
     use crate::kernel::sys::errno;
 
-    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_WORKLOAD};
     use crate::kernel::workload::workload_graph;
 
     if opcode == wl::CREATE {
         // An fmod graph, and a graph bringing its own modules, are the
         // graph backend's; everything else is a host process.
-        if !arg.is_null()
-            && arg_len > 17
-            && (*arg.add(17) == wl::SOURCE_FMOD_GRAPH || *arg.add(17) == wl::SOURCE_FMOD_PACK)
-        {
-            let rc = workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
+        if matches!(
+            arg.get(17),
+            Some(&wl::SOURCE_FMOD_GRAPH) | Some(&wl::SOURCE_FMOD_PACK)
+        ) {
+            let rc = workload_graph::workload_dispatch(-1, opcode, arg, data.reborrow());
             if rc < 0 {
                 return rc;
             }
-            return tag_fd(FD_TAG_WORKLOAD, GRAPH_SLOT_BASE + slot_of(rc));
+            return GRAPH_SLOT_BASE + rc;
         }
-        return workload_create(arg as *const u8, arg_len);
+        return workload_create(arg);
     }
     if opcode == wl::CAPS {
-        return workload_caps(arg, arg_len);
+        return crate::abi::kernel_abi::caps_word::answer(arg, workload_caps());
+    }
+    if opcode == wl::OPTIONS {
+        return workload_options(data.as_mut());
     }
     // What the node's own image holds, for pinning a pack against it.
     if opcode == wl::MODULE_DIGESTS {
-        return workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
+        return workload_graph::workload_dispatch(-1, opcode, arg, data.reborrow());
     }
     // By identity: the graph backend first (a staged CREATE, or a graph
     // workload), then the host-process slots.
     if opcode == wl::LOOKUP || (opcode == wl::DESTROY && handle < 0) {
-        let rc = workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
+        let rc = workload_graph::workload_dispatch(-1, opcode, arg, data.reborrow());
         if rc != errno::ENOENT {
             return if opcode == wl::LOOKUP && rc >= 0 {
-                tag_fd(FD_TAG_WORKLOAD, GRAPH_SLOT_BASE + slot_of(rc))
+                GRAPH_SLOT_BASE + rc
             } else {
                 rc
             };
         }
-        if arg.is_null() || arg_len < 16 {
+        let Some(id) = arg.get(..16) else {
             return errno::EINVAL;
-        }
-        let mut identity = [0u8; 16];
-        identity.copy_from_slice(core::slice::from_raw_parts(arg, 16));
-        let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
-        let owners = crate::kernel::exec::scheduler::owners();
-        let Some(idx) = (0..slots.len()).find(|&i| {
-            slots[i].in_use
-                && owners
-                    .lookup(slots[i].owner)
-                    .is_some_and(|e| e.owner_uid == identity)
-        }) else {
+        };
+        let Some(idx) = slot_by_identity(id) else {
             return errno::ENOENT;
         };
+        let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
         if !may_use(&slots[idx]) {
             return errno::EACCES;
         }
         if opcode == wl::LOOKUP {
             let owner = slots[idx].owner;
-            let out = core::slice::from_raw_parts_mut(arg, 6);
+            let out = &mut arg[..6];
             out[0..2].copy_from_slice(&owner.slot.to_le_bytes());
             out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
-            return tag_fd(FD_TAG_WORKLOAD, idx as i32);
+            return idx as i32;
         }
         return release_slot(idx);
     }
 
-    let raw = slot_of(handle);
+    let raw = handle;
     if raw >= GRAPH_SLOT_BASE {
-        let inner = tag_fd(FD_TAG_WORKLOAD, raw - GRAPH_SLOT_BASE);
-        return workload_graph::workload_dispatch(inner, opcode, arg, arg_len);
+        return workload_graph::workload_dispatch(
+            raw - GRAPH_SLOT_BASE,
+            opcode,
+            arg,
+            data.reborrow(),
+        );
     }
     let bidx = match workload_backend_idx(raw) {
         Ok(b) => b,
@@ -827,38 +851,28 @@ pub unsafe fn linux_workload_dispatch(
         wl::START => hp_start(bidx),
         wl::PAUSE => hp_pause(bidx),
         wl::RESUME => hp_resume(bidx),
-        wl::WAIT => hp_wait(bidx, arg, arg_len),
+        wl::WAIT => hp_wait(bidx, arg),
         wl::SIGNAL => {
-            if arg.is_null() || arg_len < 4 {
+            if arg.len() < 4 {
                 return errno::EINVAL;
             }
-            let signo = rd_u32(core::slice::from_raw_parts(arg, arg_len), 0);
+            let signo = rd_u32(arg, 0);
             let Some(hostsig) = portable_signo(signo) else {
                 return errno::EINVAL;
             };
-            let s = [hostsig];
-            hp_signal(bidx, s.as_ptr(), 1)
+            hp_signal(bidx, &[hostsig])
         }
         wl::DESTROY => release_slot(raw as usize),
         _ => errno::ENOSYS,
     }
 }
 
-/// WORKLOAD_CAPS: write the backend discovery structure (see the contract's
-/// `CAPS` doc). Prefix `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]`
-/// then the namespace directory ([`LINUX_OPTIONS`]): `mount`/`bind` (a
-/// volume) and `env`/`var` (the environment).
-unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len < 7 {
-        return errno::EINVAL;
-    }
-    let out = core::slice::from_raw_parts_mut(arg, arg_len);
-    out[0] = host_backend_postures();
+/// `CAPS`: the linux backend's capability word.
+fn workload_caps() -> u32 {
     // Both backends: a host-process bundle, and an fmod graph staged into
     // the live graph — with its own modules where the kernel has code space
     // for packs. Each refuses at CREATE what it cannot honour.
-    out[1] = hp::CAPS_SOURCE_HOST_PROCESS
+    let sources = hp::CAPS_SOURCE_HOST_PROCESS
         | wl::caps::SOURCE_FMOD_GRAPH
         | if crate::kernel::workload::code_pack::POOL_SIZE > 0 {
             wl::caps::SOURCE_FMOD_PACK
@@ -867,24 +881,21 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
         };
     // Optional ops: SIGNAL by real signal delivery (to the process group),
     // LOOKUP, and PAUSE iff the host can freeze at all (cgroup2 present) — a
-    // workload whose own cgroup setup failed gets ENOSYS from it. READ, EXEC
-    // and the TTY set are the host-process class's ops, not this contract's.
+    // workload whose own cgroup setup failed gets ENOSYS from it.
     let mut ops = wl::caps::SIGNAL | wl::caps::LOOKUP;
     if host_backend_can_freeze() {
         ops |= wl::caps::PAUSE;
     }
-    out[2..4].copy_from_slice(&ops.to_le_bytes());
-    out[4] = host_backend_net_caps();
-    let n = crate::kernel::workload::workload_graph::write_option_directory(
-        &mut out[5..],
-        LINUX_OPTIONS,
-    );
-    if n == 0 {
-        // Too short for the directory: the prefix alone, and an empty one.
-        out[5..7].copy_from_slice(&0u16.to_le_bytes());
-        return 7;
+    host_backend_postures() | sources | ops | host_backend_net_caps()
+}
+
+/// `OPTIONS`: the namespace directory ([`LINUX_OPTIONS`]): `mount`/`bind` (a
+/// volume) and `env`/`var` (the environment).
+fn workload_options(out: &mut [u8]) -> i32 {
+    match crate::kernel::workload::workload_graph::write_option_directory(out, LINUX_OPTIONS) {
+        0 => crate::kernel::sys::errno::ERANGE,
+        n => n as i32,
     }
-    (5 + n) as i32
 }
 
 /// Destroy every workload belonging to an owner being freed. Called from the
@@ -906,51 +917,57 @@ pub fn linux_workload_close_owner(owner: OwnerHandle) {
 
 /// Host-process (0x1B) provider dispatch — the linux host mechanics that sit
 /// beside the stable `workload` surface. Every op is a `handle = -1`
-/// call; workload-targeting ops carry the tagged workload fd in the leading
-/// 4 bytes of `arg` (LE), TTY session ops their session id.
-///
-/// # Safety
-/// Scheduler-thread dispatch only; `arg` null or valid for `arg_len` bytes.
-pub unsafe fn host_process_dispatch(
+/// call; workload-targeting ops name the workload by its identity at the
+/// head of `arg`, TTY session ops their session id.
+pub fn host_process_dispatch(
     _handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
 ) -> i32 {
-    use crate::kernel::ipc::fd::slot_of;
     use crate::kernel::sys::errno;
 
-    // What this host realizes of the source (no argument).
+    // What this host realizes of the source.
     if opcode == hp::CAPS {
-        return super::host_backend::hp_caps() as i32;
+        return crate::abi::kernel_abi::caps_word::answer(arg, super::host_backend::hp_caps());
     }
+    // SAFETY (each block below): provider dispatch runs on the scheduler
+    // thread, the only thread touching the backend's slot and session tables.
     // Session-scoped ops (no workload fd prefix).
     if opcode == hp::TTY_STEP {
-        return hp_tty_step(arg, arg_len);
+        // SAFETY: as above.
+        return unsafe { hp_tty_step(arg, data.as_mut()) };
     }
     if opcode == hp::TTY_RESIZE {
-        return hp_tty_resize(arg as *const u8, arg_len);
+        // SAFETY: as above.
+        return unsafe { hp_tty_resize(arg) };
     }
     if opcode == hp::TTY_CLOSE {
-        return hp_tty_close(arg as *const u8, arg_len);
+        // SAFETY: as above.
+        return unsafe { hp_tty_close(arg) };
     }
 
-    // Workload-scoped ops: `[workload_fd: i32 LE]` prefix.
-    if arg.is_null() || arg_len < 4 {
+    // Workload-scoped ops: `[identity]` prefix.
+    if arg.len() < hp::IDENTITY_LEN {
         return errno::EINVAL;
     }
-    let a = core::slice::from_raw_parts(arg, 4);
-    let wfd = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-    let bidx = match workload_backend_idx(slot_of(wfd)) {
+    let (id, body) = arg.split_at_mut(hp::IDENTITY_LEN);
+    // SAFETY: as above.
+    let Some(idx) = (unsafe { slot_by_identity(id) }) else {
+        return errno::EINVAL;
+    };
+    // SAFETY: as above.
+    let bidx = match unsafe { workload_backend_idx(idx as i32) } {
         Ok(b) => b,
         Err(e) => return e,
     };
-    let body = arg.add(4);
-    let body_len = arg_len - 4;
-    match opcode {
-        hp::READ => hp_read(bidx, body, body_len),
-        hp::EXEC => hp_exec(bidx, body, body_len),
-        hp::TTY_OPEN => hp_tty_open(bidx, body as *const u8, body_len),
-        _ => errno::ENOSYS,
+    // SAFETY: as above.
+    unsafe {
+        match opcode {
+            hp::READ => hp_read(bidx, data.as_mut()),
+            hp::EXEC => hp_exec(bidx, body, data.as_mut()),
+            hp::TTY_OPEN => hp_tty_open(bidx, body, data.as_slice()),
+            _ => errno::ENOSYS,
+        }
     }
 }

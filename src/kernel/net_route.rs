@@ -47,6 +47,7 @@
 use crate::abi::contracts::net::route as wire;
 use crate::abi::contracts::resource as res;
 use crate::kernel::mem::table::Table as BootTable;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use portable_atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -937,17 +938,15 @@ unsafe fn take(out: &mut [u8]) -> i32 {
 }
 
 /// The contract's dispatch, for a provider realized by `realizer` (`None`
-/// where a module realizes the tables through `TAKE`/`REPORT`).
-///
-/// # Safety
-/// `arg` points to `arg_len` caller-owned bytes for the call (the provider
-/// contract).
-pub unsafe fn dispatch(
+/// where a module realizes the tables through `TAKE`/`REPORT`). Tables travel
+/// in `data` (in for SEGMENTS, ROUTES, HOLD and REPORT, out for READ and
+/// TAKE); CAPS answers in `arg`.
+pub fn dispatch(
     realizer: Option<&Realizer>,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
 ) -> i32 {
     if handle >= 0 {
         return errno::EINVAL;
@@ -957,43 +956,36 @@ pub unsafe fn dispatch(
     if !crate::kernel::exec::scheduler::caller_authority().is_system() {
         return errno::EACCES;
     }
-    ensure_sized();
-    let a: &mut [u8] = if arg.is_null() || arg_len == 0 {
-        &mut []
-    } else {
-        core::slice::from_raw_parts_mut(arg, arg_len)
-    };
-    match opcode {
-        wire::PROBE => 0,
-        wire::CAPS => {
-            let caps = match realizer {
-                Some(r) => (r.caps)(),
-                None => module_caps(),
-            };
-            if a.len() < 4 {
-                return errno::EINVAL;
+    // SAFETY: provider-dispatch context; the store sizes itself once, before
+    // any table is written, and every table access below is serialised by
+    // the store's own writer flag and sequence lock.
+    unsafe {
+        ensure_sized();
+        match opcode {
+            wire::CAPS => {
+                let caps = match realizer {
+                    Some(r) => (r.caps)(),
+                    None => module_caps(),
+                };
+                crate::abi::kernel_abi::caps_word::answer(arg, caps)
             }
-            for (d, s) in a.iter_mut().zip(caps.to_le_bytes()) {
-                *d = s;
+            wire::SEGMENTS => replace_segments(data.as_slice(), realizer),
+            wire::ROUTES => replace_routes(data.as_slice(), realizer),
+            wire::HOLD => {
+                // A held address a module realizes goes through that module's
+                // own table; with a coordinator writing its `addr_ctl` there
+                // would be two writers of the node's addresses.
+                if realizer.is_none()
+                    && crate::kernel::workload::workload_graph::direct_addr_ctl_wired()
+                {
+                    return errno::EBUSY;
+                }
+                replace_held(data.as_slice(), realizer)
             }
-            0
+            wire::READ => read(data.as_mut(), realizer),
+            wire::REPORT => report(data.as_slice()),
+            wire::TAKE => take(data.as_mut()),
+            _ => errno::ENOSYS,
         }
-        wire::SEGMENTS => replace_segments(a, realizer),
-        wire::ROUTES => replace_routes(a, realizer),
-        wire::HOLD => {
-            // A held address a module realizes goes through that module's
-            // own table; with a coordinator writing its `addr_ctl` there
-            // would be two writers of the node's addresses.
-            if realizer.is_none()
-                && crate::kernel::workload::workload_graph::direct_addr_ctl_wired()
-            {
-                return errno::EBUSY;
-            }
-            replace_held(a, realizer)
-        }
-        wire::READ => read(a, realizer),
-        wire::REPORT => report(a),
-        wire::TAKE => take(a),
-        _ => errno::ENOSYS,
     }
 }

@@ -329,6 +329,31 @@ pub fn channel_producer_owner(ch: i32) -> OwnerHandle {
     crate::kernel::workload::owner::OWNER_SYSTEM
 }
 
+/// `channel::FACTS` for `caller`: the owner slot of the module that writes
+/// channel `ch` and the channel's edge flags (`facts::RETAINS_SEND` when
+/// the edge it is carries it), or `None` when `caller` is not an end of it.
+pub fn channel_facts(ch: i32, caller: usize) -> Option<(u16, u8)> {
+    use crate::abi::kernel_abi::channel::facts;
+    if ch < 0 {
+        return None;
+    }
+    // SAFETY: scheduler-thread read of the static edge table.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let edge = sched.edges.iter().take(sched.edge_count).find(|e| {
+        (e.channel == ch || e.consumer_channel == ch)
+            && (e.from_module == caller || e.to_module == caller)
+    })?;
+    let flags = if edge.retains_send {
+        facts::RETAINS_SEND
+    } else {
+        0
+    };
+    Some((channel_producer_owner(edge.channel).slot, flags))
+}
+
 /// The module that writes channel `ch`, if an edge names it.
 pub fn channel_producer_module(ch: i32) -> Option<usize> {
     if ch < 0 {
@@ -435,28 +460,23 @@ pub fn force_module_finished_for_test(module_idx: usize, finished: bool) {
     }
 }
 
-/// Request a graph rebuild. The per-platform main loop consumes the request
-/// after `step_modules` returns.
-///
-/// # Safety
-/// The caller must ensure `config_ptr..config_ptr+config_len` remains valid
-/// until the main loop consumes the request. A null pointer with zero length
-/// signals "reload current STATIC_CONFIG".
-pub unsafe fn request_rebuild(config_ptr: *const u8, config_len: usize) {
-    // SAFETY: caller upholds `# Safety` invariant (pointer validity); the
-    // request is consumed before the main loop re-enters `prepare_graph`.
+/// Request a graph rebuild from the boot configuration. The per-platform
+/// main loop consumes the request after `step_modules` returns.
+pub fn request_rebuild() {
+    // SAFETY: scheduler-thread mutation; the main loop consumes the request
+    // before it re-enters `prepare_graph`.
     unsafe {
         let p = &raw mut SCHED;
-        (*p).rebuild_request = Some((config_ptr, config_len));
+        (*p).rebuild_request = true;
     }
 }
 
-/// Consume the pending rebuild request, if any.
-pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
+/// Consume the pending rebuild request: whether one was made.
+pub fn take_rebuild_request() -> bool {
     // SAFETY: scheduler-thread mutation; single consumer (main loop).
     unsafe {
         let p = &raw mut SCHED;
-        (*p).rebuild_request.take()
+        core::mem::take(&mut (*p).rebuild_request)
     }
 }
 
@@ -468,9 +488,9 @@ pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
 ///
 /// The caller has already released what the module registered or opened
 /// (`release_module_handles`) and unspliced it from the execution order. A
-/// module with buffers still lent to a block source is **quarantined**: its
-/// memory and slot are kept until the source has returned them (see
-/// `block_lend`), and everything else is torn down at once.
+/// module whose lent memory is still borrowed is **quarantined**: its memory
+/// and slot are kept until every borrow is returned (see `ipc::lend`), and
+/// everything else is torn down at once.
 pub fn free_module_state(module_idx: usize) {
     if module_idx >= module_slots() {
         return;
@@ -506,14 +526,14 @@ pub fn free_module_state(module_idx: usize) {
         private,
     )
     .with_heap(crate::kernel::mem::heap::detach_module_heap(module_idx));
-    if crate::kernel::module::block_lend::holds_lends(module_idx) {
-        crate::kernel::module::block_lend::quarantine(module_idx, memory);
+    if crate::kernel::ipc::lend::lent_out(module_idx) {
+        crate::kernel::ipc::lend::quarantine(module_idx, memory);
     } else {
         // Elastic-region chunks the module grew into: teardown IS the reclaim
         // path — release them before the slot is reused.
         crate::kernel::mem::elastic::reclaim_module(module_idx as ModuleId);
         // SAFETY: the module is unspliced and never stepped again, and no
-        // source holds a buffer inside its memory.
+        // provider holds a borrow of its memory.
         unsafe { memory.release() };
     }
 

@@ -73,30 +73,26 @@
 //
 // The tables are the node's: REPLACE, CLEAR and ATTACH answer `EACCES` to a
 // module not acting with the node's authority, whatever it holds. REPLACE
-// and CLEAR also need `net_policy.replace`; PROBE, CAPS and READ need neither.
+// and CLEAR also need `net_policy.replace`; CAPS and READ need neither.
 //
 // Little-endian lengths, big-endian addresses and ports (network order, as
 // they appear on the wire the rules describe).
 
-/// Provider class id (opcode class 0x1Exx). Mirrors
+/// Provider class id (opcode class 0x15xx). Mirrors
 /// `kernel::module::provider::contract::NET_POLICY`.
 pub const CLASS: u16 = super::super::super::registry::net_policy::ID;
 
-/// Returns 1 when a net.policy provider is present. handle=-1, arg=null.
-pub use super::super::super::registry::net_policy::PROBE;
-
-/// Capability bitmap. handle=-1, arg = `[caps_out:u32 LE]` (4 bytes, written).
-/// Returns 0.
+/// Capability bitmap. handle=-1 (or a bound handle); `arg` out is exactly 4
+/// bytes, the `u32` LE [`caps`] word; no `data`. Returns 0. Every provider
+/// implements it; `ENOSYS` from `CAPS` means there is no provider.
 pub use super::super::super::registry::net_policy::CAPS;
 
-/// Replace a table atomically. handle=-1, arg:
-/// ```text
-/// [name_len:u8][name bytes]        table name, 1..=MAX_TABLE_NAME
-/// [rules_ptr:u64 LE][rules_len:u32 LE]
-/// [gen_out_ptr:u64 LE]             receives the new generation (u64 LE), or 0
-/// ```
-/// `rules` is a sequence of rule records (see [`rule`]). An empty sequence is
-/// a table with no rules — not a deletion; [`CLEAR`] deletes. Returns 0, or
+/// Replace a table atomically. handle=-1; `arg` in: the table's name record
+/// ([`name::encode`]); out: the new generation, `[generation:u64 LE]` from
+/// `arg[0]` (size `arg` with [`name::arg_len`]); `data` in: the rules.
+///
+/// The rules are a sequence of rule records (see [`rule`]). An empty sequence
+/// is a table with no rules — not a deletion; [`CLEAR`] deletes. Returns 0, or
 /// `EINVAL` (malformed, or two of its services overlap), `ENOSPC` (too many
 /// tables/rules), `ENOSYS` (a rule kind this provider cannot realize),
 /// `EEXIST` (one of its services overlaps a service another table defines),
@@ -106,7 +102,7 @@ pub use super::super::super::registry::net_policy::CAPS;
 /// as it was.
 pub use super::super::super::registry::net_policy::REPLACE;
 
-/// Delete a table. handle=-1, arg = `[name_len:u8][name bytes]`. Idempotent;
+/// Delete a table. handle=-1, `arg` = the name record. Idempotent;
 /// returns 0, or `EACCES` (not the node's authority), `EAGAIN` (another
 /// change is being applied) or the platform's error removing it. Deleting a
 /// table that exists consumes a generation (the
@@ -114,22 +110,20 @@ pub use super::super::super::registry::net_policy::REPLACE;
 /// that value notices a deletion as it notices a replace.
 pub use super::super::super::registry::net_policy::CLEAR;
 
-/// Read a table back: its state and rules. handle=-1, arg:
-/// ```text
-/// [name_len:u8][name bytes]
-/// [out_ptr:u64 LE][out_cap:u32 LE]  receives the rule records
-/// [state_out_ptr:u64 LE]            receives the table's state, or 0
-/// ```
+/// Read a table back: its state and rules. handle=-1; `arg` in: the name
+/// record; out: the table's state from `arg[0]` (size `arg` with
+/// [`name::arg_len`]); `data` out: the rule records.
+///
 /// The state is [`state::BYTES`] bytes (see [`state`]): the table's
 /// generation, the generation its enforcer last applied, and the per-table
-/// flags — [`state::ENFORCED`] among them. Returns the byte count written,
-/// `ENOENT` for no such table, `ERANGE` when `out_cap` is too small (the
-/// state is still written), or `EAGAIN` when a concurrent writer kept the
-/// store moving for every bounded retry (the caller keeps its previous copy).
+/// flags — [`state::ENFORCED`] among them. Returns the rule bytes written,
+/// `ENOENT` for no such table, `ERANGE` when `data` is too small (the state
+/// is still written), or `EAGAIN` when a concurrent writer kept the store
+/// moving for every bounded retry (the caller keeps its previous copy).
 ///
-/// A zero-length name (`name_len = 0`, no name bytes, the rest as above)
-/// reads the STORE: the state's generation is the last generation issued by
-/// any REPLACE or CLEAR, nothing is copied to `out`, and the call returns 0.
+/// A zero-length name (`name_len = 0`, no name bytes) reads the STORE: the
+/// state's generation is the last generation issued by any REPLACE or CLEAR,
+/// nothing is written to `data`, and the call returns 0.
 /// An enforcer polls that one value, and re-reads its tables only when it
 /// moved.
 pub use super::super::super::registry::net_policy::READ;
@@ -175,7 +169,7 @@ pub const ATTACH_CAPACITY: u8 = 0x80;
 /// Bytes of an ATTACH entry's `capacity`.
 pub const ATTACH_CAPACITY_TAIL: usize = 4;
 
-/// The table state [`READ`] writes to `state_out_ptr`.
+/// The table state [`READ`] answers in `arg`.
 /// ```text
 /// [generation:u64 LE][applied_gen:u64 LE][flags:u32 LE][reserved:u32]
 /// ```
@@ -198,6 +192,63 @@ pub mod state {
 
 /// Longest table name.
 pub const MAX_TABLE_NAME: usize = 32;
+
+/// The name record that leads REPLACE, CLEAR and READ's `arg`:
+/// `[name_len:u8][name bytes]`. READ takes a zero-length name for the store.
+pub mod name {
+    use super::{state, MAX_TABLE_NAME};
+
+    /// Longest name record.
+    pub const MAX: usize = 1 + MAX_TABLE_NAME;
+
+    /// Bytes an `arg` holds for a call naming a table of `name_len` bytes:
+    /// the record in, and room for the longest answer (REPLACE's generation,
+    /// READ's state) out.
+    pub const fn arg_len(name_len: usize) -> usize {
+        let rec = 1 + name_len;
+        if rec > state::BYTES {
+            rec
+        } else {
+            state::BYTES
+        }
+    }
+
+    /// The longest `arg` any of these ops takes.
+    pub const ARG_MAX: usize = arg_len(MAX_TABLE_NAME);
+
+    /// Write `name`'s record at the head of `arg`; the bytes written, or
+    /// `None` for a name past [`MAX_TABLE_NAME`] or an `arg` too short.
+    pub fn encode(name: &[u8], arg: &mut [u8]) -> Option<usize> {
+        if name.len() > MAX_TABLE_NAME {
+            return None;
+        }
+        if arg.len() < 1 + name.len() {
+            return None;
+        }
+        // Panic-free, like the readers below: enforcers link it under the
+        // strict PIC rules.
+        if let Some(b) = arg.get_mut(0) {
+            *b = name.len() as u8;
+        }
+        let mut i = 0;
+        while i < name.len() {
+            if let (Some(d), Some(c)) = (arg.get_mut(1 + i), name.get(i)) {
+                *d = *c;
+            }
+            i += 1;
+        }
+        Some(1 + name.len())
+    }
+
+    /// The name a record at the head of `arg` carries (possibly empty).
+    pub fn parse(arg: &[u8]) -> Option<&[u8]> {
+        let n = *arg.first()? as usize;
+        if n > MAX_TABLE_NAME {
+            return None;
+        }
+        arg.get(1..1 + n)
+    }
+}
 
 /// Capability bits.
 pub mod caps {

@@ -3,7 +3,7 @@
 NVMe driver for the Pi 5 NVMe HAT+. Implements NVMe 1.4 controller
 initialisation, Identify Controller / Namespace, and block
 read/write at the namespace's logical block size (512 B to 4 KiB; the
-`READ_STREAM` ioctl requires 512 B) on one admin queue plus up to `MAX_IO_QUEUES` (4) I/O
+`storage.block` `READ_STREAM` op requires 512 B) on one admin queue plus up to `MAX_IO_QUEUES` (4) I/O
 queue pairs (`io_queue_count` parameter, default 1). With
 `irq_mode = 1` completions are delivered via MSI-X through the
 brcmstb MSI mux; otherwise the CQ is drained by polling in

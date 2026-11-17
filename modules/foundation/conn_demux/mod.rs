@@ -8,10 +8,14 @@
 //!   conn_demux.lane_1 → tls_1.cipher_in   (… lane_2, lane_3)
 //!
 //! Routing key is the per-connection `conn_id` — the leading u16 LE of
-//! every per-connection net_proto message (MSG_ACCEPTED `[conn_id][port]`,
-//! MSG_DATA `[conn_id][data]`, MSG_CLOSED `[conn_id]`, MSG_TRACE_CTX, …). All
+//! every per-connection net_proto message (MSG_ACCEPTED `[conn_id][port]…`,
+//! MSG_DATA `[conn_id][data]`, MSG_CLOSED `[conn_id][kind]`, and the
+//! sidebands a connection was granted: MSG_TRACE_CTX, MSG_RETX_ACK, …). All
 //! frames of one connection share a conn_id and therefore land on the same
 //! lane, giving stable per-connection affinity without any per-flow table.
+//! Ids are not relabelled and commands do not pass through here, so what a
+//! lane asks for on its bind and what `ip` grants reach each other
+//! unchanged.
 //!
 //! Why this and not the frame-level `demux`: the baseline shows the `ip`
 //! stack is ~99.6% idle while `tls` saturates the core, and N independent
@@ -51,10 +55,13 @@ const HDR: usize = 3;
 /// `tls/mod.rs` "multi-anchor fan-out"). So BOUND must fan to ALL lanes;
 /// routing it by `payload[0]` would deliver it to one lane and wedge the
 /// others in their bind path.
-const NET_MSG_BOUND: u8 = 0x04;
-/// Max payload we route in one frame. MSG_DATA caps at one TCP MSS
-/// (MAX_DATA_FRAGMENT = 1460); 2048 leaves slack for any framing.
-const MAX_PAYLOAD: usize = 2048;
+const NET_MSG_BOUND: u8 = abi::contracts::net::net_proto::MSG_BOUND;
+/// The largest frame routed, header included (`CONN_IN_ACCEPTS_RECORD`
+/// and every lane's `max_record`): whatever a transport's `net_out` may
+/// carry. A frame is forwarded whole, so a lane carries what came in.
+const FRAME_MAX: usize = 1483;
+/// Max payload we route in one frame.
+const MAX_PAYLOAD: usize = FRAME_MAX - HDR;
 /// Largest number of lanes (one TLS+HTTP pipeline per A76 core, minus the
 /// core hosting ip/conn_demux). `lane_0` is `out[0]`; `lane_1..` are
 /// discovered via `dev_channel_port`.
@@ -147,7 +154,17 @@ unsafe fn flush_pending(s: &mut ConnDemuxState, sys: &SyscallTable) {
     }
 }
 
-fluxor_rt::module_facts! { state: ConnDemuxState, arena: 0 }
+fluxor_rt::module_facts! {
+    state: ConnDemuxState,
+    arena: 0,
+    records: [
+        in 0 CONN_IN_ACCEPTS_RECORD = FRAME_MAX,
+        out 0 LANE_0_MAX_RECORD = FRAME_MAX,
+        out 1 LANE_1_MAX_RECORD = FRAME_MAX,
+        out 2 LANE_2_MAX_RECORD = FRAME_MAX,
+        out 3 LANE_3_MAX_RECORD = FRAME_MAX,
+    ],
+}
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
@@ -274,27 +291,18 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     }
 
     let buf = s.frame_buf.as_mut_ptr();
-    // Read the 3-byte net_proto header: [msg_type][len:u16 LE].
-    let hn = (sys.channel_read)(s.in_chan, buf, HDR);
-    if hn < HDR as i32 {
+    // One whole frame, or nothing: a frame still arriving stays on the
+    // channel, and one larger than a lane may carry is dropped whole.
+    let (msg_type, payload_len, full_len) =
+        net_read_frame_sized(sys, s.in_chan, buf, HDR + MAX_PAYLOAD);
+    if msg_type == 0 {
         return StepReturn::Continue;
     }
-    let payload_len = (*buf.add(1) as usize) | ((*buf.add(2) as usize) << 8);
-    if payload_len > MAX_PAYLOAD {
-        // Oversized / malformed — cannot route safely; drop the header and
-        // resync on the next frame boundary.
+    if payload_len != full_len {
         s.dropped = s.dropped.wrapping_add(1);
         return StepReturn::Continue;
     }
-
-    if payload_len > 0 {
-        let r = (sys.channel_read)(s.in_chan, buf.add(HDR), payload_len);
-        if r < payload_len as i32 {
-            return StepReturn::Continue;
-        }
-    }
     s.pending_total = HDR + payload_len;
-    let msg_type = *buf;
 
     // Latch the frame's target lane(s) into `pending_mask`, then attempt
     // delivery. Any lane that can't accept the full frame keeps its bit set

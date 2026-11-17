@@ -2126,48 +2126,106 @@ registerProcessor('pcm-ring', PcmRing);
       },
     };
 
-    // ── Image decode bridge (wasm_browser_image_codec) ───────────────
+    // ── Image decode (wasm_browser_image_codec, image_decode) ────────
+    //
+    // A job decodes encoded image bytes to a `width`×`height` RGB565 buffer
+    // with createImageBitmap + OffscreenCanvas; `recv` drains it. The bytes
+    // come from the kernel (`host_image_decode_open`, the codec built-in) or
+    // from the object store (`host_image_decode_object`, the image_decode
+    // provider), so encoded images never enter wasm memory on that path.
     const imageDecodes = new Map();
     let nextImageHandle = 1;
+
+    const decodeToRgb565 = (bytes, width, height) =>
+      createImageBitmap(new Blob([bytes]), {
+        resizeWidth: width, resizeHeight: height, resizeQuality: 'high',
+      }).then((bitmap) => {
+        const oc = new OffscreenCanvas(width, height);
+        const ctx = oc.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        const rgba = ctx.getImageData(0, 0, width, height).data;
+        const out = new Uint8Array(width * height * 2);
+        for (let i = 0, p = 0; i < rgba.length; i += 4, p += 2) {
+          const v = ((rgba[i] >> 3) << 11) | ((rgba[i + 1] >> 2) << 5) | (rgba[i + 2] >> 3);
+          out[p] = v & 0xFF;
+          out[p + 1] = (v >> 8) & 0xFF;
+        }
+        return out;
+      });
+
+    // Start a job over a promise of encoded bytes; answers its handle.
+    const startImageJob = (source, width, height, label) => {
+      const handle = nextImageHandle++;
+      const job = { state: 'pending', buf: null, pos: 0, error: null };
+      imageDecodes.set(handle, job);
+      source
+        .then((bytes) => decodeToRgb565(bytes, width, height))
+        .then((out) => { job.buf = out; job.state = 'ready'; })
+        .catch((err) => {
+          job.state = 'error';
+          job.error = err.message;
+          console.error(label + '[' + handle + '] failed: ' + err.message);
+        });
+      return handle;
+    };
+
+    // Bytes [off, off + len) of an object, resolved the way
+    // `host_object_range_open` resolves a key: the written tier, then
+    // `asset://`, then a ranged fetch of the origin. A short read rejects.
+    // The Range header is built by concatenation: a host serving this file
+    // through env substitution rewrites `${`.
+    const readObjectRange = (key, off, len) => {
+      let rawKey = key;
+      if (!objStore.has(rawKey) && !manifestIndex.has(rawKey) && etagAlias.has(rawKey)) {
+        rawKey = etagAlias.get(rawKey);
+      }
+      const exact = (bytes) => {
+        if (bytes.length < len) throw new Error('short object range');
+        return bytes.subarray(0, len);
+      };
+      const stored = objStore.get(rawKey);
+      if (stored !== undefined) {
+        return Promise.resolve().then(() => exact(stored.slice(off, off + len)));
+      }
+      let url = rawKey;
+      if (fetchUrlOverride) url = fetchUrlOverride(url);
+      if (url.startsWith('asset://')) {
+        const bytes = assetBank.get(url.slice('asset://'.length));
+        if (!bytes) return Promise.reject(new Error('no asset ' + url));
+        return Promise.resolve().then(() => exact(bytes.slice(off, off + len)));
+      }
+      return fetch(url, { headers: { Range: 'bytes=' + off + '-' + (off + len - 1) } })
+        .then((r) => {
+          if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url);
+          return r.arrayBuffer().then((ab) => ({ status: r.status, ab }));
+        })
+        .then(({ status, ab }) => {
+          // 206 carries the window; 200 is the whole object from byte 0.
+          const bytes = new Uint8Array(ab);
+          return exact(status === 206 ? bytes : bytes.subarray(off));
+        });
+    };
+
     const imageShim = {
       host_image_decode_open: (encPtr, encLen, width, height) => {
         try {
           const enc = new Uint8Array(
             getKernel().exports.memory.buffer.slice(encPtr, encPtr + encLen)
           );
-          const handle = nextImageHandle++;
-          const job = { state: 'pending', buf: null, pos: 0, error: null, width, height };
-          imageDecodes.set(handle, job);
-          const blob = new Blob([enc]);
-          createImageBitmap(blob, { resizeWidth: width, resizeHeight: height,
-                                    resizeQuality: 'high' })
-            .then((bitmap) => {
-              const off = new OffscreenCanvas(width, height);
-              const ctx = off.getContext('2d');
-              ctx.drawImage(bitmap, 0, 0);
-              const img = ctx.getImageData(0, 0, width, height);
-              const rgba = img.data;
-              const out = new Uint8Array(width * height * 2);
-              for (let i = 0, p = 0; i < rgba.length; i += 4, p += 2) {
-                const r = rgba[i] >> 3;
-                const g = rgba[i + 1] >> 2;
-                const b = rgba[i + 2] >> 3;
-                const v = (r << 11) | (g << 5) | b;
-                out[p] = v & 0xFF;
-                out[p + 1] = (v >> 8) & 0xFF;
-              }
-              job.buf = out;
-              job.state = 'ready';
-              bitmap.close();
-            })
-            .catch((err) => {
-              job.state = 'error';
-              job.error = err.message;
-              console.error(`host_image_decode[${handle}] failed: ${err.message}`);
-            });
-          return handle;
+          return startImageJob(Promise.resolve(enc), width, height, 'host_image_decode_open');
         } catch (err) {
           console.error(`host_image_decode_open threw: ${err.message}`);
+          return -1;
+        }
+      },
+      host_image_decode_object: (keyPtr, keyLen, offset, length, width, height) => {
+        try {
+          const key = kstr(keyPtr, keyLen);
+          const source = readObjectRange(key, Number(offset), length >>> 0);
+          return startImageJob(source, width, height, 'host_image_decode_object');
+        } catch (err) {
+          console.error(`host_image_decode_object threw: ${err.message}`);
           return -1;
         }
       },
@@ -2178,12 +2236,10 @@ registerProcessor('pcm-ring', PcmRing);
         if (job.state === 'error') return -2;
         return job.buf.length;
       },
+      // > 0 bytes copied, 0 drained, -1 still decoding, -2 failed, -3 no job.
       host_image_decode_recv: (handle, bufPtr, bufLen) => {
         const job = imageDecodes.get(handle);
         if (!job) return -3;
-        // Distinguish a failed decode (-2, terminal) from one still decoding
-        // (-1, EAGAIN). The Rust img_recv maps -1 → EAGAIN, so collapsing the
-        // error state into -1 would loop the caller forever on a dead job.
         if (job.state === 'error') return -2;
         if (job.state !== 'ready') return -1;
         const remaining = job.buf.length - job.pos;
@@ -2194,65 +2250,6 @@ registerProcessor('pcm-ring', PcmRing);
         return n;
       },
       host_image_decode_close: (handle) => imageDecodes.delete(handle) ? 0 : -1,
-
-      // Range-fetch an embedded image (cover art lives inside an .m4a at a
-      // byte offset) and decode it straight to a `width`×`height` RGB565
-      // buffer in the browser — so a PIC module (truffle_shell) gets album
-      // covers without pulling multi-MB encoded images into wasm or
-      // touching an in-wasm JPEG/PNG decoder. Reuses the
-      // `host_image_decode_recv/size/close` job machinery.
-      host_image_decode_url: (urlPtr, urlLen, offset, length, width, height) => {
-        try {
-          const url = kstr(urlPtr, urlLen);
-          const off = Number(offset);
-          const len = Number(length);
-          const handle = nextImageHandle++;
-          const job = { state: 'pending', buf: null, pos: 0, error: null, width, height };
-          imageDecodes.set(handle, job);
-          // Range header built by string concat (NOT a `${}` template literal):
-          // host_shims.js is served through env-substitution that escapes `${` to
-          // `$${`, so a template here would emit a literal, malformed Range and the
-          // server would fall back to a full-body 200 (the whole multi-MB track).
-          fetch(url, { headers: { Range: 'bytes=' + off + '-' + (off + len - 1) } })
-            .then((r) => r.arrayBuffer().then((ab) => ({ status: r.status, ab })))
-            .then(({ status, ab }) => {
-              let bytes = new Uint8Array(ab);
-              // Server ignored `Range:` (200, whole body) → slice the cover
-              // out; a 206 already carries exactly the requested range.
-              if (status !== 206 && bytes.length > len) {
-                bytes = bytes.subarray(off, off + len);
-              }
-              return createImageBitmap(new Blob([bytes]), {
-                resizeWidth: width, resizeHeight: height, resizeQuality: 'high',
-              });
-            })
-            .then((bitmap) => {
-              const oc = new OffscreenCanvas(width, height);
-              const ctx = oc.getContext('2d');
-              ctx.drawImage(bitmap, 0, 0);
-              const rgba = ctx.getImageData(0, 0, width, height).data;
-              const out = new Uint8Array(width * height * 2);
-              for (let i = 0, p = 0; i < rgba.length; i += 4, p += 2) {
-                const r = rgba[i] >> 3, g = rgba[i + 1] >> 2, b = rgba[i + 2] >> 3;
-                const v = (r << 11) | (g << 5) | b;
-                out[p] = v & 0xFF;
-                out[p + 1] = (v >> 8) & 0xFF;
-              }
-              job.buf = out;
-              job.state = 'ready';
-              bitmap.close();
-            })
-            .catch((err) => {
-              job.state = 'error';
-              job.error = err.message;
-              console.error('host_image_decode_url[' + handle + '] failed: ' + err.message);
-            });
-          return handle;
-        } catch (err) {
-          console.error(`host_image_decode_url threw: ${err.message}`);
-          return -1;
-        }
-      },
     };
 
     // ── Sub-module instantiation (host_instantiate_module, ...) ──────
@@ -2317,220 +2314,37 @@ registerProcessor('pcm-ring', PcmRing);
               if (k) getKernel().exports.kernel_heap_free(k);
               return r;
             },
-            provider_call: (h, op, p, l) => {
-              // The buffer primitive's acquire record carries an address in
-              // the KERNEL's memory, which names nothing in this module's
-              // own memory, so zero-copy acquisition is not offered across
-              // the bridge: an acquire answers ENOTSUP with a zeroed record
-              // and the module falls back to channel_read/channel_write.
-              // With nothing acquirable, a release is ENOTSUP too.
-              const BUF_ACQUIRE_WRITE = 0x0300 /* registry: buffer::ACQUIRE_WRITE */, BUF_ACQUIRE_READ = 0x0302 /* registry: buffer::ACQUIRE_READ */;
-              const BUF_ACQUIRE_INPLACE = 0x0304 /* registry: buffer::ACQUIRE_INPLACE */, ACQUIRED_SIZE = 16, ENOTSUP = -95;
+            provider_call: (h, op, p, l, dp, dl) => {
+              // A channel lend's acquire record carries an address in the
+              // KERNEL's memory, which names nothing in this module's own
+              // memory, so zero-copy lends are not offered across the
+              // bridge: an acquire answers ENOTSUP with a zeroed record and
+              // the module falls back to channel_read/channel_write. With
+              // nothing acquirable, a release is ENOTSUP too.
+              const BUF_ACQUIRE_WRITE = 0x0110 /* registry: channel::ACQUIRE_WRITE */, BUF_ACQUIRE_READ = 0x0112 /* registry: channel::ACQUIRE_READ */;
+              const BUF_ACQUIRE_INPLACE = 0x0114 /* registry: channel::ACQUIRE_INPLACE */, ACQUIRED_SIZE = 16, ENOTSUP = -95;
               if (op >= BUF_ACQUIRE_WRITE && op <= BUF_ACQUIRE_INPLACE) {
                 const acquire = op === BUF_ACQUIRE_WRITE || op === BUF_ACQUIRE_READ
                   || op === BUF_ACQUIRE_INPLACE;
                 if (acquire && p) childMem().fill(0, p, p + Math.min(l, ACQUIRED_SIZE));
                 return ENOTSUP;
               }
-              // Requests that embed pointers into the CHILD's memory. Copied
-              // as they are, the provider would write through a child address
-              // into kernel memory: the module never sees the result and the
-              // kernel is corrupted. Each layout names the embedded output
-              // buffers as `[pointer offset, capacity offset, capacity width,
-              // whole]` (`whole`: copy the full buffer back, as for a fence,
-              // rather than the count the call returns). The bridge points
-              // them at kernel scratch, calls, and copies the results back. A
-              // null child pointer stays null, so the provider refuses it as
-              // it would a direct caller's.
-              const at16 = (dv, o) => (o + 2 <= dv.byteLength ? dv.getUint16(o, true) : -1);
-              const at8 = (dv, o) => (o < dv.byteLength ? dv.getUint8(o) : -1);
-              const embedded = {
-                // storage.namespace LIST:
-                // [prefix_len u16][prefix][cursor_len u16][cursor]
-                // [out u64][out_cap u32][fence u64][fence_cap u16]
-                // registry: storage_namespace::LIST
-                0x0E02: (dv) => {
-                  const pl = at16(dv, 0); const cl = pl < 0 ? -1 : at16(dv, 2 + pl);
-                  if (cl < 0) return null;
-                  const o = 4 + pl + cl;
-                  return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
-                },
-                // RENAME: [src_len u16][src][dst_len u16][dst][flags u8][fence]
-                // registry: storage_namespace::RENAME
-                0x0E03: (dv) => {
-                  const sl = at16(dv, 0); const dl = sl < 0 ? -1 : at16(dv, 2 + sl);
-                  if (dl < 0) return null;
-                  const o = 4 + sl + dl + 1;
-                  return [[o, o + 8, 2, true]];
-                },
-                // namespace DELETE: [path_len u16][path][flags u8][fence]
-                // registry: storage_namespace::DELETE
-                0x0E04: (dv) => {
-                  const pl = at16(dv, 0);
-                  if (pl < 0) return null;
-                  const o = 2 + pl + 1;
-                  return [[o, o + 8, 2, true]];
-                },
-                // BIND: [path_len u16][path][kind u8][flags u8]
-                // [target_len u16][target][fence]
-                // registry: storage_namespace::BIND
-                0x0E08: (dv) => {
-                  const pl = at16(dv, 0); const tl = pl < 0 ? -1 : at16(dv, 2 + pl + 2);
-                  if (tl < 0) return null;
-                  const o = 2 + pl + 4 + tl;
-                  return [[o, o + 8, 2, true]];
-                },
-                // HEAD: [key_len u16][key][out u64][out_cap u32][fence]
-                // registry: storage_object::HEAD
-                0x0F22: (dv) => {
-                  const kl = at16(dv, 0);
-                  if (kl < 0) return null;
-                  const o = 2 + kl;
-                  return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
-                },
-                // RANGE_GET: [offset u64][length u32][out u64]
-                // registry: storage_object::RANGE_GET
-                0x0F23: () => [[12, 8, 4, false]],
-                // object DELETE: [key_len u16][key][precondition u8]
-                // [etag_len u8][etag][fence]
-                // registry: storage_object::DELETE
-                0x0F24: (dv) => {
-                  const kl = at16(dv, 0); const el = kl < 0 ? -1 : at8(dv, 2 + kl + 1);
-                  if (el < 0) return null;
-                  const o = 2 + kl + 2 + el;
-                  return [[o, o + 8, 2, true]];
-                },
-                // PUT_STREAMED_COMMIT: [fence]
-                // registry: storage_object::PUT_STREAMED_COMMIT
-                0x0F28: () => [[0, 8, 2, true]],
-                // RETAIN: [key_len u16][key][retain_until_ms u64][hold u8][fence]
-                // registry: storage_object::RETAIN
-                0x0F2C: (dv) => {
-                  const kl = at16(dv, 0);
-                  if (kl < 0) return null;
-                  const o = 2 + kl + 9;
-                  return [[o, o + 8, 2, true]];
-                },
-                // object LIST: [prefix_len u16][prefix][cursor_len u16]
-                // [cursor][max_keys u16][out u64][out_cap u32][fence]
-                // registry: storage_object::LIST
-                0x0F2A: (dv) => {
-                  const pl = at16(dv, 0); const cl = pl < 0 ? -1 : at16(dv, 2 + pl);
-                  if (cl < 0) return null;
-                  const o = 4 + pl + cl + 2;
-                  return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
-                },
-              };
-              if (embedded[op]) {
-                const EINVAL = -22, ENOMEM = -12;
-                if (!p) return EINVAL;
-                const cbuf = childMem();
-                if (p + l > cbuf.length) return EINVAL;
-                const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
-                const layout = embedded[op](cdv);
-                if (!layout) return EINVAL;
-                const bufs = [];
-                for (const [at, capAt, capWidth, whole] of layout) {
-                  if (at + 8 > l || capAt + capWidth > l) return EINVAL;
-                  const child = Number(cdv.getBigUint64(at, true));
-                  const cap = capWidth === 4 ? cdv.getUint32(capAt, true) : cdv.getUint16(capAt, true);
-                  if (child && child + cap > cbuf.length) return EINVAL;
-                  bufs.push({ at, child, cap, whole, kp: 0 });
-                }
-                const ex = getKernel().exports;
-                const k = childToKernel(p, l);
-                const release = () => {
-                  for (const b of bufs) if (b.kp) ex.kernel_heap_free(b.kp);
-                  if (k) ex.kernel_heap_free(k);
-                };
-                if (!k) return ENOMEM;
-                for (const b of bufs) {
-                  if (!b.child) continue;
-                  b.kp = ex.kernel_heap_alloc(Math.max(b.cap, 1));
-                  if (!b.kp) { release(); return ENOMEM; }
-                }
-                const kbuf = kmem();
-                const kdv = new DataView(kbuf.buffer, kbuf.byteOffset + k, l);
-                for (const b of bufs) kdv.setBigUint64(b.at, BigInt(b.kp), true);
-                const r = ex.provider_call(h, op, k, l);
-                if (r >= 0) {
-                  for (const b of bufs) {
-                    const n = b.whole ? b.cap : Math.min(r, b.cap);
-                    if (b.kp && n > 0) kernelToChild(b.kp, b.child, n);
-                  }
-                }
-                release();
-                return r;
-              }
-              // storage.object PUT (0x1420) embeds body_ptr and fence_out_ptr
-              // (child addresses) in the arg, and the body can be megabytes.
-              // Rather than stage it through kernel heap scratch, the PUT is
-              // served here from child memory with the wasm provider's own
-              // rules (`object.rs::obj_put`): a key of 1..=255 UTF-8 bytes,
-              // `ANY` as the only precondition (others are ENOSYS), no key
-              // reference, retention or legal hold (each ENOSYS), a fence
-              // buffer of at least WIRE_MAX_LEN bytes, and a Volatile fence on
-              // success.
-              // Arg: [key_len:u16][key][ct_len:u8][ct][body_ptr:u64]
-              //      [body_len:u64][precondition:u8][etag_len:u8][etag]
-              //      [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
-              //      [fence_ptr:u64][fence_cap:u16]
-              const OBJ_PUT_OP = 0x0F20 /* registry: storage_object::PUT */;
-              if (op === OBJ_PUT_OP) {
-                const EINVAL = -22, ENOSYS = -38, ENODEV = -19;
-                const KEY_MAX = 255, KEY_REF_MAX = 64, FENCE_WIRE_MAX = 62, TAG_VOLATILE = 0;
-                try {
-                  if (!p || l < 2) return EINVAL;
-                  const cbuf = childMem();
-                  if (p + l > cbuf.length) return EINVAL;
-                  const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
-                  const keyLen = cdv.getUint16(0, true);
-                  if (keyLen === 0 || keyLen > KEY_MAX) return EINVAL;
-                  const ctOff = 2 + keyLen;
-                  if (ctOff + 1 > l) return EINVAL;
-                  const bodyOff = ctOff + 1 + cdv.getUint8(ctOff);
-                  if (bodyOff + 18 > l) return EINVAL;
-                  const bodyChild = Number(cdv.getBigUint64(bodyOff, true));
-                  const bodyLen = Number(cdv.getBigUint64(bodyOff + 8, true));
-                  const precondition = cdv.getUint8(bodyOff + 16);
-                  const keptOff = bodyOff + 18 + cdv.getUint8(bodyOff + 17);
-                  if (keptOff + 10 > l) return EINVAL;
-                  const keyRefLen = cdv.getUint8(keptOff);
-                  if (keyRefLen > KEY_REF_MAX) return EINVAL;
-                  const untilOff = keptOff + 1 + keyRefLen;
-                  const fenceOff = untilOff + 9;
-                  if (fenceOff + 10 > l) return EINVAL;
-                  const retainUntil = cdv.getBigUint64(untilOff, true);
-                  const legalHold = cdv.getUint8(untilOff + 8);
-                  if (legalHold > 1) return EINVAL;
-                  if (precondition !== 0 || keyRefLen !== 0 || retainUntil !== 0n || legalHold !== 0) return ENOSYS;
-                  // The fence buffer must be able to receive the fence.
-                  const fenceChild = Number(cdv.getBigUint64(fenceOff, true));
-                  const fenceCap = cdv.getUint16(fenceOff + 8, true);
-                  if (!fenceChild || fenceCap < FENCE_WIRE_MAX
-                    || fenceChild + FENCE_WIRE_MAX > cbuf.length) return EINVAL;
-                  if (bodyLen > 0 && bodyChild + bodyLen > cbuf.length) return EINVAL;
-                  let key;
-                  try {
-                    key = new TextDecoder('utf-8', { fatal: true })
-                      .decode(cbuf.subarray(p + 2, p + 2 + keyLen));
-                  } catch (_err) {
-                    return EINVAL;
-                  }
-                  const body = cbuf.slice(bodyChild, bodyChild + bodyLen);
-                  objStore.set(key, body);
-                  opfsPersist(key, body);
-                  cbuf[fenceChild] = TAG_VOLATILE;
-                  return 0;
-                } catch (err) {
-                  console.error(`module OBJ_PUT bridge threw: ${err.message}`);
-                  return ENODEV;
-                }
-              }
+              // The call's two spans: `arg` (a flat record) and `data` (bulk),
+              // each staged through kernel scratch and copied back whole, so
+              // whatever the provider answered in either reaches the module.
+              const ex = getKernel().exports;
               const k = childToKernel(p, l);
-              const r = getKernel().exports.provider_call(h, op, k, l);
+              const kd = childToKernel(dp, dl);
+              if ((l > 0 && !k) || (dl > 0 && !kd)) {
+                if (k) ex.kernel_heap_free(k);
+                if (kd) ex.kernel_heap_free(kd);
+                return -12; // ENOMEM
+              }
+              const r = ex.provider_call(h, op, k, l, kd, dl);
               if (k && l > 0) kernelToChild(k, p, l);
-              if (k) getKernel().exports.kernel_heap_free(k);
+              if (kd && dl > 0) kernelToChild(kd, dp, dl);
+              if (k) ex.kernel_heap_free(k);
+              if (kd) ex.kernel_heap_free(kd);
               return r;
             },
             provider_query: (h, key, p, l) => {

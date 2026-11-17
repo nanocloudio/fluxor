@@ -73,6 +73,10 @@ direction = "input"
 content_type = "OctetStream"
 required = true
 buffer_size = { default = 4096, aarch64 = 16384 }
+# The largest transport frame read, header included (`module_facts!`
+# TRANSPORT_IN_ACCEPTS_RECORD): a whole mux stream frame, so any net_proto
+# record a transport writes.
+accepts_record = 1575
 
 # tls `peer_identity` (`net` with `require_peer`).
 [[ports]]
@@ -126,6 +130,9 @@ direction = "output"
 content_type = "OctetStream"
 required = true
 buffer_size = { default = 8192, aarch64 = 16384 }
+# One fragment as a carrier command, header included (`module_facts!`
+# TRANSPORT_OUT_MAX_RECORD).
+max_record = 4123
 
 [[ports]]
 name = "ch0_rx"
@@ -184,6 +191,11 @@ direction = "input"
 content_type = "ExchangeRequest"
 max_record = 8192
 buffer_size = 8192
+# A relay carries every binding's verbs to the far side unread, so it takes
+# what a requester speaks. Its `request_out` declares none: what crosses is
+# the near requester's, and only the far graph sees the provider.
+[ports.facts]
+binding = ["http"]
 
 # `far`: the provider's answers.
 [[ports]]

@@ -20,10 +20,6 @@ requires_contract = "gpio"
 access = "write"
 
 [[resources]]
-requires_contract = "event"
-access = "write"
-
-[[resources]]
 requires_contract = "timer"
 access = "write"
 

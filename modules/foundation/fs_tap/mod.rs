@@ -217,7 +217,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         let mut path = [0u8; MAX_PATH_LEN];
         let n = s.path_len as usize;
         path[..n].copy_from_slice(&s.path[..n]);
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), n);
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), n, core::ptr::null_mut(), 0);
         if fd == E_AGAIN {
             return StepReturn::Continue;
         }
@@ -243,7 +243,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         return StepReturn::Continue;
     }
     let dst = s.line_buf.as_mut_ptr().add(s.fill as usize);
-    let n = (sys.provider_call)(s.fs_fd, FS_READ, dst, space);
+    let n = (sys.provider_call)(s.fs_fd, FS_READ, dst, space, core::ptr::null_mut(), 0);
     // EAGAIN: provider has no bytes but the stream isn't finished
     // (async FS provider). Hold the fd and retry next tick.
     if n == -11 {
@@ -252,7 +252,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     if n <= 0 {
         // EOF (n == 0) or hard error (n < 0). Flush + close.
         flush_line(s);
-        (sys.provider_call)(s.fs_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.fs_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fs_fd = -1;
         s.done = 1;
         if n == 0 {

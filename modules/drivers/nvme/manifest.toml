@@ -1,6 +1,6 @@
 version = "0.2.0"
 hardware_targets = ["bcm2712", "uefi"]
-grants = ["metal_device.pcie", "metal_device.dma"]
+grants = ["metal_device.pcie", "metal_device.dma", "lend.borrow"]
 # Controller/admin/I/O timeouts, link rescans, heartbeat, and telemetry cadence
 # all use dev_millis. The step counter is observational only.
 timer_class = "wall_clock"
@@ -9,6 +9,8 @@ timer_class = "wall_clock"
 # I/O at the namespace's logical block size (512 B to 4 KiB). Free-form
 # provider capability string; tools-only, never serialized to the .fmod.
 provides = ["storage.block"]
+# `storage.block` is served on `blocks` to the consumer wired there.
+provider_contracts = ["storage.block"]
 deferred_ready = true
 
 # Bind the NVMe controller via the PCIE_DEVICE contract. The driver
@@ -31,6 +33,7 @@ content_type = "OctetStream"
 name = "blocks"
 direction = "output"
 content_type = "OctetStream"
+serves = "storage.block"
 
 # Module-scope observability — exempt.
 [observability]

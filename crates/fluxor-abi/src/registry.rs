@@ -12,7 +12,7 @@ pub const MAX_CONTRACTS: usize = 64;
 /// ORed onto an opcode: dispatch to the provider below the caller.
 pub const CHAIN_NEXT: u32 = 0x10000;
 /// Contract ids the registry assigns.
-pub const CONTRACTS_ASSIGNED: usize = 41;
+pub const CONTRACTS_ASSIGNED: usize = 45;
 
 /// Op-level grants (`grants = [..]` in a manifest): the bits of the
 /// second grant word. A contract's own grant is its id's bit in the first.
@@ -43,7 +43,7 @@ pub mod grant {
     pub const RECONFIGURE_OWNER: u8 = 11;
     /// Stage an OTA image (`OTA_STAGE_WRITE`, `OTA_STAGE_CTRL`).
     pub const RECONFIGURE_OTA: u8 = 12;
-    /// Read and write device registers by physical address (`MMIO_READ32`, `MMIO_WRITE32`).
+    /// Open a device-register aperture and read and write registers in it (`MMIO_OPEN`, `MMIO_READ32`, `MMIO_WRITE32`).
     pub const METAL_DEVICE_MMIO: u8 = 13;
     /// Rescan PCIe and read or write any device's config space.
     pub const METAL_DEVICE_PCIE: u8 = 14;
@@ -51,9 +51,11 @@ pub mod grant {
     pub const METAL_DEVICE_DMA: u8 = 15;
     /// Keep the key vault's durable image: the holder sees every persisted record and decides what reaches the medium.
     pub const SEAL_KEY: u8 = 16;
+    /// Resolve and return a span another module lent to one of this module's edges (`RESOLVE`, `RETURN`): a privileged driver doing DMA into it.
+    pub const LEND_BORROW: u8 = 17;
 
     /// The op-level grants a gated module may not hold.
-    pub const REACH_KERNEL: u64 = 0x1ffff;
+    pub const REACH_KERNEL: u64 = 0x3ffff;
 
     /// The bit an op-level grant's name stands for.
     pub fn of_name(name: &str) -> Option<u8> {
@@ -75,6 +77,7 @@ pub mod grant {
             "metal_device.pcie" => Some(METAL_DEVICE_PCIE),
             "metal_device.dma" => Some(METAL_DEVICE_DMA),
             "seal_key" => Some(SEAL_KEY),
+            "lend.borrow" => Some(LEND_BORROW),
             _ => None,
         }
     }
@@ -99,6 +102,7 @@ pub mod grant {
             METAL_DEVICE_PCIE => Some("metal_device.pcie"),
             METAL_DEVICE_DMA => Some("metal_device.dma"),
             SEAL_KEY => Some("seal_key"),
+            LEND_BORROW => Some("lend.borrow"),
             _ => None,
         }
     }
@@ -188,15 +192,6 @@ pub mod poll {
     pub const WROTE: u32 = 0x20;
 }
 
-/// Channel ioctl commands the kernel serves (`channel_ioctl`'s `cmd`).
-pub mod ioctl {
-    pub const NOTIFY: u32 = 1;
-    pub const POLL_NOTIFY: u32 = 2;
-    pub const FLUSH: u32 = 3;
-    pub const SET_HUP: u32 = 4;
-    pub const WRITABLE: u32 = 5;
-}
-
 pub mod kernel {
     pub const ID: u16 = 0x0000;
     pub const LOG_WRITE: u32 = 0x0040;
@@ -212,7 +207,6 @@ pub mod kernel {
     pub const SYS_CLOCK_HZ: u32 = 0x003b;
     pub const SELF_INDEX: u32 = 0x0042;
     pub const MODULE_INSTANCE_PARAMS: u32 = 0x0043;
-    pub const OWNER_TAG: u32 = 0x004b;
     pub const NET_IDENT_PROVIDER: u32 = 0x004c;
     pub const BOOT_INCARNATION: u32 = 0x002f;
     pub const PROGRAM_INFO: u32 = 0x002b;
@@ -224,31 +218,36 @@ pub mod kernel {
     pub const GET_HW_ETHERNET_MAC: u32 = 0x003d;
     pub const QUERY_OP: u32 = 0x00fe;
     pub const QUERY_CLASS: u32 = 0x0001;
-    pub const QUERY_NAME: u32 = 0x0002;
-    pub const QUERY_CAPABILITIES: u32 = 0x0003;
-    pub const QUERY_STATE: u32 = 0x0004;
-    pub const QUERY_ERROR_COUNT: u32 = 0x0005;
     pub const QUERY_HEAP_STATS: u32 = 0x0006;
     pub const QUERY_LAST_FENCE: u32 = 0x0008;
     pub const QUERY_CALLER_OWNER: u32 = 0x0009;
     pub const QUERY_CALLER_MODULE: u32 = 0x000a;
     pub const QUERY_MODULE_LIVE: u32 = 0x000b;
-    pub const QUERY_EVENT_OWNER: u32 = 0x000c;
     pub const SIGNAL_CORE: u32 = 0x0052;
+    pub const BIND: u32 = 0x0053;
+    pub const BIND_DOORBELL: u32 = 0x0054;
+    pub const DOORBELL_RING: u32 = 0x0055;
 }
 
 pub mod channel {
     pub const ID: u16 = 0x0001;
     pub const OPEN: u32 = 0x0100;
     pub const CLOSE: u32 = 0x0101;
-    pub const IOCTL: u32 = 0x0106;
-    pub const REGISTER_IOCTL: u32 = 0x0107;
+    pub const FLUSH: u32 = 0x0102;
+    pub const SET_HUP: u32 = 0x0103;
+    pub const WRITABLE: u32 = 0x0104;
+    pub const RECORD_LEN: u32 = 0x0105;
+    pub const FACTS: u32 = 0x0107;
     pub const PORT: u32 = 0x010c;
+    pub const ACQUIRE_WRITE: u32 = 0x0110;
+    pub const RELEASE_WRITE: u32 = 0x0111;
+    pub const ACQUIRE_READ: u32 = 0x0112;
+    pub const RELEASE_READ: u32 = 0x0113;
+    pub const ACQUIRE_INPLACE: u32 = 0x0114;
 }
 
 pub mod timer {
     pub const ID: u16 = 0x0002;
-    pub const FD_TAG: i32 = 2;
     pub const MILLIS: u32 = 0x0202;
     pub const MICROS: u32 = 0x0203;
     pub const UNIX_MILLIS: u32 = 0x0208;
@@ -260,18 +259,13 @@ pub mod timer {
     pub const DISCIPLINE: u32 = 0x020a;
 }
 
-pub mod buffer {
+pub mod stream_select {
     pub const ID: u16 = 0x0003;
-    pub const ACQUIRE_WRITE: u32 = 0x0300;
-    pub const RELEASE_WRITE: u32 = 0x0301;
-    pub const ACQUIRE_READ: u32 = 0x0302;
-    pub const RELEASE_READ: u32 = 0x0303;
-    pub const ACQUIRE_INPLACE: u32 = 0x0304;
+    pub const SELECT: u32 = 0x0300;
 }
 
 pub mod event {
     pub const ID: u16 = 0x0004;
-    pub const FD_TAG: i32 = 4;
     pub const CREATE: u32 = 0x0400;
     pub const SIGNAL: u32 = 0x0401;
     pub const POLL: u32 = 0x0402;
@@ -281,39 +275,35 @@ pub mod event {
 
 pub mod key_vault {
     pub const ID: u16 = 0x0005;
-    pub const FD_TAG: i32 = 5;
-    pub const PROBE: u32 = 0x0500;
-    pub const STORE: u32 = 0x0501;
-    pub const ECDH: u32 = 0x0502;
-    pub const SIGN: u32 = 0x0503;
-    pub const VERIFY: u32 = 0x0504;
-    pub const DESTROY: u32 = 0x0505;
-    pub const GENERATE: u32 = 0x0506;
-    pub const PUBLIC: u32 = 0x0507;
-    pub const TIER: u32 = 0x0508;
-    pub const OPEN_OR_GENERATE: u32 = 0x0509;
-    pub const OPEN: u32 = 0x050a;
-    pub const DESTROY_BY_LABEL: u32 = 0x050b;
-    pub const DESCRIBE: u32 = 0x050c;
-    pub const SUITE_QUERY: u32 = 0x050d;
-    pub const SUITE_ENUM: u32 = 0x050e;
-    pub const ATTEST_COMPOSITION: u32 = 0x050f;
-    pub const KEY_WRAP: u32 = 0x0510;
-    pub const KEY_UNWRAP: u32 = 0x0511;
-    pub const AEAD_SEAL: u32 = 0x0512;
-    pub const AEAD_OPEN: u32 = 0x0513;
-    pub const DERIVE: u32 = 0x0514;
-    pub const AEAD_SEAL_UNITS: u32 = 0x0515;
-    pub const AEAD_OPEN_UNITS: u32 = 0x0516;
-    pub const SHARE_SPLIT: u32 = 0x0517;
-    pub const SHARE_REWRAP: u32 = 0x0518;
-    pub const SHARE_COMBINE: u32 = 0x0519;
-    pub const ATTEST_KEY: u32 = 0x051a;
+    pub const STORE: u32 = 0x0500;
+    pub const ECDH: u32 = 0x0501;
+    pub const SIGN: u32 = 0x0502;
+    pub const VERIFY: u32 = 0x0503;
+    pub const DESTROY: u32 = 0x0504;
+    pub const GENERATE: u32 = 0x0505;
+    pub const PUBLIC: u32 = 0x0506;
+    pub const TIER: u32 = 0x0507;
+    pub const OPEN_OR_GENERATE: u32 = 0x0508;
+    pub const OPEN: u32 = 0x0509;
+    pub const DESTROY_BY_LABEL: u32 = 0x050a;
+    pub const DESCRIBE: u32 = 0x050b;
+    pub const DESCRIBE_SUITE: u32 = 0x050c;
+    pub const ATTEST_COMPOSITION: u32 = 0x050d;
+    pub const KEY_WRAP: u32 = 0x050e;
+    pub const KEY_UNWRAP: u32 = 0x050f;
+    pub const AEAD_SEAL: u32 = 0x0510;
+    pub const AEAD_OPEN: u32 = 0x0511;
+    pub const DERIVE: u32 = 0x0512;
+    pub const AEAD_SEAL_UNITS: u32 = 0x0513;
+    pub const AEAD_OPEN_UNITS: u32 = 0x0514;
+    pub const SHARE_SPLIT: u32 = 0x0515;
+    pub const SHARE_REWRAP: u32 = 0x0516;
+    pub const SHARE_COMBINE: u32 = 0x0517;
+    pub const ATTEST_KEY: u32 = 0x0518;
 }
 
 pub mod gpio {
     pub const ID: u16 = 0x0006;
-    pub const FD_TAG: i32 = 6;
     pub const CLAIM: u32 = 0x0600;
     pub const RELEASE: u32 = 0x0601;
     pub const SET_MODE: u32 = 0x0602;
@@ -327,7 +317,6 @@ pub mod gpio {
 
 pub mod spi {
     pub const ID: u16 = 0x0007;
-    pub const FD_TAG: i32 = 7;
     pub const OPEN: u32 = 0x0700;
     pub const CLOSE: u32 = 0x0701;
     pub const BEGIN: u32 = 0x0702;
@@ -338,12 +327,12 @@ pub mod spi {
     pub const TRANSFER_START: u32 = 0x0707;
     pub const TRANSFER_POLL: u32 = 0x0708;
     pub const POLL_BYTE: u32 = 0x0709;
-    pub const GET_CAPS: u32 = 0x070a;
+    pub const DESCRIBE: u32 = 0x070a;
+    pub const CAPS: u32 = 0x07ff;
 }
 
 pub mod i2c {
     pub const ID: u16 = 0x0008;
-    pub const FD_TAG: i32 = 8;
     pub const OPEN: u32 = 0x0800;
     pub const CLOSE: u32 = 0x0801;
     pub const WRITE: u32 = 0x0802;
@@ -351,22 +340,18 @@ pub mod i2c {
     pub const WRITE_READ: u32 = 0x0804;
     pub const CLAIM: u32 = 0x0805;
     pub const RELEASE: u32 = 0x0806;
-    pub const GET_CAPS: u32 = 0x0807;
+    pub const POLL: u32 = 0x0807;
 }
 
 pub mod pio {
     pub const ID: u16 = 0x0009;
-    pub const FD_TAG: i32 = 9;
     pub const STREAM_ALLOC: u32 = 0x0900;
     pub const STREAM_LOAD_PROGRAM: u32 = 0x0901;
-    pub const STREAM_GET_BUFFER: u32 = 0x0902;
     pub const STREAM_CONFIGURE: u32 = 0x0903;
     pub const STREAM_CAN_PUSH: u32 = 0x0904;
     pub const STREAM_PUSH: u32 = 0x0905;
     pub const STREAM_FREE: u32 = 0x0906;
     pub const STREAM_TIME: u32 = 0x0907;
-    pub const DIRECT_BUFFER: u32 = 0x0908;
-    pub const DIRECT_PUSH: u32 = 0x0909;
     pub const PROGRAM_STATUS: u32 = 0x090a;
     pub const STREAM_SET_RATE: u32 = 0x090b;
     pub const CMD_ALLOC: u32 = 0x0910;
@@ -382,13 +367,11 @@ pub mod pio {
     pub const RX_STREAM_CAN_PULL: u32 = 0x0923;
     pub const RX_STREAM_PULL: u32 = 0x0924;
     pub const RX_STREAM_FREE: u32 = 0x0925;
-    pub const RX_STREAM_GET_BUFFER: u32 = 0x0926;
     pub const RX_STREAM_SET_RATE: u32 = 0x0927;
 }
 
 pub mod uart {
     pub const ID: u16 = 0x000a;
-    pub const FD_TAG: i32 = 10;
     pub const OPEN: u32 = 0x0a00;
     pub const CLOSE: u32 = 0x0a01;
     pub const WRITE: u32 = 0x0a02;
@@ -399,7 +382,6 @@ pub mod uart {
 
 pub mod adc {
     pub const ID: u16 = 0x000b;
-    pub const FD_TAG: i32 = 11;
     pub const OPEN: u32 = 0x0b00;
     pub const CLOSE: u32 = 0x0b01;
     pub const READ: u32 = 0x0b02;
@@ -409,7 +391,6 @@ pub mod adc {
 
 pub mod pwm {
     pub const ID: u16 = 0x000c;
-    pub const FD_TAG: i32 = 12;
     pub const OPEN: u32 = 0x0c00;
     pub const CLOSE: u32 = 0x0c01;
     pub const CONFIGURE: u32 = 0x0c02;
@@ -419,7 +400,6 @@ pub mod pwm {
 
 pub mod fs {
     pub const ID: u16 = 0x000d;
-    pub const FD_TAG: i32 = 13;
     pub const OPEN: u32 = 0x0d00;
     pub const READ: u32 = 0x0d01;
     pub const SEEK: u32 = 0x0d02;
@@ -447,14 +427,12 @@ pub mod fs {
 
 pub mod storage_namespace {
     pub const ID: u16 = 0x000e;
-    pub const FD_TAG: i32 = 14;
     pub const LOOKUP: u32 = 0x0e00;
     pub const STAT: u32 = 0x0e01;
     pub const LIST: u32 = 0x0e02;
     pub const RENAME: u32 = 0x0e03;
     pub const DELETE: u32 = 0x0e04;
     pub const SUBSCRIBE: u32 = 0x0e05;
-    pub const TAKE_RUNG: u32 = 0x0e09;
     pub const CLOSE: u32 = 0x0e06;
     pub const CHANGES: u32 = 0x0e07;
     pub const BIND: u32 = 0x0e08;
@@ -463,16 +441,12 @@ pub mod storage_namespace {
 
 pub mod storage_object {
     pub const ID: u16 = 0x000f;
-    pub const FD_TAG: i32 = 15;
     pub const PUT: u32 = 0x0f20;
     pub const GET: u32 = 0x0f21;
     pub const HEAD: u32 = 0x0f22;
     pub const RANGE_GET: u32 = 0x0f23;
     pub const DELETE: u32 = 0x0f24;
     pub const CLOSE: u32 = 0x0f25;
-    pub const IMG_DECODE: u32 = 0x0f30;
-    pub const IMG_RECV: u32 = 0x0f31;
-    pub const IMG_CLOSE: u32 = 0x0f32;
     pub const PUT_STREAMED_OPEN: u32 = 0x0f26;
     pub const PUT_STREAMED_WRITE: u32 = 0x0f27;
     pub const PUT_STREAMED_COMMIT: u32 = 0x0f28;
@@ -480,6 +454,7 @@ pub mod storage_object {
     pub const RETAIN: u32 = 0x0f2c;
     pub const LIST: u32 = 0x0f2a;
     pub const PRESENT: u32 = 0x0f2b;
+    pub const CAPS: u32 = 0x0fff;
 }
 
 pub mod telemetry {
@@ -511,35 +486,31 @@ pub mod stream_clock {
 
 pub mod trust {
     pub const ID: u16 = 0x0014;
-    pub const PROBE: u32 = 0x1400;
-    pub const VERIFY: u32 = 0x1401;
+    pub const VERIFY: u32 = 0x1400;
 }
 
 pub mod net_policy {
     pub const ID: u16 = 0x0015;
-    pub const PROBE: u32 = 0x1500;
-    pub const CAPS: u32 = 0x1501;
-    pub const REPLACE: u32 = 0x1502;
-    pub const CLEAR: u32 = 0x1503;
-    pub const READ: u32 = 0x1504;
-    pub const ATTACH: u32 = 0x1505;
+    pub const REPLACE: u32 = 0x1500;
+    pub const CLEAR: u32 = 0x1501;
+    pub const READ: u32 = 0x1502;
+    pub const ATTACH: u32 = 0x1503;
+    pub const CAPS: u32 = 0x15ff;
 }
 
 pub mod net_route {
     pub const ID: u16 = 0x0016;
-    pub const PROBE: u32 = 0x1600;
-    pub const CAPS: u32 = 0x1601;
-    pub const SEGMENTS: u32 = 0x1602;
-    pub const ROUTES: u32 = 0x1603;
-    pub const HOLD: u32 = 0x1604;
-    pub const READ: u32 = 0x1605;
-    pub const REPORT: u32 = 0x1606;
-    pub const TAKE: u32 = 0x1607;
+    pub const SEGMENTS: u32 = 0x1600;
+    pub const ROUTES: u32 = 0x1601;
+    pub const HOLD: u32 = 0x1602;
+    pub const READ: u32 = 0x1603;
+    pub const REPORT: u32 = 0x1604;
+    pub const TAKE: u32 = 0x1605;
+    pub const CAPS: u32 = 0x16ff;
 }
 
 pub mod workload {
     pub const ID: u16 = 0x0017;
-    pub const FD_TAG: i32 = 23;
     pub const CREATE: u32 = 0x1700;
     pub const START: u32 = 0x1701;
     pub const WAIT: u32 = 0x1702;
@@ -547,42 +518,42 @@ pub mod workload {
     pub const DESTROY: u32 = 0x1704;
     pub const PAUSE: u32 = 0x170b;
     pub const RESUME: u32 = 0x170c;
-    pub const LANES: u32 = 0x170d;
+    pub const LANE: u32 = 0x170d;
     pub const NET_PROVIDE: u32 = 0x170e;
     pub const NET_LANE_TAKE: u32 = 0x170f;
     pub const NET_LANE_ADMIT: u32 = 0x1710;
     pub const NET_RESOLVER: u32 = 0x1713;
-    pub const CAPS: u32 = 0x17ff;
     pub const LOOKUP: u32 = 0x1712;
     pub const MODULE_DIGESTS: u32 = 0x1711;
+    pub const OPTIONS: u32 = 0x1714;
+    pub const CAPS: u32 = 0x17ff;
 }
 
 pub mod host_process {
     pub const ID: u16 = 0x0018;
-    pub const READ: u32 = 0x1801;
-    pub const EXEC: u32 = 0x1802;
-    pub const TTY_OPEN: u32 = 0x1803;
-    pub const TTY_STEP: u32 = 0x1804;
-    pub const TTY_RESIZE: u32 = 0x1805;
-    pub const TTY_CLOSE: u32 = 0x1806;
-    pub const CAPS: u32 = 0x1800;
+    pub const READ: u32 = 0x1800;
+    pub const EXEC: u32 = 0x1801;
+    pub const TTY_OPEN: u32 = 0x1802;
+    pub const TTY_STEP: u32 = 0x1803;
+    pub const TTY_RESIZE: u32 = 0x1804;
+    pub const TTY_CLOSE: u32 = 0x1805;
+    pub const CAPS: u32 = 0x18ff;
 }
 
 pub mod host_mount {
     pub const ID: u16 = 0x0019;
-    pub const PRIV: u32 = 0x1900;
-    pub const MOUNT: u32 = 0x1901;
-    pub const UMOUNT: u32 = 0x1902;
-    pub const ROOT: u32 = 0x1903;
-    pub const PROJECT: u32 = 0x1904;
-    pub const REMOVE_TREE: u32 = 0x1905;
-    pub const GROUP_TREE: u32 = 0x1906;
-    pub const MKDIR_MODE: u32 = 0x1907;
+    pub const MOUNT: u32 = 0x1900;
+    pub const UMOUNT: u32 = 0x1901;
+    pub const ROOT: u32 = 0x1902;
+    pub const PROJECT: u32 = 0x1903;
+    pub const REMOVE_TREE: u32 = 0x1904;
+    pub const GROUP_TREE: u32 = 0x1905;
+    pub const MKDIR_MODE: u32 = 0x1906;
+    pub const CAPS: u32 = 0x19ff;
 }
 
 pub mod proc {
     pub const ID: u16 = 0x001a;
-    pub const FD_TAG: i32 = 26;
     pub const PROC_SPAWN: u32 = 0x1a00;
     pub const PROC_READ: u32 = 0x1a01;
     pub const PROC_STATUS: u32 = 0x1a02;
@@ -591,12 +562,10 @@ pub mod proc {
 
 pub mod usb_host {
     pub const ID: u16 = 0x001b;
-    pub const FD_TAG: i32 = 27;
 }
 
 pub mod pcie_device {
     pub const ID: u16 = 0x001c;
-    pub const FD_TAG: i32 = 28;
     pub const BIND: u32 = 0x1ca0;
     pub const CLOSE: u32 = 0x1ca1;
     pub const CFG_READ32: u32 = 0x1ca2;
@@ -608,7 +577,6 @@ pub mod pcie_device {
 
 pub mod platform_nic_ring {
     pub const ID: u16 = 0x001d;
-    pub const FD_TAG: i32 = 29;
     pub const NIC_BAR_MAP: u32 = 0x1df0;
     pub const NIC_BAR_UNMAP: u32 = 0x1df1;
     pub const NIC_RING_CREATE: u32 = 0x1df2;
@@ -618,17 +586,16 @@ pub mod platform_nic_ring {
 
 pub mod platform_dma {
     pub const ID: u16 = 0x001e;
-    pub const FD_TAG: i32 = 30;
     pub const ALLOC: u32 = 0x1e80;
     pub const FREE: u32 = 0x1e81;
     pub const START: u32 = 0x1e82;
     pub const BUSY: u32 = 0x1e83;
     pub const ABORT: u32 = 0x1e84;
+    pub const CHANNEL: u32 = 0x1e85;
 }
 
 pub mod platform_dma_fd {
     pub const ID: u16 = 0x001f;
-    pub const FD_TAG: i32 = 31;
     pub const CREATE: u32 = 0x1f85;
     pub const START: u32 = 0x1f86;
     pub const RESTART: u32 = 0x1f87;
@@ -670,12 +637,11 @@ pub mod monitor {
 
 pub mod bridge {
     pub const ID: u16 = 0x0022;
-    pub const FD_TAG: i32 = 34;
     pub const WRITE: u32 = 0x22e0;
     pub const READ: u32 = 0x22e1;
     pub const POLL: u32 = 0x22e2;
     pub const INFO: u32 = 0x22e3;
-    pub const SELF_BRIDGES: u32 = 0x2244;
+    pub const SELF_BRIDGE: u32 = 0x2244;
 }
 
 pub mod flash {
@@ -688,7 +654,6 @@ pub mod flash {
 pub mod diag {
     pub const ID: u16 = 0x0025;
     pub const LOG_RING_DRAIN: u32 = 0x2564;
-    pub const FAN_DIAG_SNAPSHOT: u32 = 0x2565;
 }
 
 pub mod vault_store {
@@ -703,7 +668,6 @@ pub mod vault_store {
 
 pub mod rp_raw {
     pub const ID: u16 = 0x0027;
-    pub const FD_TAG: i32 = 39;
     pub const CLAIM: u32 = 0x2750;
     pub const RELEASE: u32 = 0x2751;
     pub const PWM_PIN_ENABLE: u32 = 0x2760;
@@ -750,6 +714,7 @@ pub mod rp_raw {
 
 pub mod metal_device {
     pub const ID: u16 = 0x0024;
+    pub const MMIO_OPEN: u32 = 0x24e8;
     pub const MMIO_READ32: u32 = 0x24e4;
     pub const MMIO_WRITE32: u32 = 0x24e5;
     pub const DMA_ALLOC_CONTIG: u32 = 0x24e6;
@@ -771,13 +736,43 @@ pub mod storage_custody {
     pub const DRILL: u32 = 0x2804;
 }
 
+pub mod lend {
+    pub const ID: u16 = 0x0029;
+    pub const OPEN: u32 = 0x2900;
+    pub const RESOLVE: u32 = 0x2901;
+    pub const RETURN: u32 = 0x2902;
+    pub const CLOSE: u32 = 0x2903;
+}
+
+pub mod storage_block {
+    pub const ID: u16 = 0x002a;
+    pub const DESCRIBE: u32 = 0x2a00;
+    pub const SUBMIT: u32 = 0x2a01;
+    pub const REAP: u32 = 0x2a02;
+    pub const EXEC: u32 = 0x2a03;
+    pub const READ_STREAM: u32 = 0x2a04;
+}
+
+pub mod net_tx_drain {
+    pub const ID: u16 = 0x002b;
+    pub const DRAINED: u32 = 0x2b00;
+}
+
+pub mod image_decode {
+    pub const ID: u16 = 0x002c;
+    pub const DECODE: u32 = 0x2c00;
+    pub const RECV: u32 = 0x2c01;
+    pub const CLOSE: u32 = 0x2c02;
+}
+
 /// The contract a manifest names (`requires_contract`, `provides`).
 pub fn contract_of_name(name: &str) -> Option<u16> {
     match name {
         "channel" => Some(0x0001),
         "timer" => Some(0x0002),
-        "buffer" => Some(0x0003),
+        "stream_select" => Some(0x0003),
         "event" => Some(0x0004),
+        "key_vault" => Some(0x0005),
         "gpio" => Some(0x0006),
         "spi" => Some(0x0007),
         "i2c" => Some(0x0008),
@@ -801,6 +796,9 @@ pub fn contract_of_name(name: &str) -> Option<u16> {
         "platform_dma_fd" => Some(0x001f),
         "metal_device" => Some(0x0024),
         "storage.custody" => Some(0x0028),
+        "storage.block" => Some(0x002a),
+        "net_tx_drain" => Some(0x002b),
+        "image_decode" => Some(0x002c),
         _ => None,
     }
 }
@@ -812,7 +810,7 @@ pub fn contract_id(name: &str) -> Option<u16> {
         "kernel" => Some(0x0000),
         "channel" => Some(0x0001),
         "timer" => Some(0x0002),
-        "buffer" => Some(0x0003),
+        "stream_select" => Some(0x0003),
         "event" => Some(0x0004),
         "key_vault" => Some(0x0005),
         "gpio" => Some(0x0006),
@@ -850,6 +848,10 @@ pub fn contract_id(name: &str) -> Option<u16> {
         "rp_raw" => Some(0x0027),
         "metal_device" => Some(0x0024),
         "storage.custody" => Some(0x0028),
+        "lend" => Some(0x0029),
+        "storage.block" => Some(0x002a),
+        "net_tx_drain" => Some(0x002b),
+        "image_decode" => Some(0x002c),
         _ => None,
     }
 }
@@ -860,7 +862,7 @@ pub fn contract_name(id: u16) -> Option<&'static str> {
         0x0000 => Some("kernel"),
         0x0001 => Some("channel"),
         0x0002 => Some("timer"),
-        0x0003 => Some("buffer"),
+        0x0003 => Some("stream_select"),
         0x0004 => Some("event"),
         0x0005 => Some("key_vault"),
         0x0006 => Some("gpio"),
@@ -898,6 +900,10 @@ pub fn contract_name(id: u16) -> Option<&'static str> {
         0x0026 => Some("vault_store"),
         0x0027 => Some("rp_raw"),
         0x0028 => Some("storage.custody"),
+        0x0029 => Some("lend"),
+        0x002a => Some("storage.block"),
+        0x002b => Some("net_tx_drain"),
+        0x002c => Some("image_decode"),
         _ => None,
     }
 }
@@ -907,7 +913,9 @@ pub fn contract_name(id: u16) -> Option<&'static str> {
 pub fn module_providable(id: u16) -> bool {
     matches!(
         id,
-        0x0006
+        0x0003
+            | 0x0005
+            | 0x0006
             | 0x0007
             | 0x0008
             | 0x0009
@@ -919,42 +927,49 @@ pub fn module_providable(id: u16) -> bool {
             | 0x000f
             | 0x0012
             | 0x0028
+            | 0x002a
+            | 0x002b
+            | 0x002c
     )
 }
 
 /// How many contracts a manifest may name.
-pub const MANIFEST_CONTRACTS: usize = 27;
+pub const MANIFEST_CONTRACTS: usize = 31;
 
 /// The `i`th contract a manifest may name, in registry order.
 pub fn manifest_contract(i: usize) -> Option<&'static str> {
     match i {
         0 => Some("channel"),
         1 => Some("timer"),
-        2 => Some("buffer"),
+        2 => Some("stream_select"),
         3 => Some("event"),
-        4 => Some("gpio"),
-        5 => Some("spi"),
-        6 => Some("i2c"),
-        7 => Some("pio"),
-        8 => Some("uart"),
-        9 => Some("adc"),
-        10 => Some("pwm"),
-        11 => Some("fs"),
-        12 => Some("storage.namespace"),
-        13 => Some("storage.object"),
-        14 => Some("trust"),
-        15 => Some("net_policy"),
-        16 => Some("net_route"),
-        17 => Some("workload"),
-        18 => Some("host_mount"),
-        19 => Some("proc"),
-        20 => Some("usb_host"),
-        21 => Some("pcie_device"),
-        22 => Some("platform_nic_ring"),
-        23 => Some("platform_dma"),
-        24 => Some("platform_dma_fd"),
-        25 => Some("metal_device"),
-        26 => Some("storage.custody"),
+        4 => Some("key_vault"),
+        5 => Some("gpio"),
+        6 => Some("spi"),
+        7 => Some("i2c"),
+        8 => Some("pio"),
+        9 => Some("uart"),
+        10 => Some("adc"),
+        11 => Some("pwm"),
+        12 => Some("fs"),
+        13 => Some("storage.namespace"),
+        14 => Some("storage.object"),
+        15 => Some("trust"),
+        16 => Some("net_policy"),
+        17 => Some("net_route"),
+        18 => Some("workload"),
+        19 => Some("host_mount"),
+        20 => Some("proc"),
+        21 => Some("usb_host"),
+        22 => Some("pcie_device"),
+        23 => Some("platform_nic_ring"),
+        24 => Some("platform_dma"),
+        25 => Some("platform_dma_fd"),
+        26 => Some("metal_device"),
+        27 => Some("storage.custody"),
+        28 => Some("storage.block"),
+        29 => Some("net_tx_drain"),
+        30 => Some("image_decode"),
         _ => None,
     }
 }
@@ -978,6 +993,7 @@ pub fn op_routes_to_kernel(op: u32) -> bool {
             | 0x23
             | 0x25
             | 0x27
+            | 0x29
     ) && !matches!(op, 0x00fe)
 }
 
@@ -986,66 +1002,55 @@ pub fn class_registered(class: u32) -> bool {
     (class as usize) < CONTRACTS_ASSIGNED
 }
 
-/// Whether a contract hands out tagged handles (its id is their tag).
-pub fn contract_mints(id: u16) -> bool {
-    matches!(
-        id,
-        0x0002
-            | 0x0004
-            | 0x0005
-            | 0x0006
-            | 0x0007
-            | 0x0008
-            | 0x0009
-            | 0x000a
-            | 0x000b
-            | 0x000c
-            | 0x000d
-            | 0x000e
-            | 0x000f
-            | 0x0017
-            | 0x001a
-            | 0x001b
-            | 0x001c
-            | 0x001d
-            | 0x001e
-            | 0x001f
-            | 0x0022
-            | 0x0027
-    )
+/// Whether a contract is served across a graph edge: by the module at
+/// the other end of the caller's port, through a handle bound to it.
+pub fn contract_is_edge(id: u16) -> bool {
+    matches!(id, 0x0003 | 0x002a | 0x002b)
 }
 
-/// Handle layout: bit 31 clear, a 6-bit contract tag, then the slot.
-pub mod fd {
-    /// A handle with tag 0 is untagged (a channel port, a raw integer).
-    pub const UNTAGGED: i32 = 0;
-    pub const TAG_SHIFT: u32 = 25;
-    pub const TAG_MASK: i32 = 0x3f;
-    pub const SLOT_MASK: i32 = 0x1ffffff;
-    /// Slot bits a provider's own index may use; the kernel owns the
-    /// slot field's top bit (routed handles, the vault's hardware field).
-    pub const SLOT_FIELD_BITS: u32 = 24;
+/// The handle word: bit 31 clear (a negative value is an errno), then
+/// the contract, the generation and the index. The kernel mints every
+/// handle a module holds; a provider sees only its own index.
+pub mod handle {
+    pub const CONTRACT_BITS: u32 = 7;
+    pub const GEN_BITS: u32 = 9;
+    pub const INDEX_BITS: u32 = 15;
+    pub const GEN_SHIFT: u32 = INDEX_BITS;
+    pub const CONTRACT_SHIFT: u32 = INDEX_BITS + GEN_BITS;
+    pub const CONTRACT_MASK: u16 = (1 << CONTRACT_BITS) - 1;
+    pub const GEN_MASK: u16 = (1 << GEN_BITS) - 1;
+    pub const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
+    /// Slots a table whose index a handle names may hold.
+    pub const INDEX_LIMIT: usize = 1 << INDEX_BITS;
 
-    /// Encode a tag and a slot; a negative slot (an errno) passes through,
-    /// and an unencodable tag is `EINVAL` rather than an alias.
-    pub const fn tag_fd(tag: i32, slot: i32) -> i32 {
-        if slot < 0 {
-            return slot;
-        }
-        if tag < 0 || tag > TAG_MASK {
-            return -22;
-        }
-        (tag << TAG_SHIFT) | (slot & SLOT_MASK)
+    /// The handle naming slot `index` of `contract`'s table at `generation`;
+    /// fields wider than theirs are truncated.
+    pub const fn encode(contract: u16, generation: u16, index: u32) -> i32 {
+        ((((contract & CONTRACT_MASK) as u32) << CONTRACT_SHIFT)
+            | (((generation & GEN_MASK) as u32) << GEN_SHIFT)
+            | (index & INDEX_MASK)) as i32
     }
 
-    /// Decode a handle into `(tag, slot)`.
-    pub const fn untag_fd(fd: i32) -> (i32, i32) {
-        ((fd >> TAG_SHIFT) & TAG_MASK, fd & SLOT_MASK)
+    /// `(contract, generation, index)` of a handle; `None` for a negative
+    /// value, which is an errno.
+    pub const fn decode(h: i32) -> Option<(u16, u16, u32)> {
+        if h < 0 {
+            return None;
+        }
+        let h = h as u32;
+        Some((
+            ((h >> CONTRACT_SHIFT) as u16) & CONTRACT_MASK,
+            ((h >> GEN_SHIFT) as u16) & GEN_MASK,
+            h & INDEX_MASK,
+        ))
     }
 
-    /// The slot of a handle.
-    pub const fn slot_of(fd: i32) -> i32 {
-        fd & SLOT_MASK
+    /// The contract a handle names, if it is one.
+    pub const fn contract_of(h: i32) -> Option<u16> {
+        match decode(h) {
+            Some((c, _, _)) => Some(c),
+            None => None,
+        }
     }
 }
 
@@ -1059,6 +1064,20 @@ pub mod msg {
         pub const MSG_DG_RX_FROM: u8 = 0x41;
         pub const MSG_DG_CLOSED: u8 = 0x42;
         pub const MSG_DG_ERROR: u8 = 0x43;
+        /// Value ranges this surface owns, each filled densely.
+        pub const RANGE_COUNT: usize = 2;
+        /// The `i`th range this surface owns, `(first, last)`.
+        pub const fn range(i: usize) -> Option<(u8, u8)> {
+            match i {
+                0 => Some((0x20, 0x22)),
+                1 => Some((0x40, 0x43)),
+                _ => None,
+            }
+        }
+        /// Whether this surface owns message type `v`.
+        pub const fn owns(v: u8) -> bool {
+            matches!(v, 0x20..=0x22 | 0x40..=0x43)
+        }
     }
     pub mod identity {
         pub const ADDR_ADD: u8 = 0xa0;
@@ -1102,19 +1121,25 @@ pub mod msg {
         pub const MSG_BOUND: u8 = 0x04;
         pub const MSG_CONNECTED: u8 = 0x05;
         pub const MSG_ERROR: u8 = 0x06;
-        pub const MSG_RETRANSMIT: u8 = 0x07;
-        pub const MSG_ACK: u8 = 0x08;
-        pub const MSG_TRACE_CTX: u8 = 0x09;
-        pub const MSG_PEER: u8 = 0x0a;
-        pub const MSG_HORIZON: u8 = 0x0b;
-        pub const MSG_RESUMED: u8 = 0x0c;
+        pub const MSG_PEER: u8 = 0x07;
         pub const CMD_BIND: u8 = 0x10;
         pub const CMD_SEND: u8 = 0x11;
         pub const CMD_CLOSE: u8 = 0x12;
-        pub const CMD_RESEND: u8 = 0x18;
-        pub const CMD_DELIVERED: u8 = 0x19;
-        pub const CMD_CONNECT: u8 = 0x13;
-        pub const CMD_CONNECT_TO: u8 = 0x14;
+        pub const CMD_CONNECT_TO: u8 = 0x13;
+        /// Value ranges this surface owns, each filled densely.
+        pub const RANGE_COUNT: usize = 2;
+        /// The `i`th range this surface owns, `(first, last)`.
+        pub const fn range(i: usize) -> Option<(u8, u8)> {
+            match i {
+                0 => Some((0x01, 0x07)),
+                1 => Some((0x10, 0x13)),
+                _ => None,
+            }
+        }
+        /// Whether this surface owns message type `v`.
+        pub const fn owns(v: u8) -> bool {
+            matches!(v, 0x01..=0x07 | 0x10..=0x13)
+        }
     }
     pub mod packet {
         pub const CMD_PKT_BIND: u8 = 0x50;
@@ -1177,6 +1202,58 @@ pub mod msg {
         pub const MSG_SC_CONTINUITY: u8 = 0x9a;
         pub const MSG_SC_ERROR: u8 = 0x9f;
     }
+    pub mod stream_cursor {
+        pub const MSG_CURSOR_HORIZON: u8 = 0xd4;
+        pub const MSG_CURSOR_RESUMED: u8 = 0xd5;
+        pub const CMD_CURSOR_DELIVERED: u8 = 0xd6;
+        /// Value ranges this surface owns, each filled densely.
+        pub const RANGE_COUNT: usize = 1;
+        /// The `i`th range this surface owns, `(first, last)`.
+        pub const fn range(i: usize) -> Option<(u8, u8)> {
+            match i {
+                0 => Some((0xd4, 0xd6)),
+                _ => None,
+            }
+        }
+        /// Whether this surface owns message type `v`.
+        pub const fn owns(v: u8) -> bool {
+            matches!(v, 0xd4..=0xd6)
+        }
+    }
+    pub mod stream_retx {
+        pub const MSG_RETX_ACK: u8 = 0xd0;
+        pub const MSG_RETX_REQUEST: u8 = 0xd1;
+        pub const CMD_RETX_RESEND: u8 = 0xd2;
+        /// Value ranges this surface owns, each filled densely.
+        pub const RANGE_COUNT: usize = 1;
+        /// The `i`th range this surface owns, `(first, last)`.
+        pub const fn range(i: usize) -> Option<(u8, u8)> {
+            match i {
+                0 => Some((0xd0, 0xd2)),
+                _ => None,
+            }
+        }
+        /// Whether this surface owns message type `v`.
+        pub const fn owns(v: u8) -> bool {
+            matches!(v, 0xd0..=0xd2)
+        }
+    }
+    pub mod stream_trace {
+        pub const MSG_TRACE_CTX: u8 = 0xd3;
+        /// Value ranges this surface owns, each filled densely.
+        pub const RANGE_COUNT: usize = 1;
+        /// The `i`th range this surface owns, `(first, last)`.
+        pub const fn range(i: usize) -> Option<(u8, u8)> {
+            match i {
+                0 => Some((0xd3, 0xd3)),
+                _ => None,
+            }
+        }
+        /// Whether this surface owns message type `v`.
+        pub const fn owns(v: u8) -> bool {
+            matches!(v, 0xd3..=0xd3)
+        }
+    }
 }
 
 /// What calling an op needs.
@@ -1195,16 +1272,11 @@ pub enum OpGrant {
 pub fn op_grant(op: u32) -> Option<OpGrant> {
     match op {
         0x0001 => Some(OpGrant::Free),
-        0x0002 => Some(OpGrant::Free),
-        0x0003 => Some(OpGrant::Free),
-        0x0004 => Some(OpGrant::Free),
-        0x0005 => Some(OpGrant::Free),
         0x0006 => Some(OpGrant::Free),
         0x0008 => Some(OpGrant::Free),
         0x0009 => Some(OpGrant::Free),
         0x000a => Some(OpGrant::Free),
         0x000b => Some(OpGrant::Free),
-        0x000c => Some(OpGrant::Free),
         0x002a => Some(OpGrant::Free),
         0x002b => Some(OpGrant::Free),
         0x002c => Some(OpGrant::Free),
@@ -1224,17 +1296,27 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0043 => Some(OpGrant::Free),
         0x0045 => Some(OpGrant::Free),
         0x0046 => Some(OpGrant::Free),
-        0x004b => Some(OpGrant::Free),
         0x004c => Some(OpGrant::Free),
         0x0050 => Some(OpGrant::Free),
         0x0052 => Some(OpGrant::Grant(grant::KERNEL_SIGNAL_CORE)),
+        0x0053 => Some(OpGrant::Free),
+        0x0054 => Some(OpGrant::Free),
+        0x0055 => Some(OpGrant::Free),
         0x0066 => Some(OpGrant::Grant(grant::KERNEL_SERIAL)),
         0x00fe => Some(OpGrant::Free),
         0x0100 => Some(OpGrant::Free),
         0x0101 => Some(OpGrant::Free),
-        0x0106 => Some(OpGrant::Free),
+        0x0102 => Some(OpGrant::Free),
+        0x0103 => Some(OpGrant::Free),
+        0x0104 => Some(OpGrant::Free),
+        0x0105 => Some(OpGrant::Free),
         0x0107 => Some(OpGrant::Free),
         0x010c => Some(OpGrant::Free),
+        0x0110 => Some(OpGrant::Free),
+        0x0111 => Some(OpGrant::Free),
+        0x0112 => Some(OpGrant::Free),
+        0x0113 => Some(OpGrant::Free),
+        0x0114 => Some(OpGrant::Free),
         0x0202 => Some(OpGrant::Free),
         0x0203 => Some(OpGrant::Free),
         0x0204 => Some(OpGrant::Free),
@@ -1244,11 +1326,7 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0208 => Some(OpGrant::Free),
         0x0209 => Some(OpGrant::Free),
         0x020a => Some(OpGrant::Grant(grant::TIMER_DISCIPLINE)),
-        0x0300 => Some(OpGrant::Free),
-        0x0301 => Some(OpGrant::Free),
-        0x0302 => Some(OpGrant::Free),
-        0x0303 => Some(OpGrant::Free),
-        0x0304 => Some(OpGrant::Free),
+        0x0300 => Some(OpGrant::Contract(0x0003)),
         0x0400 => Some(OpGrant::Free),
         0x0401 => Some(OpGrant::Free),
         0x0402 => Some(OpGrant::Free),
@@ -1279,8 +1357,6 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0516 => Some(OpGrant::Contract(0x0005)),
         0x0517 => Some(OpGrant::Contract(0x0005)),
         0x0518 => Some(OpGrant::Contract(0x0005)),
-        0x0519 => Some(OpGrant::Contract(0x0005)),
-        0x051a => Some(OpGrant::Contract(0x0005)),
         0x0600 => Some(OpGrant::Contract(0x0006)),
         0x0601 => Some(OpGrant::Contract(0x0006)),
         0x0602 => Some(OpGrant::Contract(0x0006)),
@@ -1301,6 +1377,7 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0708 => Some(OpGrant::Contract(0x0007)),
         0x0709 => Some(OpGrant::Contract(0x0007)),
         0x070a => Some(OpGrant::Contract(0x0007)),
+        0x07ff => Some(OpGrant::Contract(0x0007)),
         0x0800 => Some(OpGrant::Contract(0x0008)),
         0x0801 => Some(OpGrant::Contract(0x0008)),
         0x0802 => Some(OpGrant::Contract(0x0008)),
@@ -1311,14 +1388,11 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0807 => Some(OpGrant::Contract(0x0008)),
         0x0900 => Some(OpGrant::Contract(0x0009)),
         0x0901 => Some(OpGrant::Contract(0x0009)),
-        0x0902 => Some(OpGrant::Contract(0x0009)),
         0x0903 => Some(OpGrant::Contract(0x0009)),
         0x0904 => Some(OpGrant::Contract(0x0009)),
         0x0905 => Some(OpGrant::Contract(0x0009)),
         0x0906 => Some(OpGrant::Contract(0x0009)),
         0x0907 => Some(OpGrant::Contract(0x0009)),
-        0x0908 => Some(OpGrant::Contract(0x0009)),
-        0x0909 => Some(OpGrant::Contract(0x0009)),
         0x090a => Some(OpGrant::Contract(0x0009)),
         0x090b => Some(OpGrant::Contract(0x0009)),
         0x0910 => Some(OpGrant::Contract(0x0009)),
@@ -1334,7 +1408,6 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0923 => Some(OpGrant::Contract(0x0009)),
         0x0924 => Some(OpGrant::Contract(0x0009)),
         0x0925 => Some(OpGrant::Contract(0x0009)),
-        0x0926 => Some(OpGrant::Contract(0x0009)),
         0x0927 => Some(OpGrant::Contract(0x0009)),
         0x0a00 => Some(OpGrant::Contract(0x000a)),
         0x0a01 => Some(OpGrant::Contract(0x000a)),
@@ -1384,7 +1457,6 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0e06 => Some(OpGrant::Contract(0x000e)),
         0x0e07 => Some(OpGrant::Contract(0x000e)),
         0x0e08 => Some(OpGrant::Contract(0x000e)),
-        0x0e09 => Some(OpGrant::Contract(0x000e)),
         0x0eff => Some(OpGrant::Contract(0x000e)),
         0x0f20 => Some(OpGrant::Contract(0x000f)),
         0x0f21 => Some(OpGrant::Contract(0x000f)),
@@ -1399,9 +1471,7 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x0f2a => Some(OpGrant::Contract(0x000f)),
         0x0f2b => Some(OpGrant::Contract(0x000f)),
         0x0f2c => Some(OpGrant::Contract(0x000f)),
-        0x0f30 => Some(OpGrant::Contract(0x000f)),
-        0x0f31 => Some(OpGrant::Contract(0x000f)),
-        0x0f32 => Some(OpGrant::Contract(0x000f)),
+        0x0fff => Some(OpGrant::Contract(0x000f)),
         0x103e => Some(OpGrant::Free),
         0x104d => Some(OpGrant::Contract(0x0010)),
         0x104e => Some(OpGrant::Contract(0x0010)),
@@ -1414,21 +1484,18 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x1236 => Some(OpGrant::Free),
         0x1300 => Some(OpGrant::Contract(0x0013)),
         0x1400 => Some(OpGrant::Contract(0x0014)),
-        0x1401 => Some(OpGrant::Contract(0x0014)),
-        0x1500 => Some(OpGrant::Contract(0x0015)),
-        0x1501 => Some(OpGrant::Contract(0x0015)),
-        0x1502 => Some(OpGrant::Grant(grant::NET_POLICY_REPLACE)),
-        0x1503 => Some(OpGrant::Grant(grant::NET_POLICY_REPLACE)),
-        0x1504 => Some(OpGrant::Contract(0x0015)),
-        0x1505 => Some(OpGrant::Contract(0x0015)),
-        0x1600 => Some(OpGrant::Contract(0x0016)),
-        0x1601 => Some(OpGrant::Contract(0x0016)),
+        0x1500 => Some(OpGrant::Grant(grant::NET_POLICY_REPLACE)),
+        0x1501 => Some(OpGrant::Grant(grant::NET_POLICY_REPLACE)),
+        0x1502 => Some(OpGrant::Contract(0x0015)),
+        0x1503 => Some(OpGrant::Contract(0x0015)),
+        0x15ff => Some(OpGrant::Contract(0x0015)),
+        0x1600 => Some(OpGrant::Grant(grant::NET_ROUTE_TABLE)),
+        0x1601 => Some(OpGrant::Grant(grant::NET_ROUTE_TABLE)),
         0x1602 => Some(OpGrant::Grant(grant::NET_ROUTE_TABLE)),
         0x1603 => Some(OpGrant::Grant(grant::NET_ROUTE_TABLE)),
-        0x1604 => Some(OpGrant::Grant(grant::NET_ROUTE_TABLE)),
-        0x1605 => Some(OpGrant::Grant(grant::NET_ROUTE_TABLE)),
-        0x1606 => Some(OpGrant::Grant(grant::NET_ROUTE_STACK)),
-        0x1607 => Some(OpGrant::Grant(grant::NET_ROUTE_STACK)),
+        0x1604 => Some(OpGrant::Grant(grant::NET_ROUTE_STACK)),
+        0x1605 => Some(OpGrant::Grant(grant::NET_ROUTE_STACK)),
+        0x16ff => Some(OpGrant::Contract(0x0016)),
         0x1700 => Some(OpGrant::Grant(grant::WORKLOAD_CREATE)),
         0x1701 => Some(OpGrant::Grant(grant::WORKLOAD_CREATE)),
         0x1702 => Some(OpGrant::Grant(grant::WORKLOAD_CREATE)),
@@ -1443,6 +1510,7 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x1711 => Some(OpGrant::Grant(grant::WORKLOAD_CREATE)),
         0x1712 => Some(OpGrant::Grant(grant::WORKLOAD_CREATE)),
         0x1713 => Some(OpGrant::Grant(grant::WORKLOAD_NET)),
+        0x1714 => Some(OpGrant::Grant(grant::WORKLOAD_CREATE)),
         0x17ff => Some(OpGrant::Grant(grant::WORKLOAD_CREATE)),
         0x1800 => Some(OpGrant::Grant(grant::HOST_PROCESS_EXEC)),
         0x1801 => Some(OpGrant::Grant(grant::HOST_PROCESS_EXEC)),
@@ -1450,15 +1518,15 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x1803 => Some(OpGrant::Grant(grant::HOST_PROCESS_EXEC)),
         0x1804 => Some(OpGrant::Grant(grant::HOST_PROCESS_EXEC)),
         0x1805 => Some(OpGrant::Grant(grant::HOST_PROCESS_EXEC)),
-        0x1806 => Some(OpGrant::Grant(grant::HOST_PROCESS_EXEC)),
-        0x1900 => Some(OpGrant::Contract(0x0019)),
+        0x18ff => Some(OpGrant::Grant(grant::HOST_PROCESS_EXEC)),
+        0x1900 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
         0x1901 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
-        0x1902 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
-        0x1903 => Some(OpGrant::Contract(0x0019)),
+        0x1902 => Some(OpGrant::Contract(0x0019)),
+        0x1903 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
         0x1904 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
         0x1905 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
         0x1906 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
-        0x1907 => Some(OpGrant::Grant(grant::HOST_MOUNT_MOUNT)),
+        0x19ff => Some(OpGrant::Contract(0x0019)),
         0x1a00 => Some(OpGrant::Contract(0x001a)),
         0x1a01 => Some(OpGrant::Contract(0x001a)),
         0x1a02 => Some(OpGrant::Contract(0x001a)),
@@ -1480,6 +1548,7 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x1e82 => Some(OpGrant::Contract(0x001e)),
         0x1e83 => Some(OpGrant::Contract(0x001e)),
         0x1e84 => Some(OpGrant::Contract(0x001e)),
+        0x1e85 => Some(OpGrant::Contract(0x001e)),
         0x1f85 => Some(OpGrant::Contract(0x001f)),
         0x1f86 => Some(OpGrant::Contract(0x001f)),
         0x1f87 => Some(OpGrant::Contract(0x001f)),
@@ -1521,6 +1590,7 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x24e5 => Some(OpGrant::Grant(grant::METAL_DEVICE_MMIO)),
         0x24e6 => Some(OpGrant::Grant(grant::METAL_DEVICE_DMA)),
         0x24e7 => Some(OpGrant::Grant(grant::METAL_DEVICE_DMA)),
+        0x24e8 => Some(OpGrant::Grant(grant::METAL_DEVICE_MMIO)),
         0x24ea => Some(OpGrant::Grant(grant::METAL_DEVICE_DMA)),
         0x24eb => Some(OpGrant::Grant(grant::METAL_DEVICE_DMA)),
         0x24ec => Some(OpGrant::Grant(grant::METAL_DEVICE_DMA)),
@@ -1528,7 +1598,6 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x24f6 => Some(OpGrant::Grant(grant::METAL_DEVICE_PCIE)),
         0x24f7 => Some(OpGrant::Grant(grant::METAL_DEVICE_PCIE)),
         0x2564 => Some(OpGrant::Contract(0x0025)),
-        0x2565 => Some(OpGrant::Free),
         0x2640 => Some(OpGrant::Grant(grant::SEAL_KEY)),
         0x2641 => Some(OpGrant::Grant(grant::SEAL_KEY)),
         0x2642 => Some(OpGrant::Grant(grant::SEAL_KEY)),
@@ -1582,6 +1651,19 @@ pub fn op_grant(op: u32) -> Option<OpGrant> {
         0x2802 => Some(OpGrant::Contract(0x0028)),
         0x2803 => Some(OpGrant::Contract(0x0028)),
         0x2804 => Some(OpGrant::Contract(0x0028)),
+        0x2900 => Some(OpGrant::Free),
+        0x2901 => Some(OpGrant::Grant(grant::LEND_BORROW)),
+        0x2902 => Some(OpGrant::Grant(grant::LEND_BORROW)),
+        0x2903 => Some(OpGrant::Free),
+        0x2a00 => Some(OpGrant::Contract(0x002a)),
+        0x2a01 => Some(OpGrant::Contract(0x002a)),
+        0x2a02 => Some(OpGrant::Contract(0x002a)),
+        0x2a03 => Some(OpGrant::Contract(0x002a)),
+        0x2a04 => Some(OpGrant::Contract(0x002a)),
+        0x2b00 => Some(OpGrant::Contract(0x002b)),
+        0x2c00 => Some(OpGrant::Contract(0x002c)),
+        0x2c01 => Some(OpGrant::Contract(0x002c)),
+        0x2c02 => Some(OpGrant::Contract(0x002c)),
         _ => None,
     }
 }
@@ -1593,7 +1675,7 @@ pub fn contract_grant(id: u16) -> Option<OpGrant> {
         0x0000 => Some(OpGrant::Free),
         0x0001 => Some(OpGrant::Free),
         0x0002 => Some(OpGrant::Free),
-        0x0003 => Some(OpGrant::Free),
+        0x0003 => Some(OpGrant::Contract(0x0003)),
         0x0004 => Some(OpGrant::Free),
         0x0005 => Some(OpGrant::Contract(0x0005)),
         0x0006 => Some(OpGrant::Contract(0x0006)),
@@ -1631,6 +1713,10 @@ pub fn contract_grant(id: u16) -> Option<OpGrant> {
         0x0026 => Some(OpGrant::Grant(grant::SEAL_KEY)),
         0x0027 => Some(OpGrant::Contract(0x0027)),
         0x0028 => Some(OpGrant::Contract(0x0028)),
+        0x0029 => Some(OpGrant::Free),
+        0x002a => Some(OpGrant::Contract(0x002a)),
+        0x002b => Some(OpGrant::Contract(0x002b)),
+        0x002c => Some(OpGrant::Contract(0x002c)),
         _ => None,
     }
 }
@@ -1640,12 +1726,16 @@ pub fn contract_grant(id: u16) -> Option<OpGrant> {
 pub fn op_admits(op: u32) -> bool {
     matches!(
         op,
-        0x0100 | 0x0204 | 0x0205 | 0x0400 | 0x0451 | 0x0d00 | 0x0d07 | 0x0d09
+        0x0100 | 0x0204 | 0x0205 | 0x0400 | 0x0451 | 0x0d00 | 0x0d07 | 0x0d09 | 0x2900 | 0x2c00
     )
 }
 
-/// What the gateway serves a gated module.
+/// The shape of every call a module may make, and what the gateway serves
+/// a gated module.
 pub mod gate {
+    /// Longest `arg` record any op takes.
+    pub const ARG_MAX: usize = 1024;
+
     /// What a rule lets the caller name as the handle.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum HandleUse {
@@ -1656,326 +1746,3858 @@ pub mod gate {
         Mints,
         Scoped,
         ScopedMints,
+        MintedMints,
     }
 
-    /// Which way the argument buffer moves.
+    /// Which way a buffer moves.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub enum ArgDir {
+    pub enum Dir {
         None,
         In,
         Out,
         InOut,
     }
 
-    /// How long the argument buffer may be.
+    /// How long the `data` span may be.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Bound {
         /// At most this many bytes.
         Bytes(usize),
         /// Bounded by the caller's own region alone.
         Any,
-        /// The walked-struct bound the gateway copies.
-        Walk,
     }
 
-    /// An argument struct that carries pointers, and how to find them.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub enum Walker {
-        ChannelIoctl,
-        StorageDelete,
-        StorageHead,
-        StorageList,
-        StoragePut,
-        StorageRangeGet,
-        StorageRetain,
-    }
-
-    /// One opcode a gated module may use.
+    /// One opcode's shape.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct OpRule {
         pub handle: HandleUse,
-        pub dir: ArgDir,
-        pub bound: Bound,
-        pub walk: Option<Walker>,
+        /// Which way the flat `arg` record moves.
+        pub arg: Dir,
+        /// Most bytes `arg` holds (at most `ARG_MAX`).
+        pub arg_max: usize,
+        /// Which way the bulk `data` span moves.
+        pub data: Dir,
+        pub data_max: Bound,
         /// The op releases the handle it names.
         pub closes: bool,
+        /// The op answers a kernel-granted address: never served gated.
+        pub addr_answer: bool,
+        /// The handle the op mints signals its minter through a doorbell.
+        pub signals: bool,
     }
 
-    /// The rule for `op`, if gated modules may use it.
+    /// The shape of `op`, if the registry declares one.
     pub fn op_rule(op: u32) -> Option<OpRule> {
         match op {
             0x002a => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(20),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 20,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x002b => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Bytes(64),
-                walk: None,
+                arg: Dir::InOut,
+                arg_max: 64,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: true,
+                signals: false,
             }),
             0x002c => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Any,
-                walk: None,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::Out,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x002d => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(32),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 32,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x002e => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::None,
-                bound: Bound::Bytes(0),
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x002f => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(16),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x003a => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(4),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: true,
+                signals: false,
             }),
             0x003c => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Any,
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x003d => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 6,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0040 => Some(OpRule {
                 handle: HandleUse::Value,
-                dir: ArgDir::In,
-                bound: Bound::Any,
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0041 => Some(OpRule {
                 handle: HandleUse::Channel,
-                dir: ArgDir::InOut,
-                bound: Bound::Bytes(1),
-                walk: None,
+                arg: Dir::InOut,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0042 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0043 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0045 => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::In,
-                bound: Bound::Bytes(1),
-                walk: None,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0046 => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Any,
-                walk: None,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x004c => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0050 => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::In,
-                bound: Bound::Bytes(4),
-                walk: None,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
-            0x0106 => Some(OpRule {
-                handle: HandleUse::Channel,
-                dir: ArgDir::InOut,
-                bound: Bound::Walk,
-                walk: Some(Walker::ChannelIoctl),
+            0x0052 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0053 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 34,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0055 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0066 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x00fe => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 62,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0100 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0101 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0102 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0103 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0104 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0105 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0107 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x010c => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Bytes(2),
-                walk: None,
+                arg: Dir::InOut,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0110 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x0111 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0112 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x0113 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0114 => Some(OpRule {
+                handle: HandleUse::Channel,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
             }),
             0x0202 => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(8),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0203 => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(8),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0204 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0205 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0206 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0207 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
             }),
             0x0208 => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(8),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0209 => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::Out,
-                bound: Bound::Bytes(36),
-                walk: None,
+                arg: Dir::Out,
+                arg_max: 36,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x020a => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::In,
-                bound: Bound::Bytes(20),
-                walk: None,
+                arg: Dir::In,
+                arg_max: 20,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0300 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0400 => Some(OpRule {
                 handle: HandleUse::Mints,
-                dir: ArgDir::None,
-                bound: Bound::Bytes(0),
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0401 => Some(OpRule {
                 handle: HandleUse::Minted,
-                dir: ArgDir::None,
-                bound: Bound::Bytes(0),
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0402 => Some(OpRule {
                 handle: HandleUse::Minted,
-                dir: ArgDir::None,
-                bound: Bound::Bytes(0),
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0403 => Some(OpRule {
                 handle: HandleUse::Minted,
-                dir: ArgDir::None,
-                bound: Bound::Bytes(0),
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0451 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0500 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 6,
+                data: Dir::In,
+                data_max: Bound::Bytes(4096),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0501 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 4,
+                data: Dir::InOut,
+                data_max: Bound::Bytes(256),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0502 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 6,
+                data: Dir::InOut,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0503 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0504 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0505 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::InOut,
+                arg_max: 12,
+                data: Dir::Out,
+                data_max: Bound::Bytes(4096),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0506 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::Out,
+                data_max: Bound::Bytes(4096),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0507 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0508 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::InOut,
+                arg_max: 76,
+                data: Dir::Out,
+                data_max: Bound::Bytes(4096),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0509 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::InOut,
+                arg_max: 76,
+                data: Dir::Out,
+                data_max: Bound::Bytes(4096),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x050a => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 65,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x050b => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x050c => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 20,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x050d => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 36,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x050e => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 101,
+                data: Dir::Out,
+                data_max: Bound::Bytes(256),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x050f => Some(OpRule {
+                handle: HandleUse::MintedMints,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Bytes(256),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0510 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 274,
+                data: Dir::InOut,
+                data_max: Bound::Bytes(65552),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0511 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 274,
+                data: Dir::InOut,
+                data_max: Bound::Bytes(65552),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0512 => Some(OpRule {
+                handle: HandleUse::MintedMints,
+                arg: Dir::In,
+                arg_max: 202,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0513 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 158,
+                data: Dir::InOut,
+                data_max: Bound::Bytes(65536),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0514 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 158,
+                data: Dir::InOut,
+                data_max: Bound::Bytes(65536),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0515 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 283,
+                data: Dir::Out,
+                data_max: Bound::Bytes(780),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0516 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 153,
+                data: Dir::InOut,
+                data_max: Bound::Bytes(260),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0517 => Some(OpRule {
+                handle: HandleUse::MintedMints,
+                arg: Dir::In,
+                arg_max: 28,
+                data: Dir::In,
+                data_max: Bound::Bytes(260),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0518 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 32,
+                data: Dir::Out,
+                data_max: Bound::Bytes(148),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0600 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0601 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0602 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0603 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0604 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0605 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0606 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0607 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x060a => Some(OpRule {
+                handle: HandleUse::MintedMints,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: true,
+            }),
+            0x0700 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0701 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0702 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0703 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0704 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0705 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0706 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0707 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 13,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0708 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0709 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x070a => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x07ff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0800 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 3,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0801 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0802 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Bytes(64),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0803 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0804 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::In,
+                data_max: Bound::Bytes(64),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0805 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0806 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0807 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Bytes(64),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0900 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0901 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::In,
+                data_max: Bound::Bytes(64),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0903 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0904 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0905 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Bytes(8192),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0906 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0907 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 24,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x090a => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x090b => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0910 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0911 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::In,
+                data_max: Bound::Bytes(64),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0912 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0913 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Bytes(1624),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0914 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Bytes(1616),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0915 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0916 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0920 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0921 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::In,
+                data_max: Bound::Bytes(64),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0922 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0923 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0924 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0925 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0927 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0a00 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0a01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0a02 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0a03 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0a04 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0a05 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0b00 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0b01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0b02 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0b03 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0b04 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0c00 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0c01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0c02 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0c03 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0c04 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d00 => Some(OpRule {
+                handle: HandleUse::ScopedMints,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d02 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d03 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d04 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 32,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d05 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d06 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d07 => Some(OpRule {
+                handle: HandleUse::ScopedMints,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d08 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d09 => Some(OpRule {
+                handle: HandleUse::ScopedMints,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d0a => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d0b => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d0c => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 263,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d0d => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 514,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d0e => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d0f => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d10 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d11 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d12 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d13 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 514,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d14 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0d15 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0dff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e00 => Some(OpRule {
+                handle: HandleUse::ScopedMints,
+                arg: Dir::In,
+                arg_max: 255,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 50,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e02 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 578,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e03 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 579,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e04 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 322,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e05 => Some(OpRule {
+                handle: HandleUse::ScopedMints,
+                arg: Dir::In,
+                arg_max: 258,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: true,
+            }),
+            0x0e06 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e07 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 643,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0e08 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 580,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0eff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f20 => Some(OpRule {
                 handle: HandleUse::Scoped,
-                dir: ArgDir::In,
-                bound: Bound::Walk,
-                walk: Some(Walker::StoragePut),
+                arg: Dir::InOut,
+                arg_max: 908,
+                data: Dir::In,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f21 => Some(OpRule {
                 handle: HandleUse::ScopedMints,
-                dir: ArgDir::In,
-                bound: Bound::Any,
-                walk: None,
+                arg: Dir::In,
+                arg_max: 257,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f22 => Some(OpRule {
                 handle: HandleUse::Scoped,
-                dir: ArgDir::In,
-                bound: Bound::Walk,
-                walk: Some(Walker::StorageHead),
+                arg: Dir::InOut,
+                arg_max: 666,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f23 => Some(OpRule {
                 handle: HandleUse::Minted,
-                dir: ArgDir::In,
-                bound: Bound::Walk,
-                walk: Some(Walker::StorageRangeGet),
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::Out,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f24 => Some(OpRule {
                 handle: HandleUse::Scoped,
-                dir: ArgDir::In,
-                bound: Bound::Walk,
-                walk: Some(Walker::StorageDelete),
+                arg: Dir::InOut,
+                arg_max: 578,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f25 => Some(OpRule {
                 handle: HandleUse::Minted,
-                dir: ArgDir::None,
-                bound: Bound::Bytes(0),
-                walk: None,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0f26 => Some(OpRule {
+                handle: HandleUse::ScopedMints,
+                arg: Dir::In,
+                arg_max: 844,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0f27 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0f28 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 64,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0f29 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f2a => Some(OpRule {
                 handle: HandleUse::Scoped,
-                dir: ArgDir::In,
-                bound: Bound::Walk,
-                walk: Some(Walker::StorageList),
+                arg: Dir::InOut,
+                arg_max: 580,
+                data: Dir::Out,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f2b => Some(OpRule {
-                handle: HandleUse::Mints,
-                dir: ArgDir::InOut,
-                bound: Bound::Any,
-                walk: None,
+                handle: HandleUse::ScopedMints,
+                arg: Dir::InOut,
+                arg_max: 258,
+                data: Dir::In,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x0f2c => Some(OpRule {
                 handle: HandleUse::Scoped,
-                dir: ArgDir::In,
-                bound: Bound::Walk,
-                walk: Some(Walker::StorageRetain),
+                arg: Dir::InOut,
+                arg_max: 330,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x0fff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x103e => Some(OpRule {
                 handle: HandleUse::Global,
-                dir: ArgDir::In,
-                bound: Bound::Any,
-                walk: None,
+                arg: Dir::In,
+                arg_max: 144,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x104d => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x104e => Some(OpRule {
+                handle: HandleUse::Value,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x104f => Some(OpRule {
+                handle: HandleUse::Value,
+                arg: Dir::Out,
+                arg_max: 20,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1124 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1125 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x113f => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x1234 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 251,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1235 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1236 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1300 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 24,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1400 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1500 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 33,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1501 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 33,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1502 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 33,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1503 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x15ff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1600 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1601 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1602 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1603 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1604 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1605 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x16ff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1700 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 1024,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1701 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1702 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1703 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1704 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x170b => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x170c => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x170d => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x170e => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x170f => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 20,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1710 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1711 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1712 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::InOut,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1713 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 256,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1714 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x17ff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1800 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 16,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1801 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 20,
+                data: Dir::InOut,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1802 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 20,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1803 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 13,
+                data: Dir::InOut,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1804 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1805 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x18ff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1900 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1901 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1902 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1903 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1904 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1905 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1906 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x19ff => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1a00 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1a01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1a02 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1a03 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1ca0 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 64,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1ca1 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1ca2 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1ca3 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1ca4 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x1ca5 => Some(OpRule {
+                handle: HandleUse::MintedMints,
+                arg: Dir::Out,
+                arg_max: 20,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: true,
+            }),
+            0x1ca6 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 32,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1df0 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x1df1 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1df2 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1df3 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1df4 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x1e80 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1e81 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1e82 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 14,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1e83 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1e84 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1e85 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1f85 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1f86 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 14,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1f87 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1f88 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x1f89 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2020 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2021 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2022 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2023 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2047 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 6,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2048 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 6,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2049 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 6,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x204a => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 6,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2068 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2069 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x206a => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x206b => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x206c => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x206d => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x206e => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 1024,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x206f => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2152 => Some(OpRule {
+                handle: HandleUse::Scoped,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2153 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2154 => Some(OpRule {
+                handle: HandleUse::Value,
+                arg: Dir::Out,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2155 => Some(OpRule {
+                handle: HandleUse::Value,
+                arg: Dir::Out,
+                arg_max: 32,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2156 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 3,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2157 => Some(OpRule {
+                handle: HandleUse::Value,
+                arg: Dir::Out,
+                arg_max: 66,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x21e8 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 24,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2244 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x22e0 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x22e1 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x22e2 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x22e3 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2310 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2338 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2339 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 260,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24e4 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24e5 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24e6 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::InOut,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x24e7 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24e8 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::InOut,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x24ea => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24eb => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24ec => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::InOut,
+                arg_max: 12,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x24f5 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24f6 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x24f7 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2564 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2640 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2641 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::In,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2642 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2643 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::Out,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2644 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 12,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2645 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 16,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2750 => Some(OpRule {
+                handle: HandleUse::Mints,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2751 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2760 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2761 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2762 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 6,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2763 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2770 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2771 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 7,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2772 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 3,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2773 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 3,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2774 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 6,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2775 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2776 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2777 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 3,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2778 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2779 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 6,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x277a => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x277b => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x277c => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x277d => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 32,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x277e => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x277f => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2790 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 261,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2791 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2792 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27a0 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27a1 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27a2 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27a3 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 3,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27a4 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27b0 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27b1 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27b2 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27b3 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27b4 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27c0 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27c1 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27c2 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 2,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27c3 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27d0 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27d1 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 5,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x27d2 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 1,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x2800 => Some(OpRule {
-                handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Any,
-                walk: None,
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::InOut,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x2801 => Some(OpRule {
-                handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Any,
-                walk: None,
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 4,
+                data: Dir::InOut,
+                data_max: Bound::Any,
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x2802 => Some(OpRule {
-                handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Any,
-                walk: None,
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 69,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x2803 => Some(OpRule {
-                handle: HandleUse::Global,
-                dir: ArgDir::InOut,
-                bound: Bound::Any,
-                walk: None,
+                handle: HandleUse::Scoped,
+                arg: Dir::InOut,
+                arg_max: 975,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
             }),
             0x2804 => Some(OpRule {
-                handle: HandleUse::Global,
-                dir: ArgDir::In,
-                bound: Bound::Any,
-                walk: None,
+                handle: HandleUse::Scoped,
+                arg: Dir::In,
+                arg_max: 524,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
                 closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2900 => Some(OpRule {
+                handle: HandleUse::MintedMints,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::InOut,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2901 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::InOut,
+                arg_max: 13,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: true,
+                signals: false,
+            }),
+            0x2902 => Some(OpRule {
+                handle: HandleUse::Global,
+                arg: Dir::In,
+                arg_max: 8,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2903 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2a00 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 40,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2a01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 40,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2a02 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 80,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2a03 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::InOut,
+                arg_max: 120,
+                data: Dir::InOut,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2a04 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::In,
+                arg_max: 40,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2b00 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::Out,
+                arg_max: 4,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2c00 => Some(OpRule {
+                handle: HandleUse::ScopedMints,
+                arg: Dir::In,
+                arg_max: 274,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2c01 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
+                closes: false,
+                addr_answer: false,
+                signals: false,
+            }),
+            0x2c02 => Some(OpRule {
+                handle: HandleUse::Minted,
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::None,
+                data_max: Bound::Bytes(0),
+                closes: true,
+                addr_answer: false,
+                signals: false,
             }),
             _ => None,
         }

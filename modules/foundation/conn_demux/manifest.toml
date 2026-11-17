@@ -4,8 +4,9 @@ hardware_targets = ["bcm2712", "rp2350", "linux"]
 # Connection-level demultiplexer. Sits on a single shared `ip` module's
 # `net_out` (NetProto stream) and routes each net_proto frame to one of N
 # downstream TLS+HTTP compute lanes by hashing the per-connection `conn_id`
-# (the first payload byte of every per-connection message: MSG_ACCEPTED,
-# MSG_DATA, MSG_CLOSED, MSG_CONNECTED, MSG_ERROR, MSG_TRACE_CTX, ...). All
+# (the first payload bytes of every per-connection message: MSG_ACCEPTED,
+# MSG_DATA, MSG_CLOSED, MSG_CONNECTED, MSG_ERROR and the sidebands a
+# connection was granted). All
 # frames of one connection share a conn_id → land on the same lane → stable
 # per-connection affinity. The return path (lane TLS cipher_out → ip.net_in)
 # is a plain `merge` edge in the graph, NOT through this module.
@@ -20,29 +21,36 @@ name = "conn_in"
 direction = "input"
 content_type = "NetProto"
 required = true
+# Frame bytes, header included (`module_facts!` CONN_IN_ACCEPTS_RECORD); a
+# frame is forwarded whole, so every lane carries the same bound.
+accepts_record = 1483
 
 [[ports]]
 name = "lane_0"
 direction = "output"
 content_type = "NetProto"
+max_record = 1483
 required = true
 
 [[ports]]
 name = "lane_1"
 direction = "output"
 content_type = "NetProto"
+max_record = 1483
 required = true
 
 [[ports]]
 name = "lane_2"
 direction = "output"
 content_type = "NetProto"
+max_record = 1483
 required = false
 
 [[ports]]
 name = "lane_3"
 direction = "output"
 content_type = "NetProto"
+max_record = 1483
 required = false
 
 # Module-scope observability — exempt.

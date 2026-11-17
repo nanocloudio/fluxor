@@ -97,7 +97,14 @@ const FS_READDIR: u32 = abi::registry::fs::READDIR;
 #[inline]
 unsafe fn backend_close(s: &mut BankState) {
     if s.fs_fd >= 0 {
-        (s.sys().provider_call)(s.fs_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (s.sys().provider_call)(
+            s.fs_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fs_fd = -1;
     }
 }
@@ -105,7 +112,7 @@ unsafe fn backend_close(s: &mut BankState) {
 /// Open a path via FS_OPEN. Returns the file descriptor (`< 0` on error).
 #[inline]
 unsafe fn backend_open_handle(s: &mut BankState, path: *mut u8, len: usize) -> i32 {
-    (s.sys().provider_call)(-1, FS_OPEN, path, len)
+    (s.sys().provider_call)(-1, FS_OPEN, path, len, core::ptr::null_mut(), 0)
 }
 
 /// `READDIR` batches one step may take before the scan yields.
@@ -131,7 +138,14 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
     let mut dir_path = [0u8; MAX_PATH_LEN];
     dir_path[..dlen].copy_from_slice(&s.dir_path[..dlen]);
     if s.scan_handle < 0 {
-        let dir_fd = (s.sys().provider_call)(-1, FS_OPENDIR, dir_path.as_mut_ptr(), dlen);
+        let dir_fd = (s.sys().provider_call)(
+            -1,
+            FS_OPENDIR,
+            dir_path.as_mut_ptr(),
+            dlen,
+            core::ptr::null_mut(),
+            0,
+        );
         if dir_fd == E_AGAIN {
             // The provider is not up yet, or the directory's sectors are
             // being fetched: ask again next step.
@@ -160,7 +174,14 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
         batches += 1;
         // Use `s.buf` as the readdir output buffer; nothing streams
         // while the path table is being built.
-        let n = (s.sys().provider_call)(dir_fd, FS_READDIR, s.buf.as_mut_ptr(), BUF_SIZE);
+        let n = (s.sys().provider_call)(
+            dir_fd,
+            FS_READDIR,
+            s.buf.as_mut_ptr(),
+            BUF_SIZE,
+            core::ptr::null_mut(),
+            0,
+        );
         if n == E_AGAIN {
             return false;
         }
@@ -203,7 +224,14 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
             drained = true;
         }
     }
-    (s.sys().provider_call)(dir_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    (s.sys().provider_call)(
+        dir_fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.scan_handle = -1;
 
     finish_scan(s);
@@ -231,7 +259,14 @@ unsafe fn backend_stream(s: &mut BankState) -> ReadOutcome {
         if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 {
             return ReadOutcome::Yield(if moved_any { 2 } else { 0 });
         }
-        n = (s.sys().provider_call)(s.fs_fd, FS_READ, s.buf.as_mut_ptr(), BUF_SIZE);
+        n = (s.sys().provider_call)(
+            s.fs_fd,
+            FS_READ,
+            s.buf.as_mut_ptr(),
+            BUF_SIZE,
+            core::ptr::null_mut(),
+            0,
+        );
         if n > 0 {
             let written = (s.sys().channel_write)(s.out_chans[0], s.buf.as_ptr(), n as usize);
             if written > 0 {

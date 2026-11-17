@@ -199,7 +199,8 @@ const CRED_STAGE_TRUST: usize = if CRED_ROTATE {
 } else {
     0
 };
-const NET_BUF_SIZE: usize = 1600;
+/// Frame scratch for every datagram command this module writes.
+const NET_BUF_SIZE: usize = NET_OUT_MAX_RECORD;
 const MAX_TICKETS: usize = 4;
 
 /// Resumption tickets are stateless: the ticket IS the session state,
@@ -795,7 +796,14 @@ fn authority_of(s: &QuicState) -> &[u8] {
     &s.authority[..s.authority_len as usize]
 }
 
-fluxor_rt::module_facts! { state: QuicState, arena: 65536 }
+fluxor_rt::module_facts! {
+    state: QuicState,
+    arena: 65536,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = NET_FRAME_HDR + abi::contracts::net::datagram::V6_ADDR_PREFIX + QUIC_DGRAM_MAX,
+        out 0 NET_OUT_MAX_RECORD = 1600,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_init(_syscalls: *const core::ffi::c_void) {}
@@ -1400,25 +1408,44 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
 /// `OPEN_OR_GENERATE` an AEAD key under `label`; the handle, or the vault's
 /// negative errno (`E_AGAIN` while its durable store is not readable yet).
 unsafe fn vault_open_or_generate_aead(sys: &SyscallTable, label: &[u8]) -> i32 {
-    let mut arg = [0u8; 8 + 64 + 12];
-    arg[0..2].copy_from_slice(&kv::suite::AEAD_KEY.to_le_bytes());
-    let usage = kv::usage::SEAL | kv::usage::OPEN | kv::usage::PERSIST | kv::usage::WRAP;
-    arg[2..6].copy_from_slice(&usage.to_le_bytes());
-    arg[6] = 0;
-    arg[7] = label.len() as u8;
-    arg[8..8 + label.len()].copy_from_slice(label);
-    let n = 8 + label.len() + 12;
-    (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, arg.as_mut_ptr(), n)
+    let mut arg = [0u8; kv::open::MAX_ARG];
+    let req = kv::open::Request {
+        suite: kv::suite::AEAD_KEY,
+        usage: kv::usage::SEAL | kv::usage::OPEN | kv::usage::PERSIST | kv::usage::WRAP,
+        flags: 0,
+        label,
+    };
+    let Some(n) = kv::open::encode(&mut arg, &req) else {
+        return E_INVAL;
+    };
+    // A sealing key has no public half: no `data`.
+    (sys.provider_call)(
+        -1,
+        kv::OPEN_OR_GENERATE,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn vault_destroy_by_label(sys: &SyscallTable, label: &[u8]) {
-    let mut arg = [0u8; 1 + 64];
-    arg[0] = label.len() as u8;
-    arg[1..1 + label.len()].copy_from_slice(label);
-    let _ = (sys.provider_call)(-1, kv::DESTROY_BY_LABEL, arg.as_mut_ptr(), 1 + label.len());
+    let mut arg = [0u8; kv::destroy_by_label::MAX_ARG];
+    let Some(n) = kv::destroy_by_label::encode(&mut arg, label) else {
+        return;
+    };
+    let _ = (sys.provider_call)(
+        -1,
+        kv::DESTROY_BY_LABEL,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
-/// `AEAD_SEAL` `pt` under `handle` with `aad`; bytes written to `out`, or 0.
+/// `AEAD_SEAL` `pt` under `handle` with `aad` into `out` as
+/// `[nonce:12][ciphertext][tag:16]`; the bytes written, or 0.
 unsafe fn vault_seal(
     sys: &SyscallTable,
     handle: i32,
@@ -1426,26 +1453,37 @@ unsafe fn vault_seal(
     pt: &[u8],
     out: &mut [u8],
 ) -> usize {
-    let mut arg = [0u8; 2 + 32 + 2 + TICKET_PT_LEN + 12];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + aad.len()].copy_from_slice(aad);
-    p += aad.len();
-    arg[p..p + 2].copy_from_slice(&(pt.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + pt.len()].copy_from_slice(pt);
-    p += pt.len();
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, kv::AEAD_SEAL, arg.as_mut_ptr(), p + 12);
-    if rc < 0 {
+    use kv::aead as a;
+    let need = a::NONCE_LEN + pt.len() + a::TAG_LEN;
+    if out.len() < need {
         return 0;
     }
-    u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize
+    let mut arg = [0u8; a::MAX_ARG];
+    let Some(n) = a::encode(&mut arg, &[0; a::NONCE_LEN], pt.len() as u32, aad) else {
+        return 0;
+    };
+    let body = &mut out[a::NONCE_LEN..need];
+    body[..pt.len()].copy_from_slice(pt);
+    let rc = (sys.provider_call)(
+        handle,
+        kv::AEAD_SEAL,
+        arg.as_mut_ptr(),
+        n,
+        body.as_mut_ptr(),
+        body.len(),
+    );
+    let Some(nonce) = a::nonce(&arg) else {
+        return 0;
+    };
+    if rc != (pt.len() + a::TAG_LEN) as i32 {
+        return 0;
+    }
+    out[..a::NONCE_LEN].copy_from_slice(&nonce);
+    need
 }
 
-/// `AEAD_OPEN` `blob` under `handle` with `aad`; bytes written to `out`, or 0.
+/// `AEAD_OPEN` a ticket under `handle` with `aad`; the plaintext's bytes
+/// written to `out`, or 0.
 unsafe fn vault_open(
     sys: &SyscallTable,
     handle: i32,
@@ -1453,23 +1491,47 @@ unsafe fn vault_open(
     blob: &[u8],
     out: &mut [u8],
 ) -> usize {
-    let mut arg = [0u8; 2 + 32 + 2 + MAX_TICKET_LEN + 12];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + aad.len()].copy_from_slice(aad);
-    p += aad.len();
-    arg[p..p + 2].copy_from_slice(&(blob.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + blob.len()].copy_from_slice(blob);
-    p += blob.len();
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, kv::AEAD_OPEN, arg.as_mut_ptr(), p + 12);
-    if rc < 0 {
+    open_sealed::<MAX_TICKET_LEN>(sys, handle, aad, blob, out)
+}
+
+/// `AEAD_OPEN` `blob` (`[nonce:12][ciphertext][tag:16]`, at most `N` bytes)
+/// under `handle` with `aad`, opened in place on a copy; the plaintext's
+/// bytes written to `out`, or 0.
+unsafe fn open_sealed<const N: usize>(
+    sys: &SyscallTable,
+    handle: i32,
+    aad: &[u8],
+    blob: &[u8],
+    out: &mut [u8],
+) -> usize {
+    use kv::aead as a;
+    if blob.len() < a::NONCE_LEN + a::TAG_LEN || blob.len() > N {
         return 0;
     }
-    u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize
+    let mut nonce = [0u8; a::NONCE_LEN];
+    nonce.copy_from_slice(&blob[..a::NONCE_LEN]);
+    let sealed = &blob[a::NONCE_LEN..];
+    let mut buf = [0u8; N];
+    buf[..sealed.len()].copy_from_slice(sealed);
+    let mut arg = [0u8; a::MAX_ARG];
+    let Some(n) = a::encode(&mut arg, &nonce, sealed.len() as u32, aad) else {
+        return 0;
+    };
+    let rc = (sys.provider_call)(
+        handle,
+        kv::AEAD_OPEN,
+        arg.as_mut_ptr(),
+        n,
+        buf.as_mut_ptr(),
+        sealed.len(),
+    );
+    if rc < 0 || rc as usize > out.len() {
+        return 0;
+    }
+    let pt = rc as usize;
+    out[..pt].copy_from_slice(&buf[..pt]);
+    buf.fill(0);
+    pt
 }
 
 /// Open both ticket-key generations. Without a vault no ticket is ever
@@ -1494,7 +1556,14 @@ unsafe fn ticket_keys_open(s: &mut QuicState) {
     // (the persisted key stays in the vault's store).
     for h in [k0, k1] {
         if h >= 0 {
-            let _ = (sys.provider_call)(h, kv::DESTROY, core::ptr::null_mut(), 0);
+            let _ = (sys.provider_call)(
+                h,
+                kv::DESTROY,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
     }
     s.ticket_key = [-1, -1];
@@ -1710,12 +1779,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     if payload_len > take {
                         discard_bytes(sys, s.net_in, payload_len - take);
                     }
-                    if take >= 3 {
-                        let bound_port = (buf[1] as u16) | ((buf[2] as u16) << 8);
+                    let bound = if payload_len == take {
+                        abi::contracts::net::datagram::dg_bound_parts(&buf[..take])
+                    } else {
+                        None
+                    };
+                    if let Some((ep_id, bound_port)) = bound {
                         // Port-filter our own BOUND off the (possibly broadcast)
                         // channel, then hand the ep_id to the endpoint.
                         if bound_port == s.port && !s.endpoint.is_ready() {
-                            s.endpoint.on_bound(buf[0]);
+                            s.endpoint.on_bound(ep_id);
                             dev_log(sys, 3, b"[quic] bound".as_ptr(), b"[quic] bound".len());
                         }
                     }
@@ -5026,6 +5099,15 @@ pub mod test_helpers {
     pub unsafe fn cont_feed(state: *mut u8, msg_type: u8, payload: &[u8]) {
         let s = &mut *(state as *mut QuicState);
         super::cont_apply(s, msg_type, payload);
+    }
+
+    /// Whether a custody ATTEST is still being signed (answered on a later
+    /// step).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn custody_attest_pending(state: *const u8) -> bool {
+        super::custody_attest_pending(&*(state as *const QuicState))
     }
 
     /// Serialize connection `idx`'s checkpoint record into `out`, returning

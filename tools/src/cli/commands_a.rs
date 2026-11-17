@@ -512,11 +512,19 @@ fn check_code_ceiling(
 fn check_state_budget(
     modules: &[modules::ModuleInfo],
     config: &serde_json::Value,
+    config_data: &[u8],
     target: &crate::target::TargetDescriptor,
 ) -> Result<()> {
     if modules.is_empty() {
         return Ok(());
     }
+    let by_hash: std::collections::HashMap<u32, &modules::ModuleInfo> =
+        modules.iter().map(|m| (m.name_hash, m)).collect();
+    let instances = crate::config::module_entries(config_data)?;
+    // Where the kernel carves a heap whole at instantiation, the instance's cap
+    // (params tag 0xEF, else the type's declared arena) comes out of the state
+    // arena beside its state.
+    let commits_heaps = crate::capacity::kernel_commits_heaps(target.runtime());
     // The arena the kernel will give this graph: the target's planning figure,
     // or what the graph's envelope places (`capacity::planned_state_arena`).
     let (arena, envelope) = crate::capacity::planned_state_arena(
@@ -537,17 +545,26 @@ fn check_state_budget(
         .filter(|m| !matches!(m, fluxor_contracts::isolation::RegionModel::Pages));
     let levels = module_levels(config, target);
     let default = graph_default_level(config, target);
-    for m in modules {
+    for (hash, params) in instances {
+        // A built-in instance has no .fmod: the kernel holds its state.
+        let Some(m) = by_hash.get(&hash) else {
+            continue;
+        };
         let state = m.manifest.state_bytes_64 as u64 * 64;
+        let heap = crate::config::heap_cap_offset(params)
+            .map(|at| u32::from_le_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]]))
+            .unwrap_or(m.manifest.arena_bytes) as u64;
         let gated = levels.get(&m.name).copied().unwrap_or(default).is_gated();
         let bytes = match mpu {
             Some(model) if gated && state != 0 => crate::protection::private_region_bytes(
                 m.manifest.stack_bytes_64 as u64 * 64,
                 state,
-                m.manifest.arena_bytes as u64,
+                heap,
                 target.isolation.exception_frame_bytes as u64,
                 model,
             ),
+            _ if state == 0 => 0,
+            _ if commits_heaps => state + heap,
             _ => state,
         };
         if bytes == 0 {
@@ -1045,7 +1062,7 @@ fn cmd_combine(
     )?;
 
     check_code_ceiling(&modules, &target_desc)?;
-    check_state_budget(&modules, &config, &target_desc)?;
+    check_state_budget(&modules, &config, &config_data, &target_desc)?;
     check_ring_demand(
         &config,
         &config_data,
@@ -1365,7 +1382,7 @@ fn build_packaged_blobs(
     )?;
 
     check_code_ceiling(&modules, target_desc)?;
-    check_state_budget(&modules, config, target_desc)?;
+    check_state_budget(&modules, config, &config_data, target_desc)?;
     check_ring_demand(
         config,
         &config_data,
@@ -1758,13 +1775,18 @@ mod state_budget_tests {
     use serde_json::json;
 
     fn module(name: &str, state: u64) -> ModuleInfo {
+        module_with_heap(name, state, 0)
+    }
+
+    fn module_with_heap(name: &str, state: u64, arena: u32) -> ModuleInfo {
         let manifest = Manifest {
             state_bytes_64: (state / 64) as _,
+            arena_bytes: arena,
             ..Default::default()
         };
         ModuleInfo {
             name: name.into(),
-            name_hash: 0,
+            name_hash: crate::hash::fnv1a_hash(name.as_bytes()),
             module_type: 0,
             mailbox_safe: false,
             in_place_writer: false,
@@ -1773,6 +1795,23 @@ mod state_budget_tests {
             manifest,
             data: Vec::new(),
         }
+    }
+
+    /// A built config holding one entry per instance: `(type, params TLV)`.
+    fn image(instances: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut entries = Vec::new();
+        for (ty, params) in instances {
+            entries.extend_from_slice(&(10 + params.len() as u32).to_le_bytes());
+            entries.extend_from_slice(&crate::hash::fnv1a_hash(ty.as_bytes()).to_le_bytes());
+            entries.extend_from_slice(&[0, 0]);
+            entries.extend_from_slice(params);
+        }
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(&crate::config::MAGIC_FXWR.to_le_bytes());
+        data.extend_from_slice(&(instances.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        data.extend_from_slice(&entries);
+        data
     }
 
     fn pico2w() -> crate::target::TargetDescriptor {
@@ -1790,10 +1829,11 @@ mod state_budget_tests {
         let buffer = target.buffer_arena_kb.expect("rp buffer arena") as u64 * 1024;
         // Fits the default split with 16 KiB to spare.
         let mods = [module("a", default - 16 * 1024)];
-        check_state_budget(&mods, &json!({}), &target).expect("fits the default arena");
+        let one = image(&[("a", &[])]);
+        check_state_budget(&mods, &json!({}), &one, &target).expect("fits the default arena");
         // A buffer arena 32 KiB larger leaves the state arena 32 KiB smaller.
         let cfg = json!({"capacity": {"buffer_arena": buffer + 32 * 1024}});
-        let e = check_state_budget(&mods, &cfg, &target)
+        let e = check_state_budget(&mods, &cfg, &one, &target)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1804,11 +1844,40 @@ mod state_budget_tests {
         );
         // A state-arena entry is the size the kernel guarantees.
         let cfg = json!({"capacity": {"state_arena": default - 32 * 1024}});
-        check_state_budget(&mods, &cfg, &target).expect_err("a smaller state arena");
+        check_state_budget(&mods, &cfg, &one, &target).expect_err("a smaller state arena");
         let big = [module("a", default + 8 * 1024)];
-        check_state_budget(&big, &json!({}), &target).expect_err("past the default");
+        check_state_budget(&big, &json!({}), &one, &target).expect_err("past the default");
         let cfg = json!({"capacity": {"state_arena": default + 8 * 1024}});
-        check_state_budget(&big, &cfg, &target).expect("the entry places a larger arena");
+        check_state_budget(&big, &cfg, &one, &target).expect("the entry places a larger arena");
+    }
+
+    /// Every instance takes its own state, so two instances of one type are
+    /// charged twice.
+    #[test]
+    fn each_instance_is_charged() {
+        let target = pico2w();
+        let default = target.state_arena_kb as u64 * 1024;
+        let mods = [module("a", default / 2 + 1024)];
+        check_state_budget(&mods, &json!({}), &image(&[("a", &[])]), &target)
+            .expect("one instance fits");
+        check_state_budget(&mods, &json!({}), &image(&[("a", &[]), ("a", &[])]), &target)
+            .expect_err("two instances do not");
+    }
+
+    /// RP commits a heap whole at instantiation, so the cap is charged beside
+    /// the state: the type's declared arena, or the instance's own cap (params
+    /// tag 0xEF) where the graph set one.
+    #[test]
+    fn a_committed_heap_is_charged_at_its_cap() {
+        let target = pico2w();
+        let default = target.state_arena_kb as u64 * 1024;
+        let state = default - 16 * 1024;
+        let mods = [module_with_heap("a", state, 32 * 1024)];
+        check_state_budget(&mods, &json!({}), &image(&[("a", &[])]), &target)
+            .expect_err("the declared heap does not fit beside the state");
+        let small_cap: &[u8] = &[0xFE, 0x01, 8, 0, 0xEF, 4, 0x00, 0x20, 0x00, 0x00, 0xFF, 0x00];
+        check_state_budget(&mods, &json!({}), &image(&[("a", small_cap)]), &target)
+            .expect("an 8 KiB instance cap fits");
     }
 }
 

@@ -659,6 +659,73 @@ fn provider_contract_ids(names: &[String]) -> Result<Vec<u16>> {
     Ok(ids)
 }
 
+/// Check a port's `contract` / `serves` value: a registry contract served
+/// on a graph edge (`route = "edge"`).
+fn edge_contract_name(name: &str, key: &str) -> Result<String> {
+    let id = (0..fluxor_abi::registry::CONTRACTS_ASSIGNED as u16)
+        .find(|&id| fluxor_abi::registry::contract_name(id) == Some(name))
+        .ok_or_else(|| {
+            Error::Module(format!(
+                "[[ports]] {key} = \"{name}\": not a registry contract"
+            ))
+        })?;
+    if !fluxor_abi::registry::contract_is_edge(id) {
+        let edge: Vec<&str> = (0..fluxor_abi::registry::CONTRACTS_ASSIGNED as u16)
+            .filter(|&id| fluxor_abi::registry::contract_is_edge(id))
+            .filter_map(fluxor_abi::registry::contract_name)
+            .collect();
+        return Err(Error::Module(format!(
+            "[[ports]] {key} = \"{name}\": not an edge contract; a port names one of {}",
+            edge.join(", ")
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// The registry id of an edge contract a port names (checked at parse).
+pub fn edge_contract_id(name: &str) -> Option<u16> {
+    (0..fluxor_abi::registry::CONTRACTS_ASSIGNED as u16)
+        .find(|&id| fluxor_abi::registry::contract_name(id) == Some(name))
+}
+
+/// The edge-contract declarations of one manifest agree: a port names at
+/// most one end of one contract; a port serves only a contract the module
+/// names in `provider_contracts`; and every edge contract it names there is
+/// served on some port.
+fn validate_edge_ports(ports: &[PortSpec], provider_contracts: &[u16]) -> Result<()> {
+    for p in ports {
+        let name = p.name.as_deref().unwrap_or("?");
+        if p.contract.is_some() && p.serves.is_some() {
+            return Err(Error::Module(format!(
+                "[[ports]] `{name}` both reaches and serves an edge contract; a port is one end \
+                 of its edge"
+            )));
+        }
+        if let Some(c) = &p.serves {
+            let id = edge_contract_id(c);
+            if !id.is_some_and(|id| provider_contracts.contains(&id)) {
+                return Err(Error::Module(format!(
+                    "[[ports]] `{name}` serves `{c}`, which `provider_contracts` does not name: \
+                     the kernel registers the module's dispatch for the contracts listed there"
+                )));
+            }
+        }
+    }
+    for &id in provider_contracts {
+        if !fluxor_abi::registry::contract_is_edge(id) {
+            continue;
+        }
+        let name = fluxor_abi::registry::contract_name(id).unwrap_or("?");
+        if !ports.iter().any(|p| p.serves.as_deref() == Some(name)) {
+            return Err(Error::Module(format!(
+                "provider_contracts names the edge contract `{name}`, but no port serves it: \
+                 declare `serves = \"{name}\"` on the port its consumers are wired to"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_provides_names(provides: &[String]) -> Result<()> {
     for p in provides {
         let known = provider_contracts()
@@ -851,6 +918,20 @@ pub struct PortSpec {
     /// satisfied by a `request.http` provider but not the reverse.
     /// `None` = undeclared = unchecked.
     pub requires_capability: Option<String>,
+    /// The edge contract this port reaches (`contract = "storage.block"`):
+    /// the module at the other end of its one edge must serve it there, and
+    /// the module holds the contract's grant. Tools-side only; checked across
+    /// each edge by `config::validate::validate_edge_contracts`.
+    pub contract: Option<String>,
+    /// `contract_optional = true`: the module works on without the
+    /// contract, so the peer may serve none (its bind fails and the module
+    /// falls back); a peer serving a different one is still refused.
+    pub contract_optional: bool,
+    /// The edge contract this module serves on this port
+    /// (`serves = "storage.block"`), to the module at the other end of its
+    /// one edge. The module names the contract in `provider_contracts` and
+    /// exports `module_provider_dispatch`. Tools-side only.
+    pub serves: Option<String>,
     /// `[ports.facts]` — the terms of the stream this port carries, keyed by
     /// fact name, for a content type whose surface capability is port-scoped
     /// (`vocabulary::PORT_SCOPED_CAPABILITIES`). A set-valued fact holds every
@@ -869,6 +950,42 @@ pub struct PortSpec {
     /// (`config::validate::wiring_path`). Input ports only; tools-side
     /// only, never serialised.
     pub gates_readiness: bool,
+    /// The largest record this input accepts, header included (0 =
+    /// undeclared). The composer refuses an edge whose producer's
+    /// `max_record` is larger, fans included. A `NetProto` input must
+    /// declare it, and the module states the same figure in
+    /// `module_facts!`'s `records:` (checked at `pack`). Input ports only;
+    /// tools-side only, never serialised.
+    pub accepts_record: u32,
+    /// This input's module keeps its own copy of what it sends back to the
+    /// provider until the provider reports it acknowledged (`retains_send`):
+    /// the composer marks the edge (graph edge byte 9 bit 1) and the
+    /// provider reads it through `channel::FACTS`. Input ports only.
+    pub retains_send: bool,
+    /// This input's module opens no stream through the provider on the
+    /// other end (`datagram_only`): it binds and sends datagrams alone, so
+    /// the provider retains nothing for it. Input ports only; tools-side
+    /// only, never serialised.
+    pub datagram_only: bool,
+    /// The module parameter that sizes what this output's provider retains
+    /// for consumers that do not (`send_buffer_param`): a graph that sets it
+    /// to 0 while a consumer of this port lacks `retains_send` is refused.
+    /// Output ports only; tools-side only, never serialised.
+    pub send_buffer_param: Option<String>,
+    /// The module parameter holding the bytes of every buffer this output's
+    /// provider retains in (`send_pool_param`), which the composer derives
+    /// from the graph when the instance leaves it unset: 0 when every
+    /// consumer of the port retains its own (`retains_send`) or opens no
+    /// stream (`datagram_only`) and the instance serves no workload lane
+    /// (`send_pool_lanes_param`), else `send_buffer_param` × the buffers the
+    /// type's default pool holds. Output ports only, beside a
+    /// `send_buffer_param`; tools-side only, never serialised.
+    pub send_pool_param: Option<String>,
+    /// The module parameter counting the workload lanes the provider serves
+    /// from outside the graph (`send_pool_lanes_param`): a lane is never
+    /// marked retaining, so an instance with any keeps its pool. Output
+    /// ports only, beside a `send_pool_param`.
+    pub send_pool_lanes_param: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -940,7 +1057,7 @@ pub enum ClaimSelector {
     /// reaches. A volume the module adds as it runs (`mount`'s hotplug
     /// channel) is not checked.
     Table(String),
-    /// Chosen at runtime (`provider_call_sel` with a name the module
+    /// Chosen at runtime (a `BIND` by a name the module
     /// computes), so the composer cannot check it.
     Runtime,
 }
@@ -1160,7 +1277,8 @@ pub struct HeapPerParam {
 pub struct HeapParamTerm {
     /// The integer param (`u8`, `u16`, `u32`) whose value is the count.
     pub tag: u8,
-    /// The param's schema default.
+    /// The param's schema default, resolved for the silicon (a default the
+    /// module computes per profile differs by target).
     pub default: u32,
     pub bytes_each: u32,
 }
@@ -2311,6 +2429,14 @@ impl Manifest {
     /// they never use and the node would be right to refuse.
     pub fn claimed_contracts(&self) -> Result<u64> {
         let mut mask = 0u64;
+        // A port that reaches an edge contract makes that contract's calls.
+        for p in &self.ports {
+            if let Some(id) = p.contract.as_deref().and_then(edge_contract_id) {
+                if (id as usize) < CONTRACT_ID_SPACE {
+                    mask |= 1u64 << id;
+                }
+            }
+        }
         for r in &self.resources {
             if !self.variant_applies(&r.variants) {
                 continue;
@@ -2548,6 +2674,54 @@ impl Manifest {
                 )));
             }
             let gates_readiness = p.gates_readiness.unwrap_or(true);
+            let port_label = p.name.clone().unwrap_or_else(|| "?".to_string());
+            if direction == 1
+                && (p.accepts_record.is_some()
+                    || p.retains_send.is_some()
+                    || p.datagram_only.is_some())
+            {
+                return Err(Error::Module(format!(
+                    "port '{port_label}' declares `accepts_record`, `retains_send` or \
+                     `datagram_only`, but it is an output: each is a property of an input port"
+                )));
+            }
+            if direction != 1
+                && (p.send_buffer_param.is_some()
+                    || p.send_pool_param.is_some()
+                    || p.send_pool_lanes_param.is_some())
+            {
+                return Err(Error::Module(format!(
+                    "port '{port_label}' declares `send_buffer_param`, `send_pool_param` or \
+                     `send_pool_lanes_param`, but it is an input: what a provider retains for \
+                     its consumers is a property of its output"
+                )));
+            }
+            if p.send_pool_param.is_some() && p.send_buffer_param.is_none() {
+                return Err(Error::Module(format!(
+                    "port '{port_label}' declares `send_pool_param` without `send_buffer_param`: \
+                     the pool is derived in buffers of that param's size"
+                )));
+            }
+            if p.send_pool_lanes_param.is_some() && p.send_pool_param.is_none() {
+                return Err(Error::Module(format!(
+                    "port '{port_label}' declares `send_pool_lanes_param` without \
+                     `send_pool_param`: the lanes keep a pool only where there is one"
+                )));
+            }
+            if CONTENT_TYPES[content_type as usize] == "NetProto" {
+                let missing = if direction == 1 {
+                    p.max_record.is_none().then_some("max_record")
+                } else {
+                    p.accepts_record.is_none().then_some("accepts_record")
+                };
+                if let Some(key) = missing {
+                    return Err(Error::Module(format!(
+                        "port '{port_label}' carries NetProto but declares no `{key}`: every \
+                         record on the surface is bounded by its ports, header included, and \
+                         the module states the same figure in `module_facts!`'s `records:`"
+                    )));
+                }
+            }
             let mut flags = 0u8;
             if p.required.unwrap_or(false) {
                 flags |= 0x01;
@@ -2627,8 +2801,33 @@ impl Manifest {
                     Some(c) => Some(canonical_port_requirement(c)?),
                     None => None,
                 },
+                contract: match &p.contract {
+                    Some(c) => Some(edge_contract_name(c, "contract")?),
+                    None => None,
+                },
+                contract_optional: match (p.contract_optional, &p.contract) {
+                    (Some(_), None) => {
+                        return Err(Error::Module(
+                            "[[ports]] contract_optional without a `contract`".to_string(),
+                        ))
+                    }
+                    (o, _) => o.unwrap_or(false),
+                },
+                serves: match &p.serves {
+                    Some(c) => Some(edge_contract_name(c, "serves")?),
+                    None => None,
+                },
                 facts,
                 gates_readiness,
+                accepts_record: match &p.accepts_record {
+                    Some(v) => v.resolve(abi, "accepts_record")?,
+                    None => 0,
+                },
+                retains_send: p.retains_send.unwrap_or(false),
+                datagram_only: p.datagram_only.unwrap_or(false),
+                send_buffer_param: p.send_buffer_param.clone(),
+                send_pool_param: p.send_pool_param.clone(),
+                send_pool_lanes_param: p.send_pool_lanes_param.clone(),
             });
         }
 
@@ -2709,6 +2908,7 @@ impl Manifest {
         validate_provides_names(&provides)?;
         let provider_contracts =
             provider_contract_ids(&toml_val.provider_contracts.unwrap_or_default())?;
+        validate_edge_ports(&ports, &provider_contracts)?;
         let facts = ModuleFacts {
             mailbox_safe: toml_val.mailbox_safe.unwrap_or(false),
             in_place_writer: toml_val.in_place_writer.unwrap_or(false),
@@ -3597,8 +3797,17 @@ impl Manifest {
                 rate_class_max: None,
                 rate_class_default: None,
                 requires_capability: None,
+                contract: None,
+                serves: None,
+                contract_optional: false,
                 facts: std::collections::BTreeMap::new(),
                 gates_readiness: true,
+                accepts_record: 0,
+                retains_send: false,
+                datagram_only: false,
+                send_buffer_param: None,
+                send_pool_param: None,
+                send_pool_lanes_param: None,
             });
             offset += 4;
         }
@@ -4417,8 +4626,8 @@ struct TomlHeapPerDemand {
 }
 
 /// `heap_per_param = { base = ..., params = [{ tag = ..., default = ...,
-/// bytes_each = ... }, ...] }`, `base` and each `bytes_each` flat or
-/// per-target.
+/// bytes_each = ... }, ...] }`, `base`, each `default` and each
+/// `bytes_each` flat or per-target.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TomlHeapPerParam {
@@ -4431,7 +4640,7 @@ struct TomlHeapPerParam {
 #[serde(deny_unknown_fields)]
 struct TomlHeapParamTerm {
     tag: u8,
-    default: u32,
+    default: CapacityValue,
     bytes_each: CapacityValue,
 }
 
@@ -4558,7 +4767,7 @@ fn resolve_capacities(
                 }
                 params.push(HeapParamTerm {
                     tag: t.tag,
-                    default: t.default,
+                    default: t.default.resolve(abi, &format!("{at}.default"))?,
                     bytes_each: t.bytes_each.resolve(abi, &format!("{at}.bytes_each"))?,
                 });
             }
@@ -4729,11 +4938,29 @@ struct TomlPort {
     /// Capability the peer wired to this port must declare. See
     /// [`PortSpec::requires_capability`].
     requires_capability: Option<String>,
+    /// See [`PortSpec::contract`].
+    contract: Option<String>,
+    /// See [`PortSpec::contract_optional`].
+    contract_optional: Option<bool>,
+    /// See [`PortSpec::serves`].
+    serves: Option<String>,
     /// `[ports.facts]` — see [`PortSpec::facts`]. Read as raw TOML so a set
     /// may be written as one string or an array, and a number unquoted.
     facts: Option<std::collections::BTreeMap<String, toml::Value>>,
     /// See [`PortSpec::gates_readiness`]. Input ports only.
     gates_readiness: Option<bool>,
+    /// See [`PortSpec::accepts_record`]. Input ports only.
+    accepts_record: Option<CapacityValue>,
+    /// See [`PortSpec::retains_send`]. Input ports only.
+    retains_send: Option<bool>,
+    /// See [`PortSpec::datagram_only`]. Input ports only.
+    datagram_only: Option<bool>,
+    /// See [`PortSpec::send_buffer_param`]. Output ports only.
+    send_buffer_param: Option<String>,
+    /// See [`PortSpec::send_pool_param`]. Output ports only.
+    send_pool_param: Option<String>,
+    /// See [`PortSpec::send_pool_lanes_param`]. Output ports only.
+    send_pool_lanes_param: Option<String>,
 }
 
 // deny_unknown_fields: a top-level key written after a `[[resources]]`
@@ -5042,8 +5269,17 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         });
         m.ports.push(PortSpec {
             direction: 1,
@@ -5056,8 +5292,17 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         });
         let bytes = m.to_bytes();
         assert_eq!(
@@ -5089,8 +5334,17 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
@@ -5210,8 +5464,17 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         });
         m.resources.push(ResourceClaim {
             device_class: fluxor_abi::registry::pio::ID as u8,

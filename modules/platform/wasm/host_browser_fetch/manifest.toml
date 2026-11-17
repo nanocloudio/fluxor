@@ -6,7 +6,7 @@ builtin = true
 # step (via the host shim's `host_fetch_open` import), then drains
 # the response body as it arrives and emits the bytes on the
 # `bytes` output port. On EOF the shim returns -1; the module
-# closes the channel with IOCTL_SET_HUP so downstream consumers
+# ends the stream (`channel::SET_HUP`) so downstream consumers
 # (e.g. `media_loader.rom`) can finalise.
 #
 # Used in the WASM browser-host deployment as the analogue of

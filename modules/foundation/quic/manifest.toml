@@ -2,7 +2,6 @@ version = "1.0.0"
 # timer_class: loss/idle/PTO timers read wall-clock (dev_millis).
 timer_class = "wall_clock"
 hardware_targets = ["bcm2712", "linux", "uefi"]
-grants = ["key_vault"]
 
 # The QUIC mux transport itself, a stable multiplexed-session anchor over it
 # (`protocol_surfaces.md` §Continuity), and resumable sessions whose tickets
@@ -84,11 +83,18 @@ aead = "on_wire_sequence"
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+# Datagrams only: QUIC retransmits from its own state, and the transport
+# keeps nothing for it.
+datagram_only = true
+# A datagram of QUIC_DGRAM_MAX bytes from an IPv6 peer, header included (`module_facts!` states the same).
+accepts_record = 1523
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+# The frame scratch every datagram command is written in, header included.
+max_record = 1600
 
 [[ports]]
 name = "app_in"
@@ -153,3 +159,9 @@ active_when_params = ["cert_file", "key_file", "trust"]
 [[resources]]
 requires_contract = "channel"
 access = "read"
+
+# Ticket keys, the continuity master and the custody identity live in the
+# vault: a session's sealing key never reaches this module.
+[[resources]]
+requires_contract = "key_vault"
+access = "write"

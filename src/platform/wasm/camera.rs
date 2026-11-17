@@ -64,7 +64,10 @@ unsafe fn alloc_state(out_chan: i32) -> *mut CameraState {
     raw
 }
 
-fn camera_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn camera_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this module
     // instance; cast back to the module-private type allocated by `build`.
     unsafe {

@@ -2,7 +2,15 @@
 // storage.block client
 // ============================================================================
 //
-// The consumer half of `abi::contracts::storage::block`. Two families:
+// The consumer half of `abi::contracts::storage::block`. The client binds
+// the contract once through the consumer's `blocks` input port (the source is
+// the module at the other end of that edge) and keeps the bound handle. A
+// queued request's buffer lies in the one region the consumer named at
+// `bind` — its block cache, or its state — which the client lends to the
+// source once, on first use; requests name offsets into that lend. `EXEC`
+// lends nothing: its buffer is the call's data span.
+//
+// Two families:
 //
 // - Non-blocking, for anything that runs inside a step: tagged reads
 //   (`submit_read` / `take_read`), tracked writes and discards
@@ -46,6 +54,9 @@ pub const BLK_READ_TAG: u64 = 1 << 62;
 /// Largest tag a caller may give `submit_read`.
 pub const BLK_READ_TAG_MAX: u64 = BLK_READ_TAG - 1;
 
+/// The cookie of the client's one lend to its source.
+pub const BLK_LEND_COOKIE: u32 = 1;
+
 /// Failed write sequences remembered exactly. Past this many, every write
 /// at or after the first failure reads as failed.
 pub const BLK_FAILED_SLOTS: usize = 4;
@@ -53,9 +64,20 @@ pub const BLK_FAILED_SLOTS: usize = 4;
 /// State for one block source, zero-initialisable in a module's state.
 #[repr(C)]
 pub struct BlockClient {
-    /// The `blocks` channel, or -1.
-    pub chan: i32,
-    /// Logical block size from `CAPS`; 0 until asked. The capability
+    /// The handle bound to the source through `port`, or -1 until the
+    /// first call binds it.
+    pub handle: core::cell::Cell<i32>,
+    /// The lend of `region` to the source, or -1 until a queued request
+    /// first needs it.
+    pub lend: core::cell::Cell<i32>,
+    /// Start and length of the memory every queued request's buffer lies
+    /// in; length 0 lends nothing (an `EXEC`-only consumer).
+    pub region: usize,
+    pub region_len: usize,
+    /// The consumer's input port the source is wired to.
+    pub port: u8,
+    pub _pad0: [u8; 7],
+    /// Logical block size from `DESCRIBE`; 0 until asked. The description
     /// fields are learned on first use, from paths that only read the
     /// client.
     pub lbs: core::cell::Cell<u32>,
@@ -94,29 +116,155 @@ pub struct BlockClient {
 }
 
 impl BlockClient {
-    /// Point the client at `chan` and forget everything it knew.
-    pub fn bind(&mut self, chan: i32) {
-        // SAFETY: every field is an integer or an array of them; all-zero
-        // is the empty client.
+    /// Point the client at the source wired to input port `port`, with
+    /// every queued request's buffer inside `region[..region_len]`, and
+    /// forget everything it knew. Nothing is called until first use.
+    ///
+    /// # Safety
+    /// `region[..region_len]` is this module's own memory and stays so,
+    /// unmoved, for the module's life: the source may write it whenever a
+    /// request naming it is in flight.
+    pub unsafe fn bind(&mut self, port: u8, region: *mut u8, region_len: usize) {
+        // SAFETY: every field is an integer, a cell of one, or an array of
+        // them; all-zero is the empty client.
         unsafe { core::ptr::write_bytes(self as *mut BlockClient, 0, 1) };
-        self.chan = chan;
+        self.handle.set(-1);
+        self.lend.set(-1);
+        self.port = port;
+        self.region = region as usize;
+        self.region_len = region_len;
+    }
+
+    /// Close the lend and the bound handle and forget everything the client
+    /// knew, keeping its port and region: the next call binds afresh and
+    /// asks the source's description again.
+    ///
+    /// # Safety
+    /// `sys` must be the syscall table this module was started with; no
+    /// request of this client may be in flight.
+    pub unsafe fn reset(&mut self, sys: &SyscallTable) {
+        if self.lend.get() >= 0 {
+            dev_lend_close(sys, self.lend.get());
+        }
+        if self.handle.get() >= 0 {
+            (sys.provider_close)(self.handle.get());
+        }
+        let (port, region, len) = (self.port, self.region as *mut u8, self.region_len);
+        self.bind(port, region, len);
+    }
+
+    /// The bound handle, binding it on first use. `ENODEV` while the port is
+    /// not wired, `ENOSYS` when the module there serves no `storage.block`.
+    unsafe fn session(&self, sys: &SyscallTable) -> Result<i32, i32> {
+        let h = self.handle.get();
+        if h >= 0 {
+            return Ok(h);
+        }
+        let h = dev_bind_port(
+            sys,
+            abi::registry::storage_block::ID,
+            abi::kernel_abi::bind::PORT_IN,
+            self.port,
+        );
+        if h < 0 {
+            return Err(h);
+        }
+        self.handle.set(h);
+        Ok(h)
+    }
+
+    /// The bound handle with the region lent on it, lending it on first use.
+    unsafe fn lent(&self, sys: &SyscallTable) -> Result<i32, i32> {
+        let h = self.session(sys)?;
+        if self.lend.get() >= 0 {
+            return Ok(h);
+        }
+        if self.region_len == 0 {
+            return Err(E_INVAL);
+        }
+        let l = dev_lend_open(
+            sys,
+            h,
+            LEND_INOUT,
+            BLK_LEND_COOKIE,
+            self.region as *mut u8,
+            self.region_len,
+        );
+        if l < 0 {
+            return Err(l);
+        }
+        self.lend.set(l);
+        Ok(h)
+    }
+
+    /// The offset of `buf[..len]` inside the lent region, when it lies
+    /// wholly inside it.
+    pub fn offset_of(&self, buf: *const u8, len: u32) -> Option<u32> {
+        let off = (buf as usize).checked_sub(self.region)?;
+        let end = off.checked_add(len as usize)?;
+        if end > self.region_len {
+            return None;
+        }
+        u32::try_from(off).ok()
+    }
+
+    /// Queue one encoded request through the bound handle with the region
+    /// lent.
+    unsafe fn submit_raw(
+        &self,
+        sys: &SyscallTable,
+        r: &abi::contracts::storage::block::Req,
+    ) -> i32 {
+        use abi::contracts::storage::block as blk;
+        let h = match self.lent(sys) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let mut rb = [0u8; blk::req::LEN];
+        r.encode(&mut rb);
+        dev_call(
+            sys,
+            h,
+            abi::registry::storage_block::SUBMIT,
+            rb.as_mut_ptr(),
+            rb.len(),
+        )
+    }
+
+    /// One `REAP` through the bound handle into `cb`.
+    unsafe fn reap_raw(
+        &self,
+        sys: &SyscallTable,
+        cb: &mut [u8; abi::contracts::storage::block::cpl::LEN],
+    ) -> i32 {
+        let h = match self.session(sys) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        dev_call(
+            sys,
+            h,
+            abi::registry::storage_block::REAP,
+            cb.as_mut_ptr(),
+            cb.len(),
+        )
     }
 
     pub fn has(&self, f: u32) -> bool {
         self.flags.get() & f != 0
     }
 
-    /// The source's logical block size, once `caps` has answered.
+    /// The source's logical block size, once `describe` has answered.
     pub fn block_size(&self) -> u32 {
         self.lbs.get()
     }
 
-    /// Most blocks one request may carry, once `caps` has answered.
+    /// Most blocks one request may carry, once `describe` has answered.
     pub fn max_blocks(&self) -> u32 {
         self.max_blocks.get()
     }
 
-    /// Blocks the source addresses, once `caps` has answered.
+    /// Blocks the source addresses, once `describe` has answered.
     pub fn block_count(&self) -> u64 {
         self.block_count.get()
     }
@@ -126,40 +274,44 @@ impl BlockClient {
         self.device_id.get()
     }
 
-    /// The source's capability flags, once `caps` has answered.
+    /// The source's capability flags, once `describe` has answered.
     pub fn flags(&self) -> u32 {
         self.flags.get()
     }
 
-    /// Whether the source queues requests (`F_ASYNC`), once `caps` has
+    /// Whether the source queues requests (`F_ASYNC`), once `describe` has
     /// answered. Without it the non-blocking calls answer `ENOSYS`.
     pub fn is_async(&self) -> bool {
-        self.has(abi::contracts::storage::block::caps::F_ASYNC)
+        self.has(abi::contracts::storage::block::describe::F_ASYNC)
     }
 
-    /// Ask the source for its capabilities once. Returns 0, `EAGAIN` while
+    /// Ask the source for its description once. Returns 0, `EAGAIN` while
     /// the device attaches, or the source's error (`ENOSYS` from a source
     /// that does not speak this contract).
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
-    pub unsafe fn caps(&self, sys: &SyscallTable) -> i32 {
+    pub unsafe fn describe(&self, sys: &SyscallTable) -> i32 {
         use abi::contracts::storage::block as blk;
         if self.lbs.get() != 0 {
             return 0;
         }
-        let mut buf = [0u8; blk::caps::LEN];
-        let rc = dev_channel_ioctl(
+        let h = match self.session(sys) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let mut buf = [0u8; blk::describe::LEN];
+        let rc = dev_call(
             sys,
-            self.chan,
-            blk::ioctl::CAPS,
+            h,
+            abi::registry::storage_block::DESCRIBE,
             buf.as_mut_ptr(),
-            blk::caps::LEN,
+            blk::describe::LEN,
         );
         if rc < 0 {
             return rc;
         }
-        let Some(c) = blk::Caps::decode(&buf) else {
+        let Some(c) = blk::Description::decode(&buf) else {
             return E_INVAL;
         };
         self.max_blocks.set(c.max_blocks);
@@ -171,7 +323,7 @@ impl BlockClient {
         0
     }
 
-    /// Requests the source holds in flight, once `caps` has answered.
+    /// Requests the source holds in flight, once `describe` has answered.
     pub fn queue_depth(&self) -> u16 {
         self.queue_depth.get()
     }
@@ -184,32 +336,27 @@ impl BlockClient {
     /// [`BlockClient::reap`] would take them and drop every tag it does not
     /// know, so the two styles do not share one client.
     ///
+    /// A data request's buffer is `[r.offset..][..r.buf_len]` of the region
+    /// given at [`BlockClient::bind`] ([`BlockClient::offset_of`]), and
+    /// `r.lend` is [`BLK_LEND_COOKIE`].
+    ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
-    /// The buffer `r` names must stay valid, and unmoved, until its
-    /// completion is reaped: the source may use it until then.
+    /// The buffer `r` names is the source's until its completion is reaped.
     pub unsafe fn submit(
         &self,
         sys: &SyscallTable,
         r: &abi::contracts::storage::block::Req,
     ) -> i32 {
         use abi::contracts::storage::block as blk;
-        let rc = self.caps(sys);
+        let rc = self.describe(sys);
         if rc != 0 {
             return rc;
         }
-        if !self.has(blk::caps::F_ASYNC) {
+        if !self.has(blk::describe::F_ASYNC) {
             return E_NOSYS;
         }
-        let mut rb = [0u8; blk::req::LEN];
-        r.encode(&mut rb);
-        dev_channel_ioctl(
-            sys,
-            self.chan,
-            blk::ioctl::SUBMIT,
-            rb.as_mut_ptr(),
-            rb.len(),
-        )
+        self.submit_raw(sys, r)
     }
 
     /// Hand back one finished completion of a caller-tagged request into
@@ -225,7 +372,7 @@ impl BlockClient {
     ) -> i32 {
         use abi::contracts::storage::block as blk;
         let mut cb = [0u8; blk::cpl::LEN];
-        let rc = dev_channel_ioctl(sys, self.chan, blk::ioctl::REAP, cb.as_mut_ptr(), cb.len());
+        let rc = self.reap_raw(sys, &mut cb);
         if rc != 1 {
             return rc;
         }
@@ -238,42 +385,83 @@ impl BlockClient {
         }
     }
 
-    /// Run one request to completion. Returns its status. May wait on the
-    /// device: not for a provider answering inside a caller's step.
+    /// Run one request to completion over `data[..r.buf_len]` (null for an
+    /// op without a buffer). Returns its status. May wait on the device: not
+    /// for a provider answering inside a caller's step.
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
-    /// The buffer `r` names must be valid for its length for the call.
-    pub unsafe fn exec(&self, sys: &SyscallTable, r: &abi::contracts::storage::block::Req) -> i32 {
+    /// `data` must be valid for `r.buf_len` bytes for the call.
+    pub unsafe fn exec(
+        &self,
+        sys: &SyscallTable,
+        r: &abi::contracts::storage::block::Req,
+        data: *mut u8,
+    ) -> i32 {
+        let mut c = abi::contracts::storage::block::Cpl::bare(r.tag, 0);
+        self.exec_cpl(sys, r, data, &mut c)
+    }
+
+    /// As [`BlockClient::exec`], with the completion written to `out` when
+    /// the source answered one.
+    ///
+    /// # Safety
+    /// As [`BlockClient::exec`].
+    pub unsafe fn exec_cpl(
+        &self,
+        sys: &SyscallTable,
+        r: &abi::contracts::storage::block::Req,
+        data: *mut u8,
+        out: &mut abi::contracts::storage::block::Cpl,
+    ) -> i32 {
         use abi::contracts::storage::block as blk;
-        let rc = self.caps(sys);
+        let rc = self.describe(sys);
         if rc != 0 {
             return rc;
         }
-        let mut buf = [0u8; blk::req::LEN + blk::cpl::LEN];
-        r.encode(&mut buf);
-        let rc = dev_channel_ioctl(
+        let h = match self.session(sys) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let mut buf = [0u8; blk::exec::ARG_LEN];
+        let mut req = *r;
+        req.lend = 0;
+        req.offset = 0;
+        req.encode(&mut buf);
+        let len = if data.is_null() {
+            0
+        } else {
+            r.buf_len as usize
+        };
+        let rc = dev_call_data(
             sys,
-            self.chan,
-            blk::ioctl::EXEC,
+            h,
+            abi::registry::storage_block::EXEC,
             buf.as_mut_ptr(),
             buf.len(),
+            data,
+            len,
         );
         if rc < 0 {
             return rc;
         }
-        match blk::Cpl::decode(&buf[blk::req::LEN..]) {
-            Some(c) => c.status,
+        match blk::Cpl::decode(&buf[blk::exec::CPL..]) {
+            Some(c) => {
+                *out = c;
+                c.status
+            }
             None => E_INVAL,
         }
     }
 
+    /// A request over `len` bytes at `offset` in the client's lend (none
+    /// when `len` is 0).
     pub fn data_req(
         op: u8,
         flags: u8,
         lba: u64,
         nblocks: u32,
-        buf: u64,
+        offset: u32,
         len: u32,
         tag: u64,
     ) -> abi::contracts::storage::block::Req {
@@ -282,9 +470,30 @@ impl BlockClient {
             flags,
             nblocks,
             lba,
-            buf_ptr: buf,
+            lend: if len == 0 { 0 } else { BLK_LEND_COOKIE },
+            offset: if len == 0 { 0 } else { offset },
             buf_len: len,
             tag,
+        }
+    }
+
+    /// A request for `EXEC`, whose buffer is the call's data span.
+    pub fn exec_req(
+        op: u8,
+        flags: u8,
+        lba: u64,
+        nblocks: u32,
+        len: u32,
+    ) -> abi::contracts::storage::block::Req {
+        abi::contracts::storage::block::Req {
+            op,
+            flags,
+            nblocks,
+            lba,
+            lend: 0,
+            offset: 0,
+            buf_len: len,
+            tag: 0,
         }
     }
 
@@ -296,14 +505,38 @@ impl BlockClient {
     /// `buf` must be writable for `nblocks` logical blocks.
     pub unsafe fn read(&self, sys: &SyscallTable, lba: u64, nblocks: u32, buf: *mut u8) -> i32 {
         use abi::contracts::storage::block as blk;
-        let rc = self.caps(sys);
+        let rc = self.describe(sys);
         if rc != 0 {
             return rc;
         }
         let len = nblocks.saturating_mul(self.lbs.get());
         self.exec(
             sys,
-            &Self::data_req(blk::op::READ, 0, lba, nblocks, buf as u64, len, 0),
+            &Self::exec_req(blk::op::READ, 0, lba, nblocks, len),
+            buf,
+        )
+    }
+
+    /// Ask the source to stream `nblocks` blocks from `lba` onto the edge's
+    /// channel (`READ_STREAM`): the next bytes it writes there are those
+    /// blocks, in order. No buffer is named and nothing is lent.
+    ///
+    /// # Safety
+    /// `sys` must be the syscall table this module was started with.
+    pub unsafe fn read_stream(&self, sys: &SyscallTable, lba: u64, nblocks: u32) -> i32 {
+        use abi::contracts::storage::block as blk;
+        let h = match self.session(sys) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let mut rb = [0u8; blk::req::LEN];
+        Self::data_req(blk::op::READ, 0, lba, nblocks, 0, 0, 0).encode(&mut rb);
+        dev_call(
+            sys,
+            h,
+            abi::registry::storage_block::READ_STREAM,
+            rb.as_mut_ptr(),
+            rb.len(),
         )
     }
 
@@ -323,7 +556,7 @@ impl BlockClient {
         fua: bool,
     ) -> i32 {
         use abi::contracts::storage::block as blk;
-        let rc = self.caps(sys);
+        let rc = self.describe(sys);
         if rc != 0 {
             return rc;
         }
@@ -331,7 +564,8 @@ impl BlockClient {
         let flags = if fua { blk::F_FUA } else { 0 };
         self.exec(
             sys,
-            &Self::data_req(blk::op::WRITE, flags, lba, nblocks, buf as u64, len, 0),
+            &Self::exec_req(blk::op::WRITE, flags, lba, nblocks, len),
+            buf as *mut u8,
         )
     }
 
@@ -345,7 +579,7 @@ impl BlockClient {
     /// `sys` must be the syscall table this module was started with.
     pub unsafe fn flush(&mut self, sys: &SyscallTable) -> i32 {
         use abi::contracts::storage::block as blk;
-        let rc = self.caps(sys);
+        let rc = self.describe(sys);
         if rc != 0 {
             return rc;
         }
@@ -356,10 +590,14 @@ impl BlockClient {
         if self.first_fail != 0 {
             return E_IO;
         }
-        if !self.has(blk::caps::F_FLUSH) {
+        if !self.has(blk::describe::F_FLUSH) {
             return 0;
         }
-        let rc = self.exec(sys, &Self::data_req(blk::op::FLUSH, 0, 0, 0, 0, 0, 0));
+        let rc = self.exec(
+            sys,
+            &Self::exec_req(blk::op::FLUSH, 0, 0, 0, 0),
+            core::ptr::null_mut(),
+        );
         if rc == 0 && self.next_seq > self.flush_done {
             self.flush_done = self.next_seq;
         }
@@ -427,7 +665,7 @@ impl BlockClient {
         buf: *const u8,
     ) -> i32 {
         use abi::contracts::storage::block as blk;
-        let rc = self.caps(sys);
+        let rc = self.describe(sys);
         if rc != 0 {
             return rc;
         }
@@ -436,8 +674,15 @@ impl BlockClient {
         } else {
             0
         };
-        let bufp = if op == blk::op::WRITE { buf as u64 } else { 0 };
-        if !self.has(blk::caps::F_ASYNC) {
+        let offset = if op == blk::op::WRITE {
+            match self.offset_of(buf, len) {
+                Some(o) => o,
+                None => return E_INVAL,
+            }
+        } else {
+            0
+        };
+        if !self.has(blk::describe::F_ASYNC) {
             return E_NOSYS;
         }
         self.reap(sys);
@@ -448,16 +693,8 @@ impl BlockClient {
             return E_AGAIN;
         };
         let seq = self.next_seq + 1;
-        let r = Self::data_req(op, 0, lba, nblocks, bufp, len, seq);
-        let mut rb = [0u8; blk::req::LEN];
-        r.encode(&mut rb);
-        let rc = dev_channel_ioctl(
-            sys,
-            self.chan,
-            blk::ioctl::SUBMIT,
-            rb.as_mut_ptr(),
-            rb.len(),
-        );
+        let r = Self::data_req(op, 0, lba, nblocks, offset, len, seq);
+        let rc = self.submit_raw(sys, &r);
         if rc == 0 {
             self.next_seq = seq;
             self.outstanding[slot] = seq;
@@ -469,12 +706,14 @@ impl BlockClient {
     /// 0, or `EAGAIN` when nothing more can be in flight; its sequence is
     /// [`BlockClient::last_seq`] once it returns 0.
     ///
+    /// `buf` lies in the region given at [`BlockClient::bind`]; `EINVAL`
+    /// otherwise.
+    ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with. `buf`
-    /// must be readable for `nblocks` logical blocks, and stay valid and
-    /// unchanged until [`BlockClient::write_state`] stops reporting the write
-    /// in flight — unless the source reports `F_WRITE_COPIES`, in which case
-    /// it is free when this returns.
+    /// must stay unchanged until [`BlockClient::write_state`] stops
+    /// reporting the write in flight — unless the source reports
+    /// `F_WRITE_COPIES`, in which case it is free when this returns.
     pub unsafe fn submit_write(
         &mut self,
         sys: &SyscallTable,
@@ -542,10 +781,12 @@ impl BlockClient {
     /// nothing more can be in flight, or the source's refusal. Its
     /// completion comes back through [`BlockClient::take_read`].
     ///
+    /// `buf` lies in the region given at [`BlockClient::bind`]; `EINVAL`
+    /// otherwise.
+    ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with. `buf`
-    /// must be writable for `nblocks` logical blocks and stay valid,
-    /// unmoved and unread by anyone else until `take_read` hands back this
+    /// must stay unread by anyone else until `take_read` hands back this
     /// tag: the source writes it until then.
     pub unsafe fn submit_read(
         &mut self,
@@ -556,7 +797,7 @@ impl BlockClient {
         tag: u64,
     ) -> i32 {
         use abi::contracts::storage::block as blk;
-        let rc = self.caps(sys);
+        let rc = self.describe(sys);
         if rc != 0 {
             return rc;
         }
@@ -569,7 +810,10 @@ impl BlockClient {
             return E_AGAIN;
         }
         let len = nblocks.saturating_mul(self.lbs.get());
-        if !self.has(blk::caps::F_ASYNC) {
+        let Some(offset) = self.offset_of(buf, len) else {
+            return E_INVAL;
+        };
+        if !self.has(blk::describe::F_ASYNC) {
             return E_NOSYS;
         }
         self.reap(sys);
@@ -581,19 +825,11 @@ impl BlockClient {
             0,
             lba,
             nblocks,
-            buf as u64,
+            offset,
             len,
             tag | BLK_READ_TAG,
         );
-        let mut rb = [0u8; blk::req::LEN];
-        r.encode(&mut rb);
-        let rc = dev_channel_ioctl(
-            sys,
-            self.chan,
-            blk::ioctl::SUBMIT,
-            rb.as_mut_ptr(),
-            rb.len(),
-        );
+        let rc = self.submit_raw(sys, &r);
         if rc == 0 {
             self.reads_inflight += 1;
         }
@@ -668,7 +904,7 @@ impl BlockClient {
             }
             i += 1;
         }
-        if !self.has(blk::caps::F_FLUSH) {
+        if !self.has(blk::describe::F_FLUSH) {
             return 0;
         }
         if self.flush_err != 0 {
@@ -693,21 +929,13 @@ impl BlockClient {
         }
         let covers = if low == 0 { self.next_seq } else { low - 1 };
         let r = Self::data_req(blk::op::FLUSH, 0, 0, 0, 0, 0, BLK_FLUSH_TAG | covers);
-        if !self.has(blk::caps::F_ASYNC) {
+        if !self.has(blk::describe::F_ASYNC) {
             return E_NOSYS;
         }
         if !self.queue_room() {
             return 1;
         }
-        let mut rb = [0u8; blk::req::LEN];
-        r.encode(&mut rb);
-        let rc = dev_channel_ioctl(
-            sys,
-            self.chan,
-            blk::ioctl::SUBMIT,
-            rb.as_mut_ptr(),
-            rb.len(),
-        );
+        let rc = self.submit_raw(sys, &r);
         if rc == 0 {
             self.flush_inflight = covers.max(1);
         } else if rc != E_AGAIN {
@@ -725,12 +953,12 @@ impl BlockClient {
     /// `sys` must be the syscall table this module was started with.
     pub unsafe fn reap(&mut self, sys: &SyscallTable) {
         use abi::contracts::storage::block as blk;
-        if self.lbs.get() == 0 || !self.has(blk::caps::F_ASYNC) {
+        if self.lbs.get() == 0 || !self.has(blk::describe::F_ASYNC) {
             return;
         }
         loop {
             let mut cb = [0u8; blk::cpl::LEN];
-            let rc = dev_channel_ioctl(sys, self.chan, blk::ioctl::REAP, cb.as_mut_ptr(), cb.len());
+            let rc = self.reap_raw(sys, &mut cb);
             if rc != 1 {
                 return;
             }
@@ -769,4 +997,46 @@ impl BlockClient {
             }
         }
     }
+}
+
+/// A source borrows a queued request's buffer: the bytes `r` names in the
+/// lend its consumer opened on the session `handle` (the port reference the
+/// source was handed), one borrow out. `EINVAL` for a range outside the
+/// lend, `EACCES` for a lend whose direction does not let the op move its
+/// bytes (a read writes the buffer, a write reads it), `ENOENT` for no such
+/// lend. Every borrow is given back with [`blk_give_back`] before the
+/// request's completion becomes reapable.
+///
+/// # Safety
+/// `sys` must be the syscall table this module was started with.
+pub unsafe fn blk_borrow(
+    sys: &SyscallTable,
+    handle: i32,
+    r: &abi::contracts::storage::block::Req,
+) -> Result<*mut u8, i32> {
+    let Some((base, len, dir)) = dev_lend_resolve(sys, handle, r.lend) else {
+        return Err(-2);
+    };
+    let need = if r.writes_buffer() { LEND_OUT } else { LEND_IN };
+    let Some(range) = r.range_in(len) else {
+        dev_lend_return(sys, handle, r.lend);
+        return Err(E_INVAL);
+    };
+    if dir & need == 0 {
+        dev_lend_return(sys, handle, r.lend);
+        return Err(-13);
+    }
+    Ok(base.add(range.start))
+}
+
+/// Give back the borrow [`blk_borrow`] took for `r`.
+///
+/// # Safety
+/// `sys` must be the syscall table this module was started with.
+pub unsafe fn blk_give_back(
+    sys: &SyscallTable,
+    handle: i32,
+    r: &abi::contracts::storage::block::Req,
+) {
+    dev_lend_return(sys, handle, r.lend);
 }

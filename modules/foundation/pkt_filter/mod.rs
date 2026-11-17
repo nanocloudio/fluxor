@@ -125,6 +125,7 @@ const HEAP_DEFAULT_BYTES: u32 = 4 * 1024 * 1024;
 const HEAP_DEFAULT_BYTES: u32 = 4 * 1024;
 
 const ERANGE: i32 = -34;
+const EINVAL: i32 = -22;
 const ENOENT: i32 = -2;
 
 const ACTION_DROP: u8 = 0;
@@ -281,8 +282,9 @@ fn get_u64(b: &[u8], at: usize) -> u64 {
 // net.policy: reading and attaching
 // ============================================================================
 
-/// READ `name_len` bytes of `s.table` (0: the store) into `out` (`cap`
-/// bytes); the state record lands in `state`.
+/// READ `name_len` bytes of `s.table` (0: the store): the rules into `out`
+/// (`cap` bytes, the call's `data`), the state record into `state` (answered
+/// in `arg`).
 unsafe fn np_read(
     s: &FilterState,
     name_len: usize,
@@ -290,20 +292,27 @@ unsafe fn np_read(
     cap: usize,
     state: &mut [u8; np::state::BYTES],
 ) -> i32 {
-    let mut arg = [0u8; 1 + np::MAX_TABLE_NAME + 8 + 4 + 8];
-    arg[0] = name_len as u8;
-    let mut i = 0;
-    while i < name_len && i < np::MAX_TABLE_NAME {
-        if let (Some(d), Some(c)) = (arg.get_mut(1 + i), s.table.get(i)) {
-            *d = *c;
-        }
-        i += 1;
+    let mut arg = [0u8; np::name::ARG_MAX];
+    let name = s
+        .table
+        .get(..name_len.min(np::MAX_TABLE_NAME))
+        .unwrap_or(&[]);
+    if np::name::encode(name, &mut arg).is_none() {
+        return EINVAL;
     }
-    let p = 1 + name_len;
-    put_le(&mut arg, p, out as u64, 8);
-    put_le(&mut arg, p + 8, cap as u64, 4);
-    put_le(&mut arg, p + 12, state.as_mut_ptr() as u64, 8);
-    ((*s.syscalls).provider_call)(-1, np::READ, arg.as_mut_ptr(), p + 20)
+    let n = np::name::arg_len(name.len());
+    let rc = ((*s.syscalls).provider_call)(-1, np::READ, arg.as_mut_ptr(), n, out, cap);
+    // The state is answered with the rules, and with ERANGE.
+    if rc >= 0 || rc == ERANGE {
+        let mut k = 0;
+        while k < np::state::BYTES {
+            if let (Some(d), Some(c)) = (state.get_mut(k), arg.get(k)) {
+                *d = *c;
+            }
+            k += 1;
+        }
+    }
+    rc
 }
 
 /// ATTACH naming the table, reporting `applied` and declaring
@@ -322,7 +331,14 @@ unsafe fn np_attach(s: &FilterState, applied: u64) -> i32 {
     put_le(&mut arg, 1 + nl, applied, 8);
     put_le(&mut arg, 1 + nl + np::ATTACH_TAIL, POLICY_BUF as u64, 4);
     let len = 1 + nl + np::ATTACH_TAIL + np::ATTACH_CAPACITY_TAIL;
-    ((*s.syscalls).provider_call)(-1, np::ATTACH, arg.as_mut_ptr(), len)
+    ((*s.syscalls).provider_call)(
+        -1,
+        np::ATTACH,
+        arg.as_mut_ptr(),
+        len,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Poll the store-wide generation; re-read the table when it moved, and

@@ -10,14 +10,16 @@
 //!
 //! An echo the channel refuses is held and written first next step, and
 //! nothing more is read until it is: back pressure reaches the transport
-//! instead of the bytes being lost. With `ack` set, each echo is followed
-//! by `tls`'s `CMD_DELIVERED` (`[conn_id][consumer_cursor][in_bytes]`),
-//! which tells a `tls` running `delivery_ack` how many of the stream's clear
-//! bytes are consumed — the worker acknowledgement a crash-continuous pair
-//! mirrors. The sink's cursor is the bytes it has consumed (0 unless
-//! `cursor` is set); a stream resumed here by a takeover (`MSG_RESUMED`)
-//! continues from the byte it names. With `cursor` both are logged
-//! (`[sink] acked cursor=N in=I`, `[sink] resumed cursor=C in=I out=O`).
+//! instead of the bytes being lost. With `ack` set, the sink asks for the
+//! continuity cursors (`net_proto::flag::CURSORS`) on its bind or dial, and
+//! on a connection granted them each echo is followed by
+//! `CMD_CURSOR_DELIVERED` (`[conn_id][consumer_cursor][in_bytes]`), which
+//! tells the record layer how many of the stream's clear bytes are consumed
+//! — the worker acknowledgement a crash-continuous pair mirrors. The sink's
+//! cursor is the bytes it has consumed (0 unless `cursor` is set); a stream
+//! resumed here by a takeover (`MSG_CURSOR_RESUMED`) continues from the byte
+//! it names. With `cursor` both are logged (`[sink] acked cursor=N in=I`,
+//! `[sink] resumed cursor=C in=I out=O`).
 //! With `echo_after`, exactly that many bytes are consumed at a time (an
 //! acknowledgement may stand inside a record), the rest held for the next.
 
@@ -38,39 +40,36 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-/// The connection's output horizon (`net_proto::MSG_HORIZON`).
-const NET_MSG_HORIZON: u8 = 0x0B;
-/// A stream resumed here by a takeover (`net_proto::MSG_RESUMED`).
-const NET_MSG_RESUMED: u8 = abi::contracts::net::net_proto::MSG_RESUMED;
-const NET_MSG_CLOSED: u8 = 0x03;
-/// `MSG_CLOSED` kind: the peer finished sending (net_proto `CLOSED_PEER_FIN`).
-const CLOSED_PEER_FIN: u8 = 1;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-/// `CMD_CLOSE`'s `how`: reset (net_proto `CLOSE_ABORT`).
-const CLOSE_ABORT: u8 = 1;
-const NET_CMD_CONNECT_TO: u8 = 0x14;
-const NET_MSG_CONNECTED: u8 = 0x05;
-/// What `echo_after` holds before echoing.
+use abi::contracts::net::net_proto as np;
+use abi::contracts::net::stream_cursor as cur;
+
+const NET_MSG_ACCEPTED: u8 = np::MSG_ACCEPTED;
+const NET_MSG_DATA: u8 = np::MSG_DATA;
+const NET_MSG_CLOSED: u8 = np::MSG_CLOSED;
+const NET_MSG_BOUND: u8 = np::MSG_BOUND;
+const NET_MSG_CONNECTED: u8 = np::MSG_CONNECTED;
+const NET_CMD_BIND: u8 = np::CMD_BIND;
+const NET_CMD_SEND: u8 = np::CMD_SEND;
+const NET_CMD_CLOSE: u8 = np::CMD_CLOSE;
+const NET_CMD_CONNECT_TO: u8 = np::CMD_CONNECT_TO;
+/// What `echo_after` holds before echoing: one whole `CMD_SEND`, whose
+/// frame the transport's command input accepts on every target.
+#[cfg(target_arch = "aarch64")]
 const HOLD_MAX: usize = 4096;
-/// `tls`'s clear-side acknowledgement (`delivery_ack`).
-const NET_CMD_DELIVERED: u8 = abi::contracts::net::net_proto::CMD_DELIVERED;
-use abi::contracts::net::net_proto;
-use net_proto::{DELIVERED_LEN, RESUMED_LEN};
+#[cfg(not(target_arch = "aarch64"))]
+const HOLD_MAX: usize = 1598;
 
 const LOG_PERIOD: u32 = 5000;
 /// One bit per possible `conn_id`.
 const OPEN_WORDS: usize = 65536 / 32;
-/// One inbound frame: header + conn id + the largest data fragment.
-const BUF: usize = 3 + 2 + 1460;
+/// One inbound frame, header included: whatever a transport's `net_out`
+/// may carry (`NET_IN_ACCEPTS_RECORD`).
+const BUF: usize = 1483;
 /// Frames read per step.
 const FRAMES_PER_STEP: usize = 64;
-/// The longest `CMD_SEND` this writes: an `echo_after` hold, whole.
-const SEND_MAX: usize = 5 + HOLD_MAX;
+/// The longest `CMD_SEND` this writes: an `echo_after` hold, whole
+/// (`NET_OUT_MAX_RECORD`).
+const SEND_MAX: usize = NET_FRAME_HDR + np::DATA_HEAD + HOLD_MAX;
 const _: () = assert!(SEND_MAX >= BUF);
 
 #[repr(C)]
@@ -82,6 +81,8 @@ pub struct SinkState {
     echo: u8,
     ack: u8,
     bound: u8,
+    /// The sidebands the transport granted the listener or the dial.
+    granted: u8,
     /// An echo the channel refused, written before anything else is read.
     held_len: u16,
     /// A `CMD_DELIVERED` owed for this connection.
@@ -200,21 +201,39 @@ fn parse_dial(s: &mut SinkState, t: &[u8]) {
     }
 }
 
-/// `CMD_CONNECT_TO` `[sock_type 1][af 4][port u16 LE][addr 4 BE]`.
+/// The sidebands the sink asks for: the continuity cursors when it
+/// acknowledges what it consumes.
+fn wanted_flags(s: &SinkState) -> u8 {
+    if s.ack != 0 {
+        np::flag::CURSORS
+    } else {
+        0
+    }
+}
+
+/// `CMD_CONNECT_TO` to `dial_ip:dial_port`, tagged with this module.
 unsafe fn send_dial(s: &mut SinkState) {
     let sys = &*s.syscalls;
-    let pb = s.dial_port.to_le_bytes();
-    let ab = s.dial_ip.to_be_bytes();
-    let p = [1u8, 4, pb[0], pb[1], ab[0], ab[1], ab[2], ab[3]];
-    let mut scratch = [0u8; 16];
+    let mut p = [0u8; np::CONNECT_TO_HEAD + 4 + np::REQUESTER_TAG_LEN];
+    let n = np::write_connect_to(
+        &mut p,
+        &np::ConnectTo {
+            sock_type: np::SOCK_TYPE_STREAM,
+            flags: wanted_flags(s),
+            port: s.dial_port,
+            target: np::Target::V4(s.dial_ip.to_be_bytes()),
+            requester_tag: dev_requester_tag(sys),
+        },
+    );
+    let mut scratch = [0u8; 3 + np::CONNECT_TO_HEAD + 4 + np::REQUESTER_TAG_LEN];
     if net_write_frame(
         sys,
         s.net_out,
         NET_CMD_CONNECT_TO,
         p.as_ptr(),
-        p.len(),
+        n,
         scratch.as_mut_ptr(),
-        16,
+        scratch.len(),
     ) != 0
     {
         s.dialled = 1;
@@ -263,8 +282,7 @@ unsafe fn abort(s: &mut SinkState) {
         return;
     }
     let sys = &*s.syscalls;
-    let id = s.abort_id.to_le_bytes();
-    let payload = [id[0], id[1], CLOSE_ABORT];
+    let payload = np::close(s.abort_id, true);
     let mut scratch = [0u8; 8];
     if net_write_frame(
         sys,
@@ -304,14 +322,14 @@ fn set_open(s: &mut SinkState, id: u16, open: bool) {
 
 unsafe fn send_bind(s: &mut SinkState) {
     let sys = &*s.syscalls;
-    let payload = s.port.to_le_bytes();
+    let payload = np::bind(s.port, wanted_flags(s));
     let mut scratch = [0u8; 8];
     net_write_frame(
         sys,
         s.net_out,
         NET_CMD_BIND,
         payload.as_ptr(),
-        2,
+        payload.len(),
         scratch.as_mut_ptr(),
         8,
     );
@@ -388,12 +406,11 @@ unsafe fn flush_owed(s: &mut SinkState) -> bool {
         s.held_len = 0;
     }
     if s.ack_owed != 0 {
-        let id = s.ack_conn.to_le_bytes();
-        let mut f = [0u8; 3 + DELIVERED_LEN];
-        f[..5].copy_from_slice(&[NET_CMD_DELIVERED, DELIVERED_LEN as u8, 0, id[0], id[1]]);
         let cursor = if s.cursor != 0 { s.ack_cursor } else { 0 };
-        f[5..13].copy_from_slice(&cursor.to_le_bytes());
-        f[13..21].copy_from_slice(&s.ack_cursor.to_le_bytes());
+        let mut f = [0u8; 3 + cur::DELIVERED_LEN];
+        f[0] = cur::CMD_CURSOR_DELIVERED;
+        f[1..3].copy_from_slice(&(cur::DELIVERED_LEN as u16).to_le_bytes());
+        f[3..].copy_from_slice(&cur::delivered(s.ack_conn, cursor, s.ack_cursor));
         if (sys.channel_write)(s.net_out, f.as_ptr(), f.len()) != f.len() as i32 {
             return false;
         }
@@ -422,7 +439,7 @@ unsafe fn linger(s: &mut SinkState) {
     let id = s.linger_id;
     while s.farewell_sent < s.farewell {
         let n = usize::from(s.farewell - s.farewell_sent).min(1024);
-        let mut f = [0u8; 3 + 2 + 1024];
+        let mut f = [0u8; 3 + np::DATA_HEAD + 1024];
         f[0] = NET_CMD_SEND;
         f[1..3].copy_from_slice(&((2 + n) as u16).to_le_bytes());
         f[3..5].copy_from_slice(&id.to_le_bytes());
@@ -437,14 +454,14 @@ unsafe fn linger(s: &mut SinkState) {
         }
         s.farewell_sent += n as u16;
     }
-    let payload = id.to_le_bytes();
+    let payload = np::close(id, false);
     let mut scratch = [0u8; 8];
     if net_write_frame(
         sys,
         s.net_out,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         scratch.as_mut_ptr(),
         8,
     ) == 0
@@ -461,6 +478,17 @@ unsafe fn linger(s: &mut SinkState) {
     dev_log(sys, 3, m.as_ptr(), m.len());
 }
 
+/// With `ack` on a connection granted the cursors: a `CMD_CURSOR_DELIVERED`
+/// for `n` more consumed bytes is owed.
+fn owe_ack(s: &mut SinkState, id: u16, n: usize) {
+    if s.ack != 0 && s.granted & np::flag::CURSORS != 0 {
+        s.ack_owed = 1;
+        s.ack_conn = id;
+        s.consumed = s.consumed.wrapping_add(n as u64);
+        s.ack_cursor = s.consumed;
+    }
+}
+
 unsafe fn service(s: &mut SinkState) {
     let sys = &*s.syscalls;
     let mut n = 0;
@@ -472,83 +500,96 @@ unsafe fn service(s: &mut SinkState) {
         if msg == 0 {
             break;
         }
-        let p = s.buf.as_ptr().add(3);
+        let mut payload = [0u8; BUF];
+        payload[..plen].copy_from_slice(&s.buf[3..3 + plen]);
+        let payload = &payload[..plen];
         match msg {
             NET_MSG_BOUND => {
-                s.bound = 1;
-                let m = b"[sink] bound";
-                dev_log(sys, 3, m.as_ptr(), m.len());
+                if let Some((_, port, granted)) = np::bound_parts(payload) {
+                    if port == s.port {
+                        s.bound = 1;
+                        s.granted = granted;
+                        let m = b"[sink] bound";
+                        dev_log(sys, 3, m.as_ptr(), m.len());
+                    }
+                }
             }
-            NET_MSG_ACCEPTED if plen >= 2 => {
-                let id = (*p as u16) | ((*p.add(1) as u16) << 8);
+            NET_MSG_ACCEPTED => {
                 // An accept on another listener's port belongs to another
                 // reader of the same fanned `ip.net_out`.
-                let port = if plen >= 4 {
-                    (*p.add(2) as u16) | ((*p.add(3) as u16) << 8)
-                } else {
-                    s.port
-                };
-                if port == s.port && !is_open(s, id) {
-                    set_open(s, id, true);
-                    s.open += 1;
-                    s.accepted = s.accepted.wrapping_add(1);
-                    if s.open > s.peak {
-                        s.peak = s.open;
+                if let Some(a) = np::accepted_parts(payload) {
+                    let id = a.conn_id;
+                    if a.local_port == s.port && s.dial_port == 0 && !is_open(s, id) {
+                        set_open(s, id, true);
+                        s.open += 1;
+                        s.accepted = s.accepted.wrapping_add(1);
+                        if s.open > s.peak {
+                            s.peak = s.open;
+                        }
                     }
                 }
             }
             // Our dial's session, or one we dialled elsewhere that moved
-            // here (`tls` activates a client session with CONNECTED).
-            NET_MSG_CONNECTED if plen >= 2 => {
-                let id = (*p as u16) | ((*p.add(1) as u16) << 8);
-                if !is_open(s, id) {
-                    set_open(s, id, true);
-                    s.open += 1;
-                    s.accepted = s.accepted.wrapping_add(1);
-                    s.peak = s.peak.max(s.open);
-                    let m = b"[sink] connected";
-                    dev_log(sys, 3, m.as_ptr(), m.len());
+            // here (`tls` activates a client session with CONNECTED). Another
+            // reader's dial on a fanned channel carries its own tag.
+            NET_MSG_CONNECTED => {
+                if let Some(c) = np::connected_parts(payload) {
+                    let mine = c.requester_tag == dev_requester_tag(sys)
+                        || c.requester_tag == np::REQUESTER_TAG_NONE;
+                    if mine && !is_open(s, c.conn_id) {
+                        set_open(s, c.conn_id, true);
+                        s.granted = c.opening.flags_granted;
+                        s.open += 1;
+                        s.accepted = s.accepted.wrapping_add(1);
+                        s.peak = s.peak.max(s.open);
+                        let m = b"[sink] connected";
+                        dev_log(sys, 3, m.as_ptr(), m.len());
+                    }
                 }
             }
-            // `tls`'s output horizon (`write_horizon`): logged, so a rig can
-            // hold what a takeover kept against what the client received.
-            NET_MSG_HORIZON if plen == 10 => {
-                let mut b = [0u8; 8];
-                core::ptr::copy_nonoverlapping(p.add(2), b.as_mut_ptr(), 8);
-                let through = u64::from_le_bytes(b);
-                let mut line = [0u8; 48];
-                let head = b"[sink] horizon bytes=";
-                line[..head.len()].copy_from_slice(head);
-                let mut tmp = [0u8; 12];
-                let digits = fmt_u32(through.min(u64::from(u32::MAX)) as u32, &mut tmp);
-                line[head.len()..head.len() + digits.len()].copy_from_slice(digits);
-                dev_log(sys, 3, line.as_ptr(), head.len() + digits.len());
+            // The output horizon of a connection granted the cursors: logged,
+            // so a rig can hold what a takeover kept against what the client
+            // received.
+            cur::MSG_CURSOR_HORIZON => {
+                if let Some((id, through)) = cur::horizon_parts(payload) {
+                    if is_open(s, id) {
+                        let mut line = [0u8; 48];
+                        let head = b"[sink] horizon bytes=";
+                        line[..head.len()].copy_from_slice(head);
+                        let mut tmp = [0u8; 12];
+                        let digits = fmt_u32(through.min(u64::from(u32::MAX)) as u32, &mut tmp);
+                        line[head.len()..head.len() + digits.len()].copy_from_slice(digits);
+                        dev_log(sys, 3, line.as_ptr(), head.len() + digits.len());
+                    }
+                }
             }
             // A stream resumed here: its predecessor's cursor, the byte it
             // had consumed through and its output horizon. The count of
             // bytes consumed continues from that byte.
-            NET_MSG_RESUMED if plen == RESUMED_LEN => {
-                let mut r = [0u8; RESUMED_LEN];
-                core::ptr::copy_nonoverlapping(p, r.as_mut_ptr(), RESUMED_LEN);
-                if let Some((_, cursor, in_bytes, out)) = net_proto::resumed_parts(&r) {
-                    s.consumed = in_bytes;
-                    log_value(
-                        sys,
-                        b"[sink] resumed cursor=",
-                        cursor,
-                        &[(b" in=", in_bytes), (b" out=", out)],
-                    );
+            cur::MSG_CURSOR_RESUMED => {
+                if let Some((id, cursor, in_bytes, out)) = cur::resumed_parts(payload) {
+                    if is_open(s, id) {
+                        s.consumed = in_bytes;
+                        log_value(
+                            sys,
+                            b"[sink] resumed cursor=",
+                            cursor,
+                            &[(b" in=", in_bytes), (b" out=", out)],
+                        );
+                    }
                 }
             }
-            NET_MSG_DATA if plen > 2 && s.echo_after != 0 => {
-                let id = (*p as u16) | ((*p.add(1) as u16) << 8);
-                let data_len = plen - 2;
-                s.bytes = s.bytes.wrapping_add(data_len as u32);
+            NET_MSG_DATA if s.echo_after != 0 => {
+                let Some((id, data)) = np::data_parts(payload) else {
+                    n += 1;
+                    continue;
+                };
                 if is_open(s, id) {
+                    s.bytes = s.bytes.wrapping_add(data.len() as u32);
                     // Held unconsumed until `echo_after` bytes have come.
                     let at = usize::from(s.hold_len);
-                    let k = data_len.min(HOLD_MAX - at);
-                    core::ptr::copy_nonoverlapping(p.add(2), s.hold.as_mut_ptr().add(at), k);
+                    let k = data.len().min(HOLD_MAX - at);
+                    s.hold[at..at + k].copy_from_slice(&data[..k]);
                     s.hold_len += k as u16;
                     s.hold_conn = id;
                     if s.hold_len >= s.echo_after {
@@ -560,22 +601,22 @@ unsafe fn service(s: &mut SinkState) {
                         s.hold.copy_within(n..n + rest, 0);
                         s.hold_len = rest as u16;
                         send_data(s, id, &held[..n]);
-                        if s.ack != 0 {
-                            s.ack_owed = 1;
-                            s.ack_conn = id;
-                            s.consumed = s.consumed.wrapping_add(n as u64);
-                            s.ack_cursor = s.consumed;
-                        }
+                        owe_ack(s, id, n);
                         let m = b"[sink] held bytes echoed";
                         dev_log(sys, 3, m.as_ptr(), m.len());
                         after_echo(s, id, n);
                     }
                 }
             }
-            NET_MSG_DATA if plen > 2 => {
-                let id = (*p as u16) | ((*p.add(1) as u16) << 8);
-                let data_len = plen - 2;
-                s.bytes = s.bytes.wrapping_add(data_len as u32);
+            NET_MSG_DATA => {
+                let Some((id, data)) = np::data_parts(payload) else {
+                    n += 1;
+                    continue;
+                };
+                let data_len = data.len();
+                if is_open(s, id) {
+                    s.bytes = s.bytes.wrapping_add(data_len as u32);
+                }
                 if s.echo != 0 && is_open(s, id) {
                     // Echo in place: the payload already has the shape of a
                     // CMD_SEND body, only the type byte differs.
@@ -586,20 +627,18 @@ unsafe fn service(s: &mut SinkState) {
                         s.held[..total].copy_from_slice(&s.buf[..total]);
                         s.held_len = total as u16;
                     }
-                    if s.ack != 0 {
-                        s.ack_owed = 1;
-                        s.ack_conn = id;
-                        s.consumed = s.consumed.wrapping_add(data_len as u64);
-                        s.ack_cursor = s.consumed;
-                    }
+                    owe_ack(s, id, data_len);
                     after_echo(s, id, data_len);
                 }
             }
-            NET_MSG_CLOSED if plen >= 2 => {
-                let id = (*p as u16) | ((*p.add(1) as u16) << 8);
+            NET_MSG_CLOSED => {
                 // `[conn_id][kind]`: only the peer's FIN half-closes; a
                 // connection that is gone is closed at once.
-                let peer_fin = plen >= 3 && *p.add(2) == CLOSED_PEER_FIN;
+                let Some((id, kind)) = np::closed_parts(payload) else {
+                    n += 1;
+                    continue;
+                };
+                let peer_fin = kind == np::CLOSED_PEER_FIN;
                 if is_open(s, id) && peer_fin && s.linger_ms != 0 && s.lingering == 0 {
                     // Half-closed: ours stays open for a while yet.
                     s.lingering = 1;
@@ -614,14 +653,14 @@ unsafe fn service(s: &mut SinkState) {
                     let m = b"[sink] connection closed";
                     dev_log(sys, 3, m.as_ptr(), m.len());
                     // The id is ours until we close it.
-                    let payload = id.to_le_bytes();
+                    let payload = np::close(id, false);
                     let mut scratch = [0u8; 8];
                     net_write_frame(
                         sys,
                         s.net_out,
                         NET_CMD_CLOSE,
                         payload.as_ptr(),
-                        2,
+                        payload.len(),
                         scratch.as_mut_ptr(),
                         8,
                     );
@@ -633,7 +672,10 @@ unsafe fn service(s: &mut SinkState) {
     }
 }
 
-fluxor_rt::module_facts! { state: SinkState }
+fluxor_rt::module_facts! {
+    state: SinkState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = BUF, out 0 NET_OUT_MAX_RECORD = SEND_MAX],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

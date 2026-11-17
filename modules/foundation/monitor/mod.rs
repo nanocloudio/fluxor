@@ -165,7 +165,14 @@ fn emit_bytes(s: &[u8], out: &mut [u8], pos: &mut usize) {
 unsafe fn build_mon_hist(sys: &SyscallTable, mod_idx: u16, out: &mut [u8]) -> usize {
     let mut buckets = [0u32; 8];
     let bp = buckets.as_mut_ptr() as *mut u8;
-    let rc = (sys.provider_call)(mod_idx as i32, STEP_HISTOGRAM_QUERY, bp, 32);
+    let rc = (sys.provider_call)(
+        mod_idx as i32,
+        STEP_HISTOGRAM_QUERY,
+        bp,
+        32,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         return 0;
     }
@@ -198,6 +205,8 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u16, out: &mut [u8]) -> u
         MODULE_STATE_QUERY,
         st.as_mut_ptr(),
         MODULE_STATE_MAX,
+        core::ptr::null_mut(),
+        0,
     );
     // The query answers with the width it wrote; anything short of the
     // fixed header is not a record.
@@ -351,7 +360,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         let sys_ptr = s.syscalls;
         if s.slot_capacity == 0 {
-            let cap = ((*sys_ptr).provider_call)(-1, SLOT_CAPACITY, core::ptr::null_mut(), 0);
+            let cap = ((*sys_ptr).provider_call)(
+                -1,
+                SLOT_CAPACITY,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             if cap <= 0 {
                 // No answer (a kernel without the query, or the permission
                 // withheld): nothing to walk. Ask again next round.
@@ -382,13 +398,27 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 continue;
             }
             reported += 1;
-            // Level 3 = info. LOG_WRITE routes through `syscall_log` which
+            // Level 3 = info. LOG_WRITE hands `data` to the kernel log, which
             // calls `log::info!` — bytes land in the ring and flow out the
             // active transport overlay.
-            ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
+            ((*sys_ptr).provider_call)(
+                3,
+                SYSTEM_LOG,
+                core::ptr::null_mut(),
+                0,
+                line.as_mut_ptr(),
+                n,
+            );
             let n = build_mon_hist(&*sys_ptr, idx, &mut line);
             if n > 0 {
-                ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
+                ((*sys_ptr).provider_call)(
+                    3,
+                    SYSTEM_LOG,
+                    core::ptr::null_mut(),
+                    0,
+                    line.as_mut_ptr(),
+                    n,
+                );
             }
         }
         s.cursor = i as u32;

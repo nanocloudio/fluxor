@@ -1,10 +1,10 @@
 //! Synthetic byte-stream source.
 //!
 //! Emits `size` bytes onto its single output channel on every
-//! IOCTL_NOTIFY received from a downstream consumer (typically
-//! `http.file_data`), then signals `IOCTL_SET_HUP` once the requested
-//! byte count has been written so the consumer transitions cleanly to
-//! end-of-source.
+//! `stream_select` `SELECT` from the downstream consumer (typically
+//! `http.file_data`), then ends the stream (`channel::SET_HUP`) once the
+//! requested byte count has been written so the consumer transitions
+//! cleanly to end-of-source.
 //!
 //! Decouples HTTP / IP throughput measurement from disk content. The
 //! hot path writes the module's pre-zeroed scratch buffer rather than
@@ -30,8 +30,10 @@
 //!      pressure; smaller values smooth latency, larger values lift
 //!      throughput at the cost of one tick of head-of-line.
 //!
-//! **Wiring:** single output port `stream` (OctetStream). Consumer
-//! drives the request lifecycle via `IOCTL_NOTIFY` on this channel.
+//! **Wiring:** single output port `stream` (OctetStream), which serves
+//! `stream_select`: the consumer drives the request lifecycle by binding
+//! that contract through its input port and calling `SELECT`. Every
+//! position names the one synthetic item.
 
 #![no_std]
 #![allow(
@@ -55,7 +57,12 @@ use fluxor_rt::*;
 // ============================================================================
 
 const DEFAULT_CHUNK_SIZE: u16 = 4096;
+/// Largest single chunk emit, the port's `max_record`: a host stream feeds
+/// HTTP throughput runs, an MCU one stays within its state budget.
+#[cfg(target_arch = "aarch64")]
 const MAX_CHUNK_SIZE: usize = 32768;
+#[cfg(not(target_arch = "aarch64"))]
+const MAX_CHUNK_SIZE: usize = 4096;
 
 /// Cadence for the `[synth_source] tlm` line (matches the other hot-
 /// path modules so the host parser can reconcile windows).
@@ -77,12 +84,12 @@ struct SynthState {
 
     // Runtime cursor
     /// Bytes already written to `out_chan` for the current request.
-    /// Reset to 0 on each IOCTL_NOTIFY.
+    /// Reset to 0 on each `SELECT`.
     sent: u32,
-    /// 1 once IOCTL_NOTIFY has been received and we're streaming;
+    /// 1 once a `SELECT` has been received and we're streaming;
     /// 0 in the idle gap between requests (or pre-first-request).
     streaming: u8,
-    /// 1 once IOCTL_SET_HUP has been issued for the current request;
+    /// 1 once `SET_HUP` has been issued for the current request;
     /// guards against multiple set-hup calls in the same request.
     hup_emitted: u8,
     _pad1: u16,
@@ -224,38 +231,19 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 unsafe fn step_inner(s: &mut SynthState) -> StepReturn {
     let sys = &*s.syscalls;
 
-    // Idle: poll for an IOCTL_NOTIFY from the consumer. The notify
-    // payload (file index) is irrelevant — synth_source only ever
-    // emits one logical "file", so any notify resets and starts a new
-    // emit cycle. This mirrors `fat32::check_seek_request` semantics.
+    // Idle until the consumer's `SELECT` (`module_provider_dispatch`)
+    // starts a request.
     if s.streaming == 0 {
-        let mut notify_pos: u32 = 0;
-        let pos_ptr = &mut notify_pos as *mut u32 as *mut u8;
-        let res = dev_channel_ioctl(sys, s.out_chan, IOCTL_POLL_NOTIFY, pos_ptr, 4);
-        if res == 0 {
-            // Consumer requested a fresh emit. Note: IOCTL_FLUSH from
-            // the consumer side has already cleared the channel ring
-            // and the previous HUP flag, so we can start writing
-            // immediately.
-            s.sent = 0;
-            s.hup_emitted = 0;
-            s.streaming = 1;
-        } else {
-            return StepReturn::Continue;
-        }
+        return StepReturn::Continue;
     }
 
-    // Already finished this request — wait for the next NOTIFY.
+    // Already finished this request — wait for the next `SELECT`.
     if s.sent >= s.size {
         if s.hup_emitted == 0 {
             // Last byte already flushed; signal end-of-stream so the
             // consumer's poll path sees POLL_HUP and transitions
             // out of read.
-            // SDK exports `IOCTL_EOF` for the kernel-side
-            // `IOCTL_SET_HUP` opcode (both opcode 4). Naming is just
-            // surface-level; the kernel's behaviour is the same:
-            // sticky HUP that consumer poll surfaces as `POLL_HUP`.
-            dev_channel_ioctl(sys, s.out_chan, IOCTL_EOF, core::ptr::null_mut(), 0);
+            dev_channel_set_hup(sys, s.out_chan);
             s.hup_emitted = 1;
             // Drop back into the idle branch on the next step.
             s.streaming = 0;
@@ -304,6 +292,46 @@ unsafe fn step_inner(s: &mut SynthState) -> StepReturn {
     // More to send and the channel had room — re-step in the same
     // tick to keep the pipe saturated.
     StepReturn::Burst
+}
+
+/// Serves `stream_select` to the consumer wired to `stream`: `SELECT`
+/// starts a fresh emit of `size` bytes, whatever the position (there is one
+/// synthetic item). The consumer has flushed its input, which also cleared
+/// the previous request's HUP, so the stream starts over at once.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised; `arg[..arg_len]` is valid for the
+/// call.
+#[no_mangle]
+#[link_section = ".text.module_provider_dispatch"]
+pub unsafe extern "C" fn module_provider_dispatch(
+    state: *mut u8,
+    _handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
+) -> i32 {
+    use abi::contracts::stream_select;
+    if state.is_null() || arg.is_null() {
+        return E_INVAL;
+    }
+    let s = &mut *(state as *mut SynthState);
+    let arg = core::slice::from_raw_parts(arg, arg_len);
+    match op {
+        stream_select::SELECT => {
+            if stream_select::select::parse(arg).is_none() {
+                return E_INVAL;
+            }
+            s.sent = 0;
+            s.hup_emitted = 0;
+            s.streaming = 1;
+            0
+        }
+        _ => E_NOSYS,
+    }
 }
 
 fluxor_rt::wasm_entry!();

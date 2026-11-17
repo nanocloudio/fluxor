@@ -754,7 +754,7 @@ pub mod el0 {
                 >(veneer(op::PROVIDER_OPEN)),
                 provider_call: core::mem::transmute::<
                     usize,
-                    unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32,
+                    unsafe extern "C" fn(i32, u32, *mut u8, usize, *mut u8, usize) -> i32,
                 >(veneer(op::PROVIDER_CALL)),
                 provider_query: core::mem::transmute::<
                     usize,
@@ -767,10 +767,6 @@ pub mod el0 {
                     usize,
                     unsafe extern "C" fn(i32, *mut u8, usize) -> i32,
                 >(veneer(op::CHANNEL_PEEK)),
-                provider_call_sel: core::mem::transmute::<
-                    usize,
-                    unsafe extern "C" fn(*const u8, usize, i32, u32, *mut u8, usize) -> i32,
-                >(veneer(op::PROVIDER_CALL_SEL)),
                 channel_discard: core::mem::transmute::<
                     usize,
                     unsafe extern "C" fn(i32, usize) -> i32,

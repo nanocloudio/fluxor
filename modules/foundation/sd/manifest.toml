@@ -5,21 +5,20 @@ hardware_targets = ["rp2350"]
 # `storage.block` source (CAPS and one-block SUBMIT/REAP reads) beside the
 # sector stream on `blocks`. Tools-only, never serialized to the .fmod.
 provides = ["storage.block"]
+provider_contracts = ["storage.block"]
+grants = ["lend.borrow"]
 
 [[ports]]
 name = "blocks"
 direction = "output"
 content_type = "OctetStream"
 required = true
+serves = "storage.block"
 
 # Module-scope observability (out[1], optional); wired to observe.telemetry.
 [[resources]]
 requires_contract = "spi"
 access = "exclusive"
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
 
 [[resources]]
 requires_contract = "timer"

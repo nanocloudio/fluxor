@@ -5,13 +5,21 @@
 //! platform's trap handler identifies the operation and calls [`dispatch`]
 //! with the caller's arguments. Nothing the module passes is trusted:
 //!
-//! - **Pointers** must lie wholly inside the caller's own memory — its private
+//! - **Spans** must lie wholly inside the caller's own memory — its private
 //!   regions (state, heap, stack) for anything the kernel writes, and those or
 //!   its code/rodata for anything the kernel only reads.
 //! - **Channel handles** must be one of the caller's own ports.
 //! - **Provider handles** must be ones the gateway minted for this caller.
-//! - **Opcodes** must have a gate rule in the registry (`rule_for`);
-//!   everything else is refused.
+//! - **Opcodes** must have a shape in the registry (`rule_for`); everything
+//!   else is refused.
+//!
+//! One generic rule serves every op: a call is a handle slot, a flat `arg`
+//! record and a bulk `data` span. The gateway copies `arg` into kernel memory
+//! (bounded by the op's registry maximum) before anything checks it, so what
+//! the provider reads is what was checked, and copies it back for an op that
+//! answers into it; it checks `data` in place by direction and never copies
+//! it. Nothing inside either is an address or a handle, so the gateway parses
+//! no contract's record.
 //!
 //! The mechanism that traps (SVC on Arm, a host import on wasm) is the
 //! platform's; the decision is made here, once, for every target.
@@ -37,10 +45,9 @@ pub mod op {
     pub const PROVIDER_QUERY: u32 = 8;
     pub const PROVIDER_CLOSE: u32 = 9;
     pub const CHANNEL_PEEK: u32 = 10;
-    pub const PROVIDER_CALL_SEL: u32 = 11;
-    pub const CHANNEL_DISCARD: u32 = 12;
+    pub const CHANNEL_DISCARD: u32 = 11;
     /// Number of operations; veneers exist for `0..COUNT`.
-    pub const COUNT: u32 = 13;
+    pub const COUNT: u32 = 12;
     /// The module's entry returned. Not a table slot: the return veneer sits
     /// after the operation veneers, and its outcome is the step's.
     pub const RETURN: u32 = COUNT;
@@ -222,276 +229,12 @@ mod handles {
 
 // ── Operation rules ──────────────────────────────────────────────────
 
-pub use crate::abi::registry::gate::{HandleUse, Walker};
+pub use crate::abi::registry::gate::{Bound, Dir, HandleUse, OpRule as Rule, ARG_MAX};
 
-/// How the kernel uses the argument buffer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Arg {
-    /// No buffer; the length must be 0.
-    None,
-    /// The kernel reads at most this many bytes.
-    In(usize),
-    /// The kernel writes at most this many bytes.
-    Out(usize),
-    /// The kernel reads and writes at most this many bytes.
-    InOut(usize),
-}
-
-/// One opcode a gated module may use: the registry's rule
-/// (`abi::registry::gate::op_rule`) with its bound resolved to bytes.
-#[derive(Clone, Copy, Debug)]
-pub struct Rule {
-    pub op: u32,
-    pub handle: HandleUse,
-    pub arg: Arg,
-    /// Pointers inside the argument struct, when it carries any. The struct
-    /// is copied into kernel memory, each pointer checked against the
-    /// caller's own, and the provider handed the copy.
-    pub walk: Option<Walker>,
-    /// The op releases the handle it names; the gateway forgets it.
-    pub closes: bool,
-}
-
-/// `usize::MAX` as a length bound: bounded by the caller's own region, which
-/// the pointer check enforces.
-const ANY: usize = usize::MAX;
-
-/// Longest argument struct the gateway copies to walk, sized to the largest
-/// request a gated caller makes: a `storage.object` `PUT` carrying a key and a
-/// content type of their longest, a 32-byte entity tag and a key reference of
-/// `KEY_REF_MAX`, rounded up to 16. A `LIST` with a prefix and a cursor of
-/// `STORAGE_KEY_MAX` bytes each fits too, so a caller can resume a listing at
-/// any key a provider holds.
-const WALK_MAX: usize = 656;
-const _: () = {
-    use crate::abi::contracts::storage::{
-        handle::STORAGE_KEY_MAX,
-        object::{list, KEPT_FIXED_LEN, KEY_REF_MAX},
-    };
-    let list_need = list::REQUEST_FIXED_LEN + 2 * STORAGE_KEY_MAX;
-    let put_need =
-        2 + STORAGE_KEY_MAX + 1 + 255 + 8 + 8 + 2 + 32 + KEPT_FIXED_LEN + KEY_REF_MAX + 10;
-    assert!(WALK_MAX >= list_need && WALK_MAX >= put_need && WALK_MAX - 16 < put_need);
-};
-
-/// A pointer an argument struct carries: where, how long, and whether the
-/// provider writes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Embedded {
-    pub ptr: usize,
-    pub len: usize,
-    pub write: bool,
-}
-
-/// Find the pointers `walker`'s struct carries in `arg`, or `None` if the
-/// struct is malformed (a length that runs past its end).
-pub fn walk(walker: Walker, arg: &[u8]) -> Option<([Embedded; 3], usize)> {
-    struct R<'a>(&'a [u8], usize);
-    impl R<'_> {
-        fn take(&mut self, n: usize) -> Option<&[u8]> {
-            let s = self.0.get(self.1..self.1.checked_add(n)?)?;
-            self.1 += n;
-            Some(s)
-        }
-        fn u8(&mut self) -> Option<usize> {
-            self.take(1).map(|b| b[0] as usize)
-        }
-        fn u16(&mut self) -> Option<usize> {
-            self.take(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
-        }
-        fn u32(&mut self) -> Option<usize> {
-            self.take(4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-        }
-        fn u64(&mut self) -> Option<usize> {
-            let b = self.take(8)?;
-            usize::try_from(u64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ]))
-            .ok()
-        }
-    }
-    let none = Embedded {
-        ptr: 0,
-        len: 0,
-        write: false,
-    };
-    let mut out = [none; 3];
-    let mut r = R(arg, 0);
-    let n = match walker {
-        Walker::StoragePut => {
-            let k = r.u16()?;
-            r.take(k)?;
-            let c = r.u8()?;
-            r.take(c)?;
-            out[0] = Embedded {
-                ptr: r.u64()?,
-                len: r.u64()?,
-                write: false,
-            };
-            r.u8()?; // precondition
-            let e = r.u8()?;
-            r.take(e)?;
-            let kr = r.u8()?;
-            r.take(kr)?;
-            r.u64()?; // retain_until_ms
-            r.u8()?; // legal_hold
-            out[1] = Embedded {
-                ptr: r.u64()?,
-                len: r.u16()?,
-                write: true,
-            };
-            2
-        }
-        Walker::StorageHead => {
-            let k = r.u16()?;
-            r.take(k)?;
-            out[0] = Embedded {
-                ptr: r.u64()?,
-                len: r.u32()?,
-                write: true,
-            };
-            out[1] = Embedded {
-                ptr: r.u64()?,
-                len: r.u16()?,
-                write: true,
-            };
-            2
-        }
-        Walker::StorageDelete => {
-            let k = r.u16()?;
-            r.take(k)?;
-            r.u8()?; // precondition
-            let e = r.u8()?;
-            r.take(e)?;
-            out[0] = Embedded {
-                ptr: r.u64()?,
-                len: r.u16()?,
-                write: true,
-            };
-            1
-        }
-        Walker::StorageRetain => {
-            let k = r.u16()?;
-            r.take(k)?;
-            r.u64()?; // retain_until_ms
-            r.u8()?; // hold
-            out[0] = Embedded {
-                ptr: r.u64()?,
-                len: r.u16()?,
-                write: true,
-            };
-            1
-        }
-        Walker::StorageRangeGet => {
-            r.u64()?; // offset
-            let len = r.u32()?;
-            out[0] = Embedded {
-                ptr: r.u64()?,
-                len,
-                write: true,
-            };
-            1
-        }
-        Walker::StorageList => {
-            let p = r.u16()?;
-            r.take(p)?;
-            let c = r.u16()?;
-            r.take(c)?;
-            r.u16()?; // max_keys
-            out[0] = Embedded {
-                ptr: r.u64()?,
-                len: r.u32()?,
-                write: true,
-            };
-            out[1] = Embedded {
-                ptr: r.u64()?,
-                len: r.u16()?,
-                write: true,
-            };
-            2
-        }
-        Walker::ChannelIoctl => {
-            use crate::abi::contracts::storage::block::{ioctl, Req};
-            let cmd = r.u32()? as u32;
-            let rest = arg.get(4..)?;
-            match cmd {
-                ioctl::SUBMIT | ioctl::EXEC => {
-                    let q = Req::decode(rest)?;
-                    if q.buf_len == 0 {
-                        0
-                    } else {
-                        out[0] = Embedded {
-                            ptr: usize::try_from(q.buf_ptr).ok()?,
-                            len: q.buf_len as usize,
-                            write: q.writes_buffer(),
-                        };
-                        1
-                    }
-                }
-                // The data comes back on the channel; the buffer fields are
-                // not followed.
-                ioctl::READ_STREAM => {
-                    Req::decode(rest)?;
-                    0
-                }
-                _ if channel_ioctl_admitted(cmd) => 0,
-                _ => return None,
-            }
-        }
-    };
-    Some((out, n))
-}
-
-/// Whether a gated module may issue channel ioctl `cmd`.
-///
-/// The kernel's built-in commands carry no pointers, and the `storage.block`
-/// requests carry one the gateway walks. Any other command is served by a
-/// module-registered handler whose argument layout the gateway cannot see
-/// into, so a pointer inside it would reach a privileged module unchecked.
-pub fn channel_ioctl_admitted(cmd: u32) -> bool {
-    use crate::abi::contracts::storage::block::ioctl;
-    use crate::kernel::ipc::channel as ch;
-    matches!(
-        cmd,
-        ch::IOCTL_NOTIFY
-            | ch::IOCTL_POLL_NOTIFY
-            | ch::IOCTL_FLUSH
-            | ch::IOCTL_SET_HUP
-            | ch::IOCTL_WRITABLE
-            | ioctl::CAPS
-            | ioctl::REAP
-            | ioctl::SUBMIT
-            | ioctl::EXEC
-            | ioctl::READ_STREAM
-    )
-}
-
-/// The rule for `op`, if gated modules may use it. Default deny: an opcode
-/// the registry does not serve to gated modules is refused with `EACCES`,
-/// whatever the caller's grants.
+/// The shape of `op`, if the registry declares one. Default deny: an opcode
+/// without a shape is refused with `EACCES`, whatever the caller's grants.
 pub fn rule_for(op: u32) -> Option<Rule> {
-    use crate::abi::registry::gate::{op_rule, ArgDir, Bound};
-    let r = op_rule(op)?;
-    let max = match r.bound {
-        Bound::Bytes(n) => n,
-        Bound::Any => ANY,
-        Bound::Walk => WALK_MAX,
-    };
-    let arg = match r.dir {
-        ArgDir::None => Arg::None,
-        ArgDir::In => Arg::In(max),
-        ArgDir::Out => Arg::Out(max),
-        ArgDir::InOut => Arg::InOut(max),
-    };
-    Some(Rule {
-        op,
-        handle: r.handle,
-        arg,
-        walk: r.walk,
-        closes: r.closes,
-    })
+    crate::abi::registry::gate::op_rule(op & !crate::abi::registry::CHAIN_NEXT)
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
@@ -517,19 +260,19 @@ impl Refusal {
     }
 }
 
-/// Whether `handle` is one of `module`'s channel ports.
-fn owns_channel(module: usize, handle: i32) -> bool {
-    if handle < 0 {
-        return false;
-    }
-    crate::kernel::exec::scheduler::module_owns_channel(module, handle)
+/// Whether `handle` names a channel. Which end of it the caller is, the
+/// channel itself checks on every op.
+fn is_channel(handle: i32) -> bool {
+    crate::abi::kernel_abi::handle::contract_of(handle) == Some(crate::abi::registry::channel::ID)
 }
 
-fn check_arg(g: &Gated, arg: Arg, ptr: usize, len: usize) -> Result<(), Refusal> {
-    let ok = match arg {
-        Arg::None => len == 0,
-        Arg::In(max) => len <= max && g.readable(ptr, len),
-        Arg::Out(max) | Arg::InOut(max) => len <= max && g.writable(ptr, len),
+/// Whether `[ptr, ptr + len)` may move `dir` for this caller, `len` within
+/// `max`: readable for what the kernel reads, private for what it writes.
+fn check_span(g: &Gated, dir: Dir, max: usize, ptr: usize, len: usize) -> Result<(), Refusal> {
+    let ok = match dir {
+        Dir::None => len == 0,
+        Dir::In => len <= max && g.readable(ptr, len),
+        Dir::Out | Dir::InOut => len <= max && g.writable(ptr, len),
     };
     if ok {
         Ok(())
@@ -538,21 +281,12 @@ fn check_arg(g: &Gated, arg: Arg, ptr: usize, len: usize) -> Result<(), Refusal>
     }
 }
 
-/// Every pointer a walked struct carries must be the caller's: readable for
-/// what the provider reads, private for what it writes.
-fn check_walk(g: &Gated, w: Walker, arg: &[u8]) -> Result<(), Refusal> {
-    let (ptrs, n) = walk(w, arg).ok_or(Refusal::Pointer)?;
-    for e in &ptrs[..n] {
-        let ok = if e.write {
-            g.writable(e.ptr, e.len)
-        } else {
-            g.readable(e.ptr, e.len)
-        };
-        if !ok {
-            return Err(Refusal::Pointer);
-        }
+fn data_max(b: Bound) -> usize {
+    match b {
+        Bound::Bytes(n) => n,
+        // The caller's own region bounds it: the region check refuses past it.
+        Bound::Any => usize::MAX,
     }
-    Ok(())
 }
 
 fn check_handle(module: usize, rule: &Rule, handle: i32) -> Result<(), Refusal> {
@@ -560,8 +294,8 @@ fn check_handle(module: usize, rule: &Rule, handle: i32) -> Result<(), Refusal> 
         HandleUse::Global | HandleUse::Mints => handle == -1,
         HandleUse::Scoped | HandleUse::ScopedMints => handle == -1 || handles::owns(module, handle),
         HandleUse::Value => true,
-        HandleUse::Channel => owns_channel(module, handle),
-        HandleUse::Minted => handles::owns(module, handle),
+        HandleUse::Channel => is_channel(handle),
+        HandleUse::Minted | HandleUse::MintedMints => handles::owns(module, handle),
     };
     if ok {
         Ok(())
@@ -570,36 +304,33 @@ fn check_handle(module: usize, rule: &Rule, handle: i32) -> Result<(), Refusal> 
     }
 }
 
+fn mints(rule: &Rule) -> bool {
+    matches!(
+        rule.handle,
+        HandleUse::Mints | HandleUse::ScopedMints | HandleUse::MintedMints
+    )
+}
+
 /// Authorise one call without performing it. Pure over the gateway's tables
 /// and its arguments, so the refusal matrix is host-testable.
-///
-/// `walked` is the kernel's copy of the argument struct for an op whose
-/// rule walks one — copied before it is checked, so the pointers the check
-/// sees are the pointers the provider is handed. `None` for every other op;
-/// a walked op with no copy is refused.
-pub fn authorise(
-    module: usize,
-    op: u32,
-    a: &[usize; 6],
-    walked: Option<&[u8]>,
-) -> Result<(), Refusal> {
+pub fn authorise(module: usize, op: u32, a: &[usize; 6]) -> Result<(), Refusal> {
     let g = gated(module).ok_or(Refusal::NotGated)?;
     let h = a[0] as i32;
     match op {
         op::CHANNEL_READ | op::CHANNEL_PEEK => {
-            if !owns_channel(module, h) {
+            if !is_channel(h) {
                 return Err(Refusal::Channel);
             }
-            check_arg(&g, Arg::Out(ANY), a[1], a[2])
+            check_span(&g, Dir::Out, usize::MAX, a[1], a[2])
         }
         op::CHANNEL_WRITE => {
-            if !owns_channel(module, h) {
+            if !is_channel(h) {
                 return Err(Refusal::Channel);
             }
-            check_arg(&g, Arg::In(ANY), a[1], a[2])
+            check_span(&g, Dir::In, usize::MAX, a[1], a[2])
         }
         op::CHANNEL_POLL | op::CHANNEL_DISCARD => {
-            if owns_channel(module, h) {
+            if is_channel(h) {
                 Ok(())
             } else {
                 Err(Refusal::Channel)
@@ -615,33 +346,26 @@ pub fn authorise(
             }
         }
         op::PROVIDER_OPEN => {
-            // provider_open(contract, open_op, config, len): only opens the
-            // rule table lists as minting.
+            // provider_open(contract, open_op, arg, len): only opens the
+            // registry lists as minting.
             let rule = rule_for(a[1] as u32).ok_or(Refusal::Opcode)?;
-            if !matches!(rule.handle, HandleUse::Mints | HandleUse::ScopedMints) {
+            if !mints(&rule) || rule.addr_answer {
                 return Err(Refusal::Opcode);
             }
-            check_arg(&g, Arg::In(ANY), a[2], a[3])
+            check_span(&g, Dir::In, rule.arg_max, a[2], a[3])
         }
         op::PROVIDER_CALL => {
             let rule = rule_for(a[1] as u32).ok_or(Refusal::Opcode)?;
             check_handle(module, &rule, h)?;
-            check_arg(&g, rule.arg, a[2], a[3])?;
-            if let Some(w) = rule.walk {
-                let arg = walked.ok_or(Refusal::Pointer)?;
-                if arg.len() != a[3] {
-                    return Err(Refusal::Pointer);
-                }
-                if w == Walker::ChannelIoctl {
-                    let cmd = arg
-                        .get(..4)
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .ok_or(Refusal::Pointer)?;
-                    if !channel_ioctl_admitted(cmd) {
-                        return Err(Refusal::Opcode);
-                    }
-                }
-                check_walk(&g, w, arg)?;
+            check_span(&g, rule.arg, rule.arg_max, a[2], a[3])?;
+            check_span(&g, rule.data, data_max(rule.data_max), a[4], a[5])?;
+            if crate::kernel::module::user_span::overlaps(
+                a[2] as *const u8,
+                a[3],
+                a[4] as *const u8,
+                a[5],
+            ) {
+                return Err(Refusal::Pointer);
             }
             Ok(())
         }
@@ -651,7 +375,7 @@ pub fn authorise(
             if h != -1 {
                 return Err(Refusal::Handle);
             }
-            check_arg(&g, Arg::Out(max), a[2], a[3])
+            check_span(&g, Dir::Out, max, a[2], a[3])
         }
         op::PROVIDER_CLOSE => {
             if handles::owns(module, h) {
@@ -660,9 +384,6 @@ pub fn authorise(
                 Err(Refusal::Handle)
             }
         }
-        // A selector names a provider by its own identity, which a gated
-        // module has no business addressing directly.
-        op::PROVIDER_CALL_SEL => Err(Refusal::Opcode),
         _ => Err(Refusal::UnknownOp),
     }
 }
@@ -675,35 +396,14 @@ pub fn authorise(
 /// Called from the platform's trap path, with the caller's memory mapped for
 /// the kernel and the caller not running.
 pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
-    // An argument struct the provider follows pointers in is copied into
-    // kernel memory first and checked there: the caller cannot change what
-    // was checked before the provider reads it. The copy itself is bounded
-    // by the rule's length and taken only from the caller's own memory.
-    let walks = op == op::PROVIDER_CALL && rule_for(a[1] as u32).is_some_and(|r| r.walk.is_some());
-    let mut copy = [0u8; WALK_MAX];
-    let walked: Option<&[u8]> = if walks {
-        let readable = a[3] <= WALK_MAX && gated(module).is_some_and(|g| g.readable(a[2], a[3]));
-        if !readable {
-            note_refusal(module, op, &a, Refusal::Pointer);
-            return Refusal::Pointer.errno() as isize;
-        }
-        // SAFETY: `[a[2], a[2] + a[3])` lies in the caller's own memory,
-        // checked above, and the caller is suspended.
-        copy[..a[3]]
-            .copy_from_slice(unsafe { core::slice::from_raw_parts(a[2] as *const u8, a[3]) });
-        Some(&copy[..a[3]])
-    } else {
-        None
-    };
-    if let Err(why) = authorise(module, op, &a, walked) {
+    if let Err(why) = authorise(module, op, &a) {
         note_refusal(module, op, &a, why);
         return why.errno() as isize;
     }
-    let is_walked = walked.is_some();
     let sys = crate::kernel::module::syscalls::get_syscall_table();
     let h = a[0] as i32;
-    // SAFETY: every pointer below was checked against the caller's own
-    // regions by `authorise`, and every handle against what it holds.
+    // SAFETY: every span below was checked against the caller's own regions
+    // by `authorise`, and every handle against what it holds.
     unsafe {
         match op {
             op::CHANNEL_READ => (sys.channel_read)(h, a[1] as *mut u8, a[2]) as isize,
@@ -724,34 +424,15 @@ pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
                 heap_result(module, p)
             }
             op::PROVIDER_OPEN => {
-                let rc = (sys.provider_open)(a[0] as u32, a[1] as u32, a[2] as *const u8, a[3]);
+                // The open's record goes in as the kernel's copy: the caller
+                // cannot change what was checked before the provider reads it.
+                let mut copy = [0u8; ARG_MAX];
+                let n = a[3];
+                copy[..n].copy_from_slice(core::slice::from_raw_parts(a[2] as *const u8, n));
+                let rc = (sys.provider_open)(a[0] as u32, a[1] as u32, copy.as_ptr(), n);
                 mint_result(module, rc)
             }
-            op::PROVIDER_CALL => {
-                let rule = rule_for(a[1] as u32);
-                // A walked struct is handed over as the kernel's checked copy.
-                let arg = if is_walked {
-                    copy.as_mut_ptr()
-                } else {
-                    a[2] as *mut u8
-                };
-                let rc = (sys.provider_call)(h, a[1] as u32, arg, a[3]);
-                // A walked struct the provider writes into goes back to the
-                // caller: `authorise` checked `[a[2], a[2] + a[3])` writable.
-                if is_walked && rule.is_some_and(|r| matches!(r.arg, Arg::InOut(_))) {
-                    core::ptr::copy_nonoverlapping(copy.as_ptr(), a[2] as *mut u8, a[3]);
-                }
-                match rule {
-                    Some(r) if matches!(r.handle, HandleUse::Mints | HandleUse::ScopedMints) => {
-                        mint_result(module, rc)
-                    }
-                    Some(r) if r.closes && rc >= 0 => {
-                        handles::forget(module, h);
-                        rc as isize
-                    }
-                    _ => rc as isize,
-                }
-            }
+            op::PROVIDER_CALL => call(module, sys, h, a),
             op::PROVIDER_QUERY => {
                 (sys.provider_query)(h, a[1] as u32, a[2] as *mut u8, a[3]) as isize
             }
@@ -762,6 +443,91 @@ pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
             }
             _ => errno::ENOSYS as isize,
         }
+    }
+}
+
+/// A gated `provider_call`, authorised: `arg` is copied in, the provider
+/// handed the copy, and the copy written back for an op that answers into
+/// it. `data` is the caller's own span, checked in place.
+///
+/// # Safety
+/// `authorise` passed for `a`, with the caller suspended.
+unsafe fn call(
+    module: usize,
+    sys: &crate::abi::kernel_abi::SyscallTable,
+    h: i32,
+    a: [usize; 6],
+) -> isize {
+    let Some(rule) = rule_for(a[1] as u32) else {
+        return errno::EACCES as isize;
+    };
+    let n = a[3];
+    let mut copy = [0u8; ARG_MAX];
+    if matches!(rule.arg, Dir::In | Dir::InOut) {
+        // SAFETY: `[a[2], a[2] + n)` is the caller's readable memory and
+        // `n <= rule.arg_max <= ARG_MAX` (`authorise`).
+        copy[..n].copy_from_slice(unsafe { core::slice::from_raw_parts(a[2] as *const u8, n) });
+    }
+    // SAFETY: the copy is kernel memory of `n` bytes; `data` was checked.
+    let rc = unsafe {
+        (sys.provider_call)(
+            h,
+            a[1] as u32,
+            if n == 0 {
+                core::ptr::null_mut()
+            } else {
+                copy.as_mut_ptr()
+            },
+            n,
+            a[4] as *mut u8,
+            a[5],
+        )
+    };
+    if rule.addr_answer && rc >= 0 && !answer_in_mapping(module, &copy[..n]) {
+        // The kernel granted something the caller's mapping cannot reach:
+        // the answer would name memory it does not hold.
+        return errno::EFAULT as isize;
+    }
+    if matches!(rule.arg, Dir::Out | Dir::InOut) {
+        // SAFETY: `authorise` checked `[a[2], a[2] + n)` writable.
+        unsafe { core::ptr::copy_nonoverlapping(copy.as_ptr(), a[2] as *mut u8, n) };
+    }
+    if mints(&rule) {
+        mint_result(module, rc)
+    } else if rule.closes && rc >= 0 {
+        handles::forget(module, h);
+        rc as isize
+    } else {
+        rc as isize
+    }
+}
+
+/// Whether an address answer (`[addr u64][len u32]` at the head of `arg`)
+/// lies in the caller's own mapping: memory it may read, or the region over
+/// its programs it is granted read-only. An empty answer names nothing.
+fn answer_in_mapping(module: usize, ans: &[u8]) -> bool {
+    let (Some(a), Some(l)) = (ans.get(0..8), ans.get(8..12)) else {
+        return false;
+    };
+    let addr = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+    let len = u32::from_le_bytes([l[0], l[1], l[2], l[3]]) as usize;
+    if len == 0 {
+        return true;
+    }
+    match (usize::try_from(addr), gated(module)) {
+        (Ok(addr), Some(g)) => {
+            g.readable(addr, len)
+                || crate::kernel::exec::scheduler::module_program_region(module).is_some_and(
+                    |(base, n)| {
+                        Region {
+                            base: base as usize,
+                            len: n,
+                        }
+                        .contains(addr, len)
+                    },
+                )
+        }
+        _ => false,
     }
 }
 
@@ -799,14 +565,16 @@ fn note_refusal(module: usize, op: u32, a: &[usize; 6], why: Refusal) {
     let n = LOGGED.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n.is_multiple_of(256) {
         log::warn!(
-            "[gate] module {} op {} refused: {:?} (a0={:#x} a1={:#x} a2={:#x} a3={:#x})",
+            "[gate] module {} op {} refused: {:?} (a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x})",
             module,
             op,
             why,
             a[0],
             a[1],
             a[2],
-            a[3]
+            a[3],
+            a[4],
+            a[5]
         );
     }
 }

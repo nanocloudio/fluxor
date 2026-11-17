@@ -136,21 +136,27 @@ impl ConnArena {
         }
         let bytes = (CONN_CHUNK * core::mem::size_of::<tcp::TcpConn>()) as u32;
         let b = bytes.to_le_bytes();
-        let mut arg = [b[0], b[1], b[2], b[3], 0, 0, 0, 0];
-        // SAFETY: kernel-owned syscall table; arg is an 8-byte local.
+        // In: [bytes u32]; out: [addr u64][len u32].
+        let mut arg = [b[0], b[1], b[2], b[3], 0, 0, 0, 0, 0, 0, 0, 0];
+        // SAFETY: kernel-owned syscall table; arg is a 12-byte local.
         let rc = unsafe {
             (sys.provider_call)(
                 -1,
                 abi::contracts::resource::ELASTIC_ALLOC,
                 arg.as_mut_ptr(),
                 arg.len(),
+                core::ptr::null_mut(),
+                0,
             )
         };
-        if rc < 0 || (rc as u32) < bytes {
+        let granted = u32::from_le_bytes([arg[8], arg[9], arg[10], arg[11]]);
+        if rc < 0 || granted < bytes {
             self.denials = self.denials.wrapping_add(1);
             return false;
         }
-        let chunk = u64::from_le_bytes(arg) as usize as *mut tcp::TcpConn;
+        let chunk = u64::from_le_bytes([
+            arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7],
+        ]) as usize as *mut tcp::TcpConn;
         if chunk.is_null() {
             self.denials = self.denials.wrapping_add(1);
             return false;

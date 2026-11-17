@@ -79,7 +79,7 @@ fn wasm_validate_fn_in_code(_addr: usize, _code_base: usize, _code_size: u32) ->
     true
 }
 /// WASM has no RAM OTA staging surface.
-fn wasm_ota_stage_protect(_base: *mut u8, _len: usize, _executable: bool) -> bool {
+fn wasm_ota_stage_protect(_region: &mut [u8], _executable: bool) -> bool {
     false
 }
 fn wasm_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
@@ -110,7 +110,18 @@ fn wasm_isr_tier_start(_us: u32) {}
 fn wasm_isr_tier_stop() {}
 fn wasm_isr_tier_poll() {}
 
+/// The handles this platform's provider tables can hand modules at once:
+/// fetched files, objects, namespace handles, decode jobs and vault keys.
+fn wasm_handle_slots() -> usize {
+    super::fs::MAX_OPEN_FILES
+        + super::object::MAX_OPEN_OBJECTS
+        + super::namespace::MAX_OPEN
+        + super::image_decode::JOBS
+        + crate::kernel::security::key_vault::MAX_SLOTS
+}
+
 fn wasm_init_providers() {
+    crate::kernel::module::provider::register_platform_handle_slots(wasm_handle_slots);
     // Browser-fetch FS provider — wasm analog of `fat32` (bare metal)
     // and `linux_fs_dispatch` (host). Backs FS_CONTRACT for any
     // module that opens assets through `provider_call(-1, FS_OPEN, …)`.
@@ -119,6 +130,9 @@ fn wasm_init_providers() {
     // over `Range:`-capable `fetch()` so modules demand-page immutable
     // assets via `requires_contract = "storage.object"`.
     super::object::register();
+    // Image decode: a byte range of an object in that same store, decoded
+    // by the browser to pixels at the caller's size (`image_decode`).
+    super::image_decode::register();
     // Namespace/index provider — directory enumeration (LIST / STAT /
     // LOOKUP) over the same key space the object provider writes (OPFS
     // `objStore`) plus a fetched manifest of shipped content. Lets
@@ -142,10 +156,15 @@ fn wasm_init_providers() {
     }
 }
 
-unsafe fn wasm_net_policy_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn wasm_net_policy_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: crate::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     use crate::abi::contracts::net::policy::caps;
     let c = caps::FILTER | caps::EGRESS;
-    crate::kernel::net_policy::dispatch(c, None, handle, opcode, arg, arg_len)
+    crate::kernel::net_policy::dispatch(c, None, handle, opcode, arg, data)
 }
 /// Platform-specific per-module cleanup for WASM host..
 ///
@@ -170,7 +189,7 @@ fn wasm_runtime_params(
 fn wasm_init_gpio(_gpio: &[Option<GpioConfig>]) -> usize {
     0
 }
-fn wasm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+fn wasm_csprng_fill(buf: &mut [u8]) -> i32 {
     // Delegate to the host. Browser shim wires this to
     // `crypto.getRandomValues` (a Web Crypto CSPRNG); wasmtime / edge
     // shims use the OS entropy source. The host import returns a
@@ -179,18 +198,22 @@ fn wasm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     // key generation, and any other consumer of `dev_csprng_fill`
     // would silently produce insecure output if seeded with
     // anything weaker than what the host calls a CSPRNG.
-    if buf.is_null() || len == 0 {
+    if buf.is_empty() {
         return 0;
     }
-    // SAFETY: `host_csprng_fill` is a wasm import; the host writes `len`
-    // bytes into `buf`. Caller is `hal::csprng_fill` which guarantees the
-    // pointer is valid for that length.
-    unsafe { host_csprng_fill(buf, len) }
+    // SAFETY: `host_csprng_fill` is a wasm import; the host writes
+    // `buf.len()` bytes into `buf`, a live exclusive slice.
+    unsafe { host_csprng_fill(buf.as_mut_ptr(), buf.len()) }
 }
 fn wasm_core_id() -> usize {
     0
 }
-fn wasm_irq_bind(_irq: u32, _event_handle: i32, _mmio_base: usize, _target_core: u8) -> i32 {
+fn wasm_irq_bind(
+    _irq: u32,
+    _event_handle: i32,
+    _ack: crate::kernel::sys::hal::IrqAck,
+    _target_core: u8,
+) -> i32 {
     -38 // ENOSYS — wasm has no hardware IRQs
 }
 /// Portable `sleep_until`. wasm is a cooperative single-threaded runtime

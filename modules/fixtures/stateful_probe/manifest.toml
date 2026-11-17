@@ -16,6 +16,7 @@ hardware_targets = ["bcm2712", "uefi", "linux"]
 name = "blocks"
 direction = "input"
 content_type = "OctetStream"
+contract = "storage.block"
 
 [observability]
 exempt = "self-contained fixture; its epoch/FAIL log lines are the verdict"

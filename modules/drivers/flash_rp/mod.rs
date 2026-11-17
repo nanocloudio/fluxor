@@ -9,8 +9,9 @@
 //!    `modules/foundation/button` emits for GPIO pins; downstream
 //!    `gesture` does click counting + FMP mapping.
 //!
-//! 2. **Blob serving** — Stores inline data blobs from config presets,
-//!    serves them on out[1] via IOCTL_NOTIFY protocol (replaces data_source).
+//! 2. **Blob serving** — Stores inline data blobs from config presets and
+//!    serves them on out[1]: the consumer selects a blob by index with the
+//!    `stream_select` edge contract's `SELECT`.
 //!
 //! 3. **Param store provider** — provides `runtime_params` (its manifest
 //!    says so): other modules persist their params through STORE / DELETE /
@@ -34,7 +35,8 @@
 //! **Outputs:**
 //!   - out[0]: `input::button` raw transitions (OctetStream, 1 byte
 //!     per debounced edge; 0x01=pressed, 0x00=released)
-//!   - out[1]: Blob stream (IOCTL_NOTIFY indexed, 512B chunks, IOCTL_EOF)
+//!   - out[1]: Blob stream (`stream_select` by blob index, 512B chunks,
+//!     `SET_HUP` at the blob's end)
 //!   - out[2]: `storage.block` over the data store
 
 #![no_std]
@@ -54,7 +56,7 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use abi::contracts::storage::block::{self as blk, Cpl, Description, Req};
 use abi::fence::Fence;
 
 // ============================================================================
@@ -176,8 +178,7 @@ struct FlashState {
     blob_offsets: [u16; MAX_BLOBS],
     blob_lengths: [u16; MAX_BLOBS],
     blob_storage: [u8; MAX_BLOB_STORAGE],
-    // --- Data store (out[2]) ---
-    store_chan: i32,
+    // --- Data store: `storage.block` on out[2] ---
     /// The data store's first byte (offset from XIP); 0 until known.
     data_offset: u32,
     /// A write is in progress.
@@ -188,6 +189,11 @@ struct FlashState {
     /// still to be erased.
     store_page: u8,
     _store_pad: u8,
+    /// The port reference the write's consumer reached this module through:
+    /// the session its lend is bound to.
+    store_session: i32,
+    /// The write's borrowed buffer while it is programmed.
+    store_src: usize,
     store_req: Req,
     store_cpl: Cpl,
 }
@@ -340,18 +346,10 @@ pub unsafe extern "C" fn module_new(
         s.stream_chan = dev_channel_port(&*(syscalls as *const SyscallTable), 1, 1); // out[1]
 
         // Data store (out[2]): known once the layout is read on first step.
-        s.store_chan = dev_channel_port(&*(syscalls as *const SyscallTable), 1, 2);
         s.data_offset = 0;
         s.store_busy = 0;
         s.store_done = 0;
-        if s.store_chan >= 0 {
-            dev_channel_register_ioctl(
-                &*(syscalls as *const SyscallTable),
-                s.store_chan,
-                state as *mut c_void,
-                Some(flash_store_ioctl),
-            );
-        }
+        s.store_src = 0;
         s.blob_count = 0;
         s.current_blob = 0;
         s.stream_phase = StreamPhase::Idle;
@@ -405,7 +403,14 @@ pub unsafe extern "C" fn module_new(
         {
             let sys = &*s.syscalls;
             let mut arg = [READ_CS];
-            let level = (sys.provider_call)(-1, FLASH_SIDEBAND, arg.as_mut_ptr(), 1);
+            let level = (sys.provider_call)(
+                -1,
+                FLASH_SIDEBAND,
+                arg.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
 
             if level >= 0 {
                 // Kernel returns 1=pressed, 0=not pressed
@@ -444,6 +449,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 abi::kernel_abi::FLASH_LAYOUT,
                 layout.as_mut_ptr(),
                 layout.len(),
+                core::ptr::null_mut(),
+                0,
             );
             let g =
                 abi::platform::rp::flash_layout::GraphFlash::decode(&layout).filter(|_| rc >= 0);
@@ -468,7 +475,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         // ---- Read BOOTSEL via flash sideband ----
 
         let mut arg = [READ_CS];
-        let level = (sys.provider_call)(-1, FLASH_SIDEBAND, arg.as_mut_ptr(), 1);
+        let level = (sys.provider_call)(
+            -1,
+            FLASH_SIDEBAND,
+            arg.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
 
         if level < 0 {
             s.error_count = s.error_count.wrapping_add(1);
@@ -542,18 +556,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         if s.stream_chan >= 0 {
             match s.stream_phase {
-                StreamPhase::Idle => {
-                    // Poll for seek request from downstream (bank)
-                    let mut seek_pos: u32 = 0;
-                    let seek_ptr = &mut seek_pos as *mut u32 as *mut u8;
-                    let res = dev_channel_ioctl(sys, s.stream_chan, IOCTL_POLL_NOTIFY, seek_ptr, 4);
-                    if res == 0 && (seek_pos as u8) < s.blob_count {
-                        s.current_blob = seek_pos as u8;
-                        s.blob_write_pos = 0;
-                        s.stream_phase = StreamPhase::Streaming;
-                        return StepReturn::Burst; // start writing immediately
-                    }
-                }
+                // Idle until the consumer's `SELECT` (`select_blob`)
+                // starts a blob.
+                StreamPhase::Idle => {}
                 StreamPhase::Streaming => {
                     // Check if output channel is ready for writing
                     let poll = (sys.channel_poll)(s.stream_chan, POLL_OUT);
@@ -568,7 +573,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
                     if pos >= blob_len {
                         // Done — send EOF and return to idle
-                        dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut(), 0);
+                        dev_channel_set_hup(sys, s.stream_chan);
                         s.stream_phase = StreamPhase::Idle;
                         return StepReturn::Continue;
                     }
@@ -588,7 +593,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
                     // Check if we finished
                     if s.blob_write_pos as usize >= blob_len {
-                        dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut(), 0);
+                        dev_channel_set_hup(sys, s.stream_chan);
                         s.stream_phase = StreamPhase::Idle;
                         return StepReturn::Continue;
                     }
@@ -606,10 +611,28 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 // Flash Store Provider Dispatch
 // ============================================================================
 
+/// `stream_select` `SELECT` on `stream` (out[1]): restart the blob stream at
+/// the blob the position indexes. `EINVAL` for a blob the presets do not
+/// hold. The consumer has flushed its input, so the blob starts at once.
+fn select_blob(s: &mut FlashState, arg: &[u8]) -> i32 {
+    let Some(pos) = abi::contracts::stream_select::select::parse(arg) else {
+        return E_INVAL;
+    };
+    if pos >= u64::from(s.blob_count) {
+        return E_INVAL;
+    }
+    s.current_blob = pos as u8;
+    s.blob_write_pos = 0;
+    s.stream_phase = StreamPhase::Streaming;
+    0
+}
+
 /// The `runtime_params` provider: a module's `STORE` / `DELETE` /
 /// `CLEAR_ALL` arrive here as ordinary provider calls, and the overrides are
 /// keyed by the calling module, which the kernel names (`QUERY_CALLER_MODULE`)
-/// so no caller can write another's.
+/// so no caller can write another's. `storage.block` ops come from the
+/// consumer of the data store on `store` ([`store_op`]), and
+/// `stream_select` from the consumer of the blob stream ([`select_blob`]).
 ///
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
@@ -622,10 +645,12 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 )]
 pub unsafe extern "C" fn flash_store_dispatch(
     state: *mut u8,
-    _handle: i32,
+    handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return -22; // EINVAL
@@ -633,6 +658,23 @@ pub unsafe extern "C" fn flash_store_dispatch(
     let s = &mut *(state as *mut FlashState);
     if s.syscalls.is_null() {
         return -22;
+    }
+    if opcode == abi::contracts::stream_select::SELECT {
+        if arg.is_null() {
+            return E_INVAL;
+        }
+        return select_blob(s, core::slice::from_raw_parts(arg, arg_len));
+    }
+    if (opcode >> 8) as u16 == abi::registry::storage_block::ID {
+        if arg.is_null() {
+            return E_INVAL;
+        }
+        return store_op(
+            s,
+            handle,
+            opcode,
+            core::slice::from_raw_parts_mut(arg, arg_len),
+        );
     }
     let sys = &*s.syscalls;
     if s.store_offset == 0 {
@@ -1121,7 +1163,14 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
 /// Call kernel to erase runtime store sector.
 unsafe fn raw_flash_erase(sys: &SyscallTable, offset: u32) -> i32 {
     let mut buf = offset.to_le_bytes();
-    (sys.provider_call)(-1, FLASH_RAW_ERASE, buf.as_mut_ptr(), 4)
+    (sys.provider_call)(
+        -1,
+        FLASH_RAW_ERASE,
+        buf.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Call kernel to program a 256-byte page.
@@ -1140,22 +1189,22 @@ unsafe fn raw_flash_program(sys: &SyscallTable, offset: u32, page: *const u8) ->
         *bp.add(4 + i) = *page.add(i);
         i += 1;
     }
-    (sys.provider_call)(-1, FLASH_RAW_PROGRAM, bp, 260)
+    (sys.provider_call)(-1, FLASH_RAW_PROGRAM, bp, 260, core::ptr::null_mut(), 0)
 }
 
 // ============================================================================
 // Data store — storage.block over the flash's data region (out[2])
 // ============================================================================
 
-fn store_caps() -> Caps {
+fn store_caps() -> Description {
     let sector = abi::platform::rp::flash_layout::FLASH_SECTOR;
-    Caps {
+    Description {
         logical_block_size: sector,
         block_count: u64::from(abi::platform::rp::flash_layout::DATA_STORE_SIZE / sector),
         max_blocks: 1,
         atomic_blocks: 1,
         queue_depth: 1,
-        flags: blk::caps::F_WRITE | blk::caps::F_FUA | blk::caps::F_ASYNC,
+        flags: blk::describe::F_WRITE | blk::describe::F_FUA | blk::describe::F_ASYNC,
         device_id: DATA_STORE_ID,
     }
 }
@@ -1174,7 +1223,13 @@ fn store_completion(r: &Req, status: i32) -> Cpl {
     c
 }
 
+/// Decide the request in progress; a write's borrow is given back before its
+/// completion becomes reapable.
 unsafe fn store_finish(s: &mut FlashState, status: i32) {
+    if s.store_src != 0 {
+        blk_give_back(&*s.syscalls, s.store_session, &s.store_req);
+        s.store_src = 0;
+    }
     s.store_cpl = store_completion(&s.store_req, status);
     s.store_busy = 0;
     s.store_done = 1;
@@ -1198,7 +1253,7 @@ unsafe fn store_pump(s: &mut FlashState) {
         return;
     }
     let pages = (sector as usize / PAGE_SIZE) as u8;
-    let src = s.store_req.buf_ptr as usize as *const u8;
+    let src = s.store_src as *const u8;
     let mut n = 0u8;
     while n < PAGES_PER_STEP && s.store_page < pages {
         let off = s.store_page as usize * PAGE_SIZE;
@@ -1215,44 +1270,53 @@ unsafe fn store_pump(s: &mut FlashState) {
     }
 }
 
-unsafe extern "C" fn flash_store_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
-    if state.is_null() || arg.is_null() {
-        return E_INVAL;
-    }
-    let s = &mut *(state as *mut FlashState);
+/// `storage.block` on `store` (out[2]); `handle` is this module's port
+/// reference on that edge.
+unsafe fn store_op(s: &mut FlashState, handle: i32, op: u32, arg: &mut [u8]) -> i32 {
+    use abi::registry::storage_block as SB;
     if s.data_offset == 0 {
         // The partition is read on the first step.
         return E_AGAIN;
     }
     let caps = store_caps();
-    match cmd {
-        blk::ioctl::CAPS => {
-            caps.encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
-            blk::caps::LEN as i32
+    match op {
+        SB::DESCRIBE => {
+            if caps.encode(arg) {
+                0
+            } else {
+                E_INVAL
+            }
         }
-        blk::ioctl::SUBMIT => {
-            let Some(r) = Req::decode(core::slice::from_raw_parts(arg, blk::req::LEN)) else {
+        SB::SUBMIT => {
+            let Some(r) = Req::decode(arg) else {
                 return E_INVAL;
             };
-            if !caps.admits(&r) || r.flags & !blk::F_ALL != 0 {
+            if !caps.admits(&r) {
                 return E_INVAL;
             }
             if s.store_busy != 0 || s.store_done != 0 {
                 return E_AGAIN;
             }
+            let buf = if r.has_buffer() {
+                match blk_borrow(&*s.syscalls, handle, &r) {
+                    Ok(p) => p,
+                    Err(rc) => return rc,
+                }
+            } else {
+                core::ptr::null_mut()
+            };
             s.store_req = r;
+            s.store_session = handle;
             match r.op {
                 blk::op::READ => {
                     let from = (XIP_BASE + s.data_offset) as usize
                         + r.lba as usize * caps.logical_block_size as usize;
-                    core::ptr::copy_nonoverlapping(
-                        from as *const u8,
-                        r.buf_ptr as usize as *mut u8,
-                        r.buf_len as usize,
-                    );
+                    core::ptr::copy_nonoverlapping(from as *const u8, buf, r.buf_len as usize);
+                    blk_give_back(&*s.syscalls, handle, &r);
                     store_finish(s, 0);
                 }
                 blk::op::WRITE => {
+                    s.store_src = buf as usize;
                     s.store_busy = 1;
                     s.store_page = ERASE_FIRST;
                 }
@@ -1261,14 +1325,16 @@ unsafe extern "C" fn flash_store_ioctl(state: *mut c_void, cmd: u32, arg: *mut u
             }
             0
         }
-        blk::ioctl::REAP => {
+        SB::REAP => {
             if s.store_done == 0 {
                 return 0;
             }
             s.store_done = 0;
-            s.store_cpl
-                .encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
-            1
+            if s.store_cpl.encode(arg) {
+                1
+            } else {
+                E_INVAL
+            }
         }
         _ => E_NOSYS,
     }

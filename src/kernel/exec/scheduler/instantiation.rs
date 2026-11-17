@@ -280,11 +280,6 @@ pub(crate) fn finalize_module(
         &mut *p
     };
 
-    let flag = if error_code.is_some() {
-        POLL_ERR as u8
-    } else {
-        POLL_HUP as u8
-    }; // u8: sticky_events is AtomicU8
     if let Some(rc) = error_code {
         log::warn!("[sched] module {module_idx} ({type_name}) error rc={rc}{context}");
     } else {
@@ -295,7 +290,7 @@ pub(crate) fn finalize_module(
     let mut p = 0;
     while p < ports.out_count as usize {
         if ports.out_chans[p] >= 0 {
-            channel_set_flags(ports.out_chans[p], flag);
+            channel_producer_gone(ports.out_chans[p], error_code.is_some());
         }
         p += 1;
     }

@@ -123,6 +123,9 @@ mod fs;
 #[path = "wasm/object.rs"]
 mod object;
 
+#[path = "wasm/image_decode.rs"]
+mod image_decode;
+
 #[path = "wasm/namespace.rs"]
 mod namespace;
 
@@ -324,18 +327,18 @@ static mut MODULE_COUNT: usize = 0;
 /// modules are present — mainly for the bare `firmware.wasm` smoke
 /// artifact. Real configs ship through `load_embedded_modules`.
 fn init_tick_demo() {
-    let chan = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+    let chan = channel::channel_open(&[]);
     if chan < 0 {
         log_str(4, b"[wasm-kernel] channel_open failed");
         return;
     }
 
     let mut source = scheduler::BuiltInModule::new("wasm_tick_source", tick_source_step);
-    source.state[0..4].copy_from_slice(&(chan as i32).to_le_bytes());
+    source.state[0..4].copy_from_slice(&chan.to_le_bytes());
     scheduler::store_builtin_module(0, source);
 
     let mut sink = scheduler::BuiltInModule::new("wasm_tick_sink", tick_sink_step);
-    sink.state[0..4].copy_from_slice(&(chan as i32).to_le_bytes());
+    sink.state[0..4].copy_from_slice(&chan.to_le_bytes());
     scheduler::store_builtin_module(1, sink);
 
     // SAFETY: MODULE_COUNT mutated once at boot under single-threaded
@@ -1538,7 +1541,11 @@ unsafe fn load_embedded_modules() -> usize {
 /// `module_step_wasm` is a no-arg wasm32-only entry point that
 /// dispatches into the module's existing `module_step(state_ptr)`
 /// using its internal static state buffer.
-fn wasm_module_step(state: *mut u8) -> i32 {
+///
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn wasm_module_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer; the first
     // 4 bytes hold the host module handle written in load_embedded_modules.
     // `host_invoke_module` is a wasm import; we pass it the handle plus a
@@ -1849,7 +1856,10 @@ pub extern "C" fn kernel_config_blob_capacity() -> u32 {
 
 const REPORT_INTERVAL: u32 = 60;
 
-fn tick_source_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn tick_source_step(state: *mut u8) -> i32 {
     // SAFETY: state is the BuiltInModule's 64-byte state buffer; we read
     // the channel handle from [0..4] and the tick counter from [4..8].
     unsafe {
@@ -1867,7 +1877,10 @@ fn tick_source_step(state: *mut u8) -> i32 {
     0
 }
 
-fn tick_sink_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn tick_sink_step(state: *mut u8) -> i32 {
     // SAFETY: state is the BuiltInModule's 64-byte state buffer; we read
     // the channel handle from [0..4], counter from [4..8], timestamp from [8..16].
     unsafe {
@@ -2164,9 +2177,16 @@ pub unsafe extern "C" fn provider_open(
     reason = "low-level platform shim; safety contract documented at call site"
 )]
 #[no_mangle]
-pub unsafe extern "C" fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub unsafe extern "C" fn provider_call(
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
     let table = crate::kernel::module::syscalls::get_syscall_table();
-    (table.provider_call)(handle, op, arg, arg_len)
+    (table.provider_call)(handle, op, arg, arg_len, data, data_len)
 }
 
 #[allow(

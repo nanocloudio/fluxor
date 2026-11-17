@@ -15,15 +15,15 @@
 //   kind payload
 //
 //   Request direction (requester -> provider):
-//     HEAD     [method u8][target_len u16][hdr_len u16][peer_len u16]
-//              [resp_credit u32] target | headers | peer | body
+//     HEAD     [op u8][verb u8][target_len u16][meta_len u16][peer_len u16]
+//              [resp_credit u32] target | meta | peer | body
 //     BODY     body bytes
 //     ABORT    [reason u8]
 //     CREDIT   [bytes u32]          response-body credit
 //     DATAGRAM [context u64] payload
 //
 //   Response direction (provider -> requester):
-//     HEAD     [status u16][ct_len u8][hdr_len u16] content_type | headers | body
+//     HEAD     [outcome u8][detail u16][meta_len u16] meta | body
 //     BODY     body bytes
 //     ABORT    [reason u8]
 //     CREDIT   [bytes u32]          request-body credit
@@ -35,6 +35,23 @@
 // counter — and the provider echoes it verbatim on every record it writes for
 // that exchange. It is opaque to the provider, so any number of exchanges from
 // any number of sources share one channel pair.
+//
+// A request names what it is with `op`: a CALL asks for an answer, a PUBLISH
+// hands a record to a durable destination (`target` is its ordering key, the
+// body the record), an OPEN asks for a session whose BODY records then carry
+// the session's own stream. `verb` belongs to a BINDING — a protocol whose
+// vocabulary a provider speaks on top of these records, such as HTTP
+// (`exchange_http.rs`) — and is 0 outside one. The rules hold for every
+// binding and are enforced where a HEAD is decoded or encoded: a PUBLISH
+// carries verb 0; an OPEN carries one of its binding's opening verbs and a
+// CALL never does; a verb its binding does not name is refused.
+//
+// `meta` is a run of fields `[key_len u8][key][val_len u16][val]`: a key of 1
+// to 255 bytes with no ASCII upper-case letter, a value of up to 65535 bytes.
+// A field means whatever its key names; the content type of a body, either
+// direction, is the field `content-type` and travels nowhere else. A binding
+// maps its own metadata onto fields (HTTP's header lines), and may reserve
+// keys starting `:` for facts of its own that never leave as metadata.
 //
 // A HEAD carries the first body bytes inline, as many as fit the record; MORE
 // says further BODY records follow in that direction, and a HEAD or BODY
@@ -49,15 +66,20 @@
 // only up to `resp_credit` plus the requester's CREDIT grants. A side that
 // holds a body back stops granting, and the other stops sending that
 // exchange's body and nothing else's. The first request-body credit is also
-// the provider's consent to the body: an HTTP client that asked for
-// `100 Continue` is answered then.
+// the provider's consent to the body.
 //
-// `status` is an HTTP status code for every provider, HTTP or not: 200 is an
-// answer (for a sink, durable acceptance, with an empty body), and a provider
-// that relays a peer's answer reports the peer's own status. The refusals a
-// provider raises itself are named in `status` below, and the HEAD that
-// carries one is marked RAISED: the same number from a peer and from the
-// provider are different facts, and only the flag tells them apart.
+// A response says how the exchange went with `outcome`, one of the classes in
+// `outcome`, which every requester can act on without knowing the provider.
+// `detail` is the binding's own account (an HTTP status), or 0. When detail is
+// not 0 it determines the outcome: the outcome is the binding's class for that
+// detail, an encoder that knows the binding computes it, and a decoder that
+// knows the binding refuses a HEAD where the two disagree. A party that knows
+// no binding carries `detail` without reading it.
+//
+// A HEAD whose answer the provider raised itself — it could not reach a peer,
+// the peer did not answer in time, it refused the request before asking — is
+// marked RAISED; without it, the answer is the peer's own. A relay forwards
+// outcome, detail and RAISED verbatim.
 //
 // LINK carries the provider's connection to whatever backs it, not an
 // exchange. LINK_DOWN says every exchange the requester has open without a
@@ -69,6 +91,10 @@
 // a dependency, and a layout mounted from one place cannot drift between the
 // parties that speak it.
 
+use core::marker::PhantomData;
+
+use crate::errno::EINVAL;
+
 // ── Capabilities ──────────────────────────────────────────────────────────
 //
 // What a provider promises beyond answering. A provider that only answers — an
@@ -79,21 +105,29 @@
 /// satisfied by either role below, under the registry's parent-matches-child
 /// rule.
 pub const CAP_ORDERED_ACK: &str = "stream.ordered_ack";
-/// A provider that durably ACCEPTS records and answers with a status alone: an
-/// MQTT topic, a Kafka partition, an INSERT.
+/// A provider that durably ACCEPTS records and answers with an outcome alone:
+/// an MQTT topic, a Kafka partition, an INSERT.
 pub const CAP_ORDERED_ACK_SINK: &str = "stream.ordered_ack.sink";
 /// A provider that durably accepts and also ANSWERS WITH DATA: an HTTP call, a
 /// SELECT. It does everything a sink does and more, which is why it is a
 /// sibling of `.sink` under a shared parent.
 pub const CAP_ORDERED_ACK_EXCHANGE: &str = "stream.ordered_ack.exchange";
 
-// Terms a provider of either role satisfies: an answer with status 200 means
+// Terms a provider of either role satisfies: an answer with outcome OK means
 // durable acceptance at the strongest level its configuration offers; order is
 // kept per `target` within a connection; nothing is dropped silently — every
 // exchange is answered or invalidated by LINK_DOWN; backpressure is by channel
 // and credit, never by dropping; a BROADCAST request reaches every ordering
 // unit and is answered once, after the slowest. A provider that offers less
 // says so in its `[capability_facts]`.
+
+/// The port-scoped capability of an `ExchangeRequest` port. Its one fact,
+/// `binding`, lists the bindings whose verbs the port carries: a requester's
+/// `request_out` declares the bindings it sends verbs of, a provider's
+/// `request_in` the bindings it speaks. The build refuses an edge whose
+/// producer declares a binding its consumer does not; a port that declares
+/// none carries verb 0 only.
+pub const CAP_EXCHANGE_REQUEST: &str = "exchange.request";
 
 // ── Sizes ─────────────────────────────────────────────────────────────────
 
@@ -104,11 +138,18 @@ pub const RECORD_MAX: usize = 8192;
 /// Largest body one BODY record carries.
 pub const BODY_MAX: usize = RECORD_MAX - HDR;
 /// Fixed part of a request HEAD after the prefix.
-pub const REQ_HEAD_FIXED: usize = 1 + 2 + 2 + 2 + 4;
+pub const REQ_HEAD_FIXED: usize = 1 + 1 + 2 + 2 + 2 + 4;
+/// Where a request HEAD's `peer_len` sits in its record, for a relay that
+/// rewrites `peer` in place.
+pub const REQ_PEER_LEN_AT: usize = HDR + 1 + 1 + 2 + 2;
 /// Fixed part of a response HEAD after the prefix.
-pub const RESP_HEAD_FIXED: usize = 2 + 1 + 2;
+pub const RESP_HEAD_FIXED: usize = 1 + 2 + 2;
 /// Length of the exchange id.
 pub const ID_LEN: usize = 14;
+/// Fixed part of one meta field: the key's and the value's lengths.
+pub const META_FIELD_FIXED: usize = 1 + 2;
+/// Longest meta key.
+pub const META_KEY_MAX: usize = u8::MAX as usize;
 
 /// The largest body a collected exchange carries — the figure a module that
 /// takes requests whole sizes its buffer from, and the one a requester holds
@@ -119,6 +160,9 @@ pub const PAYLOAD_MAX: usize = 8192;
 /// The largest `target` a publish carries: a table or topic identifier plus a
 /// natural key, with room for requesters whose ordering unit is wider.
 pub const KEY_MAX: usize = 512;
+
+/// The meta key a body's content type travels under, in either direction.
+pub const META_CONTENT_TYPE: &[u8] = b"content-type";
 
 // ── Vocabulary ────────────────────────────────────────────────────────────
 
@@ -134,46 +178,89 @@ pub mod kind {
     pub const LINK: u8 = 0x06;
 }
 
+/// What a request asks for.
+pub mod op {
+    /// Answer it.
+    pub const CALL: u8 = 1;
+    /// Accept a record for a durable destination: `target` is its ordering
+    /// key, the body is the record. Carries verb 0.
+    pub const PUBLISH: u8 = 2;
+    /// Open a session: an answer with outcome OK accepts it, and BODY records
+    /// in both directions then carry the session's stream. Carries one of its
+    /// binding's opening verbs.
+    pub const OPEN: u8 = 3;
+}
+
 /// Record flags.
 pub mod flag {
-    /// More BODY records follow in this direction.
+    /// HEAD or BODY: more BODY records follow in this direction.
     pub const MORE: u8 = 0x01;
-    /// Request: the requester asks for a held exchange (a watch, an event
-    /// stream) that its provider keeps open until the origin ends it; a
+    /// Request HEAD: the requester asks for a held exchange (a watch, an
+    /// event stream) that its provider keeps open until the origin ends it; a
     /// provider that grants it answers HOLD|MORE on the response HEAD and,
     /// once that head has come, applies no whole-exchange or stall deadline
-    /// to it (liveness is the transport's own, e.g. an h2 PING). Response:
-    /// the provider holds the exchange open on purpose and ends it itself;
-    /// its progress deadline is the long one.
+    /// to it (liveness is the transport's own, e.g. an h2 PING). Response
+    /// HEAD: the provider holds the exchange open on purpose and ends it
+    /// itself; its progress deadline is the long one.
     pub const HOLD: u8 = 0x02;
-    /// Request: an extended CONNECT for a WebSocket on a route that delegates
-    /// the upgrade. Response: the upgrade is accepted, and the exchange
-    /// becomes a WebSocket tunnel the server terminates.
-    pub const WEBSOCKET: u8 = 0x04;
-    /// Request: an extended CONNECT for a WebTransport session. Response: the
-    /// session is accepted; BODY records then carry the session stream.
-    pub const WEBTRANSPORT: u8 = 0x08;
-    /// Request: the route is a file route this server delegates.
-    pub const ROUTE_FILE: u8 = 0x10;
-    /// Request: the route is a proxy route this server delegates.
-    pub const ROUTE_PROXY: u8 = 0x20;
-    /// Request: deliver to every ordering unit, not the one `target` names.
-    pub const BROADCAST: u8 = 0x40;
-    /// Response HEAD: the provider raised this status itself, and no peer
+    /// Request HEAD: deliver to every ordering unit, not the one `target`
+    /// names.
+    pub const BROADCAST: u8 = 0x04;
+    /// Response HEAD: the provider raised this answer itself, and no peer
     /// answered — it could not reach one, the peer did not answer in time,
     /// or the provider refused the request before asking. Without it, the
-    /// status is the peer's own answer. A requester that must tell "the
-    /// origin said 502" from "there was no origin to say anything" reads
-    /// this bit; one that relays the status onward needs nothing else.
+    /// answer is the peer's own. A requester that must tell "the origin said
+    /// it was unavailable" from "there was no origin to say anything" reads
+    /// this bit; one that relays the answer onward needs nothing else.
     ///
-    /// Set on a response HEAD. A body, if any — inline or in the BODY records
-    /// that follow under MORE — is the provider's own account of what
-    /// happened, never a peer's; a requester that wants no such account
-    /// ABORTs the exchange rather than leave it waiting for credit. A relay that forwards
-    /// response records unchanged forwards it unchanged; one that answers
-    /// from a peer that set it keeps it, since its own requester was not
-    /// answered by a peer either.
-    pub const RAISED: u8 = 0x80;
+    /// A body, if any — inline or in the BODY records that follow under
+    /// MORE — is the provider's own account of what happened, never a
+    /// peer's; a requester that wants no such account ABORTs the exchange
+    /// rather than leave it waiting for credit. A relay forwards it verbatim;
+    /// one that answers from a peer that set it keeps it, since its own
+    /// requester was not answered by a peer either.
+    pub const RAISED: u8 = 0x08;
+
+    /// The flags a request HEAD may carry.
+    pub const REQUEST_HEAD: u8 = MORE | HOLD | BROADCAST;
+    /// The flags a response HEAD may carry.
+    pub const RESPONSE_HEAD: u8 = MORE | HOLD | RAISED;
+}
+
+/// How an exchange went: the class of its answer, the same for every binding.
+/// A requester branches on these alone.
+pub mod outcome {
+    /// Answered; for a sink, durably accepted.
+    pub const OK: u8 = 1;
+    /// Not a request this provider performs: malformed, an unknown verb, a
+    /// target it cannot route, a header it would have to drop.
+    pub const REFUSED: u8 = 2;
+    /// What the request names does not exist.
+    pub const NOT_FOUND: u8 = 3;
+    /// The requester is not allowed to do this.
+    pub const DENIED: u8 = 4;
+    /// The request contradicts the state it names: a precondition that did
+    /// not hold, a version that moved.
+    pub const CONFLICT: u8 = 5;
+    /// The request or its body passed what the provider takes.
+    pub const TOO_LARGE: u8 = 6;
+    /// The provider holds as many exchanges as it can, or was asked to slow
+    /// down; the request may be repeated.
+    pub const BUSY: u8 = 7;
+    /// The peer behind the provider could not be reached, or answered with
+    /// something the provider could not carry back.
+    pub const UNAVAILABLE: u8 = 8;
+    /// The peer behind the provider did not answer in time.
+    pub const TIMEOUT: u8 = 9;
+    /// The provider failed answering it.
+    pub const FAILED: u8 = 10;
+    /// An answer of no class above; `detail` says what it is.
+    pub const OTHER: u8 = 11;
+
+    /// Whether `o` is one of the classes above.
+    pub const fn valid(o: u8) -> bool {
+        o >= OK && o <= OTHER
+    }
 }
 
 /// Why an exchange was aborted.
@@ -204,104 +291,238 @@ pub mod link {
     pub const UP: u8 = 2;
 }
 
-/// The statuses a provider raises itself, each on a HEAD marked
-/// [`flag::RAISED`]. Everything else a status carries is an answer, including
-/// a relayed peer's own, and is not marked.
-pub mod status {
-    /// Answered; for a sink, durably accepted.
-    pub const OK: u16 = 200;
-    /// The request was not a well-formed request for this provider: an
-    /// unknown method, a target it cannot route.
-    pub const BAD_REQUEST: u16 = 400;
-    /// The request or its body passed what this provider takes.
-    pub const TOO_LARGE: u16 = 413;
-    /// The provider failed answering it.
-    pub const FAILED: u16 = 500;
-    /// The peer behind the provider could not be reached, or answered with
-    /// something the provider could not carry back.
-    pub const BAD_GATEWAY: u16 = 502;
-    /// The provider holds as many exchanges as it can; the request may be
-    /// repeated.
-    pub const BUSY: u16 = 503;
-    /// The peer behind the provider did not answer in time.
-    pub const TIMEOUT: u16 = 504;
+// ── Bindings ──────────────────────────────────────────────────────────────
+
+/// What a party knows of the binding its records speak, and so what it
+/// checks beyond the rules every binding shares. Decoders and encoders take
+/// one as a type parameter.
+pub trait Binding {
+    /// Whether a request may carry `verb` under `op`. Asked only after the
+    /// shared rules held: `op` is one of [`op`], a PUBLISH carries 0, an OPEN
+    /// carries something else.
+    fn admits(op: u8, verb: u8) -> bool;
+    /// Whether a response may carry the non-zero `detail` under `outcome`.
+    fn admits_detail(outcome: u8, detail: u16) -> bool;
 }
 
-// The method vocabulary. A request names its method as one byte, and every
-// reader of that byte needs the same table. Deliberately NOT a Rust enum: the
-// value crosses a channel as a byte, and a `#[repr(u8)]` enum would make every
-// decode a fallible transmute at the receiver for no gain over a `u8` plus
-// these constants.
+/// A party that speaks no binding: its requests carry verb 0, so it opens no
+/// session, and a detail on an answer is carried without being read.
+pub struct Plain;
 
-/// No method parsed, or an unrecognised token.
-pub const METHOD_NONE: u8 = 0;
-pub const METHOD_GET: u8 = 1;
-/// CONNECT, which h2 and h3 also use as the extended CONNECT that opens a
-/// WebSocket or WebTransport session.
-pub const METHOD_CONNECT: u8 = 2;
-pub const METHOD_POST: u8 = 3;
-pub const METHOD_HEAD: u8 = 4;
-pub const METHOD_PUT: u8 = 5;
-pub const METHOD_PATCH: u8 = 6;
-pub const METHOD_DELETE: u8 = 7;
-pub const METHOD_OPTIONS: u8 = 8;
-/// A record for a durable destination: `target` is its ordering key, the body
-/// is the record. Not an HTTP method; an HTTP provider refuses it.
-pub const METHOD_PUBLISH: u8 = 9;
-
-/// The method constant for an HTTP request-line token, or [`METHOD_NONE`] for
-/// any token this table does not name. Case-sensitive: RFC 9110 §9.1 makes the
-/// method token case-sensitive, so `get` is not a method.
-pub fn method_from_token(tok: &[u8]) -> u8 {
-    match tok {
-        b"GET" => METHOD_GET,
-        b"HEAD" => METHOD_HEAD,
-        b"POST" => METHOD_POST,
-        b"PUT" => METHOD_PUT,
-        b"PATCH" => METHOD_PATCH,
-        b"DELETE" => METHOD_DELETE,
-        b"OPTIONS" => METHOD_OPTIONS,
-        b"CONNECT" => METHOD_CONNECT,
-        _ => METHOD_NONE,
+impl Binding for Plain {
+    fn admits(_op: u8, verb: u8) -> bool {
+        verb == 0
+    }
+    fn admits_detail(_outcome: u8, _detail: u16) -> bool {
+        true
     }
 }
 
-/// Every token end to end, so [`method_name`] can answer with a span of this
-/// rather than a table of separate literals.
-const TOKENS: &[u8] = b"GETCONNECTPOSTHEADPUTPATCHDELETEOPTIONSPUBLISH";
+/// A party that carries records between two others without speaking their
+/// binding — a relay. It checks the shared rules and passes every verb and
+/// detail through for the ends to judge.
+pub struct Relayed;
 
-/// `(offset, length)` into [`TOKENS`] per method constant, indexed by the
-/// constant itself. [`METHOD_NONE`] and anything past the table is `(0, 0)`.
-const TOKEN_SPAN: [(u8, u8); 10] = [
-    (0, 0),  // METHOD_NONE
-    (0, 3),  // GET
-    (3, 7),  // CONNECT
-    (10, 4), // POST
-    (14, 4), // HEAD
-    (18, 3), // PUT
-    (21, 5), // PATCH
-    (26, 6), // DELETE
-    (32, 7), // OPTIONS
-    (39, 7), // PUBLISH
-];
+impl Binding for Relayed {
+    fn admits(_op: u8, _verb: u8) -> bool {
+        true
+    }
+    fn admits_detail(_outcome: u8, _detail: u16) -> bool {
+        true
+    }
+}
 
-/// The token for a method constant — for a request line, a log line, or the
-/// `method` a browser API is handed. Empty for [`METHOD_NONE`].
-///
-/// The span table holds integers, not string references, and that is
-/// load-bearing. A `match` returning a different `&'static [u8]` per arm
-/// compiles to a table of `{pointer, length}` pairs that the linker fills with
-/// absolute addresses. A `.fmod` is a flat image mapped at whatever base the
-/// loader picks, with no relocations applied, so every pointer in such a table
-/// is wrong by the load address. Offsets into one literal need no relocation.
-pub fn method_name(m: u8) -> &'static [u8] {
-    let (off, len) = match TOKEN_SPAN.get(m as usize) {
-        Some(&(off, len)) => (off as usize, len as usize),
-        None => return &[],
+/// The rules every binding shares for a request's `op` and `verb`, then the
+/// binding's own.
+pub fn request_admitted<B: Binding>(op: u8, verb: u8) -> bool {
+    let shared = match op {
+        op::CALL => true,
+        op::PUBLISH => verb == 0,
+        op::OPEN => verb != 0,
+        _ => false,
     };
-    match TOKENS.get(off..off + len) {
-        Some(tok) => tok,
-        None => &[],
+    shared && B::admits(op, verb)
+}
+
+/// The rules every binding shares for a response's `outcome` and `detail`,
+/// then the binding's own.
+pub fn answer_admitted<B: Binding>(outcome: u8, detail: u16) -> bool {
+    outcome::valid(outcome) && (detail == 0 || B::admits_detail(outcome, detail))
+}
+
+// ── Meta ──────────────────────────────────────────────────────────────────
+
+fn meta_key_ok(key: &[u8]) -> bool {
+    !key.is_empty() && key.len() <= META_KEY_MAX && !key.iter().any(u8::is_ascii_uppercase)
+}
+
+/// The fields of a meta run, in order, as `(key, value)`. Stops at the first
+/// field that does not decode; a run a decoder accepted decodes whole.
+pub struct MetaFields<'a> {
+    rest: &'a [u8],
+}
+
+/// Iterate the fields of `meta`.
+pub fn meta_fields(meta: &[u8]) -> MetaFields<'_> {
+    MetaFields { rest: meta }
+}
+
+impl<'a> Iterator for MetaFields<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let b = self.rest;
+        let kl = usize::from(*b.first()?);
+        let key = b.get(1..1 + kl)?;
+        let vl = u16_at(b, 1 + kl)?;
+        let at = 1 + kl + 2;
+        let val = b.get(at..at + vl)?;
+        self.rest = b.get(at + vl..).unwrap_or(&[]);
+        Some((key, val))
+    }
+}
+
+/// Whether `meta` is a whole run of well-formed fields.
+pub fn meta_valid(meta: &[u8]) -> bool {
+    let mut b = meta;
+    while !b.is_empty() {
+        let kl = usize::from(b[0]);
+        let Some(key) = b.get(1..1 + kl) else {
+            return false;
+        };
+        if !meta_key_ok(key) {
+            return false;
+        }
+        let Some(vl) = u16_at(b, 1 + kl) else {
+            return false;
+        };
+        match b.get(1 + kl + 2 + vl..) {
+            Some(rest) => b = rest,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The value of the first field keyed `key`.
+pub fn meta_get<'a>(meta: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    meta_fields(meta).find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+/// The bytes one field of a `key_len`-byte key and a `val_len`-byte value
+/// takes.
+pub const fn meta_field_len(key_len: usize, val_len: usize) -> usize {
+    META_FIELD_FIXED + key_len + val_len
+}
+
+/// Writes a meta run into a buffer, a field at a time. A field is whole or
+/// absent: `over` records that something did not fit or a key broke the
+/// rules, and [`MetaWriter::finish`] then answers `None`, so a run is never
+/// sent short.
+pub struct MetaWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+    /// Where the open field's value length sits, while a field is open.
+    open: Option<usize>,
+    over: bool,
+}
+
+impl<'a> MetaWriter<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        MetaWriter {
+            buf,
+            len: 0,
+            open: None,
+            over: false,
+        }
+    }
+
+    /// One whole field.
+    pub fn put(&mut self, key: &[u8], val: &[u8]) {
+        self.begin(key);
+        self.push(val);
+        self.end();
+    }
+
+    /// Start a field keyed `key`; its value follows through
+    /// [`MetaWriter::push`] or [`MetaWriter::spare`], and
+    /// [`MetaWriter::end`] closes it.
+    pub fn begin(&mut self, key: &[u8]) {
+        if self.open.is_some() || !meta_key_ok(key) {
+            self.over = true;
+            return;
+        }
+        let at = self.len;
+        let end = at + 1 + key.len() + 2;
+        match self.buf.get_mut(at..end) {
+            Some(d) => {
+                d[0] = key.len() as u8;
+                d[1..1 + key.len()].copy_from_slice(key);
+                self.len = end;
+                self.open = Some(end - 2);
+            }
+            None => self.over = true,
+        }
+    }
+
+    /// Append value bytes to the open field.
+    pub fn push(&mut self, bytes: &[u8]) {
+        if self.open.is_none() {
+            self.over = true;
+            return;
+        }
+        match self.buf.get_mut(self.len..self.len + bytes.len()) {
+            Some(d) => {
+                d.copy_from_slice(bytes);
+                self.len += bytes.len();
+            }
+            None => self.over = true,
+        }
+    }
+
+    /// The room after the open field's value, for a writer that renders the
+    /// value in place; [`MetaWriter::advance`] then takes what it wrote.
+    pub fn spare(&mut self) -> &mut [u8] {
+        self.buf.get_mut(self.len..).unwrap_or(&mut [])
+    }
+
+    /// Take `n` bytes written in place into [`MetaWriter::spare`].
+    pub fn advance(&mut self, n: usize) {
+        if self.open.is_none() || self.len + n > self.buf.len() {
+            self.over = true;
+            return;
+        }
+        self.len += n;
+    }
+
+    /// Mark the run short: something its writer meant to put did not fit.
+    pub fn refuse(&mut self) {
+        self.over = true;
+    }
+
+    /// Close the open field.
+    pub fn end(&mut self) {
+        let Some(at) = self.open.take() else {
+            self.over = true;
+            return;
+        };
+        let vl = self.len - at - 2;
+        if vl > u16::MAX as usize {
+            self.over = true;
+            return;
+        }
+        match self.buf.get_mut(at..at + 2) {
+            Some(d) => d.copy_from_slice(&(vl as u16).to_le_bytes()),
+            None => self.over = true,
+        }
+    }
+
+    /// The run's length, or `None` when it is not whole.
+    pub fn finish(&self) -> Option<usize> {
+        if self.over || self.open.is_some() {
+            return None;
+        }
+        Some(self.len)
     }
 }
 
@@ -342,9 +563,12 @@ impl ExchangeId {
 pub struct RequestHead<'a> {
     pub id: ExchangeId,
     pub flags: u8,
-    pub method: u8,
+    /// One of [`op`].
+    pub op: u8,
+    /// The binding's verb, or 0.
+    pub verb: u8,
     pub target: &'a [u8],
-    pub headers: &'a [u8],
+    pub meta: &'a [u8],
     pub peer: &'a [u8],
     pub resp_credit: u32,
     /// The first body bytes, inline.
@@ -356,11 +580,39 @@ pub struct RequestHead<'a> {
 pub struct ResponseHead<'a> {
     pub id: ExchangeId,
     pub flags: u8,
-    pub status: u16,
-    pub content_type: &'a [u8],
-    pub headers: &'a [u8],
+    /// One of [`outcome`].
+    pub outcome: u8,
+    /// The binding's own account of the answer, or 0.
+    pub detail: u16,
+    pub meta: &'a [u8],
     /// The first body bytes, inline.
     pub body: &'a [u8],
+}
+
+impl<'a> ResponseHead<'a> {
+    /// A head with no binding detail: `outcome`, `meta` and the inline body.
+    pub const fn answer(id: ExchangeId, outcome: u8, meta: &'a [u8], body: &'a [u8]) -> Self {
+        ResponseHead {
+            id,
+            flags: 0,
+            outcome,
+            detail: 0,
+            meta,
+            body,
+        }
+    }
+
+    /// The body's content type, empty when the head names none.
+    pub fn content_type(&self) -> &'a [u8] {
+        meta_get(self.meta, META_CONTENT_TYPE).unwrap_or(&[])
+    }
+}
+
+impl<'a> RequestHead<'a> {
+    /// The body's content type, empty when the head names none.
+    pub fn content_type(&self) -> &'a [u8] {
+        meta_get(self.meta, META_CONTENT_TYPE).unwrap_or(&[])
+    }
 }
 
 /// One decoded record. `Head` carries the direction's own head type.
@@ -473,7 +725,7 @@ fn common<'a, H>(b: &'a [u8], id: ExchangeId) -> Option<Record<'a, H>> {
     let flags = b[1];
     let rest = &b[HDR..];
     match b[0] {
-        kind::BODY => Some(Record::Body {
+        kind::BODY if flags & !flag::MORE == 0 => Some(Record::Body {
             id,
             flags,
             data: rest,
@@ -497,137 +749,202 @@ fn common<'a, H>(b: &'a [u8], id: ExchangeId) -> Option<Record<'a, H>> {
     }
 }
 
-/// Decode one request-direction record. `None` when it is malformed: a record
-/// is exactly one channel read, so a length that disagrees with it is refused
-/// rather than read past or short.
-pub fn parse_request(b: &[u8]) -> Option<RequestRecord<'_>> {
+/// Decode one request-direction record as a party speaking binding `B`.
+/// `Err(EINVAL)` when it is malformed: a record is exactly one channel read,
+/// so a length that disagrees with it is refused rather than read past or
+/// short, and a HEAD whose `op`, `verb`, flags or meta break the rules is
+/// refused whole.
+pub fn parse_request<B: Binding>(b: &[u8]) -> Result<RequestRecord<'_>, i32> {
     if b.len() > RECORD_MAX {
-        return None;
+        return Err(EINVAL);
     }
-    let id = record_id(b)?;
+    let id = record_id(b).ok_or(EINVAL)?;
     if b[0] != kind::HEAD {
-        return common(b, id);
+        return common(b, id).ok_or(EINVAL);
     }
     let p = HDR;
-    let method = *b.get(p)?;
-    let target_len = u16_at(b, p + 1)?;
-    let hdr_len = u16_at(b, p + 3)?;
-    let peer_len = u16_at(b, p + 5)?;
-    let resp_credit = u32_at(b, p + 7)?;
+    let op = *b.get(p).ok_or(EINVAL)?;
+    let verb = *b.get(p + 1).ok_or(EINVAL)?;
+    let target_len = u16_at(b, p + 2).ok_or(EINVAL)?;
+    let meta_len = u16_at(b, p + 4).ok_or(EINVAL)?;
+    let peer_len = u16_at(b, REQ_PEER_LEN_AT).ok_or(EINVAL)?;
+    let resp_credit = u32_at(b, p + 8).ok_or(EINVAL)?;
     let target_at = p + REQ_HEAD_FIXED;
-    let hdr_at = target_at.checked_add(target_len)?;
-    let peer_at = hdr_at.checked_add(hdr_len)?;
-    let body_at = peer_at.checked_add(peer_len)?;
-    if body_at > b.len() {
-        return None;
+    let meta_at = target_at + target_len;
+    let peer_at = meta_at + meta_len;
+    let body_at = peer_at + peer_len;
+    if body_at > b.len() || b[1] & !flag::REQUEST_HEAD != 0 || !request_admitted::<B>(op, verb) {
+        return Err(EINVAL);
     }
-    Some(Record::Head(RequestHead {
+    let meta = &b[meta_at..peer_at];
+    if !meta_valid(meta) {
+        return Err(EINVAL);
+    }
+    Ok(Record::Head(RequestHead {
         id,
         flags: b[1],
-        method,
-        target: &b[target_at..hdr_at],
-        headers: &b[hdr_at..peer_at],
+        op,
+        verb,
+        target: &b[target_at..meta_at],
+        meta,
         peer: &b[peer_at..body_at],
         resp_credit,
         body: &b[body_at..],
     }))
 }
 
-/// Decode one response-direction record. `None` when it is malformed.
-pub fn parse_response(b: &[u8]) -> Option<ResponseRecord<'_>> {
+/// Decode one response-direction record as a party speaking binding `B`.
+/// `Err(EINVAL)` when it is malformed, including a HEAD whose detail its
+/// binding puts in another class than its outcome.
+pub fn parse_response<B: Binding>(b: &[u8]) -> Result<ResponseRecord<'_>, i32> {
     if b.len() > RECORD_MAX {
-        return None;
+        return Err(EINVAL);
     }
-    let id = record_id(b)?;
+    let id = record_id(b).ok_or(EINVAL)?;
     match b[0] {
         kind::HEAD => {}
         kind::LINK if b.len() == HDR + 1 && id == ExchangeId::NONE => {
-            return Some(Record::Link { state: b[HDR] });
+            return Ok(Record::Link { state: b[HDR] });
         }
-        _ => return common(b, id),
+        _ => return common(b, id).ok_or(EINVAL),
     }
     let p = HDR;
-    let status = u16_at(b, p)? as u16;
-    let ct_len = *b.get(p + 2)? as usize;
-    let hdr_len = u16_at(b, p + 3)?;
-    let ct_at = p + RESP_HEAD_FIXED;
-    let hdr_at = ct_at.checked_add(ct_len)?;
-    let body_at = hdr_at.checked_add(hdr_len)?;
-    if body_at > b.len() {
-        return None;
+    let outcome = *b.get(p).ok_or(EINVAL)?;
+    let detail = u16_at(b, p + 1).ok_or(EINVAL)? as u16;
+    let meta_len = u16_at(b, p + 3).ok_or(EINVAL)?;
+    let meta_at = p + RESP_HEAD_FIXED;
+    let body_at = meta_at + meta_len;
+    if body_at > b.len()
+        || b[1] & !flag::RESPONSE_HEAD != 0
+        || !answer_admitted::<B>(outcome, detail)
+    {
+        return Err(EINVAL);
     }
-    Some(Record::Head(ResponseHead {
+    let meta = &b[meta_at..body_at];
+    if !meta_valid(meta) {
+        return Err(EINVAL);
+    }
+    Ok(Record::Head(ResponseHead {
         id,
         flags: b[1],
-        status,
-        content_type: &b[ct_at..hdr_at],
-        headers: &b[hdr_at..body_at],
+        outcome,
+        detail,
+        meta,
         body: &b[body_at..],
     }))
 }
 
-/// Encode a request HEAD. `None` when it does not fit `out` or one record.
-pub fn write_request_head(h: &RequestHead<'_>, out: &mut [u8]) -> Option<usize> {
+/// Encode a request HEAD as a party speaking binding `B`. `None` when it
+/// does not fit `out` or one record, or breaks a rule its decoder enforces.
+pub fn write_request_head<B: Binding>(h: &RequestHead<'_>, out: &mut [u8]) -> Option<usize> {
     let end = HDR
         .checked_add(REQ_HEAD_FIXED)?
         .checked_add(h.target.len())?
-        .checked_add(h.headers.len())?
+        .checked_add(h.meta.len())?
         .checked_add(h.peer.len())?
         .checked_add(h.body.len())?;
     if end > out.len()
         || end > RECORD_MAX
         || h.target.len() > u16::MAX as usize
-        || h.headers.len() > u16::MAX as usize
+        || h.meta.len() > u16::MAX as usize
         || h.peer.len() > u16::MAX as usize
+        || h.flags & !flag::REQUEST_HEAD != 0
+        || !request_admitted::<B>(h.op, h.verb)
+        || !meta_valid(h.meta)
     {
         return None;
     }
     prefix(kind::HEAD, h.flags, &h.id, out)?;
     let p = HDR;
-    out[p] = h.method;
-    out[p + 1..p + 3].copy_from_slice(&(h.target.len() as u16).to_le_bytes());
-    out[p + 3..p + 5].copy_from_slice(&(h.headers.len() as u16).to_le_bytes());
-    out[p + 5..p + 7].copy_from_slice(&(h.peer.len() as u16).to_le_bytes());
-    out[p + 7..p + 11].copy_from_slice(&h.resp_credit.to_le_bytes());
+    out[p] = h.op;
+    out[p + 1] = h.verb;
+    out[p + 2..p + 4].copy_from_slice(&(h.target.len() as u16).to_le_bytes());
+    out[p + 4..p + 6].copy_from_slice(&(h.meta.len() as u16).to_le_bytes());
+    out[REQ_PEER_LEN_AT..REQ_PEER_LEN_AT + 2].copy_from_slice(&(h.peer.len() as u16).to_le_bytes());
+    out[p + 8..p + 12].copy_from_slice(&h.resp_credit.to_le_bytes());
     let mut at = p + REQ_HEAD_FIXED;
-    for part in [h.target, h.headers, h.peer, h.body] {
+    for part in [h.target, h.meta, h.peer, h.body] {
         out[at..at + part.len()].copy_from_slice(part);
         at += part.len();
     }
     Some(at)
 }
 
-/// Encode a response HEAD. `None` when it does not fit `out` or one record.
-pub fn write_response_head(h: &ResponseHead<'_>, out: &mut [u8]) -> Option<usize> {
-    let end = HDR
-        .checked_add(RESP_HEAD_FIXED)?
-        .checked_add(h.content_type.len())?
-        .checked_add(h.headers.len())?
-        .checked_add(h.body.len())?;
+/// Encode a response HEAD as a party speaking binding `B`. `None` when it
+/// does not fit `out` or one record, or breaks a rule its decoder enforces —
+/// a detail its binding puts in another class than the outcome among them.
+pub fn write_response_head<B: Binding>(h: &ResponseHead<'_>, out: &mut [u8]) -> Option<usize> {
+    let at = seal_response_head::<B>(h, h.body.len(), out)?;
+    let start = at - h.body.len();
+    out[start..at].copy_from_slice(h.body);
+    Some(at)
+}
+
+/// Seal a response HEAD whose `body_len` inline body bytes are already in
+/// place at [`response_body_at`]`(h.meta.len())`, for a writer that renders
+/// the body in place; `h.body` is not read. Returns the record length.
+pub fn seal_response_head<B: Binding>(
+    h: &ResponseHead<'_>,
+    body_len: usize,
+    out: &mut [u8],
+) -> Option<usize> {
+    let at = response_body_at(h.meta.len());
+    out.get_mut(HDR + RESP_HEAD_FIXED..at)?
+        .copy_from_slice(h.meta);
+    seal_response_in_place::<B>(
+        &h.id,
+        h.flags,
+        h.outcome,
+        h.detail,
+        h.meta.len(),
+        body_len,
+        out,
+    )
+}
+
+/// Seal a response HEAD whose `meta_len` meta bytes and then `body_len`
+/// inline body bytes are already in place at `out[HDR + RESP_HEAD_FIXED..]`,
+/// for a writer that renders the meta in place too: writes the prefix and the
+/// fixed part, checks what is in place as a decoder would, and returns the
+/// record length.
+pub fn seal_response_in_place<B: Binding>(
+    id: &ExchangeId,
+    flags: u8,
+    outcome: u8,
+    detail: u16,
+    meta_len: usize,
+    body_len: usize,
+    out: &mut [u8],
+) -> Option<usize> {
+    let at = response_body_at(meta_len);
+    let end = at.checked_add(body_len)?;
     if end > out.len()
         || end > RECORD_MAX
-        || h.content_type.len() > u8::MAX as usize
-        || h.headers.len() > u16::MAX as usize
+        || meta_len > u16::MAX as usize
+        || flags & !flag::RESPONSE_HEAD != 0
+        || !answer_admitted::<B>(outcome, detail)
+        || !meta_valid(out.get(HDR + RESP_HEAD_FIXED..at)?)
     {
         return None;
     }
-    prefix(kind::HEAD, h.flags, &h.id, out)?;
+    prefix(kind::HEAD, flags, id, out)?;
     let p = HDR;
-    out[p..p + 2].copy_from_slice(&h.status.to_le_bytes());
-    out[p + 2] = h.content_type.len() as u8;
-    out[p + 3..p + 5].copy_from_slice(&(h.headers.len() as u16).to_le_bytes());
-    let mut at = p + RESP_HEAD_FIXED;
-    for part in [h.content_type, h.headers, h.body] {
-        out[at..at + part.len()].copy_from_slice(part);
-        at += part.len();
-    }
-    Some(at)
+    out[p] = outcome;
+    out[p + 1..p + 3].copy_from_slice(&detail.to_le_bytes());
+    out[p + 3..p + 5].copy_from_slice(&(meta_len as u16).to_le_bytes());
+    Some(end)
+}
+
+/// Where a response HEAD's inline body starts, for `meta_len` bytes of
+/// meta — for a writer that renders the body in place.
+pub const fn response_body_at(meta_len: usize) -> usize {
+    HDR + RESP_HEAD_FIXED + meta_len
 }
 
 /// Encode a BODY record (either direction).
 pub fn write_body(id: &ExchangeId, flags: u8, data: &[u8], out: &mut [u8]) -> Option<usize> {
     let end = HDR.checked_add(data.len())?;
-    if end > out.len() || end > RECORD_MAX {
+    if end > out.len() || end > RECORD_MAX || flags & !flag::MORE != 0 {
         return None;
     }
     prefix(kind::BODY, flags, id, out)?;
@@ -640,7 +957,7 @@ pub fn write_body(id: &ExchangeId, flags: u8, data: &[u8], out: &mut [u8]) -> Op
 /// that decodes straight into the record rather than through a copy.
 pub fn seal_body(id: &ExchangeId, flags: u8, data_len: usize, out: &mut [u8]) -> Option<usize> {
     let end = HDR.checked_add(data_len)?;
-    if end > out.len() || end > RECORD_MAX {
+    if end > out.len() || end > RECORD_MAX || flags & !flag::MORE != 0 {
         return None;
     }
     prefix(kind::BODY, flags, id, out)?;
@@ -689,126 +1006,24 @@ pub fn write_link(state: u8, out: &mut [u8]) -> Option<usize> {
     Some(HDR + 1)
 }
 
-/// Encode a whole response: one HEAD carrying the entire body, no MORE.
+/// Encode a whole response with no binding detail: one HEAD carrying
+/// `outcome`, `meta` and the entire body, no MORE.
 pub fn write_response(
     id: &ExchangeId,
-    status: u16,
-    content_type: &[u8],
+    outcome: u8,
+    meta: &[u8],
     body: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    write_response_head(
-        &ResponseHead {
-            id: *id,
-            flags: 0,
-            status,
-            content_type,
-            headers: &[],
-            body,
-        },
-        out,
-    )
+    write_response_head::<Plain>(&ResponseHead::answer(*id, outcome, meta, body), out)
 }
 
-/// Encode a refusal the provider raises itself: a terminal HEAD carrying
-/// `status`, marked [`flag::RAISED`], with no content type, headers or body.
-pub fn write_refusal(id: &ExchangeId, status: u16, out: &mut [u8]) -> Option<usize> {
-    write_response_head(
-        &ResponseHead {
-            id: *id,
-            flags: flag::RAISED,
-            status,
-            content_type: &[],
-            headers: &[],
-            body: &[],
-        },
-        out,
-    )
-}
-
-/// Where a whole response's body starts, for a content type of `ct_len` bytes
-/// and no extra headers — for a writer that renders the body in place.
-pub const fn response_body_at(ct_len: usize) -> usize {
-    HDR + RESP_HEAD_FIXED + ct_len
-}
-
-/// Seal a whole response whose `body_len` bytes are already at
-/// [`response_body_at`]. Returns the record length.
-pub fn seal_response(
-    id: &ExchangeId,
-    status: u16,
-    content_type: &[u8],
-    body_len: usize,
-    out: &mut [u8],
-) -> Option<usize> {
-    let at = response_body_at(content_type.len());
-    let end = at.checked_add(body_len)?;
-    if end > out.len() || end > RECORD_MAX || content_type.len() > u8::MAX as usize {
-        return None;
-    }
-    write_response_head(
-        &ResponseHead {
-            id: *id,
-            flags: 0,
-            status,
-            content_type,
-            headers: &[],
-            body: &[],
-        },
-        out,
-    )?;
-    Some(end)
-}
-
-// ── Header blocks ─────────────────────────────────────────────────────────
-
-/// The value of the first header named `name` (ASCII case-insensitive) in a
-/// `name: value\r\n` block, with optional whitespace trimmed.
-pub fn header<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    header_lines(headers)
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v)
-}
-
-/// The `name: value\r\n` lines of a header block, in order.
-pub struct HeaderLines<'a> {
-    rest: &'a [u8],
-}
-
-/// Iterate a header block's fields as `(name, value)` with optional whitespace
-/// trimmed from the value. A line without a colon is skipped.
-pub fn header_lines(headers: &[u8]) -> HeaderLines<'_> {
-    HeaderLines { rest: headers }
-}
-
-impl<'a> Iterator for HeaderLines<'a> {
-    type Item = (&'a [u8], &'a [u8]);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while !self.rest.is_empty() {
-            let end = self
-                .rest
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .unwrap_or(self.rest.len());
-            // Checked slicing throughout: a PIC module links no panic path.
-            let line = self.rest.get(..end).unwrap_or(self.rest);
-            self.rest = self.rest.get(end + 2..).unwrap_or(&[]);
-            let Some(colon) = line.iter().position(|&c| c == b':') else {
-                continue;
-            };
-            let name = line.get(..colon).unwrap_or(&[]);
-            let mut v = line.get(colon + 1..).unwrap_or(&[]);
-            while let [b' ' | b'\t', tail @ ..] = v {
-                v = tail;
-            }
-            while let [head @ .., b' ' | b'\t'] = v {
-                v = head;
-            }
-            return Some((name, v));
-        }
-        None
-    }
+/// Encode an answer the provider raises itself: a terminal HEAD carrying
+/// `outcome` and no detail, marked [`flag::RAISED`], with no meta or body.
+pub fn write_refusal(id: &ExchangeId, outcome: u8, out: &mut [u8]) -> Option<usize> {
+    let mut h = ResponseHead::answer(*id, outcome, &[], &[]);
+    h.flags = flag::RAISED;
+    write_response_head::<Plain>(&h, out)
 }
 
 // ── Collecting requests whole ─────────────────────────────────────────────
@@ -829,51 +1044,53 @@ impl<'a> Iterator for HeaderLines<'a> {
 pub enum Refuse {
     /// No free slot: more exchanges arrived at once than the provider holds.
     Busy,
-    /// The target, headers or body passed what the provider holds.
+    /// The target, meta or body passed what the provider holds.
     TooLarge,
-    /// A record that does not belong to a collected exchange, or arrived out
-    /// of order.
+    /// A record that does not decode, does not belong to a collected
+    /// exchange, or arrived out of order.
     Unexpected,
 }
 
 impl Refuse {
-    /// The status a caller is owed for this refusal.
-    pub const fn status(self) -> u16 {
+    /// The outcome a caller is owed for this refusal.
+    pub const fn outcome(self) -> u8 {
         match self {
-            Self::Busy => status::BUSY,
-            Self::TooLarge => status::TOO_LARGE,
-            Self::Unexpected => status::BAD_REQUEST,
+            Self::Busy => outcome::BUSY,
+            Self::TooLarge => outcome::TOO_LARGE,
+            Self::Unexpected => outcome::REFUSED,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct Slot<const TARGET: usize, const HEADERS: usize, const BODY: usize> {
+struct Slot<const TARGET: usize, const META: usize, const BODY: usize> {
     live: bool,
     done: bool,
     id: ExchangeId,
-    method: u8,
+    op: u8,
+    verb: u8,
     flags: u8,
     target: [u8; TARGET],
     target_len: u16,
-    headers: [u8; HEADERS],
-    headers_len: u16,
+    meta: [u8; META],
+    meta_len: u16,
     body: [u8; BODY],
     body_len: u32,
     resp_credit: u32,
 }
 
-impl<const TARGET: usize, const HEADERS: usize, const BODY: usize> Slot<TARGET, HEADERS, BODY> {
+impl<const TARGET: usize, const META: usize, const BODY: usize> Slot<TARGET, META, BODY> {
     pub const EMPTY: Self = Slot {
         live: false,
         done: false,
         id: ExchangeId::NONE,
-        method: 0,
+        op: 0,
+        verb: 0,
         flags: 0,
         target: [0; TARGET],
         target_len: 0,
-        headers: [0; HEADERS],
-        headers_len: 0,
+        meta: [0; META],
+        meta_len: 0,
         body: [0; BODY],
         body_len: 0,
         resp_credit: 0,
@@ -884,25 +1101,27 @@ impl<const TARGET: usize, const HEADERS: usize, const BODY: usize> Slot<TARGET, 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
     pub id: ExchangeId,
-    pub method: u8,
+    pub op: u8,
+    pub verb: u8,
     pub flags: u8,
     pub target: &'a [u8],
-    pub headers: &'a [u8],
+    pub meta: &'a [u8],
     pub body: &'a [u8],
     /// Response body bytes the requester has granted so far.
     pub resp_credit: u32,
 }
 
-/// The exchanges a provider is collecting: `SLOTS` at once, each holding up to
-/// `TARGET`, `HEADERS` and `BODY` bytes. Each module sets the four from what it
-/// actually serves.
+/// The exchanges a provider speaking binding `B` is collecting: `SLOTS` at
+/// once, each holding up to `TARGET`, `META` and `BODY` bytes. Each module
+/// sets the four from what it actually serves.
 pub struct Collector<
+    B: Binding,
     const SLOTS: usize,
     const TARGET: usize,
-    const HEADERS: usize,
+    const META: usize,
     const BODY: usize,
 > {
-    slots: [Slot<TARGET, HEADERS, BODY>; SLOTS],
+    slots: [Slot<TARGET, META, BODY>; SLOTS],
     /// A request-body credit owed to the requester. A provider that grants
     /// nothing never receives a body, and the symptom is not an error but a
     /// request that stays half-collected, so the grant is owed the moment an
@@ -912,16 +1131,18 @@ pub struct Collector<
     /// grant and taken the same way, because the collector does no I/O —
     /// whoever owns the port sends it.
     refusal: Option<(ExchangeId, Refuse)>,
+    binding: PhantomData<fn() -> B>,
 }
 
-impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: usize>
-    Collector<SLOTS, TARGET, HEADERS, BODY>
+impl<B: Binding, const SLOTS: usize, const TARGET: usize, const META: usize, const BODY: usize>
+    Collector<B, SLOTS, TARGET, META, BODY>
 {
     pub const fn new() -> Self {
         Collector {
             slots: [Slot::EMPTY; SLOTS],
             grant: None,
             refusal: None,
+            binding: PhantomData,
         }
     }
 
@@ -935,7 +1156,19 @@ impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: 
     /// [`Collector::request`] and free it with [`Collector::release`] once
     /// answered. `Ok(None)` is progress with nothing finished yet.
     pub fn accept(&mut self, record: &[u8]) -> Result<Option<usize>, Refuse> {
-        match parse_request(record).ok_or(Refuse::Unexpected)? {
+        let rec = match parse_request::<B>(record) {
+            Ok(rec) => rec,
+            Err(_) => {
+                // A HEAD that breaks a rule still names its exchange, and is
+                // owed an answer; anything else malformed has nowhere to
+                // send one.
+                return match (record_kind(record), record_id(record)) {
+                    (Some(kind::HEAD), Some(id)) => Err(self.refuse(id, Refuse::Unexpected)),
+                    _ => Err(Refuse::Unexpected),
+                };
+            }
+        };
+        match rec {
             Record::Head(head) => self.open(&head),
             Record::Body { id, flags, data } => self.extend(&id, flags, data),
             // An abort ends the exchange: an answer would have nowhere to go.
@@ -957,7 +1190,7 @@ impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: 
     }
 
     fn open(&mut self, head: &RequestHead<'_>) -> Result<Option<usize>, Refuse> {
-        if head.target.len() > TARGET || head.headers.len() > HEADERS || head.body.len() > BODY {
+        if head.target.len() > TARGET || head.meta.len() > META || head.body.len() > BODY {
             return Err(self.refuse(head.id, Refuse::TooLarge));
         }
         // A repeat HEAD for an exchange already open restarts it; take the
@@ -973,15 +1206,16 @@ impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: 
         *slot = Slot::EMPTY;
         slot.live = true;
         slot.id = head.id;
-        slot.method = head.method;
+        slot.op = head.op;
+        slot.verb = head.verb;
         slot.flags = head.flags;
         slot.resp_credit = head.resp_credit;
         slot.target[..head.target.len()].copy_from_slice(head.target);
-        slot.headers[..head.headers.len()].copy_from_slice(head.headers);
+        slot.meta[..head.meta.len()].copy_from_slice(head.meta);
         slot.body[..head.body.len()].copy_from_slice(head.body);
         // Every length was bounded above by a const that fits.
         slot.target_len = head.target.len() as u16;
-        slot.headers_len = head.headers.len() as u16;
+        slot.meta_len = head.meta.len() as u16;
         slot.body_len = head.body.len() as u32;
         slot.done = head.flags & flag::MORE == 0;
         if !slot.done {
@@ -1023,10 +1257,11 @@ impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: 
         }
         Some(Request {
             id: slot.id,
-            method: slot.method,
+            op: slot.op,
+            verb: slot.verb,
             flags: slot.flags,
             target: slot.target.get(..usize::from(slot.target_len))?,
-            headers: slot.headers.get(..usize::from(slot.headers_len))?,
+            meta: slot.meta.get(..usize::from(slot.meta_len))?,
             body: slot.body.get(..slot.body_len as usize)?,
             resp_credit: slot.resp_credit,
         })
@@ -1046,8 +1281,8 @@ impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: 
     }
 
     /// A refusal to answer, and the exchange it belongs to. `None` when the
-    /// refused record named no exchange — an unparseable record has no id, so
-    /// there is nowhere to send a status.
+    /// refused record named no exchange — a record too short to carry an id
+    /// has nowhere to send an answer.
     pub fn take_refusal(&mut self) -> Option<(ExchangeId, Refuse)> {
         self.refusal.take()
     }
@@ -1063,8 +1298,8 @@ impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: 
     }
 }
 
-impl<const SLOTS: usize, const TARGET: usize, const HEADERS: usize, const BODY: usize> Default
-    for Collector<SLOTS, TARGET, HEADERS, BODY>
+impl<B: Binding, const SLOTS: usize, const TARGET: usize, const META: usize, const BODY: usize>
+    Default for Collector<B, SLOTS, TARGET, META, BODY>
 {
     fn default() -> Self {
         Self::new()

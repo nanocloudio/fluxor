@@ -234,7 +234,7 @@ pub mod gpio {
                     IRQ_EDGE_CONFIG[i] = 0;
                 }
                 EDGE_ACTIVE_MASK[edge_word(i)].fetch_and(!edge_bit(i), Ordering::Release);
-                GPIO_EVENT_BINDING[i].store(-1, Ordering::Release);
+                GPIO_DOORBELL[i].store(NO_WATCH, Ordering::Release);
                 // SAFETY: SLOTS[i] mutated only while CLAIMED guard is true;
                 // `i` is bounded by the MAX_GPIO loop.
                 unsafe {
@@ -510,9 +510,15 @@ pub mod gpio {
         1u32 << (pin & 31)
     }
 
-    /// Event handle bound to each GPIO pin for edge-triggered event signaling.
-    /// -1 = no binding. Read by poll_gpio_edges(). Set by gpio_watch_edge().
-    static GPIO_EVENT_BINDING: [AtomicI32; MAX_GPIO] = [const { AtomicI32::new(-1) }; MAX_GPIO];
+    /// The doorbell of each pin's edge watch (`gpio::WATCH_EDGE`): rung by
+    /// poll_gpio_edges() on a detected edge. [`NO_WATCH`] when the pin is not
+    /// watched, [`WATCH_UNBOUND`] between the watch and the doorbell the
+    /// kernel hands it.
+    static GPIO_DOORBELL: [AtomicI32; MAX_GPIO] = [const { AtomicI32::new(NO_WATCH) }; MAX_GPIO];
+    /// [`GPIO_DOORBELL`]: no watch.
+    const NO_WATCH: i32 = -1;
+    /// [`GPIO_DOORBELL`]: watched, its doorbell not yet bound.
+    const WATCH_UNBOUND: i32 = -2;
 
     // Edge interest constants — re-exported from abi::gpio_edge.
     pub use crate::abi::contracts::hal::gpio::edge::BOTH as EDGE_BOTH;
@@ -623,9 +629,9 @@ pub mod gpio {
                         }
                         LAST_LEVEL[idx] = current;
                         if edge_detected {
-                            let evt = GPIO_EVENT_BINDING[idx].load(Ordering::Relaxed);
-                            if evt >= 0 {
-                                crate::kernel::ipc::event::event_signal(evt);
+                            let doorbell = GPIO_DOORBELL[idx].load(Ordering::Relaxed);
+                            if doorbell >= 0 {
+                                crate::kernel::ipc::event::doorbell_ring(doorbell);
                             }
                         }
                     }
@@ -638,10 +644,11 @@ pub mod gpio {
     // Edge-to-event binding (GPIO provider owns the full lifecycle)
     // ============================================================================
 
-    /// Bind an event to a GPIO pin's edge detection.
-    /// pin: GPIO pin number, edge: 1=rising 2=falling 3=both, event_handle: tagged event fd.
-    /// Caller (provider dispatch) must have already verified pin ownership.
-    pub fn gpio_watch_edge(pin: u8, edge: u8, event_handle: i32) -> i32 {
+    /// Start watching a claimed pin's edges (`gpio::WATCH_EDGE`).
+    /// edge: 1=rising 2=falling 3=both. The watch rings nothing until its
+    /// doorbell is bound ([`gpio_bind_doorbell`]). Caller (provider dispatch)
+    /// must have already verified pin ownership.
+    pub fn gpio_watch_edge(pin: u8, edge: u8) -> i32 {
         let idx = pin as usize;
         if idx >= MAX_GPIO {
             return errno::EINVAL;
@@ -652,18 +659,38 @@ pub mod gpio {
         if !CLAIMED[idx].load(Ordering::Acquire) {
             return errno::ENODEV;
         }
-        // Already has an event binding?
-        if GPIO_EVENT_BINDING[idx].load(Ordering::Acquire) >= 0 {
+        if GPIO_DOORBELL[idx].load(Ordering::Acquire) != NO_WATCH {
             return errno::EBUSY;
         }
-        // Set up edge detection
         let rc = gpio_set_irq(pin as i32, edge);
         if rc < 0 {
             return rc;
         }
-        // Bind the event
-        GPIO_EVENT_BINDING[idx].store(event_handle, Ordering::Release);
+        GPIO_DOORBELL[idx].store(WATCH_UNBOUND, Ordering::Release);
         0
+    }
+
+    /// Hand a pin's watch the doorbell its edges ring: `EBADF` when the pin
+    /// is not watched or already has one.
+    pub fn gpio_bind_doorbell(pin: u8, doorbell: i32) -> i32 {
+        let Some(slot) = GPIO_DOORBELL.get(pin as usize) else {
+            return errno::EBADF;
+        };
+        match slot.compare_exchange(WATCH_UNBOUND, doorbell, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => 0,
+            Err(_) => errno::EBADF,
+        }
+    }
+
+    /// Stop watching a pin's edges and drop its doorbell.
+    pub fn gpio_unwatch(pin: u8) -> i32 {
+        let Some(slot) = GPIO_DOORBELL.get(pin as usize) else {
+            return errno::EBADF;
+        };
+        if slot.swap(NO_WATCH, Ordering::AcqRel) == NO_WATCH {
+            return errno::EBADF;
+        }
+        gpio_set_irq(pin as i32, 0)
     }
 
     /// Check whether a GPIO pin is currently claimed.

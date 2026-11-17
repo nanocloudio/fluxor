@@ -100,13 +100,14 @@ Provider opcodes pass through a default-deny rule table:
   the caller, never another module's grant. `PRESENT` carries no pointer, since
   its refusal is written into the request itself, so a gated caller can present
   the longest capability chain however far it runs past the struct copy.
-- A channel ioctl is admitted only for the kernel's built-in commands and the
-  `storage.block` requests. A block request's buffer is checked like any
-  embedded pointer: private memory for a read, readable memory for a write.
-  Any other command would reach a module-registered handler whose argument
-  the gateway cannot see into, so it is refused. Every block command carries
-  exactly its record's length, and a buffer lent by `SUBMIT` stays valid after
-  the module is gone: see [Lent buffers](storage_capability_surface.md#11-storageblock-v1).
+- A channel op names a channel handle; which end of the channel the caller
+  is, the channel itself checks on every op, so the gateway checks only the
+  handle's contract and the op's spans. `storage.block` requests carry no
+  address: a request names a span of a `lend` the caller opened over its own
+  memory, checked when the lend is opened (private memory for a span the
+  source writes, readable memory for one it reads), and memory still
+  borrowed when the module is gone is quarantined: see
+  [`storage.block`](storage_capability_surface.md#11-storageblock-v1).
 - Refusals are logged as `[gate] module M op N refused: <why>`, rate-limited.
 
 Channel data is copied by the gateway, so a gated module has no view onto a

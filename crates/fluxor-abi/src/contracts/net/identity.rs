@@ -180,21 +180,21 @@ pub use super::super::super::registry::msg::identity::MSG_ADDR_FENCED;
 /// `reason` per `refusal`.
 pub use super::super::super::registry::msg::identity::MSG_ADDR_REFUSED;
 
-/// The transmit-drain query a NIC driver answers on the frame channel it
-/// reads from the ip module, over `channel_ioctl` (`dev_channel_ioctl`
-/// with `handle = ip's frames_tx channel`). This is how a fence reaches
-/// the wire: after closing its gate the ip module asks the driver whether
-/// every frame handed over before the fence has left the NIC.
+/// The transmit-drain query a NIC driver answers on the frame edge the ip
+/// module writes: the edge contract `net_tx_drain`, reached by binding the
+/// frames output port (`BIND` with `bind::PORT`) and served by the driver at
+/// the other end, handed its own frames input port. This is how a fence
+/// reaches the wire: after closing its gate the ip module asks the driver
+/// whether every frame handed over before the fence has left the NIC.
 ///
-/// Answer: `0` when the driver holds no unread frame on that channel and
-/// every submitted transmit descriptor is reported complete by the
-/// hardware, with `arg[0..4]` set to the driver's completed transmit count
-/// (LE); `EAGAIN` while either is still pending; `ENOSYS` from a channel
-/// whose reader registers no handler — a driver that cannot prove the wire,
-/// so the fence reports `cutoff::RING_HANDOFF`.
+/// `DRAINED` (`registry::net_tx_drain::DRAINED`): `arg` out `[completed u32
+/// LE]`. Answer: `0` when the driver holds no unread frame on that edge and
+/// every submitted transmit descriptor is reported complete by the hardware,
+/// with the driver's completed transmit count in `arg`; `EAGAIN` while either
+/// is still pending. A driver that serves no such contract makes the bind
+/// fail: it cannot prove the wire, so the fence reports
+/// `cutoff::RING_HANDOFF`.
 pub mod tx_drain {
-    /// The ioctl command, outside the kernel's built-in set (1..4).
-    pub const IOCTL: u32 = 0x0010;
     /// Bytes `arg` carries: the completed transmit count.
     pub const ARG_LEN: usize = 4;
 }

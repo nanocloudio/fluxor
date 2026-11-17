@@ -438,7 +438,7 @@ pub fn step_domain_modules(modules: &mut [ModuleSlot], domain_id: usize) -> Step
     // exec_order rotation. Mirrors the pump call in `step_modules`.
     pump_isr_bridges();
     // Reap the completions of torn-down modules' lent buffers.
-    crate::kernel::module::block_lend::pump();
+    crate::kernel::ipc::lend::pump();
 
     // Donate what is left of the tick budget to the state arena's zeroing: a
     // domain with no budget donates nothing.

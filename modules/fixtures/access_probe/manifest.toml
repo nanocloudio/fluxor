@@ -2,12 +2,13 @@ version = "1.0.0"
 hardware_targets = ["bcm2712"]
 grants = ["metal_device.mmio", "metal_device.dma"]
 
-# Fixture for the bounds on the raw register and cache-maintenance opcodes,
-# on QEMU virt. On its first step it asks for what must be refused — a
-# register read in DRAM, an unaligned one, one in a gigabyte with nothing
-# behind it, a cache flush of its own state, a flush that wraps — and for
-# what must be served — a device register, a flush of a streaming DMA
-# buffer — and logs one line:
+# Fixture for the bounds on register access through an aperture and on the
+# cache-maintenance opcodes, on QEMU virt. On its first step it asks for what
+# must be refused — an aperture the machine does not have, a read through a
+# handle naming none, an unaligned read, one past the aperture, a cache flush
+# of no allocation of its own, a flush that wraps — and for what must be
+# served — a device register, a flush of a streaming DMA buffer — and logs
+# one line:
 #
 #   [access_probe] ok
 #   [access_probe] FAIL case=<n>

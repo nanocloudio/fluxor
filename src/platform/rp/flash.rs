@@ -432,8 +432,8 @@ pub mod store {
 
     /// Program a 256-byte page. Validates the offset falls within a known
     /// writable region (`is_writable_sector`).
-    pub fn raw_program(offset: u32, data: *const u8) -> i32 {
-        if !is_writable_sector(offset, PAGE_SIZE as u32) {
+    pub fn raw_program(offset: u32, page: &[u8]) -> i32 {
+        if page.len() != PAGE_SIZE || !is_writable_sector(offset, PAGE_SIZE as u32) {
             return crate::kernel::sys::errno::EINVAL;
         }
         // As `raw_erase`: resolved before anything is disconnected.
@@ -442,11 +442,9 @@ pub mod store {
             return crate::kernel::sys::errno::ENOSYS;
         };
         // SAFETY: writable-region check above; with_flash_op disables IRQs
-        // and detaches XIP. Caller must ensure `data` points to a readable
-        // PAGE_SIZE buffer (raw_program is itself a syscall surface that
-        // already validates `data`).
+        // and detaches XIP. `page` holds exactly PAGE_SIZE readable bytes.
         unsafe {
-            match with_flash_op(|| flash_program_page(&rom, program, offset, data)) {
+            match with_flash_op(|| flash_program_page(&rom, program, offset, page.as_ptr())) {
                 Ok(()) => 0,
                 Err(()) => crate::kernel::sys::errno::ERROR,
             }

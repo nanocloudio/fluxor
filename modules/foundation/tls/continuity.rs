@@ -77,11 +77,11 @@
 //   [delivered_in:8]      records whose plaintext reached clear_out
 //   [emitted_out:8]       records whose ciphertext reached cipher_out
 //   [out_bytes:8]         the consumer's clear bytes through the last
-//                         record emitted (`net_proto::MSG_HORIZON`)
-//   [consumer_cursor:8]   the cursor the consumer's last `CMD_DELIVERED`
+//                         record emitted (`stream_cursor::MSG_CURSOR_HORIZON`)
+//   [consumer_cursor:8]   the cursor the consumer's last `CMD_CURSOR_DELIVERED`
 //                         carried (0 for none), opaque here: a standby's
 //                         consumer is handed it at activation
-//                         (`net_proto::MSG_RESUMED`)
+//                         (`stream_cursor::MSG_CURSOR_RESUMED`)
 //   [cursor_at:8]         the clear byte that acknowledgement carried
 //                         (`in_bytes`): the consumer had consumed the
 //                         stream's first `cursor_at` bytes (0 for none)
@@ -172,9 +172,9 @@
 // cipher_in nor clear_in is drained, so back-pressure reaches the
 // producer and the TCP window instead of a queue. What the clear-side
 // consumer has consumed is mirrored too, as DELTA_TLS_DELIVERED: when
-// `delivery_ack` is set the consumer acknowledges its deliveries
-// (`CMD_DELIVERED`) and the count moves only then; otherwise a delivery is
-// consumed when it is handed up. Under the strict profile the committed
+// the consumer was granted the cursors (`net_proto::flag::CURSORS`) it
+// acknowledges its deliveries (`CMD_CURSOR_DELIVERED`) and the count moves
+// only then; otherwise a delivery is consumed when it is handed up. Under the strict profile the committed
 // checkpoint ends a quiesce: from then on the horizons, not a closed
 // window, keep the standby exact. PROFILE_PLANNED mirrors asynchronously;
 // the cut at CUT_EXPORT is what is exact.
@@ -327,7 +327,7 @@ const CONT_REDELIVER_MAX: usize = 8 * 2 + 8 * 512;
 /// And at most this many of them.
 const CONT_REDELIVER_COUNT: u8 = 8;
 /// Records handed up and not yet consumed a primary keeps account of
-/// (`delivery_ack`): a strict pair never lets more than
+/// (a consumer granted CURSORS): a strict pair never lets more than
 /// `CONT_REDELIVER_COUNT` stand (`continuity_rx_gate`); beyond these the
 /// oldest is counted consumed, which only an unmirrored session reaches.
 const PEND_MAX: usize = 16;
@@ -390,7 +390,7 @@ const CONT_OUT_BUDGET: usize = 12 * 1024;
 /// (`cont_out_admits_strict`): a delta the channel refused would end the
 /// pair.
 const CONT_OUT_NEED: usize = CONT_OUT_BUDGET
-    + abi::contracts::net::net_proto::MAX_CMD_DATA
+    + net_proto::data_capacity(CLEAR_IN_ACCEPTS_RECORD)
     + TX_HOLD_RECORDS
         * (DELTA_PAYLOAD_OFF + DELTA_OUT_HDR + 8 + (WIRE_RECORD_MAX - CLEAR_CHUNK_MAX))
     + DELTA_PAYLOAD_OFF
@@ -421,11 +421,14 @@ const REPLY_MAX: usize = sc::FRAME_HDR + sc::CONTINUITY_HEADER_LEN + REPLY_BODY_
 /// Frames drained from cont_in per step.
 const CONT_DRAIN_BUDGET: u32 = 8;
 /// Outbound records one session may hold for its send horizon: every
-/// record one `CMD_SEND` (`MAX_CMD_DATA` bytes) can produce, since the
-/// clear-side frame is consumed whole.
+/// record one `CMD_SEND` (as much data as `clear_in` accepts) can produce,
+/// since the clear-side frame is consumed whole.
 const TX_HOLD_RECORDS: usize =
-    abi::contracts::net::net_proto::MAX_CMD_DATA.div_ceil(CLEAR_CHUNK_MAX);
-const TX_HOLD_SIZE: usize = TX_HOLD_RECORDS * WIRE_RECORD_MAX;
+    net_proto::data_capacity(CLEAR_IN_ACCEPTS_RECORD).div_ceil(CLEAR_CHUNK_MAX);
+/// The bytes those records come to: the frame's clear data and each
+/// record's header, inner type and tag.
+const TX_HOLD_SIZE: usize = net_proto::data_capacity(CLEAR_IN_ACCEPTS_RECORD)
+    + TX_HOLD_RECORDS * (WIRE_RECORD_MAX - CLEAR_CHUNK_MAX);
 /// Milliseconds a strict horizon may stay unconfirmed before the mirror is
 /// abandoned. The inputs are one channel for every session, so a horizon
 /// freezes them all; a standby that has stopped answering must not hold
@@ -636,9 +639,9 @@ struct TlsCheckpoint {
     delivered_in: u64,
     emitted_out: u64,
     /// The consumer's clear bytes through the last record emitted: its
-    /// output horizon, in its numbering (`net_proto::MSG_HORIZON`).
+    /// output horizon, in its numbering (`stream_cursor::MSG_CURSOR_HORIZON`).
     out_bytes: u64,
-    /// The cursor the consumer's last `CMD_DELIVERED` carried, and the
+    /// The cursor the consumer's last `CMD_CURSOR_DELIVERED` carried, and the
     /// clear byte it stood at.
     consumer_cursor: u64,
     cursor_at: u64,
@@ -809,11 +812,11 @@ struct SessionContinuity {
     rx_owed_len: u16,
     /// Deliveries the clear-side consumer has consumed — the records
     /// handed up whose plaintext ends at or before the clear byte its last
-    /// `CMD_DELIVERED` carried — and the count last mirrored as
+    /// `CMD_CURSOR_DELIVERED` carried — and the count last mirrored as
     /// DELTA_TLS_DELIVERED.
     consumed: u64,
     consumed_told: u64,
-    /// The cursor the consumer's last `CMD_DELIVERED` carried (opaque, 0
+    /// The cursor the consumer's last `CMD_CURSOR_DELIVERED` carried (opaque, 0
     /// for none) and its clear byte (`in_bytes`), and the ones last
     /// mirrored with the count.
     consumer_cursor: u64,
@@ -823,7 +826,7 @@ struct SessionContinuity {
     /// The clear byte the last record handed up ends at, in the consumer's
     /// numbering (from the stream's start, across takeovers).
     handed_bytes: u64,
-    /// The records handed up and not yet consumed (`delivery_ack`): where
+    /// The records handed up and not yet consumed (CURSORS): where
     /// each ends, oldest first, and their plaintext bytes in all.
     pend_end: [u64; PEND_MAX],
     pend_len: [u16; PEND_MAX],
@@ -836,7 +839,7 @@ struct SessionContinuity {
     /// holding the next outbound record back with no acknowledgement from
     /// the peer's transport since (0 while it does not).
     pub(crate) txrec_since_ms: u64,
-    /// Activated here: `MSG_RESUMED` (`[cursor][in_bytes][out_bytes]`) is
+    /// Activated here: `MSG_CURSOR_RESUMED` (`[cursor][in_bytes][out_bytes]`) is
     /// owed to the consumer, after the peer report and before any data.
     resumed_owed: bool,
     resumed_cursor: u64,
@@ -1193,6 +1196,46 @@ const EMPTY_CONT_KEY: ContKey = ContKey {
     used: false,
 };
 
+/// A custody ATTEST whose record the custody identity is signing
+/// (`TlsState::custody_job`). The vault signs as a job of several calls, so
+/// the SIGN is issued once a step (`custody_attest_step`) and the evidence
+/// answered when the signature arrives.
+#[derive(Clone, Copy)]
+struct CustodyAttest {
+    /// The recipient the record attests; -1 when no ATTEST is in flight.
+    recipient: i32,
+    name: [u8; sc::FLOW_ID_BYTES],
+    epoch: u32,
+    /// When the ATTEST arrived (`dev_millis`).
+    since_ms: u64,
+    rpub: [u8; sc::custody::PUB_LEN],
+    record: [u8; sc::custody::RECORD_LEN],
+    /// The record's SHA-256: the input every SIGN of the job repeats.
+    digest: [u8; 32],
+}
+
+const NO_CUSTODY_ATTEST: CustodyAttest = CustodyAttest {
+    recipient: -1,
+    name: [0; sc::FLOW_ID_BYTES],
+    epoch: 0,
+    since_ms: 0,
+    rpub: [0; sc::custody::PUB_LEN],
+    record: [0; sc::custody::RECORD_LEN],
+    digest: [0; 32],
+};
+
+/// An ATTEST command's payload: the flow header, the op and the challenge.
+/// One that arrives while another is being signed is held whole until
+/// that one is answered (`TlsState::custody_held`).
+const CUSTODY_ATTEST_CMD_LEN: usize = sc::FLOW_HEADER_LEN + 1 + 32;
+
+/// Milliseconds the custody identity's signature may take before the
+/// ATTEST is refused. Wall-clock, not steps: how many steps the vault's
+/// job needs depends on the suite and the target, how many a second holds
+/// on the graph's tick. Generous against the slowest target's P-256
+/// signature, so only a vault that has stopped answering is given up on.
+const CUSTODY_SIGN_MS: u64 = 30_000;
+
 /// `OPEN_OR_GENERATE` a key under `label`; the handle, or -1. `pub_out`
 /// receives the public half when the suite has one.
 unsafe fn cont_vault_open_or_generate(
@@ -1202,19 +1245,24 @@ unsafe fn cont_vault_open_or_generate(
     label: &[u8],
     pub_out: &mut [u8],
 ) -> i32 {
-    let mut arg = [0u8; 8 + kv::MAX_LABEL + 12];
-    if label.len() > kv::MAX_LABEL {
+    let mut arg = [0u8; kv::open::MAX_ARG];
+    let req = kv::open::Request {
+        suite,
+        usage,
+        flags: 0,
+        label,
+    };
+    let Some(n) = kv::open::encode(&mut arg, &req) else {
         return -1;
-    }
-    arg[0..2].copy_from_slice(&suite.to_le_bytes());
-    arg[2..6].copy_from_slice(&usage.to_le_bytes());
-    arg[6] = 0;
-    arg[7] = label.len() as u8;
-    arg[8..8 + label.len()].copy_from_slice(label);
-    let t = 8 + label.len();
-    arg[t..t + 8].copy_from_slice(&(pub_out.as_mut_ptr() as u64).to_le_bytes());
-    arg[t + 8..t + 10].copy_from_slice(&(pub_out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, arg.as_mut_ptr(), t + 12);
+    };
+    let rc = (sys.provider_call)(
+        -1,
+        kv::OPEN_OR_GENERATE,
+        arg.as_mut_ptr(),
+        n,
+        pub_out.as_mut_ptr(),
+        pub_out.len(),
+    );
     if rc < 0 {
         -1
     } else {
@@ -1222,7 +1270,8 @@ unsafe fn cont_vault_open_or_generate(
     }
 }
 
-/// `AEAD_SEAL` `pt` under `handle` with `aad`; bytes written to `out`, or 0.
+/// `AEAD_SEAL` `pt` under `handle` with `aad` into `out` as
+/// `[nonce:12][ciphertext][tag:16]`; bytes written, or 0.
 unsafe fn cont_vault_seal(
     sys: &SyscallTable,
     handle: i32,
@@ -1230,31 +1279,38 @@ unsafe fn cont_vault_seal(
     pt: &[u8],
     out: &mut [u8],
 ) -> usize {
-    let mut arg = [0u8; 2 + CONT_AAD_LEN + 2 + TLS_SECRET_SET_LEN + 12];
-    if aad.len() > CONT_AAD_LEN || pt.len() > TLS_SECRET_SET_LEN {
+    use kv::aead as a;
+    let sealed = pt.len() + a::TAG_LEN;
+    if aad.len() > CONT_AAD_LEN || out.len() < a::NONCE_LEN + sealed {
         return 0;
     }
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + aad.len()].copy_from_slice(aad);
-    p += aad.len();
-    arg[p..p + 2].copy_from_slice(&(pt.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + pt.len()].copy_from_slice(pt);
-    p += pt.len();
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, kv::AEAD_SEAL, arg.as_mut_ptr(), p + 12);
-    let n = u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize;
-    cont_wipe(&mut arg);
-    if rc < 0 {
+    let mut arg = [0u8; a::HEADER + CONT_AAD_LEN];
+    let Some(n) = a::encode(&mut arg, &[0; a::NONCE_LEN], pt.len() as u32, aad) else {
+        return 0;
+    };
+    let body = &mut out[a::NONCE_LEN..a::NONCE_LEN + sealed];
+    body[..pt.len()].copy_from_slice(pt);
+    let rc = (sys.provider_call)(
+        handle,
+        kv::AEAD_SEAL,
+        arg.as_mut_ptr(),
+        n,
+        body.as_mut_ptr(),
+        body.len(),
+    );
+    if rc != sealed as i32 {
+        cont_wipe(body);
         return 0;
     }
-    n
+    let Some(nonce) = a::nonce(&arg) else {
+        return 0;
+    };
+    out[..a::NONCE_LEN].copy_from_slice(&nonce);
+    a::NONCE_LEN + sealed
 }
 
-/// `AEAD_OPEN` `blob` under `handle` with `aad`; bytes written to `out`, or 0.
+/// `AEAD_OPEN` `blob` (`[nonce:12][ciphertext][tag:16]`) under `handle`
+/// with `aad`; plaintext bytes written to `out`, or 0.
 unsafe fn cont_vault_open(
     sys: &SyscallTable,
     handle: i32,
@@ -1262,32 +1318,54 @@ unsafe fn cont_vault_open(
     blob: &[u8],
     out: &mut [u8],
 ) -> usize {
-    let mut arg = [0u8; 2 + CONT_AAD_LEN + 2 + TLS_SEALED_LEN + 12];
-    if aad.len() > CONT_AAD_LEN || blob.len() > TLS_SEALED_LEN {
+    use kv::aead as a;
+    if aad.len() > CONT_AAD_LEN
+        || blob.len() > TLS_SEALED_LEN
+        || blob.len() < a::NONCE_LEN + a::TAG_LEN
+    {
         return 0;
     }
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + aad.len()].copy_from_slice(aad);
-    p += aad.len();
-    arg[p..p + 2].copy_from_slice(&(blob.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + blob.len()].copy_from_slice(blob);
-    p += blob.len();
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, kv::AEAD_OPEN, arg.as_mut_ptr(), p + 12);
-    if rc < 0 {
+    let sealed = blob.len() - a::NONCE_LEN;
+    let pt_len = sealed - a::TAG_LEN;
+    if out.len() < pt_len {
         return 0;
     }
-    u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize
+    let mut nonce = [0u8; a::NONCE_LEN];
+    nonce.copy_from_slice(&blob[..a::NONCE_LEN]);
+    let mut arg = [0u8; a::HEADER + CONT_AAD_LEN];
+    let Some(n) = a::encode(&mut arg, &nonce, sealed as u32, aad) else {
+        return 0;
+    };
+    let mut body = [0u8; TLS_SEALED_LEN];
+    body[..sealed].copy_from_slice(&blob[a::NONCE_LEN..]);
+    let rc = (sys.provider_call)(
+        handle,
+        kv::AEAD_OPEN,
+        arg.as_mut_ptr(),
+        n,
+        body.as_mut_ptr(),
+        sealed,
+    );
+    if rc != pt_len as i32 {
+        cont_wipe(&mut body);
+        return 0;
+    }
+    out[..pt_len].copy_from_slice(&body[..pt_len]);
+    cont_wipe(&mut body);
+    pt_len
 }
 
 /// Free a vault handle.
 unsafe fn cont_vault_destroy(sys: &SyscallTable, handle: i32) {
     if handle >= 0 {
-        let _ = (sys.provider_call)(handle, kv::DESTROY, core::ptr::null_mut(), 0);
+        let _ = (sys.provider_call)(
+            handle,
+            kv::DESTROY,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -1330,7 +1408,14 @@ unsafe fn cont_derive_key(s: &mut TlsState, flow: &[u8; sc::FLOW_ID_BYTES], epoc
     arg[c..c + sc::FLOW_ID_BYTES].copy_from_slice(flow);
     arg[c + sc::FLOW_ID_BYTES..c + ctx_len].copy_from_slice(&epoch.to_le_bytes());
     let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(master, kv::DERIVE, arg.as_mut_ptr(), c + ctx_len);
+    let rc = (sys.provider_call)(
+        master,
+        kv::DERIVE,
+        arg.as_mut_ptr(),
+        c + ctx_len,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         -1
     } else {
@@ -2400,7 +2485,7 @@ fn retx_room(len: u16, anchored: bool, cap: usize, total: usize) -> bool {
 /// of what the window holds — because the transport names absolute
 /// sequences and the window was filled before the first one arrived. The
 /// first acknowledgement anchors it by `isn`, the sequence of the stream's
-/// first byte, which `ip`'s `MSG_ACK` carries.
+/// first byte, which `ip`'s `MSG_RETX_ACK` carries.
 fn retx_slide(
     buf: &mut [u8],
     len: &mut u16,
@@ -2532,11 +2617,11 @@ unsafe fn cont_out_admits_strict(sys: &SyscallTable, ch: i32) -> bool {
     if ch < 0 {
         return true;
     }
-    let mut free = [0u8; 4];
-    if dev_channel_ioctl(sys, ch, IOCTL_WRITABLE, free.as_mut_ptr(), 4) < 0 {
+    let free = dev_channel_writable(sys, ch);
+    if free < 0 {
         return true;
     }
-    u32::from_le_bytes(free) as usize >= CONT_OUT_NEED
+    free as usize >= CONT_OUT_NEED
 }
 
 /// Mirror the retransmit window sliding on a transport acknowledgement.
@@ -2735,7 +2820,7 @@ unsafe fn emit_record(s: &mut TlsState, idx: usize, rec: *const u8, total: usize
             let sess = &s.sessions[idx];
             let held = usize::from(sess.cont.tx_hold_len);
             let busy = sess.retx_len.saturating_add(held as u16);
-            if !retx_room(busy, sess.retx_seq_anchored, RETX_BUF_SIZE, total) {
+            if retains(sess) && !retx_room(busy, sess.retx_seq_anchored, RETX_BUF_SIZE, total) {
                 return EmitOutcome::Blocked;
             }
             let c = &mut s.sessions[idx].cont;
@@ -2830,7 +2915,8 @@ unsafe fn write_record_now(s: &mut TlsState, idx: usize, rec: *const u8, total: 
         if sess.cont.abandon_blocks() {
             return false;
         }
-        if !retx_room(sess.retx_len, sess.retx_seq_anchored, RETX_BUF_SIZE, total) {
+        if retains(sess) && !retx_room(sess.retx_len, sess.retx_seq_anchored, RETX_BUF_SIZE, total)
+        {
             s.retx_full = s.retx_full.wrapping_add(1);
             return false;
         }
@@ -3050,7 +3136,7 @@ unsafe fn continuity_rx_gate(s: &mut TlsState, idx: usize, rec_len: usize) -> bo
     true
 }
 
-/// Under a strict pair whose consumer acknowledges (`delivery_ack`): may
+/// Under a strict pair whose consumer acknowledges (CURSORS): may
 /// the record at the head of recv_buf (`rec_len` payload bytes) be opened
 /// and handed up? Only while what stands unconsumed with it fits what the
 /// standby holds for a takeover to redeliver — fewer than
@@ -3063,7 +3149,7 @@ unsafe fn continuity_rx_gate(s: &mut TlsState, idx: usize, rec_len: usize) -> bo
 /// `CONT_HORIZON_MS` while the caps hold, the pair is abandoned and the
 /// connection goes on unmirrored (`redeliver_cap_abandoned`).
 unsafe fn redelivery_room(s: &mut TlsState, idx: usize, rec_len: usize) -> bool {
-    // Without `delivery_ack` a delivery is consumed when it is handed up,
+    // Without CURSORS a delivery is consumed when it is handed up,
     // and its consumption is mirrored here too, before the next is opened:
     // the standby never holds more deliveries than the caps either way.
     mirror_consumed(s, idx);
@@ -3161,10 +3247,10 @@ unsafe fn continuity_rx_owed(s: &mut TlsState, idx: usize) {
 }
 
 /// A record's `len` bytes of plaintext reached clear_out. Without
-/// `delivery_ack` that is also its consumption; with it the record waits,
+/// the cursors granted that is also its consumption; with them the record waits,
 /// by where it ends, for the consumer's acknowledgement to reach that byte.
 fn note_delivered(s: &mut TlsState, idx: usize, len: usize) {
-    let worker_acks = s.delivery_ack != 0;
+    let worker_acks = s.sessions[idx].clear_flags & flag::CURSORS != 0;
     let c = &mut s.sessions[idx].cont;
     c.delivered_in = c.delivered_in.wrapping_add(1);
     c.handed_bytes = c.handed_bytes.wrapping_add(len as u64);
@@ -3191,8 +3277,8 @@ fn note_delivered(s: &mut TlsState, idx: usize, len: usize) {
 }
 
 /// The clear-side consumer has consumed the stream's first `in_bytes`
-/// clear bytes and stands at `cursor` there (`CMD_DELIVERED`, under
-/// `delivery_ack`). The records whose plaintext ends at or before that byte
+/// clear bytes and stands at `cursor` there (`CMD_CURSOR_DELIVERED`, on a
+/// connection granted CURSORS). The records whose plaintext ends at or before that byte
 /// are consumed; one it falls inside is not, and a takeover redelivers it
 /// from that byte. An acknowledgement behind the last, or past what was
 /// handed up (with the part of a record still going out), is ignored.
@@ -4587,8 +4673,24 @@ unsafe fn activate_shadow(s: &mut TlsState, sh: usize, new_epoch: u32, conn_id: 
             return false;
         }
     };
+    // The sidebands the connection carries here: what this host's transport
+    // grants on the lane (and a moved retransmit window says the primary's
+    // did not keep a copy), and what this host's consumer asked for.
+    let cipher_flags = s.cipher_grant
+        | if ck.retx_len > 0 || ck.retx_anchored {
+            flag::RETX
+        } else {
+            0
+        };
+    let asked = if ck.is_server {
+        s.bind_flags
+    } else {
+        s.dial_flags
+    };
     let sess = &mut s.sessions[idx];
     sess.cont.reset();
+    sess.cipher_flags = cipher_flags;
+    sess.clear_flags = clear_grant(asked, cipher_flags);
     sess.driver.reset();
     sess.driver.is_server = ck.is_server;
     sess.driver.suite = suite;
@@ -4894,6 +4996,11 @@ unsafe fn handle_custody(s: &mut TlsState, p: &[u8]) {
     let epoch = u32::from_le_bytes([p[16], p[17], p[18], p[19]]);
     let op = p[20];
     let body = &p[21..];
+    if op == cu::ATTEST && s.custody_job.recipient >= 0 && p.len() == CUSTODY_ATTEST_CMD_LEN {
+        s.custody_held[..p.len()].copy_from_slice(p);
+        s.custody_held_len = p.len() as u8;
+        return;
+    }
     let r = match op {
         cu::ATTEST => custody_attest(s, &flow, epoch, body),
         cu::WRAP => custody_wrap(s, &flow, epoch, body),
@@ -4907,7 +5014,9 @@ unsafe fn handle_custody(s: &mut TlsState, p: &[u8]) {
 
 type CustodyResult = Result<(), (u8, u8)>;
 
-/// ATTEST `[challenge:32]`: a fresh recipient under `name`, attested.
+/// ATTEST `[challenge:32]`: a fresh recipient under `name`, its record
+/// taken from the vault and handed to the custody identity to sign; the
+/// evidence is answered by `custody_attest_step` when the signature arrives.
 unsafe fn custody_attest(
     s: &mut TlsState,
     name: &[u8; sc::FLOW_ID_BYTES],
@@ -4919,71 +5028,135 @@ unsafe fn custody_attest(
     if body.len() != 32 {
         return Err((sc::STATUS_CORRUPT, cu::why::EVIDENCE));
     }
-    let signer = custody_signer(s);
-    if signer < 0 {
+    if custody_signer(s) < 0 {
         return Err(vault);
     }
     // A later ATTEST under the same name replaces the recipient.
     if let Some(i) = cont_key_find(s, &[KEY_RECIPIENT], name, epoch) {
         cont_key_free(s, i);
     }
-    let Some(slot) = cont_key_alloc(s) else {
-        return Err(vault);
-    };
     let sys = &*s.syscalls;
-    // GENERATE: [suite:u16][usage:u32][flags:u8][_pad:u8]
-    //           [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
-    let mut rpub = [0u8; cu::PUB_LEN];
-    let mut g = [0u8; 20];
-    g[0..2].copy_from_slice(&kv::suite::P256.to_le_bytes());
-    let usage = kv::usage::AGREE | kv::usage::EXPORT_PUBLIC;
-    g[2..6].copy_from_slice(&usage.to_le_bytes());
-    g[8..16].copy_from_slice(&(rpub.as_mut_ptr() as u64).to_le_bytes());
-    g[16..18].copy_from_slice(&(cu::PUB_LEN as u16).to_le_bytes());
-    let recipient = (sys.provider_call)(-1, kv::GENERATE, g.as_mut_ptr(), g.len());
-    if recipient < 0 || u16::from_le_bytes([g[18], g[19]]) as usize != cu::PUB_LEN {
-        cont_vault_destroy(sys, recipient);
-        return Err(vault);
-    }
-    // ATTEST_KEY: [challenge:32][signer:i32][_pad:u32][out_ptr:u64]
-    //             [out_cap:u32][out_len_out:u32]
-    let mut ev = [0u8; cu::EVIDENCE_MAX];
-    let mut rec = [0u8; cu::RECORD_LEN + cu::SIG_MAX];
-    let mut a = [0u8; kv::attest_key::ARG_LEN];
-    a[..32].copy_from_slice(body);
-    a[kv::attest_key::SIGNER..kv::attest_key::SIGNER + 4].copy_from_slice(&signer.to_le_bytes());
-    a[kv::attest_key::OUT_PTR..kv::attest_key::OUT_PTR + 8]
-        .copy_from_slice(&(rec.as_mut_ptr() as u64).to_le_bytes());
-    a[kv::attest_key::OUT_CAP..kv::attest_key::OUT_CAP + 4]
-        .copy_from_slice(&(rec.len() as u32).to_le_bytes());
-    let rc = (sys.provider_call)(recipient, kv::ATTEST_KEY, a.as_mut_ptr(), a.len());
-    let n = u32::from_le_bytes([
-        a[kv::attest_key::OUT_LEN],
-        a[kv::attest_key::OUT_LEN + 1],
-        a[kv::attest_key::OUT_LEN + 2],
-        a[kv::attest_key::OUT_LEN + 3],
-    ]) as usize;
-    if rc < 0 || n <= cu::RECORD_LEN || n > rec.len() {
-        cont_vault_destroy(sys, recipient);
-        return Err(vault);
-    }
-    let sig_len = n - cu::RECORD_LEN;
-    ev[..cu::RECORD_LEN].copy_from_slice(&rec[..cu::RECORD_LEN]);
-    ev[cu::RECIPIENT..cu::RECIPIENT + cu::PUB_LEN].copy_from_slice(&rpub);
-    ev[cu::SIGNER..cu::SIGNER + cu::PUB_LEN].copy_from_slice(&s.custody_signer_pub);
-    ev[cu::SIG_LEN..cu::SIG_LEN + 2].copy_from_slice(&(sig_len as u16).to_le_bytes());
-    ev[cu::SIG..cu::SIG + sig_len].copy_from_slice(&rec[cu::RECORD_LEN..n]);
-    cont_key_put(s, slot, KEY_RECIPIENT, name, epoch, recipient);
-    custody_reply(
-        s,
-        name,
-        epoch,
-        cu::ATTEST,
-        sc::STATUS_OK,
+    let mut job = NO_CUSTODY_ATTEST;
+    let mut g = kv::generate::encode(
+        kv::suite::P256,
+        kv::usage::AGREE | kv::usage::EXPORT_PUBLIC,
         0,
-        &ev[..cu::SIG + sig_len],
     );
+    let recipient = (sys.provider_call)(
+        -1,
+        kv::GENERATE,
+        g.as_mut_ptr(),
+        g.len(),
+        job.rpub.as_mut_ptr(),
+        job.rpub.len(),
+    );
+    if recipient < 0 || kv::generate::len(&g) != Some(cu::PUB_LEN) {
+        cont_vault_destroy(sys, recipient);
+        return Err(vault);
+    }
+    // ATTEST_KEY: the recipient's record, which the custody identity signs
+    // over its SHA-256, in the evidence convention.
+    let mut a = [0u8; kv::attest_key::ARG_LEN];
+    a.copy_from_slice(body);
+    let rc = (sys.provider_call)(
+        recipient,
+        kv::ATTEST_KEY,
+        a.as_mut_ptr(),
+        a.len(),
+        job.record.as_mut_ptr(),
+        cu::RECORD_LEN,
+    );
+    if rc != cu::RECORD_LEN as i32 {
+        cont_vault_destroy(sys, recipient);
+        return Err(vault);
+    }
+    job.digest = sha256(&job.record);
+    job.recipient = recipient;
+    job.name = *name;
+    job.epoch = epoch;
+    job.since_ms = dev_millis(sys);
+    s.custody_job = job;
     Ok(())
+}
+
+/// Advance the ATTEST in flight: one SIGN of the custody identity's job a
+/// step, the identical call each time, until it answers the signature —
+/// then the recipient is kept under its name and the evidence answered —
+/// or refuses, or outlasts `CUSTODY_SIGN_MS`. An ATTEST held meanwhile is
+/// handled once this one is answered.
+unsafe fn custody_attest_step(s: &mut TlsState) -> bool {
+    use sc::custody as cu;
+    if s.custody_job.recipient < 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let job = s.custody_job;
+    let mut sig = [0u8; cu::SIG_MAX];
+    sig[..32].copy_from_slice(&job.digest);
+    let mut arg = kv::sign::encode(kv::sign_mode::DIGEST, 32);
+    let rc = (sys.provider_call)(
+        s.custody_signer,
+        kv::SIGN,
+        arg.as_mut_ptr(),
+        arg.len(),
+        sig.as_mut_ptr(),
+        sig.len(),
+    );
+    let sig_len = if rc == abi::errno::EAGAIN || rc == abi::errno::EBUSY {
+        if dev_millis(sys).wrapping_sub(job.since_ms) <= CUSTODY_SIGN_MS {
+            return true;
+        }
+        0
+    } else if rc > 0 && rc as usize <= cu::SIG_MAX {
+        rc as usize
+    } else {
+        0
+    };
+    s.custody_job = NO_CUSTODY_ATTEST;
+    let slot = if sig_len == 0 {
+        None
+    } else {
+        cont_key_alloc(s)
+    };
+    match slot {
+        Some(slot) => {
+            let mut ev = [0u8; cu::EVIDENCE_MAX];
+            ev[..cu::RECORD_LEN].copy_from_slice(&job.record);
+            ev[cu::RECIPIENT..cu::RECIPIENT + cu::PUB_LEN].copy_from_slice(&job.rpub);
+            ev[cu::SIGNER..cu::SIGNER + cu::PUB_LEN].copy_from_slice(&s.custody_signer_pub);
+            ev[cu::SIG_LEN..cu::SIG_LEN + 2].copy_from_slice(&(sig_len as u16).to_le_bytes());
+            ev[cu::SIG..cu::SIG + sig_len].copy_from_slice(&sig[..sig_len]);
+            cont_key_put(s, slot, KEY_RECIPIENT, &job.name, job.epoch, job.recipient);
+            custody_reply(
+                s,
+                &job.name,
+                job.epoch,
+                cu::ATTEST,
+                sc::STATUS_OK,
+                0,
+                &ev[..cu::SIG + sig_len],
+            );
+        }
+        None => {
+            cont_vault_destroy(&*s.syscalls, job.recipient);
+            custody_reply(
+                s,
+                &job.name,
+                job.epoch,
+                cu::ATTEST,
+                sc::STATUS_NO_CAPACITY,
+                cu::why::VAULT,
+                &[],
+            );
+        }
+    }
+    let held = s.custody_held_len as usize;
+    if held != 0 {
+        let cmd = s.custody_held;
+        s.custody_held_len = 0;
+        handle_custody(s, &cmd[..held]);
+    }
+    true
 }
 
 /// WRAP `[challenge:32][evidence]`: the flow's sealing key, wrapped to the
@@ -5031,17 +5204,22 @@ unsafe fn custody_wrap(
         return refuse(cu::why::RECIPIENT);
     }
     let sys = &*s.syscalls;
-    // VERIFY with the signer's public key: [hash_len:u16][sig_len:u16]
-    // [pub_len:u16][_pad:u16][hash][sig][pub].
+    // VERIFY with the signer's public key: digest ‖ signature ‖ public key.
     let digest = sha256(record);
-    let mut v = [0u8; 8 + 32 + cu::SIG_MAX + cu::PUB_LEN];
-    v[0..2].copy_from_slice(&32u16.to_le_bytes());
-    v[2..4].copy_from_slice(&(cu::SIG_MAX as u16).to_le_bytes());
-    v[4..6].copy_from_slice(&(cu::PUB_LEN as u16).to_le_bytes());
-    v[8..40].copy_from_slice(&digest);
-    v[40..40 + cu::SIG_MAX].copy_from_slice(sig);
-    v[40 + cu::SIG_MAX..].copy_from_slice(signer);
-    if (sys.provider_call)(-1, kv::VERIFY, v.as_mut_ptr(), v.len()) != 1 {
+    let mut v = [0u8; 32 + cu::SIG_MAX + cu::PUB_LEN];
+    v[..32].copy_from_slice(&digest);
+    v[32..32 + cu::SIG_MAX].copy_from_slice(sig);
+    v[32 + cu::SIG_MAX..].copy_from_slice(signer);
+    let mut va = kv::verify::encode(32, cu::SIG_MAX as u16, cu::PUB_LEN as u16);
+    if (sys.provider_call)(
+        -1,
+        kv::VERIFY,
+        va.as_mut_ptr(),
+        va.len(),
+        v.as_mut_ptr(),
+        v.len(),
+    ) != 1
+    {
         return refuse(cu::why::SIGNATURE);
     }
     // The flow must be a live session of this instance: the key it seals
@@ -5059,20 +5237,23 @@ unsafe fn custody_wrap(
     if key < 0 {
         return Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT));
     }
-    // KEY_WRAP: [dest_pub_len:u16][dest_pub][attest_digest:32]
-    //           [out_ptr:u64][out_cap:u16][out_len_out:u16]
+    // KEY_WRAP: arg [dest_pub][attest_digest][len], the wrapped key in `data`.
     let mut blob = [0u8; cu::WRAPPED_LEN];
-    let mut w = [0u8; 2 + cu::PUB_LEN + 32 + 12];
-    w[0..2].copy_from_slice(&(cu::PUB_LEN as u16).to_le_bytes());
-    w[2..2 + cu::PUB_LEN].copy_from_slice(recipient);
-    let c = 2 + cu::PUB_LEN;
-    w[c..c + 32].copy_from_slice(&record[ak::R_COMPOSITION..ak::R_COMPOSITION + 32]);
-    w[c + 32..c + 40].copy_from_slice(&(blob.as_mut_ptr() as u64).to_le_bytes());
-    w[c + 40..c + 42].copy_from_slice(&(blob.len() as u16).to_le_bytes());
+    let mut dest = [0u8; kv::wrap::EPH_PUB_LEN];
+    dest.copy_from_slice(recipient);
+    let mut attest = [0u8; 32];
+    attest.copy_from_slice(&record[ak::R_COMPOSITION..ak::R_COMPOSITION + 32]);
+    let mut w = kv::key_wrap::encode(&dest, &attest);
     let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(key, kv::KEY_WRAP, w.as_mut_ptr(), w.len());
-    let n = u16::from_le_bytes([w[c + 42], w[c + 43]]) as usize;
-    if rc < 0 || n != cu::WRAPPED_LEN {
+    let rc = (sys.provider_call)(
+        key,
+        kv::KEY_WRAP,
+        w.as_mut_ptr(),
+        w.len(),
+        blob.as_mut_ptr(),
+        blob.len(),
+    );
+    if rc != cu::WRAPPED_LEN as i32 {
         return Err((sc::STATUS_NO_CAPACITY, cu::why::VAULT));
     }
     custody_reply(s, flow, epoch, cu::WRAP, sc::STATUS_OK, 0, &blob);
@@ -5097,20 +5278,33 @@ unsafe fn custody_unwrap(
     };
     let recipient = s.cont_keys[ri].handle;
     let sys = &*s.syscalls;
-    // KEY_UNWRAP: [blob_len:u16][blob]
-    let mut u = [0u8; 2 + cu::WRAPPED_LEN];
-    u[0..2].copy_from_slice(&(cu::WRAPPED_LEN as u16).to_le_bytes());
-    u[2..].copy_from_slice(blob);
-    let key = (sys.provider_call)(recipient, kv::KEY_UNWRAP, u.as_mut_ptr(), u.len());
+    // KEY_UNWRAP: the wrapped key in `data`, no arg.
+    let mut u = [0u8; cu::WRAPPED_LEN];
+    u.copy_from_slice(blob);
+    let key = (sys.provider_call)(
+        recipient,
+        kv::KEY_UNWRAP,
+        core::ptr::null_mut(),
+        0,
+        u.as_mut_ptr(),
+        u.len(),
+    );
     if key < 0 {
         return Err((sc::STATUS_CORRUPT, cu::why::VAULT));
     }
-    // It must be a sealing key, as the primary's are; DESCRIBE:
-    // [suite_out:u16][usage_out:u32][tier_out:u8][persisted_out:u8].
-    let mut d = [0u8; 8];
-    let rc = (sys.provider_call)(key, kv::DESCRIBE, d.as_mut_ptr(), d.len());
-    let suite = u16::from_le_bytes([d[0], d[1]]);
-    let usage = u32::from_le_bytes([d[2], d[3], d[4], d[5]]);
+    // It must be a sealing key, as the primary's are.
+    let mut d = [0u8; kv::describe::ARG_LEN];
+    let rc = (sys.provider_call)(
+        key,
+        kv::DESCRIBE,
+        d.as_mut_ptr(),
+        d.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    let described = kv::describe::parse(&d);
+    let suite = described.map_or(0, |x| x.suite);
+    let usage = described.map_or(0, |x| x.usage);
     if rc < 0
         || suite != kv::suite::AEAD_KEY
         || usage & (kv::usage::SEAL | kv::usage::OPEN) != kv::usage::SEAL | kv::usage::OPEN
@@ -5266,8 +5460,8 @@ unsafe fn local_close_step(s: &mut TlsState, idx: usize) -> bool {
         s.cipher_out,
         NET_CMD_CLOSE,
         conn_id,
-        core::ptr::null(),
-        0,
+        HOW_ORDERLY.as_ptr(),
+        1,
     ) {
         return false;
     }
@@ -5363,12 +5557,17 @@ unsafe fn continuity_step(s: &mut TlsState) -> bool {
         }
         i += 1;
     }
+    if custody_attest_step(s) {
+        did_work = true;
+    }
     if s.cont_in < 0 {
         return did_work;
     }
     let sys = &*s.syscalls;
     let mut drained = 0u32;
-    while drained < CONT_DRAIN_BUDGET {
+    // An ATTEST held behind the one being signed stops the drain: the
+    // commands after it stay unread, in order, until it is handled.
+    while drained < CONT_DRAIN_BUDGET && s.custody_held_len == 0 {
         let poll = (sys.channel_poll)(s.cont_in, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;

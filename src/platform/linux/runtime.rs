@@ -366,26 +366,26 @@ fn linux_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
 
 /// Staged-code page-permission flip, for the OTA staging buffers and the
 /// workload code pool: RW while bytes land, RX once committed (W^X — a
-/// staged region is only ever writable OR executable). `base` must start a
-/// host page, and the caller owns its buffer out to the end of the last
-/// page `len` reaches: the range is rounded up, never down, so no change
-/// reaches a neighbour before `base`. A base that is not page-aligned is
+/// staged region is only ever writable OR executable). `region` must start
+/// a host page, and the caller owns its buffer out to the end of the last
+/// page `region` reaches: the range is rounded up, never down, so no change
+/// reaches a neighbour before it. A region that does not start a page is
 /// refused rather than rounded onto a neighbour.
-fn linux_ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
+fn linux_ota_stage_protect(region: &mut [u8], executable: bool) -> bool {
     // SAFETY: sysconf on a valid selector.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page <= 0 {
         return false;
     }
     let page = page as usize;
-    let start = base as usize;
+    let start = region.as_mut_ptr() as usize;
     if !start.is_multiple_of(page) {
         log::error!(
             "[ota] stage protect: base {start:#x} is not aligned to the host's {page}-byte page"
         );
         return false;
     }
-    let end = (start + len + page - 1) & !(page - 1);
+    let end = (start + region.len() + page - 1) & !(page - 1);
     let prot = if executable {
         libc::PROT_READ | libc::PROT_EXEC
     } else {
@@ -425,6 +425,12 @@ fn linux_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
     }
 }
 
+/// The handles this platform's provider tables can hand modules at once:
+/// the library's tables and the host object and namespace tables.
+fn linux_handle_slots() -> usize {
+    fluxor::platform::linux::providers::handle_slots() + OBJ_MAX_OPEN + NS_MAX_OPEN
+}
+
 fn linux_init_providers() {
     // Instance scoping first: `FLUXOR_STATE_DIR` (this instance's own state
     // directory, locked for the runtime's life; distinct from
@@ -443,6 +449,7 @@ fn linux_init_providers() {
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
+    provider::register_platform_handle_slots(linux_handle_slots);
     // What an owner holds of the platform goes with the owner.
     provider::register_owner_release_hook(linux_owner_released);
     provider::register(dev_class::STREAM_CLOCK, linux_stream_time_dispatch);
@@ -640,17 +647,17 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     metal_device: None,
 };
 
-fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+fn linux_csprng_fill(buf: &mut [u8]) -> i32 {
     // `libc::SYS_getrandom` is the canonical per-arch syscall selector
     // and `libc::syscall` handles the platform-specific calling
     // convention, so this compiles correctly (or fails loudly) on any
     // architecture libc supports — no hand-rolled `svc`/asm or
     // hardcoded syscall numbers.
+    let len = buf.len();
     // SAFETY: `libc::syscall` invoked with the per-arch SYS_getrandom
-    // selector and `(buf, len, flags=0)` matches `getrandom(2)`. The
-    // caller supplies `buf`/`len` from a Rust slice, so the pointer
-    // is valid for writes of `len` bytes.
-    let ret = unsafe { libc::syscall(libc::SYS_getrandom, buf as *mut libc::c_void, len, 0u32) };
+    // selector and `(buf, len, flags=0)` matches `getrandom(2)`; `buf` is
+    // a live exclusive slice, writable for its whole length.
+    let ret = unsafe { libc::syscall(libc::SYS_getrandom, buf.as_mut_ptr() as *mut libc::c_void, len, 0u32) };
     if ret < 0 || ret as usize != len {
         return -1;
     }

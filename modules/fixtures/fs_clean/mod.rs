@@ -312,7 +312,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     match s.phase {
         PH_OPEN => {
             let mut root = *b"/";
-            let rc = (sys.provider_call)(-1, FS_OPENDIR, root.as_mut_ptr(), root.len());
+            let rc = (sys.provider_call)(
+                -1,
+                FS_OPENDIR,
+                root.as_mut_ptr(),
+                root.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == EAGAIN {
                 return StepReturn::Continue; // the volume is not mounted yet
             }
@@ -326,7 +333,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             s.phase = PH_READ;
         }
         PH_READ => {
-            let rc = (sys.provider_call)(s.dir, FS_READDIR, s.buf.as_mut_ptr(), s.buf.len());
+            let rc = (sys.provider_call)(
+                s.dir,
+                FS_READDIR,
+                s.buf.as_mut_ptr(),
+                s.buf.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == EAGAIN {
                 return StepReturn::Continue;
             }
@@ -334,7 +348,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 take_batch(s, rc as usize);
                 return StepReturn::Continue;
             }
-            (sys.provider_call)(s.dir, FS_CLOSE, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                s.dir,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             s.dir = -1;
             if rc < 0 {
                 s.last_rc = rc;
@@ -359,7 +380,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                     s.cursor -= 1;
                     return StepReturn::Continue;
                 }
-                let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_UNLINK,
+                    path.as_mut_ptr(),
+                    n,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 // Not yet, or taken and not yet decided: the same name, with
                 // the same bytes, on the next step.
                 if rc == EAGAIN || rc == abi::kernel_abi::errno::EINPROGRESS {

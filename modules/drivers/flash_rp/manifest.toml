@@ -1,10 +1,11 @@
 version = "1.0.0"
 type = "EventHandler"
 hardware_targets = ["rp2350", "rp2040"]
-grants = ["flash"]
+grants = ["flash", "lend.borrow"]
 # `store` (out[2]) is a `storage.block` source over the flash's data store.
+# `stream` (out[1]) serves `stream_select`: its consumer picks the blob.
 provides = ["storage.block"]
-provider_contracts = ["runtime_params"]
+provider_contracts = ["runtime_params", "storage.block", "stream_select"]
 deferred_ready = true
 
 # BOOTSEL button driver — reads the QSPI CS pin via the flash
@@ -21,13 +22,15 @@ buffer_size = 64
 max_record = 1
 
 # Blob serving / asset bank source — flash-resident preset blobs
-# served on demand via IOCTL_NOTIFY. Used by waveshare image_viewer
+# served on demand: the consumer selects one by index (`stream_select`).
+# Used by waveshare image_viewer
 # bare-metal builds where the gallery is baked into flash.
 [[ports]]
 name = "stream"
 index = 1
 direction = "output"
 content_type = "OctetStream"
+serves = "stream_select"
 # Blob stream.
 buffer_size = 2048
 # BLOB_CHUNK_SIZE — blobs are emitted in 512-byte chunks.
@@ -41,6 +44,7 @@ name = "store"
 index = 2
 direction = "output"
 content_type = "OctetStream"
+serves = "storage.block"
 
 # Module-scope observability — exempt.
 [observability]

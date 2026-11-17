@@ -339,8 +339,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
 
     match s.phase {
         PH_CREATE => {
-            let rc =
-                (sys.provider_call)(-1, FS_OPEN_CREATE, s.path.as_mut_ptr(), s.path_len as usize);
+            let rc = (sys.provider_call)(
+                -1,
+                FS_OPEN_CREATE,
+                s.path.as_mut_ptr(),
+                s.path_len as usize,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -372,7 +378,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 chunk[i] = pattern_byte(s.idx, s.round, off + i);
                 i += 1;
             }
-            let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_WRITE,
+                chunk.as_mut_ptr(),
+                n,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -385,7 +398,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_SUBMIT => {
-            let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, s.ticket.as_mut_ptr(), 8);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_FSYNC_SUBMIT,
+                s.ticket.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -398,7 +418,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_POLL => {
-            let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, s.ticket.as_mut_ptr(), 8);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_FSYNC_POLL,
+                s.ticket.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == FENCE_PENDING || rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -413,7 +440,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_CLOSE => {
-            let rc = (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -439,7 +473,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_VOPEN => {
-            let rc = (sys.provider_call)(-1, FS_OPEN, s.path.as_mut_ptr(), s.path_len as usize);
+            let rc = (sys.provider_call)(
+                -1,
+                FS_OPEN,
+                s.path.as_mut_ptr(),
+                s.path_len as usize,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -477,7 +518,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 total - off
             };
             let mut chunk = [0u8; CHUNK];
-            let rc = (sys.provider_call)(s.fd, FS_READ, chunk.as_mut_ptr(), n);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_READ,
+                chunk.as_mut_ptr(),
+                n,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -503,7 +551,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
 
         PH_VCLOSE => {
             if s.fd >= 0 {
-                let _ = (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                let _ = (sys.provider_call)(
+                    s.fd,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 s.fd = -1;
             }
             s.idx += 1;

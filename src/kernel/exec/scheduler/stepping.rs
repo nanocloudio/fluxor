@@ -358,8 +358,8 @@ pub(crate) fn handle_mpu_fault(
 ///
 /// 1. `syscalls::release_module_handles` releases everything the module
 ///    registered or opened: events, timers, platform handles (DMA among
-///    them), provider layers and the channel ioctl handlers it bound.
-/// 2. Every connected channel (in / out / ctrl) is `IOCTL_FLUSH`'d.
+///    them), provider layers, and the mailbox records it held lent.
+/// 2. Every connected channel (in / out / ctrl) is flushed.
 /// 3. If the module was `deferred_ready`, its ready bit is reset.
 /// 4. Fault state moves back to `Running`; `finished[idx]` is cleared.
 ///
@@ -393,29 +393,17 @@ pub(crate) fn handle_module_restart(
     let ports = &sched.ports[module_idx];
     for i in 0..ports.in_count as usize {
         if ports.in_chans[i] >= 0 {
-            channel::channel_ioctl(
-                ports.in_chans[i],
-                channel::IOCTL_FLUSH,
-                core::ptr::null_mut(),
-            );
+            channel::channel_flush(ports.in_chans[i]);
         }
     }
     for i in 0..ports.out_count as usize {
         if ports.out_chans[i] >= 0 {
-            channel::channel_ioctl(
-                ports.out_chans[i],
-                channel::IOCTL_FLUSH,
-                core::ptr::null_mut(),
-            );
+            channel::channel_flush(ports.out_chans[i]);
         }
     }
     for i in 0..ports.ctrl_count as usize {
         if ports.ctrl_chans[i] >= 0 {
-            channel::channel_ioctl(
-                ports.ctrl_chans[i],
-                channel::IOCTL_FLUSH,
-                core::ptr::null_mut(),
-            );
+            channel::channel_flush(ports.ctrl_chans[i]);
         }
     }
 
@@ -693,7 +681,7 @@ pub fn step_modules(modules: &mut [ModuleSlot], count: usize) -> StepResult {
     // tick T finishes.
     pump_isr_bridges();
     // Reap the completions of torn-down modules' lent buffers.
-    crate::kernel::module::block_lend::pump();
+    crate::kernel::ipc::lend::pump();
 
     if active_count == 0 {
         StepResult::Done

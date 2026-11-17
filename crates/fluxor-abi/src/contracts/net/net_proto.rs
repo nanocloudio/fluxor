@@ -3,21 +3,38 @@
 // Layer: contracts/net (public, stable).
 //
 // In the protocol-surface taxonomy (docs/architecture/protocol_surfaces.md)
-// this contract is the **Stream Surface**: its upstream commands and
-// downstream events match the stream surface vocabulary directly and
-// are consumed unchanged by HTTP, MQTT, and TLS.
+// this contract is the **Stream Surface**: bind, accept, connect, data,
+// close, error and the stream's peer, consumed unchanged by HTTP, MQTT and
+// TLS. Nothing a particular pair of stages shares rides here: the
+// retransmission hand-off between a transport and a record layer that keeps
+// its own copy is `stream_retx`, the trace context is `stream_trace`, and
+// the continuity cursors are `stream_cursor`. A connection carries those
+// only when it asked for them and the transport granted them
+// ([`flag`]), on the same channel and in order with its stream.
 //
-// Stream only. Datagram traffic (UDP and friends) lives on the
-// `datagram` surface in the sibling `datagram.rs`; packet-preserving
-// flows (QUIC/SRTP/classifiers) live on `packet.rs`. The ABI registry's
-// `net_tlv` msgset (`abi/registry.toml`) gives every message type of every
-// surface sharing this header a distinct value, so a shared channel can
-// carry multiple contracts unambiguously.
+// Stream only. Datagram traffic (UDP and friends) lives on the `datagram`
+// surface; packet-preserving flows (QUIC/SRTP/classifiers) live on
+// `packet`. The ABI registry's `net_tlv` msgset (`abi/registry.toml`) gives
+// every message type of every surface sharing this header a distinct value
+// inside the range its surface owns, so a shared channel carries several
+// contracts unambiguously.
 //
-// Frame format: [msg_type: u8] [len: u16 LE] [payload: len bytes]
-// Carried over channels between IP / TLS / HTTP / MQTT modules. The
-// kernel does not interpret these bytes — protocol state lives entirely
-// in the modules.
+// Frame format: `[msg_type: u8] [len: u16 LE] [payload: len bytes]`. Every
+// record has exactly one length (`MSG_DATA` and `CMD_SEND` carry their data
+// after a fixed head); a record of any other length is malformed and its
+// accessor answers `None`.
+//
+// Record size. No constant bounds a record on this surface. Each port that
+// writes it declares the largest frame it writes (`max_record`, header
+// included) and each port that reads it the largest it accepts
+// (`accepts_record`); the composer refuses an edge, fans included, whose
+// producer may write more than a consumer accepts. A module states both
+// figures once, in `module_facts!`, and its manifest must agree.
+//
+// Consumers on a fanned channel. Every stage reading a fanned `net_out`
+// skips a message type it does not know and a `conn_id` it does not hold:
+// a sideband granted to another consumer's connection, or that connection's
+// data, is not its business.
 
 /// Frame header size (msg_type + len).
 ///
@@ -61,6 +78,19 @@ pub fn frame_len(frame: &[u8]) -> usize {
     FRAME_HDR + payload_len(frame)
 }
 
+/// Write a frame header for `payload_len` bytes of `msg_type` into `out`;
+/// `None` when `out` is shorter than [`FRAME_HDR`] or the length does not
+/// fit the `u16` field.
+#[inline]
+pub fn put_header(out: &mut [u8], msg_type: u8, payload_len: usize) -> Option<()> {
+    let n = u16::try_from(payload_len).ok()?.to_le_bytes();
+    let h = out.get_mut(..FRAME_HDR)?;
+    h[0] = msg_type;
+    h[1] = n[0];
+    h[2] = n[1];
+    Some(())
+}
+
 /// Read the leading `conn_id` of a payload. Callers bounds-check
 /// `payload.len() >= CONN_ID_LEN` first (frame validation).
 #[inline]
@@ -74,151 +104,179 @@ pub fn put_conn_id(payload: &mut [u8], conn_id: u16) {
     payload[0..2].copy_from_slice(&conn_id.to_le_bytes());
 }
 
-/// Parts of a `MSG_CONNECTED` payload: `(conn_id, requester_tag)`.
-///
-/// The 2-byte form carries no tag and yields `REQUESTER_TAG_NONE`.
-/// Callers bounds-check `payload.len() >= CONN_ID_LEN` first (frame
-/// validation), as with `conn_id`.
+/// The leading `conn_id` of a payload of any record that opens with one,
+/// or `None` when it is shorter than one.
 #[inline]
-pub fn connected_parts(payload: &[u8]) -> (u16, RequesterTag) {
-    let tag = match payload.get(CONN_ID_LEN..CONNECTED_FIXED) {
-        Some(t) => u16::from_le_bytes([t[0], t[1]]),
-        None => REQUESTER_TAG_NONE,
-    };
-    (conn_id(payload), tag)
+pub fn conn_id_of(payload: &[u8]) -> Option<u16> {
+    let p = payload.get(..CONN_ID_LEN)?;
+    Some(u16::from_le_bytes([p[0], p[1]]))
 }
 
-/// The session generation a `MSG_ACCEPTED` or `MSG_CONNECTED` carries after
-/// its fixed fields (`fixed`: [`ACCEPTED_FIXED`] or [`CONNECTED_FIXED`]), or
-/// 0 when it carries none. A stage that terminates sessions over the
-/// transport's connections (`tls`) numbers each session it opens; its
-/// `peer_identity` records name the session by that number, so a consumer
-/// can tell a connection id's current session from a closed one's.
-#[inline]
-pub fn session_generation(payload: &[u8], fixed: usize) -> u16 {
-    match payload.get(fixed..fixed + SESSION_GENERATION_LEN) {
-        Some(g) => u16::from_le_bytes([g[0], g[1]]),
-        None => 0,
-    }
+fn u16_at(p: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([p[at], p[at + 1]])
 }
 
-/// Bytes a session generation occupies after a record's fixed part.
-pub const SESSION_GENERATION_LEN: usize = 2;
-
-/// Write a session generation at `fixed`, where [`session_generation`] reads
-/// it, and return the length of the record through it: `None` when `buf`
-/// cannot hold it.
-///
-/// The writer and the reader take the same offset, so where the number sits
-/// is stated once: a stage that numbers sessions appends the number after the
-/// fixed fields, and a consumer reads it back from the same place.
-#[inline]
-pub fn put_session_generation(buf: &mut [u8], fixed: usize, generation: u16) -> Option<usize> {
-    let end = fixed.checked_add(SESSION_GENERATION_LEN)?;
-    buf.get_mut(fixed..end)?
-        .copy_from_slice(&generation.to_le_bytes());
-    Some(end)
+/// Per-connection sidebands, asked for in `CMD_BIND` / `CMD_CONNECT_TO`'s
+/// `flags` and answered in `MSG_BOUND` / `MSG_ACCEPTED` / `MSG_CONNECTED`'s
+/// `flags_granted`. A sideband frame for a connection is emitted only when
+/// its bit was granted on it; a bit the provider does not serve is left
+/// clear in the grant, and an undefined bit in a request is refused
+/// `EINVAL`. A listener's grant carries to every connection it accepts.
+pub mod flag {
+    /// `stream_trace`: the transport hands the connection's trace context
+    /// (`MSG_TRACE_CTX`) up before its first data.
+    pub const TRACE: u8 = 0x01;
+    /// `stream_cursor`: the record layer reports the output horizon
+    /// (`MSG_CURSOR_HORIZON`) and holds what it delivered until the
+    /// consumer acknowledges it (`CMD_CURSOR_DELIVERED`); a takeover hands
+    /// the resuming consumer `MSG_CURSOR_RESUMED`.
+    pub const CURSORS: u8 = 0x02;
+    /// Every bit a consumer may ask for.
+    pub const REQUESTABLE: u8 = TRACE | CURSORS;
+    /// `stream_retx`, granted and never asked for: the transport keeps no
+    /// copy of what this connection sends. It reports the peer's
+    /// acknowledgements (`MSG_RETX_ACK`) and asks for bytes again
+    /// (`MSG_RETX_REQUEST`); the consumer keeps what it sent until it is
+    /// acknowledged and answers with `CMD_RETX_RESEND`. The transport grants
+    /// it only on a channel whose every consumer retains what it sends
+    /// (the manifest port fact `retains_send`); without the grant the
+    /// consumer keeps nothing and the transport retransmits from its own
+    /// copy.
+    pub const RETX: u8 = 0x04;
+    /// Every bit a provider may grant.
+    pub const GRANTABLE: u8 = REQUESTABLE | RETX;
 }
 
-/// The application protocol a session stage negotiated for the stream (TLS
-/// ALPN, RFC 7301: `h2`, `http/1.1`, …), carried after the session
-/// generation as `[alpn_len: u8][alpn…]` (`fixed`: [`ACCEPTED_FIXED`] or
-/// [`CONNECTED_FIXED`]). Empty when the stage negotiated none, when the
-/// record stops at its generation, and when the length overruns the record.
-/// A consumer that speaks more than one protocol over the stream (an HTTP
-/// client choosing between HTTP/1.1 and HTTP/2) reads it from the
-/// `MSG_CONNECTED` / `MSG_ACCEPTED` that hands it the connection, before any
-/// of its data.
-#[inline]
-pub fn session_alpn(payload: &[u8], fixed: usize) -> &[u8] {
-    let at = fixed + SESSION_GENERATION_LEN;
-    let Some(&n) = payload.get(at) else {
-        return &[];
-    };
-    payload.get(at + 1..at + 1 + n as usize).unwrap_or(&[])
-}
-
-/// Write the negotiated protocol where [`session_alpn`] reads it — after a
-/// generation written at `fixed` — and return the length of the record
-/// through it: `None` when `buf` cannot hold it or `proto` is over 255
-/// bytes. An empty `proto` writes a zero length, which reads back empty.
-#[inline]
-pub fn put_session_alpn(buf: &mut [u8], fixed: usize, proto: &[u8]) -> Option<usize> {
-    let at = fixed.checked_add(SESSION_GENERATION_LEN)?;
-    let n = u8::try_from(proto.len()).ok()?;
-    let end = at.checked_add(1 + proto.len())?;
-    let dst = buf.get_mut(at..end)?;
-    dst[0] = n;
-    dst[1..].copy_from_slice(proto);
-    Some(end)
-}
-
-/// `MSG_ACCEPTED`'s fixed part: `[conn_id][local_port]`.
-pub const ACCEPTED_FIXED: usize = CONN_ID_LEN + 2;
 /// Bytes a requester tag occupies on the wire (`u16` LE).
 pub const REQUESTER_TAG_LEN: usize = 2;
-/// `MSG_CONNECTED`'s fixed part: `[conn_id][requester_tag]`.
-pub const CONNECTED_FIXED: usize = CONN_ID_LEN + REQUESTER_TAG_LEN;
+/// Bytes a session generation occupies.
+pub const SESSION_GENERATION_LEN: usize = 2;
+/// Longest negotiated application protocol name a record carries.
+pub const ALPN_MAX: usize = 255;
 
-/// `MSG_ERROR`'s untagged form: `[conn_id][errno]`.
-pub const ERROR_FIXED: usize = CONN_ID_LEN + 1;
+/// A session's opening facts, common to `MSG_ACCEPTED` and `MSG_CONNECTED`:
+/// the sidebands granted on it, the session generation (a stage that
+/// terminates sessions over the transport's connections, `tls`, numbers each
+/// session it opens so a consumer can tell a connection id's current session
+/// from a closed one's; 0 from a transport) and the application protocol the
+/// session negotiated (TLS ALPN; empty for none).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Opening<'a> {
+    pub flags_granted: u8,
+    pub generation: u16,
+    pub alpn: &'a [u8],
+}
 
-/// Parts of a `MSG_ERROR` payload: `(conn_id, errno, requester_tag)`.
-///
-/// The 3-byte form carries no tag and yields `REQUESTER_TAG_NONE` — an
-/// UNTAGGED error is an established-connection error and routes by
-/// `conn_id`; a TAGGED error is a connect-phase failure and is attributed
-/// by tag ALONE, because its `conn_id` is meaningless on that path (see
-/// `MSG_ERROR`). This accessor exists so no consumer re-derives that
-/// discriminator from literal offsets — mis-reading it is exactly how a
-/// module claims another module's connect failure. Callers bounds-check
-/// `payload.len() >= CONN_ID_LEN + 1` first.
-#[inline]
-pub fn error_parts(payload: &[u8]) -> (u16, i8, RequesterTag) {
-    let errno = payload[CONN_ID_LEN] as i8;
-    let tag = match payload.get(ERROR_FIXED..ERROR_FIXED + REQUESTER_TAG_LEN) {
-        Some(t) => u16::from_le_bytes([t[0], t[1]]),
-        None => REQUESTER_TAG_NONE,
+impl Opening<'_> {
+    /// No sideband, generation 0, no protocol: what a transport reports.
+    pub const PLAIN: Opening<'static> = Opening {
+        flags_granted: 0,
+        generation: 0,
+        alpn: &[],
     };
-    (conn_id(payload), errno, tag)
 }
 
-/// Parts of a `MSG_ACCEPTED` / `MSG_BOUND` payload: `(conn_id, local_port)`.
-/// Callers bounds-check `payload.len() >= CONN_ID_LEN + 2` first; a consumer
-/// that ignores the port reads just `conn_id`.
-#[inline]
-pub fn accepted_parts(payload: &[u8]) -> (u16, u16) {
-    (
-        conn_id(payload),
-        u16::from_le_bytes([payload[CONN_ID_LEN], payload[CONN_ID_LEN + 1]]),
-    )
+/// Bytes of `[flags_granted u8][generation u16][alpn_len u8]`.
+const OPENING_HEAD: usize = 1 + SESSION_GENERATION_LEN + 1;
+
+fn read_opening(p: &[u8], at: usize) -> Option<Opening<'_>> {
+    let head = p.get(at..at + OPENING_HEAD)?;
+    let n = head[3] as usize;
+    let alpn = p.get(at + OPENING_HEAD..)?;
+    if alpn.len() != n || head[0] & !flag::GRANTABLE != 0 {
+        return None;
+    }
+    Some(Opening {
+        flags_granted: head[0],
+        generation: u16::from_le_bytes([head[1], head[2]]),
+        alpn,
+    })
 }
 
-// Downstream: IP/net → consumer
-/// New connection accepted. Payload: `[conn_id: u16 LE][local_port: u16 LE]`.
+fn put_opening(buf: &mut [u8], at: usize, o: &Opening<'_>) -> Option<usize> {
+    let n = u8::try_from(o.alpn.len()).ok()?;
+    let end = at.checked_add(OPENING_HEAD + o.alpn.len())?;
+    let dst = buf.get_mut(at..end)?;
+    dst[0] = o.flags_granted;
+    dst[1..3].copy_from_slice(&o.generation.to_le_bytes());
+    dst[3] = n;
+    dst[OPENING_HEAD..].copy_from_slice(o.alpn);
+    Some(end)
+}
+
+// ─── Downstream: provider → consumer ─────────────────────────────────
+
+/// New connection accepted. Payload:
+/// `[conn_id: u16 LE][local_port: u16 LE][flags_granted: u8]
+/// [generation: u16 LE][alpn_len: u8][alpn…]` ([`ACCEPTED_FIXED`] +
+/// `alpn_len` bytes exactly).
+///
 /// `local_port` is the listener port the connection was accepted on. When
-/// `net_out` is fanned to several stream consumers each bound to a
-/// distinct port (a multi-anchor graph), every consumer filters on
-/// `local_port` and claims only the connections accepted on its own
-/// `CMD_BIND` — otherwise they would all `alloc` the same `conn_id` and
-/// corrupt each other's subsequent `MSG_DATA`. A single-consumer graph
-/// may ignore the trailing port bytes and read just `conn_id`. A session
-/// stage appends `[generation: u16 LE]` ([`session_generation`]) to the
-/// port-qualified form, then `[alpn_len: u8][alpn…]`, the application
-/// protocol it negotiated ([`session_alpn`]; length 0 for none).
+/// `net_out` is fanned to several stream consumers each bound to a distinct
+/// port (a multi-anchor graph), every consumer claims only the connections
+/// accepted on its own `CMD_BIND`. `flags_granted` is the listener's grant.
 pub use super::super::super::registry::msg::net_proto::MSG_ACCEPTED;
-/// Received data. Payload: `[conn_id: u16 LE][data…]`. The `data` portion of a
-/// single `MSG_DATA` frame MUST NOT exceed [`MAX_DATA_FRAGMENT`] — a producer
-/// that has more bytes splits them across multiple frames. This bounds every
-/// consumer's per-frame scratch (so the alignment-safe reader never has to drop
-/// a tail) and matches the natural TCP-MSS segmentation of the bare-metal stack.
-pub use super::super::super::registry::msg::net_proto::MSG_DATA;
+/// `MSG_ACCEPTED`'s length without its protocol name.
+pub const ACCEPTED_FIXED: usize = CONN_ID_LEN + 2 + OPENING_HEAD;
 
-/// Normative maximum `data` bytes in one [`MSG_DATA`] frame (one TCP MSS). A
-/// `net_out` producer (IP, the Linux host adapter, …) chunks larger reads into
-/// multiple frames; a consumer may therefore size its frame scratch to
-/// `FRAME_HDR + CONN_ID_LEN + MAX_DATA_FRAGMENT` and be sure a whole frame always fits.
-pub const MAX_DATA_FRAGMENT: usize = 1460;
+/// A `MSG_ACCEPTED` payload.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Accepted<'a> {
+    pub conn_id: u16,
+    pub local_port: u16,
+    pub opening: Opening<'a>,
+}
+
+/// Read a `MSG_ACCEPTED` payload; `None` unless it is exactly one.
+#[inline]
+pub fn accepted_parts(p: &[u8]) -> Option<Accepted<'_>> {
+    if p.len() < ACCEPTED_FIXED {
+        return None;
+    }
+    Some(Accepted {
+        conn_id: u16_at(p, 0),
+        local_port: u16_at(p, 2),
+        opening: read_opening(p, 4)?,
+    })
+}
+
+/// Write a `MSG_ACCEPTED` payload into `buf`; its length, or `None` when
+/// `buf` cannot hold it or the protocol name is over [`ALPN_MAX`] bytes.
+#[inline]
+pub fn put_accepted(buf: &mut [u8], a: &Accepted<'_>) -> Option<usize> {
+    buf.get_mut(..4)?;
+    buf[0..2].copy_from_slice(&a.conn_id.to_le_bytes());
+    buf[2..4].copy_from_slice(&a.local_port.to_le_bytes());
+    put_opening(buf, 4, &a.opening)
+}
+
+/// Received data. Payload: `[conn_id: u16 LE][data…]`, at least one byte
+/// of data. How much one frame carries is bounded by the producing port's
+/// `max_record` (header included); a producer with more bytes splits them
+/// across frames.
+pub use super::super::super::registry::msg::net_proto::MSG_DATA;
+/// `MSG_DATA` / `CMD_SEND` bytes before the data.
+pub const DATA_HEAD: usize = CONN_ID_LEN;
+
+/// `(conn_id, data)` of a `MSG_DATA` or `CMD_SEND` payload; `None` when it
+/// carries no data.
+#[inline]
+pub fn data_parts(p: &[u8]) -> Option<(u16, &[u8])> {
+    if p.len() <= DATA_HEAD {
+        return None;
+    }
+    Some((u16_at(p, 0), &p[DATA_HEAD..]))
+}
+
+/// The largest data a frame of `record` bytes (header included) carries on
+/// `MSG_DATA` / `CMD_SEND`: what a port declaring `max_record` /
+/// `accepts_record` of `record` moves per frame.
+#[inline]
+#[must_use]
+pub const fn data_capacity(record: usize) -> usize {
+    record.saturating_sub(FRAME_HDR + DATA_HEAD)
+}
+
 /// The connection closed, or its peer finished sending. Payload:
 /// `[conn_id: u16 LE][kind: u8]` ([`CLOSED_LEN`] bytes), `kind` one of:
 ///
@@ -237,11 +295,7 @@ pub const MAX_DATA_FRAGMENT: usize = 1460;
 /// answers cannot leak the id for good. Both transports implement it: the
 /// bare-metal `ip` (which holds the TCP slot in CloseWait until the close,
 /// then times it out) and the Linux host adapter (which holds the freed
-/// slot's id for the grace interval). Without the rule the two failure
-/// modes meet: a transport that holds CloseWait indefinitely, and a consumer
-/// that withholds its close because some other transport freed the id
-/// underneath it — between them every client-closed keepalive connection
-/// leaks a slot until the table is full.
+/// slot's id for the grace interval).
 pub use super::super::super::registry::msg::net_proto::MSG_CLOSED;
 /// How long a transport keeps a closed connection's id reserved for the
 /// consumer's [`CMD_CLOSE`] after [`MSG_CLOSED`] before releasing it itself.
@@ -268,94 +322,111 @@ pub fn closed_parts(payload: &[u8]) -> Option<(u16, u8)> {
     if kind != CLOSED_PEER_FIN && kind != CLOSED_GONE {
         return None;
     }
-    Some((u16::from_le_bytes([payload[0], payload[1]]), kind))
+    Some((u16_at(payload, 0), kind))
 }
-/// Bind/listen completed. Payload: `[conn_id: u16 LE][local_port: u16 LE]`.
-/// `local_port` echoes the port from the consumer's `CMD_BIND`; a
-/// multi-anchor consumer records it and matches it against the
-/// `local_port` in subsequent `MSG_ACCEPTED` frames (see `MSG_ACCEPTED`).
+
+/// Bind/listen completed. Payload: `[conn_id: u16 LE][local_port: u16 LE]
+/// [flags_granted: u8]` ([`BOUND_LEN`] bytes). `local_port` echoes the port
+/// from the consumer's `CMD_BIND`; a multi-anchor consumer records it and
+/// matches it against the `local_port` of later `MSG_ACCEPTED` frames.
+/// `flags_granted` is what every connection the listener accepts carries.
 pub use super::super::super::registry::msg::net_proto::MSG_BOUND;
-/// Outbound connect completed. Payload: `[conn_id: u16 LE][requester_tag: u16 LE]`.
-/// `requester_tag` echoes the tag the consumer put on its `CMD_CONNECT_TO` (its
-/// module index **+ 1** — the `dev_requester_tag` wire encoding, NOT the raw
-/// index) so that when `ip.net_out` is fanned to several stream consumers (e.g.
-/// TLS + an OTLP exporter), each claims only the connections it opened. A
-/// consumer that doesn't filter just reads `conn_id` and ignores the trailing
-/// tag; untagged connects echo tag `0` (`REQUESTER_TAG_NONE`). A session
-/// stage appends `[generation: u16 LE]` ([`session_generation`]), then
-/// `[alpn_len: u8][alpn…]`, the application protocol it negotiated
-/// ([`session_alpn`]; length 0 for none).
+/// `MSG_BOUND` payload length.
+pub const BOUND_LEN: usize = CONN_ID_LEN + 2 + 1;
+
+/// `(conn_id, local_port, flags_granted)` of a `MSG_BOUND` payload, or
+/// `None` unless it is exactly one.
+#[inline]
+pub fn bound_parts(p: &[u8]) -> Option<(u16, u16, u8)> {
+    if p.len() != BOUND_LEN || p[4] & !flag::GRANTABLE != 0 {
+        return None;
+    }
+    Some((u16_at(p, 0), u16_at(p, 2), p[4]))
+}
+
+/// A `MSG_BOUND` payload.
+#[inline]
+#[must_use]
+pub fn bound(conn_id: u16, local_port: u16, flags_granted: u8) -> [u8; BOUND_LEN] {
+    let c = conn_id.to_le_bytes();
+    let p = local_port.to_le_bytes();
+    [c[0], c[1], p[0], p[1], flags_granted]
+}
+
+/// Outbound connect completed. Payload: `[conn_id: u16 LE]
+/// [requester_tag: u16 LE][flags_granted: u8][generation: u16 LE]
+/// [alpn_len: u8][alpn…]` ([`CONNECTED_FIXED`] + `alpn_len` bytes
+/// exactly). `requester_tag` echoes the tag of the `CMD_CONNECT_TO` that
+/// opened it, so that when `net_out` is fanned to several stream consumers
+/// each claims only the connections it opened.
 pub use super::super::super::registry::msg::net_proto::MSG_CONNECTED;
-/// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE?]`. For a
-/// connect-phase failure the trailing `requester_tag` echoes the failing
-/// `CMD_CONNECT_TO`'s tag so a consumer that has no conn_id yet can recognise its
-/// own failure on a fanned `net_out`; established-connection errors carry the
-/// owning connection's conn_id (filter by that). 3-byte form = tag 0.
-/// On a connect-phase failure `conn_id` is MEANINGLESS — it is the id already
-/// allocated if the dial failed after allocation, and `0` if it failed before
-/// (bad `sock_type`, no free slot), which is indistinguishable from a valid id
-/// `0` — so a consumer must match a connect failure on `requester_tag` ALONE,
-/// never on a conn_id it has not yet been assigned.
+/// `MSG_CONNECTED`'s length without its protocol name.
+pub const CONNECTED_FIXED: usize = CONN_ID_LEN + REQUESTER_TAG_LEN + OPENING_HEAD;
+
+/// A `MSG_CONNECTED` payload.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Connected<'a> {
+    pub conn_id: u16,
+    pub requester_tag: RequesterTag,
+    pub opening: Opening<'a>,
+}
+
+/// Read a `MSG_CONNECTED` payload; `None` unless it is exactly one.
+#[inline]
+pub fn connected_parts(p: &[u8]) -> Option<Connected<'_>> {
+    if p.len() < CONNECTED_FIXED {
+        return None;
+    }
+    Some(Connected {
+        conn_id: u16_at(p, 0),
+        requester_tag: u16_at(p, 2),
+        opening: read_opening(p, 4)?,
+    })
+}
+
+/// Write a `MSG_CONNECTED` payload into `buf`; its length, or `None` when
+/// `buf` cannot hold it or the protocol name is over [`ALPN_MAX`] bytes.
+#[inline]
+pub fn put_connected(buf: &mut [u8], c: &Connected<'_>) -> Option<usize> {
+    buf.get_mut(..4)?;
+    buf[0..2].copy_from_slice(&c.conn_id.to_le_bytes());
+    buf[2..4].copy_from_slice(&c.requester_tag.to_le_bytes());
+    put_opening(buf, 4, &c.opening)
+}
+
+/// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE]`
+/// ([`ERROR_LEN`] bytes). An error with tag [`REQUESTER_TAG_NONE`] is an
+/// established connection's (or a bind's) and routes by `conn_id`. An error
+/// with a tag is a connect-phase failure and is attributed by tag ALONE:
+/// its `conn_id` is meaningless on that path — the id already allocated if
+/// the dial failed after allocation, and `0` if it failed before (bad
+/// `sock_type`, no free slot), which is indistinguishable from a valid id
+/// `0` — so a consumer matches a connect failure on `requester_tag`, never
+/// on a conn_id it has not yet been assigned.
 pub use super::super::super::registry::msg::net_proto::MSG_ERROR;
-/// Ask the consumer to send its retained bytes again from `from_seq` on the
-/// named connection. Payload: `[conn_id: u16 LE][from_seq: u32 LE]`. A
-/// transport that leaves the send buffer to its consumer (the bare-metal
-/// `ip` under `tls`) emits it on three duplicate ACKs, an RTO and each
-/// partial acknowledgement in recovery; the consumer answers with
-/// [`CMD_RESEND`]. A consumer that retains nothing drops it as any unknown
-/// opcode, and the transport then has nothing to resend for it.
-pub use super::super::super::registry::msg::net_proto::MSG_RETRANSMIT;
-/// `MSG_RETRANSMIT` payload length.
-pub const RETRANSMIT_LEN: usize = CONN_ID_LEN + 4;
-/// The peer's cumulative acknowledgement moved. Payload: `[conn_id: u16 LE]
-/// [acked_seq: u32 LE][isn: u32 LE]`: everything before `acked_seq` arrived,
-/// so the consumer may release what it retained below it. The third field,
-/// `isn`, is the sequence number of the stream's first byte (ISS + 1): it
-/// places the consumer's retained bytes in sequence space however many it
-/// handed down before the first report reached it. Sent when it moves, not
-/// per segment.
-pub use super::super::super::registry::msg::net_proto::MSG_ACK;
-/// `MSG_ACK` payload length.
-pub const ACK_LEN: usize = CONN_ID_LEN + 4 + 4;
+/// `MSG_ERROR` payload length.
+pub const ERROR_LEN: usize = CONN_ID_LEN + 1 + REQUESTER_TAG_LEN;
 
-/// `(conn_id, acked_seq, isn)` of a `MSG_ACK` payload, or `None` when short.
+/// `(conn_id, errno, requester_tag)` of a `MSG_ERROR` payload, or `None`
+/// unless it is exactly one. This accessor exists so no consumer re-derives
+/// the tag/conn_id discriminator from literal offsets — mis-reading it is
+/// exactly how a module claims another module's connect failure.
 #[inline]
-pub fn ack_parts(payload: &[u8]) -> Option<(u16, u32, u32)> {
-    let p = payload.get(..ACK_LEN)?;
-    Some((
-        u16::from_le_bytes([p[0], p[1]]),
-        u32::from_le_bytes([p[2], p[3], p[4], p[5]]),
-        u32::from_le_bytes([p[6], p[7], p[8], p[9]]),
-    ))
+pub fn error_parts(p: &[u8]) -> Option<(u16, i8, RequesterTag)> {
+    if p.len() != ERROR_LEN {
+        return None;
+    }
+    Some((u16_at(p, 0), p[2] as i8, u16_at(p, 3)))
 }
 
-/// `(conn_id, from_seq)` of a `MSG_RETRANSMIT` payload, or `None` when short.
+/// A `MSG_ERROR` payload.
 #[inline]
-pub fn retransmit_parts(payload: &[u8]) -> Option<(u16, u32)> {
-    let p = payload.get(..RETRANSMIT_LEN)?;
-    Some((
-        u16::from_le_bytes([p[0], p[1]]),
-        u32::from_le_bytes([p[2], p[3], p[4], p[5]]),
-    ))
+#[must_use]
+pub fn error(conn_id: u16, errno: i8, tag: RequesterTag) -> [u8; ERROR_LEN] {
+    let c = conn_id.to_le_bytes();
+    let t = tag.to_le_bytes();
+    [c[0], c[1], errno as u8, t[0], t[1]]
 }
-
-// 0x09 is `MSG_TRACE_CTX`, 0x0A `MSG_PEER`, 0x0B `MSG_HORIZON`, 0x0C
-// `MSG_RESUMED`; the next free downstream opcode is 0x0D.
-
-/// Observability trace context for a connection (W3C). Emitted by the ingress
-/// (IP) right after `MSG_ACCEPTED`, and re-emitted by each forwarding stage
-/// (TLS) with its own span id, so the next stage parents its span correctly.
-/// Payload: `[conn_id: u16 LE][trace_id: 16][parent_span_id: 8][trace_flags: u8]`
-/// (27 bytes). Purely additive and best-effort (direct write, dropped if the
-/// channel is full) — a stage that doesn't trace discards it like any unknown
-/// frame, so it never affects the data path. The trailing `trace_flags` byte is
-/// the W3C flags (low bit = `sampled`), so the head-sampling decision survives
-/// each hop.
-pub use super::super::super::registry::msg::net_proto::MSG_TRACE_CTX;
-
-/// `MSG_TRACE_CTX` payload length: conn_id + 16-byte trace id + 8-byte span id
-/// + 1-byte W3C trace-flags.
-pub const TRACE_CTX_LEN: usize = CONN_ID_LEN + 16 + 8 + 1;
 
 /// The stream's peer: who is at the other end of `conn_id`. Payload:
 /// `[conn_id: u16 LE][family: u8][addr: 16][port: u16 LE]` ([`PEER_LEN`]
@@ -369,77 +440,11 @@ pub const TRACE_CTX_LEN: usize = CONN_ID_LEN + 16 + 8 + 1;
 /// `MSG_ACCEPTED` and delivered before the stream's first `MSG_DATA` — so a
 /// consumer that reads it has it before any byte of the stream. A stage that
 /// relabels connection ids (`tls`, a demultiplexer) re-emits it with its own
-/// id. A consumer that does not use it drops it as any unknown opcode.
+/// id.
 pub use super::super::super::registry::msg::net_proto::MSG_PEER;
 
 /// `MSG_PEER` payload length.
 pub const PEER_LEN: usize = CONN_ID_LEN + 1 + 16 + 2;
-
-/// The connection's output horizon moved: every clear byte this consumer
-/// handed down on `conn_id` up to `bytes_through` is in records the
-/// transport has put on the wire — under a crash-continuous continuity
-/// pairing (`TRANSPORT_CONTINUITY`), records the standby acknowledged
-/// before they left, so the primary's loss cannot take them. Payload:
-/// `[conn_id: u16 LE][bytes_through: u64 LE]` ([`HORIZON_LEN`]), sent when
-/// it moves. Counted from the first byte this consumer sent on the stream
-/// as it holds it — a connection moved to another host starts again at 0
-/// for its consumer there. Bytes, not commands, so a stage that splits or
-/// joins commands between the consumer and the record layer (a router)
-/// keeps the numbering. Emitted by a record layer that opts in (`tls`'s
-/// `write_horizon`); a consumer that does not use it drops it as any
-/// unknown opcode.
-pub use super::super::super::registry::msg::net_proto::MSG_HORIZON;
-/// `MSG_HORIZON` payload length.
-pub const HORIZON_LEN: usize = CONN_ID_LEN + 8;
-
-/// `(conn_id, bytes_through)` of a `MSG_HORIZON` payload, or `None` when it
-/// is short.
-#[inline]
-pub fn horizon_parts(payload: &[u8]) -> Option<(u16, u64)> {
-    let p = payload.get(..HORIZON_LEN)?;
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&p[2..10]);
-    Some((u16::from_le_bytes([p[0], p[1]]), u64::from_le_bytes(b)))
-}
-
-/// The stream was resumed here by a transport-continuity takeover
-/// (`TRANSPORT_CONTINUITY` ACTIVATE): where the consumer's predecessor on
-/// the old host stood, so this consumer continues exactly. Payload:
-/// `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE]
-/// [out_bytes: u64 LE]` ([`RESUMED_LEN`]). `consumer_cursor` and
-/// `in_bytes` are what the predecessor's last `CMD_DELIVERED` carried (both
-/// 0 when none was mirrored): it had consumed the stream's first `in_bytes`
-/// clear bytes and stood at `consumer_cursor` there. Redelivery of what was
-/// handed up and not acknowledged starts at exactly byte `in_bytes` — in
-/// the middle of a record when the acknowledgement was — so this consumer
-/// counts on from `in_bytes` in its own `CMD_DELIVERED`s. `out_bytes` is
-/// the output horizon in `MSG_HORIZON`'s `bytes_through` numbering: the
-/// predecessor's clear bytes through the last record the connection holds.
-/// Sent once, after the activated stream's `MSG_PEER` (after its accept
-/// when it has no peer report) and before any of its data, redelivered or
-/// new. A consumer that does not use it drops it as any unknown opcode.
-pub use super::super::super::registry::msg::net_proto::MSG_RESUMED;
-/// `MSG_RESUMED` payload length.
-pub const RESUMED_LEN: usize = CONN_ID_LEN + 8 + 8 + 8;
-
-/// `(conn_id, consumer_cursor, in_bytes, out_bytes)` of a `MSG_RESUMED`
-/// payload, or `None` when it is short.
-#[inline]
-pub fn resumed_parts(payload: &[u8]) -> Option<(u16, u64, u64, u64)> {
-    let p = payload.get(..RESUMED_LEN)?;
-    let mut c = [0u8; 8];
-    c.copy_from_slice(&p[2..10]);
-    let mut i = [0u8; 8];
-    i.copy_from_slice(&p[10..18]);
-    let mut o = [0u8; 8];
-    o.copy_from_slice(&p[18..26]);
-    Some((
-        u16::from_le_bytes([p[0], p[1]]),
-        u64::from_le_bytes(c),
-        u64::from_le_bytes(i),
-        u64::from_le_bytes(o),
-    ))
-}
 
 /// Write a whole `MSG_PEER` frame (header included) into `out`; its length,
 /// or `None` when `out` is too short.
@@ -472,105 +477,101 @@ pub fn write_peer(
 }
 
 /// Parts of a `MSG_PEER` payload: `(conn_id, family, addr, port)`, or
-/// `None` when it is short.
+/// `None` unless it is exactly one.
 #[inline]
 pub fn peer_parts(payload: &[u8]) -> Option<(u16, u8, [u8; 16], u16)> {
-    let p = payload.get(..PEER_LEN)?;
+    if payload.len() != PEER_LEN {
+        return None;
+    }
+    let p = payload;
     let mut addr = [0u8; 16];
     for (i, a) in addr.iter_mut().enumerate() {
         *a = *p.get(3 + i)?;
     }
-    Some((
-        u16::from_le_bytes([*p.first()?, *p.get(1)?]),
-        *p.get(2)?,
-        addr,
-        u16::from_le_bytes([*p.get(19)?, *p.get(20)?]),
-    ))
+    Some((u16_at(p, 0), p[2], addr, u16_at(p, 19)))
 }
 
-// Upstream: consumer → IP/net
-/// Bind to port and listen. Payload: [port: u16 LE]
+// ─── Upstream: consumer → provider ───────────────────────────────────
+
+/// Bind to a port and listen. Payload: `[port: u16 LE][flags: u8]`
+/// ([`BIND_LEN`] bytes); `flags` asks for sidebands ([`flag`]) on every
+/// connection the listener accepts. Answered `MSG_BOUND` with the grant, or
+/// `MSG_ERROR` (`EINVAL` for an undefined flag bit). The bind is made as the
+/// owner the kernel attests for the channel it arrived on, never as one the
+/// record names.
 pub use super::super::super::registry::msg::net_proto::CMD_BIND;
-/// Send data on connection. Payload: `[conn_id: u16 LE][data…]`. The `data` portion
-/// MUST NOT exceed [`MAX_CMD_DATA`]; a consumer with more bytes issues multiple
-/// `CMD_SEND`s. The net stack (IP / host adapter) re-segments to MSS on the
-/// wire. This bounds the receiver's command scratch; an oversized frame is
-/// drained and rejected alignment-safely rather than mis-parsed.
+/// `CMD_BIND` payload length.
+pub const BIND_LEN: usize = 2 + 1;
+
+/// `(port, flags)` of a `CMD_BIND` payload, or `None` unless it is exactly
+/// one. The flags are returned as sent; a provider refuses bits outside
+/// [`flag::REQUESTABLE`].
+#[inline]
+pub fn bind_parts(p: &[u8]) -> Option<(u16, u8)> {
+    if p.len() != BIND_LEN {
+        return None;
+    }
+    Some((u16_at(p, 0), p[2]))
+}
+
+/// A `CMD_BIND` payload.
+#[inline]
+#[must_use]
+pub fn bind(port: u16, flags: u8) -> [u8; BIND_LEN] {
+    let b = port.to_le_bytes();
+    [b[0], b[1], flags]
+}
+
+/// Send data on a connection. Payload: `[conn_id: u16 LE][data…]`, at least
+/// one byte of data ([`data_parts`]). How much one command carries is bounded
+/// by the receiving port's `accepts_record` (header included); a consumer
+/// with more bytes issues several. The transport re-segments to its MSS on
+/// the wire.
 pub use super::super::super::registry::msg::net_proto::CMD_SEND;
 
-/// Normative maximum `data` bytes in one upstream command frame (`CMD_SEND`).
-/// Receivers (IP, the Linux host adapter) size their command scratch to
-/// `FRAME_HDR + CONN_ID_LEN + MAX_CMD_DATA` and drain anything larger to stay frame-aligned.
-pub const MAX_CMD_DATA: usize = 8192;
-/// Close connection. Payload: `[conn_id: u16 LE]`, or
-/// `[conn_id: u16 LE][how: u8]` with `how` [`CLOSE_ABORT`]: an abortive
-/// close — the connection is reset (RST) instead of closed in order (FIN),
-/// and whatever is queued or in flight is dropped (`SO_LINGER` zero). A
-/// record layer forwards it without its own close (no close_notify).
+/// Close a connection. Payload: `[conn_id: u16 LE][how: u8]`
+/// ([`CLOSE_LEN`] bytes), `how` [`CLOSE_ORDERLY`] (FIN after everything
+/// queued) or [`CLOSE_ABORT`]: an abortive close — the connection is reset
+/// (RST) instead of closed in order, and whatever is queued or in flight is
+/// dropped (`SO_LINGER` zero). A record layer forwards an abort without its
+/// own close (no close_notify).
 ///
 /// Always safe after [`MSG_CLOSED`] within [`CLOSED_ID_GRACE_MS`] — the id
 /// is still the consumer's — and a no-op on an id the transport has already
 /// released.
 pub use super::super::super::registry::msg::net_proto::CMD_CLOSE;
+/// `CMD_CLOSE` payload length.
+pub const CLOSE_LEN: usize = CONN_ID_LEN + 1;
+/// `CMD_CLOSE`'s `how`: close in order.
+pub const CLOSE_ORDERLY: u8 = 0;
 /// `CMD_CLOSE`'s `how`: reset the connection.
 pub const CLOSE_ABORT: u8 = 1;
 
-/// Bytes the consumer already handed down, sent again at their own sequence
-/// numbers — its answer to [`MSG_RETRANSMIT`]. Payload: `[conn_id: u16 LE]
-/// [seq: u32 LE][data…]`, at most one segment of data. Unlike [`CMD_SEND`]
-/// it allocates nothing: of the bytes it carries, those in `[SND.UNA,
-/// SND.NXT)` go out again and the rest (acknowledged since, or never sent)
-/// are dropped.
-pub use super::super::super::registry::msg::net_proto::CMD_RESEND;
-/// `CMD_RESEND` header length before its data.
-pub const RESEND_HEAD: usize = CONN_ID_LEN + 4;
-/// The consumer has consumed the first `in_bytes` clear bytes a stage
-/// handed up on `conn_id`, and stands at `consumer_cursor` there. Payload:
-/// exactly `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE]`
-/// ([`DELIVERED_LEN`]). `in_bytes` counts the stream's clear bytes from its
-/// start (after a takeover, on from `MSG_RESUMED`'s `in_bytes`) and may
-/// fall inside a record; `consumer_cursor` is the consumer's own position
-/// there, opaque to the transport. A record layer that defers its delivery
-/// horizon to its worker (`tls`'s `delivery_ack`) counts as consumed only
-/// the records whose plaintext ends at or before `in_bytes`, keeps the
-/// cursor with its byte offset, mirrors both under transport continuity
-/// and hands them to the consumer that resumes the stream after a takeover
-/// (`MSG_RESUMED`), redelivering from exactly that byte. A payload of any
-/// other length is ignored; a stage that does not defer drops it as any
-/// unknown opcode.
-pub use super::super::super::registry::msg::net_proto::CMD_DELIVERED;
-/// `CMD_DELIVERED` payload length.
-pub const DELIVERED_LEN: usize = CONN_ID_LEN + 16;
-
-/// `(conn_id, consumer_cursor, in_bytes)` of a `CMD_DELIVERED` payload, or
-/// `None` unless it is exactly [`DELIVERED_LEN`] long.
+/// `(conn_id, abort)` of a `CMD_CLOSE` payload, or `None` unless it is
+/// exactly one with a defined `how`.
 #[inline]
-pub fn delivered_parts(payload: &[u8]) -> Option<(u16, u64, u64)> {
-    if payload.len() != DELIVERED_LEN {
+pub fn close_parts(p: &[u8]) -> Option<(u16, bool)> {
+    if p.len() != CLOSE_LEN {
         return None;
     }
-    let mut c = [0u8; 8];
-    c.copy_from_slice(&payload[2..10]);
-    let mut i = [0u8; 8];
-    i.copy_from_slice(&payload[10..18]);
-    Some((
-        u16::from_le_bytes([payload[0], payload[1]]),
-        u64::from_le_bytes(c),
-        u64::from_le_bytes(i),
-    ))
+    match p[2] {
+        CLOSE_ORDERLY => Some((u16_at(p, 0), false)),
+        CLOSE_ABORT => Some((u16_at(p, 0), true)),
+        _ => None,
+    }
 }
-/// Reserved and unsupported: the 7/9-byte
-/// `[sock_type][ip: u32 LE][port: u16 LE][requester_tag: u16 LE?]` dial shape.
-/// Every provider answers it with `MSG_ERROR` `ENOSYS` on the requester tag
-/// (bytes 7..9 when present) and one log line naming
-/// [`CMD_CONNECT_TO`], so a stale emitter fails loudly on its first dial
-/// instead of dialling a garbage address: byte 1 of this payload is the
-/// address's last octet, which would alias `af` if the two shapes shared
-/// an opcode. One opcode dials; this one only says no.
-pub use super::super::super::registry::msg::net_proto::CMD_CONNECT;
+
+/// A `CMD_CLOSE` payload.
+#[inline]
+#[must_use]
+pub fn close(conn_id: u16, abort: bool) -> [u8; CLOSE_LEN] {
+    let c = conn_id.to_le_bytes();
+    [c[0], c[1], if abort { CLOSE_ABORT } else { CLOSE_ORDERLY }]
+}
 
 /// Initiate an outbound connection to a target.
-/// Payload: `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u16 LE?]`
+/// Payload: `[sock_type: u8][flags: u8][af: u8][port: u16 LE][addr…]
+/// [requester_tag: u16 LE]`
 ///
 /// - `af = AF_INET (4)`: `addr` is 4 bytes, network order.
 /// - `af = AF_INET6 (6)`: `addr` is 16 bytes, network order.
@@ -581,14 +582,15 @@ pub use super::super::super::registry::msg::net_proto::CMD_CONNECT;
 ///   narrower name ceiling than this one and refuse a longer name
 ///   `EINVAL`.
 ///
-/// `AF_INET` / `AF_INET6` are the datagram surface's values, so the two
-/// surfaces spell an address the same way. Only `SOCK_TYPE_STREAM` is
-/// accepted; any other `sock_type`, a name outside 1..=253 bytes, or an
-/// `af` the provider does not serve fails `EINVAL` synchronously on the
-/// requester tag. A failed resolution is `ENOENT` on the tag. The trailing
-/// `requester_tag` is optional; when present it is echoed in
-/// `MSG_CONNECTED` / `MSG_ERROR`, and it carries the requesting module's
-/// index **+ 1** (`dev_requester_tag`), never the raw index.
+/// `flags` asks for sidebands on the connection ([`flag`]); the grant comes
+/// back in `MSG_CONNECTED`. `AF_INET` / `AF_INET6` are the datagram
+/// surface's values, so the two surfaces spell an address the same way. Only
+/// `SOCK_TYPE_STREAM` is accepted; any other `sock_type`, an undefined flag
+/// bit, a name outside 1..=253 bytes, or an `af` the provider does not serve
+/// fails `EINVAL` synchronously on the requester tag. A failed resolution is
+/// `ENOENT` on the tag. The `requester_tag` is echoed in `MSG_CONNECTED` /
+/// `MSG_ERROR`; it carries the requesting module's index **+ 1**
+/// (`dev_requester_tag`), never the raw index, or [`REQUESTER_TAG_NONE`].
 ///
 /// Emit with [`write_connect_to`], read with [`read_connect_to`]; parse a
 /// `host[:port]` authority with [`Target::parse`] so a literal is never
@@ -606,7 +608,7 @@ pub const AF_INET6: u8 = 6;
 /// Longest DNS name `AF_NAME` carries (RFC 1035 presentation form).
 pub const MAX_NAME_LEN: usize = 253;
 /// Bytes before `addr…` in a `CMD_CONNECT_TO` payload.
-pub const CONNECT_TO_HEAD: usize = 1 + 1 + 2;
+pub const CONNECT_TO_HEAD: usize = 1 + 1 + 1 + 2;
 /// Largest `CMD_CONNECT_TO` payload: head, a name with its length, a tag.
 pub const CONNECT_TO_MAX: usize = CONNECT_TO_HEAD + 1 + MAX_NAME_LEN + REQUESTER_TAG_LEN;
 
@@ -921,32 +923,38 @@ pub fn name_ok(host: &[u8]) -> bool {
     letter
 }
 
+/// A `CMD_CONNECT_TO` payload.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConnectTo<'a> {
+    pub sock_type: u8,
+    pub flags: u8,
+    /// The connector's resolved port: the authority's when it named one,
+    /// else the protocol default.
+    pub port: u16,
+    pub target: Target<'a>,
+    pub requester_tag: RequesterTag,
+}
+
 /// Compose a `CMD_CONNECT_TO` payload into `buf`, answering its length,
 /// or `0` when `buf` cannot hold it or the name is not one `AF_NAME`
-/// carries. `port` is the connector's resolved port: the authority's when
-/// it named one, else the protocol default.
-pub fn write_connect_to(
-    buf: &mut [u8],
-    sock_type: u8,
-    port: u16,
-    t: &Target<'_>,
-    tag: Option<RequesterTag>,
-) -> usize {
-    let n = CONNECT_TO_HEAD + t.wire_len() + if tag.is_some() { REQUESTER_TAG_LEN } else { 0 };
+/// carries.
+pub fn write_connect_to(buf: &mut [u8], c: &ConnectTo<'_>) -> usize {
+    let n = CONNECT_TO_HEAD + c.target.wire_len() + REQUESTER_TAG_LEN;
     if buf.len() < n {
         return 0;
     }
-    buf[0] = sock_type;
-    buf[1] = t.af();
-    buf[2..4].copy_from_slice(&port.to_le_bytes());
+    buf[0] = c.sock_type;
+    buf[1] = c.flags;
+    buf[2] = c.target.af();
+    buf[3..5].copy_from_slice(&c.port.to_le_bytes());
     let mut at = CONNECT_TO_HEAD;
-    match t {
+    match c.target {
         Target::V4(a) => {
-            buf[at..at + 4].copy_from_slice(a);
+            buf[at..at + 4].copy_from_slice(&a);
             at += 4;
         }
         Target::V6(a) => {
-            buf[at..at + 16].copy_from_slice(a);
+            buf[at..at + 16].copy_from_slice(&a);
             at += 16;
         }
         Target::Name(name) => {
@@ -959,31 +967,26 @@ pub fn write_connect_to(
             at += name.len();
         }
     }
-    if let Some(tag) = tag {
-        buf[at..at + REQUESTER_TAG_LEN].copy_from_slice(&tag.to_le_bytes());
-        at += REQUESTER_TAG_LEN;
-    }
-    at
+    buf[at..at + REQUESTER_TAG_LEN].copy_from_slice(&c.requester_tag.to_le_bytes());
+    at + REQUESTER_TAG_LEN
 }
 
-/// Read a `CMD_CONNECT_TO` payload: `(sock_type, port, target, tag)`.
-/// `None` for a malformed record — a truncated address, an unknown `af`,
-/// a name of 0 or over 253 bytes or holding a NUL or a non-ASCII byte, or
-/// trailing bytes after the address that are neither none nor exactly a
-/// tag — which the provider answers `EINVAL` on the record's last two
-/// bytes read as a tag (`REQUESTER_TAG_NONE` when the record is shorter):
+/// Read a `CMD_CONNECT_TO` payload. `None` for a malformed record — a
+/// truncated address, an unknown `af`, a name of 0 or over 253 bytes or
+/// holding a NUL or a non-ASCII byte, or a length other than the head, the
+/// address and the tag exactly — which the provider answers `EINVAL` on the
+/// record's last two bytes read as a tag ([`malformed_connect_to_tag`]):
 /// the emitter is broken either way, and those bytes are the closest thing
-/// to its name.
-///
-/// The tag is `None` when the record carries none; a provider treats that
-/// as `REQUESTER_TAG_NONE`.
-pub fn read_connect_to(payload: &[u8]) -> Option<(u8, u16, Target<'_>, Option<RequesterTag>)> {
+/// to its name. The flags are returned as sent; a provider refuses bits
+/// outside [`flag::REQUESTABLE`] on the tag.
+pub fn read_connect_to(payload: &[u8]) -> Option<ConnectTo<'_>> {
     if payload.len() < CONNECT_TO_HEAD {
         return None;
     }
     let sock_type = payload[0];
-    let af = payload[1];
-    let port = u16::from_le_bytes([payload[2], payload[3]]);
+    let flags = payload[1];
+    let af = payload[2];
+    let port = u16_at(payload, 3);
     let rest = &payload[CONNECT_TO_HEAD..];
     let (target, used) = match af {
         AF_INET => {
@@ -1009,30 +1012,24 @@ pub fn read_connect_to(payload: &[u8]) -> Option<(u8, u16, Target<'_>, Option<Re
         }
         _ => return None,
     };
-    let tag = match rest.len() - used {
-        0 => None,
-        REQUESTER_TAG_LEN => Some(u16::from_le_bytes([rest[used], rest[used + 1]])),
-        _ => return None,
-    };
-    Some((sock_type, port, target, tag))
+    if rest.len() != used + REQUESTER_TAG_LEN {
+        return None;
+    }
+    Some(ConnectTo {
+        sock_type,
+        flags,
+        port,
+        target,
+        requester_tag: u16_at(rest, used),
+    })
 }
 
 /// The tag a provider answers a malformed `CMD_CONNECT_TO` on: the
-/// record's last two bytes LE, where a tag would sit, or
+/// record's last two bytes LE, where the tag sits, or
 /// `REQUESTER_TAG_NONE` when the record is shorter than a tag.
 pub fn malformed_connect_to_tag(payload: &[u8]) -> RequesterTag {
     match payload.len().checked_sub(REQUESTER_TAG_LEN) {
-        Some(at) => u16::from_le_bytes([payload[at], payload[at + 1]]),
-        None => REQUESTER_TAG_NONE,
-    }
-}
-
-/// The requester tag of an unsupported [`CMD_CONNECT`] payload, so a provider
-/// can address its `ENOSYS` to the emitter that dialled. Bytes 7..9 LE when
-/// the 9-byte form was sent; `REQUESTER_TAG_NONE` otherwise.
-pub fn retired_connect_tag(payload: &[u8]) -> RequesterTag {
-    match payload.get(7..9) {
-        Some(t) => u16::from_le_bytes([t[0], t[1]]),
+        Some(at) => u16_at(payload, at),
         None => REQUESTER_TAG_NONE,
     }
 }
@@ -1046,12 +1043,11 @@ pub const SOCK_TYPE_STREAM: u8 = 1;
 /// `u16` LE wherever it appears on the wire.
 pub type RequesterTag = u16;
 
-/// `requester_tag` value meaning "no routing tag" — an untagged
-/// `CMD_CONNECT_TO` and any consumer that doesn't tag its connects.
+/// `requester_tag` value meaning "no routing tag": a consumer that does not
+/// tag its connects, and every established-connection error.
 ///
 /// The wire tag is the requester's **module index + 1**, so `0` can never be a
-/// valid tag (module index `0` maps to wire tag `1`). This avoids the collision
-/// a raw zero-based index would have with this sentinel. Encode with
+/// valid tag (module index `0` maps to wire tag `1`). Encode with
 /// `dev_requester_tag`; a filtering consumer claims a frame iff its tag equals
 /// the consumer's own `dev_requester_tag` OR is `REQUESTER_TAG_NONE`
 /// (sole-consumer graphs).

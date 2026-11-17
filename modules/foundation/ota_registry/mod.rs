@@ -63,8 +63,11 @@ const CTRL_EPOCH: u8 = 2;
 
 // ── Sizing ───────────────────────────────────────────────────────────
 
-/// One MSG_DATA fragment (net_proto MAX_CMD_DATA) + conn id + header.
+/// The largest frame read off `net_in`, header included
+/// (`NET_IN_ACCEPTS_RECORD`); the scratch frames are written through too.
 const NET_BUF_SIZE: usize = 3 + 2 + 8192;
+/// Request bytes one `CMD_SEND` carries.
+const TX_CHUNK: usize = 1024;
 /// HTTP response header accumulator.
 const HDR_BUF_SIZE: usize = 2048;
 /// Whole-manifest buffer. A layered image manifest carries one layer
@@ -79,8 +82,6 @@ const DIRECTIVE_MAGIC: u8 = 0x44;
 const PORT_IN_DIRECTIVE: u32 = 1;
 /// Request builder.
 const TX_BUF_SIZE: usize = 512;
-/// `OTA_STAGE_WRITE` arg: 4-byte offset prefix + one fragment.
-const STAGE_ARG_SIZE: usize = 4 + 8192;
 
 /// `authority` as written: `host[:port]`, sent verbatim as the HTTP
 /// `Host:` header.
@@ -211,7 +212,6 @@ struct State {
     manifest_buf: [u8; MANIFEST_BUF_SIZE],
     tx_buf: [u8; TX_BUF_SIZE],
     net_buf: [u8; NET_BUF_SIZE],
-    stage_arg: [u8; STAGE_ARG_SIZE],
 }
 
 mod params_def {
@@ -328,6 +328,8 @@ unsafe fn channel_port_in(sys: &SyscallTable, index: u32) -> i32 {
         abi::kernel_abi::channel::PORT,
         arg.as_mut_ptr(),
         arg.len(),
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -443,14 +445,13 @@ fn parse_hex32(b: &[u8], at: usize, out: &mut [u8; 32]) -> bool {
 unsafe fn enter_backoff(s: &mut State) {
     let sys = &*s.syscalls;
     if s.conn_present == 1 {
-        let mut payload = [0u8; 2];
-        payload[..2].copy_from_slice(&s.conn_id.to_le_bytes());
+        let payload = net_proto::close(s.conn_id, false);
         let _ = net_write_frame(
             sys,
             s.net_out,
             NET_CMD_CLOSE,
             payload.as_ptr(),
-            2,
+            payload.len(),
             s.net_buf.as_mut_ptr(),
             NET_BUF_SIZE,
         );
@@ -622,8 +623,8 @@ unsafe fn flush_tx(s: &mut State) -> bool {
     let sys = &*s.syscalls;
     while s.tx_sent < s.tx_len {
         let remaining = (s.tx_len - s.tx_sent) as usize;
-        let chunk = remaining.min(1024);
-        let mut payload = [0u8; 2 + 1024];
+        let chunk = remaining.min(TX_CHUNK);
+        let mut payload = [0u8; 2 + TX_CHUNK];
         payload[..2].copy_from_slice(&s.conn_id.to_le_bytes());
         payload[2..2 + chunk]
             .copy_from_slice(&s.tx_buf[s.tx_sent as usize..s.tx_sent as usize + chunk]);
@@ -855,19 +856,21 @@ unsafe fn body_bytes(s: &mut State, data: &[u8]) -> bool {
     } else {
         let sys = &*s.syscalls;
         s.hasher.update(data);
-        let mut off = 0usize;
-        while off < data.len() {
-            let chunk = (data.len() - off).min(STAGE_ARG_SIZE - 4);
-            s.stage_arg[..4].copy_from_slice(&s.stage_offset.to_le_bytes());
-            s.stage_arg[4..4 + chunk].copy_from_slice(&data[off..off + chunk]);
-            let rc = (sys.provider_call)(-1, OTA_STAGE_WRITE, s.stage_arg.as_mut_ptr(), 4 + chunk);
-            if rc < 0 {
-                log_msg_num(s, b"[ota_reg] stage write failed rc=-", (-rc) as u64);
-                return false;
-            }
-            s.stage_offset += chunk as u32;
-            off += chunk;
+        // `arg` = the staging offset; `data` = the bytes staged there.
+        let mut arg = s.stage_offset.to_le_bytes();
+        let rc = (sys.provider_call)(
+            -1,
+            OTA_STAGE_WRITE,
+            arg.as_mut_ptr(),
+            arg.len(),
+            data.as_ptr() as *mut u8,
+            data.len(),
+        );
+        if rc < 0 {
+            log_msg_num(s, b"[ota_reg] stage write failed rc=-", (-rc) as u64);
+            return false;
         }
+        s.stage_offset += data.len() as u32;
         s.intra_offset += data.len() as u32;
     }
     s.body_received += data.len() as u32;
@@ -882,14 +885,13 @@ unsafe fn body_complete(s: &mut State) -> bool {
     // the ip conn slot is reclaimed rather than parking in CloseWait —
     // a long retry run would otherwise exhaust the conn table.
     if s.conn_present == 1 {
-        let mut payload = [0u8; 2];
-        payload[..2].copy_from_slice(&s.conn_id.to_le_bytes());
+        let payload = net_proto::close(s.conn_id, false);
         let _ = net_write_frame(
             sys,
             s.net_out,
             NET_CMD_CLOSE,
             payload.as_ptr(),
-            2,
+            payload.len(),
             s.net_buf.as_mut_ptr(),
             NET_BUF_SIZE,
         );
@@ -902,7 +904,14 @@ unsafe fn body_complete(s: &mut State) -> bool {
         }
         // Epoch gate: fetch the blob only when it is newer than live.
         let mut cmd = [CTRL_EPOCH];
-        let live = (sys.provider_call)(-1, OTA_STAGE_CTRL, cmd.as_mut_ptr(), 1);
+        let live = (sys.provider_call)(
+            -1,
+            OTA_STAGE_CTRL,
+            cmd.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
         if live >= 0 && s.image_epoch <= live as u64 && live > 0 {
             log_msg_num(s, b"[ota_reg] up to date at epoch ", live as u64);
             s.phase = Phase::Idle;
@@ -954,12 +963,26 @@ unsafe fn body_complete(s: &mut State) -> bool {
             if digest[..] != s.blob_digest[..] {
                 log_err(s, b"[ota_reg] blob sha256 mismatch; discarding");
                 let mut cmd = [CTRL_ABORT];
-                let _ = (sys.provider_call)(-1, OTA_STAGE_CTRL, cmd.as_mut_ptr(), 1);
+                let _ = (sys.provider_call)(
+                    -1,
+                    OTA_STAGE_CTRL,
+                    cmd.as_mut_ptr(),
+                    1,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 return false;
             }
         }
         let mut cmd = [CTRL_COMMIT];
-        let rc = (sys.provider_call)(-1, OTA_STAGE_CTRL, cmd.as_mut_ptr(), 1);
+        let rc = (sys.provider_call)(
+            -1,
+            OTA_STAGE_CTRL,
+            cmd.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
         if rc == 0 {
             log_msg_num(s, b"[ota_reg] committed image epoch ", s.image_epoch);
             s.backoff_ms = 0;
@@ -996,11 +1019,10 @@ unsafe fn pump_net(s: &mut State) -> bool {
     let payload = core::slice::from_raw_parts(nbuf.add(3), payload_len);
     match msg_type {
         NET_MSG_CONNECTED => {
-            // [conn_id: u16 LE][requester_tag: u16 LE]
-            if s.phase == Phase::WaitConnect && payload_len >= net_proto::CONN_ID_LEN {
-                let (cid, tag) = net_proto::connected_parts(payload);
+            if let (Some(c), Phase::WaitConnect) = (net_proto::connected_parts(payload), s.phase) {
+                let tag = c.requester_tag;
                 if tag == net_proto::REQUESTER_TAG_NONE || tag == dev_requester_tag(sys) {
-                    s.conn_id = cid;
+                    s.conn_id = c.conn_id;
                     s.conn_present = 1;
                     let len = build_request(s);
                     s.tx_len = len as u16;
@@ -1012,14 +1034,12 @@ unsafe fn pump_net(s: &mut State) -> bool {
             }
         }
         NET_MSG_DATA => {
-            if payload_len < 2 {
+            let Some((cid, mut data)) = net_proto::data_parts(payload) else {
                 return true;
-            }
-            let cid = u16::from_le_bytes([payload[0], payload[1]]);
+            };
             if s.conn_present == 0 || cid != s.conn_id {
                 return true;
             }
-            let mut data = &payload[2..];
             if s.phase == Phase::RecvHeader {
                 // Accumulate into hdr_buf until CRLFCRLF.
                 let fill = s.hdr_fill as usize;
@@ -1080,8 +1100,7 @@ unsafe fn pump_net(s: &mut State) -> bool {
             }
         }
         NET_MSG_CLOSED => {
-            if payload_len >= 2 {
-                let cid = u16::from_le_bytes([payload[0], payload[1]]);
+            if let Some((cid, _)) = net_proto::closed_parts(payload) {
                 if s.conn_present == 1 && cid == s.conn_id {
                     s.conn_present = 0;
                     // A close mid-transfer is a failure; a close after
@@ -1095,18 +1114,17 @@ unsafe fn pump_net(s: &mut State) -> bool {
             }
         }
         NET_MSG_ERROR => {
-            // Payload: [conn_id u16][errno][tag u16?]. Claim only errors for
-            // the CURRENT connection (established) or a connect-phase
-            // failure that isn't a late event from the previous conn.
-            let cid = if payload_len >= 2 {
-                u16::from_le_bytes([payload[0], payload[1]])
-            } else {
-                0
+            // Claim only an established error on the CURRENT connection, or
+            // a connect-phase failure carrying this module's tag.
+            let Some((cid, _, tag)) = net_proto::error_parts(payload) else {
+                return true;
             };
-            let stale = payload_len >= 2 && cid == s.prev_conn_id && cid != s.conn_id;
-            if (s.conn_present == 1 && cid == s.conn_id)
-                || (s.phase == Phase::WaitConnect && !stale)
-            {
+            let ours = if tag == net_proto::REQUESTER_TAG_NONE {
+                s.conn_present == 1 && cid == s.conn_id
+            } else {
+                s.phase == Phase::WaitConnect && tag == dev_requester_tag(sys)
+            };
+            if ours {
                 log_err(s, b"[ota_reg] net error");
                 enter_backoff(s);
             }
@@ -1210,10 +1228,13 @@ unsafe fn pump(s: &mut State) -> StepReturn {
             let tag = dev_requester_tag(sys);
             let n = write_connect_to(
                 &mut payload,
-                SOCK_TYPE_STREAM,
-                s.peer_port,
-                &dial_target(s),
-                Some(tag),
+                &net_proto::ConnectTo {
+                    sock_type: SOCK_TYPE_STREAM,
+                    flags: 0,
+                    port: s.peer_port,
+                    target: dial_target(s),
+                    requester_tag: tag,
+                },
             );
             let wrote = net_write_frame(
                 sys,
@@ -1264,7 +1285,13 @@ unsafe fn pump(s: &mut State) -> StepReturn {
 
 // ── Module ABI entry points ──────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: State }
+fluxor_rt::module_facts! {
+    state: State,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE,
+        out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + net_proto::DATA_HEAD + TX_CHUNK,
+    ],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

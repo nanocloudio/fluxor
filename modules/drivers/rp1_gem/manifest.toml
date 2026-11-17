@@ -18,10 +18,15 @@ timer_class = "agnostic"
 # combined `MAX_PRE_TICK_BUDGET_US = 5` ceiling.
 pre_tick_drain = true
 
+# `net_tx_drain` is served on `frames_tx` to the stack wired there: a fence
+# learns from it when the wire is quiet.
+provider_contracts = ["net_tx_drain"]
+
 [[ports]]
 name = "frames_tx"
 direction = "input"
 content_type = "EthernetFrame"
+serves = "net_tx_drain"
 buffer_size = 8192
 
 [[ports]]

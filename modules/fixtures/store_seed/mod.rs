@@ -45,15 +45,12 @@ use fluxor_rt::*;
 // literal: a seeder that restates the wire can write against its own copy.
 const OBJ_PUT: u32 = abi::contracts::storage::object::PUT;
 use abi::contracts::storage::object::{write_answer, WriteAnswer};
-/// Room for an encoded fence (`fence::WIRE_MAX_LEN`).
-const FENCE_CAP: usize = 64;
 /// The contract's one key bound: a key this seeds is one every store holds.
 const MAX_KEY: usize = abi::contracts::storage::handle::STORAGE_KEY_MAX;
 const MAX_VALUE: usize = 1024;
-/// `[key_len:u16][key][ct_len:u8][body_ptr:u64][body_len:u64]
-/// [precondition:u8][etag_len:u8][key_ref_len:u8][retain_until_ms:u64]
-/// [legal_hold:u8][fence_ptr:u64][fence_cap:u16]`.
-const PUT_ARG_MAX: usize = 2 + MAX_KEY + 1 + 8 + 8 + 2 + 10 + 8 + 2;
+/// A `PUT` of a key of `MAX_KEY` bytes and nothing else: the record and the
+/// fence trailer.
+const PUT_ARG_MAX: usize = abi::contracts::storage::object::put::arg_len(MAX_KEY, 0, 0, 0);
 
 #[repr(C)]
 struct State {
@@ -73,9 +70,6 @@ struct State {
     /// Write no earlier than this, in ms since boot (`after_ms`).
     after_ms: u32,
     rc: i32,
-    /// Where the write's fence lands. In the state, so a write asked again
-    /// is the same request.
-    fence: [u8; FENCE_CAP],
 }
 
 mod params_def {
@@ -259,30 +253,28 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         let key = &s.key[..s.key_len as usize];
         let val = &s.value[..s.value_len as usize];
 
-        // [key_len:u16][key][ct_len:u8][body_ptr:u64][body_len:u64]
-        // [precondition:u8][etag_len:u8][key_ref_len:u8][retain_until_ms:u64]
-        // [legal_hold:u8][fence_ptr:u64][fence_cap:u16]
+        // The record names the key alone (no content type, precondition ANY,
+        // nothing kept); the body travels in `data`.
         let mut arg = [0u8; PUT_ARG_MAX];
-        let mut p = 0usize;
-        arg[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-        p += 2;
-        arg[p..p + key.len()].copy_from_slice(key);
-        p += key.len();
-        arg[p] = 0;
-        p += 1;
-        arg[p..p + 8].copy_from_slice(&(val.as_ptr() as u64).to_le_bytes());
-        p += 8;
-        arg[p..p + 8].copy_from_slice(&(val.len() as u64).to_le_bytes());
-        p += 8;
-        arg[p] = 0; // precondition ANY
-        arg[p + 1] = 0;
-        p += 2;
-        p += 10; // no key_ref, no retention, no hold: already zero
-        arg[p..p + 8].copy_from_slice(&(s.fence.as_mut_ptr() as u64).to_le_bytes());
-        p += 8;
-        arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-        p += 2;
-        s.rc = match write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p)) {
+        let req = abi::contracts::storage::object::put::Request {
+            key,
+            content_type: &[],
+            precondition: abi::contracts::storage::object::precondition::ANY,
+            etag: &[],
+            kept: abi::contracts::storage::object::Kept::none(),
+        };
+        let Some(p) = abi::contracts::storage::object::put::encode(&mut arg, &req) else {
+            s.written = 1;
+            return StepReturn::Continue;
+        };
+        s.rc = match write_answer((sys.provider_call)(
+            -1,
+            OBJ_PUT,
+            arg.as_mut_ptr(),
+            p,
+            val.as_ptr() as *mut u8,
+            val.len(),
+        )) {
             // Not decided yet: asked again next step, with the same request.
             WriteAnswer::Pending => return StepReturn::Continue,
             // Not ready yet (a disk-backed store mounting its volume): ask

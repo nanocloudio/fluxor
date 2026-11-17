@@ -134,9 +134,9 @@ A handful of statics are shared across cores in steady state. Every one
 must be an atomic or guarded by a lock:
 
 - `CHANNELS[i]` (`src/kernel/ipc/channel.rs`) — each `ChannelSlot`
-  uses `AtomicI8`/`AtomicU8`/`AtomicU32`/`AtomicPtr`/`AtomicBool` for
-  state + buffer + ioctl handler fields, plus an internal spin-wait
-  `lock` for the FIFO critical section. Cross-core safe.
+  uses atomics for its state, generation, ends, stream flags and buffer
+  slot, plus an internal spin-wait `lock` for the FIFO critical section.
+  Cross-core safe.
 - `BUFFER_REGISTRY[i]` (`src/kernel/ipc/buffer_pool.rs`) — each
   `BufferRegistrySlot` is fully atomic. Cross-core safe.
 - The buffer arena allocator (`src/kernel/ipc/buffer_pool.rs`) —

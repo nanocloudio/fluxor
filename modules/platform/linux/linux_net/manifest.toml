@@ -33,15 +33,23 @@ type = "u32"
 default = 128
 range = [1, 65535]
 
+# Records are bounded per port, header included; the built-in states the
+# same figures in providers.rs (`LINUX_NET_OUT_MAX_RECORD`,
+# `LINUX_NET_IN_ACCEPTS_RECORD`). A MSG_DATA carries at most 1460 bytes and a
+# datagram is delivered only while its MSG_DG_RX_FROM fits 1483 (1472 bytes
+# of IPv4 payload); a larger host datagram is dropped and counted.
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 1483
 
+# One command up to the 48 KiB command scratch.
 [[ports]]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 49155
 
 # Module-scope observability — exempt.
 [observability]

@@ -14,20 +14,19 @@
 //! axis it exists to exercise.
 //!
 //! Implements: BIND, LOOKUP, STAT, LIST, RENAME, DELETE, CLOSE,
-//! SUBSCRIBE, TAKE_RUNG, CHANGES, CAPS
+//! SUBSCRIBE, CHANGES, CAPS
 //! (BIND|RENAME|DELETE|SUBSCRIBE|CHANGES).
 //!
 //! # Subscriptions
 //!
-//! Small and fixed, but the whole doorbell contract: a subscription names
-//! the caller's own kernel event (refused unless `EVENT_OWNER` says the
-//! caller's module owns it) and is stamped with the caller's owner record
-//! and module occupancy. A change under its prefix sets its *rung* bit and
-//! signals the event when the bit was clear — after checking, every time,
-//! that the occupancy still stands (`MODULE_LIVE`) and still owns the
-//! event; a subscription that fails either is dropped, never signalled.
-//! `TAKE_RUNG` returns and clears the caller's rung bits on an event,
-//! signalling again when they do not all fit.
+//! Small and fixed, but the whole doorbell contract: SUBSCRIBE answers the
+//! subscription's index, stamped with the caller's owner record, and the
+//! kernel hands this provider the subscription's doorbell
+//! (`kernel::BIND_DOORBELL`). A change under its prefix rings it
+//! (`kernel::DOORBELL_RING`); a ring due before the doorbell arrives is
+//! owed and rung when it does. The kernel keeps the subscription handle to
+//! its minter and frees the doorbell when the handle closes, so a ring
+//! after the close rings nothing.
 //!
 //! `CHANGES` is served from a key-only change log of the last
 //! [`LOG_CAP`] entries `{rev, path, hint}`, one per key a write touched
@@ -38,8 +37,8 @@
 //! last entry only, so no record carries a revision past the page's cut.
 //! A `since` older than the log reaches is `LOST`, and the empty token
 //! relists the prefix by path, pinned at the revision its first page saw.
-//! Nothing here waits, so no answer is `EAGAIN` and a read's `sub` is
-//! never re-rung.
+//! Nothing here waits, so no answer is `EAGAIN` and a read never re-rings
+//! its subscription.
 //!
 //! # Parameters
 //!
@@ -73,18 +72,17 @@ const NS_SUBSCRIBE: u32 = abi::registry::storage_namespace::SUBSCRIBE;
 const NS_CLOSE: u32 = abi::registry::storage_namespace::CLOSE;
 const NS_CHANGES: u32 = abi::registry::storage_namespace::CHANGES;
 const NS_BIND: u32 = abi::registry::storage_namespace::BIND;
-const NS_TAKE_RUNG: u32 = abi::registry::storage_namespace::TAKE_RUNG;
 const NS_CAPS: u32 = abi::registry::storage_namespace::CAPS;
 
 // namespace.rs::caps bits.
-const NS_CAP_BIND: u32 = 1 << 0;
-const NS_CAP_RENAME: u32 = 1 << 1;
-const NS_CAP_DELETE: u32 = 1 << 2;
-const NS_CAP_SUBSCRIBE: u32 = 1 << 3;
-const NS_CAP_CHANGES: u32 = 1 << 4;
+const NS_CAP_BIND: u32 = abi::contracts::storage::namespace::caps::BIND;
+const NS_CAP_RENAME: u32 = abi::contracts::storage::namespace::caps::RENAME;
+const NS_CAP_DELETE: u32 = abi::contracts::storage::namespace::caps::DELETE;
+const NS_CAP_SUBSCRIBE: u32 = abi::contracts::storage::namespace::caps::SUBSCRIBE;
+const NS_CAP_CHANGES: u32 = abi::contracts::storage::namespace::caps::CHANGES;
 
-use abi::contracts::storage::namespace::{changes, subscribe, take};
-use abi::kernel_abi::{event as kevent, fd, query_key};
+use abi::contracts::storage::namespace::{bind, changes, delete, rename, stat, subscribe};
+use abi::kernel_abi::{doorbell, query_key};
 
 // Entry kind tags.
 const KIND_MAX: u8 = 2; // 0=object, 1=namespace, 2=stream
@@ -164,29 +162,24 @@ struct OpenSlot {
 #[derive(Clone, Copy)]
 struct Sub {
     in_use: u8,
-    /// Set by a change, cleared by `TAKE_RUNG`; while set, further
-    /// changes do nothing.
-    rung: u8,
+    /// A ring came before the doorbell did: rung when it arrives.
+    owed: u8,
     prefix_len: u8,
     _pad: u8,
-    /// The subscriber's tagged event fd.
-    event: i32,
+    /// The doorbell the kernel handed for it (`BIND_DOORBELL`), or -1.
+    doorbell: i32,
     /// `CALLER_OWNER` record of the opener.
     owner: [u8; 8],
-    /// `CALLER_MODULE` record of the opener: the occupancy that must
-    /// still stand, and still own `event`, for a signal to be sent.
-    occ: [u8; 8],
     prefix: [u8; MAX_PATH],
 }
 
 const SUB_EMPTY: Sub = Sub {
     in_use: 0,
-    rung: 0,
+    owed: 0,
     prefix_len: 0,
     _pad: 0,
-    event: -1,
+    doorbell: -1,
     owner: [0; 8],
-    occ: [0; 8],
     prefix: [0; MAX_PATH],
 };
 
@@ -292,45 +285,14 @@ pub extern "C" fn module_step(_state: *mut u8) -> StepReturn {
 
 // ── arg-parse helpers (bounds-checked, LE) ─────────────────────────
 
-#[inline]
-fn get_u16(a: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([*a.get(off)?, *a.get(off + 1)?]))
-}
-
-#[inline]
-fn get_u64(a: &[u8], off: usize) -> Option<u64> {
-    let mut b = [0u8; 8];
-    let mut i = 0;
-    while i < 8 {
-        b[i] = *a.get(off + i)?;
-        i += 1;
-    }
-    Some(u64::from_le_bytes(b))
-}
-
-/// Write the achieved fence — always `Volatile` here — into the caller's
-/// `[fence_out_ptr, fence_out_cap]` pair. A null/short buffer is EINVAL,
-/// mirroring the platform providers.
-unsafe fn write_volatile_fence(a: &[u8], off: usize) -> i32 {
-    let Some(fptr) = get_u64(a, off) else {
-        return E_INVAL;
-    };
-    let Some(fcap) = get_u16(a, off + 8) else {
-        return E_INVAL;
-    };
-    write_volatile_fence_at(fptr, fcap)
-}
-
-/// Write a `Volatile` fence into the caller's `[fptr, fptr + fcap)`.
-unsafe fn write_volatile_fence_at(fptr: u64, fcap: u16) -> i32 {
-    let fcap = fcap as usize;
-    if fptr == 0 || fcap < abi::fence::WIRE_MAX_LEN {
-        return E_INVAL;
-    }
-    let buf = core::slice::from_raw_parts_mut(fptr as *mut u8, fcap);
-    match abi::fence::Fence::Volatile.encode(buf) {
-        Some(_) => 0,
-        None => E_INVAL,
+/// Write the achieved fence — always `Volatile` here — into the trailer of
+/// `a`. Written before the op acts, since nothing here can fail to reach
+/// it; an `arg` with no room for the trailer is `EINVAL`.
+fn write_volatile_fence(a: &mut [u8]) -> i32 {
+    if abi::fence::trailer::put(a, &abi::fence::Fence::Volatile) {
+        0
+    } else {
+        E_INVAL
     }
 }
 
@@ -348,33 +310,27 @@ fn find_binding(s: &MemNsState, path: &[u8]) -> Option<usize> {
 
 // ── ops ────────────────────────────────────────────────────────────
 
-/// BIND — `[path_len:u16][path][kind:u8][flags:u8][target_len:u16][target]
-/// [fence_out_ptr:u64][fence_out_cap:u16]`.
-unsafe fn ns_bind(s: &mut MemNsState, a: &[u8]) -> i32 {
-    let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
+/// BIND — `namespace::bind`.
+unsafe fn ns_bind(s: &mut MemNsState, a: &mut [u8]) -> i32 {
+    let frc = write_volatile_fence(a);
+    if frc != 0 {
+        return frc;
+    }
+    let Some(req) = bind::parse_request(a) else {
         return E_INVAL;
     };
-    if pl == 0 || pl > MAX_PATH || a.len() < 2 + pl + 2 {
+    let (path, kind, flags, target) = (req.path, req.kind, req.flags, req.target);
+    let (pl, tl) = (path.len(), target.len());
+    if pl == 0 || pl > MAX_PATH || tl > MAX_TARGET {
         return E_INVAL;
     }
-    let path = &a[2..2 + pl];
     // A path is what LIST names, and a listed name is UTF-8.
     if !utf8_valid(path) {
         return E_INVAL;
     }
-    let kind = a[2 + pl];
-    let flags = a[2 + pl + 1];
     if kind > KIND_MAX {
         return E_INVAL;
     }
-    let Some(tl) = get_u16(a, 2 + pl + 2).map(|v| v as usize) else {
-        return E_INVAL;
-    };
-    if tl > MAX_TARGET || a.len() < 2 + pl + 4 + tl + 10 {
-        return E_INVAL;
-    }
-    let target_off = 2 + pl + 4;
-    let fence_off = target_off + tl;
 
     let existing = find_binding(s, path);
     let slot = match existing {
@@ -400,13 +356,6 @@ unsafe fn ns_bind(s: &mut MemNsState, a: &[u8]) -> i32 {
         }
     };
 
-    // Fence write can still fail on a malformed buffer; do it BEFORE
-    // mutating so a failed call leaves the table untouched.
-    let frc = write_volatile_fence(a, fence_off);
-    if frc != 0 {
-        return frc;
-    }
-
     s.revision += 1;
     let b = &mut s.bindings[slot];
     b.mod_rev = s.revision;
@@ -415,7 +364,7 @@ unsafe fn ns_bind(s: &mut MemNsState, a: &[u8]) -> i32 {
     b.path_len = pl as u8;
     b.path[..pl].copy_from_slice(path);
     b.target_len = tl as u8;
-    b.target[..tl].copy_from_slice(&a[target_off..target_off + tl]);
+    b.target[..tl].copy_from_slice(target);
     let hint = if existing.is_some() {
         HINT_MODIFIED
     } else {
@@ -448,7 +397,7 @@ fn ns_lookup(s: &mut MemNsState, a: &[u8]) -> i32 {
 }
 
 /// STAT — handle-bound; output per namespace.rs (size/mtime/kind/etag).
-unsafe fn ns_stat(s: &MemNsState, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+fn ns_stat(s: &MemNsState, handle: i32, out: &mut [u8]) -> i32 {
     let idx = handle as usize;
     if handle < 0 || idx >= MAX_OPEN || s.open[idx].in_use == 0 {
         return E_INVAL;
@@ -457,23 +406,22 @@ unsafe fn ns_stat(s: &MemNsState, handle: i32, arg: *mut u8, arg_len: usize) -> 
     if b.in_use == 0 {
         return E_NOENT; // deleted behind the handle
     }
-    const OUT: usize = 8 + 8 + 1 + 1;
-    if arg.is_null() || arg_len < OUT {
-        return E_INVAL;
+    // No clock in the fixture, and no etag.
+    match stat::encode(out, b.target_len as u64, 0, b.kind, &[]) {
+        Some(n) => n as i32,
+        None => E_INVAL,
     }
-    let out = core::slice::from_raw_parts_mut(arg, OUT);
-    out[..8].copy_from_slice(&(b.target_len as u64).to_le_bytes());
-    out[8..16].copy_from_slice(&0u64.to_le_bytes()); // no clock in the fixture
-    out[16] = b.kind;
-    out[17] = 0; // no etag
-    OUT as i32
 }
 
 /// LIST — the `namespace::LIST` request; the page is written by
 /// `namespace::list::PageWriter`. Entries are in ascending path order and the
 /// cursor is the last path a page returned, so the table's slot order and any
 /// write between pages are invisible to the listing.
-unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
+fn ns_list(s: &MemNsState, a: &mut [u8], out: &mut [u8]) -> i32 {
+    let frc = write_volatile_fence(a);
+    if frc != 0 {
+        return frc;
+    }
     let Some(req) = abi::contracts::storage::namespace::list::parse_request(a) else {
         return E_INVAL;
     };
@@ -486,7 +434,6 @@ unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
     } else {
         return E_INVAL;
     };
-    let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
     let mut page = abi::contracts::storage::namespace::list::PageWriter::new(out);
     let mut more = false;
     let mut last_binding = MAX_BINDINGS;
@@ -531,49 +478,29 @@ unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
     let Some(n) = page.finish(cursor) else {
         return E_NOMEM;
     };
-    let frc = write_volatile_fence_at(req.fence_out_ptr, req.fence_out_cap);
-    if frc != 0 {
-        return frc;
-    }
     n as i32
 }
 
-/// RENAME — `[src_len:u16][src][dst_len:u16][dst][flags:u8]
-/// [fence_out_ptr:u64][fence_out_cap:u16]`.
-unsafe fn ns_rename(s: &mut MemNsState, a: &[u8]) -> i32 {
-    let Some(sl) = get_u16(a, 0).map(|v| v as usize) else {
-        return E_INVAL;
-    };
-    if sl == 0 || a.len() < 2 + sl + 2 {
-        return E_INVAL;
-    }
-    let Some(dl) = get_u16(a, 2 + sl).map(|v| v as usize) else {
-        return E_INVAL;
-    };
-    if dl == 0 || dl > MAX_PATH || a.len() < 2 + sl + 2 + dl + 1 + 10 {
-        return E_INVAL;
-    }
-    if !utf8_valid(&a[2 + sl + 2..2 + sl + 2 + dl]) {
-        return E_INVAL;
-    }
-    let flags_off = 2 + sl + 2 + dl;
-    let flags = a[flags_off];
-    let frc = write_volatile_fence(a, flags_off + 1);
+/// RENAME — `namespace::rename`.
+unsafe fn ns_rename(s: &mut MemNsState, a: &mut [u8]) -> i32 {
+    let frc = write_volatile_fence(a);
     if frc != 0 {
         return frc;
     }
-    // Borrow-split: locate indices first, then mutate.
-    let src_idx = {
-        let src = &a[2..2 + sl];
-        match find_binding(s, src) {
-            Some(i) => i,
-            None => return E_NOENT,
-        }
+    let Some(req) = rename::parse_request(a) else {
+        return E_INVAL;
     };
-    let dst = &a[2 + sl + 2..2 + sl + 2 + dl];
+    let (src, dst, flags) = (req.src, req.dst, req.flags);
+    if src.is_empty() || dst.is_empty() || dst.len() > MAX_PATH || !utf8_valid(dst) {
+        return E_INVAL;
+    }
+    let dl = dst.len();
+    let Some(src_idx) = find_binding(s, src) else {
+        return E_NOENT;
+    };
     let mut dst_hint = HINT_CREATED;
     if let Some(d) = find_binding(s, dst) {
-        if flags & 0x01 == 0 {
+        if flags & rename::FLAG_REPLACE == 0 {
             return E_EXIST;
         }
         if d != src_idx {
@@ -598,21 +525,20 @@ unsafe fn ns_rename(s: &mut MemNsState, a: &[u8]) -> i32 {
     0
 }
 
-/// DELETE — `[path_len:u16][path][flags:u8][fence_out_ptr:u64]
-/// [fence_out_cap:u16]`. Flat table: nothing nests, so the recursive
-/// flag is accepted and means nothing extra.
-unsafe fn ns_delete(s: &mut MemNsState, a: &[u8]) -> i32 {
-    let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
-        return E_INVAL;
-    };
-    if pl == 0 || a.len() < 2 + pl + 1 + 10 {
-        return E_INVAL;
-    }
-    let frc = write_volatile_fence(a, 2 + pl + 1);
+/// DELETE — `namespace::delete`. Flat table: nothing nests, so the
+/// recursive flag is accepted and means nothing extra.
+unsafe fn ns_delete(s: &mut MemNsState, a: &mut [u8]) -> i32 {
+    let frc = write_volatile_fence(a);
     if frc != 0 {
         return frc;
     }
-    let path = &a[2..2 + pl];
+    let Some(req) = delete::parse_request(a) else {
+        return E_INVAL;
+    };
+    let path = req.path;
+    if path.is_empty() {
+        return E_INVAL;
+    }
     let Some(idx) = find_binding(s, path) else {
         return E_NOENT;
     };
@@ -623,8 +549,8 @@ unsafe fn ns_delete(s: &mut MemNsState, a: &[u8]) -> i32 {
 }
 
 unsafe fn ns_close(s: &mut MemNsState, handle: i32) -> i32 {
-    if handle >= 0 && fd::slot_of(handle) & SUB_BAND != 0 {
-        return sub_close(s, fd::slot_of(handle));
+    if handle >= 0 && handle & SUB_BAND != 0 {
+        return sub_close(s, handle);
     }
     let idx = handle as usize;
     if handle < 0 || idx >= MAX_OPEN || s.open[idx].in_use == 0 {
@@ -639,11 +565,11 @@ unsafe fn ns_close(s: &mut MemNsState, handle: i32) -> i32 {
 
 // ── subscriptions ──────────────────────────────────────────────────
 
-/// An 8-byte record from a `handle = -1`-style query (`CALLER_OWNER`,
-/// `CALLER_MODULE`) or `EVENT_OWNER` on `handle`, or the errno.
-unsafe fn query_record(sys: &SyscallTable, handle: i32, key: u32) -> Result<[u8; 8], i32> {
+/// An 8-byte record from a `handle = -1` query (`CALLER_OWNER`), or the
+/// errno.
+unsafe fn query_record(sys: &SyscallTable, key: u32) -> Result<[u8; 8], i32> {
     let mut r = [0u8; 8];
-    let rc = (sys.provider_query)(handle, key, r.as_mut_ptr(), r.len());
+    let rc = (sys.provider_query)(-1, key, r.as_mut_ptr(), r.len());
     match rc {
         8 => Ok(r),
         rc if rc < 0 => Err(rc),
@@ -651,32 +577,28 @@ unsafe fn query_record(sys: &SyscallTable, handle: i32, key: u32) -> Result<[u8;
     }
 }
 
-/// Whether `sub` may still be signalled: its module occupancy stands and
-/// still owns its event. Checked before every signal, so an occupancy that
-/// ended, or an event slot another module now holds, never wakes anybody.
-unsafe fn sub_alive(sys: &SyscallTable, sub: &Sub) -> bool {
-    let mut occ = sub.occ;
-    let live = (sys.provider_query)(-1, query_key::MODULE_LIVE, occ.as_mut_ptr(), occ.len());
-    live == 1 && query_record(sys, sub.event, query_key::EVENT_OWNER) == Ok(sub.occ)
-}
-
-/// Ring subscription `i`: set its bit and signal its event when the bit
-/// was clear. A subscription that may no longer be signalled, or whose
-/// event the kernel no longer holds, is dropped instead.
+/// Ring subscription `i`'s doorbell, or owe the ring until the doorbell
+/// arrives.
 unsafe fn ring(s: &mut MemNsState, i: usize) {
-    if s.subs[i].in_use == 0 || s.subs[i].rung != 0 {
+    if s.subs[i].in_use == 0 {
         return;
     }
+    let d = s.subs[i].doorbell;
+    if d < 0 {
+        s.subs[i].owed = 1;
+        return;
+    }
+    s.subs[i].owed = 0;
     let sys = &*s.syscalls;
-    if !sub_alive(sys, &s.subs[i]) {
-        s.subs[i] = SUB_EMPTY;
-        return;
-    }
-    s.subs[i].rung = 1;
-    let rc = (sys.provider_call)(s.subs[i].event, kevent::SIGNAL, core::ptr::null_mut(), 0);
-    if rc == E_INVAL {
-        s.subs[i] = SUB_EMPTY;
-    }
+    let mut arg = doorbell::ring_arg(d as u32);
+    (sys.provider_call)(
+        -1,
+        doorbell::DOORBELL_RING,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// Append one key a write touched to the change log, then ring every
@@ -708,8 +630,19 @@ unsafe fn changed(s: &mut MemNsState, path: &[u8], hint: u8) {
     }
 }
 
+/// The index SUBSCRIBE answers for slot `i`, in a band of its own beside
+/// the LOOKUP slots.
 fn sub_handle(i: usize) -> i32 {
-    fd::tag_fd(fd::FD_TAG_STORAGE_NAMESPACE, SUB_BAND | i as i32)
+    SUB_BAND | i as i32
+}
+
+/// The live subscription slot `handle` names.
+fn sub_slot(s: &MemNsState, handle: i32) -> Option<usize> {
+    if handle < 0 || handle & SUB_BAND == 0 {
+        return None;
+    }
+    let i = (handle & !SUB_BAND) as usize;
+    (i < MAX_SUBS && s.subs[i].in_use != 0).then_some(i)
 }
 
 /// SUBSCRIBE — `namespace::subscribe`.
@@ -721,64 +654,45 @@ unsafe fn ns_subscribe(s: &mut MemNsState, a: &[u8]) -> i32 {
         return E_INVAL;
     }
     let sys = &*s.syscalls;
-    // A call from outside any module has no occupancy to stamp.
-    let (Ok(occ), Ok(owner)) = (
-        query_record(sys, -1, query_key::CALLER_MODULE),
-        query_record(sys, -1, query_key::CALLER_OWNER),
-    ) else {
+    // A call from outside any module has no owner to stamp.
+    let Ok(owner) = query_record(sys, query_key::CALLER_OWNER) else {
         return E_INVAL;
     };
-    // The event must be the caller's own: a subscription never wakes a
-    // module that did not ask for it.
-    if query_record(sys, req.event, query_key::EVENT_OWNER) != Ok(occ) {
-        return E_INVAL;
-    }
-    let ring_now = req.flags & subscribe::FLAG_RING_NOW != 0;
-    // Idempotent: a module re-running its subscribe path gets the same
-    // handle back.
-    let mut i = 0;
-    while i < MAX_SUBS {
-        let sub = &s.subs[i];
-        if sub.in_use != 0
-            && sub.owner == owner
-            && sub.occ == occ
-            && sub.event == req.event
-            && &sub.prefix[..sub.prefix_len as usize] == req.prefix
-        {
-            if ring_now {
-                ring(s, i);
-            }
-            return sub_handle(i);
-        }
-        i += 1;
-    }
-    let mut slot = admit(s, &owner);
-    if slot.is_none() {
-        // Dead subscriptions are swept before a refusal.
-        let mut j = 0;
-        while j < MAX_SUBS {
-            if s.subs[j].in_use != 0 && !sub_alive(sys, &s.subs[j]) {
-                s.subs[j] = SUB_EMPTY;
-            }
-            j += 1;
-        }
-        slot = admit(s, &owner);
-    }
-    let Some(i) = slot else {
+    let Some(i) = admit(s, &owner) else {
         return E_NOMEM;
     };
     let sub = &mut s.subs[i];
     *sub = SUB_EMPTY;
     sub.in_use = 1;
-    sub.event = req.event;
     sub.owner = owner;
-    sub.occ = occ;
     sub.prefix_len = req.prefix.len() as u8;
     sub.prefix[..req.prefix.len()].copy_from_slice(req.prefix);
-    if ring_now {
-        ring(s, i);
+    if req.flags & subscribe::FLAG_RING_NOW != 0 {
+        sub.owed = 1;
     }
     sub_handle(i)
+}
+
+/// `kernel::BIND_DOORBELL` for subscription `handle`: keep the doorbell, and
+/// ring it at once when a ring is owed. Refused for anything but a
+/// subscription of the caller's owner not yet bound.
+unsafe fn sub_bind_doorbell(s: &mut MemNsState, handle: i32, a: &[u8]) -> i32 {
+    let Some((d, _)) = doorbell::parse_bind(a) else {
+        return E_INVAL;
+    };
+    let Some(i) = sub_slot(s, handle) else {
+        return abi::kernel_abi::errno::EBADF;
+    };
+    let sys = &*s.syscalls;
+    if s.subs[i].doorbell >= 0 || query_record(sys, query_key::CALLER_OWNER) != Ok(s.subs[i].owner)
+    {
+        return abi::kernel_abi::errno::EBADF;
+    }
+    s.subs[i].doorbell = d as i32;
+    if s.subs[i].owed != 0 {
+        ring(s, i);
+    }
+    0
 }
 
 /// A free subscription slot, unless the pool or `owner`'s quota is spent.
@@ -800,52 +714,11 @@ fn admit(s: &MemNsState, owner: &[u8; 8]) -> Option<usize> {
     free
 }
 
-/// TAKE_RUNG — `namespace::take`. Names and clears the rung bits of the
-/// caller's subscriptions on the event, and signals the event again when
-/// they did not all fit.
-unsafe fn ns_take_rung(s: &mut MemNsState, a: &[u8]) -> i32 {
-    let Some(req) = take::parse(a) else {
-        return E_INVAL;
-    };
-    let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
-    let sys = &*s.syscalls;
-    let Ok(occ) = query_record(sys, -1, query_key::CALLER_MODULE) else {
-        return E_INVAL;
-    };
-    let Some(mut w) = take::Writer::new(out) else {
-        return E_NOMEM;
-    };
-    let mut more = false;
-    let mut i = 0;
-    while i < MAX_SUBS {
-        let sub = &mut s.subs[i];
-        if sub.in_use != 0 && sub.rung != 0 && sub.occ == occ && sub.event == req.event {
-            if !w.push(sub_handle(i)) {
-                more = true;
-                break;
-            }
-            sub.rung = 0;
-        }
-        i += 1;
-    }
-    let n = w.finish(more);
-    if more {
-        (sys.provider_call)(req.event, kevent::SIGNAL, core::ptr::null_mut(), 0);
-    }
-    n as i32
-}
-
-/// CLOSE of a subscription. One the caller did not open is as if not open:
-/// a no-op.
-unsafe fn sub_close(s: &mut MemNsState, raw: i32) -> i32 {
-    let i = (raw & !SUB_BAND) as usize;
-    if i >= MAX_SUBS || s.subs[i].in_use == 0 {
-        return 0;
-    }
-    let sys = &*s.syscalls;
-    if query_record(sys, -1, query_key::CALLER_OWNER) == Ok(s.subs[i].owner)
-        && query_record(sys, -1, query_key::CALLER_MODULE) == Ok(s.subs[i].occ)
-    {
+/// CLOSE of a subscription: the kernel closes a subscription handle for
+/// its minter alone, so the slot is freed whoever is on the provider stack
+/// (a teardown closes it from another frame).
+unsafe fn sub_close(s: &mut MemNsState, handle: i32) -> i32 {
+    if let Some(i) = sub_slot(s, handle) {
         s.subs[i] = SUB_EMPTY;
     }
     0
@@ -890,26 +763,33 @@ fn last_for_key(s: &MemNsState, i: usize) -> bool {
 
 /// CHANGES — `namespace::changes`. One page from the log (a bare revision
 /// or an `L` continuation), or of a relist (the empty token or an `R`
-/// continuation).
-unsafe fn ns_changes(s: &MemNsState, a: &[u8]) -> i32 {
-    let Some(req) = changes::parse_request(a) else {
-        return E_INVAL;
-    };
-    let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
-    let tok = req.token;
-    let n = if tok.is_empty() || tok[0] == TOKEN_RELIST && tok.len() > 9 {
-        changes_relist(s, req.prefix, tok, out)
-    } else {
-        changes_log(s, req.prefix, tok, out)
-    };
-    if n < 0 {
-        return n;
+/// continuation). `handle` is the caller's subscription the read serves, or
+/// -1; nothing here waits, so no read re-rings one.
+unsafe fn ns_changes(s: &MemNsState, handle: i32, a: &mut [u8], out: &mut [u8]) -> i32 {
+    if handle >= 0 && !own_sub(s, handle) {
+        return abi::kernel_abi::errno::EBADF;
     }
-    let frc = write_volatile_fence_at(req.fence_out_ptr, req.fence_out_cap);
+    let frc = write_volatile_fence(a);
     if frc != 0 {
         return frc;
     }
-    n
+    let Some(req) = changes::parse_request(a) else {
+        return E_INVAL;
+    };
+    let tok = req.token;
+    if tok.is_empty() || tok[0] == TOKEN_RELIST && tok.len() > 9 {
+        changes_relist(s, req.prefix, tok, out)
+    } else {
+        changes_log(s, req.prefix, tok, out)
+    }
+}
+
+/// Whether `handle` names a live subscription of the caller's owner.
+unsafe fn own_sub(s: &MemNsState, handle: i32) -> bool {
+    let Some(i) = sub_slot(s, handle) else {
+        return false;
+    };
+    query_record(&*s.syscalls, query_key::CALLER_OWNER) == Ok(s.subs[i].owner)
 }
 
 /// A page of the log from a bare revision or an `L` continuation.
@@ -1076,8 +956,9 @@ fn changes_relist(s: &MemNsState, prefix: &[u8], tok: &[u8], out: &mut [u8]) -> 
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
-/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
-/// (may be null when `arg_len` is 0) valid for the call.
+/// module's `module_new` initialised, `arg` points to `arg_len` bytes and
+/// `data` to `data_len` bytes (either may be null when its length is 0),
+/// disjoint and valid for the call.
 #[cfg_attr(
     not(feature = "host-test"),
     link_section = ".text.module_provider_dispatch"
@@ -1089,48 +970,54 @@ pub unsafe extern "C" fn mem_ns_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return E_INVAL;
     }
     let s = &mut *(state as *mut MemNsState);
+    let a: &mut [u8] = if arg.is_null() || arg_len == 0 {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(arg, arg_len)
+    };
+    let d: &mut [u8] = if data.is_null() || data_len == 0 {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(data, data_len)
+    };
 
     // Per-handle fence introspection: everything here is RAM.
     if opcode == abi::fence::QUERY_OP {
-        if arg.is_null() || arg_len < abi::fence::WIRE_MAX_LEN {
+        if a.len() < abi::fence::WIRE_MAX_LEN {
             return E_INVAL;
         }
         let idx = handle as usize;
         if handle < 0 || idx >= MAX_OPEN || s.open[idx].in_use == 0 {
             return E_NOSYS;
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match abi::fence::Fence::Volatile.encode(buf) {
+        return match abi::fence::Fence::Volatile.encode(a) {
             Some(n) => n as i32,
             None => E_INVAL,
         };
     }
 
-    let a = if arg.is_null() {
-        &[][..]
-    } else {
-        core::slice::from_raw_parts(arg as *const u8, arg_len)
-    };
-
     match opcode {
-        NS_CAPS => {
-            (NS_CAP_BIND | NS_CAP_RENAME | NS_CAP_DELETE | NS_CAP_SUBSCRIBE | NS_CAP_CHANGES) as i32
-        }
+        NS_CAPS => abi::kernel_abi::caps_word::answer(
+            a,
+            NS_CAP_BIND | NS_CAP_RENAME | NS_CAP_DELETE | NS_CAP_SUBSCRIBE | NS_CAP_CHANGES,
+        ),
         NS_BIND => ns_bind(s, a),
         NS_LOOKUP => ns_lookup(s, a),
-        NS_STAT => ns_stat(s, handle, arg, arg_len),
-        NS_LIST => ns_list(s, a),
+        NS_STAT => ns_stat(s, handle, a),
+        NS_LIST => ns_list(s, a, d),
         NS_RENAME => ns_rename(s, a),
         NS_DELETE => ns_delete(s, a),
         NS_CLOSE => ns_close(s, handle),
         NS_SUBSCRIBE => ns_subscribe(s, a),
-        NS_TAKE_RUNG => ns_take_rung(s, a),
-        NS_CHANGES => ns_changes(s, a),
+        doorbell::BIND_DOORBELL => sub_bind_doorbell(s, handle, a),
+        NS_CHANGES => ns_changes(s, handle, a, d),
         _ => E_NOSYS,
     }
 }

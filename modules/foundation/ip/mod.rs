@@ -78,7 +78,14 @@
 //! answer or a dial with no resolver known. `CMD_DG_SEND_TO` takes the same
 //! `AF_NAME`: a cached name sends at once; a name not in hand starts the
 //! lookup and drops that datagram, which a datagram sender retransmits.
-//! The reserved `CMD_CONNECT` (0x13) is unsupported and answered `MSG_ERROR ENOSYS`.
+//!
+//! # Who keeps what is sent
+//!
+//! This module retransmits every connection. For one whose consumer keeps
+//! no copy of what it sends it keeps the bytes in flight itself (a send
+//! buffer from one pool, `send_pool.rs`); for one granted `RETX` — every
+//! consumer of the channel declares `retains_send` — it keeps nothing and
+//! asks the consumer over `stream_retx`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -153,6 +160,8 @@ mod ipv6;
 mod policy;
 /// The `net.route` tables read with TAKE: segments, peer routes, held.
 mod route;
+/// The send buffers of connections whose consumer keeps no copy.
+mod send_pool;
 /// Service translation (`net.policy` DNAT, `scope = local`).
 mod service;
 #[allow(
@@ -192,6 +201,10 @@ const SEAM_V6_MAX: usize = 4;
 /// Without this, the failure is a stack that completes a handshake and then
 /// drops every full-size segment — which presents as a stall, not an error.
 const _: () = assert!(tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE);
+// The net_out scratch holds the longest record either port it serves writes.
+const _: () = assert!(NET_OUT_MAX_RECORD <= PACKET_FWD_MAX_RECORD);
+const _: () =
+    assert!(abi::contracts::net::net_proto::data_capacity(NET_OUT_MAX_RECORD) >= tcp::MSS as usize);
 
 /// Largest transmit frame `send_frame` will accept. It stages
 /// `[len:u16 LE][frame…]` inside a single buffer, so two bytes of the
@@ -223,10 +236,9 @@ const MAX_ICMP_TX_LEN: usize = MAX_TX_FRAME_PAYLOAD - eth::ETH_HEADER_LEN - ipv4
 const E_MSGSIZE: i8 = -90;
 const E_NETUNREACH: i8 = -101;
 
-/// CMD_SEND stash capacity. Must match the largest single-frame
-/// payload an upstream consumer can write — `NET_BUF_SIZE` per
-/// target. A frame larger than the reader's buffer is dropped whole,
-/// so anything smaller would lose commands.
+/// CMD_SEND stash capacity: the largest command `net_in` accepts
+/// (`NET_IN_ACCEPTS_RECORD`, the port's `accepts_record`, is this plus the
+/// header). A frame larger than the reader's buffer is dropped whole.
 #[cfg(target_arch = "aarch64")]
 const PENDING_CMD_BUF_SIZE: usize = 8192;
 #[cfg(not(target_arch = "aarch64"))]
@@ -234,53 +246,27 @@ const PENDING_CMD_BUF_SIZE: usize = 1600;
 
 // NET_FRAME_HDR (3 bytes: msg_type + len u16 LE) defined in pic_runtime.rs
 
-/// Net protocol: downstream messages (IP → consumer)
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-use abi::contracts::net::net_proto::{CLOSED_GONE, CLOSED_PEER_FIN};
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-/// Request that the consumer retransmit data from `from_seq` onwards on
-/// the named connection. Fires on 3 duplicate ACKs, an RTO timeout and each
-/// partial acknowledgement in recovery; the consumer answers with
-/// `NET_CMD_RESEND`.
-const NET_MSG_RETRANSMIT: u8 = abi::contracts::net::net_proto::MSG_RETRANSMIT;
-/// Advance the consumer-side "acknowledged bytes" watermark so the
-/// consumer may free its retained send buffer up to this sequence.
-/// Payload: `[conn_id: u16 LE][acked_seq: u32 LE][isn: u32 LE]` — `isn` is
-/// the sequence number of the stream's first byte (ISS + 1), which places
-/// a consumer's retained bytes in sequence space however many it handed
-/// down before the first report reached it.
-const NET_MSG_ACK: u8 = abi::contracts::net::net_proto::MSG_ACK;
-
-/// Net protocol: upstream commands (consumer → IP)
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-/// The consumer's answer to `NET_MSG_RETRANSMIT`, bytes it already handed
-/// down sent again at their own sequence numbers. Payload: `[conn_id: u16 LE][seq: u32 LE][data…]`.
-/// Unlike `CMD_SEND` it allocates nothing: of the bytes it carries, those in
-/// `[SND.UNA, SND.NXT)` go out again, up to one segment, and the rest
-/// (acknowledged since, or not yet sent) are dropped.
-const NET_CMD_RESEND: u8 = abi::contracts::net::net_proto::CMD_RESEND;
-/// Retired: answered `MSG_ERROR ENOSYS` on its tag so a stale emitter
-/// fails loudly on its first dial.
-const NET_CMD_CONNECT: u8 = abi::contracts::net::net_proto::CMD_CONNECT;
-/// Open a stream to a target carrying an address family (`net_proto`).
-const NET_CMD_CONNECT_TO: u8 = abi::contracts::net::net_proto::CMD_CONNECT_TO;
+// Net protocol: the stream surface (`net_proto`) and its sidebands.
+use abi::contracts::net::net_proto::{
+    flag as net_flag, CLOSED_GONE, CLOSED_PEER_FIN, CMD_BIND as NET_CMD_BIND,
+    CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND,
+    MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND, MSG_CLOSED as NET_MSG_CLOSED,
+    MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
+};
+/// The retransmission hand-off with a consumer that keeps its own copy
+/// (`stream_retx`, granted as `flag::RETX`): the peer's acknowledgement
+/// (`MSG_RETX_ACK`), the request to send again from a sequence number
+/// (`MSG_RETX_REQUEST`) and the consumer's answer (`CMD_RETX_RESEND`).
+use abi::contracts::net::stream_retx::{
+    CMD_RETX_RESEND as NET_CMD_RETX_RESEND, MSG_RETX_ACK as NET_MSG_RETX_ACK,
+    MSG_RETX_REQUEST as NET_MSG_RETX_REQUEST,
+};
 
 // Datagram surface opcodes share the same `net_in` / `net_out` pair as
 // net_proto; the disjoint opcode ranges keep the contracts unambiguous.
 // See `crates/fluxor-abi/src/contracts/net/datagram.rs`.
 
-// `DG_OWNER_TAG_MARK` / `DG_OWNER_TAG_FIELD` — the marker byte that introduces
-// the owner tag on `DG_CMD_SEND_TO` / `DG_CMD_CLOSE`, and the field's width —
-// come from `sdk/runtime/net.rs`, which re-exports the contract for every
-// module on the datagram surface.
-
-/// Bytes of a `DG_CMD_SEND_TO` payload after the owner-tag field:
+/// Bytes of a `DG_CMD_SEND_TO` payload after its `ep_id`:
 /// `[af:1][addr:4][port:2]`.
 const DG_V4_DEST_LEN: usize = 1 + 4 + 2;
 
@@ -412,12 +398,14 @@ const DNS_PENDING_DEFAULT: u8 = 2;
 #[cfg(target_arch = "aarch64")]
 const HEAP_DEFAULT_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(not(target_arch = "aarch64"))]
-const HEAP_DEFAULT_BYTES: u32 = 5 * 1024
-    + (PACKET_HOLDS_DEFAULT as usize
-        * (core::mem::size_of::<HeldPacket>() + core::mem::size_of::<OwedRef>())) as u32;
+const HEAP_DEFAULT_BYTES: u32 =
+    5 * 1024 + send_pool::POOL_BLOCKS as u32 * send_pool::BLOCK_OVERHEAD;
 
-/// Decision-seam holds when the graph declares none: the profile's figure.
-const PACKET_HOLDS_DEFAULT: u16 = MAX_PACKET_HOLD as u16;
+/// Heap bytes one decision-seam hold takes: the held frame and its owed-record
+/// reference. The manifest's `heap_per_param` term for `packet_holds` charges
+/// this per declared hold.
+const HOLD_BYTES: usize = core::mem::size_of::<HeldPacket>() + core::mem::size_of::<OwedRef>();
+const _: () = assert!(HOLD_BYTES == 1628);
 /// The most holds a `pkt_id` can name.
 const PACKET_HOLDS_MAX: usize = 1 << abi::contracts::net::packet::PKT_SLOT_BITS;
 
@@ -534,6 +522,8 @@ struct DnsPending {
     srv_port: u16,
     srv_ip: u32,
     src_slot: u16,
+    /// The sidebands granted to the dial (`IpState::dial_flags`).
+    dial_flags: u8,
 }
 
 /// `DnsPending::search`: the name as dialled, not expanded.
@@ -620,7 +610,7 @@ pub struct LocalAddr {
     /// Install generation, monotonic per module instance.
     pub generation: u32,
     /// Owning workload tag (0 = host/system — a legitimate owner, not a
-    /// sentinel). Enforced on bind and on source selection: an owner-stamped
+    /// sentinel). Enforced on bind and on source selection: an owner's
     /// bind serves exactly the addresses whose `owner_tag` matches, of both
     /// families, an owned secondary (`owner_tag != 0`) is never served by a
     /// host wildcard listener, and an owner's traffic leaves only from its
@@ -713,11 +703,16 @@ const PACKET_FWD_PORT: u8 = 4;
 const PKT_DECISION_OFF: u8 = 0;
 const PKT_DECISION_PRE_TRANSPORT: u8 = 1;
 
-/// Largest control frame an event queue holds: the peer report
-/// (`MSG_PEER`), the 3-byte header, a u16 connection id, the family, a
-/// 16-byte address and a u16 port. Every other queued frame is shorter;
-/// MSG_DATA goes through its own per-connection backpressure path.
-const NET_OUT_FRAME_MAX: usize = NET_FRAME_HDR + abi::contracts::net::net_proto::PEER_LEN;
+/// Largest control frame an event queue holds: the longer of the peer
+/// report (`MSG_PEER`) and the trace context (`MSG_TRACE_CTX`), with the
+/// 3-byte header. Every other queued frame is shorter; MSG_DATA goes through
+/// its own per-connection backpressure path.
+const NET_OUT_FRAME_MAX: usize = NET_FRAME_HDR
+    + if abi::contracts::net::net_proto::PEER_LEN > abi::contracts::net::stream_trace::CTX_LEN {
+        abi::contracts::net::net_proto::PEER_LEN
+    } else {
+        abi::contracts::net::stream_trace::CTX_LEN
+    };
 
 /// One queued control frame.
 #[repr(C)]
@@ -1018,6 +1013,7 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
     }
     continuity::note_release(s, idx);
     continuity::on_conn_released(s, idx);
+    sbuf_release(s, idx);
     *s.tcp_conns.ptr_mut(idx) = tcp::TcpConn::new();
     free_push(s, idx);
 }
@@ -1659,6 +1655,9 @@ struct IpState {
     _fw_pad: u8,
     fence_wait_gen: u32,
     fence_wait_deadline_ms: u32,
+    /// `net_tx_drain`, bound through the frames output to the driver at
+    /// the other end of that edge; -1 until a bind succeeds.
+    tx_drain: i32,
     /// `arm_authority`: an arm needs the VIP authority's verdict on its
     /// emission token (identity.rs §The VIP authority's token).
     arm_authority: u8,
@@ -1730,7 +1729,7 @@ struct IpState {
     cont: continuity::Continuity,
 
     // Net protocol scratch buffer: NET_FRAME_HDR(3) + conn_id(1) + TCP payload.
-    net_scratch: [u8; 1600],
+    net_scratch: [u8; PACKET_FWD_MAX_RECORD],
 
     // Frame buffers
     rx_frame: [u8; MAX_FRAME_SIZE],
@@ -1899,8 +1898,8 @@ struct IpState {
     /// CloseWait connections this module finished closing because the
     /// consumer never sent CMD_CLOSE within the grace interval.
     tcp_closewait_expired: u32,
-    /// Segments sent again at their own sequence numbers on the consumer's
-    /// `NET_CMD_RESEND` (retransmissions of data).
+    /// Segments sent again at their own sequence numbers, from this
+    /// module's copy or a consumer's `CMD_RETX_RESEND`.
     tcp_resent: u32,
     /// SYN-ACKs answered from cookie mode, spending no connection slot.
     /// `> 0` is the operator's signal that the deployment crossed the
@@ -2066,6 +2065,20 @@ struct IpState {
     /// The service a dial being made was translated from, stamped on the
     /// connection it makes (`svc_vip`).
     dial_vip: u32,
+    /// The sidebands granted to the dial being made (`CMD_CONNECT_TO`'s
+    /// flags, as `grant_flags` answers them), stamped on its connection.
+    dial_flags: u8,
+    /// `tcp_send_buf`: bytes per send buffer, and the pool they come from.
+    tcp_send_buf: u32,
+    /// `tcp_send_pool`: bytes of the whole pool.
+    tcp_send_pool: u32,
+    send_pool: send_pool::SendPool,
+    /// The owner the kernel attests for the node's own `net_in`, and
+    /// whether every consumer of its `net_out` retains what it sends
+    /// (`node_facts`, asked once).
+    node_owner: u16,
+    node_retx: bool,
+    node_facts_known: bool,
     dial_vport: u16,
     /// The name being dialled ended in a dot (absolute: no search list).
     dial_absolute: bool,
@@ -2110,6 +2123,21 @@ mod params_def {
         // policy: the consumer knows what "idle" means for its protocol, but
         // a consumer without one, or a slot no consumer is tracking, must
         // not hold TCP state for good.
+        // Bytes of each send buffer: what one connection keeps of what it
+        // sent until the peer acknowledges it, for consumers that keep no
+        // copy themselves (all but a `retains_send` one, granted `RETX`).
+        // In flight is the least of it, the congestion window and the
+        // peer's window. 0 keeps nothing: a graph may set it only when every
+        // consumer retains what it sends (the composer checks).
+        33, tcp_send_buf, u32, send_pool::BLOCK_DEFAULT
+            => |s, d, len| { s.tcp_send_buf = p_u32(d, len, 0, send_pool::BLOCK_DEFAULT); };
+        // Bytes of the whole send pool: as many `tcp_send_buf` blocks as it
+        // holds, up to `POOL_BLOCKS`. The composer derives it from the
+        // graph — 0 where no consumer of `net_out` leaves retention here
+        // and no workload lane is served — and grows the heap by it on an
+        // MCU-class target (`heap_per_param`).
+        34, tcp_send_pool, u32, send_pool::POOL_DEFAULT
+            => |s, d, len| { s.tcp_send_pool = p_u32(d, len, 0, send_pool::POOL_DEFAULT); };
         5, tcp_idle_s, u16, 0
             => |s, d, len| { s.tcp_idle_ticks = p_u16(d, len, 0, 0).saturating_mul(TCP_TIMER_HZ); };
         // Pre-transport decision seam. `pre_transport` hands every validated
@@ -2144,10 +2172,12 @@ mod params_def {
             };
         // Packets the decision seam holds at once (`packet_decision`), each
         // a whole frame in this module's heap: a burst past them is refused
-        // (`hold_refused`) and its peers retransmit. At most the slots a
-        // `pkt_id` can name (`PKT_SLOT_BITS`).
-        32, packet_holds, u16, PACKET_HOLDS_DEFAULT
-            => |s, d, len| { s.pkt_holds = p_u16(d, len, 0, PACKET_HOLDS_DEFAULT); };
+        // (`hold_refused`) and its peers retransmit. A graph that turns the
+        // seam on declares them (the profile's figure is `MAX_PACKET_HOLD`);
+        // with the seam off there are none. At most the slots a `pkt_id` can
+        // name (`PKT_SLOT_BITS`).
+        32, packet_holds, u16, 0
+            => |s, d, len| { s.pkt_holds = p_u16(d, len, 0, 0); };
         // Declared capacities: each sizes a table in this module's heap at
         // construction. A graph that declares more than the defaults gives
         // the instance the heap for it (`heap.arena_bytes`).
@@ -2421,7 +2451,12 @@ unsafe fn size_declared_tables(s: &mut IpState) -> bool {
         return false;
     }
     if s.pkt_decision != PKT_DECISION_OFF && s.pkt_holds == 0 {
-        let msg = b"[ip] refusing to construct: packet_decision with packet_holds 0 would refuse every packet";
+        let msg = b"[ip] refusing to construct: packet_decision needs packet_holds (the profile's figure is MAX_PACKET_HOLD)";
+        dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
+        return false;
+    }
+    if s.pkt_decision == PKT_DECISION_OFF && s.pkt_holds > 0 {
+        let msg = b"[ip] refusing to construct: packet_holds declared but packet_decision=off";
         dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
         return false;
     }
@@ -2518,13 +2553,28 @@ unsafe fn size_declared_tables(s: &mut IpState) -> bool {
             srv_port: 0,
             srv_ip: 0,
             src_slot: 0,
+            dial_flags: 0,
         },
     );
     if s.dns_pending_per > 0 && s.dns_pending.is_null() {
         refuse_capacity(s, b"the resolver queries (dns_pending)");
         return false;
     }
-    true
+    match s
+        .send_pool
+        .init(&*s.syscalls, s.tcp_send_buf, s.tcp_send_pool)
+    {
+        Ok(()) => true,
+        Err(send_pool::PoolRefusal::Heap) => {
+            refuse_capacity(s, b"the send buffers (tcp_send_pool)");
+            false
+        }
+        Err(send_pool::PoolRefusal::Blocks) => {
+            let m = b"[ip] refusing to construct: tcp_send_pool is not 1..=POOL_BLOCKS blocks of tcp_send_buf";
+            dev_log(&*s.syscalls, 1, m.as_ptr(), m.len());
+            false
+        }
+    }
 }
 
 /// The lane stashes: too large to build on the stack as a value, so each is
@@ -2666,7 +2716,7 @@ fn slot_is_owned(s: &IpState, slot: u16) -> bool {
     owner_tag_for_slot(s, slot) != 0
 }
 
-/// Resolve a nonzero bind `owner_tag` to the slot an owner-stamped bind is
+/// Resolve a nonzero bind owner to the slot that owner's bind is
 /// anchored at: the first active local-address slot that owner owns, of
 /// either family. The bind serves every address the owner holds
 /// (`bind_serves`), so the anchor only names the bind. `None` = the owner has
@@ -2829,7 +2879,7 @@ unsafe fn addr_evt(s: &mut IpState, msg: u8, payload: &[u8]) {
         return;
     }
     let sys = &*s.syscalls;
-    let mut scratch = [0u8; NET_FRAME_HDR + 48];
+    let mut scratch = [0u8; ADDR_EVT_MAX_RECORD];
     let _ = ip_net_write_frame(
         sys,
         s.addr_evt_chan,
@@ -2865,6 +2915,8 @@ unsafe fn mint_token(s: &IpState) -> Option<[u8; 16]> {
             abi::kernel_abi::BOOT_INCARNATION,
             probe.as_mut_ptr(),
             16,
+            core::ptr::null_mut(),
+            0,
         );
         let mut line = *b"[ip] token: no boot incarnation rc=-000";
         let e = rc.unsigned_abs();
@@ -3091,22 +3143,36 @@ enum DrainAnswer {
     Drained(u64),
     /// Frames are still leaving.
     Draining,
-    /// No driver answers the query on this channel.
+    /// The driver on the frame edge serves no `net_tx_drain`.
     Unsupported,
 }
 
-/// Ask the frame channel's reader whether everything handed over has left
-/// the NIC (`net::identity::tx_drain`).
+/// Ask the driver at the other end of the frames output whether everything
+/// handed over has left the NIC (`net::identity::tx_drain`). The edge
+/// contract is bound on first use; a driver that serves none is
+/// `Unsupported`, which reports the ring hand-off.
 unsafe fn driver_tx_drained(s: &mut IpState) -> DrainAnswer {
     if s.out_chan < 0 {
         return DrainAnswer::Unsupported;
     }
     let sys = &*s.syscalls;
+    if s.tx_drain < 0 {
+        let h = dev_bind_port(
+            sys,
+            abi::registry::net_tx_drain::ID,
+            abi::kernel_abi::bind::PORT_OUT,
+            0,
+        );
+        if h < 0 {
+            return DrainAnswer::Unsupported;
+        }
+        s.tx_drain = h;
+    }
     let mut arg = [0u8; netid::tx_drain::ARG_LEN];
-    let rc = dev_channel_ioctl(
+    let rc = dev_call(
         sys,
-        s.out_chan,
-        netid::tx_drain::IOCTL,
+        s.tx_drain,
+        abi::registry::net_tx_drain::DRAINED,
         arg.as_mut_ptr(),
         arg.len(),
     );
@@ -3291,7 +3357,7 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 2 + data_len; // conn_id (u16 LE) + data
-    let max_copy = s.net_scratch.len() - NET_FRAME_HDR - 2;
+    let max_copy = abi::contracts::net::net_proto::data_capacity(NET_OUT_MAX_RECORD);
     if data_len > max_copy {
         return false;
     }
@@ -3456,60 +3522,100 @@ unsafe fn drain_pending_net_out(s: &mut IpState) {
     }
 }
 
+/// A short control frame `[msg][len][payload]` built in `out`, its length.
+fn ctl_frame(out: &mut [u8; NET_OUT_FRAME_MAX], msg: u8, payload: &[u8]) -> usize {
+    let n = NET_FRAME_HDR + payload.len();
+    if abi::contracts::net::net_proto::put_header(&mut out[..], msg, payload.len()).is_none()
+        || n > NET_OUT_FRAME_MAX
+    {
+        return 0;
+    }
+    out[NET_FRAME_HDR..n].copy_from_slice(payload);
+    n
+}
+
+/// The sidebands granted on endpoint `idx` (0 past the table).
+#[inline(always)]
+unsafe fn conn_flags(s: &IpState, idx: usize) -> u8 {
+    if idx < s.tcp_conns.len() {
+        (*s.tcp_conns.ptr(idx)).flags
+    } else {
+        0
+    }
+}
+
 #[inline(always)]
 #[must_use]
 unsafe fn net_send_accepted(s: &mut IpState, conn_id: u16, local_port: u16) -> bool {
-    // MSG_ACCEPTED payload: `[conn_id:2 LE][local_port:2 LE]`, mirroring
-    // `net_send_bound`. Consumers that share `net_out` with other anchors
-    // (multi-anchor graphs binding distinct ports) filter on `local_port` so
-    // they only claim conn_ids whose listener matches their own CMD_BIND;
-    // without it every consumer alloc_slot()s the same new conn_id and
-    // corrupts each other's subsequent NET_MSG_DATA dispatch.
-    let mut frame = [0u8; 7];
-    let cb = conn_id.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACCEPTED);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    let pb = local_port.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), pb[1]);
-    let ok = net_send_or_queue(s, &frame);
-    // Observability: start a `tcp.connection` span for the accepted (server-
-    // side) connection, mint its root trace context, and propagate that context
-    // downstream (best-effort `MSG_TRACE_CTX`, right after ACCEPTED) so TLS/HTTP
-    // parent their spans under it. One predicate — no clock read, no work — when
-    // the telemetry port is unwired, so tracing is zero-cost when disabled.
-    if ok && dev_telemetry_enabled(&*s.syscalls) {
-        let idx = conn_id as usize;
-        if idx < s.tcp_conns.len() {
-            let sys = &*s.syscalls;
-            let now = dev_micros(sys);
-            // `0` means "no span"; clamp a (boot-impossible) 0 to 1 so a real
-            // accept is never mistaken for an unspanned slot.
-            s.tcp_conns[idx].span_start_us = if now == 0 { 1 } else { now };
-            dev_csprng_fill(sys, s.tcp_conns[idx].trace_id.as_mut_ptr(), 16);
-            dev_csprng_fill(sys, s.tcp_conns[idx].span_id.as_mut_ptr(), 8);
-            let trace_id = s.tcp_conns[idx].trace_id;
-            let span_id = s.tcp_conns[idx].span_id;
-            // Decide head sampling ONCE, here, and latch it on the connection.
-            let sampled = ingress_sample_decision(s.sample_permille, &trace_id);
-            s.tcp_conns[idx].sampled_flags = sampled;
-            let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
-            dev_net_send_trace_ctx(
-                sys,
-                out_chan_conn(s, conn_id as usize),
-                conn_id,
-                &trace_id,
-                &span_id,
-                sampled,
-                scratch.as_mut_ptr(),
-                scratch.len(),
-            );
-        }
+    // `[conn_id][local_port][flags_granted][generation = 0][alpn_len = 0]`.
+    // Consumers that share `net_out` with other anchors (multi-anchor
+    // graphs binding distinct ports) filter on `local_port` so they only
+    // claim conn_ids whose listener matches their own CMD_BIND; without it
+    // every consumer alloc_slot()s the same new conn_id and corrupts each
+    // other's subsequent NET_MSG_DATA dispatch.
+    use abi::contracts::net::net_proto::{put_accepted, Accepted, Opening, ACCEPTED_FIXED};
+    let mut p = [0u8; ACCEPTED_FIXED];
+    let n = put_accepted(
+        &mut p,
+        &Accepted {
+            conn_id,
+            local_port,
+            opening: Opening {
+                flags_granted: conn_flags(s, conn_id as usize),
+                ..Opening::PLAIN
+            },
+        },
+    )
+    .unwrap_or(0);
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    let len = ctl_frame(&mut frame, NET_MSG_ACCEPTED, &p[..n]);
+    let ok = net_send_or_queue(s, &frame[..len]);
+    if ok {
+        mint_trace(s, conn_id as usize, true);
     }
     ok
+}
+
+/// Mint the root trace context of stream `idx` when anyone will use it: the
+/// telemetry port (an accepted stream's `tcp.connection` span starts here)
+/// or the consumer, granted `TRACE`. One predicate — no clock read, no work
+/// — when neither is, so tracing is zero-cost when unused. Head sampling is
+/// decided once, here, and latched on the connection.
+unsafe fn mint_trace(s: &mut IpState, idx: usize, span: bool) {
+    if idx >= s.tcp_conns.len() {
+        return;
+    }
+    let telemetry = dev_telemetry_enabled(&*s.syscalls);
+    if !telemetry && s.tcp_conns[idx].flags & net_flag::TRACE == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    if telemetry && span {
+        let now = dev_micros(sys);
+        // `0` means "no span"; clamp a (boot-impossible) 0 to 1 so a real
+        // accept is never mistaken for an unspanned slot.
+        s.tcp_conns[idx].span_start_us = if now == 0 { 1 } else { now };
+    }
+    dev_csprng_fill(sys, s.tcp_conns[idx].trace_id.as_mut_ptr(), 16);
+    dev_csprng_fill(sys, s.tcp_conns[idx].span_id.as_mut_ptr(), 8);
+    let trace_id = s.tcp_conns[idx].trace_id;
+    s.tcp_conns[idx].sampled_flags = ingress_sample_decision(s.sample_permille, &trace_id);
+}
+
+/// Hand stream `conn_id`'s trace context up (`stream_trace`
+/// `MSG_TRACE_CTX`), queued like a control frame so it precedes the
+/// stream's first data. Only for a connection granted `TRACE`.
+unsafe fn net_send_trace_ctx(s: &mut IpState, conn_id: u16) -> bool {
+    use abi::contracts::net::stream_trace::{ctx, MSG_TRACE_CTX};
+    let idx = conn_id as usize;
+    if conn_flags(s, idx) & net_flag::TRACE == 0 {
+        return true;
+    }
+    let c = &*s.tcp_conns.ptr(idx);
+    let p = ctx(conn_id, &c.trace_id, &c.span_id, c.sampled_flags);
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    let len = ctl_frame(&mut frame, MSG_TRACE_CTX, &p);
+    net_send_or_queue(s, &frame[..len])
 }
 
 /// `MSG_CLOSED` `[conn_id][kind]` (`net_proto::CLOSED_PEER_FIN` or
@@ -3597,22 +3703,16 @@ unsafe fn emit_conn_span(s: &mut IpState, idx: usize) {
     );
 }
 
-/// MSG_BOUND payload: `[conn_id:1][local_port:2 LE]`. Consumers that
-/// share `net_out` with other bound peers match on `local_port` so they
+/// MSG_BOUND payload: `[conn_id][local_port][flags_granted]`. Consumers
+/// that share `net_out` with other bound peers match on `local_port` so they
 /// only claim a conn_id for their own CMD_BIND.
 #[inline(always)]
 unsafe fn net_send_bound(s: &mut IpState, conn_id: u16, local_port: u16) {
-    let mut frame = [0u8; 7];
-    let cb = conn_id.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_BOUND);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    let pb = local_port.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), pb[1]);
-    net_send_or_queue(s, &frame);
+    let p =
+        abi::contracts::net::net_proto::bound(conn_id, local_port, conn_flags(s, conn_id as usize));
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    let len = ctl_frame(&mut frame, NET_MSG_BOUND, &p);
+    net_send_or_queue(s, &frame[..len]);
 }
 
 /// Who is at the other end of stream `idx`: `(address, port)` in host
@@ -3667,18 +3767,24 @@ unsafe fn net_send_peer(s: &mut IpState, conn_id: u16) -> bool {
 /// for both, and is otherwise refused whole (`false`).
 unsafe fn net_announce(s: &mut IpState, conn_id: u16, accepted: bool, local_port: u16) -> bool {
     let lane = out_lane_conn(s, conn_id as usize);
-    if lane_evt(s, lane) >= 0 && ev_room(s, lane) < 2 {
+    let traced = conn_flags(s, conn_id as usize) & net_flag::TRACE != 0;
+    let need = if traced { 3 } else { 2 };
+    if lane_evt(s, lane) >= 0 && ev_room(s, lane) < need {
         ev_drain_lane(s, lane);
-        if ev_room(s, lane) < 2 {
+        if ev_room(s, lane) < need {
             return false;
         }
     }
     let first = if accepted {
         net_send_accepted(s, conn_id, local_port)
     } else {
-        net_send_connected_only(s, conn_id)
+        let ok = net_send_connected_only(s, conn_id);
+        if ok {
+            mint_trace(s, conn_id as usize, false);
+        }
+        ok
     };
-    first && net_send_peer(s, conn_id)
+    first && net_send_peer(s, conn_id) && net_send_trace_ctx(s, conn_id)
 }
 
 /// `MSG_CONNECTED` and the stream's peer report (see [`net_announce`]).
@@ -3691,25 +3797,31 @@ unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
 #[inline(always)]
 #[must_use]
 unsafe fn net_send_connected_only(s: &mut IpState, conn_id: u16) -> bool {
-    // Payload `[conn_id:2 LE][requester_tag:2 LE]` — the tag echoes the
-    // connecting module's dial tag so a fanned net_out routes the event back
-    // to it.
+    // `[conn_id][requester_tag][flags_granted][generation = 0][alpn_len =
+    // 0]` — the tag echoes the connecting module's dial tag so a fanned
+    // net_out routes the event back to it.
+    use abi::contracts::net::net_proto::{put_connected, Connected, Opening, CONNECTED_FIXED};
     let tag = if (conn_id as usize) < s.tcp_conns.len() {
         s.tcp_conns[conn_id as usize].connect_tag
     } else {
         REQUESTER_TAG_NONE
     };
-    let mut frame = [0u8; 7];
-    let cb = conn_id.to_le_bytes();
-    let tb = tag.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_CONNECTED);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), tb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), tb[1]);
-    net_send_or_queue(s, &frame)
+    let mut p = [0u8; CONNECTED_FIXED];
+    let n = put_connected(
+        &mut p,
+        &Connected {
+            conn_id,
+            requester_tag: tag,
+            opening: Opening {
+                flags_granted: conn_flags(s, conn_id as usize),
+                ..Opening::PLAIN
+            },
+        },
+    )
+    .unwrap_or(0);
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    let len = ctl_frame(&mut frame, NET_MSG_CONNECTED, &p[..n]);
+    net_send_or_queue(s, &frame[..len])
 }
 
 /// Send a MSG_ERROR frame. Returns whether the frame was delivered
@@ -3742,47 +3854,30 @@ unsafe fn net_send_error_to(
     errno: i8,
     tag: RequesterTag,
 ) -> bool {
-    // Payload `[conn_id:2 LE][errno][requester_tag:2 LE]`. The tag echoes the
-    // failing dial's tag so a consumer sharing a fanned net_out
-    // attributes a connect failure to the right requester (it has no conn_id
-    // yet). Errors not tied to an outbound connect pass tag 0 (untagged).
-    let mut frame = [0u8; 8];
-    let cb = conn_id.to_le_bytes();
-    let tb = tag.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ERROR);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 5u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), errno as u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), tb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(7), tb[1]);
-    net_send_or_queue_lane(s, lane, &frame)
+    // `[conn_id][errno][requester_tag]`. The tag echoes the failing dial's
+    // tag so a consumer sharing a fanned net_out attributes a connect
+    // failure to the right requester (it has no conn_id yet). Errors not
+    // tied to an outbound connect carry tag 0.
+    let p = abi::contracts::net::net_proto::error(conn_id, errno, tag);
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    let len = ctl_frame(&mut frame, NET_MSG_ERROR, &p);
+    net_send_or_queue_lane(s, lane, &frame[..len])
 }
 
-/// Emit a MSG_RETRANSMIT frame. Payload: `[conn_id:2 LE][from_seq:4 LE]`.
-/// The acknowledgement it resends from is reported first, queued in order
-/// before it, so the consumer's retained bytes are placed in sequence space
-/// by the time it is asked for them.
-#[inline(always)]
-unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u16, from_seq: u32) {
+/// Ask the consumer of `RETX` stream `conn_id` for its bytes again from
+/// `from_seq` (`MSG_RETX_REQUEST`). The acknowledgement it resends from is
+/// reported first, queued in order before it, so the consumer's retained
+/// bytes are placed in sequence space by the time it is asked for them.
+unsafe fn net_send_retx_request(s: &mut IpState, conn_id: u16, from_seq: u32) {
     report_ack(s, conn_id as usize, true);
-    let mut frame = [0u8; 9];
-    let cb = conn_id.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_RETRANSMIT);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 6u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    let b = from_seq.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[1]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[2]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(8), b[3]);
-    net_send_or_queue(s, &frame);
+    let p = abi::contracts::net::stream_retx::request(conn_id, from_seq);
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    let len = ctl_frame(&mut frame, NET_MSG_RETX_REQUEST, &p);
+    net_send_or_queue(s, &frame[..len]);
 }
 
-/// Emit a MSG_ACK frame. Payload: `[conn_id:2 LE][acked_seq:4 LE][isn:4 LE]`.
+/// Report the peer's cumulative acknowledgement to the consumer of `RETX`
+/// stream `conn_id` (`MSG_RETX_ACK` `[conn_id][acked_seq][isn]`).
 ///
 /// An acknowledgement is cumulative, so a later one stands for every one
 /// before it: unless `queue`, the report is written only straight onto an
@@ -3790,7 +3885,6 @@ unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u16, from_seq: u32) {
 /// the frames a consumer cannot do without (accepts, closes) need. A
 /// report that does not go out leaves `ack_told` behind `SND.UNA`, and the
 /// timer sweep tries it again.
-#[inline(always)]
 unsafe fn net_send_ack(
     s: &mut IpState,
     conn_id: u16,
@@ -3798,21 +3892,12 @@ unsafe fn net_send_ack(
     isn: u32,
     queue: bool,
 ) -> bool {
-    let mut frame = [0u8; 13];
-    let cb = conn_id.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACK);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 10u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    let b = acked_seq.to_le_bytes();
-    let n = isn.to_le_bytes();
-    for k in 0..4 {
-        core::ptr::write_volatile(frame.as_mut_ptr().add(5 + k), b[k]);
-        core::ptr::write_volatile(frame.as_mut_ptr().add(9 + k), n[k]);
-    }
+    let p = abi::contracts::net::stream_retx::ack(conn_id, acked_seq, isn);
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    let len = ctl_frame(&mut frame, NET_MSG_RETX_ACK, &p);
+    let frame = &frame[..len];
     if queue {
-        return net_send_or_queue(s, &frame);
+        return net_send_or_queue(s, frame);
     }
     let lane = out_lane_conn(s, conn_id as usize);
     let ch = lane_evt(s, lane);
@@ -3826,11 +3911,16 @@ unsafe fn net_send_ack(
     (sys.channel_write)(ch, frame.as_ptr(), frame.len()) == frame.len() as i32
 }
 
-/// Tell the consumer of stream `idx` how far the peer has acknowledged
-/// (`MSG_ACK`), if that moved since it was last told. The consumer — `tls`
-/// — holds the only copy of the bytes in flight, and releases them on it.
+/// The peer's acknowledgement on stream `idx` moved: release what it covers
+/// from this module's copy, or — for a connection granted `RETX`, whose
+/// consumer holds the only copy of the bytes in flight — tell the consumer
+/// (`MSG_RETX_ACK`) if that moved since it was last told.
 unsafe fn report_ack(s: &mut IpState, idx: usize, queue: bool) {
     if idx >= s.tcp_conns.len() || s.loopback_peer[idx] >= 0 {
+        return;
+    }
+    if (*s.tcp_conns.ptr(idx)).flags & net_flag::RETX == 0 {
+        sbuf_trim(s, idx);
         return;
     }
     let c = &*s.tcp_conns.ptr(idx);
@@ -3904,7 +3994,8 @@ unsafe fn dg_send_rx_from_v4(
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 1 + 1 + 4 + 2 + data_len; // ep_id + af + addr + port + data
-    let max_copy = s.net_scratch.len() - NET_FRAME_HDR;
+                                                // A datagram past the port's record bound is one no consumer reads.
+    let max_copy = NET_OUT_MAX_RECORD - NET_FRAME_HDR;
     if payload_len > max_copy {
         return;
     }
@@ -3941,7 +4032,7 @@ unsafe fn dg_send_rx_from_v6(
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 1 + 1 + 16 + 2 + data_len;
-    if payload_len > s.net_scratch.len() - NET_FRAME_HDR {
+    if payload_len > NET_OUT_MAX_RECORD - NET_FRAME_HDR {
         return;
     }
     *scratch = DG_MSG_RX_FROM;
@@ -4031,13 +4122,12 @@ unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
     };
     let out_ch = out_chan_conn(s, conn_idx);
 
-    let mut free = [0u8; 4];
-    let rc = dev_channel_ioctl(sys, out_ch, IOCTL_WRITABLE, free.as_mut_ptr(), 4);
-    let free = u32::from_le_bytes(free);
-    let wnd = if rc < 0 || free == 0 {
+    let rc = dev_channel_writable(sys, out_ch);
+    let free = rc.max(0) as u32;
+    let wnd = if rc <= 0 {
         // Zero free bytes is either a full ring or a channel with no ring
         // to measure (a mailbox reports 0 yet accepts a write), and a refused
-        // ioctl measures nothing. Readiness tells them apart: a full ring is
+        // op measures nothing. Readiness tells them apart: a full ring is
         // not writable.
         let poll_out = (sys.channel_poll)(out_ch, POLL_OUT);
         if poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0 {
@@ -4093,41 +4183,64 @@ const EPHEMERAL_SCAN_MAX: usize = tcp::MAX_TCP_CONNS * 2;
 ///
 /// # Safety
 /// `s.tcp_conns` must be initialised.
-/// Decode the optional owner tag at the head of a `DG_CMD_SEND_TO` /
-/// `DG_CMD_CLOSE` payload. Returns `(claimed_tag, offset_of_next_field)`.
-///
-/// The tag is recognised by `DG_OWNER_TAG_MARK` at offset 1 — the byte that
-/// carries `af` in the untagged shape, and a value no address family takes —
-/// so the two shapes are distinguished without a length rule over a payload
-/// that ends in variable-length data.
-///
-/// An absent tag decodes as 0. Endpoints bound with `owner_tag == 0` are
-/// therefore reachable by any consumer sharing this module's command
-/// channel; endpoints bound with a nonzero tag are not.
-///
-/// # Safety
-/// `payload` must point to at least `plen` readable bytes.
-#[inline]
-unsafe fn dg_decode_owner_tag(payload: *const u8, plen: usize) -> (u16, usize) {
-    if plen > DG_OWNER_TAG_FIELD && *payload.add(1) == DG_OWNER_TAG_MARK {
-        (
-            u16::from_le_bytes([*payload.add(2), *payload.add(3)]),
-            1 + DG_OWNER_TAG_FIELD,
-        )
-    } else {
-        (0, 1)
+/// The owner the channel being served commands as, as the kernel attests
+/// it: a workload lane's owner from `NET_LANE_TAKE`, the node's own channel
+/// the producer owner `channel::FACTS` reported for it (`node_facts`). A
+/// command never names its owner.
+unsafe fn cmd_owner(s: &IpState) -> u16 {
+    match lane_at(s, s.cur_lane) {
+        Some(l) => l.owner_slot,
+        None => s.node_owner,
     }
 }
 
-/// The owner a datagram command acts as. A lane's command acts as the
-/// lane's own owner — the lane is the proof, and its endpoints were bound as
-/// that owner — whatever tag its payload names; the node's shared channel
-/// presents the tag it names.
-unsafe fn lane_claim(s: &IpState, claimed: u16) -> u16 {
-    match lane_at(s, s.cur_lane) {
-        Some(l) => l.owner_slot,
-        None => claimed,
+/// Ask the kernel, once, about the node's own pair of channels: who writes
+/// `net_in` (the owner its binds and endpoints are made as), and whether
+/// every consumer of `net_out` keeps its own copy of what it sends
+/// (`RETAINS_SEND`: its connections are granted `RETX` and this module
+/// retains nothing for them). A kernel that cannot say leaves the host
+/// owner and no `RETX`.
+unsafe fn node_facts(s: &mut IpState) {
+    if s.node_facts_known {
+        return;
     }
+    s.node_facts_known = true;
+    let sys = &*s.syscalls;
+    if let Some((owner, _)) = channel_facts(sys, s.net_in_chan) {
+        s.node_owner = owner;
+    }
+    if let Some((_, flags)) = channel_facts(sys, s.net_out_chan) {
+        s.node_retx = flags & abi::kernel_abi::channel::facts::RETAINS_SEND != 0;
+    }
+}
+
+/// `channel::FACTS` for channel `ch`: `(producer owner, edge flags)`.
+unsafe fn channel_facts(sys: &SyscallTable, ch: i32) -> Option<(u16, u8)> {
+    use abi::kernel_abi::channel::{facts, FACTS};
+    if ch < 0 {
+        return None;
+    }
+    let mut a = [0u8; facts::LEN];
+    let rc = (sys.provider_call)(ch, FACTS, a.as_mut_ptr(), a.len(), core::ptr::null_mut(), 0);
+    if rc < 0 {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([a[facts::PRODUCER_OWNER], a[facts::PRODUCER_OWNER + 1]]),
+        a[facts::FLAGS],
+    ))
+}
+
+/// The sidebands this module grants of those `requested` on the channel
+/// being served: `TRACE` when asked; `RETX` on the node's own channel when
+/// every consumer of it retains what it sends. `CURSORS` is a record
+/// layer's to serve, never this transport's.
+unsafe fn grant_flags(s: &IpState, requested: u8) -> u8 {
+    let mut g = requested & net_flag::TRACE;
+    if s.cur_lane == 0 && s.node_retx {
+        g |= net_flag::RETX;
+    }
+    g
 }
 
 /// Outcome of datagram bind admission.
@@ -4556,7 +4669,29 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
 // Module ABI
 // ============================================================================
 
-fluxor_rt::module_facts! { state: IpState, arena: HEAP_DEFAULT_BYTES }
+fluxor_rt::module_facts! {
+    state: IpState,
+    arena: HEAP_DEFAULT_BYTES,
+    records: [
+        // The largest record on `net_out`: a datagram of one link MTU
+        // (`[ep_id][af][addr 4][port]` + 1472 B, IPv4), longer than a
+        // stream's MSS of data (`[conn_id]` + 1460 B) and a v6 datagram
+        // (`[ep_id][af][addr 16][port]` + 1452 B).
+        out 1 NET_OUT_MAX_RECORD = NET_FRAME_HDR + 1 + 1 + 4 + 2 + 1472,
+        // A command up to the stash (`PENDING_CMD_BUF_SIZE`).
+        in 1 NET_IN_ACCEPTS_RECORD = NET_FRAME_HDR + PENDING_CMD_BUF_SIZE,
+        // An address-control command, its authority token included.
+        in 2 ADDR_CTL_ACCEPTS_RECORD = NET_FRAME_HDR + 32 + 2 + netid::ARM_AUTH_MAX,
+        // A disposition.
+        in 3 PACKET_IN_ACCEPTS_RECORD = NET_FRAME_HDR + 24,
+        // A decision record, the IPv6 one the longest.
+        out 3 PACKET_OUT_MAX_RECORD = NET_FRAME_HDR + abi::contracts::net::packet::DECIDE6_LEN,
+        // A held frame forwarded whole, behind its id and disposition.
+        out 4 PACKET_FWD_MAX_RECORD = 1600,
+        // An emission event.
+        out 5 ADDR_EVT_MAX_RECORD = NET_FRAME_HDR + 48,
+    ],
+}
 
 // The same figure as data, so `pack` records this module's resident footprint in
 // its manifest and a graph's state-arena demand can be summed host-side. `ip` is
@@ -4724,6 +4859,10 @@ pub unsafe extern "C" fn module_new(
         s.entropy_warned = false;
         s.gw_pin_pending = false;
         s.gw_pin_ip = 0;
+        s.dial_flags = 0;
+        s.node_owner = 0;
+        s.node_retx = false;
+        s.node_facts_known = false;
 
         // Discover net protocol channels
         let sys = &*s.syscalls;
@@ -4736,6 +4875,7 @@ pub unsafe extern "C" fn module_new(
         s.addr_generation = 0;
         s.tx_fenced = 0;
         s.fence_wait_slot = 0xFFFF;
+        s.tx_drain = -1;
         s.fence_wait_discarded = 0;
         s.fence_wait_gen = 0;
         s.fence_wait_deadline_ms = 0;
@@ -4783,6 +4923,8 @@ pub unsafe extern "C" fn module_new(
             abi::kernel_abi::NET_IDENT_PROVIDER,
             reg.as_mut_ptr(),
             reg.len(),
+            core::ptr::null_mut(),
+            0,
         );
         // in[2]: addr control (optional). Read after registering: on a node
         // that creates workloads the kernel gives the unwired port its
@@ -4813,7 +4955,9 @@ pub unsafe extern "C" fn module_new(
         s.dg_flow_idle_s = flows::IDLE_DEFAULT_S;
         s.max_segments = route::SEGMENTS_DEFAULT;
         s.policy_bytes = policy::BYTES_DEFAULT;
-        s.pkt_holds = PACKET_HOLDS_DEFAULT;
+        s.pkt_holds = 0;
+        s.tcp_send_buf = send_pool::BLOCK_DEFAULT;
+        s.tcp_send_pool = send_pool::POOL_DEFAULT;
         if !params.is_null() && params_len > 0 {
             params_def::parse_tlv(s, params, params_len);
         }
@@ -4854,7 +4998,14 @@ pub unsafe extern "C" fn module_new(
         // kernel that cannot answer yet is asked again on the first step.
         if s.lane_cap > 0 {
             let mut cap = [s.lane_cap];
-            let rc = (sys.provider_call)(-1, NET_PROVIDE, cap.as_mut_ptr(), cap.len());
+            let rc = (sys.provider_call)(
+                -1,
+                NET_PROVIDE,
+                cap.as_mut_ptr(),
+                cap.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             s.lane_provider = match rc {
                 0 => 1,
                 -16 | -22 | -28 => 2, // EBUSY, EINVAL, ENOSPC
@@ -6004,7 +6155,7 @@ unsafe fn describe_held(s: &mut IpState, slot: usize, msg: u8, rec: &[u8]) {
 
 /// The profile's default must be nameable in the slot field the contract
 /// declares; a declared `packet_holds` is held to it at construction.
-const _: () = assert!(PACKET_HOLDS_DEFAULT as usize <= PACKET_HOLDS_MAX);
+const _: () = assert!(MAX_PACKET_HOLD <= PACKET_HOLDS_MAX);
 
 /// `pkt_id` for a slot under its current generation.
 fn hold_id(slot: usize, gen: u32) -> u32 {
@@ -6280,7 +6431,7 @@ unsafe fn forward_record(s: &mut IpState, slot: usize, disp: &[u8; 7]) -> bool {
     let len = h.len as usize;
     let payload_len = 4 + 1 + pkt::DISP_ARGS_LEN + len;
     let total = NET_FRAME_HDR + payload_len;
-    if total > s.net_scratch.len() {
+    if total > PACKET_FWD_MAX_RECORD {
         return true; // cannot ever fit: release rather than hold forever
     }
     let scratch = s.net_scratch.as_mut_ptr();
@@ -6526,7 +6677,7 @@ unsafe fn service_packet_in(s: &mut IpState) {
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
         }
-        let mut frame = [0u8; NET_FRAME_HDR + 24];
+        let mut frame = [0u8; PACKET_IN_ACCEPTS_RECORD];
         let (msg, plen) = net_read_frame(sys, s.pkt_in_chan, frame.as_mut_ptr(), frame.len());
         let buf = &frame[NET_FRAME_HDR..];
         match msg {
@@ -7454,17 +7605,18 @@ unsafe fn process_tcp_segment(
                         ip_hdr.src_ip,
                         tcp_hdr.src_port,
                     );
-                    let (lane, owner) = {
+                    let (lane, owner, flags) = {
                         let l = &*s.tcp_conns.ptr(li);
-                        (l.lane, l.owner_tag)
+                        (l.lane, l.owner_tag, l.flags)
                     };
                     let conn = &mut *s.tcp_conns.ptr_mut(idx);
                     *conn = tcp::TcpConn::new();
                     conn.local_port = listener_port;
                     // An accepted connection belongs to its listener's lane
-                    // and owner.
+                    // and owner, and carries its grant.
                     conn.lane = lane;
                     conn.owner_tag = owner;
+                    conn.flags = flags;
                     // Latch the local address this SYN arrived at so replies
                     // source from it and the demux axis distinguishes it.
                     conn.local_slot = local_slot;
@@ -7652,7 +7804,7 @@ unsafe fn process_tcp_segment(
                         } else if tcp_hdr.ack_num == prev_una && tcp_hdr.payload_len == 0 {
                             // Duplicate ACK (no new data, no new ACK).
                             if tcp::on_dup_ack(conn) {
-                                // Fast retransmit trigger — consumer notified.
+                                // Fast retransmit trigger (`retransmit`).
                                 net_send_fast_retransmit = true;
                                 net_send_fast_retransmit_conn = conn_idx as u16;
                                 net_send_fast_retransmit_seq = conn.snd_una;
@@ -8010,14 +8162,15 @@ unsafe fn process_tcp_segment(
         continuity::after_segment(s, conn_idx, state_before, rcv_before, acked_new);
     }
 
-    // What the peer acknowledged, to the consumer that retains the bytes.
+    // What the peer acknowledged: released from this module's copy, or told
+    // to the consumer that retains the bytes.
     report_ack(s, conn_idx, false);
 
-    // Fast retransmit — signal the consumer to resend from `snd_una`.
+    // Fast retransmit — send again from `snd_una`.
     if net_send_fast_retransmit {
-        net_send_retransmit(
+        retransmit(
             s,
-            net_send_fast_retransmit_conn,
+            net_send_fast_retransmit_conn as usize,
             net_send_fast_retransmit_seq,
         );
     }
@@ -8377,15 +8530,16 @@ unsafe fn try_cookie_accept(
     // construction. The block is installed one step short of `Established`
     // so the shared admissibility gate and state machine complete it.
     let idx = accept_idx as usize;
-    let (lane, owner) = {
+    let (lane, owner, flags) = {
         let l = &*s.tcp_conns.ptr(li);
-        (l.lane, l.owner_tag)
+        (l.lane, l.owner_tag, l.flags)
     };
     let conn = &mut *s.tcp_conns.ptr_mut(idx);
     *conn = tcp::TcpConn::new();
     conn.local_port = listener_port;
     conn.lane = lane;
     conn.owner_tag = owner;
+    conn.flags = flags;
     conn.local_slot = local_slot;
     conn.remote_ip = ip_hdr.src_ip;
     conn.remote_port = tcp_hdr.src_port;
@@ -9797,7 +9951,10 @@ unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_
             return;
         }
     };
-    let listener_owner = (*s.tcp_conns.ptr(li)).owner_tag;
+    let (listener_owner, listener_flags) = {
+        let l = &*s.tcp_conns.ptr(li);
+        (l.owner_tag, l.flags)
+    };
 
     // Established immediately — there is no handshake to perform.
     // `remote_ip` stays 0 so no close path ever touches the ARP table
@@ -9810,6 +9967,7 @@ unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_
         c.local_port = local_port;
         c.local_slot = src_slot;
         c.connect_tag = requester_tag;
+        c.flags = s.dial_flags;
         c.retransmit_timer = 0;
         c.lane = dialler_lane;
     }
@@ -9824,6 +9982,7 @@ unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_
         v.local_port = port;
         v.local_slot = dst_slot;
         v.owner_tag = listener_owner;
+        v.flags = listener_flags;
         v.connect_tag = REQUESTER_TAG_NONE;
         v.retransmit_timer = 0;
         v.lane = listener_lane;
@@ -9947,7 +10106,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize, abort: bool) -> boo
                 return false;
             }
             (*s.tcp_conns.ptr_mut(conn_id)).state = tcp::TcpState::FinWait1;
-            continuity::on_sent(s, conn_id, seq, 0, true);
+            continuity::on_sent(s, conn_id, seq, 0, true, &[]);
             continuity::on_state(s, conn_id);
             true
         }
@@ -9962,7 +10121,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize, abort: bool) -> boo
             c.state = tcp::TcpState::LastAck;
             // The closing bound counts from here.
             c.retransmit_timer = 0;
-            continuity::on_sent(s, conn_id, seq, 0, true);
+            continuity::on_sent(s, conn_id, seq, 0, true, &[]);
             continuity::on_state(s, conn_id);
             true
         }
@@ -10024,7 +10183,7 @@ unsafe fn try_send_cmd_payload(
     // a closed TCP window.
     if s.loopback_peer[conn_id] >= 0 {
         let peer = s.loopback_peer[conn_id] as u16;
-        let max_chunk = s.net_scratch.len() - NET_FRAME_HDR - 2;
+        let max_chunk = abi::contracts::net::net_proto::data_capacity(NET_OUT_MAX_RECORD);
         while data_off < payload_len {
             if s.loopback_peer[conn_id] < 0 {
                 return payload_len; // peer closed mid-send — drop the tail
@@ -10050,24 +10209,47 @@ unsafe fn try_send_cmd_payload(
             // Peer's window closed — stash and wait for an ACK to open it.
             return data_off;
         }
+        let seq = conn.snd_nxt;
+        // A connection whose consumer keeps no copy is held to what its
+        // send buffer has room for: in flight is the least of the buffer,
+        // the congestion window and the peer's window. No buffer to be had
+        // waits like a closed window.
+        let retained = sbuf_retains(s, conn_id);
+        let room = if retained {
+            sbuf_room(s, conn_id)
+        } else {
+            usize::MAX
+        };
         let chunk = (payload_len - data_off)
             .min(v6t::conn_mss(s, conn_id))
-            .min(avail_wnd);
+            .min(avail_wnd)
+            .min(room);
         if chunk == 0 {
+            sbuf_trim(s, conn_id);
             return data_off;
         }
-        let seq = conn.snd_nxt;
-        // A strict mirror sees the allocation before the wire does.
-        if !continuity::send_gate(s, conn_id, seq, chunk as u16) {
+        // A strict mirror sees the allocation, and the bytes this module
+        // keeps, before the wire does.
+        let kept: &[u8] = if retained {
+            core::slice::from_raw_parts(payload.add(data_off), chunk)
+        } else {
+            &[]
+        };
+        if !continuity::send_gate(s, conn_id, seq, chunk as u16, kept) {
+            sbuf_trim(s, conn_id);
             return data_off;
         }
         let ok = send_tcp_data(s, conn_id, payload.add(data_off), chunk);
         if !ok {
             // NIC out_chan full or ARP miss. snd_nxt was NOT advanced —
             // stash the unsent tail and retry next tick.
+            sbuf_trim(s, conn_id);
             return data_off;
         }
-        continuity::on_sent(s, conn_id, seq, chunk as u16, false);
+        if retained {
+            sbuf_append(s, conn_id, payload.add(data_off), chunk);
+        }
+        continuity::on_sent(s, conn_id, seq, chunk as u16, false, kept);
         let now_ms = dev_millis(&*s.syscalls) as u32;
         let conn2 = &mut *s.tcp_conns.ptr_mut(conn_id);
         tcp::rtt_arm(conn2, seq, now_ms);
@@ -10076,8 +10258,191 @@ unsafe fn try_send_cmd_payload(
     data_off
 }
 
-/// Send again, at their own sequence numbers, bytes the consumer handed
-/// down before (`NET_CMD_RESEND`, `len` of them from `seq`): the part still
+// ── Send buffers ────────────────────────────────
+//
+// What a connection has sent and the peer has not acknowledged, kept by
+// this module for every connection whose consumer keeps no copy (one not
+// granted `RETX`), so a lost segment is sent again from here. The buffer
+// holds exactly `[SND.UNA, SND.NXT)` of data: bytes enter it as they first
+// go out and leave as they are acknowledged, and the block goes back to the
+// pool (`send_pool.rs`) when it empties.
+
+/// Whether stream `idx` keeps its own copy of what it sends: a wire
+/// connection (not a fast-path half, not a datagram endpoint) not granted
+/// `RETX`.
+#[inline(always)]
+unsafe fn sbuf_retains(s: &IpState, idx: usize) -> bool {
+    let c = &*s.tcp_conns.ptr(idx);
+    !c.is_datagram && c.flags & net_flag::RETX == 0 && *s.loopback_peer.as_ptr().add(idx) < 0
+}
+
+/// Room for new bytes in stream `idx`'s send buffer, taking a block when it
+/// holds none; 0 when no block can be had.
+unsafe fn sbuf_room(s: &mut IpState, idx: usize) -> usize {
+    let sys = &*s.syscalls;
+    let c = &mut *s.tcp_conns.ptr_mut(idx);
+    if !sb_hold(&mut s.send_pool, sys, c) {
+        return 0;
+    }
+    s.send_pool.grant().saturating_sub(c.sbuf_len) as usize
+}
+
+/// Keep `n` bytes just sent at the end of stream `idx`'s buffer (room was
+/// checked by `sbuf_room`).
+unsafe fn sbuf_append(s: &mut IpState, idx: usize, data: *const u8, n: usize) {
+    let c = &mut *s.tcp_conns.ptr_mut(idx);
+    sb_append(&mut s.send_pool, c, core::slice::from_raw_parts(data, n));
+}
+
+/// Release what the peer has acknowledged from stream `idx`'s buffer, and
+/// give the block back when nothing is left in it.
+unsafe fn sbuf_trim(s: &mut IpState, idx: usize) {
+    if idx < s.tcp_conns.len() {
+        sb_trim(&mut s.send_pool, &mut *s.tcp_conns.ptr_mut(idx));
+    }
+}
+
+/// Give stream `idx`'s buffer back whatever it holds (the connection is
+/// gone).
+unsafe fn sbuf_release(s: &mut IpState, idx: usize) {
+    sb_release(&mut s.send_pool, &mut *s.tcp_conns.ptr_mut(idx));
+}
+
+/// Make `c` hold a send block (taking one when it holds none), anchored at
+/// its `SND.NXT`; `false` when none can be had.
+pub(crate) unsafe fn sb_hold(
+    pool: &mut send_pool::SendPool,
+    sys: &SyscallTable,
+    c: &mut tcp::TcpConn,
+) -> bool {
+    if c.sbuf != tcp::SBUF_NONE {
+        return true;
+    }
+    let b = pool.take(sys);
+    if b == tcp::SBUF_NONE {
+        return false;
+    }
+    c.sbuf = b;
+    c.sbuf_head = 0;
+    c.sbuf_seq = c.snd_nxt;
+    c.sbuf_len = 0;
+    true
+}
+
+/// Append `data` (its first byte at `sbuf_seq + sbuf_len`) to `c`'s block,
+/// as much of it as there is room for; the bytes kept.
+pub(crate) unsafe fn sb_append(
+    pool: &mut send_pool::SendPool,
+    c: &mut tcp::TcpConn,
+    data: &[u8],
+) -> usize {
+    if c.sbuf == tcp::SBUF_NONE {
+        return 0;
+    }
+    let cap = pool.grant();
+    let n = (data.len() as u32).min(cap.saturating_sub(c.sbuf_len));
+    let block = pool.bytes(c.sbuf);
+    let ((a, an), (_, bn)) = send_pool::runs(c.sbuf_head.wrapping_add(c.sbuf_len), n, cap);
+    block[a..a + an].copy_from_slice(&data[..an]);
+    block[..bn].copy_from_slice(&data[an..an + bn]);
+    c.sbuf_len += n;
+    n as usize
+}
+
+/// Release what the peer acknowledged (below `SND.UNA`) from `c`'s block;
+/// give the block back when it empties.
+pub(crate) fn sb_trim(pool: &mut send_pool::SendPool, c: &mut tcp::TcpConn) {
+    if c.sbuf == tcp::SBUF_NONE {
+        return;
+    }
+    let cap = pool.grant();
+    if tcp::seq_lt(c.sbuf_seq, c.snd_una) {
+        let acked = c.snd_una.wrapping_sub(c.sbuf_seq).min(c.sbuf_len);
+        c.sbuf_seq = c.sbuf_seq.wrapping_add(acked);
+        c.sbuf_len -= acked;
+        c.sbuf_head = if cap == 0 {
+            0
+        } else {
+            (c.sbuf_head + acked) % cap
+        };
+    }
+    if c.sbuf_len == 0 {
+        sb_release(pool, c);
+    }
+}
+
+/// Give `c`'s block back, whatever it holds.
+pub(crate) fn sb_release(pool: &mut send_pool::SendPool, c: &mut tcp::TcpConn) {
+    if c.sbuf != tcp::SBUF_NONE {
+        pool.give(c.sbuf);
+        c.sbuf = tcp::SBUF_NONE;
+        c.sbuf_len = 0;
+        c.sbuf_head = 0;
+    }
+}
+
+/// Copy `c`'s kept bytes from sequence `seq` into `out`; the bytes copied
+/// (0 when `seq` is not among them).
+pub(crate) unsafe fn sb_read(
+    pool: &send_pool::SendPool,
+    c: &tcp::TcpConn,
+    seq: u32,
+    out: &mut [u8],
+) -> usize {
+    if c.sbuf == tcp::SBUF_NONE || tcp::seq_lt(seq, c.sbuf_seq) {
+        return 0;
+    }
+    let skip = seq.wrapping_sub(c.sbuf_seq);
+    if skip >= c.sbuf_len {
+        return 0;
+    }
+    let n = (c.sbuf_len - skip).min(out.len() as u32);
+    let cap = pool.grant();
+    let block = pool.view(c.sbuf);
+    let ((a, an), (_, bn)) = send_pool::runs(c.sbuf_head.wrapping_add(skip), n, cap);
+    out[..an].copy_from_slice(&block[a..a + an]);
+    out[an..an + bn].copy_from_slice(&block[..bn]);
+    n as usize
+}
+
+/// Send again, from this module's own copy, up to one segment of stream
+/// `idx`'s bytes in flight from `from_seq` (`SND.UNA` or later). The bytes
+/// go straight from the block; a run that wraps its end goes as the part up
+/// to the end, the rest following as the window allows.
+unsafe fn resend_own(s: &mut IpState, idx: usize, from_seq: u32) {
+    let c = &*s.tcp_conns.ptr(idx);
+    if c.sbuf == tcp::SBUF_NONE || tcp::seq_lt(from_seq, c.sbuf_seq) {
+        return;
+    }
+    let skip = from_seq.wrapping_sub(c.sbuf_seq);
+    if skip >= c.sbuf_len {
+        return;
+    }
+    let cap = s.send_pool.grant();
+    let mss = v6t::conn_mss(s, idx) as u32;
+    let ((at, n), _) = send_pool::runs(
+        c.sbuf_head.wrapping_add(skip),
+        (c.sbuf_len - skip).min(mss),
+        cap,
+    );
+    let p = s.send_pool.view(c.sbuf).as_ptr().add(at);
+    resend_cmd_payload(s, idx, from_seq, p, n);
+}
+
+/// Send stream `idx`'s bytes again from `from_seq` (three duplicate ACKs, an
+/// RTO, a partial acknowledgement in recovery): from this module's copy, or,
+/// for a connection granted `RETX`, by asking its consumer.
+unsafe fn retransmit(s: &mut IpState, idx: usize, from_seq: u32) {
+    if (*s.tcp_conns.ptr(idx)).flags & net_flag::RETX != 0 {
+        net_send_retx_request(s, idx as u16, from_seq);
+    } else {
+        resend_own(s, idx, from_seq);
+    }
+}
+
+/// Send again, at their own sequence numbers, bytes handed down before
+/// (from this module's copy, or a consumer's `CMD_RETX_RESEND`; `len` of
+/// them from `seq`): the part still
 /// unacknowledged and already sent, `[max(seq, SND.UNA), SND.NXT)`, up to
 /// one segment. Nothing is allocated and nothing is gated: these numbers
 /// were taken, and mirrored, when the bytes first went out. A resend that
@@ -10407,7 +10772,7 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
     // waits for the next tick (the port is low-rate control, not data).
     let mut count = 0;
     while count <= MAX_LOCAL_ADDRS {
-        let mut frame = [0u8; NET_FRAME_HDR + 32 + 2 + netid::ARM_AUTH_MAX];
+        let mut frame = [0u8; ADDR_CTL_ACCEPTS_RECORD];
         let (msg_type, plen) =
             net_read_frame(sys, s.addr_ctl_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
@@ -10469,6 +10834,7 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
 unsafe fn service_net_channels(s: &mut IpState) {
     lanes_take(s);
     s.cur_lane = 0;
+    node_facts(s);
     service_net_channel(s);
     let shared_in = s.net_in_chan;
     let mut lane = 1u8;
@@ -10493,7 +10859,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
 /// the lane being served.
 unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize) -> bool {
     let idx = match msg_type {
-        NET_CMD_SEND | NET_CMD_CLOSE | NET_CMD_RESEND if plen >= 2 => {
+        NET_CMD_SEND | NET_CMD_CLOSE | NET_CMD_RETX_RESEND if plen >= 2 => {
             u16::from_le_bytes([*p, *p.add(1)]) as usize
         }
         DG_CMD_SEND_TO | DG_CMD_CLOSE if plen >= 1 => *p as usize,
@@ -10507,7 +10873,7 @@ unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize)
 ///
 /// A lane's bind is stamped with the lane's own owner, never with an owner
 /// tag its payload names: a workload cannot bind as another — the same owner
-/// `lane_claim` presents for its later commands. It is anchored at the
+/// `cmd_owner` presents for its later commands. It is anchored at the
 /// owner's own address when the owner holds one, and serves every address it
 /// holds of either family (`bind_serves`); it lands on the wildcard (the
 /// node's shared addresses) when the owner holds none. The kernel then admits it as
@@ -10523,7 +10889,14 @@ unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16,
     req[4..8].copy_from_slice(&l.owner_gen.to_le_bytes());
     req[8] = protocol;
     req[10..12].copy_from_slice(&port.to_le_bytes());
-    let rc = ((*s.syscalls).provider_call)(-1, NET_LANE_ADMIT, req.as_mut_ptr(), req.len());
+    let rc = ((*s.syscalls).provider_call)(
+        -1,
+        NET_LANE_ADMIT,
+        req.as_mut_ptr(),
+        req.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         return Err(rc as i8);
     }
@@ -10563,7 +10936,14 @@ unsafe fn lanes_take(s: &mut IpState) {
     let sys = &*s.syscalls;
     if s.lane_provider == 0 {
         let mut cap = [s.lane_cap];
-        let rc = (sys.provider_call)(-1, NET_PROVIDE, cap.as_mut_ptr(), cap.len());
+        let rc = (sys.provider_call)(
+            -1,
+            NET_PROVIDE,
+            cap.as_mut_ptr(),
+            cap.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         s.lane_provider = if rc == 0 { 1 } else { 2 };
         if rc == 0 {
             log_info(s, b"[ip] net lanes: provider");
@@ -10577,7 +10957,14 @@ unsafe fn lanes_take(s: &mut IpState) {
     let mut n = 0;
     while n < 2 * s.lane_cap as usize {
         let mut r = [0u8; net_lane::RECORD_LEN];
-        let rc = (sys.provider_call)(-1, NET_LANE_TAKE, r.as_mut_ptr(), net_lane::RECORD_LEN);
+        let rc = (sys.provider_call)(
+            -1,
+            NET_LANE_TAKE,
+            r.as_mut_ptr(),
+            net_lane::RECORD_LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if rc != net_lane::RECORD_LEN as i32 {
             return;
         }
@@ -10775,10 +11162,9 @@ unsafe fn service_net_channel(s: &mut IpState) {
     // sitting well below the burst-iteration limit on aarch64 yet
     // high enough to saturate gigabit.
     //
-    // `buf` must be ≥ the largest single CMD_SEND payload — the
-    // upstream cap is `NET_BUF_SIZE`, matched here by
-    // `PENDING_CMD_BUF_SIZE`. An undersized buffer would truncate
-    // the payload and corrupt the next frame's header parse.
+    // `frame` holds the largest record `net_in` accepts
+    // (`NET_IN_ACCEPTS_RECORD`); the composer refuses a producer that
+    // writes more.
     let mut count = 0;
     while count < 32 {
         // Headroom check has to repeat every iteration: each command
@@ -10787,7 +11173,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
         if lane_intake_paused(s) {
             break;
         }
-        let mut frame = [0u8; NET_FRAME_HDR + PENDING_CMD_BUF_SIZE];
+        let mut frame = [0u8; NET_IN_ACCEPTS_RECORD];
         let (msg_type, plen) = net_read_frame(sys, s.net_in_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
             break;
@@ -10804,21 +11190,22 @@ unsafe fn service_net_channel(s: &mut IpState) {
 
         match msg_type {
             NET_CMD_BIND => {
-                // Payload: [port: u16 LE]                        host/wildcard
-                //     or   [port: u16 LE][owner_tag: u16 LE]     owner-stamped
-                // The optional trailing owner_tag is the bind-admission axis.
-                // It is stamped by the trusted upstream on behalf of the
-                // binding workload; the ip module cannot itself learn the
-                // commanding owner (the module syscall ABI exposes no owner
-                // query), so the stamp comes from the workload-backend or
-                // ingress path. Absent or 0 ⇒ host wildcard.
-                if plen >= 2 {
-                    let port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    let payload_tag = if plen >= 4 {
-                        u16::from_le_bytes([*buf.as_ptr().add(2), *buf.as_ptr().add(3)])
-                    } else {
-                        0
-                    };
+                // `[port: u16 LE][flags: u8]`. The bind is made as the owner
+                // the kernel attests for the channel being served
+                // (`cmd_owner`), never one the record names.
+                let bind = abi::contracts::net::net_proto::bind_parts(&buf[..plen]);
+                if let Some((port, req_flags)) = bind {
+                    if req_flags & !net_flag::REQUESTABLE != 0 {
+                        net_send_reply_error(s, -22, 0); // EINVAL: an undefined flag
+                        count += 1;
+                        continue;
+                    }
+                    let granted = grant_flags(s, req_flags);
+                    if granted & net_flag::RETX == 0 && s.send_pool.grant() == 0 {
+                        net_send_reply_error(s, -95, 0); // EOPNOTSUPP: nothing retains it
+                        count += 1;
+                        continue;
+                    }
                     // A lane binds as its own owner (`lane_bind_target`).
                     let lane_target = if s.cur_lane != 0 {
                         match lane_bind_target(s, abi::contracts::workload::NET_PROTO_TCP, port) {
@@ -10833,7 +11220,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     } else {
                         None
                     };
-                    let owner_tag = lane_target.map_or(payload_tag, |t| t.0);
+                    let owner_tag = lane_target.map_or(cmd_owner(s), |t| t.0);
                     // Resolve the target local-address slot for this bind.
                     // owner 0 → wildcard (host). A nonzero owner must own a
                     // configured address here; if it does not, the bind is
@@ -10909,6 +11296,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                         net_send_reply_error(s, -98, 0); // EADDRINUSE
                     } else if let Some(idx) = existing {
                         log_info(s, b"[ip] net bind: existing listener");
+                        (*s.tcp_conns.ptr_mut(idx)).flags = granted;
                         net_send_bound(s, idx as u16, port);
                     } else {
                         let found = alloc_free_slot(s);
@@ -10925,6 +11313,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                             conn.local_slot = target_slot;
                             conn.owner_tag = owner_tag;
                             conn.lane = s.cur_lane;
+                            conn.flags = granted;
                             conn_index_insert(s, ci);
                             log_info(s, b"[ip] net bind");
                             net_send_bound(s, ci as u16, port);
@@ -10935,28 +11324,28 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     }
                 }
             }
-            NET_CMD_CONNECT => {
-                // Retired. Fail the emitter loudly on its tag rather than
-                // dial whatever this payload's address bytes decode to.
-                let tag = abi::contracts::net::net_proto::retired_connect_tag(&buf[..plen]);
-                log_error(
-                    s,
-                    b"[ip] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14)",
-                );
-                net_send_reply_error(s, -38, tag); // ENOSYS
-            }
             NET_CMD_CONNECT_TO => {
                 // Stream surface: open a TCP outbound connection to a
-                // target: `[sock_type][af][port: u16 LE][addr…][tag?]`.
+                // target: `[sock_type][flags][af][port: u16 LE][addr…][tag]`.
                 // Only TCP is accepted here; UDP uses the `datagram`
                 // surface (`CMD_DG_BIND` + `CMD_DG_SEND_TO`).
-                use abi::contracts::net::net_proto::{read_connect_to, Target};
+                use abi::contracts::net::net_proto::{read_connect_to, ConnectTo, Target};
                 match read_connect_to(&buf[..plen]) {
-                    Some((sock_type, port, target, tag)) => {
-                        let requester_tag = tag.unwrap_or(REQUESTER_TAG_NONE);
-                        if sock_type != SOCK_TYPE_STREAM {
+                    Some(ConnectTo {
+                        sock_type,
+                        flags,
+                        port,
+                        target,
+                        requester_tag,
+                    }) => {
+                        let granted = grant_flags(s, flags);
+                        if sock_type != SOCK_TYPE_STREAM || flags & !net_flag::REQUESTABLE != 0 {
                             net_send_reply_error(s, -22, requester_tag); // EINVAL
+                        } else if granted & net_flag::RETX == 0 && s.send_pool.grant() == 0 {
+                            // Nothing would retain what this stream sends.
+                            net_send_reply_error(s, -95, requester_tag); // EOPNOTSUPP
                         } else {
+                            s.dial_flags = granted;
                             match target {
                                 Target::V4(a) => {
                                     connect_v4(s, u32::from_be_bytes(a), port, requester_tag);
@@ -10998,6 +11387,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                         net_send_reply_error(s, -22, tag);
                     }
                 }
+                s.dial_flags = 0;
             }
             NET_CMD_SEND => {
                 // Stream surface: send TCP payload.
@@ -11044,28 +11434,30 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     }
                 }
             }
-            NET_CMD_RESEND => {
-                // The consumer's answer to MSG_RETRANSMIT:
-                // `[conn_id: u16 LE][seq: u32 LE][data...]`.
-                if plen > 6 {
-                    let conn_id =
-                        u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
-                    let seq = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
-                    if conn_id < s.tcp_conns.len() {
-                        resend_cmd_payload(s, conn_id, seq, buf.as_ptr().add(6), plen - 6);
+            NET_CMD_RETX_RESEND => {
+                // The consumer's answer to MSG_RETX_REQUEST, on a connection
+                // granted `RETX` only: `[conn_id: u16 LE][seq: u32 LE][data...]`.
+                if let Some((conn_id, seq, data)) =
+                    abi::contracts::net::stream_retx::resend_parts(&buf[..plen])
+                {
+                    let conn_id = conn_id as usize;
+                    if conn_id < s.tcp_conns.len()
+                        && (*s.tcp_conns.ptr(conn_id)).flags & net_flag::RETX != 0
+                    {
+                        resend_cmd_payload(s, conn_id, seq, data.as_ptr(), data.len());
                     }
                 }
             }
             NET_CMD_CLOSE => {
-                // Payload: `[conn_id: u16 LE]`. Defer the FIN if there's
-                // stashed CMD_SEND data still draining (RFC 793 §3.5:
-                // CLOSE waits for queued SENDs to be transmitted) or
+                // Payload: `[conn_id: u16 LE][how: u8]`. Defer the FIN if
+                // there's stashed CMD_SEND data still draining (RFC 793
+                // §3.5: CLOSE waits for queued SENDs to be transmitted) or
                 // if the FIN frame itself can't be queued; the prelude
                 // retry path resumes once the precondition clears.
-                if plen >= 2 {
-                    let conn_id =
-                        u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
-                    let abort = plen >= 3 && buf[2] == abi::contracts::net::net_proto::CLOSE_ABORT;
+                if let Some((conn_id, abort)) =
+                    abi::contracts::net::net_proto::close_parts(&buf[..plen])
+                {
+                    let conn_id = conn_id as usize;
                     if conn_id < s.tcp_conns.len()
                         && (lane_state(s, s.cur_lane).valid != 0
                             || !process_cmd_close(s, conn_id, abort))
@@ -11078,19 +11470,14 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 }
             }
             DG_CMD_BIND => {
-                // datagram bind. Payload: [port: u16 LE] [flags: u8]
-                //   or owner-stamped: [port: u16 LE][flags: u8][owner_tag: u16 LE]
+                // datagram bind. Payload: `[port: u16 LE][flags: u8]`.
                 // Port 0 requests ephemeral allocation. Provider responds
-                // with MSG_DG_BOUND [ep_id, local_port]. The optional trailing
-                // owner_tag is the same bind-admission axis as NET_CMD_BIND;
-                // absent or 0 ⇒ host wildcard.
-                if plen >= 2 {
-                    let req_port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    let payload_tag = if plen >= 5 {
-                        u16::from_le_bytes([*buf.as_ptr().add(3), *buf.as_ptr().add(4)])
-                    } else {
-                        0
-                    };
+                // with MSG_DG_BOUND [ep_id, local_port]. The endpoint is
+                // bound as the owner the kernel attests for the channel
+                // being served (`cmd_owner`), as a stream bind is.
+                if let Some((req_port, _flags)) =
+                    abi::contracts::net::datagram::bind_parts(&buf[..plen])
+                {
                     // A lane binds as its own owner (`lane_bind_target`); an
                     // ephemeral request (port 0) claims no endpoint and is
                     // admitted as such.
@@ -11108,7 +11495,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     } else {
                         None
                     };
-                    let owner_tag = lane_target.map_or(payload_tag, |t| t.0);
+                    let owner_tag = lane_target.map_or(cmd_owner(s), |t| t.0);
                     // A lane holds at most its quota of endpoints: the
                     // endpoint id is a u8 every lane draws from, so one
                     // workload cannot take the ids the others need.
@@ -11212,18 +11599,15 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 //   [ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]
                 // Name payload:
                 //   [ep_id:1][af:1=1][len:1][name…][dst_port:2 LE][data...]
-                // Owner-tagged form inserts [MARK][owner_tag:2 LE] between
-                // `ep_id` and `af`, so the tag sits at a fixed offset ahead of
-                // the variable-length data rather than after it.
                 let bp = buf.as_ptr();
-                let (claimed_tag, dest_off) = dg_decode_owner_tag(bp, plen);
-                let claimed_tag = lane_claim(s, claimed_tag);
+                let dest_off = 1;
+                let commander = cmd_owner(s);
                 if plen > dest_off {
                     let ep_id = *bp as usize;
                     let af = *bp.add(dest_off);
                     // The endpoint is admitted before the destination is
-                    // read: `ep_id` is an index, the tag is the authority,
-                    // and a consumer that does not hold the endpoint gets
+                    // read: `ep_id` is an index, the channel's owner is the
+                    // authority, and a consumer that does not hold the endpoint gets
                     // neither a datagram out nor a name lookup out of it.
                     let source_port = if ep_id >= MAX_DG_ENDPOINTS {
                         dg_send_error(s, ep_id as u8, -97); // EAFNOSUPPORT
@@ -11237,7 +11621,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                             s.drops.dg_ep_unowned = s.drops.dg_ep_unowned.wrapping_add(1);
                             dg_send_error(s, ep_id as u8, -88); // ENOTSOCK
                             None
-                        } else if conn.owner_tag != claimed_tag {
+                        } else if conn.owner_tag != commander {
                             // A live endpoint reached by a consumer that does
                             // not hold it.
                             s.drops.dg_ep_perm = s.drops.dg_ep_perm.wrapping_add(1);
@@ -11322,18 +11706,16 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 }
             }
             DG_CMD_CLOSE => {
-                // datagram close. Payload: [ep_id: u8], or the owner-tagged
-                // form [ep_id: u8][MARK][owner_tag: u16 LE].
-                if plen >= 1 {
-                    let bp = buf.as_ptr();
-                    let ep_id = *bp as usize;
-                    let (claimed_tag, _) = dg_decode_owner_tag(bp, plen);
-                    let claimed_tag = lane_claim(s, claimed_tag);
+                // datagram close. Payload: `[ep_id: u8]`, from a channel of
+                // the endpoint's owner.
+                if plen == abi::contracts::net::datagram::CLOSE_LEN {
+                    let ep_id = buf[0] as usize;
+                    let commander = cmd_owner(s);
                     let live = ep_id < MAX_DG_ENDPOINTS && {
                         let conn = &*s.tcp_conns.ptr(ep_id);
                         conn.is_datagram && conn.state == tcp::TcpState::Listen
                     };
-                    let owned = live && (*s.tcp_conns.ptr(ep_id)).owner_tag == claimed_tag;
+                    let owned = live && (*s.tcp_conns.ptr(ep_id)).owner_tag == commander;
                     if owned {
                         conn_reset(s, ep_id);
                         dg_send_closed(s, ep_id as u8);
@@ -11460,6 +11842,7 @@ unsafe fn connect_v4_to(s: &mut IpState, ip: u32, port: u16, requester_tag: Requ
     conn.local_port = local_port;
     conn.local_slot = src_slot;
     conn.connect_tag = requester_tag;
+    conn.flags = s.dial_flags;
     // The lane whose command this is: the connection's events go to it.
     conn.lane = s.cur_lane;
     conn.svc_vip = s.dial_vip;
@@ -11513,6 +11896,8 @@ unsafe fn lane_resolver<'a>(s: &IpState, lane: u8) -> (u32, &'a [u8]) {
             abi::contracts::workload::NET_RESOLVER,
             buf.as_mut_ptr(),
             buf.len(),
+            core::ptr::null_mut(),
+            0,
         );
         if rc > 0 {
             let n = (rc as usize).min(st.rctx.len());
@@ -11936,6 +12321,7 @@ unsafe fn resolver_start(
         e.search = search;
         e.srv_ip = srv_ip;
         e.srv_port = srv_port;
+        e.dial_flags = s.dial_flags;
         e.src_slot = src_slot;
     }
     if flags & DNS_PEND_LEADER != 0 {
@@ -11965,9 +12351,9 @@ unsafe fn resolver_complete_group(s: &mut IpState, id: u16, addr: u32) {
     let total = dns_pending_total(s);
     let mut i = 0;
     while i < total {
-        let (flags, port, tag, lane, eid) = {
+        let (flags, port, tag, lane, eid, dial_flags) = {
             let e = dns_pending_at(s, i);
-            (e.flags, e.port, e.tag, e.lane, e.id)
+            (e.flags, e.port, e.tag, e.lane, e.id, e.dial_flags)
         };
         if flags & DNS_PEND_ACTIVE != 0 && eid == id {
             resolver_clear(s, i);
@@ -11975,7 +12361,9 @@ unsafe fn resolver_complete_group(s: &mut IpState, id: u16, addr: u32) {
                 // The dial's lane, not whichever is being served now.
                 let was = s.cur_lane;
                 s.cur_lane = lane;
+                s.dial_flags = dial_flags;
                 connect_v4(s, addr, port, tag);
+                s.dial_flags = 0;
                 s.cur_lane = was;
             }
         }
@@ -12392,7 +12780,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                     conn.state = tcp::TcpState::LastAck;
                     conn.retransmit_timer = 0;
                     s.tcp_closewait_expired = s.tcp_closewait_expired.wrapping_add(1);
-                    continuity::on_sent(s, i, seq, 0, true);
+                    continuity::on_sent(s, i, seq, 0, true, &[]);
                     continuity::on_state(s, i);
                 }
             }
@@ -12453,7 +12841,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                             conn.idle_timer = 0;
                             conn.state = tcp::TcpState::FinWait1;
                             s.tcp_idle_closed = s.tcp_idle_closed.wrapping_add(1);
-                            continuity::on_sent(s, i, seq, 0, true);
+                            continuity::on_sent(s, i, seq, 0, true, &[]);
                             continuity::on_state(s, i);
                             let _ = net_send_error(s, i as u16, -110, 0);
                         }
@@ -12468,7 +12856,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 }
                 let conn = &mut *s.tcp_conns.ptr_mut(i);
                 // RTO: if there is unacknowledged data and the timer expires,
-                // collapse cwnd, signal the consumer to retransmit, and arm
+                // collapse cwnd, send again from SND.UNA (`retransmit`), and arm
                 // backoff. Karn: don't use the retransmit sample for RTT.
                 if conn.snd_nxt != conn.snd_una {
                     conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
@@ -12479,7 +12867,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                         // Exponential backoff — double RTO for next timeout.
                         tcp::rto_backoff(conn);
                         conn.rtt_active = false; // Karn's algorithm
-                        net_send_retransmit(s, i as u16, seq);
+                        retransmit(s, i, seq);
                     }
                 } else {
                     conn.retransmit_timer = 0;
@@ -12794,6 +13182,20 @@ pub mod test_helpers {
         pub is_datagram: bool,
         pub local_slot: u16,
         pub owner_tag: u16,
+        /// The sidebands granted (`net_proto::flag`).
+        pub flags: u8,
+        /// Bytes this module keeps of what the connection sent.
+        pub sbuf_len: u32,
+    }
+
+    /// The send pool: `(blocks backed, blocks free, takes, misses)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn send_pool(state: *const u8) -> (u16, u16, u32, u32) {
+        let p = &(*(state as *const IpState)).send_pool;
+        let (made, free) = p.counts();
+        (made, free, p.takes, p.misses)
     }
 
     /// Handshakes waiting on a neighbour: (listed, overflowed).
@@ -12936,6 +13338,12 @@ pub mod test_helpers {
             is_datagram: c.is_datagram,
             local_slot: c.local_slot,
             owner_tag: c.owner_tag,
+            flags: c.flags,
+            sbuf_len: if c.sbuf == tcp::SBUF_NONE {
+                0
+            } else {
+                c.sbuf_len
+            },
         }
     }
 
@@ -12987,6 +13395,12 @@ pub mod test_helpers {
             is_datagram: c.is_datagram,
             local_slot: c.local_slot,
             owner_tag: c.owner_tag,
+            flags: c.flags,
+            sbuf_len: if c.sbuf == tcp::SBUF_NONE {
+                0
+            } else {
+                c.sbuf_len
+            },
         }
     }
 

@@ -124,15 +124,23 @@ pub unsafe fn net_read_frame_sized(
 /// Returns 0 on success, negative errno on failure.
 #[inline(always)]
 pub unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
-    (sys.provider_call)(-1, abi::registry::kernel::RANDOM_FILL, buf, len)
+    (sys.provider_call)(
+        -1,
+        abi::registry::kernel::RANDOM_FILL,
+        core::ptr::null_mut(),
+        0,
+        buf,
+        len,
+    )
 }
 
-/// Build + emit a `MSG_TRACE_CTX` frame carrying a connection's W3C trace
-/// context downstream (ingress IP after MSG_ACCEPTED, or a forwarding stage with
-/// its own span id). Payload:
+/// Build + emit a `MSG_TRACE_CTX` frame (`stream_trace`) carrying a
+/// connection's W3C trace context downstream (the transport after
+/// MSG_ACCEPTED, or a forwarding stage with its own span id), for a
+/// connection granted `net_proto::flag::TRACE`. Payload:
 /// `[conn_id][trace_id 16][parent_span_id 8][trace_flags 1]`. `flags` is the
 /// W3C trace-flags byte (low bit = `sampled`). Returns true if the frame was
-/// written. See `contracts/net/net_proto.rs`.
+/// written.
 #[allow(
     clippy::too_many_arguments,
     reason = "flat trace-context args (conn id, trace/span ids, flags) plus the caller's scratch buffer — a struct would just move the list"
@@ -147,43 +155,33 @@ pub unsafe fn dev_net_send_trace_ctx(
     scratch: *mut u8,
     scratch_max: usize,
 ) -> bool {
-    use abi::contracts::net::net_proto::{MSG_TRACE_CTX, TRACE_CTX_LEN};
-    let mut payload = [0u8; TRACE_CTX_LEN];
-    payload[0..2].copy_from_slice(&conn_id.to_le_bytes());
-    payload[2..18].copy_from_slice(trace_id);
-    payload[18..26].copy_from_slice(span_id);
-    payload[26] = flags;
+    use abi::contracts::net::stream_trace::{ctx, CTX_LEN, MSG_TRACE_CTX};
+    let payload = ctx(conn_id, trace_id, span_id, flags);
     net_write_frame(
         sys,
         chan,
         MSG_TRACE_CTX,
         payload.as_ptr(),
-        TRACE_CTX_LEN,
+        CTX_LEN,
         scratch,
         scratch_max,
     ) > 0
 }
 
 /// Parse a received `MSG_TRACE_CTX` frame. `frame_buf` points at the frame start
-/// (including the 3-byte net_proto header); `payload_len` is from
-/// `net_read_frame`. Returns `(conn_id, trace_id, parent_span_id, trace_flags)`
-/// or `None`.
+/// (including the 3-byte header); `payload_len` is from `net_read_frame`.
+/// Returns `(conn_id, trace_id, parent_span_id, trace_flags)`, or `None`
+/// unless the payload is exactly one.
 pub unsafe fn parse_trace_ctx(
     frame_buf: *const u8,
     payload_len: usize,
 ) -> Option<(u16, [u8; 16], [u8; 8], u8)> {
-    use abi::contracts::net::net_proto::TRACE_CTX_LEN;
-    if payload_len < TRACE_CTX_LEN {
+    use abi::contracts::net::stream_trace::{ctx_parts, CTX_LEN};
+    if payload_len != CTX_LEN {
         return None;
     }
-    let p = frame_buf.add(NET_FRAME_HDR);
-    let conn_id = u16::from_le_bytes([*p, *p.add(1)]);
-    let mut trace_id = [0u8; 16];
-    let mut span_id = [0u8; 8];
-    core::ptr::copy_nonoverlapping(p.add(2), trace_id.as_mut_ptr(), 16);
-    core::ptr::copy_nonoverlapping(p.add(18), span_id.as_mut_ptr(), 8);
-    let flags = *p.add(26);
-    Some((conn_id, trace_id, span_id, flags))
+    let p = core::slice::from_raw_parts(frame_buf.add(NET_FRAME_HDR), CTX_LEN);
+    ctx_parts(p)
 }
 
 // ============================================================================
@@ -205,8 +203,6 @@ pub const DG_MSG_ERROR: u8 = abi::contracts::net::datagram::MSG_DG_ERROR;
 pub const DG_AF_INET: u8 = abi::contracts::net::datagram::AF_INET;
 pub const DG_AF_INET6: u8 = abi::contracts::net::datagram::AF_INET6;
 pub const DG_AF_NAME: u8 = abi::contracts::net::datagram::AF_NAME;
-pub const DG_OWNER_TAG_MARK: u8 = abi::contracts::net::datagram::OWNER_TAG_MARK;
-pub const DG_OWNER_TAG_FIELD: usize = abi::contracts::net::datagram::OWNER_TAG_FIELD;
 
 /// Build and emit a `CMD_DG_SEND_TO` frame for an IPv4 destination.
 /// Layout:
@@ -239,35 +235,28 @@ pub unsafe fn dev_dg_send_to_v4(
     scratch: *mut u8,
     scratch_max: usize,
 ) -> usize {
-    dev_dg_send_to_v4_owned(
-        sys,
-        chan,
-        ep_id,
-        0,
-        dst_ip,
-        dst_port,
-        data,
-        data_len,
-        scratch,
-        scratch_max,
-    )
+    let mut head = [0u8; 1 + 1 + 4 + 2];
+    head[0] = ep_id;
+    head[1] = DG_AF_INET;
+    head[2..6].copy_from_slice(&dst_ip.to_be_bytes());
+    head[6..8].copy_from_slice(&dst_port.to_le_bytes());
+    dg_send_to(sys, chan, &head, data, data_len, scratch, scratch_max)
 }
 
-/// Send one datagram to a NAMED destination on the datagram surface, owner
-/// tagged: `[ep_id]([MARK][owner_tag])?[af = 1][len][name…][port: u16 LE][data…]`.
-/// The provider resolves the name; a name it does not yet hold starts a
-/// lookup and drops this datagram, so callers retransmit as on loss.
-/// Returns the frame length written, or `0` when the name is not one the
-/// surface carries, the scratch is too small, or the channel refused.
+/// Send one datagram to a NAMED destination on the datagram surface:
+/// `[ep_id][af = 1][len][name…][port: u16 LE][data…]`. The provider
+/// resolves the name; a name it does not yet hold starts a lookup and drops
+/// this datagram, so callers retransmit as on loss. Returns the frame length
+/// written, or `0` when the name is not one the surface carries, the scratch
+/// is too small, or the channel refused.
 #[allow(
     clippy::too_many_arguments,
     reason = "an addressed datagram send is destination plus payload plus scratch"
 )]
-pub unsafe fn dev_dg_send_to_name_owned(
+pub unsafe fn dev_dg_send_to_name(
     sys: &SyscallTable,
     chan: i32,
     ep_id: u8,
-    owner_tag: u16,
     name: &[u8],
     dst_port: u16,
     data: *const u8,
@@ -275,61 +264,36 @@ pub unsafe fn dev_dg_send_to_name_owned(
     scratch: *mut u8,
     scratch_max: usize,
 ) -> usize {
-    if chan < 0 || ep_id == 0xFF || name.is_empty() || name.len() > 253 {
+    if name.is_empty() || name.len() > abi::contracts::net::net_proto::MAX_NAME_LEN {
         return 0;
     }
-    let tag_len = if owner_tag == 0 {
-        0
-    } else {
-        DG_OWNER_TAG_FIELD
-    };
-    // [ep_id][af][len][name…][port:2]
-    let prefix = 1 + 1 + 1 + name.len() + 2;
-    let body_len = prefix + tag_len + data_len;
-    let total = NET_FRAME_HDR + body_len;
-    if total > scratch_max || body_len > u16::MAX as usize {
-        return 0;
-    }
-    *scratch = DG_CMD_SEND_TO;
-    let pl = (body_len as u16).to_le_bytes();
-    *scratch.add(1) = pl[0];
-    *scratch.add(2) = pl[1];
-    *scratch.add(3) = ep_id;
-    if tag_len != 0 {
-        let tb = owner_tag.to_le_bytes();
-        *scratch.add(4) = DG_OWNER_TAG_MARK;
-        *scratch.add(5) = tb[0];
-        *scratch.add(6) = tb[1];
-    }
-    let af_at = NET_FRAME_HDR + 1 + tag_len;
-    *scratch.add(af_at) = DG_AF_NAME;
-    *scratch.add(af_at + 1) = name.len() as u8;
-    core::ptr::copy_nonoverlapping(name.as_ptr(), scratch.add(af_at + 2), name.len());
-    let port_at = af_at + 2 + name.len();
-    let port_bytes = dst_port.to_le_bytes();
-    *scratch.add(port_at) = port_bytes[0];
-    *scratch.add(port_at + 1) = port_bytes[1];
-    if data_len > 0 && !data.is_null() {
-        core::ptr::copy_nonoverlapping(data, scratch.add(port_at + 2), data_len);
-    }
-    if (sys.channel_write)(chan, scratch, total) == total as i32 {
-        total
-    } else {
-        0
-    }
+    let mut head = [0u8; 1 + 1 + 1 + abi::contracts::net::net_proto::MAX_NAME_LEN + 2];
+    head[0] = ep_id;
+    head[1] = DG_AF_NAME;
+    head[2] = name.len() as u8;
+    head[3..3 + name.len()].copy_from_slice(name);
+    head[3 + name.len()..5 + name.len()].copy_from_slice(&dst_port.to_le_bytes());
+    dg_send_to(
+        sys,
+        chan,
+        &head[..5 + name.len()],
+        data,
+        data_len,
+        scratch,
+        scratch_max,
+    )
 }
 
-/// `CMD_DG_SEND_TO` to an IPv6 destination: `[ep_id][tag?][af = 6]
-/// [addr 16][port u16 LE][data]`. Same contract as the IPv4 form.
+/// `CMD_DG_SEND_TO` to an IPv6 destination: `[ep_id][af = 6][addr 16]
+/// [port u16 LE][data]`. Same contract as the IPv4 form.
 #[allow(
     clippy::too_many_arguments,
     reason = "an addressed datagram send is destination plus payload plus scratch"
 )]
-pub unsafe fn dev_dg_send_to_v6_owned(
+pub unsafe fn dev_dg_send_to_v6(
     sys: &SyscallTable,
     chan: i32,
     ep_id: u8,
-    owner_tag: u16,
     dst: &[u8; 16],
     dst_port: u16,
     data: *const u8,
@@ -337,124 +301,43 @@ pub unsafe fn dev_dg_send_to_v6_owned(
     scratch: *mut u8,
     scratch_max: usize,
 ) -> usize {
-    if chan < 0 || ep_id == 0xFF {
-        return 0;
-    }
-    let tag_len = if owner_tag == 0 {
-        0
-    } else {
-        DG_OWNER_TAG_FIELD
-    };
-    let prefix = 1 + 1 + 16 + 2;
-    let body_len = prefix + tag_len + data_len;
-    let total = NET_FRAME_HDR + body_len;
-    if total > scratch_max || body_len > u16::MAX as usize {
-        return 0;
-    }
-    *scratch = DG_CMD_SEND_TO;
-    let pl = (body_len as u16).to_le_bytes();
-    *scratch.add(1) = pl[0];
-    *scratch.add(2) = pl[1];
-    *scratch.add(3) = ep_id;
-    if tag_len != 0 {
-        let tb = owner_tag.to_le_bytes();
-        *scratch.add(4) = DG_OWNER_TAG_MARK;
-        *scratch.add(5) = tb[0];
-        *scratch.add(6) = tb[1];
-    }
-    let af_at = NET_FRAME_HDR + 1 + tag_len;
-    *scratch.add(af_at) = abi::contracts::net::datagram::AF_INET6;
-    core::ptr::copy_nonoverlapping(dst.as_ptr(), scratch.add(af_at + 1), 16);
-    let port_bytes = dst_port.to_le_bytes();
-    *scratch.add(af_at + 17) = port_bytes[0];
-    *scratch.add(af_at + 18) = port_bytes[1];
-    if data_len > 0 && !data.is_null() {
-        core::ptr::copy_nonoverlapping(
-            data,
-            scratch.add(NET_FRAME_HDR + prefix + tag_len),
-            data_len,
-        );
-    }
-    if (sys.channel_write)(chan, scratch, total) == total as i32 {
-        total
-    } else {
-        0
-    }
+    let mut head = [0u8; 1 + 1 + 16 + 2];
+    head[0] = ep_id;
+    head[1] = DG_AF_INET6;
+    head[2..18].copy_from_slice(dst);
+    head[18..20].copy_from_slice(&dst_port.to_le_bytes());
+    dg_send_to(sys, chan, &head, data, data_len, scratch, scratch_max)
 }
 
-/// Owner-tag-carrying form of [`dev_dg_send_to_v4`]. `owner_tag` is the tag the
-/// endpoint was bound with; the provider admits the command only when it equals
-/// the recorded one and answers `EPERM` otherwise. `owner_tag == 0` emits the
-/// untagged shape — the tag field is absent, and the bytes on the wire are
-/// exactly those of the untagged form.
-///
-/// Owner-tagged layout:
-///   `[0x21][len:2 LE][ep_id:1][MARK][owner_tag:2 LE][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]`
-///
-/// The marker sits where `af` sits and is no defined address family, so the two
-/// shapes separate at a fixed offset rather than by a length rule over the
-/// variable-length tail.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "datagram send wire-shape: signature mirrors the on-wire datagram envelope fields"
-)]
-pub unsafe fn dev_dg_send_to_v4_owned(
+/// One `CMD_DG_SEND_TO` frame: `head` (`[ep_id][af][addr][port]`), then the
+/// data, written whole or not at all.
+unsafe fn dg_send_to(
     sys: &SyscallTable,
     chan: i32,
-    ep_id: u8,
-    owner_tag: u16,
-    dst_ip: u32,
-    dst_port: u16,
+    head: &[u8],
     data: *const u8,
     data_len: usize,
     scratch: *mut u8,
     scratch_max: usize,
 ) -> usize {
-    if chan < 0 || ep_id == 0xFF {
+    if chan < 0 || head[0] == 0xFF {
         return 0;
     }
-    let tag_len = if owner_tag == 0 {
-        0
-    } else {
-        DG_OWNER_TAG_FIELD
-    };
-    let body_len = DG_V4_PREFIX + tag_len + data_len;
+    let body_len = head.len() + data_len;
     let total = NET_FRAME_HDR + body_len;
     if total > scratch_max || body_len > u16::MAX as usize {
         return 0;
     }
-
     *scratch = DG_CMD_SEND_TO;
     let pl = (body_len as u16).to_le_bytes();
     *scratch.add(1) = pl[0];
     *scratch.add(2) = pl[1];
-    *scratch.add(3) = ep_id;
-    if tag_len != 0 {
-        let tb = owner_tag.to_le_bytes();
-        *scratch.add(4) = DG_OWNER_TAG_MARK;
-        *scratch.add(5) = tb[0];
-        *scratch.add(6) = tb[1];
-    }
-    let af_at = NET_FRAME_HDR + 1 + tag_len;
-    *scratch.add(af_at) = DG_AF_INET;
-    let ip_bytes = dst_ip.to_be_bytes();
-    *scratch.add(af_at + 1) = ip_bytes[0];
-    *scratch.add(af_at + 2) = ip_bytes[1];
-    *scratch.add(af_at + 3) = ip_bytes[2];
-    *scratch.add(af_at + 4) = ip_bytes[3];
-    let port_bytes = dst_port.to_le_bytes();
-    *scratch.add(af_at + 5) = port_bytes[0];
-    *scratch.add(af_at + 6) = port_bytes[1];
+    core::ptr::copy_nonoverlapping(head.as_ptr(), scratch.add(NET_FRAME_HDR), head.len());
     if data_len > 0 && !data.is_null() {
-        core::ptr::copy_nonoverlapping(
-            data,
-            scratch.add(NET_FRAME_HDR + DG_V4_PREFIX + tag_len),
-            data_len,
-        );
+        core::ptr::copy_nonoverlapping(data, scratch.add(NET_FRAME_HDR + head.len()), data_len);
     }
-    // Honour backpressure: a datagram frame is atomic, so anything short of the
-    // full `total` means the channel rejected it. Return 0 so the caller keeps
-    // the unsent payload instead of treating a dropped write as success.
+    // A datagram frame is atomic: anything short of the full `total` means the
+    // channel rejected it, and the caller keeps the unsent payload.
     if (sys.channel_write)(chan, scratch, total) == total as i32 {
         total
     } else {

@@ -7,8 +7,12 @@ travels in the same records. The party that asks is the **requester**, the
 party that answers is the **provider**, and neither learns what the other is.
 
 The contract is `crates/fluxor-abi/src/contracts/exchange.rs`, mounted for every module
-as `abi::contracts::exchange`. It is the authority for every byte; this page
-describes what the records are for.
+as `abi::contracts::exchange`. It is neutral: nothing in it is HTTP's. A
+**binding** — a protocol's vocabulary on top of the records — fills the two
+fields the contract leaves to one; the HTTP binding is
+`crates/fluxor-abi/src/contracts/exchange_http.rs` (`abi::contracts::exchange_http`).
+The two files are the authority for every byte; this page describes what the
+records are for.
 
 ## Ports
 
@@ -34,21 +38,38 @@ whose lengths disagree with its size, is refused rather than read short.
 
 | Kind | Request direction | Response direction |
 |------|-------------------|--------------------|
-| `HEAD` | method, target, headers, peer, response credit, first body bytes | status, content type, headers, first body bytes |
+| `HEAD` | op, verb, target, meta, peer, response credit, first body bytes | outcome, detail, meta, first body bytes |
 | `BODY` | more request body | more response body |
 | `ABORT` | the requester gives up the exchange | the provider could not finish it |
 | `CREDIT` | response-body bytes the requester will take | request-body bytes the provider will take |
 | `DATAGRAM` | a message on the exchange outside its body, tagged by a `context` | the same, toward the requester |
 | `LINK` | — | the provider's link to its backend: `DOWN` or `UP` |
 
-A HEAD carries as much of the body inline as fits; `MORE` in its flags says
-BODY records follow, and a HEAD or BODY without `MORE` ends that direction.
-Headers travel as a `name: value\r\n` block, read with `header` and
-`header_lines`. Methods are one byte (`METHOD_GET` … `METHOD_OPTIONS`);
-`method_from_token` and `method_name` convert to and from the request-line
-token. `METHOD_PUBLISH` is not an HTTP method: it is a record for a durable
-destination, its `target` the ordering key (up to `KEY_MAX`) and its body the
-record. An HTTP provider refuses it.
+The request HEAD is `[op u8][verb u8][target_len u16][meta_len u16]
+[peer_len u16][resp_credit u32]` then target, meta, peer and the first body
+bytes; the response HEAD is `[outcome u8][detail u16][meta_len u16]` then
+meta and the first body bytes. A HEAD carries as much of the body inline as
+fits; `MORE` in its flags says BODY records follow, and a HEAD or BODY
+without `MORE` ends that direction. The other flags are `HOLD` (a held
+exchange, either direction), `BROADCAST` (request: every ordering unit) and
+`RAISED` (response: below).
+
+`op` says what a request is: `CALL` asks for an answer; `PUBLISH` hands a
+record to a durable destination, its `target` the ordering key (up to
+`KEY_MAX`) and its body the record; `OPEN` asks for a session whose BODY
+records then carry the session's own stream, accepted by an answer with
+outcome `OK`. `verb` is the binding's, and 0 outside one. Every decoder and
+encoder holds the rules: a PUBLISH carries verb 0, an OPEN carries one of its
+binding's opening verbs and a CALL never does, and a verb the binding does
+not name is refused (`EINVAL`). The decoders take the binding as a type
+parameter: `Http`, `Plain` for a party that speaks none (verb 0 only), or
+`Relayed` for a party that carries records it does not read.
+
+`meta` is a run of fields `[key_len u8][key][val_len u16][val]`, keys of 1 to
+255 bytes with no upper-case ASCII letter, written with `MetaWriter` and read
+with `meta_fields` and `meta_get`. A body's content type is the field
+`content-type` in either direction (`META_CONTENT_TYPE`) and travels nowhere
+else.
 
 ## Exchange ids
 
@@ -59,36 +80,86 @@ for that exchange. The id is opaque to the provider, so any number of
 exchanges from any number of sources share one channel pair. The all-zero id
 is reserved for LINK records.
 
-## Answers and statuses
+## Answers and outcomes
 
 A provider answers every exchange exactly once with a terminal record: a
 response HEAD or BODY without `MORE`, or an ABORT. Nothing further is written
 for an exchange after its terminal record, and an ABORT from the requester
 ends it too. A response that ends before the request does ends the exchange.
 
-`status` is an HTTP status code for every provider, HTTP or not. 200 is an
-answer — for a sink, durable acceptance with an empty body. A provider that
-relays a peer reports the peer's own status. The statuses a provider raises
-itself are named in `status`:
+`outcome` is the class of the answer, the same for every provider, and a
+requester branches on it alone:
 
-| Status | Meaning |
-|--------|---------|
-| 400 | not a request this provider can perform: an unknown method, a target it cannot route |
-| 413 | the request or its body passed what the provider takes |
-| 500 | the provider failed answering it |
-| 502 | the peer behind the provider was unreachable, or answered with something it could not carry back |
-| 503 | the provider holds as many exchanges as it can; the request may be repeated |
-| 504 | the peer behind the provider did not answer in time |
+| Outcome | Meaning |
+|---------|---------|
+| `OK` | answered; for a sink, durably accepted |
+| `REFUSED` | not a request this provider performs: malformed, an unknown verb, a target it cannot route |
+| `NOT_FOUND` | what the request names does not exist |
+| `DENIED` | the requester is not allowed to do this |
+| `CONFLICT` | a precondition did not hold, a version moved |
+| `TOO_LARGE` | the request or its body passed what the provider takes |
+| `BUSY` | the provider holds as many exchanges as it can, or was asked to slow down; the request may be repeated |
+| `UNAVAILABLE` | the peer behind the provider was unreachable, or answered with something it could not carry back |
+| `TIMEOUT` | the peer behind the provider did not answer in time |
+| `FAILED` | the provider failed answering it |
+| `OTHER` | no class above; `detail` says what it is |
 
-A HEAD carrying a status the provider raised is marked `RAISED` (`0x80`), and
+`detail` is the binding's own account of the answer — an HTTP status — or 0.
+A non-zero detail determines the outcome: the outcome is the binding's class
+for it, encoders that know the binding compute it, and a decoder that knows
+the binding refuses a HEAD where the two disagree. A party that knows no
+binding carries the detail without reading it.
+
+A HEAD whose answer the provider raised itself is marked `RAISED`, and
 `write_refusal` writes one. The bit is the only thing that tells "the peer
-answered 502" from "there was no peer to answer": a requester that relays the
-status onward — an HTTP server answering its client — needs nothing more than
-the number, while one that reports a failure differently from an answer — a
-script runtime whose `fetch` rejects on a network error — reads the flag. A
-peer's own answer is never marked, whatever its status; an origin's 503 is an
-answer. A relay that forwards response records unchanged forwards the flag
-with them.
+said it was unavailable" from "there was no peer to answer": a requester that
+relays the answer onward — an HTTP server answering its client — needs
+nothing more than outcome and detail, while one that reports a failure
+differently from an answer — a script runtime whose `fetch` rejects on a
+network error — reads the flag. A peer's own answer is never marked,
+whatever its outcome; an origin's 503 is an answer. A relay forwards outcome,
+detail and the flag verbatim.
+
+## The HTTP binding
+
+`exchange_http.rs` is what a party that speaks HTTP puts in the binding
+fields:
+
+- `verb` is the method: `GET` 1, `HEAD` 2, `POST` 3, `PUT` 4, `PATCH` 5,
+  `DELETE` 6, `OPTIONS` 7, and the opening verbs `CONNECT` 8, `WS_CONNECT` 9
+  and `WT_CONNECT` 10 — the extended CONNECTs that open a WebSocket and a
+  WebTransport session. `method_from_token`, `method_for_protocol` and
+  `method_name` convert to and from the request line (every opening verb is
+  `CONNECT` there).
+- `detail` is the status, and `outcome_of` its class: 2xx `OK`; 3xx `OTHER`;
+  400, 405 and 422 `REFUSED`; 401 and 403 `DENIED`; 404 and 410
+  `NOT_FOUND`; 409 and 412 `CONFLICT`; 413 `TOO_LARGE`; 429 and 503 `BUSY`;
+  502 `UNAVAILABLE`; 504 `TIMEOUT`; any other 4xx `REFUSED`, any other 5xx
+  `FAILED`. A 1xx is never carried. An answer with no detail is written to an
+  HTTP client with `canonical_status` (`OK` 200, `REFUSED` 400, `NOT_FOUND`
+  404, `DENIED` 403, `CONFLICT` 409, `TOO_LARGE` 413, `BUSY` 503,
+  `UNAVAILABLE` 502, `TIMEOUT` 504, `FAILED` and `OTHER` 500).
+- `meta` fields are header fields, keyed by the name in lower case, in order:
+  `meta_from_header_lines` and `header_lines_from_meta` map one to the other.
+  Keys starting `:` are the binding's own and never leave as header lines:
+  `:route` says how a server routed a request it delegates (`file`,
+  `proxy`).
+- `100 Continue`: the first request-body CREDIT is the provider's consent to
+  the body, and an HTTP server answers a client that asked for it
+  (`expects_continue`) when that CREDIT arrives — never as a response HEAD.
+
+A provider that speaks the binding declares it on its `request_in` port, and a
+requester that sends its verbs on its `request_out`:
+
+```toml
+[ports.facts]
+binding = ["http"]
+```
+
+The composer refuses an edge whose producer declares a binding its consumer
+does not; a port that declares none carries verb 0 only. A relay declares the
+binding on the input it takes requests on and none on the output it hands
+them on, since only the far graph sees its provider.
 
 ## Credit
 
@@ -111,11 +182,11 @@ requester issues each of those exchanges again.
 ## Ordered acceptance
 
 A provider that durably accepts records in order declares a capability under
-`stream.ordered_ack`: `stream.ordered_ack.sink` answers with a status alone
+`stream.ordered_ack`: `stream.ordered_ack.sink` answers with an outcome alone
 (an MQTT topic, a Kafka partition, an INSERT), and
 `stream.ordered_ack.exchange` also answers with data (an HTTP call, a SELECT).
 A requester that only publishes requires the parent and accepts either. The
-terms either role satisfies: a 200 means durable acceptance at the strongest
+terms either role satisfies: outcome `OK` means durable acceptance at the strongest
 level its configuration offers; order is kept per `target` within a
 connection; nothing is dropped silently — every exchange is answered or
 invalidated by `LINK DOWN`; backpressure is by channel and credit, never by
@@ -127,12 +198,14 @@ its provider's at build.
 ## Taking requests whole
 
 A provider that answers a request only once all of it is in hand uses
-`Collector<SLOTS, TARGET, HEADERS, BODY>`, sized from what it serves. It
+`Collector<B, SLOTS, TARGET, META, BODY>`, sized from what it serves and
+decoding as binding `B`. It
 takes request records one at a time and hands over a request whose body is
 complete; it owes the requester the remaining body credit the moment an
 exchange opens with a body to come; and it refuses — never truncates — a
-request past a bound with 413, or one past its slots with 503, freeing
-whatever the refused exchange held. A requester ABORT frees the exchange's
+request past a bound with `TOO_LARGE`, one past its slots with `BUSY`, or a
+HEAD that breaks its binding's rules with `REFUSED`, freeing whatever the
+refused exchange held. A requester ABORT frees the exchange's
 slot, and CREDIT records accumulate on it. The collector does no I/O: the
 grant and the refusal it owes are taken after each record and written by the
 module that owns the port.
@@ -168,7 +241,9 @@ leaves through one `ExchangeOutbox`.
 | `PATCH /<name>` with `retain-until`, `legal-hold` or both | `200`: extends the object's retention, sets or clears its hold |
 | `GET /?list&prefix=…&after=…&max=…` | `200`, one page of names, one per line, with `next` when there is more |
 
-The name is the target after its `/`, verbatim. Every success carries the
+It speaks the HTTP binding: requests are calls with a method, headers are
+meta fields, and every answer's detail is its status. The name is the target
+after its `/`, verbatim. Every success carries the
 store's fence as `fence: <hex of Fence::encode>`, and the statuses map the
 store's refusals precisely: absent `404`, a condition that did not hold `412`,
 a body the store will not take `413`, an object its retention or hold protects
@@ -209,7 +284,8 @@ serve several near endpoints at once (one session each), hands the provider
 every exchange under an id of its own and maps it back on every answer, and
 writes each request HEAD's `peer` as the session's verified key
 fingerprint (empty without `require_peer`), whatever the requester wrote —
-a HEAD that no longer fits is answered `413`. A placed member (`node:`) is never named by
+a HEAD that no longer fits is answered `TOO_LARGE`. The relay reads no
+binding: verb, outcome, detail and `RAISED` cross as written. A placed member (`node:`) is never named by
 a wire; the graph wires the requester to a near endpoint as it would to the
 provider.
 

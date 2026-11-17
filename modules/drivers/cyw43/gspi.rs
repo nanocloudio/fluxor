@@ -16,7 +16,6 @@
 
 use super::abi::contracts::hal::gpio as dev_gpio;
 use super::abi::platform::rp::pio as dev_pio;
-use super::abi::platform::rp::pio::CmdTransferArgs as PioCmdTransferArgs;
 use super::constants::*;
 use super::Cyw43State;
 
@@ -165,21 +164,26 @@ pub unsafe fn txn_write(s: &mut Cyw43State, function: u32, address: u32, data: &
     // Assert CS
     {
         let mut _l = [0u8];
-        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        (sys.provider_call)(
+            s.cs_handle,
+            dev_gpio::SET_LEVEL,
+            _l.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 
     // Start PIO transfer (TX only, no RX)
-    let transfer_args = PioCmdTransferArgs {
-        tx_ptr: s.txn_buf.as_ptr(),
-        tx_len: tx_bytes as u32,
-        rx_ptr: core::ptr::null_mut(),
-        rx_len: 0,
-    };
+    // The frame goes in as the call's data; what comes back is
+    // collected by `CMD_POLL`.
     let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
-        &transfer_args as *const _ as *mut u8,
-        core::mem::size_of::<PioCmdTransferArgs>(),
+        core::ptr::null_mut(),
+        0,
+        s.txn_buf.as_mut_ptr(),
+        (tx_bytes as u32) as usize,
     );
 
     // Deassert CS — transfer completes synchronously
@@ -187,7 +191,14 @@ pub unsafe fn txn_write(s: &mut Cyw43State, function: u32, address: u32, data: &
         // Not started: nothing is on the bus, so release it now.
         {
             let mut _l = [1u8];
-            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+            (sys.provider_call)(
+                s.cs_handle,
+                dev_gpio::SET_LEVEL,
+                _l.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         return result;
     }
@@ -268,7 +279,6 @@ pub unsafe fn txn_read(s: &mut Cyw43State, function: u32, address: u32, read_len
     s.txn_buf[11] = rw_bytes[3];
 
     let tx_bytes: usize = 12; // tx_words(4) + cmd(4) + rx_words(4)
-    let rx_bytes = rx_words as usize * 4;
 
     // Store skip info for txn_poll / rxn accessors
     s.txn_rx_skip_words = skip_words as u8;
@@ -277,21 +287,26 @@ pub unsafe fn txn_read(s: &mut Cyw43State, function: u32, address: u32, read_len
     // Assert CS
     {
         let mut _l = [0u8];
-        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        (sys.provider_call)(
+            s.cs_handle,
+            dev_gpio::SET_LEVEL,
+            _l.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 
     // Start PIO transfer (TX cmd+rx_count, RX response+payload)
-    let transfer_args = PioCmdTransferArgs {
-        tx_ptr: s.txn_buf.as_ptr(),
-        tx_len: tx_bytes as u32,
-        rx_ptr: s.rxn_buf.as_mut_ptr(),
-        rx_len: rx_bytes as u32,
-    };
+    // The frame goes in as the call's data; what comes back is
+    // collected by `CMD_POLL`.
     let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
-        &transfer_args as *const _ as *mut u8,
-        core::mem::size_of::<PioCmdTransferArgs>(),
+        core::ptr::null_mut(),
+        0,
+        s.txn_buf.as_mut_ptr(),
+        (tx_bytes as u32) as usize,
     );
 
     // Deassert CS — transfer completes synchronously
@@ -299,7 +314,14 @@ pub unsafe fn txn_read(s: &mut Cyw43State, function: u32, address: u32, read_len
         // Not started: nothing is on the bus, so release it now.
         {
             let mut _l = [1u8];
-            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+            (sys.provider_call)(
+                s.cs_handle,
+                dev_gpio::SET_LEVEL,
+                _l.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         return result;
     }
@@ -322,13 +344,28 @@ pub unsafe fn txn_poll(s: &mut Cyw43State) -> i32 {
         return -1;
     }
     let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(s.pio_handle, dev_pio::CMD_POLL, core::ptr::null_mut(), 0);
+    // The received words land in `rxn_buf` once the transfer is done.
+    let rc = (sys.provider_call)(
+        s.pio_handle,
+        dev_pio::CMD_POLL,
+        core::ptr::null_mut(),
+        0,
+        s.rxn_buf.as_mut_ptr(),
+        s.rxn_buf.len(),
+    );
     if rc == EAGAIN {
         return 0;
     }
     {
         let mut _l = [1u8];
-        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        (sys.provider_call)(
+            s.cs_handle,
+            dev_gpio::SET_LEVEL,
+            _l.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     s.txn_step = TxnStep::Idle;
     if rc < 0 {
@@ -380,7 +417,14 @@ pub unsafe fn txn_reset(s: &mut Cyw43State) {
     // Ensure CS is high
     {
         let mut _l = [1u8];
-        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        (sys.provider_call)(
+            s.cs_handle,
+            dev_gpio::SET_LEVEL,
+            _l.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     s.txn_step = TxnStep::Idle;
     s.txn_len = 0;
@@ -452,20 +496,25 @@ pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u3
     // Assert CS
     {
         let mut _l = [0u8];
-        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        (sys.provider_call)(
+            s.cs_handle,
+            dev_gpio::SET_LEVEL,
+            _l.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 
-    let transfer_args = PioCmdTransferArgs {
-        tx_ptr: s.txn_buf.as_ptr(),
-        tx_len: 16, // tx_words(4) + cmd(4) + data(4) + rx_words(4)
-        rx_ptr: core::ptr::null_mut(),
-        rx_len: 0,
-    };
+    // The frame — tx_words(4) + cmd(4) + data(4) + rx_words(4) — goes in as
+    // the call's data; what comes back is collected by `CMD_POLL`.
     let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
-        &transfer_args as *const _ as *mut u8,
-        core::mem::size_of::<PioCmdTransferArgs>(),
+        core::ptr::null_mut(),
+        0,
+        s.txn_buf.as_mut_ptr(),
+        16,
     );
 
     // Deassert CS — transfer completes synchronously
@@ -473,7 +522,14 @@ pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u3
         // Not started: nothing is on the bus, so release it now.
         {
             let mut _l = [1u8];
-            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+            (sys.provider_call)(
+                s.cs_handle,
+                dev_gpio::SET_LEVEL,
+                _l.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         return result;
     }
@@ -521,20 +577,25 @@ pub unsafe fn bus_read32_swapped_start(s: &mut Cyw43State, addr: u32) -> i32 {
     // Assert CS
     {
         let mut _l = [0u8];
-        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        (sys.provider_call)(
+            s.cs_handle,
+            dev_gpio::SET_LEVEL,
+            _l.as_mut_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 
-    let transfer_args = PioCmdTransferArgs {
-        tx_ptr: s.txn_buf.as_ptr(),
-        tx_len: 12,
-        rx_ptr: s.rxn_buf.as_mut_ptr(),
-        rx_len: 8, // 2 words * 4 bytes
-    };
+    // The frame goes in as the call's data; what comes back is
+    // collected by `CMD_POLL`.
     let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
-        &transfer_args as *const _ as *mut u8,
-        core::mem::size_of::<PioCmdTransferArgs>(),
+        core::ptr::null_mut(),
+        0,
+        s.txn_buf.as_mut_ptr(),
+        12,
     );
 
     // Deassert CS — transfer completes synchronously
@@ -542,7 +603,14 @@ pub unsafe fn bus_read32_swapped_start(s: &mut Cyw43State, addr: u32) -> i32 {
         // Not started: nothing is on the bus, so release it now.
         {
             let mut _l = [1u8];
-            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+            (sys.provider_call)(
+                s.cs_handle,
+                dev_gpio::SET_LEVEL,
+                _l.as_mut_ptr(),
+                1,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         return result;
     }

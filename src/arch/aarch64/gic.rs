@@ -31,6 +31,7 @@ use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use super::exception::MAX_CORES;
 use super::mmio;
+use crate::kernel::sys::hal::IrqAck;
 
 static GICD: AtomicUsize = AtomicUsize::new(0);
 static GICC: AtomicUsize = AtomicUsize::new(0);
@@ -100,6 +101,39 @@ pub fn configure_v3(gicd_base: usize, gicr_base: usize, timer_ppi: u32) {
     GICD.store(gicd_base, Ordering::Relaxed);
     GICR.store(gicr_base, Ordering::Relaxed);
     TIMER_PPI.store(timer_ppi, Ordering::Relaxed);
+}
+
+/// A machine's virtio-mmio transports: `count` register windows from `base`,
+/// `stride` apart, transport `i` raising INTID `first_intid + i` (QEMU
+/// `virt`: 32 from 0x0a00_0000, 0x200 apart, from SPI 16).
+pub struct VirtioMmio {
+    pub base: usize,
+    pub stride: usize,
+    pub first_intid: u32,
+    pub count: u32,
+}
+
+static VIRTIO_BASE: AtomicUsize = AtomicUsize::new(0);
+static VIRTIO_STRIDE: AtomicUsize = AtomicUsize::new(0);
+static VIRTIO_FIRST: AtomicU32 = AtomicU32::new(0);
+static VIRTIO_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Name the machine's virtio-mmio transports, where it has them, so a
+/// binding that asks for [`IrqAck::VirtioMmio`] finds the transport behind
+/// its line. Called at boot, as [`configure`] is.
+pub fn configure_virtio_mmio(v: VirtioMmio) {
+    VIRTIO_BASE.store(v.base, Ordering::Relaxed);
+    VIRTIO_STRIDE.store(v.stride, Ordering::Relaxed);
+    VIRTIO_FIRST.store(v.first_intid, Ordering::Relaxed);
+    VIRTIO_COUNT.store(v.count, Ordering::Relaxed);
+}
+
+/// The register window of the virtio-mmio transport that raises `irq`.
+fn virtio_mmio_transport(irq: u32) -> Option<usize> {
+    let base = VIRTIO_BASE.load(Ordering::Relaxed);
+    let i = irq.checked_sub(VIRTIO_FIRST.load(Ordering::Relaxed))?;
+    (base != 0 && i < VIRTIO_COUNT.load(Ordering::Relaxed))
+        .then(|| base + i as usize * VIRTIO_STRIDE.load(Ordering::Relaxed))
 }
 
 #[inline(always)]
@@ -355,9 +389,9 @@ pub(crate) fn irq_mux() -> Option<fn()> {
 }
 
 /// Bind an event to a hardware IRQ and enable it in the distributor.
-/// `mmio_base`: if nonzero, the ISR acknowledges a virtio-mmio device by
-/// reading `InterruptStatus` (offset 0x60) and writing it to
-/// `InterruptACK` (0x64).
+/// `ack`: [`IrqAck::VirtioMmio`] has the ISR acknowledge the virtio-mmio
+/// transport behind `irq` (its `InterruptStatus`, offset 0x60, written back
+/// to `InterruptACK`, 0x64); `EINVAL` when the machine has none there.
 /// `target_core`: the core the distributor delivers this SPI to
 /// (`GICD_ITARGETSR` on a GICv2, `GICD_IROUTER` on a GICv3) — for a Tier-2
 /// IRQ the core its owning domain runs on, otherwise core 0. For an SGI or
@@ -369,7 +403,7 @@ pub(crate) fn irq_mux() -> Option<fn()> {
 ///
 /// Returns 0 on success, negative errno on failure: `EINVAL` for an INTID
 /// past the GIC's, or an SGI or PPI bound to an event.
-pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) -> i32 {
+pub fn irq_bind(irq: u32, event_handle: i32, ack: IrqAck, target_core: u8) -> i32 {
     // 1020..=1023 are special IDs and must never be programmed into the
     // distributor (the validator rejects them at build time; this is the
     // runtime backstop). A larger value would also index ISENABLER,
@@ -384,6 +418,13 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) 
     if irq < 32 && event_handle >= 0 {
         return crate::kernel::sys::errno::EINVAL;
     }
+    let mmio_base = match ack {
+        IrqAck::None => 0,
+        IrqAck::VirtioMmio => match virtio_mmio_transport(irq) {
+            Some(base) => base,
+            None => return crate::kernel::sys::errno::EINVAL,
+        },
+    };
     let gicd = gicd_base();
     // SAFETY: IRQ_BINDINGS / IRQ_BINDING_COUNT are scheduler-thread-only
     // and only grow at boot/configure time; `idx` is range-checked above.

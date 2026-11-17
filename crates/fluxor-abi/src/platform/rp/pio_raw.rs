@@ -7,11 +7,11 @@
 
 /// Completion of a `CMD_TRANSFER` started earlier: 1 busy, 0 done.
 pub use super::super::super::registry::rp_raw::PIO_CMD_POLL as CMD_POLL;
-/// Atomic PIO CMD transfer — sets up SM + runs DMA in one call.
-/// handle=-1, arg = PioCmdExecTransferArgs (28 bytes).
+/// Atomic PIO CMD transfer — sets up SM + starts DMA in one call.
+/// handle = the caller's claim of the PIO block, arg = [`cmd_transfer`].
 /// Performs: disable SM, set X (write_bits), set Y (read_bits),
-/// SET PINDIRS=1, JMP origin, arm DMA, enable SM, wait completion.
-/// Returns total bytes transferred or negative errno.
+/// SET PINDIRS=1, JMP origin, arm both DMA directions, enable SM. Returns 0
+/// once started; `CMD_POLL` reports completion.
 pub use super::super::super::registry::rp_raw::PIO_CMD_TRANSFER as CMD_TRANSFER;
 /// Read PIO FSTAT register.
 /// handle=-1, arg=[pio:u8] (1 byte). Returns fstat as i32.
@@ -29,7 +29,7 @@ pub use super::super::super::registry::rp_raw::PIO_INSTR_ALLOC as INSTR_ALLOC;
 /// handle=-1, arg=[pio:u8, mask:u32 LE] (5 bytes).
 pub use super::super::super::registry::rp_raw::PIO_INSTR_FREE as INSTR_FREE;
 /// Write a single instruction to PIO instruction memory.
-/// handle=-1, arg=[pio:u8, addr:u8, instr:u16 LE] (4 bytes).
+/// handle=-1, arg=[pio:u8, slot:u8, instr:u16 LE] (4 bytes).
 pub use super::super::super::registry::rp_raw::PIO_INSTR_WRITE as INSTR_WRITE;
 /// The input level of a pin set up for PIO: 1 high, 0 low.
 /// handle=-1, arg=[pin:u8] (1 byte). A peripheral that signals pending
@@ -59,3 +59,33 @@ pub use super::super::super::registry::rp_raw::PIO_SM_WRITE_REG as SM_WRITE_REG;
 /// Write a 32-bit value to a PIO SM TX FIFO.
 /// handle=-1, arg=[pio:u8, sm:u8, value:u32 LE] (6 bytes).
 pub use super::super::super::registry::rp_raw::PIO_TXF_WRITE as TXF_WRITE;
+
+/// `CMD_TRANSFER` argument. The TX words (`tx_words`) and the RX words
+/// (`ceil((read_bits + 1) / 32)`, at least one) lie in one span the caller
+/// lent on its PIO claim handle (`lend::OPEN`, direction inout).
+pub mod cmd_transfer {
+    /// `u8` — PIO block.
+    pub const PIO: usize = 0;
+    /// `u8` — state machine.
+    pub const SM: usize = 1;
+    /// `u8` — program origin from `INSTR_ALLOC`.
+    pub const ORIGIN: usize = 2;
+    /// `u32` LE — bits to write, minus one (0 for none).
+    pub const WRITE_BITS: usize = 4;
+    /// `u32` LE — bits to read, minus one (0 for none).
+    pub const READ_BITS: usize = 8;
+    /// `u32` LE — the lend's cookie.
+    pub const LEND: usize = 12;
+    /// `u32` LE — TX words' offset in the lend.
+    pub const TX_OFFSET: usize = 16;
+    /// `u32` LE — TX words.
+    pub const TX_WORDS: usize = 20;
+    /// `u32` LE — RX words' offset in the lend.
+    pub const RX_OFFSET: usize = 24;
+    /// `u8` — the caller's TX DMA channel number.
+    pub const CH_TX: usize = 28;
+    /// `u8` — the caller's RX DMA channel number.
+    pub const CH_RX: usize = 29;
+    /// Total length, in bytes.
+    pub const LEN: usize = 32;
+}

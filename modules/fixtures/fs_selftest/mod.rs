@@ -361,7 +361,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             // mounted, and a consumer that latches an unread answer runs its
             // degraded tier forever. Ask until there is an answer.
             let mut caps = [0u8; 4];
-            let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+            let rc =
+                (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4, core::ptr::null_mut(), 0);
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -381,7 +382,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_MKDIR => {
-            let rc = (sys.provider_call)(-1, FS_MKDIR, DIR.as_ptr().cast_mut(), DIR.len());
+            let rc = (sys.provider_call)(
+                -1,
+                FS_MKDIR,
+                DIR.as_ptr().cast_mut(),
+                DIR.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -399,6 +407,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 FS_OPEN_CREATE,
                 TMP_PATH.as_ptr().cast_mut(),
                 TMP_PATH.len(),
+                core::ptr::null_mut(),
+                0,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
@@ -426,7 +436,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 chunk[i] = payload_byte(off + i);
                 i += 1;
             }
-            let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_WRITE,
+                chunk.as_mut_ptr(),
+                n,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -439,7 +456,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_FSYNC => {
-            let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_FSYNC,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -451,7 +475,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         }
 
         PH_CLOSE => {
-            let rc = (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc < 0 {
                 return fail(s, rc);
             }
@@ -469,6 +500,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 FS_FSYNC_NAME,
                 TMP_PATH.as_ptr().cast_mut(),
                 TMP_PATH.len(),
+                core::ptr::null_mut(),
+                0,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
@@ -485,7 +518,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         PH_RENAME => {
             let mut arg = [0u8; 64];
             let n = rename_arg(&mut arg, TMP_PATH, FINAL_PATH);
-            let rc = (sys.provider_call)(-1, FS_RENAME, arg.as_mut_ptr(), n);
+            let rc =
+                (sys.provider_call)(-1, FS_RENAME, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0);
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -504,7 +538,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         PH_TRUNCATE => {
             let mut arg = [0u8; 64];
             let n = truncate_arg(&mut arg, TRUNC_TO, FINAL_PATH);
-            let rc = (sys.provider_call)(-1, FS_TRUNCATE, arg.as_mut_ptr(), n);
+            let rc = (sys.provider_call)(
+                -1,
+                FS_TRUNCATE,
+                arg.as_mut_ptr(),
+                n,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
             }
@@ -523,6 +564,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 FS_UNLINK,
                 FINAL_PATH.as_ptr().cast_mut(),
                 FINAL_PATH.len(),
+                core::ptr::null_mut(),
+                0,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
@@ -540,6 +583,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 FS_OPEN,
                 FINAL_PATH.as_ptr().cast_mut(),
                 FINAL_PATH.len(),
+                core::ptr::null_mut(),
+                0,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
@@ -547,7 +592,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             if rc >= 0 {
                 // The name still resolves. Close the handle before reporting,
                 // so a failed run does not also leak one.
-                (sys.provider_call)(rc, FS_CLOSE, core::ptr::null_mut(), 0);
+                (sys.provider_call)(
+                    rc,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 return fail(s, -17);
             }
             advance(s);
@@ -563,6 +615,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 FS_FSYNC_NAME,
                 FINAL_PATH.as_ptr().cast_mut(),
                 FINAL_PATH.len(),
+                core::ptr::null_mut(),
+                0,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
@@ -586,7 +640,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
 unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> StepReturn {
     let sys = &*s.syscalls;
     if s.fd < 0 {
-        let rc = (sys.provider_call)(-1, FS_OPEN, path.as_ptr().cast_mut(), path.len());
+        let rc = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            path.as_ptr().cast_mut(),
+            path.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         if rc == E_AGAIN || rc == E_INPROGRESS {
             return StepReturn::Continue;
         }
@@ -599,8 +660,15 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> StepReturn {
         // Reading the bytes back alone cannot catch a size field that
         // disagrees with the chain — a short read looks the same as a short
         // file — so ask the entry directly first.
-        let mut st = [0u8; 16];
-        let rc = (sys.provider_call)(s.fd, FS_STAT, st.as_mut_ptr(), 16);
+        let mut st = [0u8; abi::contracts::storage::fs::stat::LEN];
+        let rc = (sys.provider_call)(
+            s.fd,
+            FS_STAT,
+            st.as_mut_ptr(),
+            st.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         if rc < 0 {
             return fail(s, rc);
         }
@@ -612,20 +680,41 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> StepReturn {
     }
     let off = s.progress as usize;
     if off >= len {
-        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fd = -1;
         advance(s);
         return StepReturn::Continue;
     }
     let want = core::cmp::min(512, len - off);
-    let rc = (sys.provider_call)(s.fd, FS_READ, s.buf.as_mut_ptr(), want);
+    let rc = (sys.provider_call)(
+        s.fd,
+        FS_READ,
+        s.buf.as_mut_ptr(),
+        want,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc == E_AGAIN || rc == E_INPROGRESS {
         return StepReturn::Continue;
     }
     if rc <= 0 {
         // Short of the length the entry claims: the size field and the chain
         // disagree, which is the shape a lost cluster takes on read.
-        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fd = -1;
         return fail(s, if rc == 0 { -5 } else { rc });
     }
@@ -633,7 +722,14 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> StepReturn {
     let mut i = 0usize;
     while i < n {
         if *s.buf.as_ptr().add(i) != payload_byte(off + i) {
-            (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                s.fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             s.fd = -1;
             return fail(s, -5);
         }

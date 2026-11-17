@@ -73,8 +73,13 @@ const TRANSPORT_UART: u8 = 1;
 /// frame is truncated frame-aligned (tail dropped) rather than desyncing the FIFO.
 const PAYLOAD_MAX: usize = 1400;
 
-/// Frame assembly / read scratch: NET_FRAME_HDR + DG_V4_PREFIX + payload.
-const NET_BUF_SIZE: usize = NET_FRAME_HDR + DG_V4_PREFIX + PAYLOAD_MAX + 8;
+/// Frame assembly / read scratch: the larger of one `CMD_DG_SEND_TO` this
+/// module writes and one record `net_in` accepts.
+const NET_BUF_SIZE: usize = if NET_IN_ACCEPTS_RECORD > NET_OUT_MAX_RECORD {
+    NET_IN_ACCEPTS_RECORD
+} else {
+    NET_OUT_MAX_RECORD
+};
 
 /// Bound on payloads sent per step so a flooded input can't starve the tick.
 const MAX_SEND_PER_STEP: u32 = 32;
@@ -177,7 +182,14 @@ unsafe fn send_one(s: &mut TransportBufferState) -> usize {
     let remaining = len - off;
     let sys = &*s.syscalls;
     if s.transport == TRANSPORT_UART {
-        let n = (sys.provider_call)(-1, SERIAL_WRITE, s.pending.as_mut_ptr().add(off), remaining);
+        let n = (sys.provider_call)(
+            -1,
+            SERIAL_WRITE,
+            core::ptr::null_mut(),
+            0,
+            s.pending.as_mut_ptr().add(off),
+            remaining,
+        );
         if n > 0 {
             n as usize
         } else {
@@ -279,7 +291,13 @@ unsafe fn discard_net_in(s: &mut TransportBufferState) {
 // Module interface
 // ============================================================================
 
-fluxor_rt::module_facts! { state: TransportBufferState }
+fluxor_rt::module_facts! {
+    state: TransportBufferState,
+    records: [
+        in 1 NET_IN_ACCEPTS_RECORD = 1483,
+        out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + DG_V4_PREFIX + PAYLOAD_MAX,
+    ],
+}
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.

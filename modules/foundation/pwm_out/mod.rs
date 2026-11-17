@@ -168,7 +168,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         };
 
         let mut duty_bytes = duty.to_le_bytes();
-        (sys.provider_call)(s.pwm_handle, PWM_SET_DUTY, duty_bytes.as_mut_ptr(), 2);
+        (sys.provider_call)(
+            s.pwm_handle,
+            PWM_SET_DUTY,
+            duty_bytes.as_mut_ptr(),
+            2,
+            core::ptr::null_mut(),
+            0,
+        );
 
         StepReturn::Continue
     }

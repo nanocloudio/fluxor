@@ -2,9 +2,9 @@
 //!
 //! Registers as the **default (unkeyed) FS provider** and routes each path
 //! to a volume backend by longest-prefix match. Backends are keyed `fat32`
-//! instances (each declaring a `volume:` selector); this module forwards
-//! each op to the named volume via `provider_call_sel` (the kernel
-//! re-resolves the backend by selector per call — no cached binding).
+//! instances (each declaring a `volume:` selector); this module binds each
+//! named volume once (`kernel_abi::bind`, `NAME`), keeps the bound handle,
+//! and forwards each op through it.
 //!
 //! Consumers keep `requires_contract = "fs"` and open plain absolute paths.
 //! Only this module's `mounts:` config knows which volume a path prefix lives
@@ -12,23 +12,24 @@
 //! consumer.
 //!
 //! ```text
-//!  bank / fs_tap  --FS_OPEN("/data/x")-->  [mount]  --call_sel("nvme0")-->  fat32#nvme0
-//!                                             |      --call_sel("sd0")----> fat32#sd0
+//!  bank / fs_tap  --FS_OPEN("/data/x")-->  [mount]  --bound("nvme0")-->  fat32#nvme0
+//!                                             |      --bound("sd0")----> fat32#sd0
 //!                                             +-- longest-prefix table:  /data -> nvme0
 //!                                                                        /boot -> sd0
 //! ```
 //!
 //! # Handle remapping
 //!
-//! A backend `FS_OPEN` sent through `provider_call_sel` comes back as a
+//! A backend `FS_OPEN` sent through a volume's bound handle comes back as a
 //! kernel-routed handle that names the backend that minted it, so the
 //! handles two volumes return never collide and each op on one reaches its
 //! own backend with the backend's own slot. The consumer still gets a handle
 //! of this module's: it allocates its OWN mount slot, records `(mount_idx,
-//! backend_handle)`, and returns `FD_TAG_FS | mount_slot`. Later
-//! handle-bound ops (`FS_READ` / `FS_CLOSE` / …) route by tag back to this
-//! module (the default FS provider), which is what lets an unmount revoke
-//! them, and forwards each to the backend. `FS_CLOSE` frees the mount slot.
+//! backend_handle)`, and answers the mount slot, which the kernel wraps in a
+//! handle routed back to this module. Later handle-bound ops (`FS_READ` /
+//! `FS_CLOSE` / …) reach this module with that slot, which is what lets an
+//! unmount revoke them, and are forwarded to the backend. `FS_CLOSE` frees
+//! the mount slot.
 //!
 //! A mount may name `platform` as its volume: the platform's own FS provider
 //! (the host filesystem on Linux), beneath this module.
@@ -70,6 +71,7 @@ const FS_CAPS: u32 = abi::registry::fs::CAPS;
 
 // errno
 const EINVAL: i32 = -22;
+const EAGAIN: i32 = -11;
 const ENODEV: i32 = -19;
 const EBADF: i32 = -9;
 const ENFILE: i32 = -23;
@@ -109,6 +111,9 @@ struct MountEntry {
     /// `false` once the volume is unmounted (its slot is reusable by a
     /// later `MOUNT_ADD`); routing skips inactive entries.
     active: bool,
+    /// The handle bound to the volume, once the first op through it bound
+    /// it; `-1` before.
+    bound: i32,
 }
 
 impl MountEntry {
@@ -119,6 +124,7 @@ impl MountEntry {
             volume: [0; VOLUME_MAX],
             volume_len: 0,
             active: false,
+            bound: -1,
         }
     }
 }
@@ -231,6 +237,7 @@ unsafe fn parse_mounts(s: &mut MountState, d: *const u8, len: usize) {
         e.volume[..volume.len()].copy_from_slice(volume);
         e.volume_len = volume.len() as u8;
         e.active = true;
+        e.bound = -1;
         s.mount_count += 1;
     }
 }
@@ -249,14 +256,7 @@ unsafe fn revoke_volume(s: &mut MountState, mi: usize) {
         let slot = s.opens[i];
         if slot.in_use && !slot.revoked && slot.mount_idx as usize == mi {
             if slot.backend_handle >= 0 {
-                call_volume(
-                    s,
-                    mi,
-                    slot.backend_handle,
-                    FS_CLOSE,
-                    core::ptr::null_mut(),
-                    0,
-                );
+                call_backend(s, slot.backend_handle, FS_CLOSE, core::ptr::null_mut(), 0);
             }
             s.opens[i].revoked = true;
             s.opens[i].backend_handle = -1;
@@ -273,13 +273,20 @@ unsafe fn remove_mount(s: &mut MountState, prefix: &[u8]) {
         {
             revoke_volume(s, i);
             s.mounts[i].active = false;
+            // The volume may come back under another backend: bind afresh.
+            let bound = s.mounts[i].bound;
+            if bound >= 0 {
+                ((*s.syscalls).provider_close)(bound);
+                s.mounts[i].bound = -1;
+            }
             return;
         }
     }
 }
 
 /// Add (or re-activate) a mount at runtime (media insertion). Reuses an
-/// inactive table slot; binding stays lazy (first FS_OPEN binds it).
+/// inactive table slot; binding stays lazy (the first op through it binds
+/// it).
 unsafe fn add_mount(s: &mut MountState, prefix: &[u8], volume: &[u8]) {
     if prefix.is_empty()
         || volume.is_empty()
@@ -315,6 +322,7 @@ unsafe fn add_mount(s: &mut MountState, prefix: &[u8], volume: &[u8]) {
     e.volume[..volume.len()].copy_from_slice(volume);
     e.volume_len = volume.len() as u8;
     e.active = true;
+    e.bound = -1;
 }
 
 /// Parse and apply one control message
@@ -491,28 +499,65 @@ unsafe fn route_two_paths(s: &mut MountState, op: u32, arg: *mut u8, arg_len: us
     *out.add(1) = l1[1];
     *out.add(at) = l2[0];
     *out.add(at + 1) = l2[1];
-    call_volume(s, ms, -1, op, out, at + 2 + n2)
+    call_volume(s, ms, op, out, at + 2 + n2)
 }
 
-/// Forward one op to the backend for mount `mi`, selecting the volume by
-/// name each call. `provider_call_sel` re-resolves by selector, so there is
-/// no cached token to go stale under live graph mutation. `op_handle` is
-/// `-1` for open-style ops, or the routed handle this volume's open returned;
-/// the kernel refuses one minted through any other selector.
-unsafe fn call_volume(
+/// Forward a path op to the backend for mount `mi`, through the handle
+/// bound to its volume: bound on first use and kept, and bound again after
+/// a refusal (a volume whose backend has not registered yet answers
+/// `ENODEV`). A handle an open through it returns is routed to that backend.
+unsafe fn call_volume(s: &mut MountState, mi: usize, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let sys = &*s.syscalls;
+    if s.mounts[mi].bound < 0 {
+        let vl = s.mounts[mi].volume_len as usize;
+        let h = dev_bind_name(sys, abi::registry::fs::ID, &s.mounts[mi].volume[..vl]);
+        if h < 0 {
+            return h;
+        }
+        s.mounts[mi].bound = h;
+    }
+    s.ops_routed = s.ops_routed.wrapping_add(1);
+    (sys.provider_call)(
+        s.mounts[mi].bound,
+        op,
+        arg,
+        arg_len,
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
+/// Forward a handle-bound op to the backend that minted `backend_handle`
+/// (a handle routed to it), with the caller's `data` span.
+unsafe fn call_backend(
     s: &mut MountState,
-    mi: usize,
-    op_handle: i32,
+    backend_handle: i32,
     op: u32,
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    let mut vol = [0u8; VOLUME_MAX];
-    let vl = s.mounts[mi].volume_len as usize;
-    vol[..vl].copy_from_slice(&s.mounts[mi].volume[..vl]);
+    call_backend_data(
+        s,
+        backend_handle,
+        op,
+        arg,
+        arg_len,
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
+unsafe fn call_backend_data(
+    s: &mut MountState,
+    backend_handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
     s.ops_routed = s.ops_routed.wrapping_add(1);
-    let sys = &*s.syscalls;
-    dev_provider_call_sel(sys, &vol[..vl], op_handle, op, arg, arg_len)
+    ((*s.syscalls).provider_call)(backend_handle, op, arg, arg_len, data, data_len)
 }
 
 unsafe fn alloc_slot(s: &mut MountState, mount_idx: u8, backend_handle: i32) -> Option<usize> {
@@ -543,6 +588,8 @@ unsafe fn mount_dispatch(
     op: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     match op {
         FS_OPEN | FS_OPENDIR | FS_OPEN_CREATE => {
@@ -555,18 +602,16 @@ unsafe fn mount_dispatch(
             };
             let n = rewrite_path(s, mi, arg, arg_len);
             let p = s.scratch.as_mut_ptr();
-            let backend_h = call_volume(s, mi, -1, op, p, n);
+            let backend_h = call_volume(s, mi, op, p, n);
             if backend_h < 0 {
                 return backend_h;
             }
             match alloc_slot(s, mi as u8, backend_h) {
-                Some(slot) => {
-                    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot as i32)
-                }
+                Some(slot) => slot as i32,
                 None => {
                     // No free mount slot — close the backend handle so it
                     // doesn't leak, then report the table-full error.
-                    call_volume(s, mi, backend_h, FS_CLOSE, core::ptr::null_mut(), 0);
+                    call_backend(s, backend_h, FS_CLOSE, core::ptr::null_mut(), 0);
                     ENFILE
                 }
             }
@@ -581,7 +626,7 @@ unsafe fn mount_dispatch(
             };
             let n = rewrite_path(s, mi, arg, arg_len);
             let p = s.scratch.as_mut_ptr();
-            call_volume(s, mi, -1, op, p, n)
+            call_volume(s, mi, op, p, n)
         }
         FS_RENAME | FS_LINK => route_two_paths(s, op, arg, arg_len),
         FS_TRUNCATE => {
@@ -600,7 +645,7 @@ unsafe fn mount_dispatch(
             let n = rewrite_path_at(s, mi, path, arg_len - 8, 8);
             core::ptr::copy_nonoverlapping(arg as *const u8, s.scratch.as_mut_ptr(), 8);
             let p = s.scratch.as_mut_ptr();
-            call_volume(s, mi, -1, op, p, 8 + n)
+            call_volume(s, mi, op, p, 8 + n)
         }
         FS_CAPS => {
             // Report the first active volume's caps as representative; a
@@ -613,9 +658,10 @@ unsafe fn mount_dispatch(
                     break;
                 }
             }
+            // No volume up yet: the word is not known, so ask again.
             match mi {
-                Some(i) => call_volume(s, i, -1, FS_CAPS, arg, arg_len),
-                None => 0,
+                Some(i) => call_volume(s, i, FS_CAPS, arg, arg_len),
+                None => EAGAIN,
             }
         }
         _ => {
@@ -624,7 +670,7 @@ unsafe fn mount_dispatch(
             if handle < 0 {
                 return EINVAL;
             }
-            let slot = abi::kernel_abi::fd::slot_of(handle) as usize;
+            let slot = handle as usize;
             if slot >= MAX_OPEN || !s.opens[slot].in_use {
                 return EBADF;
             }
@@ -635,9 +681,8 @@ unsafe fn mount_dispatch(
                 s.route_misses = s.route_misses.wrapping_add(1);
                 return ENODEV;
             }
-            let mi = s.opens[slot].mount_idx as usize;
             let bh = s.opens[slot].backend_handle;
-            let rc = call_volume(s, mi, bh, op, arg, arg_len);
+            let rc = call_backend_data(s, bh, op, arg, arg_len, data, data_len);
             if op == FS_CLOSE {
                 s.opens[slot].in_use = false;
             }
@@ -738,8 +783,9 @@ unsafe fn emit_telemetry(s: &mut MountState) {
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
-/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
-/// (may be null when `arg_len` is 0) valid for the call.
+/// module's `module_new` initialised, `arg` points to `arg_len` bytes and
+/// `data` to `data_len` bytes (either may be null when its length is 0),
+/// valid for the call.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(
     not(feature = "host-test"),
@@ -751,6 +797,8 @@ pub unsafe extern "C" fn module_provider_dispatch(
     op: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return EINVAL;
@@ -762,7 +810,7 @@ pub unsafe extern "C" fn module_provider_dispatch(
         if s.syscalls.is_null() {
             return EINVAL;
         }
-        mount_dispatch(s, handle, op, arg, arg_len)
+        mount_dispatch(s, handle, op, arg, arg_len, data, data_len)
     }
 }
 

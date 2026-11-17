@@ -58,7 +58,7 @@ const READ_TAG: u64 = 1;
 
 /// Where the module is.
 pub mod phase {
-    pub const CAPS: u8 = 0;
+    pub const DESCRIBE: u8 = 0;
     pub const ATTACH: u8 = 1;
     pub const SCAN: u8 = 2;
     pub const DECIDE: u8 = 3;
@@ -163,7 +163,22 @@ unsafe fn log_n(s: &VaultStoreState, level: u8, msg: &[u8], n: u32) {
 
 /// The vault-store opcode `op` with `arg`.
 unsafe fn call(s: &VaultStoreState, op: u32, arg: &mut [u8]) -> i32 {
-    (s.sys().provider_call)(-1, op, arg.as_mut_ptr(), arg.len())
+    call_data(s, op, arg, core::ptr::null_mut(), 0)
+}
+
+/// The vault-store opcode `op` with `arg` and the piece at `data[..len]`.
+///
+/// # Safety
+/// `data[..len]` is this module's own memory, live for the call and disjoint
+/// from `arg`.
+unsafe fn call_data(
+    s: &VaultStoreState,
+    op: u32,
+    arg: &mut [u8],
+    data: *mut u8,
+    len: usize,
+) -> i32 {
+    (s.sys().provider_call)(-1, op, arg.as_mut_ptr(), arg.len(), data, len)
 }
 
 /// Stop for good: the configuration cannot work.
@@ -176,7 +191,7 @@ unsafe fn stop(s: &mut VaultStoreState, why: &[u8]) -> i32 {
 /// Wait `RETRY_MS`, then go to `resume`, with a fresh client: a source that
 /// failed a request is asked again from its capabilities.
 unsafe fn back_off(s: &mut VaultStoreState, resume: u8) {
-    s.blk.bind(s.chan);
+    s.blk.reset(&*s.syscalls);
     s.reading = 0;
     s.resume = resume;
     s.until = dev_millis(s.sys()) + RETRY_MS;
@@ -184,18 +199,18 @@ unsafe fn back_off(s: &mut VaultStoreState, resume: u8) {
 }
 
 /// The source's geometry, checked against the parameters.
-unsafe fn caps(s: &mut VaultStoreState) -> i32 {
-    match s.blk.caps(&*s.syscalls) {
+unsafe fn describe(s: &mut VaultStoreState) -> i32 {
+    match s.blk.describe(&*s.syscalls) {
         0 => {}
         E_AGAIN => return 0,
-        _ => return stop(s, b"[vault_store] the blocks source answers no CAPS"),
+        _ => return stop(s, b"[vault_store] the blocks source answers no DESCRIBE"),
     }
     let bs = s.blk.block_size();
     let flags = s.blk.flags();
     if !(512..=MAX_BLOCK as u32).contains(&bs) || !bs.is_power_of_two() {
         return stop(s, b"[vault_store] source block size outside 512..4096");
     }
-    if flags & blk::caps::F_WRITE == 0 || flags & blk::caps::F_ASYNC == 0 {
+    if flags & blk::describe::F_WRITE == 0 || flags & blk::describe::F_ASYNC == 0 {
         return stop(
             s,
             b"[vault_store] source does not queue writes (F_WRITE, F_ASYNC)",
@@ -293,9 +308,8 @@ unsafe fn load_step(s: &mut VaultStoreState) -> i32 {
     };
     a[1] = s.slot;
     a[4..8].copy_from_slice(&s.off.to_le_bytes());
-    a[8..16].copy_from_slice(&(s.buf.0.as_ptr() as u64).to_le_bytes());
-    a[16..20].copy_from_slice(&s.bs.to_le_bytes());
-    let rc = call(s, vs::LOAD, &mut a);
+    let piece = s.buf.0.as_mut_ptr();
+    let rc = call_data(s, vs::LOAD, &mut a, piece, s.bs as usize);
     if rc < 0 {
         // The slot changed between the passes, or the kernel's load is not
         // the one this pass belongs to: attaching again restarts it there
@@ -326,8 +340,7 @@ unsafe fn load_step(s: &mut VaultStoreState) -> i32 {
 }
 
 unsafe fn decide(s: &mut VaultStoreState) -> i32 {
-    let mut a = [0u8; 8];
-    match call(s, vs::DECIDE, &mut a) {
+    match call(s, vs::DECIDE, &mut []) {
         rc @ (0 | 1) => {
             s.slot = rc as u8;
             s.off = 0;
@@ -370,9 +383,8 @@ unsafe fn write_step(s: &mut VaultStoreState) -> i32 {
     let mut a = [0u8; vs::READ_LEN];
     a[0..8].copy_from_slice(&s.seq.to_le_bytes());
     a[8..12].copy_from_slice(&s.off.to_le_bytes());
-    a[12..16].copy_from_slice(&s.bs.to_le_bytes());
-    a[16..24].copy_from_slice(&(s.buf.0.as_mut_ptr() as u64).to_le_bytes());
-    if call(s, vs::READ, &mut a) != 0 {
+    let piece = s.buf.0.as_mut_ptr();
+    if call_data(s, vs::READ, &mut a, piece, s.bs as usize) != 0 {
         // A newer image: start it from its beginning (same slot).
         s.phase = phase::RUN;
         return 0;
@@ -439,7 +451,7 @@ unsafe fn fence(s: &mut VaultStoreState) -> i32 {
 
 unsafe fn step(s: &mut VaultStoreState) -> i32 {
     match s.phase {
-        phase::CAPS => caps(s),
+        phase::DESCRIBE => describe(s),
         phase::ATTACH => attach(s),
         phase::SCAN | phase::FILL => load_step(s),
         phase::DECIDE => decide(s),
@@ -490,7 +502,9 @@ pub unsafe extern "C" fn module_new(
         let s = &mut *(state as *mut VaultStoreState);
         s.syscalls = syscalls as *const SyscallTable;
         s.chan = in_chan;
-        s.blk.bind(in_chan);
+        // Every block this module reads or writes passes through `buf`.
+        let buf = s.buf.0.as_mut_ptr();
+        s.blk.bind(0, buf, MAX_BLOCK);
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
@@ -501,7 +515,7 @@ pub unsafe extern "C" fn module_new(
         if in_chan < 0 {
             return -1;
         }
-        s.phase = phase::CAPS;
+        s.phase = phase::DESCRIBE;
         0
     }
 }

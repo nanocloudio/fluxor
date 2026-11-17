@@ -45,14 +45,11 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use abi::contracts::hal::spi::{
-    OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs,
-};
+use abi::contracts::hal::spi::{open as spi_open, transfer_start};
 use abi::SyscallTable;
 use fluxor_abi as abi;
 
 // Provider contract ids (mirror kernel::module::provider::contract::*).
-const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
 const HAL_SPI_CONTRACT: u32 = abi::registry::spi::ID as u32;
 const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
 
@@ -91,9 +88,6 @@ const DATA_FREQ: u32 = 12_000_000;
 
 /// Maximum attempts waiting for R1 response
 const CMD_TIMEOUT: u32 = 100;
-
-/// Channel ioctl: the producer's end-of-stream.
-const IOCTL_SET_HUP: u32 = 4;
 
 /// Data token indicating start of block data
 const TOKEN_DATA: u8 = 0xFE;
@@ -311,6 +305,9 @@ struct SdState {
     // Syscall table pointer
     syscalls: *const SyscallTable,
     spi_handle: i32,
+    /// Base of this state: the SPI lends cover all of it, and a transfer
+    /// names its bytes by their offset from here.
+    spi_base: usize,
     /// Card-dependent multiplier (1 for SDHC, 512 for older cards)
     cdv: u32,
 
@@ -370,9 +367,14 @@ struct SdState {
     start_block: u32,
     block_count: u32,
     current_block: u32,
+    /// The block a `storage.block` `READ_STREAM` restarts the stream at,
+    /// while `seek_pending` is set.
+    seek_block: u32,
     /// CS pin number (stored for TLV v2)
     cs_pin: u8,
-    _pad5: [u8; 3],
+    /// A `READ_STREAM` is waiting for the stream to take it.
+    seek_pending: u8,
+    _pad5: [u8; 2],
     /// Timer fd for init retry delays (fd-based timer API)
     timer_fd: i32,
 
@@ -389,8 +391,13 @@ struct SdState {
     req_tag_hi: u32,
     /// Card address of the block the request reads.
     req_addr: u32,
-    /// The caller's buffer, lent until the completion is reaped.
+    /// A read's buffer, borrowed from its consumer's lend until the block
+    /// has landed in it; null when nothing is borrowed.
     req_buf: *mut u8,
+    /// The port reference the request came through and its lend's cookie:
+    /// the borrow `req_buf` is given back under.
+    req_session: i32,
+    req_lend: u32,
 
     // Block write state
     wb_state: BlockWriteState,
@@ -407,7 +414,18 @@ struct SdState {
     /// Landing buffer for requested reads, copied to the caller only when the
     /// whole block has arrived intact.
     req_data: [u8; BLOCK_SIZE],
+    /// What a transfer that neither sends nor keeps bytes clocks in.
+    spi_sink: [u8; SPI_SINK],
 }
+
+/// Longest transfer that neither sends nor keeps bytes (the 74+ wake-up
+/// clocks).
+const SPI_SINK: usize = 64;
+
+/// The SPI lends over this state: one the provider reads (transmit), one it
+/// writes (receive).
+const SPI_LEND_TX: u32 = 1;
+const SPI_LEND_RX: u32 = 2;
 
 impl SdState {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -446,6 +464,8 @@ impl SdState {
         self.req_tag_hi = 0;
         self.req_addr = 0;
         self.req_buf = ptr::null_mut();
+        self.req_session = -1;
+        self.req_lend = 0;
         self.wb_state = BlockWriteState::Idle;
         self._pad8 = 0;
         self.wb_attempts = 0;
@@ -461,7 +481,8 @@ impl SdState {
         self.spi_bus = 0;
         self.pending_offset = 0;
         self.cs_pin = 5; // default CS pin
-        self._pad5 = [0; 3];
+        self.seek_pending = 0;
+        self._pad5 = [0; 2];
         self.timer_fd = -1;
         self.out_chan = -1;
         self.blocks_read = 0;
@@ -469,6 +490,7 @@ impl SdState {
         self.start_block = 0;
         self.block_count = 0;
         self.current_block = 0;
+        self.seek_block = 0;
     }
 
     #[inline(always)]
@@ -586,6 +608,8 @@ macro_rules! try_start_timer {
             abi::registry::timer::SET,
             ms_buf.as_mut_ptr(),
             4,
+            core::ptr::null_mut(),
+            0,
         ) == 0
         {
             $s.init_state = $timer_state;
@@ -642,6 +666,8 @@ unsafe fn deselect(s: &SdState) {
         abi::registry::spi::SET_CS,
         lvl.as_mut_ptr(),
         1,
+        core::ptr::null_mut(),
+        0,
     );
 }
 
@@ -650,6 +676,8 @@ unsafe fn release(s: &SdState) {
     (s.sys().provider_call)(
         s.spi_handle,
         abi::registry::spi::END,
+        core::ptr::null_mut(),
+        0,
         core::ptr::null_mut(),
         0,
     );
@@ -669,11 +697,15 @@ unsafe fn claim_begin_select(s: &mut SdState, start_ms: u64) -> i32 {
         abi::registry::spi::CLAIM,
         timeout.as_mut_ptr(),
         4,
+        core::ptr::null_mut(),
+        0,
     ) == 0
     {
         if (s.sys().provider_call)(
             s.spi_handle,
             abi::registry::spi::BEGIN,
+            core::ptr::null_mut(),
+            0,
             core::ptr::null_mut(),
             0,
         ) < 0
@@ -686,6 +718,8 @@ unsafe fn claim_begin_select(s: &mut SdState, start_ms: u64) -> i32 {
             abi::registry::spi::SET_CS,
             lvl.as_mut_ptr(),
             1,
+            core::ptr::null_mut(),
+            0,
         );
         return 1;
     }
@@ -699,19 +733,31 @@ unsafe fn claim_begin_select(s: &mut SdState, start_ms: u64) -> i32 {
 // SPI Transfer Layer
 // ============================================================================
 
+/// Start one transfer: `tx` sent (with `rx` null), or `rx` received while
+/// 0xFF is sent (with `tx` null), or with both null `len` dummy bytes
+/// clocked. Every buffer lies in this state, lent on the SPI handle.
 unsafe fn spi_transfer_start(s: &mut SdState, tx: *const u8, rx: *mut u8, len: usize) -> bool {
-    let mut args = SpiTransferStartArgs {
-        tx,
-        rx,
-        len: len as u32,
-        fill: 0xFF,
-        _pad: [0; 3],
+    let (lend, at) = if !tx.is_null() {
+        (SPI_LEND_TX, tx as usize)
+    } else if !rx.is_null() {
+        (SPI_LEND_RX, rx as usize)
+    } else {
+        if len > SPI_SINK {
+            return false;
+        }
+        (SPI_LEND_RX, s.spi_sink.as_ptr() as usize)
     };
+    let Some(offset) = at.checked_sub(s.spi_base) else {
+        return false;
+    };
+    let mut args = transfer_start::encode(lend, offset as u32, len as u32, 0xFF);
     if (s.sys().provider_call)(
         s.spi_handle,
         abi::registry::spi::TRANSFER_START,
-        &mut args as *mut _ as *mut u8,
-        core::mem::size_of::<SpiTransferStartArgs>(),
+        args.as_mut_ptr(),
+        args.len(),
+        core::ptr::null_mut(),
+        0,
     ) < 0
     {
         return false;
@@ -735,6 +781,8 @@ unsafe fn spi_transfer_poll(s: &mut SdState) -> i32 {
         let res = (s.sys().provider_call)(
             s.spi_handle,
             abi::registry::spi::TRANSFER_POLL,
+            core::ptr::null_mut(),
+            0,
             core::ptr::null_mut(),
             0,
         );
@@ -761,6 +809,8 @@ unsafe fn spi_poll_byte(s: &mut SdState) -> i32 {
         let res = (s.sys().provider_call)(
             s.spi_handle,
             abi::registry::spi::POLL_BYTE,
+            core::ptr::null_mut(),
+            0,
             core::ptr::null_mut(),
             0,
         );
@@ -1138,7 +1188,7 @@ const E_UNREACHABLE: i32 = -10;
 /// source itself keeps running.
 unsafe fn end_stream(s: &SdState) {
     if s.out_chan >= 0 {
-        dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_SET_HUP, ptr::null_mut(), 0);
+        dev_channel_set_hup(s.sys(), s.out_chan);
     }
 }
 
@@ -1442,7 +1492,7 @@ unsafe fn write_block_poll(s: &mut SdState) -> i32 {
 // storage.block v1
 // ============================================================================
 //
-// A source of one-block requests: `CAPS`, and `READ` / `WRITE` through
+// A source of one-block requests: `DESCRIBE`, and `READ` / `WRITE` through
 // `SUBMIT` / `REAP` (queue depth 1), run on the read machine the stream uses
 // or the write machine, between the stream's own blocks. A write is copied
 // at `SUBMIT` (`F_WRITE_COPIES`) and completes once the card has released
@@ -1457,7 +1507,7 @@ unsafe fn write_block_poll(s: &mut SdState) -> i32 {
 // source answers it `ENOSYS`, as a source that cannot queue answers `SUBMIT`.
 // Every step advances the request by one bounded poll of the read machine.
 
-use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use abi::contracts::storage::block::{self as blk, Cpl, Description, Req};
 use abi::fence::Fence;
 
 /// Logical blocks a card holds, from its CSD register. `None` for a CSD
@@ -1504,21 +1554,21 @@ pub fn csd_device_id(csd: &[u8]) -> u64 {
     h
 }
 
-fn sd_caps(s: &SdState) -> Option<Caps> {
+fn sd_caps(s: &SdState) -> Option<Description> {
     if s.init_state != SdInitPhase::Done {
         return None;
     }
     let count = csd_block_count(&s.csd_buf)?;
-    Some(Caps {
+    Some(Description {
         logical_block_size: BLOCK_SIZE as u32,
         block_count: count,
         max_blocks: 1,
         atomic_blocks: 1,
         queue_depth: 1,
-        flags: blk::caps::F_ASYNC
-            | blk::caps::F_WRITE
-            | blk::caps::F_FUA
-            | blk::caps::F_WRITE_COPIES,
+        flags: blk::describe::F_ASYNC
+            | blk::describe::F_WRITE
+            | blk::describe::F_FUA
+            | blk::describe::F_WRITE_COPIES,
         device_id: csd_device_id(&s.csd_buf),
     })
 }
@@ -1542,6 +1592,11 @@ unsafe fn request_finish(s: &mut SdState, res: i32) {
         s.req_status = 0;
     } else {
         s.req_status = E_IO;
+    }
+    // The borrow goes back before the completion is reapable.
+    if !s.req_buf.is_null() {
+        dev_lend_return(s.sys(), s.req_session, s.req_lend);
+        s.req_buf = ptr::null_mut();
     }
     s.req_state = ReqState::Done;
 }
@@ -1577,10 +1632,13 @@ unsafe fn request_step(s: &mut SdState) -> bool {
     true
 }
 
-/// `SUBMIT`: take one request. 0 when queued, `EAGAIN` while the card is
-/// not attached or the slot is taken, `EINVAL` when the request is refused.
-unsafe fn request_submit(s: &mut SdState, arg: *mut u8) -> i32 {
-    let Some(r) = Req::decode(core::slice::from_raw_parts(arg, blk::req::LEN)) else {
+/// `SUBMIT`: take one request, its buffer in the lend its consumer opened
+/// on `handle`. 0 when queued, `EAGAIN` while the card is not attached or the
+/// slot is taken, `EINVAL` when the request is refused. A write is copied
+/// now and its borrow given back before this returns (`F_WRITE_COPIES`); a
+/// read's buffer stays borrowed until the block has landed in it.
+unsafe fn request_submit(s: &mut SdState, handle: i32, arg: &[u8]) -> i32 {
+    let Some(r) = Req::decode(arg) else {
         return E_INVAL;
     };
     let Some(c) = sd_caps(s) else {
@@ -1598,16 +1656,17 @@ unsafe fn request_submit(s: &mut SdState, arg: *mut u8) -> i32 {
         let Some(a) = card_address(r.lba, s.cdv) else {
             return E_INVAL;
         };
-        let Ok(p) = usize::try_from(r.buf_ptr) else {
-            return E_INVAL;
+        let src = match blk_borrow(s.sys(), handle, &r) {
+            Ok(p) => p as *const u8,
+            Err(rc) => return rc,
         };
         // Copied now: the caller's buffer is free when this returns.
-        let src = p as *const u8;
         let mut i = 0usize;
         while i < BLOCK_SIZE {
             s.req_data[i] = *src.add(i);
             i += 1;
         }
+        blk_give_back(s.sys(), handle, &r);
         addr = a;
     }
     if r.op == blk::op::READ {
@@ -1616,17 +1675,19 @@ unsafe fn request_submit(s: &mut SdState, arg: *mut u8) -> i32 {
         let Some(a) = card_address(r.lba, s.cdv) else {
             return E_INVAL;
         };
-        let Ok(p) = usize::try_from(r.buf_ptr) else {
-            return E_INVAL;
+        buf = match blk_borrow(s.sys(), handle, &r) {
+            Ok(p) => p,
+            Err(rc) => return rc,
         };
         addr = a;
-        buf = p as *mut u8;
     }
     s.req_op = r.op;
     s.req_tag_lo = r.tag as u32;
     s.req_tag_hi = (r.tag >> 32) as u32;
     s.req_addr = addr;
     s.req_buf = buf;
+    s.req_session = handle;
+    s.req_lend = r.lend;
     s.req_status = 0;
     // A read or a write touches the card. A write completes on the card,
     // so a flush has nothing to wait for.
@@ -1640,7 +1701,7 @@ unsafe fn request_submit(s: &mut SdState, arg: *mut u8) -> i32 {
 
 /// `REAP`: hand back the finished request. 1 when a completion was written,
 /// 0 when none is ready.
-unsafe fn request_reap(s: &mut SdState, arg: *mut u8) -> i32 {
+unsafe fn request_reap(s: &mut SdState, arg: &mut [u8]) -> i32 {
     if s.req_state != ReqState::Done {
         return 0;
     }
@@ -1657,26 +1718,47 @@ unsafe fn request_reap(s: &mut SdState, arg: *mut u8) -> i32 {
             }
         }
     }
-    cpl.encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
+    if !cpl.encode(arg) {
+        return E_INVAL;
+    }
     s.req_state = ReqState::Empty;
     1
 }
 
-unsafe extern "C" fn sd_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+/// Serves `storage.block` to the consumer wired to `blocks`: `DESCRIBE`,
+/// `SUBMIT`, `REAP` and `READ_STREAM`. `handle` is this module's own port reference on that
+/// edge, the session its consumer's lend is bound to.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised; `arg[..arg_len]` is valid for the
+/// call.
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_provider_dispatch"]
+pub unsafe extern "C" fn module_provider_dispatch(
+    state: *mut u8,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
+) -> i32 {
+    use abi::registry::storage_block as SB;
     if state.is_null() || arg.is_null() {
         return E_INVAL;
     }
     let s = &mut *(state as *mut SdState);
-    match cmd {
-        blk::ioctl::CAPS => match sd_caps(s) {
-            Some(c) => {
-                c.encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
-                blk::caps::LEN as i32
-            }
+    let arg = core::slice::from_raw_parts_mut(arg, arg_len);
+    match op {
+        SB::DESCRIBE => match sd_caps(s) {
+            Some(c) if c.encode(arg) => 0,
+            Some(_) => E_INVAL,
             None => E_AGAIN,
         },
-        blk::ioctl::SUBMIT => request_submit(s, arg),
-        blk::ioctl::REAP => request_reap(s, arg),
+        SB::SUBMIT => request_submit(s, handle, arg),
+        SB::REAP => request_reap(s, arg),
+        SB::READ_STREAM => stream_request(s, arg),
         _ => E_NOSYS,
     }
 }
@@ -1714,11 +1796,15 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
                     abi::registry::spi::CLAIM,
                     timeout.as_mut_ptr(),
                     4,
+                    core::ptr::null_mut(),
+                    0,
                 );
                 if claim_rc == 0 {
                     let begin_rc = (s.sys().provider_call)(
                         s.spi_handle,
                         abi::registry::spi::BEGIN,
+                        core::ptr::null_mut(),
+                        0,
                         core::ptr::null_mut(),
                         0,
                     );
@@ -1735,6 +1821,8 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
                         abi::registry::spi::CONFIGURE,
                         cfg.as_mut_ptr(),
                         5,
+                        core::ptr::null_mut(),
+                        0,
                     );
                     s.init_preclk_count = 0;
                     s.init_state = SdInitPhase::Preclocking;
@@ -2008,6 +2096,8 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
                     abi::registry::spi::CONFIGURE,
                     cfg_arg.as_mut_ptr(),
                     5,
+                    core::ptr::null_mut(),
+                    0,
                 );
                 s.init_state = SdInitPhase::Done;
                 return 1;
@@ -2061,14 +2151,6 @@ pub unsafe extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
 
         s.out_chan = out_chan;
-        if out_chan >= 0 {
-            dev_channel_register_ioctl(
-                &*s.syscalls,
-                out_chan,
-                state as *mut c_void,
-                Some(sd_blocks_ioctl_handler),
-            );
-        }
 
         // Parse params
         let is_tlv =
@@ -2088,42 +2170,30 @@ pub unsafe extern "C" fn module_new(
 
         s.current_block = s.start_block;
 
-        // Open a GPIO output handle for CS — tracked against HAL_GPIO.
-        let cs_pin = s.cs_pin;
-        let mut gpio_arg = [cs_pin];
-        let cs_handle = (s.sys().provider_open)(
-            HAL_GPIO_CONTRACT,
-            abi::registry::gpio::SET_OUTPUT,
-            gpio_arg.as_mut_ptr(),
-            1,
-        );
-        if cs_handle < 0 {
-            return -10;
-        }
-        let mut lvl = [1u8];
-        (s.sys().provider_call)(
-            cs_handle,
-            abi::registry::gpio::SET_LEVEL,
-            lvl.as_mut_ptr(),
-            1,
-        );
-
-        // Open SPI — tracked against HAL_SPI.
-        let spi_bus = s.spi_bus;
-        let mut spi_args = SpiOpenArgs {
-            cs_handle,
-            freq_hz: INIT_FREQ,
-            bus: spi_bus,
+        // Open SPI with the card's chip select: the provider claims the pin
+        // and drives it (`SET_CS`).
+        let spi_args = spi_open::encode(&spi_open::Open {
+            bus: s.spi_bus,
+            cs_pin: s.cs_pin,
             mode: 0,
-            _pad: [0; 2],
-        };
+            freq_hz: INIT_FREQ,
+        });
         s.spi_handle = (s.sys().provider_open)(
             HAL_SPI_CONTRACT,
             abi::registry::spi::OPEN,
-            &mut spi_args as *mut _ as *mut u8,
-            core::mem::size_of::<SpiOpenArgs>(),
+            spi_args.as_ptr(),
+            spi_args.len(),
         );
         if s.spi_handle < 0 {
+            return -12;
+        }
+        // Every transfer's bytes lie in this state: lend it on the SPI
+        // handle once each way.
+        s.spi_base = state as usize;
+        let size = core::mem::size_of::<SdState>();
+        if dev_lend_open(s.sys(), s.spi_handle, LEND_IN, SPI_LEND_TX, state, size) < 0
+            || dev_lend_open(s.sys(), s.spi_handle, LEND_OUT, SPI_LEND_RX, state, size) < 0
+        {
             return -12;
         }
 
@@ -2191,21 +2261,30 @@ unsafe fn try_write_block(s: &mut SdState) -> WriteResult {
     }
 }
 
-/// Check for pending seek request on output channel.
-/// Returns the seek position if one is pending, or u32::MAX if none.
+/// `READ_STREAM`: restart the stream on `blocks` at the request's LBA. The
+/// stream runs on sequentially from there (`nblocks` bounds nothing: the
+/// consumer reads what it needs and asks again). A block in flight for the
+/// old position is dropped when it lands.
+fn stream_request(s: &mut SdState, arg: &[u8]) -> i32 {
+    let Some(r) = Req::decode_stream(arg) else {
+        return E_INVAL;
+    };
+    let Ok(lba) = u32::try_from(r.lba) else {
+        return E_INVAL;
+    };
+    s.seek_block = lba;
+    s.seek_pending = 1;
+    0
+}
+
+/// The block a pending `READ_STREAM` restarts the stream at, taking it.
 #[inline]
-unsafe fn check_seek_request(s: &SdState) -> u32 {
-    if s.out_chan < 0 {
-        return u32::MAX;
+fn take_seek(s: &mut SdState) -> Option<u32> {
+    if s.seek_pending == 0 {
+        return None;
     }
-    let mut seek_pos: u32 = 0;
-    let seek_ptr = &mut seek_pos as *mut u32 as *mut u8;
-    let res = dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_POLL_NOTIFY, seek_ptr, 4);
-    if res == 0 {
-        seek_pos
-    } else {
-        u32::MAX
-    }
+    s.seek_pending = 0;
+    Some(s.seek_block)
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -2260,10 +2339,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             return StepReturn::Continue;
         }
 
-        // Check for seek request (when not mid-SPI-read)
+        // A restart takes effect between reads (when not mid-SPI-read).
         if s.rb_state == BlockReadState::Idle {
-            let seek_pos = check_seek_request(s);
-            if seek_pos != u32::MAX {
+            if let Some(seek_pos) = take_seek(s) {
                 // Seek to the requested block — discard any pending write
                 s.current_block = seek_pos;
                 s.pending_offset = 0;
@@ -2338,10 +2416,10 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     return StepReturn::error(E_READ_FAILED);
                 }
                 if res > 0 {
-                    // Block read complete — check if a seek arrived during the read
-                    let seek_pos = check_seek_request(s);
-                    if seek_pos != u32::MAX {
-                        // Discard this stale block — seek overrides
+                    // Block read complete — a restart that arrived during
+                    // the read makes this block stale.
+                    if let Some(seek_pos) = take_seek(s) {
+                        // Discard this stale block — the restart overrides
                         s.current_block = seek_pos;
                         s.pending_offset = 0;
                     } else {

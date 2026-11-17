@@ -23,16 +23,11 @@ Source: `crates/fluxor-abi/src/kernel_abi.rs`.
 
 Every PIC module receives a `SyscallTable` at init. It holds exactly:
 
-- `channel_read` / `channel_write` / `channel_poll` — direct ring-buffer I/O
-- `channel_peek` — copy from the head of a channel without consuming: a FIFO's stream, or a mailbox's pending record (frame-aware consumers inspect a header before committing to consume)
-- `channel_discard` — drop the next `len` bytes of a FIFO's stream without copying, what is buffered now and the rest as it arrives, or release a mailbox's pending record whole (the consuming half of a whole-frame read, and a whole-frame drop)
+- `channel_read` / `channel_write` / `channel_poll` — direct channel I/O: one record per write, whole or not at all; reads a byte stream over the records' payload
+- `channel_peek` — copy from the head of a channel without consuming: a FIFO's stream, or a mailbox's READY record (frame-aware consumers inspect a header before committing to consume)
+- `channel_discard` — drop the next `len` bytes of a FIFO's stream without copying, what is buffered now and the rest as it arrives, or release a mailbox's READY record whole (the consuming half of a whole-frame read, and a whole-frame drop)
 - `heap_alloc` / `heap_free` / `heap_realloc` — per-module heap
-- `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch
-- `provider_call_sel` — selector-routed provider call: the op names its
-  target (e.g. a storage volume, or `platform` for the platform's own
-  provider beneath the graph) inline via a selector string, so policy
-  modules can route per-op; a handle it mints comes back routed to its
-  minting provider
+- `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch. A module selects one provider of a contract with `provider_open(contract, kernel::BIND, arg)`: `arg = [NAME][len][name]` names an instance-keyed layer (or `platform`, the platform's own provider beneath the graph), `[PORT][port_type][index]` the module at the other end of one of the caller's ports (an edge contract). The bound handle routes every later op to that provider, and a handle an op through it mints comes back routed to the same provider.
 
 Everything else goes through `provider_*`. The kernel tracks each
 handle's bound contract and routes calls to the contract's vtable;
@@ -71,9 +66,8 @@ can reach them without declaring anything in its manifest.
 
 | Contract | Id | Contents |
 |----------|----|----------|
-| `CHANNEL` | `0x0001` | `open`, `close`, `connect`, `bind`, `listen`, `accept`, `port`, `ioctl` |
+| `CHANNEL` | `0x0001` | `open` (ring size), `close`, `flush`, `set_hup`, `writable`, `record_len`, `facts`, `port`, and the mailbox record's lends `acquire_write` / `release_write` / `acquire_read` / `release_read` / `acquire_inplace`; read, write, peek, discard and poll are the syscall table's own entries |
 | `TIMER` | `0x0002` | `millis`, `micros`, `create`, `set`, `cancel`, `destroy` |
-| `BUFFER` | `0x0003` | Zero-copy slot acquisition for in-place writers |
 | `EVENT` | `0x0004` | Signalable/pollable flags + IRQ binding |
 | `KEY_VAULT` | `0x0005` | P-256 + Ed25519 slots — ECDH, sign, verify, generate; raw material stays backend-side. Backend is platform-overridable (see below). |
 
@@ -83,7 +77,7 @@ A kernel service contract has one *default* implementation in
 `src/kernel/`, and a platform may re-register the class dispatch and
 vtable at platform boot with an alternate backend. The consumer-visible
 surface never changes; backends differ only in what the contract's own
-discovery opcodes report (for `KEY_VAULT`: `TIER` and `SUITE_QUERY`).
+discovery opcodes report (for `KEY_VAULT`: `TIER` and `DESCRIBE_SUITE`).
 
 Current backends of `KEY_VAULT`:
 
@@ -119,14 +113,16 @@ platform) implements the vtable, and consumers reach it through
 | `FS` | `0x000D` | PIC (`fat32`, `linux_fs_dispatch`) | Filesystem dispatch: open/read/write/seek/stat/close. |
 | `PLATFORM_NIC_RING` | `0x001D` | Kernel (platform) | NIC DMA ring management: `NIC_RING_CREATE` / `INFO` / `DESTROY`. A privileged module only. |
 | `PLATFORM_DMA` | `0x001E` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. |
-| `PLATFORM_DMA_FD` | `0x001F` | Kernel (platform) | Async DMA fd with ping-pong queuing. Handle = tagged fd. Opcodes under `dma_raw::fd::*`. Separate contract from `PLATFORM_DMA`; see the DMA section below. |
+| `PLATFORM_DMA_FD` | `0x001F` | Kernel (platform) | Async DMA fd with ping-pong queuing. Opcodes under `dma_raw::fd::*`; its handle polls ready when a transfer completes. Separate contract from `PLATFORM_DMA`; see the DMA section below. |
 | `PCIE_DEVICE` | `0x001C` | Kernel (platform) | Handle-scoped PCIe device binding. A privileged module only. |
 | `METAL_DEVICE` | `0x0028` | Kernel (bcm2712, uefi) | Device registers, DMA memory and cache maintenance for bare-metal drivers; register access needs `metal_device.mmio`, a PCIe rescan or config access `metal_device.pcie`, DMA and cache ops `metal_device.dma`. |
 | `STORAGE_NAMESPACE` | `0x000E` | PIC / platform | Directory-like name-keyed storage surface (opcode class 0x0Exx). See [storage_capability_surface.md](storage_capability_surface.md). |
 | `STORAGE_OBJECT` | `0x000F` | PIC / platform | Whole-blob byte-addressed storage surface (opcode class 0x0Fxx). See [storage_capability_surface.md](storage_capability_surface.md). |
+| `IMAGE_DECODE` | `0x002C` | Platform (wasm) / PIC | Decode a byte range of a `storage.object` object, named by key, to raw pixels at a caller-named size (opcode class 0x2Cxx): `DECODE` mints a job, `RECV` drains its pixels into `data` (`EAGAIN` while decoding), `CLOSE` releases it. |
 | `USB_HOST` | `0x001B` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding. The id is reserved and no platform serves it. |
 | `WORKLOAD` | `0x0017` | Kernel (platform backends) | Platform-neutral isolated-workload surface (opcode class 0x17xx): run an isolated workload with a declared capability envelope. |
 | `STREAM_CLOCK` | `0x0013` | Kernel (platform) | Generic stream-clock capability (opcode class 0x13xx) answering the `STREAM_TIME` audio-clock query independently of PIO hardware. |
+| `STREAM_SELECT` | `0x0003` | PIC (`flash_rp`, `host_asset_index`, `synth_source`) — an edge contract | Restart the stream a producer writes on one edge at a position the consumer names (opcode class 0x03xx): the consumer binds `[PORT][in][index]` to the producer at the other end of its input port and calls `SELECT`; the producer is handed its own output port ref as the handle, drops what it had pending, writes the selected item and ends it with `SET_HUP`. A position the producer does not hold is `EINVAL`. |
 | `TRUST` | `0x0014` | Kernel (platform) | Platform certificate-chain verification (opcode class 0x14xx): the platform answers for a chain, or refuses every chain. Registered where a system trust store exists and absent otherwise, which is why a graph names it in `[[requires_when]]`. |
 | `NET_POLICY` | `0x0015` | Kernel (platform) | Packet policy and service NAT (opcode class 0x15xx): a consumer states what traffic is allowed and where a virtual address leads, and the platform decides how — the host's packet filter on Linux, the in-graph packet filter on bare metal. Tables are replaced whole and atomically, each REPLACE advancing the table's generation. A provider that records a table it cannot act on leaves the `ENFORCED` capability bit clear rather than implying enforcement. |
 | `NET_ROUTE` | `0x0016` | Kernel (platform), realized by the platform or by a registered net-identity module | Node reachability (opcode class 0x16xx): the node's segments (each a local network whose gateway the node holds), peer routes (another node's segment, reached through that node) and held addresses (answered for the node with no workload owning them). Each table is replaced whole and atomically by a single bound writer and persists across that writer's exit and graph rebuilds; `READ` reports each entry as realized, pending, fenced, refused (with a reason) or unknown, so a realization the host defeats is reported rather than lost. |
@@ -280,7 +276,7 @@ need:
 | Contract | Id | Opener → handle | Opcodes | Import path |
 |----------|----|-----------------|---------|-------------|
 | `PLATFORM_DMA` | `0x001E` | `channel::ALLOC` → raw DMA channel number | `ALLOC` / `FREE` / `START` / `BUSY` / `ABORT` | `abi::platform::rp::dma_raw::channel` |
-| `PLATFORM_DMA_FD` | `0x001F` | `fd::CREATE` → FD_TAG_DMA-tagged fd | `CREATE` / `START` / `RESTART` / `QUEUE` / `FREE` | `abi::platform::rp::dma_raw::fd` |
+| `PLATFORM_DMA_FD` | `0x001F` | `fd::CREATE` → a DMA fd handle | `CREATE` / `START` / `RESTART` / `QUEUE` / `FREE` | `abi::platform::rp::dma_raw::fd` |
 
 Manifest:
 ```toml
@@ -372,13 +368,17 @@ second is refused `EBUSY`, and every raw op names the claim as its handle.
 Pins and DMA channels are owned the same way: a raw op configures only a pin
 the caller holds and starts only a channel it allocated.
 
-A grant says which opcodes a module may call; for the raw address
-opcodes the kernel bounds the address as well. On bcm2712 a register access
-(`MMIO_READ32` / `MMIO_WRITE32`) reaches only an aligned word inside one of
-the board's device apertures, never DRAM or an empty hole, and cache
-maintenance by address (`CACHE_FLUSH_RANGE`, `DMA_FLUSH`, `DMA_INVALIDATE`)
-only a range inside the DMA arenas the allocators hand out. Anything else is
-refused `EFAULT`, and the first refusal is logged.
+A grant says which opcodes a module may call; for the raw register
+opcodes the kernel bounds the address as well. A register is named by an
+aperture handle and an offset, never by an address: `MMIO_OPEN` opens one of
+the machine's device apertures (on bcm2712 a gigabyte of the board's device
+apertures, never DRAM or an empty hole) and answers where it lies, and
+`MMIO_READ32` / `MMIO_WRITE32` reach an aligned word inside it; anything
+else is refused `EFAULT`. DMA memory is named by
+the handle its allocation (`DMA_ALLOC_CONTIG`, `DMA_ALLOC_STREAMING`)
+minted, never by address: cache maintenance (`CACHE_FLUSH_RANGE`,
+`DMA_FLUSH`, `DMA_INVALIDATE`) names that handle and a range inside it, so
+it reaches the caller's own buffer and nothing else.
 
 **New modules should not land opcodes here.** If a new surface is
 genuinely needed, it goes into `kernel_abi` (as a primitive every
@@ -565,8 +565,44 @@ rewrites this layer.
 Every ABI number is declared once, in
 [`crates/fluxor-abi/registry/registry.toml`](../../crates/fluxor-abi/registry/registry.toml), and
 generated into `abi::registry` by `fluxor abi-regen`. A contract's id is its
-opcode class byte, its vtable index, its bit in the first grant word and,
-when it mints handles, their fd tag; ids are dense from `0x00`.
+opcode class byte, its vtable index, its bit in the first grant word and the
+contract field of its handles; ids are dense from `0x00`.
+
+### Handles
+
+Every handle a module holds is a word the kernel minted:
+
+```
+bit 31  30        24 23          15 14                    0
+ +---+-------------+---------------+-----------------------+
+ | 0 |  contract   |  generation   |        index          |
+ +---+-------------+---------------+-----------------------+
+```
+
+The split is the registry's (`handle_contract_bits`, `handle_generation_bits`,
+`handle_index_bits`; `abi::kernel_abi::handle::{encode, decode}`), so a
+negative value is always an errno. A native handle — a channel, event, timer
+or lend — names its slot in the kernel's own table. Every other handle names
+a route: the kernel's record of which provider serves it (a module, or the
+platform) and what that provider calls it. A provider — kernel, platform or
+PIC module — returns and receives only its own index, a non-negative `i32`
+it chooses; an op the registry marks as minting (`mints`, `scoped_mints`,
+`minted_mints`) has its answer wrapped in a route. A slot's generation moves
+each time it is claimed, so a handle kept past its close names nothing
+(`EBADF`), and a routed handle answers only its minter's owner. Routes are
+claimed next-fit from a table sized by the boot plan (the `handles` pool: the
+platform's provider tables plus a reserve for module providers' handles); a
+mint past it is `ENOSPC`, counted. `HANDLE_POLL` asks the handle's contract
+(`ProviderVTable::poll`).
+
+A provider signals the module that minted one of its handles through a
+doorbell. An op the registry marks `signals` (`storage.namespace::SUBSCRIBE`,
+`gpio::WATCH_EDGE`, `pcie_device::MSI_ALLOC`) mints a handle whose route owns
+a kernel event slot for the minter; the kernel hands the provider the
+doorbell (`kernel::BIND_DOORBELL`, `abi::kernel_abi::doorbell`), and the
+provider rings it — the platform directly, even from an interrupt handler, a
+module with `kernel::DOORBELL_RING`. The handle then polls `POLL_IN` once per
+ring and its minter is woken; a ring after the handle closed rings nothing.
 
 - Contract `kernel` (id `0x00`) carries the kernel primitives (LOG_WRITE,
   HANDLE_POLL, ARENA_GET, RANDOM_FILL, STREAM_TIME, …), documented in
@@ -577,6 +613,15 @@ when it mints handles, their fd tag; ids are dense from `0x00`.
   by their opcode class ahead of any handle.
 - The opcode → grant mapping is the registry's (`abi::registry::op_grant`);
   an opcode the registry does not list does not exist.
+- Capability discovery has one shape. A contract with capability bits has
+  a `CAPS` op at low byte `0xFF`: `handle = -1` or a bound handle, no
+  `data`, `arg` out exactly four bytes holding the `u32` word
+  (`kernel_abi::caps_word`), answering 0. Every provider of such a contract
+  implements it, so `ENOSYS` from `CAPS` means no provider; no contract has
+  a separate presence probe, and a graph that needs a provider says so at
+  composition (`requires_contract`, a target capability). A contract whose
+  optional parts are properties of one attached device answers them in a
+  description record instead (`storage.block` `DESCRIBE`).
 
 ## Provider registration
 
@@ -728,7 +773,7 @@ compile into the kernel binary; everything else is a PIC module:
    PCIe binding, DMA, NIC rings, GPIO, MMU/GIC/boot code in
    `src/platform/<chip>/`.
 2. **Kernel service contract implementations** and their
-   platform-overridable backends (CHANNEL, TIMER, BUFFER, EVENT,
+   platform-overridable backends (CHANNEL, TIMER, EVENT,
    KEY_VAULT) — each backend documented in the backends table above
    with a descriptor under `modules/platform/<platform>/`.
 3. **Built-in modules** — host-API drivers that are manifest-declared
@@ -797,7 +842,7 @@ ruling records the condition under which it reopens.
 
 ### POSIX vocabulary at the kernel boundary: retained
 
-`fd` (tagged handle), `errno` (negative error code), poll flags, and
+`fd` (a handle), `errno` (negative error code), poll flags, and
 syscall terminology at the kernel/module boundary are retained
 deliberately. They are universally understood OS primitives, not
 orchestrator vocabulary; renaming them to invented equivalents
@@ -844,20 +889,18 @@ minting a new one.
 
 The stable 0x1A workload contract carries only the native core
 (CREATE / START / WAIT / portable SIGNAL / DESTROY / PAUSE / RESUME /
-CAPS plus the Tier-1 header). Host-process mechanics — READ / EXEC /
-TTY_* opcodes, SOURCE_HOST_PROCESS, FD_TAG_PROC, and the process-executor
-class — live in the host-scoped class
-`abi::platform::linux::host_process` (0x1B), registered only by the
-Linux platform; unregistered = `ENOSYS` = discovery. Workload-targeting
-ops carry the tagged fd as an in-argument, since handle-tagged calls
-route by tag→class. The 0x1A contract leaves the host-process opcode
-positions unused and its `ops` CAPS bits 0..2 reserved; its
-`source_kinds` bits are the native artifacts (bit 0 an fmod graph, bit 2
-a graph with its own modules), bit 1 being the host-process source the
-Linux backend defines. The generic kernel carries no host vocabulary: the proc
-fd-tag routes via the platform-registered `register_fd_tag_route`
-table, and the kernel registry keeps class 0x0016 — the host-process
-executor class position — and its fd tag 25 only as reserved numerics.
+CAPS / OPTIONS plus the Tier-1 header). Host-process mechanics — READ / EXEC /
+TTY_* opcodes, SOURCE_HOST_PROCESS and the process-executor class — live
+in the host-scoped class `abi::platform::linux::host_process`, registered
+only by the Linux platform; unregistered = `ENOSYS` = discovery.
+Workload-targeting ops name the workload by its 16-byte identity at the
+head of `arg`, since a handle is of one contract and these ops are another's.
+The workload `CAPS` word holds the postures in byte
+0, the source kinds in byte 1 (bit 8 an fmod graph, bit 10 a graph with
+its own modules, bit 9 the host-process source the Linux backend
+defines), the optional ops in byte 2 and the network fields in byte 3. The generic kernel carries no host vocabulary: the
+process executor's handles are routes to the Linux platform's provider like
+any other.
 
 ### Container isolation: generic primitive in fluxor, OCI policy in nanocloud
 

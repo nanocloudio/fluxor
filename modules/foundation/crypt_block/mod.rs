@@ -122,7 +122,7 @@ use fluxor_abi as abi;
 use fluxor_rt::*;
 
 use abi::contracts::key_vault as kv;
-use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use abi::contracts::storage::block::{self as blk, Cpl, Description, Req};
 use abi::fence::Fence;
 
 // ── Format constants ────────────────────────────────────────────────────
@@ -528,6 +528,12 @@ struct CryptState {
     syscalls: *const SyscallTable,
     /// The upper `blocks` output this source answers on.
     out_chan: i32,
+    /// This module's port reference on that edge, as the kernel hands it:
+    /// the session its consumer's lend is bound to.
+    session: i32,
+    /// The running `EXEC`'s buffer: the call's data span, valid while
+    /// `exec_live` is set.
+    exec_buf: usize,
     phase: u8,
     format: u8,
     key_len: u8,
@@ -738,19 +744,23 @@ unsafe fn vault_open_epoch(s: &CryptState, epoch: u32, create: bool) -> i32 {
     if len == 0 {
         return E_INVAL;
     }
-    let mut arg = [0u8; 8 + KEY_LABEL_CAP + 12];
-    arg[0..2].copy_from_slice(&kv::suite::KDF_KEY.to_le_bytes());
-    let usage = kv::usage::DERIVE | kv::usage::PERSIST;
-    arg[2..6].copy_from_slice(&usage.to_le_bytes());
-    arg[7] = len as u8;
-    arg[8..8 + len].copy_from_slice(&label[..len]);
-    let n = 8 + len + 12;
+    let mut arg = [0u8; kv::open::HEADER + KEY_LABEL_CAP];
+    let req = kv::open::Request {
+        suite: kv::suite::KDF_KEY,
+        usage: kv::usage::DERIVE | kv::usage::PERSIST,
+        flags: 0,
+        label: &label[..len],
+    };
+    let Some(n) = kv::open::encode(&mut arg, &req) else {
+        return E_INVAL;
+    };
+    // A derivation master has no public half: no `data`.
     let op = if create {
         kv::OPEN_OR_GENERATE
     } else {
         kv::OPEN
     };
-    (s.sys().provider_call)(-1, op, arg.as_mut_ptr(), n)
+    (s.sys().provider_call)(-1, op, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0)
 }
 
 /// Destroy epoch `epoch`'s persisted master, record and all.
@@ -760,10 +770,18 @@ unsafe fn vault_destroy_epoch(s: &CryptState, epoch: u32) -> i32 {
     if len == 0 {
         return E_INVAL;
     }
-    let mut arg = [0u8; 1 + KEY_LABEL_CAP];
-    arg[0] = len as u8;
-    arg[1..1 + len].copy_from_slice(&label[..len]);
-    (s.sys().provider_call)(-1, kv::DESTROY_BY_LABEL, arg.as_mut_ptr(), 1 + len)
+    let mut arg = [0u8; kv::destroy_by_label::MAX_ARG];
+    let Some(n) = kv::destroy_by_label::encode(&mut arg, &label[..len]) else {
+        return E_INVAL;
+    };
+    (s.sys().provider_call)(
+        -1,
+        kv::DESTROY_BY_LABEL,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// `DERIVE` a purpose key from the current master.
@@ -786,20 +804,35 @@ unsafe fn vault_derive_from(
     label: &[u8],
     context: &[u8],
 ) -> i32 {
-    use kv::derive as d;
-    let mut arg = [0u8; d::LABEL + 32 + 32];
-    arg[d::TARGET_SUITE..d::TARGET_SUITE + 2].copy_from_slice(&suite.to_le_bytes());
-    arg[d::TARGET_USAGE..d::TARGET_USAGE + 4].copy_from_slice(&usage.to_le_bytes());
-    arg[d::LABEL_LEN] = label.len() as u8;
-    arg[d::CONTEXT_LEN..d::CONTEXT_LEN + 2].copy_from_slice(&(context.len() as u16).to_le_bytes());
-    arg[d::LABEL..d::LABEL + label.len()].copy_from_slice(label);
-    arg[d::LABEL + label.len()..d::LABEL + label.len() + context.len()].copy_from_slice(context);
-    let n = d::LABEL + label.len() + context.len();
-    (s.sys().provider_call)(master, kv::DERIVE, arg.as_mut_ptr(), n)
+    let mut arg = [0u8; kv::derive::LABEL + 32 + 32];
+    let req = kv::derive::Request {
+        suite,
+        usage,
+        label,
+        context,
+    };
+    let Some(n) = kv::derive::encode(&mut arg, &req) else {
+        return E_INVAL;
+    };
+    (s.sys().provider_call)(
+        master,
+        kv::DERIVE,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn vault_destroy(s: &CryptState, handle: i32) {
-    (s.sys().provider_call)(handle, kv::DESTROY, core::ptr::null_mut(), 0);
+    (s.sys().provider_call)(
+        handle,
+        kv::DESTROY,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// The superblock MAC: HMAC-SHA256 under the derived superblock key.
@@ -818,21 +851,24 @@ unsafe fn superblock_mac(
     if k < 0 {
         return None;
     }
-    let mut tag = [0u8; 32];
-    let mut arg = [0u8; 6 + SB_MAC_OFF + 12];
-    arg[0] = kv::sign_mode::RAW;
-    arg[2..6].copy_from_slice(&(SB_MAC_OFF as u32).to_le_bytes());
-    arg[6..6 + SB_MAC_OFF].copy_from_slice(body);
-    let t = 6 + SB_MAC_OFF;
-    arg[t..t + 8].copy_from_slice(&(tag.as_mut_ptr() as u64).to_le_bytes());
-    arg[t + 8..t + 10].copy_from_slice(&32u16.to_le_bytes());
-    let rc = (s.sys().provider_call)(k, kv::SIGN, arg.as_mut_ptr(), arg.len());
+    // The MAC is made in place over a copy of the body.
+    let mut buf = *body;
+    let mut arg = kv::sign::encode(kv::sign_mode::RAW, SB_MAC_OFF as u32);
+    let rc = (s.sys().provider_call)(
+        k,
+        kv::SIGN,
+        arg.as_mut_ptr(),
+        arg.len(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
     vault_destroy(s, k);
-    if rc < 0 {
-        None
-    } else {
-        Some(tag)
+    if rc != 32 {
+        return None;
     }
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&buf[..32]);
+    Some(tag)
 }
 
 /// The buffers of one unit handed to the vault: the nonce and associated data
@@ -848,7 +884,8 @@ struct SealedUnit<'a> {
 }
 
 /// Seal or open one buffer in place under the data key. Seal writes the tag;
-/// open checks it and zeroes the buffer when it does not verify.
+/// open checks it and zeroes the buffer when it does not verify, answered
+/// `E_IO` like any unreadable unit.
 unsafe fn vault_unit(s: &CryptState, key: i32, seal: bool, unit: &SealedUnit) -> i32 {
     use kv::units as u;
     let SealedUnit {
@@ -858,26 +895,30 @@ unsafe fn vault_unit(s: &CryptState, key: i32, seal: bool, unit: &SealedUnit) ->
         len,
         tag,
     } = *unit;
-    let mut arg = [0u8; u::HEADER_LEN + u::ENTRY_LEN];
-    arg[u::COUNT..u::COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
-    let e = u::HEADER_LEN;
-    arg[e + u::NONCE..e + u::NONCE + 12].copy_from_slice(nonce);
-    arg[e + u::AAD_LEN..e + u::AAD_LEN + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
-    arg[e + u::AAD_PTR..e + u::AAD_PTR + 8].copy_from_slice(&(aad.as_ptr() as u64).to_le_bytes());
-    arg[e + u::DATA_PTR..e + u::DATA_PTR + 8].copy_from_slice(&(data as u64).to_le_bytes());
-    arg[e + u::DATA_LEN..e + u::DATA_LEN + 4].copy_from_slice(&(len as u32).to_le_bytes());
-    arg[e + u::TAG_PTR..e + u::TAG_PTR + 8].copy_from_slice(&(tag as u64).to_le_bytes());
+    let mut t = [0u8; u::TAG_LEN];
+    if !seal {
+        core::ptr::copy_nonoverlapping(tag, t.as_mut_ptr(), u::TAG_LEN);
+    }
+    let mut arg = [0u8; u::MAX_ARG];
+    let Some(n) = u::encode(&mut arg, nonce, &t, aad) else {
+        return E_INVAL;
+    };
     let op = if seal {
         kv::AEAD_SEAL_UNITS
     } else {
         kv::AEAD_OPEN_UNITS
     };
-    let rc = (s.sys().provider_call)(key, op, arg.as_mut_ptr(), arg.len());
-    match rc {
-        0 => 0,
-        rc if rc < 0 => rc,
-        _ => E_IO,
+    let rc = (s.sys().provider_call)(key, op, arg.as_mut_ptr(), n, data, len);
+    if rc < 0 {
+        return if seal { rc } else { E_IO };
     }
+    if seal {
+        let Some(t) = u::tag(&arg) else {
+            return E_INVAL;
+        };
+        core::ptr::copy_nonoverlapping(t.as_ptr(), tag, u::TAG_LEN);
+    }
+    0
 }
 
 /// The data key for units sealed under `epoch`: the current epoch's, or
@@ -943,7 +984,7 @@ unsafe fn io_start(s: &mut CryptState, op: u8, lba: u64, blocks: u64, buf: *mut 
     // A source with no volatile cache has nothing to flush: every write it
     // completed is already durable.
     let nothing = if op == blk::op::FLUSH {
-        s.lower.flags() & blk::caps::F_FLUSH == 0
+        s.lower.flags() & blk::describe::F_FLUSH == 0
     } else {
         blocks == 0
     };
@@ -984,7 +1025,7 @@ fn io_complete(s: &mut CryptState, status: i32, c: &Cpl) {
         return;
     }
     let flush = s.io.op == blk::op::FLUSH;
-    if flush || (s.io.op == blk::op::WRITE && s.lower.flags() & blk::caps::F_FLUSH == 0) {
+    if flush || (s.io.op == blk::op::WRITE && s.lower.flags() & blk::describe::F_FLUSH == 0) {
         record_fence(s, c);
     }
     s.io.done += s.io.chunk;
@@ -1006,30 +1047,32 @@ unsafe fn io_issue(s: &mut CryptState) -> bool {
         (s.io.blocks - s.io.done).min(max)
     };
     s.io.chunk = n;
-    let r = Req {
-        op: s.io.op,
-        flags: 0,
-        nblocks: n as u32,
-        lba: if n == 0 { 0 } else { s.io.lba + s.io.done },
-        buf_ptr: if n == 0 {
+    let len = (n * lbs) as u32;
+    let at = (s.io.buf as *mut u8).wrapping_add((s.io.done * lbs) as usize);
+    let sys = &*s.syscalls;
+    if s.lower.flags() & blk::describe::F_ASYNC != 0 {
+        let offset = if n == 0 {
             0
         } else {
-            s.io.buf as u64 + s.io.done * lbs
-        },
-        buf_len: (n * lbs) as u32,
-        tag: s.io.tag,
-    };
-    let mut b = [0u8; blk::req::LEN + blk::cpl::LEN];
-    r.encode(&mut b);
-    let sys = &*s.syscalls;
-    if s.lower.flags() & blk::caps::F_ASYNC != 0 {
-        let rc = dev_channel_ioctl(
-            sys,
-            s.lower.chan,
-            blk::ioctl::SUBMIT,
-            b.as_mut_ptr(),
-            blk::req::LEN,
+            match s.lower.offset_of(at, len) {
+                Some(o) => o,
+                None => {
+                    s.io.status = E_INVAL;
+                    s.io.state = IO_DONE;
+                    return true;
+                }
+            }
+        };
+        let r = BlockClient::data_req(
+            s.io.op,
+            0,
+            if n == 0 { 0 } else { s.io.lba + s.io.done },
+            n as u32,
+            offset,
+            len,
+            s.io.tag,
         );
+        let rc = s.lower.submit(sys, &r);
         match rc {
             0 => s.io.state = IO_WAIT,
             E_AGAIN => return false,
@@ -1040,11 +1083,20 @@ unsafe fn io_issue(s: &mut CryptState) -> bool {
         }
         return true;
     }
-    let rc = dev_channel_ioctl(sys, s.lower.chan, blk::ioctl::EXEC, b.as_mut_ptr(), b.len());
+    let mut r = BlockClient::exec_req(
+        s.io.op,
+        0,
+        if n == 0 { 0 } else { s.io.lba + s.io.done },
+        n as u32,
+        len,
+    );
+    r.tag = s.io.tag;
+    let mut c = Cpl::bare(r.tag, E_IO);
+    let data = if n == 0 { core::ptr::null_mut() } else { at };
+    let rc = s.lower.exec_cpl(sys, &r, data, &mut c);
     if rc == E_AGAIN {
         return false;
     }
-    let c = Cpl::decode(&b[blk::req::LEN..]).unwrap_or(Cpl::bare(r.tag, E_IO));
     io_complete(s, rc, &c);
     true
 }
@@ -1068,19 +1120,13 @@ unsafe fn io_advance(s: &mut CryptState, work: &mut u32) -> bool {
                     return false;
                 }
                 *work += 1;
-                let mut cb = [0u8; blk::cpl::LEN];
+                let mut c = Cpl::bare(0, E_IO);
                 let sys = &*s.syscalls;
-                let rc = dev_channel_ioctl(
-                    sys,
-                    s.lower.chan,
-                    blk::ioctl::REAP,
-                    cb.as_mut_ptr(),
-                    cb.len(),
-                );
+                let rc = s.lower.reap_one(sys, &mut c);
                 if rc == 0 {
                     return false;
                 }
-                let decoded = if rc == 1 { Cpl::decode(&cb) } else { None };
+                let decoded = if rc == 1 { Some(c) } else { None };
                 let Some(c) = decoded else {
                     s.io.status = if rc < 0 { rc } else { E_IO };
                     s.io.state = IO_DONE;
@@ -1201,6 +1247,9 @@ struct Upper {
     req: Req,
     /// Arrival order: the oldest queued request runs first.
     seq: u64,
+    /// The request's buffer, borrowed from its consumer's lend from
+    /// `SUBMIT` until its completion is delivered; 0 for none.
+    buf: u64,
     used: u8,
     started: u8,
     _pad: [u8; 6],
@@ -1966,9 +2015,18 @@ unsafe fn run_format(s: &mut CryptState, f: &mut Frame) -> Act {
             sb.prefix = u32::from_le_bytes([rnd[16], rnd[17], rnd[18], rnd[19]]);
             // AES-256-GCM where the vault offers it (constant-time AES),
             // otherwise ChaCha20-Poly1305. Fixed at format.
-            let mut q = [0u8; 14];
-            q[0..2].copy_from_slice(&kv::suite::AEAD_AES256_GCM.to_le_bytes());
-            if (s.sys().provider_call)(-1, kv::SUITE_QUERY, q.as_mut_ptr(), q.len()) >= 0 {
+            let mut q = kv::describe_suite::encode_cursor(kv::suite::AEAD_AES256_GCM);
+            if (s.sys().provider_call)(
+                -1,
+                kv::DESCRIBE_SUITE,
+                q.as_mut_ptr(),
+                q.len(),
+                core::ptr::null_mut(),
+                0,
+            ) >= 0
+                && kv::describe_suite::parse(&q).map(|r| r.suite)
+                    == Some(kv::suite::AEAD_AES256_GCM)
+            {
                 sb.suite = SUITE_AES;
             }
             s.sb = sb;
@@ -2085,7 +2143,7 @@ unsafe fn run_mount(s: &mut CryptState, f: &mut Frame) -> Act {
     loop {
         match f.pc {
             0 => {
-                let rc = s.lower.caps(s.sys());
+                let rc = s.lower.describe(s.sys());
                 if rc != 0 {
                     return Act::Done(rc);
                 }
@@ -2102,7 +2160,7 @@ unsafe fn run_mount(s: &mut CryptState, f: &mut Frame) -> Act {
                     || s.journal_param < 2
                     || !s.journal_param.is_multiple_of(2)
                     || s.journal_param as usize / 2 > MAX_JOURNAL_RECORDS
-                    || s.lower.flags() & blk::caps::F_WRITE == 0
+                    || s.lower.flags() & blk::describe::F_WRITE == 0
                 {
                     return Act::Done(E_INVAL);
                 }
@@ -2309,12 +2367,19 @@ unsafe fn run_mount(s: &mut CryptState, f: &mut Frame) -> Act {
 /// Make the fresh recipient key and announce its public key.
 unsafe fn attach_recipient(s: &mut CryptState) -> i32 {
     let mut public = [0u8; kv::share::P256_PUB_LEN];
-    let mut arg = [0u8; 20];
-    arg[0..2].copy_from_slice(&kv::suite::P256.to_le_bytes());
-    arg[2..6].copy_from_slice(&(kv::usage::AGREE | kv::usage::EXPORT_PUBLIC).to_le_bytes());
-    arg[8..16].copy_from_slice(&(public.as_mut_ptr() as u64).to_le_bytes());
-    arg[16..18].copy_from_slice(&(public.len() as u16).to_le_bytes());
-    let h = (s.sys().provider_call)(-1, kv::GENERATE, arg.as_mut_ptr(), arg.len());
+    let mut arg = kv::generate::encode(
+        kv::suite::P256,
+        kv::usage::AGREE | kv::usage::EXPORT_PUBLIC,
+        0,
+    );
+    let h = (s.sys().provider_call)(
+        -1,
+        kv::GENERATE,
+        arg.as_mut_ptr(),
+        arg.len(),
+        public.as_mut_ptr(),
+        public.len(),
+    );
     if h < 0 {
         return h;
     }
@@ -2398,29 +2463,37 @@ fn attach_wanting(s: &CryptState) -> bool {
 }
 
 /// Reconstruct the master the bundle holds, bound to `resource` and
-/// `epoch`, into a new handle (or a negative errno). The recipient key and
-/// the bundle are spent whatever the outcome.
+/// `epoch`, into a new handle (or a negative errno): the bundle's two
+/// envelopes, one `SHARE_COMBINE` each, both opened by the recipient key.
+/// The recipient key and the bundle are spent whatever the outcome.
 unsafe fn share_combine(s: &mut CryptState, resource: &[u8; 16], epoch: u32) -> i32 {
-    use kv::share::{self as sh, combine as a};
-    let env_a = 8;
-    let env_b = 8 + sh::P256_LEN;
-    let mut arg = [0u8; a::ENVS + 2 * sh::P256_LEN];
-    arg[a::TARGET_SUITE..a::TARGET_SUITE + 2].copy_from_slice(&kv::suite::KDF_KEY.to_le_bytes());
-    arg[a::TARGET_USAGE..a::TARGET_USAGE + 4].copy_from_slice(&kv::usage::DERIVE.to_le_bytes());
-    arg[a::OPENER_A..a::OPENER_A + 4].copy_from_slice(&s.recipient.to_le_bytes());
-    arg[a::OPENER_B..a::OPENER_B + 4].copy_from_slice(&s.recipient.to_le_bytes());
-    arg[a::RESOURCE..a::RESOURCE + 16].copy_from_slice(resource);
-    arg[a::EPOCH..a::EPOCH + 4].copy_from_slice(&epoch.to_le_bytes());
-    arg[a::ENV_A_LEN..a::ENV_A_LEN + 2].copy_from_slice(&(sh::P256_LEN as u16).to_le_bytes());
-    arg[a::ENV_B_LEN..a::ENV_B_LEN + 2].copy_from_slice(&(sh::P256_LEN as u16).to_le_bytes());
-    arg[a::ENVS..a::ENVS + 2 * sh::P256_LEN]
-        .copy_from_slice(&s.bundle[env_a..env_b + sh::P256_LEN]);
-    let h = if s.recipient >= 0 {
-        (s.sys().provider_call)(-1, kv::SHARE_COMBINE, arg.as_mut_ptr(), arg.len())
+    use kv::share as sh;
+    let arg = sh::combine::encode(kv::suite::KDF_KEY, kv::usage::DERIVE, resource, epoch);
+    let mut h = if s.recipient >= 0 {
+        abi::errno::EINPROGRESS
     } else {
         E_INVAL
     };
-    arg.fill(0);
+    let mut env = [0u8; sh::P256_LEN];
+    let mut i = 0;
+    while i < 2 && h == abi::errno::EINPROGRESS {
+        let at = 8 + i * sh::P256_LEN;
+        env.copy_from_slice(&s.bundle[at..at + sh::P256_LEN]);
+        let mut a = arg;
+        h = (s.sys().provider_call)(
+            s.recipient,
+            kv::SHARE_COMBINE,
+            a.as_mut_ptr(),
+            a.len(),
+            env.as_mut_ptr(),
+            env.len(),
+        );
+        i += 1;
+    }
+    env.fill(0);
+    if h == abi::errno::EINPROGRESS {
+        h = E_INVAL;
+    }
     attach_finish(s, h)
 }
 
@@ -2998,7 +3071,7 @@ unsafe fn poll_control(s: &mut CryptState) -> i32 {
 
 // ── Upper block surface ─────────────────────────────────────────────────
 
-fn caps_of(s: &CryptState) -> Option<Caps> {
+fn caps_of(s: &CryptState) -> Option<Description> {
     if s.phase != PHASE_READY {
         return None;
     }
@@ -3006,22 +3079,31 @@ fn caps_of(s: &CryptState) -> Option<Caps> {
     // No `F_WRITE_COPIES`: a queued write reads its buffer when its turn
     // comes, which may be steps after `SUBMIT`, so the buffer is lent until
     // the completion is reaped.
-    Some(Caps {
+    Some(Description {
         logical_block_size: s.upper_block,
         block_count: s.sb.data_units * u64::from(per_unit),
         max_blocks: per_unit * 8,
         atomic_blocks: per_unit,
         queue_depth: QUEUE_DEPTH as u16,
-        flags: blk::caps::F_WRITE
-            | blk::caps::F_FLUSH
-            | blk::caps::F_DISCARD
-            | blk::caps::F_DISCARD_ZEROES
-            | blk::caps::F_ASYNC,
+        flags: blk::describe::F_WRITE
+            | blk::describe::F_FLUSH
+            | blk::describe::F_DISCARD
+            | blk::describe::F_DISCARD_ZEROES
+            | blk::describe::F_ASYNC,
         device_id: s.lower.device_id(),
     })
 }
 
 /// The request a request frame serves.
+/// The buffer of the request in `slot`.
+fn buffer_of(s: &CryptState, slot: u8) -> *mut u8 {
+    if slot == EXEC_SLOT {
+        s.exec_buf as *mut u8
+    } else {
+        s.reqs[slot as usize % QUEUE_DEPTH].buf as usize as *mut u8
+    }
+}
+
 fn request_of(s: &CryptState, slot: u8) -> Req {
     if slot == EXEC_SLOT {
         s.exec.req
@@ -3032,11 +3114,18 @@ fn request_of(s: &CryptState, slot: u8) -> Req {
 
 /// Hand a finished request its completion: the EXEC slot keeps it for the
 /// caller's next ask; a queued request's waits for `REAP`.
-fn deliver(s: &mut CryptState, slot: u8, c: Cpl) {
+unsafe fn deliver(s: &mut CryptState, slot: u8, c: Cpl) {
     if slot == EXEC_SLOT {
         s.exec_cpl = c;
         s.exec_state = EXEC_DONE;
         return;
+    }
+    let q = &mut s.reqs[slot as usize % QUEUE_DEPTH];
+    // The borrow goes back before the completion is reapable.
+    if q.buf != 0 {
+        let r = q.req;
+        q.buf = 0;
+        blk_give_back(&*s.syscalls, s.session, &r);
     }
     s.reqs[slot as usize % QUEUE_DEPTH].used = 0;
     if s.count as usize >= QUEUE_DEPTH {
@@ -3051,7 +3140,7 @@ fn deliver(s: &mut CryptState, slot: u8, c: Cpl) {
 /// (`FLUSH`, `FUA`) carries the fence of the lower completion that made it
 /// durable, as the lower source reported it; any other write is `Volatile`;
 /// a read or a failure carries none.
-fn finish(s: &mut CryptState, f: &Frame, status: i32, durable: bool) -> Act {
+unsafe fn finish(s: &mut CryptState, f: &Frame, status: i32, durable: bool) -> Act {
     s.plain.fill(0);
     let r = request_of(s, f.flag);
     let mut c = Cpl::bare(r.tag, status);
@@ -3076,6 +3165,7 @@ fn finish(s: &mut CryptState, f: &Frame, status: i32, durable: bool) -> Act {
 /// the caller's next ask of the same request resumes it.
 unsafe fn run_request(s: &mut CryptState, f: &mut Frame) -> Act {
     let r = request_of(s, f.flag);
+    let ubuf = buffer_of(s, f.flag);
     let unit = s.unit() as u64;
     let ub = u64::from(s.upper_block);
     let len = u64::from(r.nblocks) * ub;
@@ -3159,7 +3249,7 @@ unsafe fn run_request(s: &mut CryptState, f: &mut Frame) -> Act {
                 }
                 core::ptr::copy_nonoverlapping(
                     s.plain.as_ptr().add(in_unit as usize),
-                    (r.buf_ptr as *mut u8).add(f.a as usize),
+                    ubuf.add(f.a as usize),
                     n as usize,
                 );
                 f.a += n;
@@ -3174,11 +3264,7 @@ unsafe fn run_request(s: &mut CryptState, f: &mut Frame) -> Act {
                     if !buffer_ok {
                         return Act::Park;
                     }
-                    core::ptr::copy_nonoverlapping(
-                        (r.buf_ptr as *const u8).add(f.a as usize),
-                        dst,
-                        n as usize,
-                    );
+                    core::ptr::copy_nonoverlapping(ubuf.add(f.a as usize), dst, n as usize);
                 } else {
                     core::ptr::write_bytes(dst, 0, n as usize);
                 }
@@ -3221,25 +3307,54 @@ fn queued(s: &CryptState) -> usize {
     s.count as usize + s.reqs.iter().filter(|q| q.used != 0).count()
 }
 
-unsafe extern "C" fn crypt_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+/// Serves `storage.block` to the consumer wired to `blocks`: `CAPS`,
+/// `EXEC`, `SUBMIT` and `REAP`. `handle` is this module's own port
+/// reference on that edge, the session its consumer's lend is bound to.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised; `arg[..arg_len]` and
+/// `data[..data_len]` are valid for the call.
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_provider_dispatch"]
+pub unsafe extern "C" fn module_provider_dispatch(
+    state: *mut u8,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    use abi::registry::storage_block as SB;
     if state.is_null() || arg.is_null() {
         return E_INVAL;
     }
     let s = &mut *(state as *mut CryptState);
-    match cmd {
-        blk::ioctl::CAPS => match caps_of(s) {
-            Some(c) => {
-                c.encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
-                blk::caps::LEN as i32
-            }
+    let arg = core::slice::from_raw_parts_mut(arg, arg_len);
+    match op {
+        SB::DESCRIBE => match caps_of(s) {
+            Some(c) if c.encode(arg) => 0,
+            Some(_) => E_INVAL,
             None if s.phase == PHASE_FAILED => s.open_err,
             None => E_AGAIN,
         },
-        blk::ioctl::EXEC => {
-            let r = match admitted(s, core::slice::from_raw_parts(arg, blk::req::LEN)) {
+        SB::EXEC => {
+            if arg.len() < blk::exec::ARG_LEN {
+                return E_INVAL;
+            }
+            let r = match admitted(s, arg) {
                 Ok(r) => r,
                 Err(rc) => return rc,
             };
+            let want = if r.has_buffer() {
+                r.buf_len as usize
+            } else {
+                0
+            };
+            if data_len != want || (want != 0 && data.is_null()) {
+                return E_INVAL;
+            }
             if s.exec_state != EXEC_FREE && s.exec.req != r {
                 // Another request holds the slot. Its caller has moved on;
                 // it is dropped unless it owns a lower request in flight.
@@ -3253,22 +3368,21 @@ unsafe extern "C" fn crypt_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u
                 s.exec.req = r;
                 s.exec_state = EXEC_WAITING;
             }
+            s.exec_buf = data as usize;
             s.exec_live = 1;
             pump(s);
             s.exec_live = 0;
+            s.exec_buf = 0;
             if s.exec_state != EXEC_DONE {
                 return E_AGAIN;
             }
             let c = s.exec_cpl;
             s.exec_state = EXEC_FREE;
-            c.encode(core::slice::from_raw_parts_mut(
-                arg.add(blk::req::LEN),
-                blk::cpl::LEN,
-            ));
+            c.encode(&mut arg[blk::exec::CPL..]);
             c.status
         }
-        blk::ioctl::SUBMIT => {
-            let r = match admitted(s, core::slice::from_raw_parts(arg, blk::req::LEN)) {
+        SB::SUBMIT => {
+            let r = match admitted(s, arg) {
                 Ok(r) => r,
                 Err(rc) => return rc,
             };
@@ -3283,10 +3397,20 @@ unsafe extern "C" fn crypt_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u
             let Some(i) = s.reqs.iter().position(|q| q.used == 0) else {
                 return E_AGAIN;
             };
+            let buf = if r.has_buffer() {
+                match blk_borrow(&*s.syscalls, handle, &r) {
+                    Ok(p) => p as usize as u64,
+                    Err(rc) => return rc,
+                }
+            } else {
+                0
+            };
+            s.session = handle;
             s.req_seq += 1;
             s.reqs[i] = Upper {
                 req: r,
                 seq: s.req_seq,
+                buf,
                 used: 1,
                 started: 0,
                 _pad: [0; 6],
@@ -3294,7 +3418,7 @@ unsafe extern "C" fn crypt_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u
             pump(s);
             0
         }
-        blk::ioctl::REAP => {
+        SB::REAP => {
             pump(s);
             if s.count == 0 {
                 return 0;
@@ -3302,8 +3426,11 @@ unsafe extern "C" fn crypt_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u
             let c = s.done[s.head as usize];
             s.head = ((s.head as usize + 1) % QUEUE_DEPTH) as u8;
             s.count -= 1;
-            c.encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
-            1
+            if c.encode(arg) {
+                1
+            } else {
+                E_INVAL
+            }
         }
         _ => E_NOSYS,
     }
@@ -3444,7 +3571,7 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
-    in_chan: i32,
+    _in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
     params: *const u8,
@@ -3470,7 +3597,9 @@ pub unsafe extern "C" fn module_new(
         s.other_master = -1;
         s.other_data_key = -1;
         s.ctrl_chan = ctrl_chan;
-        s.lower.bind(in_chan);
+        s.session = -1;
+        // Every buffer a lower request names lies in this state.
+        s.lower.bind(0, state, core::mem::size_of::<CryptState>());
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
@@ -3486,14 +3615,6 @@ pub unsafe extern "C" fn module_new(
         };
         // The `status` output, third of the outputs; optional.
         s.status_out = dev_channel_port(&*s.syscalls, 1, 2);
-        if out_chan >= 0 {
-            dev_channel_register_ioctl(
-                &*s.syscalls,
-                out_chan,
-                state as *mut c_void,
-                Some(crypt_block_ioctl),
-            );
-        }
         0
     }
 }

@@ -6,6 +6,14 @@
 //! path (`dns64_prefix`) and an authenticated single-zone dynamic-update
 //! authority (`update_zone`).
 //!
+//! The `resolver` variant serves neither dynamic update nor DNSSEC
+//! validation and holds none of their tables (the zone generations, the
+//! zone file image, the TSIG keys and transaction cache, the trust
+//! anchors): an instance that sets `update_zone`, `update_durability`,
+//! `update_allow`, `dnssec` or `dnssec_anchor` on it refuses to construct.
+//! It is the variant for a graph that resolves and forwards, on an arena
+//! where those tables are most of the module.
+//!
 //! # DNS64 (RFC 6147, non-validating profile, every RFC 6052 prefix length)
 //!
 //! A native AAAA answer is always preserved, except that an AAAA in the
@@ -131,9 +139,10 @@
 //!   `upstream_ep`; forwarded queries go out as `CMD_DG_SEND_TO` to the
 //!   upstream DNS server; upstream responses arrive as `MSG_DG_RX_FROM`.
 //!
-//! Frames share the 3-byte TLV header with net_proto, but datagram
-//! opcodes (`0x20..0x43`) are disjoint from net_proto's (`0x01..0x14`) so
-//! a shared `net_out` channel can carry both contracts unambiguously.
+//! Frames share the 3-byte TLV header with net_proto; the registry's
+//! `net_tlv` msgset gives each surface its own range of message types, so a
+//! shared `net_out` channel carries both contracts unambiguously, and a
+//! frame of a type this module does not read is skipped.
 //!
 //! # Parameters
 //!
@@ -217,8 +226,10 @@ pub use fluxor_sdk::dnssec::*;
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
 // crates/fluxor-rt/src/lib.rs (shared across consumers).
 
-/// Net buffer size (frame header + ep_id + addressing + DNS packet)
-const NET_BUF_SIZE: usize = 600;
+/// Datagram-side frame buffer: one record `net_in` accepts, which also holds
+/// every frame this module writes on `net_out`.
+const NET_BUF_SIZE: usize = NET_IN_ACCEPTS_RECORD;
+const _: () = assert!(NET_OUT_MAX_RECORD <= NET_BUF_SIZE);
 
 /// Maximum local host entries
 const MAX_HOSTS: usize = 16;
@@ -241,8 +252,13 @@ const TRANSPORT_HTTPS: u8 = 2;
 const UPSTREAM_PATH_MAX: usize = 64;
 /// Room for the byte string an RRSIG signs.
 const DNSSEC_SIGNED_MAX: usize = 4096;
-/// Trust anchors a deployment may configure.
-const MAX_ANCHORS: usize = 4;
+/// Whether this is the `resolver` variant, which serves neither dynamic
+/// update nor DNSSEC validation and holds none of their tables.
+const RESOLVER: bool = cfg!(feature = "resolver");
+
+/// Trust anchors a deployment may configure; none in the `resolver`
+/// variant.
+const MAX_ANCHORS: usize = if RESOLVER { 0 } else { 4 };
 /// Longest DNSKEY RDATA an anchor may carry (flags/proto/alg + key).
 const MAX_ANCHOR_RDATA: usize = 1028;
 
@@ -316,11 +332,12 @@ const PHASE_A: u8 = 2;
 // ── Dynamic update ───────────────────────────────────────────────────────
 
 /// Records one zone generation holds. Per profile: the host and pi5-class
-/// profile serve allocated address space, an MCU serves a handful of hosts.
+/// profile serve allocated address space, an MCU serves a handful of hosts;
+/// the `resolver` variant serves no zone.
 #[cfg(target_arch = "aarch64")]
-const MAX_ZONE_RRS: usize = 64;
+const MAX_ZONE_RRS: usize = if RESOLVER { 0 } else { 64 };
 #[cfg(not(target_arch = "aarch64"))]
-const MAX_ZONE_RRS: usize = 16;
+const MAX_ZONE_RRS: usize = if RESOLVER { 0 } else { 16 };
 
 /// Records admitted in the prerequisite section and in the update section
 /// of one UPDATE message, each.
@@ -331,8 +348,9 @@ const MAX_UPDATE_RRS: usize = 32;
 const MAX_ZONE_NAME: usize = 128;
 const MAX_ZONE_RDATA: usize = 128;
 
-/// TSIG keys admitted through `update_allow`.
-const MAX_UPDATE_KEYS: usize = 4;
+/// TSIG keys admitted through `update_allow`; none in the `resolver`
+/// variant.
+const MAX_UPDATE_KEYS: usize = if RESOLVER { 0 } else { 4 };
 
 /// Record types one `update_allow` entry may list.
 const MAX_ALLOW_TYPES: usize = 8;
@@ -350,8 +368,9 @@ const TSIG_ERR_BADSIG: u16 = 16;
 const TSIG_ERR_BADKEY: u16 = 17;
 const TSIG_ERR_BADTIME: u16 = 18;
 
-/// Authenticated transactions whose response is retained, and for how long.
-const MAX_TXN_CACHE: usize = 4;
+/// Authenticated transactions whose response is retained (none in the
+/// `resolver` variant), and for how long.
+const MAX_TXN_CACHE: usize = if RESOLVER { 0 } else { 4 };
 const TXN_RETAIN_MS: u32 = 30000;
 
 /// Longest committed-generation file path.
@@ -854,6 +873,9 @@ struct DnsState {
     /// DNSKEY RDATA it is anchored by.
     anchors: [TrustAnchor; MAX_ANCHORS],
     anchor_count: u8,
+    /// Set when an `update_allow` or `dnssec_anchor` entry arrives on the
+    /// `resolver` variant, which holds no table for either.
+    unserved: u8,
     /// Answers validated, and answers refused for failing validation. The
     /// second is the one to alert on: it is a broken zone or an attack.
     dnssec_secure: u32,
@@ -991,6 +1013,7 @@ impl DnsState {
         self.upstream_path_len = 0;
         self.dnssec = 0;
         self.anchor_count = 0;
+        self.unserved = 0;
         self.dnssec_secure = 0;
         self.dnssec_bogus = 0;
         self.tls_in_chan = -1;
@@ -1025,10 +1048,8 @@ impl DnsState {
         self.update_zone_len = 0;
         self.update_path_len = 0;
         self.key_count = 0;
-        i = 0;
-        while i < MAX_UPDATE_KEYS {
-            self.keys[i] = TsigKey::empty();
-            i += 1;
+        for k in self.keys.iter_mut() {
+            *k = TsigKey::empty();
         }
         self.zone = Zone::empty();
         self.candidate = Zone::empty();
@@ -1050,10 +1071,8 @@ impl DnsState {
             mac: [0; TSIG_MAC_LEN],
         };
         self.updates_deferred = 0;
-        i = 0;
-        while i < MAX_TXN_CACHE {
-            self.txn_cache[i] = TxnEntry::empty();
-            i += 1;
+        for e in self.txn_cache.iter_mut() {
+            *e = TxnEntry::empty();
         }
         self.tlm = TlmCounters::new();
         self.tlm_last_ms = 0;
@@ -1473,7 +1492,7 @@ unsafe fn dg_send_from(
         dns_data,
         dns_len,
         buf,
-        NET_BUF_SIZE,
+        NET_OUT_MAX_RECORD,
     );
     if n > 0 {
         (*state).tlm.bytes_out = (*state).tlm.bytes_out.wrapping_add(dns_len as u32);
@@ -1637,17 +1656,20 @@ unsafe fn dot_pump(s: &mut DnsState) {
     let mut taken = 0u32;
     while taken < 8 {
         taken += 1;
-        let mut frame = [0u8; NET_BUF_SIZE];
-        let (msg, len) = net_read_frame(sys, s.tls_in_chan, frame.as_mut_ptr(), NET_BUF_SIZE);
+        let mut frame = [0u8; TLS_IN_ACCEPTS_RECORD];
+        let (msg, len) = net_read_frame(sys, s.tls_in_chan, frame.as_mut_ptr(), frame.len());
         if msg == 0 {
             return;
         }
-        let payload = &frame[NET_FRAME_HDR..NET_FRAME_HDR + len.min(NET_BUF_SIZE - NET_FRAME_HDR)];
+        let payload = &frame[NET_FRAME_HDR..NET_FRAME_HDR + len];
         match msg {
             net_proto::MSG_CONNECTED => {
-                if payload.len() >= net_proto::CONN_ID_LEN {
-                    let (cid, _tag) = net_proto::connected_parts(payload);
-                    s.dot_conn_id = cid;
+                // Only the dial this module made: another consumer of a
+                // shared leg tags its own.
+                let mine = net_proto::connected_parts(payload)
+                    .filter(|c| s.dot_connecting != 0 && c.requester_tag == dev_requester_tag(sys));
+                if let Some(c) = mine {
+                    s.dot_conn_id = c.conn_id;
                     s.dot_present = 1;
                     s.dot_connecting = 0;
                     s.dot_rx_len = 0;
@@ -1656,15 +1678,13 @@ unsafe fn dot_pump(s: &mut DnsState) {
                 }
             }
             net_proto::MSG_DATA => {
-                if payload.len() < net_proto::CONN_ID_LEN {
+                let Some((cid, body)) = net_proto::data_parts(payload) else {
                     continue;
-                }
-                let cid = net_proto::conn_id(payload);
+                };
                 if s.dot_present == 0 || cid != s.dot_conn_id {
                     // Another consumer's connection on a shared lane.
                     continue;
                 }
-                let body = &payload[net_proto::CONN_ID_LEN..];
                 let room = DOT_RX_BYTES - s.dot_rx_len as usize;
                 if body.len() > room {
                     // `DOT_RX_BYTES` is two whole messages; more than that
@@ -1691,7 +1711,9 @@ unsafe fn dot_pump(s: &mut DnsState) {
                 s.dot_rx_len += body.len() as u16;
                 dot_drain_messages(s);
             }
-            net_proto::MSG_CLOSED | net_proto::MSG_ERROR => {
+            net_proto::MSG_CLOSED | net_proto::MSG_ERROR
+                if dot_event_is_ours(s, msg, payload, dev_requester_tag(sys)) =>
+            {
                 // The peer finished with us, or the dial failed — a refused
                 // connection and a failed handshake both arrive here, and
                 // neither is distinguished from the other. A redial follows
@@ -1793,6 +1815,10 @@ unsafe fn ensure_do_bit(s: &DnsState, buf: *mut u8, pkt_len: usize, question_end
 /// `MAX_ANCHOR_RDATA`, are dropped without one. The algorithm and protocol
 /// are read as decimal and kept as the low byte.
 unsafe fn parse_dnssec_anchor(s: &mut DnsState, d: *const u8, len: usize) {
+    if RESOLVER {
+        s.unserved = 1;
+        return;
+    }
     if s.anchor_count as usize >= MAX_ANCHORS {
         let m: &[u8] = b"[dns] more dnssec_anchor entries than this build holds; extra ignored";
         dev_log(s.sys(), 1, m.as_ptr(), m.len());
@@ -1995,19 +2021,22 @@ unsafe fn dot_dial(s: &mut DnsState) {
     let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
     let length = net_proto::write_connect_to(
         &mut payload,
-        net_proto::SOCK_TYPE_STREAM,
-        port.unwrap_or(if s.upstream_transport == TRANSPORT_HTTPS {
-            DOH_DEFAULT_PORT
-        } else {
-            DOT_DEFAULT_PORT
-        }),
-        &target,
-        Some(dev_requester_tag(s.sys())),
+        &net_proto::ConnectTo {
+            sock_type: net_proto::SOCK_TYPE_STREAM,
+            flags: 0,
+            port: port.unwrap_or(if s.upstream_transport == TRANSPORT_HTTPS {
+                DOH_DEFAULT_PORT
+            } else {
+                DOT_DEFAULT_PORT
+            }),
+            target,
+            requester_tag: dev_requester_tag(s.sys()),
+        },
     );
     if length == 0 {
         return;
     }
-    let mut scratch = [0u8; NET_BUF_SIZE];
+    let mut scratch = [0u8; TLS_OUT_MAX_RECORD];
     if net_write_frame(
         s.sys(),
         s.tls_out_chan,
@@ -2015,7 +2044,7 @@ unsafe fn dot_dial(s: &mut DnsState) {
         payload.as_ptr(),
         length,
         scratch.as_mut_ptr(),
-        NET_BUF_SIZE,
+        TLS_OUT_MAX_RECORD,
     ) != 0
     {
         s.dot_connecting = 1;
@@ -2030,7 +2059,7 @@ unsafe fn dot_dial(s: &mut DnsState) {
 /// reason to expect one.
 ///
 /// The head and the message travel as one frame, so their total has to fit
-/// `NET_BUF_SIZE`; a request that does not is refused rather than sent
+/// `TLS_OUT_MAX_RECORD`; a request that does not is refused rather than sent
 /// short.
 unsafe fn send_upstream_query_https(s: &mut DnsState, dns_data: *const u8, dns_len: usize) -> bool {
     if s.dot_present == 0 || s.tls_out_chan < 0 || dns_len > DNS_MAX_PACKET {
@@ -2096,7 +2125,7 @@ unsafe fn send_upstream_query_https(s: &mut DnsState, dns_data: *const u8, dns_l
     pos += at;
     core::ptr::copy_nonoverlapping(dns_data, payload.as_mut_ptr().add(pos), dns_len);
     pos += dns_len;
-    let mut scratch = [0u8; NET_BUF_SIZE];
+    let mut scratch = [0u8; TLS_OUT_MAX_RECORD];
     if net_write_frame(
         s.sys(),
         s.tls_out_chan,
@@ -2104,7 +2133,7 @@ unsafe fn send_upstream_query_https(s: &mut DnsState, dns_data: *const u8, dns_l
         payload.as_ptr(),
         pos,
         scratch.as_mut_ptr(),
-        NET_BUF_SIZE,
+        TLS_OUT_MAX_RECORD,
     ) == 0
     {
         return false;
@@ -2130,7 +2159,7 @@ unsafe fn send_upstream_query_tls(s: &mut DnsState, dns_data: *const u8, dns_len
     payload[at + 1] = be[1];
     core::ptr::copy_nonoverlapping(dns_data, payload.as_mut_ptr().add(at + 2), dns_len);
     let total = at + 2 + dns_len;
-    let mut scratch = [0u8; NET_BUF_SIZE];
+    let mut scratch = [0u8; TLS_OUT_MAX_RECORD];
     let wrote = net_write_frame(
         s.sys(),
         s.tls_out_chan,
@@ -2138,7 +2167,7 @@ unsafe fn send_upstream_query_tls(s: &mut DnsState, dns_data: *const u8, dns_len
         payload.as_ptr(),
         total,
         scratch.as_mut_ptr(),
-        NET_BUF_SIZE,
+        TLS_OUT_MAX_RECORD,
     );
     if wrote == 0 {
         return false;
@@ -4044,6 +4073,10 @@ unsafe fn parse_rtype(data: *const u8, len: usize) -> Option<u16> {
 /// every type. A malformed entry is ignored, so the key it would have
 /// admitted stays unadmitted.
 unsafe fn parse_update_allow(s: &mut DnsState, data: *const u8, len: usize) {
+    if RESOLVER && len != 0 {
+        s.unserved = 1;
+        return;
+    }
     if len == 0 || s.key_count as usize >= MAX_UPDATE_KEYS {
         return;
     }
@@ -4114,19 +4147,27 @@ unsafe fn open_tsig_keys(s: &mut DnsState) {
             i += 1;
             continue;
         }
-        let mut arg = [0u8; 8 + MAX_VAULT_LABEL + 12];
-        arg[0..2].copy_from_slice(&kv::suite::HMAC_SHA256.to_le_bytes());
-        arg[2..6].copy_from_slice(&(kv::usage::SIGN | kv::usage::VERIFY).to_le_bytes());
-        arg[6] = 0;
-        arg[7] = label_len as u8;
-        arg[8..8 + TSIG_LABEL_PREFIX.len()].copy_from_slice(TSIG_LABEL_PREFIX);
+        let mut label = [0u8; MAX_VAULT_LABEL];
+        label[..TSIG_LABEL_PREFIX.len()].copy_from_slice(TSIG_LABEL_PREFIX);
         copy_bytes(
-            arg.as_mut_ptr().add(8 + TSIG_LABEL_PREFIX.len()),
+            label.as_mut_ptr().add(TSIG_LABEL_PREFIX.len()),
             key.name.as_ptr(),
             name_len,
         );
-        let n = 8 + label_len + 12;
-        let rc = (sys.provider_call)(-1, kv::OPEN, arg.as_mut_ptr(), n);
+        let mut arg = [0u8; kv::open::MAX_ARG];
+        let req = kv::open::Request {
+            suite: kv::suite::HMAC_SHA256,
+            usage: kv::usage::SIGN | kv::usage::VERIFY,
+            flags: 0,
+            label: &label[..label_len],
+        };
+        // An HMAC key has no public half: no `data`.
+        let rc = match kv::open::encode(&mut arg, &req) {
+            Some(n) => {
+                (sys.provider_call)(-1, kv::OPEN, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0)
+            }
+            None => -1,
+        };
         if rc < 0 {
             key.handle = -1;
             log_info(
@@ -4365,21 +4406,18 @@ unsafe fn verify_tsig(
     if end == 0 {
         return TsigVerdict::Malformed;
     }
-    // VERIFY against the slot: [msg_len][mac_len][pub_len=0][pad][msg][mac].
-    let mut arg = [0u8; 8 + MAC_INPUT_MAX + TSIG_MAC_LEN];
-    arg[0..2].copy_from_slice(&(end as u16).to_le_bytes());
-    arg[2..4].copy_from_slice(&(TSIG_MAC_LEN as u16).to_le_bytes());
-    copy_bytes(arg.as_mut_ptr().add(8), buf, end);
-    copy_bytes(
-        arg.as_mut_ptr().add(8 + end),
-        info.mac.as_ptr(),
-        TSIG_MAC_LEN,
-    );
+    // VERIFY against the slot: `data` = the message ‖ its MAC, no public key.
+    let mut data = [0u8; MAC_INPUT_MAX + TSIG_MAC_LEN];
+    copy_bytes(data.as_mut_ptr(), buf, end);
+    copy_bytes(data.as_mut_ptr().add(end), info.mac.as_ptr(), TSIG_MAC_LEN);
+    let mut arg = kv::verify::encode(end as u32, TSIG_MAC_LEN as u16, 0);
     let rc = (s.sys().provider_call)(
         key.handle,
         kv::VERIFY,
         arg.as_mut_ptr(),
-        8 + end + TSIG_MAC_LEN,
+        arg.len(),
+        data.as_mut_ptr(),
+        end + TSIG_MAC_LEN,
     );
     if rc != 1 {
         return TsigVerdict::BadSig;
@@ -4446,18 +4484,21 @@ unsafe fn append_tsig(
         if end == 0 {
             return 0;
         }
-        // SIGN: [mode][pad][input_len:u32][input][out_ptr:u64][cap:u16][len_out:u16]
-        let mut arg = [0u8; 6 + MAC_INPUT_MAX + 12];
-        arg[0] = kv::sign_mode::RAW;
-        arg[2..6].copy_from_slice(&(end as u32).to_le_bytes());
-        copy_bytes(arg.as_mut_ptr().add(6), buf, end);
-        let tail = 6 + end;
-        arg[tail..tail + 8].copy_from_slice(&(mac.as_mut_ptr() as u64).to_le_bytes());
-        arg[tail + 8..tail + 10].copy_from_slice(&(TSIG_MAC_LEN as u16).to_le_bytes());
-        let rc = (s.sys().provider_call)(key.handle, kv::SIGN, arg.as_mut_ptr(), tail + 12);
-        if rc < 0 {
+        // SIGN in place over the MAC input: the tag comes back over its
+        // head.
+        let mut arg = kv::sign::encode(kv::sign_mode::RAW, end as u32);
+        let rc = (s.sys().provider_call)(
+            key.handle,
+            kv::SIGN,
+            arg.as_mut_ptr(),
+            arg.len(),
+            buf,
+            MAC_INPUT_MAX,
+        );
+        if rc != TSIG_MAC_LEN as i32 {
             return 0;
         }
+        copy_bytes(mac.as_mut_ptr(), buf, TSIG_MAC_LEN);
     }
     let mac_len = if signed { TSIG_MAC_LEN } else { 0 };
     let name_len = key.name_len as usize;
@@ -4563,13 +4604,9 @@ unsafe fn zone_remove(z: &mut Zone, idx: usize) {
 
 /// Remove every record at `name` matching `rtype` (`QTYPE_ANY` for all).
 unsafe fn zone_remove_all(z: &mut Zone, name: *const u8, name_len: usize, rtype: u16) {
-    let mut guard = 0;
-    while guard < MAX_ZONE_RRS {
-        match zone_find(z, name, name_len, rtype, None) {
-            Some(i) => zone_remove(z, i),
-            None => break,
-        }
-        guard += 1;
+    // Each removal shrinks the zone, so this ends when nothing matches.
+    while let Some(i) = zone_find(z, name, name_len, rtype, None) {
+        zone_remove(z, i);
     }
 }
 
@@ -5059,7 +5096,14 @@ unsafe fn zone_commit_begin(s: &mut DnsState) {
 unsafe fn zone_commit_release(s: &mut DnsState) {
     use abi::contracts::storage::fs;
     if s.zio_fd >= 0 {
-        let _ = (s.sys().provider_call)(s.zio_fd, fs::CLOSE, core::ptr::null_mut(), 0);
+        let _ = (s.sys().provider_call)(
+            s.zio_fd,
+            fs::CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.zio_fd = -1;
     }
 }
@@ -5094,7 +5138,10 @@ unsafe fn zone_commit_advance(s: &mut DnsState) {
     let mut calls = 0usize;
     while calls < MAX_ZIO_CALLS_PER_STEP {
         calls += 1;
-        let pc = s.sys().provider_call;
+        let call = s.sys().provider_call;
+        let pc = move |h: i32, op: u32, a: *mut u8, l: usize| {
+            call(h, op, a, l, core::ptr::null_mut(), 0)
+        };
         match s.zio_phase {
             ZIO_COM_UNLINK => {
                 // A previous interrupted commit may have left the temporary
@@ -5240,7 +5287,7 @@ unsafe fn zone_commit_finish(s: &mut DnsState, committed: bool) {
 unsafe fn zone_storage_ready(s: &DnsState) -> Option<bool> {
     use abi::contracts::storage::fs;
     let mut caps = [0u8; 4];
-    let rc = (s.sys().provider_call)(-1, fs::CAPS, caps.as_mut_ptr(), 4);
+    let rc = (s.sys().provider_call)(-1, fs::CAPS, caps.as_mut_ptr(), 4, core::ptr::null_mut(), 0);
     if rc == abi::errno::EAGAIN {
         return None;
     }
@@ -5264,7 +5311,10 @@ unsafe fn zone_recover_drive(s: &mut DnsState) -> bool {
     let mut calls = 0usize;
     while calls < MAX_ZIO_CALLS_PER_STEP {
         calls += 1;
-        let pc = s.sys().provider_call;
+        let call = s.sys().provider_call;
+        let pc = move |h: i32, op: u32, a: *mut u8, l: usize| {
+            call(h, op, a, l, core::ptr::null_mut(), 0)
+        };
         match s.zio_phase {
             ZIO_REC_OPEN => {
                 let mut path = [0u8; MAX_ZONE_PATH];
@@ -5342,7 +5392,14 @@ unsafe fn zone_recover_drive(s: &mut DnsState) -> bool {
 unsafe fn zone_recover_finish(s: &mut DnsState, recovered: bool) {
     use abi::contracts::storage::fs;
     if s.zio_fd >= 0 {
-        let _ = (s.sys().provider_call)(s.zio_fd, fs::CLOSE, core::ptr::null_mut(), 0);
+        let _ = (s.sys().provider_call)(
+            s.zio_fd,
+            fs::CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.zio_fd = -1;
     }
     s.zio_phase = ZIO_IDLE;
@@ -5367,19 +5424,12 @@ unsafe fn txn_lookup(
     mac: &[u8; TSIG_MAC_LEN],
     now_ms: u32,
 ) -> Option<usize> {
-    let mut i = 0;
-    while i < MAX_TXN_CACHE {
-        let e = &*s.txn_cache.as_ptr().add(i);
-        if e.live != 0
+    s.txn_cache.iter().position(|e| {
+        e.live != 0
             && e.key_idx as usize == key_idx
             && now_ms.wrapping_sub(e.stored_ms) < TXN_RETAIN_MS
             && e.mac == *mac
-        {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    })
 }
 
 /// Retain a response, displacing the oldest entry.
@@ -5391,23 +5441,22 @@ unsafe fn txn_store(
     reply_len: usize,
     now_ms: u32,
 ) {
-    let mut victim = 0usize;
+    let mut victim = None;
     let mut oldest_age = 0u32;
-    let mut i = 0;
-    while i < MAX_TXN_CACHE {
-        let e = &*s.txn_cache.as_ptr().add(i);
+    for (i, e) in s.txn_cache.iter().enumerate() {
         if e.live == 0 {
-            victim = i;
+            victim = Some(i);
             break;
         }
         let age = now_ms.wrapping_sub(e.stored_ms);
-        if age >= oldest_age {
+        if victim.is_none() || age >= oldest_age {
             oldest_age = age;
-            victim = i;
+            victim = Some(i);
         }
-        i += 1;
     }
-    let e = &mut *s.txn_cache.as_mut_ptr().add(victim);
+    let Some(e) = victim.and_then(|i| s.txn_cache.get_mut(i)) else {
+        return;
+    };
     e.live = 1;
     e.key_idx = key_idx as u8;
     e.stored_ms = now_ms;
@@ -5697,7 +5746,33 @@ unsafe fn evaluate_update(
 // PIC Module Interface
 // ============================================================================
 
-fluxor_rt::module_facts! { state: DnsState }
+fluxor_rt::module_facts! {
+    state: DnsState,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + DG_V4_PREFIX + DNS_MAX_PACKET,
+        in 1 TLS_IN_ACCEPTS_RECORD = 1483,
+        out 1 TLS_OUT_MAX_RECORD = 600,
+    ],
+}
+
+/// Whether a `MSG_CLOSED` / `MSG_ERROR` on the stream leg is this module's:
+/// a close or an established-connection error on the connection it holds,
+/// or a connect failure tagged with its own requester tag. Anything else is
+/// another consumer's on a shared leg.
+fn dot_event_is_ours(s: &DnsState, msg: u8, payload: &[u8], my_tag: u16) -> bool {
+    if msg == net_proto::MSG_CLOSED {
+        return net_proto::closed_parts(payload)
+            .is_some_and(|(cid, _)| s.dot_present != 0 && cid == s.dot_conn_id);
+    }
+    match net_proto::error_parts(payload) {
+        Some((_, _, tag)) if tag != net_proto::REQUESTER_TAG_NONE => {
+            s.dot_connecting != 0 && tag == my_tag
+        }
+        Some((cid, _, _)) => s.dot_present != 0 && cid == s.dot_conn_id,
+        None => false,
+    }
+}
 
 // Same figure as data, so `pack` records it and a resolver-bearing graph's arena
 // demand is summable at compose time. It matters here more than most: `dns` is
@@ -5771,6 +5846,18 @@ pub unsafe extern "C" fn module_new(
             }
         }
 
+        if RESOLVER
+            && (s.update_enabled != 0
+                || s.update_durability != DURABILITY_UNSET
+                || s.unserved != 0
+                || s.dnssec != 0)
+        {
+            log_info(
+                s,
+                b"[dns] refusing to construct: the resolver variant serves no update zone and no DNSSEC (update_* / dnssec*); select the full variant",
+            );
+            return -1;
+        }
         if s.dns64_bad != 0 {
             log_info(
                 s,

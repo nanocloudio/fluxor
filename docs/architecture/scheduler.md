@@ -252,7 +252,7 @@ A `CREATE` lends a workload a host directory with the Tier-2 entry
 A read-only volume takes no change; nothing in a volume is charged to the
 owner; the owner's release closes it and leaves its directory as it was.
 At most 16 per workload. A node that does not lend volumes does not list
-the entry in `CAPS`, and a required entry it does not list fails the
+the entry in `OPTIONS`, and a required entry it does not list fails the
 `CREATE` with `ENOSYS`, so an orchestrator marks every volume required.
 
 ### A workload's own vault
@@ -283,7 +283,7 @@ volume and the seal key holds the key, which is the point of keeping it
 there, and the trade against a node-held key a device-unique seal or a
 token would bind to the node. One vault per workload; `dir` outside a lent
 volume, or in a read-only one, refuses the `CREATE`. The graph backend lists
-the entry in `CAPS`; a host process (which reaches no kernel vault) and a
+the entry in `OPTIONS`; a host process (which reaches no kernel vault) and a
 metal node do not, and answer a required entry `ENOSYS`.
 
 ## Where tier is declared
@@ -374,11 +374,11 @@ tiers exclusively via bridge rings:
   back-pressured.
 - The bridge slot indices are populated into each ISR-tier module's
   `in_bridges` / `out_bridges` arrays at admission time.
-- From inside the step body, a module discovers its own bridge
-  endpoints with the `SELF_BRIDGES` op (`0x2244`), which returns
-  tagged bridge fds, and then moves data with the bridge ops
-  `WRITE` (`0x22E0`), `READ` (`0x22E1`), `POLL` (`0x22E2`), and
-  `INFO` (`0x22E3`). These five ops are exempt from the ISR-tier
+- In `module_new`, a module takes a handle to each of its bridge
+  endpoints with the `SELF_BRIDGE` op (`0x2244`, `arg = [dir][index]`,
+  one handle per call), and from the step body moves data with the
+  bridge ops `WRITE` (`0x22E0`), `READ` (`0x22E1`), `POLL` (`0x22E2`),
+  and `INFO` (`0x22E3`). These five ops are exempt from the ISR-tier
   syscall deny because the underlying ring operations are lock-free
   and allocation-free; every other `provider_call` op is denied from
   ISR context. Up to `MAX_BRIDGES_PER_MODULE` (4) input and output
@@ -410,7 +410,7 @@ Source: `src/kernel/module/syscalls.rs`,
    - **Channels:** `channel_open`, `channel_read`, `channel_write`,
      `channel_peek`, `channel_discard`, `channel_poll`.
    - **Providers:** `provider_open`, `provider_call`,
-     `provider_call_sel`, `provider_query`, `provider_close`, with
+     `provider_query`, `provider_close`, with
      the ISR-safe bridge ops exempted as described above. The gate
      fires at the syscall wrapper (before permission/contract
      checks) so the EACCES path is reached before any other

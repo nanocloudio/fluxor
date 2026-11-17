@@ -5,7 +5,7 @@
 // NOT a wire contract, so it is not ABI and not hashed into the
 // ABI-surface digest).
 // Arena-agnostic: the caller owns the concrete table and supplies
-// scratch; this file owns only the SUBSCRIBE / TAKE_RUNG / CHANGES /
+// scratch; this file owns only the SUBSCRIBE / poll / CHANGES /
 // shadow-relist protocol so every table consumer (http edge,
 // dns-records-in-graph, …) shares one audited implementation instead of
 // re-deriving it.
@@ -19,66 +19,57 @@
 //
 // ## The pattern
 //
-//   1. One kernel event — the module creates it once
-//      (`kernel_abi::event::CREATE`, [`create_event`]) and names it in
-//      every subscription it opens. The store signals it; it never writes
-//      a byte into any channel of the module, so no self-wired port and
-//      no sink exist.
-//   2. Subscribe — `SUBSCRIBE` on the prefix with that event.
-//      `EAGAIN` is asked again next step, any other refusal after a
-//      backoff; the subscription is opened *before* the first read, so
-//      every change after it rings. A new subscription is *pending* with
-//      the token it holds — empty on a cold start, so its first read is
-//      the relist: a cold start is a recovery.
-//   3. Take — each step `event::POLL`s, and when the event fired asks
-//      `TAKE_RUNG` which subscriptions rang, marking each one
-//      named *pending* ([`take_rung`]). A take that fails, or answers
-//      `more`, is owed: the next step takes again whether or not the event
-//      fired, since `POLL` consumed the signal and a set rung bit sends no
-//      other.
-//   4. Read — a pending consumer reads `CHANGES` from its token,
-//      one bounded page per call, applying each page by key as it lands.
+//   1. Subscribe — `SUBSCRIBE` on the prefix. `EAGAIN` is asked again
+//      next step, any other refusal after a backoff; the subscription is
+//      opened *before* the first read, so every change after it rings. A
+//      new subscription is *pending* with the token it holds — empty on a
+//      cold start, so its first read is the relist: a cold start is a
+//      recovery. The subscription is a signalling handle: the store rings
+//      its doorbell on a change, and the kernel wakes the module. The store
+//      never writes a byte into any channel of the module, so no self-wired
+//      port and no sink exist.
+//   2. Poll — each step `HANDLE_POLL`s the subscription; `POLL_IN` (once
+//      per ring: the poll takes it) marks the consumer *pending*.
+//   3. Read — a pending consumer reads `CHANGES` from its token through
+//      its subscription's handle, one bounded page per call, applying each
+//      page by key as it lands.
 //      *Pending* is cleared only by a page whose `more` is clear; that
 //      page carries the 8-byte revision token kept at rest. Any failure
 //      (`EAGAIN`, `ENOMEM`, …) leaves the token where it was and the
 //      consumer pending, so the next step asks again — an `EAGAIN` also
-//      re-rings the subscription, named in the read, once the store can
+//      re-rings the subscription the read came through, once the store can
 //      answer.
-//   5. Loss recovery with shadow swap — a LOST answer (the token is older
+//   4. Loss recovery with shadow swap — a LOST answer (the token is older
 //      than the store can answer), a continuation the store no longer
 //      recognises, or a cold start relists: `CHANGES` with the empty token,
 //      paged by key, into a SHADOW table, swapped in only when the last
 //      page lands — never in place, because a table swapped in place is a
 //      torn table for any reader mid-scan. The relist's last page carries
 //      the token the consumer resumes from.
-//   6. Bounded admission — the arena is the caller's; overflow is the
+//   5. Bounded admission — the arena is the caller's; overflow is the
 //      caller's to surface (a reader holds no write grant).
-//   7. Single-writer prefix discipline — a compiler owns the prefix;
+//   6. Single-writer prefix discipline — a compiler owns the prefix;
 //      the consumer treats it as read-only.
 //
 // ## Which store
 //
 // Every store op goes to the provider `store` names: empty, the contract's
-// default (`provider_call` with `handle == -1`); otherwise a keyed volume, or
-// `platform` for the platform's own store beneath a graph-local default
-// (`provider_call_sel`). A module names its store by a `str` param it
-// declares as its `storage.namespace` claim's `selector_param`, so the
-// composer checks the store a table reads from as it checks every claim. A
-// subscription opened through a selector is a routed handle; the kernel
-// names it so in `TAKE_RUNG` answers and hands the provider its own in
-// `CHANGES`, so the consumer is the same machine whichever store it follows.
-// The event is the module's own, whichever store rings it.
+// default (`handle == -1`); otherwise a keyed volume, or `platform` for the
+// platform's own store beneath a graph-local default, which the consumer
+// binds by name once (`kernel_abi::bind`) and keeps the bound handle of. A
+// module names its store by a `str` param it declares as its
+// `storage.namespace` claim's `selector_param`, so the composer checks the
+// store a table reads from as it checks every claim. A subscription opened
+// through the bound handle comes back routed to the same store, and its
+// `CHANGES` reads go through it, so the consumer is the same machine
+// whichever store it follows.
 //
-// ## Several tables on one event
+// ## Several tables
 //
-// A module with several table consumers creates ONE event for all of
-// them. `TAKE_RUNG` answers every rung subscription the caller holds on
-// the event, so the module takes once per step for all of them —
-// [`take_rung`] over the whole set of one store — and then
-// [`TableConsumer::advance`]s each. Tables following different stores are
-// taken once per store. [`TableConsumer::step`] is the one-table shorthand that does both.
-// Two consumers of one prefix share one subscription (SUBSCRIBE is
-// idempotent), and a take that names it marks both.
+// Each consumer holds its own subscription handle and polls it, so a module
+// with several table consumers keeps them in its state side by side — the
+// consumer *is* the module's map from a subscription to the table it feeds —
+// and [`TableConsumer::step`]s each.
 
 // `SyscallTable` and `abi` are provided by the `include!` site (see the
 // header).
@@ -86,7 +77,7 @@
 use fluxor_abi as abi;
 use fluxor_abi::kernel_abi::SyscallTable;
 
-use abi::contracts::storage::namespace::{self as ns, changes, subscribe, take};
+use abi::contracts::storage::namespace::{self as ns, changes, subscribe};
 
 /// Steps until a `SUBSCRIBE` refused for a reason other than "not now"
 /// is asked again. Rare by construction (a malformed prefix, a store
@@ -99,10 +90,6 @@ pub const RESUBSCRIBE_BACKOFF_STEPS: u32 = 1024;
 /// `CHANGES` pages read in one step at most. A relist of a large prefix
 /// spans steps; the step stays bounded whatever the prefix holds.
 pub const PAGES_PER_STEP: usize = 4;
-
-/// Rung handles taken in one `TAKE_RUNG`. More are taken on the next
-/// wake: the store signals the event again when they did not fit.
-pub const TAKE_MAX: usize = 16;
 
 /// Errnos the consumer tells apart.
 pub const ERR_AGAIN: i32 = -11;
@@ -141,29 +128,31 @@ pub const SUB_REFUSED: u8 = 2;
 /// The subscription's persistent bookkeeping. Embed one per consumed
 /// prefix in the module's `#[repr(C)]` state. All-zero is
 /// [`TableConsumer::new`], so a kernel-zeroed state needs no init. The
-/// table itself lives in the caller's arena; this holds the subscription
-/// handle and the resume token, which an opaque provider continuation
-/// may make as long as `changes::TOKEN_MAX`.
+/// table itself lives in the caller's arena; this holds the store binding,
+/// the subscription handle and the resume token, which an opaque provider
+/// continuation may make as long as `changes::TOKEN_MAX`.
 #[repr(C)]
 pub struct TableConsumer {
     /// The store's subscription handle while `sub == SUB_OPEN`.
     pub handle: i32,
+    /// The handle bound to a named store while `store_bound` is set.
+    pub store: i32,
     /// [`SUB_NONE`], [`SUB_OPEN`] or [`SUB_REFUSED`].
     pub sub: u8,
-    /// A read is owed: set by a rung take and at cold start, cleared only
-    /// by a `CHANGES` page with `more` clear.
+    /// A read is owed: set by a ring and at cold start, cleared only by a
+    /// `CHANGES` page with `more` clear.
     pub pending: u8,
     /// A relist is in flight: pages land in the shadow table, which is
     /// swapped in when the last one does.
     pub relisting: u8,
-    /// A `TAKE_RUNG` is owed: the last one failed or answered `more`, so
-    /// the next [`take_rung`] asks whether or not the event fired.
-    pub take_owed: u8,
+    pub _pad1: u8,
     /// Steps left before a refused `SUBSCRIBE` is asked again.
     pub backoff: u32,
     /// Length of `token`. 0: nothing listed yet — the next read relists.
     pub token_len: u16,
-    pub _pad2: [u8; 6],
+    /// `store` holds the binding of the named store, opened once.
+    pub store_bound: u8,
+    pub _pad2: [u8; 5],
     /// Where the next read resumes: at rest the 8-byte revision of the
     /// last completed read; mid-read the store's continuation.
     pub token: [u8; changes::TOKEN_MAX],
@@ -173,13 +162,15 @@ impl TableConsumer {
     pub const fn new() -> Self {
         Self {
             handle: 0,
+            store: 0,
             sub: SUB_NONE,
             pending: 0,
             relisting: 0,
-            take_owed: 0,
+            _pad1: 0,
             backoff: 0,
             token_len: 0,
-            _pad2: [0; 6],
+            store_bound: 0,
+            _pad2: [0; 5],
             token: [0; changes::TOKEN_MAX],
         }
     }
@@ -194,20 +185,9 @@ impl TableConsumer {
         changes::token_revision(&self.token[..self.token_len as usize])
     }
 
-    /// Mark this consumer pending when `handle` is its subscription;
-    /// `true` when it is.
-    pub fn ring(&mut self, handle: i32) -> bool {
-        if self.sub == SUB_OPEN && self.handle == handle {
-            self.pending = 1;
-            return true;
-        }
-        false
-    }
-
-    /// Drive one step of a module's ONLY table consumer: take the
-    /// event's rung subscriptions, then [`advance`](Self::advance).
-    /// A module with several consumers on one event calls [`take_rung`]
-    /// once over all of them and `advance`s each instead.
+    /// Drive one step: subscribe if not yet subscribed, mark the consumer
+    /// pending when its subscription rang, then read what is owed (see
+    /// [`advance`](Self::advance)).
     ///
     /// # Safety
     /// As [`advance`](Self::advance).
@@ -215,16 +195,14 @@ impl TableConsumer {
         &mut self,
         sys: &SyscallTable,
         store: &[u8],
-        event: i32,
         prefix: &[u8],
         scratch: &mut [u8],
         table: &mut T,
     ) {
-        if event < 0 {
-            return;
+        if self.sub == SUB_OPEN && rang(sys, self.handle) {
+            self.pending = 1;
         }
-        take_rung(sys, store, event, &mut [&mut *self]);
-        self.advance(sys, store, event, prefix, scratch, table);
+        self.advance(sys, store, prefix, scratch, table);
     }
 
     /// Subscribe if not yet subscribed, then, while a read is owed, read
@@ -237,24 +215,18 @@ impl TableConsumer {
     /// stepped in turn may share one.
     ///
     /// # Safety
-    /// `sys` must be a live syscall table; `event >= 0` an event the
-    /// calling module created.
+    /// `sys` must be a live syscall table.
     pub unsafe fn advance<T: TableSink>(
         &mut self,
         sys: &SyscallTable,
         store: &[u8],
-        event: i32,
         prefix: &[u8],
         scratch: &mut [u8],
         table: &mut T,
     ) {
-        if event < 0 {
+        if self.sub != SUB_OPEN && !self.subscribe(sys, store, prefix) {
             return;
         }
-        if self.sub != SUB_OPEN && !self.subscribe(sys, store, event, prefix) {
-            return;
-        }
-        let mut fence = [0u8; abi::fence::WIRE_MAX_LEN];
         let mut pages = 0;
         while self.pending != 0 && pages < PAGES_PER_STEP {
             pages += 1;
@@ -266,12 +238,11 @@ impl TableConsumer {
             let token_len = self.token_len as usize;
             let n = read_changes(
                 sys,
-                store,
-                prefix,
                 self.handle,
+                prefix,
                 &self.token[..token_len],
                 scratch,
-                &mut fence,
+                None,
             );
             if n < 0 {
                 if n == ERR_INVAL && token_len != 0 && token_len != changes::REVISION_TOKEN_LEN {
@@ -280,7 +251,7 @@ impl TableConsumer {
                     self.restart_relist();
                     continue;
                 }
-                // EAGAIN (the store re-rings us when it can answer),
+                // EAGAIN (the store rings again when it can answer),
                 // ENOMEM or anything else: keep the token and stay
                 // pending; the next step asks again.
                 return;
@@ -320,13 +291,7 @@ impl TableConsumer {
 
     /// Open the subscription. `true` once open (and a read owed from the
     /// token held: the relist when there is none).
-    unsafe fn subscribe(
-        &mut self,
-        sys: &SyscallTable,
-        store: &[u8],
-        event: i32,
-        prefix: &[u8],
-    ) -> bool {
+    unsafe fn subscribe(&mut self, sys: &SyscallTable, store: &[u8], prefix: &[u8]) -> bool {
         if self.sub == SUB_REFUSED {
             if self.backoff > 0 {
                 self.backoff -= 1;
@@ -334,7 +299,14 @@ impl TableConsumer {
             }
             self.sub = SUB_NONE;
         }
-        let rc = subscribe(sys, store, prefix, event, 0);
+        let h = match self.store_handle(sys, store) {
+            Ok(h) => h,
+            Err(e) => {
+                self.refuse(e);
+                return false;
+            }
+        };
+        let rc = subscribe(sys, h, prefix, 0);
         if rc >= 0 {
             self.handle = rc;
             self.sub = SUB_OPEN;
@@ -343,11 +315,38 @@ impl TableConsumer {
             self.pending = 1;
             return true;
         }
+        self.refuse(rc);
+        false
+    }
+
+    /// A refused subscribe: asked again next step on `EAGAIN`, else after
+    /// the backoff.
+    fn refuse(&mut self, rc: i32) {
         if rc != ERR_AGAIN {
             self.sub = SUB_REFUSED;
             self.backoff = RESUBSCRIBE_BACKOFF_STEPS;
         }
-        false
+    }
+
+    /// The handle ops on the store `store` names go through: `-1` for the
+    /// default, else the binding of the named store, opened on first use and
+    /// kept. A negative errno when the store cannot be bound.
+    ///
+    /// # Safety
+    /// `sys` must be a live syscall table.
+    pub unsafe fn store_handle(&mut self, sys: &SyscallTable, store: &[u8]) -> Result<i32, i32> {
+        if store.is_empty() {
+            return Ok(-1);
+        }
+        if self.store_bound == 0 {
+            let h = bind_store(sys, store);
+            if h < 0 {
+                return Err(h);
+            }
+            self.store = h;
+            self.store_bound = 1;
+        }
+        Ok(self.store)
     }
 
     /// Drop the token and any half-built shadow; the next read relists.
@@ -363,178 +362,100 @@ impl Default for TableConsumer {
     }
 }
 
-/// Create the module's subscription event (`kernel_abi::event::CREATE`).
-/// Returns the event fd, or a negative errno.
+/// Whether subscription `handle` rang since the last poll: `HANDLE_POLL`
+/// for `POLL_IN`, which takes the ring.
 ///
 /// # Safety
 /// `sys` must be a live syscall table.
-pub unsafe fn create_event(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, abi::kernel_abi::event::CREATE, core::ptr::null_mut(), 0)
-}
-
-/// `event::POLL` the module's event and, when it fired or a take is owed,
-/// `TAKE_RUNG` once at the store `store` names, marking every consumer whose
-/// subscription is named pending. `consumers` is every consumer on `event`
-/// that follows that store: a take clears the bits of all the caller's
-/// subscriptions on it there.
-///
-/// A take that fails is owed by every consumer, and so is one whose
-/// handles did not all fit (`more`): `POLL` consumed the signal, and a rung
-/// bit left set sends no other, so the next step takes again whether or
-/// not the event fires. Returns how many handles the take named.
-///
-/// # Safety
-/// `sys` must be a live syscall table; `event` an event the calling
-/// module created.
-pub unsafe fn take_rung(
-    sys: &SyscallTable,
-    store: &[u8],
-    event: i32,
-    consumers: &mut [&mut TableConsumer],
-) -> usize {
-    if event < 0 {
-        return 0;
-    }
-    let fired = (sys.provider_call)(
-        event,
-        abi::kernel_abi::event::POLL,
+pub unsafe fn rang(sys: &SyscallTable, handle: i32) -> bool {
+    let mut events = [abi::kernel_abi::poll::IN as u8];
+    let rc = (sys.provider_call)(
+        handle,
+        abi::kernel_abi::HANDLE_POLL,
+        events.as_mut_ptr(),
+        events.len(),
         core::ptr::null_mut(),
         0,
     );
-    let owed = consumers.iter().any(|c| c.take_owed != 0);
-    if fired <= 0 && !owed {
-        return 0;
-    }
-    let mut out = [0u8; take::HEAD_LEN + 4 * TAKE_MAX];
-    let answer = take_into(sys, store, event, &mut out);
-    let Some((more, handles)) = answer else {
-        for c in consumers.iter_mut() {
-            c.take_owed = 1;
-        }
-        return 0;
-    };
-    for c in consumers.iter_mut() {
-        c.take_owed = u8::from(more);
-    }
-    let mut named = 0;
-    for h in handles {
-        named += 1;
-        // Not `find`: consumers of one prefix share one subscription.
-        for c in consumers.iter_mut() {
-            c.ring(h);
-        }
-    }
-    named
+    rc > 0 && rc as u32 & abi::kernel_abi::poll::IN != 0
 }
 
-/// Issue one `TAKE_RUNG` on `event` into `out`: `(more, handles)`, or
-/// `None` when the take failed or its answer does not decode.
+/// Encode + issue `SUBSCRIBE` on `prefix` (`namespace::subscribe`) through
+/// `handle` (`-1`, or a handle bound to the store). Returns the subscription
+/// handle (routed to the bound store), which polls ready when it rings, or a
+/// negative errno.
 ///
 /// # Safety
 /// `sys` must be a live syscall table.
-pub unsafe fn take_into<'a>(
-    sys: &SyscallTable,
-    store: &[u8],
-    event: i32,
-    out: &'a mut [u8],
-) -> Option<(bool, impl Iterator<Item = i32> + 'a)> {
-    let req = take::Request {
-        event,
-        out_ptr: out.as_mut_ptr() as u64,
-        out_cap: out.len() as u32,
-    };
-    let mut arg = [0u8; take::REQUEST_LEN];
-    let len = take::encode(&mut arg, &req)?;
-    let n = store_call(sys, store, ns::TAKE_RUNG, &mut arg, len);
-    if n < 0 {
-        return None;
-    }
-    take::decode(out.get(..n as usize)?)
-}
-
-/// Encode + issue `SUBSCRIBE` on `prefix` with the caller's
-/// `event` (`namespace::subscribe`) at the store `store` names. Returns the
-/// subscription handle (a routed one through a selector) or a negative
-/// errno.
-///
-/// # Safety
-/// `sys` must be a live syscall table; `event` an event the calling
-/// module created.
-pub unsafe fn subscribe(
-    sys: &SyscallTable,
-    store: &[u8],
-    prefix: &[u8],
-    event: i32,
-    flags: u8,
-) -> i32 {
-    let mut arg = [0u8; ARG_MAX];
-    let req = subscribe::Request {
-        prefix,
-        event,
-        flags,
-    };
+pub unsafe fn subscribe(sys: &SyscallTable, handle: i32, prefix: &[u8], flags: u8) -> i32 {
+    let mut arg = [0u8; subscribe::ARG_MAX];
+    let req = subscribe::Request { prefix, flags };
     let Some(len) = subscribe::encode(&mut arg, &req) else {
-        return ERR_INVAL; // prefix too long for the scratch
+        return ERR_INVAL;
     };
-    store_call(sys, store, ns::SUBSCRIBE, &mut arg, len)
+    (sys.provider_call)(
+        handle,
+        ns::SUBSCRIBE,
+        arg.as_mut_ptr(),
+        len,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
-/// Encode + issue one `CHANGES` page read into `out`
-/// (`namespace::changes`) at the store `store` names, writing the encoded
-/// fence into `fence`
-/// (>= `fence::WIRE_MAX_LEN`). `sub` is the subscription the read serves
-/// (or -1). Returns the byte count written to `out`, or a negative errno.
+/// Encode + issue one `CHANGES` page read into `out` (`namespace::changes`)
+/// through `handle`: the subscription the read serves, or `-1` (or a handle
+/// bound to the store) for a read none serves. The fence of the page, when
+/// `fence` asks for it, is decoded from the trailer. Returns the byte count
+/// written to `out`, or a negative errno.
 ///
 /// # Safety
-/// `sys` must be a live syscall table; `out` and `fence` must remain
-/// valid for the duration of the call — the store writes the page into
-/// `out` and the covered fence into `fence`.
+/// `sys` must be a live syscall table.
 pub unsafe fn read_changes(
     sys: &SyscallTable,
-    store: &[u8],
+    handle: i32,
     prefix: &[u8],
-    sub: i32,
     token: &[u8],
     out: &mut [u8],
-    fence: &mut [u8],
+    fence: Option<&mut Option<abi::fence::Fence>>,
 ) -> i32 {
-    let mut arg = [0u8; ARG_MAX];
-    let req = changes::Request {
-        prefix,
-        sub,
-        token,
-        out_ptr: out.as_mut_ptr() as u64,
-        out_cap: out.len().min(u32::MAX as usize) as u32,
-        fence_out_ptr: fence.as_mut_ptr() as u64,
-        fence_out_cap: fence.len().min(u16::MAX as usize) as u16,
-    };
+    let mut arg = [0u8; changes::ARG_MAX];
+    let req = changes::Request { prefix, token };
     let Some(len) = changes::encode_request(&mut arg, &req) else {
         return ERR_INVAL;
     };
-    store_call(sys, store, ns::CHANGES, &mut arg, len)
+    let rc = (sys.provider_call)(
+        handle,
+        ns::CHANGES,
+        arg.as_mut_ptr(),
+        len,
+        out.as_mut_ptr(),
+        out.len(),
+    );
+    if let Some(f) = fence {
+        *f = if rc >= 0 {
+            abi::fence::trailer::get(&arg[..len])
+        } else {
+            None
+        };
+    }
+    rc
 }
 
-/// One store op (`handle == -1`) at the provider `store` names: the
-/// contract's default when empty, else the keyed volume or `platform` by
-/// selector.
+/// Bind the store registered under `name` (`kernel_abi::bind`, `NAME`): the
+/// bound handle, or a negative errno.
 ///
 /// # Safety
-/// `sys` must be a live syscall table; `arg[..len]` the op's request.
-pub unsafe fn store_call(
-    sys: &SyscallTable,
-    store: &[u8],
-    op: u32,
-    arg: &mut [u8],
-    len: usize,
-) -> i32 {
-    let len = len.min(arg.len());
-    if store.is_empty() {
-        (sys.provider_call)(-1, op, arg.as_mut_ptr(), len)
-    } else {
-        (sys.provider_call_sel)(store.as_ptr(), store.len(), -1, op, arg.as_mut_ptr(), len)
-    }
+/// `sys` must be a live syscall table.
+pub unsafe fn bind_store(sys: &SyscallTable, name: &[u8]) -> i32 {
+    let mut b = [0u8; abi::kernel_abi::bind::ARG_MAX];
+    let Some(n) = abi::kernel_abi::bind::name(name, &mut b) else {
+        return ERR_INVAL;
+    };
+    (sys.provider_open)(
+        u32::from(abi::registry::storage_namespace::ID),
+        abi::kernel_abi::bind::BIND,
+        b.as_ptr(),
+        n,
+    )
 }
-
-/// Scratch for the SUBSCRIBE / CHANGES arg encodings: a consumer's prefix
-/// (well under this), the longest token and the fixed fields.
-pub const ARG_MAX: usize = 256 + changes::TOKEN_MAX + changes::REQUEST_FIXED_LEN;

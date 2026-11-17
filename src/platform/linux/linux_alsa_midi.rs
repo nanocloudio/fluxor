@@ -34,7 +34,10 @@ struct LinuxAlsaMidiState {
     events_in: i32,
 }
 
-fn linux_alsa_midi_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn linux_alsa_midi_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-owned per-instance arena for this
     // module; size-matched to `LinuxAlsaMidiState` by the loader.
     let st = unsafe { instance_state::<LinuxAlsaMidiState>(state) };

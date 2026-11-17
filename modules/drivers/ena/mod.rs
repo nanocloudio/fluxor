@@ -176,7 +176,8 @@ struct EnaState {
     tx_bufs: u64,
     rx_bufs: u64,
     host_info: u64,
-    msix_event: i32,
+    /// One handle per MSI-X vector: each polls ready once per interrupt.
+    msix_vec_fd: [i32; MSIX_VECTORS],
     aenq_groups: u32,
     reset_deadline_us: u64,
     tx_inflight: u16,
@@ -415,7 +416,7 @@ unsafe fn create_sq(s: &mut EnaState, direction: u8, ring: u64, cq_idx: u16) {
 }
 
 unsafe fn dma(s: &mut EnaState, bytes: usize) -> u64 {
-    dev_dma_alloc(sys(s), bytes as u32, 4096)
+    dev_dma_alloc(sys(s), bytes as u32, 4096).map_or(0, |r| r.addr)
 }
 
 /// Allocate every ring. `false` if memory ran out.
@@ -471,20 +472,19 @@ unsafe fn enable_msix(s: &mut EnaState) -> bool {
         return false;
     }
     let table = dev_pcie_device_cfg_read32(sys_table, s.pci, cap as u16 + 4);
-    let bar = dev_pcie_device_bar_map(sys_table, s.pci, (table & 7) as u8);
-    if bar == 0 {
+    let offset = (table & !7) as usize;
+    let Some((bar, len)) = dev_pcie_device_bar_map(sys_table, s.pci, (table & 7) as u8) else {
+        return false;
+    };
+    if offset + MSIX_VECTORS * 16 > len as usize {
         return false;
     }
-    s.msix_event = dev_event_create(sys_table);
-    if s.msix_event < 0 {
-        return false;
-    }
-    let entries = bar as usize + (table & !7) as usize;
+    let entries = bar as usize + offset;
     for vector in 0..MSIX_VECTORS {
-        let Some((_, addr, data)) = dev_pcie_device_msi_alloc(sys_table, s.pci, s.msix_event)
-        else {
+        let Some((vfd, _, addr, data)) = dev_pcie_device_msi_alloc(sys_table, s.pci) else {
             return false;
         };
+        s.msix_vec_fd[vector] = vfd;
         let entry = entries + vector * 16;
         reg_write_at(entry, addr as u32);
         reg_write_at(entry + 4, (addr >> 32) as u32);
@@ -509,11 +509,10 @@ unsafe fn step_bind(s: &mut EnaState) {
         return;
     }
     s.pci = handle;
-    let bar = dev_pcie_device_bar_map(sys(s), handle, 0);
-    if bar == 0 {
+    let Some((bar, _)) = dev_pcie_device_bar_map(sys(s), handle, 0) else {
         fail(s, b"[ena] no bar0 rc=", 0);
         return;
-    }
+    };
     s.bar0 = bar as usize;
     if !allocate(s) {
         fail(s, b"[ena] dma alloc failed rc=", 0);
@@ -692,9 +691,9 @@ unsafe fn step_rx(s: &mut EnaState) {
 
 /// Ask the device for an interrupt on the next RX completion. Written after
 /// every poll: a frame that lands between this write and the next step
-/// raises the vector, whose event wakes this module's core.
+/// raises the vector, whose ring wakes this module's core.
 unsafe fn arm_rx_interrupt(s: &mut EnaState) {
-    if s.rx.unmask != 0 && s.msix_event >= 0 {
+    if s.rx.unmask != 0 && s.msix_vec_fd[0] >= 0 {
         fence();
         reg_write(s, s.rx.unmask - s.bar0, INTR_UNMASK);
     }
@@ -950,7 +949,7 @@ pub unsafe extern "C" fn module_new(
     s.in_chan = in_chan;
     s.out_chan = out_chan;
     s.pci = -1;
-    s.msix_event = -1;
+    s.msix_vec_fd = [-1; MSIX_VECTORS];
     s.phase = Phase::Bind;
     0
 }
@@ -981,8 +980,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             }
         }
         Phase::Run => {
-            if s.msix_event >= 0 {
-                let _ = dev_event_poll(sys(s), s.msix_event);
+            for vfd in s.msix_vec_fd {
+                if vfd >= 0 {
+                    let _ = dev_fd_poll(sys(s), vfd, POLL_IN);
+                }
             }
             step_aenq(s);
             step_rx(s);

@@ -46,9 +46,10 @@
 //   records tiling it from parsing that window's record headers, numbered
 //   back from the write sequence. The window must be anchored to sequence
 //   space and cover exactly what is in flight, or the state is not
-//   exported. `ip`'s `MSG_ACK` anchors it (with the stream's first sequence
-//   number) and slides it to SND.UNA, so a quiesced cut carries the bytes
-//   in flight; the standby's `tls` resends them on `ip`'s MSG_RETRANSMIT.
+//   exported. `ip`'s `MSG_RETX_ACK` (`stream_retx`) anchors it (with the
+//   stream's first sequence number) and slides it to SND.UNA, so a quiesced
+//   cut carries the bytes in flight; the standby's `tls` resends them on
+//   `ip`'s `MSG_RETX_REQUEST`.
 // - the receive buffer: `tls`'s partial inbound record (bytes `ip` delivered
 //   that do not yet form a record).
 // - TLS: suite, epochs (the record counts the first application epoch as 3
@@ -342,7 +343,7 @@ const _: () = assert!(TCS_SEG_CHUNK >= TS_RECV_MAX);
 /// The per-layer layouts the codecs below read and write; their SHA-256 is
 /// what each module's PAIR_PREPARE binds, so a layout change in `ip` or
 /// `tls` is refused at pairing rather than misread.
-pub const TCS_FXTC_LABEL: [u8; 49] = *b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6:timers";
+pub const TCS_FXTC_LABEL: [u8; 54] = *b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6:timers:send";
 pub const TCS_CT_TLS_LABEL: [u8; 28] = *b"fluxor.tls.continuity.ct_tls";
 
 /// Module-defined frames, `[type][len u16 LE][payload]` like every other
@@ -401,7 +402,13 @@ const FXTC_LAYOUT: u8 = 1;
 const FXTC_FIXED: usize = 112;
 /// Out-of-order slots and bytes (aarch64 `ip`: four of 512).
 const FXTC_REORDER: usize = TS_OOO_MAX;
-pub const FXTC_MAX: usize = FXTC_FIXED + FXTC_REORDER * (6 + TS_OOO_SEG);
+pub const FXTC_MAX: usize = FXTC_FIXED + FXTC_REORDER * (6 + TS_OOO_SEG) + FXTC_SEND_LEN;
+/// FXTC's send section, `[send_len u32][bytes]`: the bytes `ip` keeps of a
+/// connection whose consumer keeps none. Every flow this bridge moves is
+/// `tls`'s, which keeps its own (`ip` grants it `RETX`), so the section is
+/// empty both ways and a record that carries bytes is refused: the
+/// canonical record's send buffer holds TLS records, never `ip`'s bytes.
+const FXTC_SEND_LEN: usize = 4;
 
 /// FXTC's state codes, of which this bridge moves ESTABLISHED and
 /// CLOSE_WAIT (the peer half-closed; ours is still open).
@@ -569,6 +576,13 @@ pub fn fxtc_decode(b: &[u8], h: &mut TcpHalf) -> Result<(), CkptError> {
         o.len = 0;
     }
     h.ooo_count = n as u8;
+    if p + FXTC_SEND_LEN > b.len() {
+        return Err(CkptError::Truncated);
+    }
+    if le32(b, p) != 0 {
+        return Err(CkptError::Bounds);
+    }
+    p += FXTC_SEND_LEN;
     if p != b.len() {
         return Err(CkptError::Trailing);
     }
@@ -624,6 +638,7 @@ pub fn fxtc_encode(h: &TcpHalf, out: &mut [u8]) -> Option<usize> {
         w.u16(o.len)?;
         w.bytes(&o.bytes[..usize::from(o.len)])?;
     }
+    w.u32(0)?;
     if h.v6 {
         w.bytes(&h.local_ip6)?;
         w.bytes(&h.remote_ip6)?;
@@ -701,7 +716,7 @@ pub struct TlsHalf {
     /// output horizon, `TsState::out_bytes`).
     pub out_bytes: u64,
     /// The consumer's cursor its last acknowledgement carried
-    /// (`net_proto::CMD_DELIVERED`; `TsState::consumer_cursor`).
+    /// (`stream_cursor::CMD_CURSOR_DELIVERED`; `TsState::consumer_cursor`).
     pub consumer_cursor: u64,
     /// The clear byte it carried (`TsState::cursor_at`).
     pub cursor_at: u64,
@@ -2198,15 +2213,17 @@ fn tcs_horizon<O: TcsOut>(c: &TcsFlow, out: &mut O) -> bool {
 /// agree only when built alike. This bridge is built for the targets `tls`
 /// sizes these for (aarch64), and states them.
 #[cfg(target_arch = "aarch64")]
-const TCS_TLS_BUILD: [u32; 3] = [16704, 4096, 2];
+const TCS_TLS_BUILD: [u32; 3] = [16704, 16384, 2];
 #[cfg(not(target_arch = "aarch64"))]
 const TCS_TLS_BUILD: [u32; 3] = [4096, 4096, 0];
 
-fn tcs_fxtc_digest() -> [u8; 32] {
+/// The codec digest a PAIR_PREPARE to `ip` carries.
+pub fn tcs_fxtc_digest() -> [u8; 32] {
     sha256(&TCS_FXTC_LABEL)
 }
 
-fn tcs_ct_tls_digest() -> [u8; 32] {
+/// The codec digest a PAIR_PREPARE to `tls` carries.
+pub fn tcs_ct_tls_digest() -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(&TCS_CT_TLS_LABEL);
     for v in TCS_TLS_BUILD {
@@ -4341,7 +4358,7 @@ impl TcStack {
                 }
                 // Quiescent is drained: nothing stashed below `ip`'s send
                 // window, nothing gated. Bytes in flight are not waited on —
-                // `tls`'s retransmit window, anchored by `ip`'s `MSG_ACK`,
+                // `tls`'s retransmit window, anchored by `ip`'s `MSG_RETX_ACK`,
                 // holds exactly `[SND.UNA, SND.NXT)` and the cut carries it.
                 self.flows[i].drained = body.first() == Some(&1);
                 next!(

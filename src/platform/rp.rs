@@ -13,9 +13,14 @@ use fluxor::platform::planner::{self, PioRole};
 
 /// HAL `irq_bind` for RP: enable the NVIC line for a Tier 2 module's IRQ so it
 /// dispatches through the vector table's default interrupt handler →
-/// `isr_tier2_trampoline`. The `event_handle` / `trampoline` parameters are
+/// `isr_tier2_trampoline`. The `event_handle` and `ack` parameters are
 /// unused on RP (dispatch is by IRQ number). Returns 0.
-fn rp_irq_bind(irq: u32, _event_handle: i32, _trampoline_or_mmio: usize, _target_core: u8) -> i32 {
+fn rp_irq_bind(
+    irq: u32,
+    _event_handle: i32,
+    _ack: fluxor::kernel::sys::hal::IrqAck,
+    _target_core: u8,
+) -> i32 {
     // NVIC line ceiling, from the rp-pac `Interrupt` enum: the highest line on
     // each chip is SWI_IRQ_5 — 31 on RP2040, 52 on RP235x. The build-time
     // ISR-tier validator rejects out-of-range IRQs; this is the runtime backstop
@@ -381,7 +386,7 @@ fn rp_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
 
 /// RP has no RAM OTA staging surface — OTA delivery is the flash
 /// graph-slot A/B path (`graph_slot` + `ota_ingest`).
-fn rp_ota_stage_protect(_base: *mut u8, _len: usize, _executable: bool) -> bool {
+fn rp_ota_stage_protect(_region: &mut [u8], _executable: bool) -> bool {
     false
 }
 
@@ -632,7 +637,7 @@ fn rp_seal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
         return None;
     }
     let mut nonce = [0u8; 12];
-    if rp_csprng_fill(nonce.as_mut_ptr(), 12) != 0 {
+    if rp_csprng_fill(&mut nonce) != 0 {
         key.fill(0);
         return None;
     }
@@ -688,10 +693,7 @@ fn rp_unseal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
 ///
 /// [`HalOps::csprng_fill`]: crate::kernel::sys::hal::HalOps::csprng_fill
 /// [`rp_entropy`]: fluxor::platform::rp_entropy
-fn rp_csprng_fill(buf: *mut u8, len: usize) -> i32 {
-    // SAFETY: caller is `hal::csprng_fill`, which guarantees `buf` is valid
-    // for `len` bytes and is not aliased for the duration of this call.
-    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+fn rp_csprng_fill(out: &mut [u8]) -> i32 {
     match fluxor::platform::rp_entropy::fill_conditioned(out) {
         Ok(()) => 0,
         Err(e) => {
@@ -1003,25 +1005,24 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
         if isr_registered > 0 {
             log::info!("[isr] Tier 1b admitted {isr_registered} module(s)");
         }
-        match rp_run_main_loop(module_count as usize) {
-            Some(_rebuild) => {
-                log::info!("[reconfigure] main loop yielded, rebuilding graph");
-                scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
-            }
-            None => park_reporting("[fluxor] graph halted\r\n"),
+        if rp_run_main_loop(module_count as usize) {
+            log::info!("[reconfigure] main loop yielded, rebuilding graph");
+            scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
+        } else {
+            park_reporting("[fluxor] graph halted\r\n");
         }
     }
 }
 
-/// Step the graph until either a rebuild is requested (returns `Some((ptr,
-/// len))`) or the graph halts (returns `None`).
+/// Step the graph until either a rebuild is requested (returns `true`) or
+/// the graph halts (returns `false`).
 ///
 /// One thread, one loop: the graph is stepped, the USB device stack is
 /// pumped, the console is drained, and the core idles in `WFE` until the
 /// earlier of the pacer's deadline and the device stack's. Nothing here can
 /// wait on anything else, which is what keeps the USB pump serviced under
 /// every module's behaviour.
-fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
+fn rp_run_main_loop(module_count: usize) -> bool {
     use fluxor::kernel::exec::bare_metal::wait_for_wake;
 
     // SAFETY: `sched_modules` returns a shared global; this is the only
@@ -1041,11 +1042,11 @@ fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
             StepResult::Continue => {}
             StepResult::Done => {
                 log::warn!("[sched] all modules done");
-                return None;
+                return false;
             }
             StepResult::Error(i) => {
                 log::error!("[sched] step error module={i}");
-                return None;
+                return false;
             }
         }
 
@@ -1093,8 +1094,8 @@ fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
 
         debug_drain_poll();
 
-        if let Some(req) = scheduler::take_rebuild_request() {
-            return Some(req);
+        if scheduler::take_rebuild_request() {
+            return true;
         }
 
         let wake = fluxor::kernel::ipc::event::take_wake_pending();

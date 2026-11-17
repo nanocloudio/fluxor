@@ -211,8 +211,9 @@ pub struct TcpConn {
     pub in_recovery: bool,
     pub recover_seq: u32, // snd_nxt at recovery entry (fast retransmit or RTO)
 
-    /// `SND.UNA` as last reported to the consumer (`MSG_ACK`), which
-    /// releases the send bytes it retains up to there. The segment that
+    /// `SND.UNA` as last reported to a `RETX` connection's consumer
+    /// (`MSG_RETX_ACK`), which releases the send bytes it retains up to
+    /// there. The segment that
     /// moves `SND.UNA` reports it; one whose report found the consumer's
     /// channel full is reported again by the timer sweep.
     pub ack_told: u32,
@@ -244,6 +245,21 @@ pub struct TcpConn {
     /// latch a queue-full at the moment of close would lose the
     /// consumer event entirely.
     pub pending_close_notify: u8,
+    /// The sidebands granted on this connection (`net_proto::flag`): a
+    /// listener's grant, carried to every connection it accepts, or the
+    /// dial's. `RETX` means the consumer keeps what it sends and this
+    /// module keeps nothing; without it the bytes in flight are held in the
+    /// connection's send buffer (`sbuf`).
+    pub flags: u8,
+    /// The send buffer: the pool block holding the bytes sent and not yet
+    /// acknowledged (`SBUF_NONE` while the connection holds none), the ring
+    /// offset of its oldest byte, that byte's sequence number and how many
+    /// bytes it holds. A block is taken when a burst starts and given back
+    /// when everything in it is acknowledged (`send_pool.rs`).
+    pub sbuf: u16,
+    pub sbuf_head: u32,
+    pub sbuf_seq: u32,
+    pub sbuf_len: u32,
     /// Requester tag from `CMD_CONNECT_TO` (the connecting module's index plus
     /// one), echoed in `MSG_CONNECTED` so a fanned `net_out` routes the event
     /// back to the consumer that opened the connection. `0` = untagged. Only
@@ -322,6 +338,11 @@ impl TcpConn {
             delivered_bytes: 0,
             consumed_bytes: 0,
             pending_close_notify: 0,
+            flags: 0,
+            sbuf: SBUF_NONE,
+            sbuf_head: 0,
+            sbuf_seq: 0,
+            sbuf_len: 0,
             connect_tag: 0,
             sampled_flags: 0,
             chal_budget: CHALLENGE_ACK_PEER_BUDGET,
@@ -337,6 +358,9 @@ impl TcpConn {
         self.state != TcpState::Closed
     }
 }
+
+/// `TcpConn::sbuf` while the connection holds no send buffer.
+pub const SBUF_NONE: u16 = u16::MAX;
 
 /// Path MSS used for cwnd accounting (conservative lower bound below Ethernet MTU).
 pub const MSS: u16 = 1460;

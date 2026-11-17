@@ -916,7 +916,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult,
     // ISR-bridge drain — domain-global, once per tick.
     pump_isr_bridges();
     // Reap the completions of torn-down modules' lent buffers.
-    crate::kernel::module::block_lend::pump();
+    crate::kernel::ipc::lend::pump();
 
     let result = if active_count == 0 {
         StepResult::Done
@@ -1189,6 +1189,22 @@ pub fn deny_isr_tier_syscall(op: &'static str) -> bool {
     true
 }
 
+/// The module making a channel call: its id (`NO_MODULE` in kernel context),
+/// or `EACCES` for an ISR-tier module, which reads and writes bridge rings
+/// and never a channel (`op` names the call for the log). One lookup of the
+/// stepping module serves both questions on the channel's hot path.
+#[inline(never)]
+pub fn channel_caller(op: &'static str) -> Result<ModuleId, i32> {
+    let module_idx = current_module_index();
+    if module_idx >= module_slots() {
+        return Ok(NO_MODULE);
+    }
+    if deny_isr_tier_syscall(op) {
+        return Err(crate::kernel::sys::errno::EACCES);
+    }
+    Ok(module_idx as ModuleId)
+}
+
 /// Test-facing setter — assigns `domain` to module `module_idx`.
 /// Production paths route the assignment through `prepare_graph`,
 /// which reads it off the config blob; this helper exists so
@@ -1338,35 +1354,23 @@ pub fn record_step_time(module_idx: usize, elapsed_us: u32) {
 }
 
 /// Query step histogram. `module_idx == usize::MAX` returns the global
-/// histogram; otherwise a per-module histogram. Writes 8 u32 LE to `out_buf`.
-///
-/// # Safety
-/// `out_buf` must be valid for writes of at least 32 bytes
-/// (8 × u32 LE). The function does not read from `out_buf`. Aliasing
-/// is fine since each call writes a fixed-size, fixed-offset record.
-pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
-    let hist_ptr: *const [u32; 8] = if module_idx == usize::MAX {
-        &raw const SCHED.step_hist_global
+/// histogram; otherwise a per-module histogram. Writes 8 u32 LE to
+/// `out[..32]`; `EINVAL` when `out` is shorter.
+pub fn query_step_histogram(module_idx: usize, out: &mut [u8]) -> i32 {
+    let Some(out) = out.get_mut(..32) else {
+        return crate::kernel::sys::errno::EINVAL;
+    };
+    // SAFETY: scheduler-thread-only read of the histogram tables.
+    let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
+    let hist = if module_idx == usize::MAX {
+        &sched.step_hist_global
     } else if module_idx < module_slots() {
-        // SAFETY: module_idx < module_slots() bounds the offset; `step_hist`
-        // is `[[u32; 8]; MAX_MODULES]` so the cast + `add` is in-bounds.
-        unsafe {
-            (&raw const SCHED.step_hist)
-                .cast::<[u32; 8]>()
-                .add(module_idx)
-        }
+        &sched.step_hist[module_idx]
     } else {
         return crate::kernel::sys::errno::EINVAL;
     };
-    for i in 0..8 {
-        // SAFETY: hist_ptr is one of the two valid pointers selected above.
-        let v = unsafe { (*hist_ptr)[i] };
-        let bytes = v.to_le_bytes();
-        // SAFETY: caller's `# Safety` contract: `out_buf` covers 32 bytes;
-        // i*4 ranges in 0..28 → +4 reads stay in-bounds.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.add(i * 4), 4);
-        }
+    for (chunk, v) in out.chunks_exact_mut(4).zip(hist.iter()) {
+        chunk.copy_from_slice(&v.to_le_bytes());
     }
     0
 }
@@ -1380,11 +1384,10 @@ pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
 /// a different question — whether it is being stepped, not why it is
 /// not running.
 ///
-/// # Safety
-///
-/// `out_buf` must be valid for writes of
+/// Writes the record into `out`, which holds at least
 /// `monitor::MODULE_STATE_LEN` bytes.
-pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: usize) -> i32 {
+pub fn query_module_state(module_idx: usize, out: &mut [u8]) -> i32 {
+    let out_cap = out.len();
     use crate::abi::internal::monitor::{
         module_state_flags as f, MODULE_STATE_LEN, MODULE_STATE_MAX, MODULE_STATE_NAME_MAX,
     };
@@ -1434,11 +1437,7 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
         written += n;
     }
 
-    // SAFETY: caller's contract — `out_buf` covers `out_cap` bytes, and
-    // `written` is bounded by it above.
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf, written);
-    }
+    out[..written].copy_from_slice(&buf[..written]);
     written as i32
 }
 
@@ -1773,20 +1772,17 @@ pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
     }
 }
 
-/// Syscall: get the calling module's arena allocation.
-/// Returns null if no arena was allocated.
-///
-/// # Safety
-/// `size_out` must either be null or a valid `*mut u32`. The returned
-/// `*mut u8` (if non-null) points at the calling module's arena
-/// region; lifetime is bounded by the module's existence in the
-/// scheduler. Cross-module aliasing is prevented by the per-module
-/// arena layout, but the caller must not retain the pointer past
-/// module teardown.
-pub unsafe extern "C" fn syscall_arena_get(size_out: *mut u32) -> *mut u8 {
+/// The calling module's arena: its base and size, or `(null, 0)` when it
+/// has none. The base stays the module's for as long as it is loaded.
+pub fn arena_get() -> (*mut u8, u32) {
     let cm = current_module_index();
-    let Some(arena) = (&*core::ptr::addr_of!(SCHED)).arenas.get(cm).copied() else {
-        return core::ptr::null_mut();
+    // SAFETY: scheduler-thread read of the arena table.
+    let Some(arena) = (unsafe { &*core::ptr::addr_of!(SCHED) })
+        .arenas
+        .get(cm)
+        .copied()
+    else {
+        return (core::ptr::null_mut(), 0);
     };
     // An elastic heap's arena is its whole cap, committed at instantiation
     // for a module that declares raw arena use (`params_raw_arena`). One that
@@ -1806,8 +1802,5 @@ pub unsafe extern "C" fn syscall_arena_get(size_out: *mut u32) -> *mut u8 {
     } else {
         (arena.ptr, arena.size)
     };
-    if !size_out.is_null() {
-        *size_out = size;
-    }
-    ptr
+    (ptr, size)
 }

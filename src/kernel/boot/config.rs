@@ -707,7 +707,7 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 ///              Otherwise the largest of it and the two port
 ///              capacities is the edge's request (`ipc::ring_size`).
 ///   byte 8:    rate_class
-///   byte 9:    bit 0 = wake_on_write; bits 1-7 reserved
+///   byte 9:    bit 0 = wake_on_write; bit 1 = retains_send; bits 2-7 reserved
 ///   byte 10:   from_id, high byte
 ///   byte 11:   to_id, high byte
 pub const GRAPH_EDGE_SIZE: usize = 12;
@@ -904,6 +904,11 @@ pub struct GraphEdge {
     /// event-wake bit and rings the scheduler doorbell so an idle
     /// sleep is cut short. Byte 9 bit 0 of the edge record.
     pub wake_on_write: bool,
+    /// The consumer port declares `retains_send`: it keeps its own copy of
+    /// what it sends until the provider reports it acknowledged. Byte 9 bit
+    /// 1 of the edge record, set by the composer; read back through
+    /// `channel::FACTS`.
+    pub retains_send: bool,
 }
 
 // ============================================================================
@@ -1676,7 +1681,8 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> ModuleEntry {
 ///   MODULE_FLOW_BUDGET provider query.
 /// - byte 9:    bit 0 = wake_on_write (a
 ///   `channel_write` on this edge latches the consumer's event-wake
-///   bit and rings the scheduler doorbell); bits 1-7 reserved
+///   bit and rings the scheduler doorbell); bit 1 = retains_send (the
+///   consumer port keeps its own copy of what it sends); bits 2-7 reserved
 /// - bytes 10-11: reserved (0)
 ///
 /// Both port indices are 4 bits; the runtime caps both at
@@ -1700,6 +1706,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
         let buffer_bytes = u32::from_le_bytes([*ptr.add(4), *ptr.add(5), *ptr.add(6), *ptr.add(7)]);
         let rate_class = *ptr.add(8);
         let wake_on_write = (*ptr.add(9) & 0x01) != 0;
+        let retains_send = (*ptr.add(9) & 0x02) != 0;
         let edge_class = match edge_class_raw {
             1 => EdgeClass::DmaOwned,
             2 => EdgeClass::CrossCore,
@@ -1717,6 +1724,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
             buffer_bytes,
             rate_class,
             wake_on_write,
+            retains_send,
         }
     }
 }

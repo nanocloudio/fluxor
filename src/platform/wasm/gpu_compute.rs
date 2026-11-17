@@ -297,7 +297,10 @@ unsafe fn alloc_state(in_chan: i32, out_chan: i32) -> *mut GpuComputeState {
     raw
 }
 
-fn gpu_compute_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn gpu_compute_step(state: *mut u8) -> i32 {
     // SAFETY: single-threaded module step; `state` holds the live pointer
     // `build` wrote, and every buffer below was allocated in `alloc_state` at
     // exactly the length it is reconstituted with.

@@ -19,7 +19,7 @@ digest = sha256( "semantic_epoch"\0 SEMANTIC_EPOCH
 ```
 
 Every ABI number — contract ids, opcodes, permission bits, errno, poll bits,
-ioctl commands, fd tags — is declared once, in
+channel message types, the handle word's bit split — is declared once, in
 `crates/fluxor-abi/registry/registry.toml`. `fluxor abi-regen` generates
 `crates/fluxor-abi/src/registry.rs` from it, and that generated file is one of
 the sources `CONTRACTS_PLATFORM_SRC_HASH` covers, so a number change moves the

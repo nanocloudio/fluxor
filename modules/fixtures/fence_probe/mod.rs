@@ -44,7 +44,7 @@ pub struct ProbeState {
     pub cutoff_kind: u8,
     _pad2: [u8; 3],
     pub cutoff_index: u64,
-    buf: [u8; 64],
+    buf: [u8; FRAME_MAX],
 }
 
 mod params_def {
@@ -107,7 +107,7 @@ unsafe fn send_install(s: &mut ProbeState) {
         payload.as_ptr(),
         payload.len(),
         s.buf.as_mut_ptr(),
-        64,
+        FRAME_MAX,
     );
 }
 
@@ -123,7 +123,7 @@ unsafe fn send_fence(s: &mut ProbeState) {
         payload.as_ptr(),
         payload.len(),
         s.buf.as_mut_ptr(),
-        64,
+        FRAME_MAX,
     );
 }
 
@@ -131,7 +131,7 @@ unsafe fn service_events(s: &mut ProbeState) {
     let sys = &*s.syscalls;
     let mut n = 0;
     while n < 8 {
-        let (msg, plen) = net_read_frame(sys, s.addr_evt, s.buf.as_mut_ptr(), 64);
+        let (msg, plen) = net_read_frame(sys, s.addr_evt, s.buf.as_mut_ptr(), FRAME_MAX);
         if msg == 0 {
             break;
         }
@@ -203,7 +203,13 @@ unsafe fn service_events(s: &mut ProbeState) {
     }
 }
 
-fluxor_rt::module_facts! { state: ProbeState }
+/// The largest address-control frame read or written, header included.
+const FRAME_MAX: usize = 64;
+
+fluxor_rt::module_facts! {
+    state: ProbeState,
+    records: [out 0 ADDR_CTL_OUT_MAX_RECORD = FRAME_MAX, in 0 ADDR_EVT_IN_ACCEPTS_RECORD = FRAME_MAX],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

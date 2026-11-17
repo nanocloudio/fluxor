@@ -325,9 +325,6 @@ fn generate_config_impl(
         modules
     };
 
-    // Get data section for preset resolution
-    let data_section = config.get("data");
-
     // Load manifests FIRST (via the rich resolver — standard module
     // dirs + project/install roots + caller-supplied extras) so that
     // `parse_modules_map` / `build_module_entry` can read per-module
@@ -345,6 +342,39 @@ fn generate_config_impl(
         resolved_target,
         project_root,
     );
+
+    // Send pools are sized from the graph: what each instance retains for
+    // its consumers depends on who consumes it, which the wiring says.
+    let modules_with_pools;
+    let modules_ref = match (modules_ref.as_array(), config.get("wiring")) {
+        (Some(list), Some(wiring)) => {
+            let names: Vec<String> = list
+                .iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect();
+            // A wiring that does not parse is refused below, by name.
+            match parse_wiring_edges(wiring, &names, &manifests) {
+                Ok((edges, ..)) => {
+                    let mut list = list.clone();
+                    let default_of = |entry: &Value, param: &str| -> Option<u64> {
+                        let name = entry.get("name").and_then(Value::as_str)?;
+                        let mtype = entry.get("type").and_then(Value::as_str).unwrap_or(name);
+                        let schema = schema::load_schema_for_entry(entry, mtype, loc).ok()??;
+                        let p = schema.params.iter().find(|p| p.name == param)?;
+                        Some(u64::from(p.default))
+                    };
+                    derive_send_pools(&mut list, &edges, &names, &manifests, &default_of)?;
+                    modules_with_pools = Value::Array(list);
+                    &modules_with_pools
+                }
+                Err(_) => modules_ref,
+            }
+        }
+        _ => modules_ref,
+    };
+
+    // Get data section for preset resolution
+    let data_section = config.get("data");
 
     // Adaptive-tick validation (range checks + timer-class gate). Run here,
     // after the full manifest map exists, so the timer-class gate resolves
@@ -562,6 +592,15 @@ fn generate_config_impl(
         )?;
     }
 
+    validate_record_limits(
+        config,
+        &edges,
+        &module_names,
+        &manifests,
+        &from_specs,
+        &to_specs,
+    )?;
+
     // Required-input-unwired detector. Manifests mark some input
     // ports `required: true` — those MUST have a wiring edge
     // connecting to them or the module will block on an empty
@@ -664,6 +703,9 @@ fn generate_config_impl(
         &manifests,
         resolved_target.unwrap_or("linux"),
     )?;
+    // An edge contract's client and server meet across one edge, in one
+    // domain.
+    validate_edge_contracts(config, validation_list, &manifests)?;
 
     // Resume-style fault recovery. `fault_policy: restart` resumes the
     // module's existing state after releasing its handles and flushing
@@ -860,7 +902,17 @@ fn generate_config_impl(
                     )));
                 }
             }
-            flags.push(wake as u8);
+            let retains = edges
+            .get(i)
+            .and_then(|&(_, to_id, to_port, _, to_pi)| {
+                let to_dir = if to_port == 1 { 2u8 } else { 0u8 };
+                module_names
+                    .get(to_id as usize)
+                    .and_then(|n| manifests.get(n))
+                    .and_then(|m| m.find_port_spec(to_dir, to_pi))
+            })
+            .is_some_and(|p| p.retains_send);
+            flags.push(wake as u8 | (u8::from(retains) << 1));
         }
         flags
     };
@@ -886,7 +938,10 @@ fn generate_config_impl(
     //              type default. Consumed by the kernel's
     //              MODULE_FLOW_BUDGET query.
     //   byte 9:    bit 0 = wake_on_write (`wake: true` — control and
-    //              transaction classes only); bits 1-7 reserved
+    //              transaction classes only); bit 1 = retains_send (the
+    //              consumer port keeps its own copy of what it sends, read
+    //              back by the producer through `channel::FACTS`); bits 2-7
+    //              reserved
     //   byte 10:   from_id, high byte
     //   byte 11:   to_id, high byte
     //
@@ -926,8 +981,8 @@ fn generate_config_impl(
         graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
         graph_section.extend_from_slice(&buffer_bytes.to_le_bytes());
         graph_section.push(edge_rate_classes.get(i).copied().unwrap_or(0));
-        // byte 9: bit 0 = wake_on_write; bits 1-7 reserved.
-        graph_section.push(edge_wake_flags.get(i).copied().unwrap_or(0) & 0x01);
+        // byte 9: bit 0 = wake_on_write; bit 1 = retains_send; bits 2-7 reserved.
+        graph_section.push(edge_wake_flags.get(i).copied().unwrap_or(0) & 0x03);
         graph_section.push((*from_id >> 8) as u8);
         graph_section.push((*to_id >> 8) as u8);
     }

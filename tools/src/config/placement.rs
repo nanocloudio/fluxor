@@ -484,8 +484,17 @@ mod placement_tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: Default::default(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         };
         Manifest {
             ports: vec![

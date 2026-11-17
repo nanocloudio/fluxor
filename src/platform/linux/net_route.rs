@@ -47,6 +47,7 @@
 use super::instance;
 use super::net_identity as nl;
 use crate::abi::contracts::net::route as wire;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::net_route as store;
 use crate::kernel::sys::errno;
 use std::io::Write as _;
@@ -2042,11 +2043,8 @@ pub fn detach(addr: [u8; 4]) {
 }
 
 /// The provider: the shared store, realized on this host.
-///
-/// # Safety
-/// As `crate::kernel::net_route::dispatch`.
-pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    store::dispatch(Some(&REALIZER), handle, opcode, arg, arg_len)
+pub fn dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    store::dispatch(Some(&REALIZER), handle, opcode, arg, data)
 }
 
 // ---- reclaim ------------------------------------------------------------------

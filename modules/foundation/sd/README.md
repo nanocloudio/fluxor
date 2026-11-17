@@ -45,13 +45,17 @@ access = "write"
 
 `blocks` carries two things:
 
-- a sector stream from `start_block`, repositioned by `IOCTL_NOTIFY` seeks;
+- a sector stream from `start_block`, restarted at a consumer's LBA by
+  `storage.block` `READ_STREAM` (the stream runs on sequentially from there);
 - `storage.block`: `CAPS` and one-block `READ` and `WRITE` requests through
   `SUBMIT` / `REAP`. Capacity and the device id come from the card's CSD
   register.
 
 `CAPS` reports `F_ASYNC | F_WRITE | F_FUA | F_WRITE_COPIES`, queue depth 1,
-`max_blocks` 1. `SUBMIT` answers `EAGAIN` while the card is attaching or the
+`max_blocks` 1 — and not `F_READ_STREAM`: a filesystem reads a writable
+source that offers it through its stream, and the stream does not bound a
+request's `nblocks` (it runs on until restarted), so this card is read
+through requests. `SUBMIT` answers `EAGAIN` while the card is attaching or the
 one slot is taken, and `EINVAL` for a refused request (a range past the card,
 a buffer that does not cover the block, or a block the card cannot address).
 A queued request runs as soon as the stream's block in flight finishes, ahead
@@ -76,7 +80,7 @@ answer. A consumer reads this source through `SUBMIT` / `REAP`.
 
 When the stream has read its `block_count` blocks (non-zero), `blocks`
 reports end-of-stream (`POLL_HUP`) and the module keeps running, so `CAPS`,
-`SUBMIT` and `REAP` are still served. A seek after the end is not honoured.
+`SUBMIT` and `REAP` are still served. A `READ_STREAM` past the end is not honoured.
 
 ## Addressing
 

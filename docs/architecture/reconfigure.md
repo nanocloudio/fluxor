@@ -299,7 +299,7 @@ modules would see under an atomic reconfigure.
 | Bit | Name | Description |
 |-----|------|-------------|
 | 0 | mailbox_safe | Can consume from mailbox channels |
-| 1 | in_place_writer | Uses buffer_acquire_inplace |
+| 1 | in_place_writer | Uses the channel's `ACQUIRE_INPLACE` |
 | 2 | deferred_ready | Needs init time before downstream runs |
 | 3 | drain_capable | Exports module_drain for live reconfigure |
 | 4 | isr_module | Defines module_isr_entry (Tier 2) |

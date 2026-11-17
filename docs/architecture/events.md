@@ -26,7 +26,7 @@ Events solve both: the scheduler only steps a module when its event fires, and a
 Hardware edge
     |
     v
-poll_gpio_edges()  ──>  event_signal(handle)
+poll_gpio_edges()  ──>  doorbell_ring(doorbell)
                               |
                          sets signaled = true
                          sets EVENT_WAKE_PENDING bit for owner module
@@ -71,11 +71,11 @@ The event is owned by the currently executing module. When signaled, the schedul
 ### Signal
 
 ```rust
-// From any module (e.g., module A signaling module B's event):
+// From the module that owns the event:
 let rc = (sys.provider_call)(evt, event::SIGNAL, core::ptr::null_mut(), 0);
 ```
 
-Sets the signaled flag, marks the owning module for wake, and pokes `SCHEDULER_WAKE`. The owning module will be stepped in the same tick cycle (intra-tick wake).
+Sets the signaled flag, marks the owning module for wake, and pokes `SCHEDULER_WAKE`. The owning module will be stepped in the same tick cycle (intra-tick wake). Every event op checks that the caller owns the event; an event handle names its slot at a generation, so a handle kept past `DESTROY` names nothing (`EBADF`). Another module, a provider or the platform signals a module through a doorbell instead (below).
 
 ### Poll
 
@@ -106,19 +106,38 @@ Events can be bound to hardware IRQ sources. This document shows GPIO edge detec
 
 ```rust
 // Bind event to GIC IRQ 187 (example) so the kernel signals the event
-// on fire. The MMIO base is optional (0 = no auto-ACK).
-let mut args = [0u8; 12];
+// on fire. `ack` says how the kernel quiets the device behind the line
+// first: `event::ack::NONE` leaves it to the driver, `VIRTIO_MMIO`
+// acknowledges the machine's virtio-mmio transport on that line.
+let mut args = [0u8; 5];
 args[..4].copy_from_slice(&187u32.to_le_bytes());  // IRQ number
-// args[4..12] = MMIO base (u64 LE, zero if not needed)
-let rc = (sys.provider_call)(evt, event::BIND_IRQ, args.as_mut_ptr(), 12);
+args[4] = event::ack::NONE;
+let rc = (sys.provider_call)(evt, event::BIND_IRQ, args.as_mut_ptr(), 5);
 ```
 
 After binding, the kernel's ISR signals the event whenever the IRQ
 fires. The module does not need to poll — just poll the event.
 
-GPIO edge-triggered wakes go through a different path: the GPIO
-contract's `WATCH_EDGE` opcode binds a specific edge transition on a
-claimed pin to an already-created event handle.
+GPIO edge-triggered wakes go through a doorbell: the GPIO contract's
+`WATCH_EDGE` opcode on a claimed pin mints a watch handle that polls
+`POLL_IN` once per edge.
+
+### Doorbells
+
+A provider signals the module that minted one of its handles through a
+doorbell. An op the registry marks `signals` — `storage.namespace::SUBSCRIBE`,
+`gpio::WATCH_EDGE`, `pcie_device::MSI_ALLOC` — mints a handle whose route
+owns an event slot claimed for the minter. After the provider answers the op
+with its own index, the kernel delivers `kernel::BIND_DOORBELL` to it (that
+index as the handle, `[doorbell u32][contract u16][0 u16]` as `arg`); a
+refusal closes the index and fails the op. The provider rings the doorbell
+when its condition holds: platform code with `event::doorbell_ring`, which is
+interrupt-safe, a module provider with `kernel::DOORBELL_RING` (`[doorbell
+u32]`), which only the provider the doorbell was handed to may ring. The
+minter is woken (`latch_module_wake`), and `HANDLE_POLL` on its handle
+answers `POLL_IN` once per ring — the poll takes it. Closing the handle closes
+the provider's index and frees the slot; the doorbell's generation moves, so
+a ring after the close rings nothing.
 
 ### Release
 
@@ -191,6 +210,26 @@ A lightweight variant of `step_modules` that:
 | Module-to-module signal | Same tick cycle | Module A signals → `step_woken_modules()` runs before sleep |
 | ISR sources | Sub-tick | ISR → `event_signal_from_isr()` → `SCHEDULER_WAKE` breaks the sleep |
 
+### Channel readiness and stream state
+
+A channel handle polls through the same `HANDLE_POLL` (`channel_poll` on
+the syscall table), from either end of the channel:
+
+| Bit | Holds when |
+|-----|------------|
+| `IN` | a ring byte or a mailbox's READY record is buffered |
+| `OUT` | a write fits now (a mailbox: its record is IDLE), or the reader is gone, when every write is committed and kept nowhere |
+| `HUP` | the producer ended the stream (`channel::SET_HUP`), or retired (`producer_gone`) |
+| `ERR` | the producer retired with an error |
+| `WROTE` | anything was written since the last `channel::FLUSH` |
+
+HUP has one source per meaning: the producer's statement, which a
+`FLUSH` clears to start a new stream, and its retirement, which no flush
+clears. ERR stays for the channel's life. HUP with WROTE is a stream that
+ended; HUP without WROTE one that never started. A successful write on a
+`wake: true` edge latches the consumer's wake bit, as an event signal
+does, so data cuts an idle sleep short.
+
 ## ISR Safety Contract
 
 `event_signal_from_isr()` contains exactly:
@@ -207,8 +246,9 @@ No validation beyond bounds. No allocation. No channel writes. No driver logic. 
 
 ## GPIO Event Binding Model
 
-GPIO event binding on RP targets uses software polling via
-`poll_gpio_edges()` (same-tick-cycle response, ~1 ms worst case). This model
+GPIO edge watches on RP targets use software polling via
+`poll_gpio_edges()` (same-tick-cycle response, ~1 ms worst case), which
+rings each watch's doorbell. This model
 is suitable for buttons, sensors, and most GPIO-driven peripherals.
 
 It is also the model the RP platform commits to: `IO_IRQ_BANK0` is not
@@ -219,10 +259,10 @@ For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` work
 
 ## Timers
 
-A timer is an fd, and it wakes its owner the same way an event does.
-`timer::CREATE` returns a tagged fd, `SET` arms it with a delay in
-milliseconds, and the generic fd `POLL` reports `POLL_IN` once it has
-fired. A module that wants to act in 5 ms arms a timer and waits on it; it
+A timer is a handle, and it wakes its owner the same way an event does.
+`timer::CREATE` returns the timer's handle, `SET` arms it with a delay in
+milliseconds, and `HANDLE_POLL` reports `POLL_IN` once it has fired. Every
+timer op checks that the caller owns the timer. A module that wants to act in 5 ms arms a timer and waits on it; it
 does not read the clock on a tick it does not control.
 
 The kernel does two things with the armed timers of a domain each time it
@@ -244,10 +284,11 @@ expiry latches the owner's wake bit, but only the owner's own domain
 shortens its sleep for it, so a sibling domain's short timer cannot drag
 this one off its backstop.
 
-`POLL` on a timer or event fd is a kernel primitive — a question about the
-handle rather than a request to whatever provider the handle belongs to —
-so `provider_call` routes the `0x0C` opcode class to the kernel ahead of
-the handle's contract.
+`HANDLE_POLL` is a kernel primitive — a question about the handle rather
+than a request to whatever provider the handle belongs to — so
+`provider_call` routes it to the kernel ahead of the handle's contract, which
+answers through its vtable's `poll` (the timer's deadline, the event's flag,
+a signalling handle's doorbell).
 
 ## ABI
 
@@ -265,7 +306,7 @@ the handle's contract.
 | `0x0401` | `SIGNAL` | handle=event | 0 or error |
 | `0x0402` | `POLL` | handle=event | 1 (was signaled), 0 (not), or error |
 | `0x0403` | `DESTROY` | handle=event | 0 or error |
-| `0x0451` | `BIND_IRQ` | handle=event, arg=[irq:u32 LE, mmio_base:u64 LE] (12B) | 0 or error |
+| `0x0451` | `BIND_IRQ` | handle=event, arg=[irq:u32 LE, ack:u8] (5B) | 0 or error |
 
 ### Error Codes
 
@@ -369,14 +410,16 @@ The kernel provides:
 The kernel does NOT provide:
 - WiFi opcodes, netif types, association states
 - Protocol logic, packet formats, device registers
-- Any domain-specific dispatch or IOCTL
+- Any domain-specific dispatch, or a sideband word beside a channel: what
+  two modules tell each other travels in the contract they speak
 
 ## Implementation
 
 | File | Description |
 |------|-------------|
 | `src/kernel/ipc/event.rs` | Event pool, create/signal/poll/destroy; IRQ binding stored per-event |
-| `src/kernel/ipc/fd.rs` | Tagged fd table, unified `fd_poll`, timer slots and `timer_pump()` |
+| `src/kernel/ipc/handle.rs` | Native handle resolution (`resolve_owned`) and `fd_poll` / `fd_poll_multi` |
+| `src/kernel/ipc/timer.rs` | Timer slots and `timer_pump()` |
 | `crates/fluxor-abi/src/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
 | `crates/fluxor-abi/src/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
 | `src/kernel/module/syscalls.rs` | Event contract dispatch |

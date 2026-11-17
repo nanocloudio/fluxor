@@ -35,7 +35,10 @@ struct LinuxGpuInstance {
     announced: bool,
 }
 
-fn linux_gpu_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn linux_gpu_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned bootstrap buffer initialised by `install_state`
     // with a `Box<LinuxGpuInstance>` in `build_linux_gpu`.
     let st = unsafe { instance_state::<LinuxGpuInstance>(state) };

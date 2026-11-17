@@ -49,18 +49,6 @@ pub const NETIF_STATE_READY: u8 = 5;
 pub const NETIF_STATE_ERROR: u8 = 255;
 
 // ============================================================================
-// Channel Ioctl Commands
-// ============================================================================
-
-pub use abi::registry::ioctl::FLUSH as IOCTL_FLUSH;
-pub use abi::registry::ioctl::NOTIFY as IOCTL_NOTIFY;
-pub use abi::registry::ioctl::POLL_NOTIFY as IOCTL_POLL_NOTIFY;
-pub use abi::registry::ioctl::SET_HUP as IOCTL_EOF;
-/// Bytes a write can place in the channel's ring now (`[u32 out]`); 0 for a
-/// full ring and for a mailbox channel, which has no ring to measure.
-pub use abi::registry::ioctl::WRITABLE as IOCTL_WRITABLE;
-
-// ============================================================================
 // FMP Well-Known Message Types (pre-computed FNV-1a hashes)
 // ============================================================================
 

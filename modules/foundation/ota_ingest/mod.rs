@@ -508,6 +508,8 @@ pub extern "C" fn module_new(
             abi::kernel_abi::FLASH_LAYOUT,
             layout.as_mut_ptr(),
             layout.len(),
+            core::ptr::null_mut(),
+            0,
         );
         s.slot_size = GraphFlash::decode(&layout)
             .filter(|_| rc >= 0)
@@ -554,6 +556,8 @@ unsafe fn channel_port_out(sys: &SyscallTable, index: u32) -> i32 {
         abi::kernel_abi::channel::PORT,
         arg.as_mut_ptr(),
         arg.len(),
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -564,6 +568,8 @@ unsafe fn channel_port_in(sys: &SyscallTable, index: u32) -> i32 {
         abi::kernel_abi::channel::PORT,
         arg.as_mut_ptr(),
         arg.len(),
+        core::ptr::null_mut(),
+        0,
     )
 }
 

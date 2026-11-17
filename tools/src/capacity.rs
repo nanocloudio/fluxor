@@ -231,6 +231,14 @@ pub fn kernel_places_arenas(runtime: &str) -> bool {
     kernel_profile(runtime) == "profile_rp"
 }
 
+/// Whether `target`'s kernel commits a module heap whole at instantiation
+/// (`HEAP_SEGMENTS` == 1), carving the instance's whole cap from the state
+/// arena before the module runs. Elsewhere a heap grows on demand, so its cap
+/// is a ceiling, not a load-time charge.
+pub fn kernel_commits_heaps(target: &str) -> bool {
+    eval(profile_body(kernel_profile(target)), "HEAP_SEGMENTS") == Some(1)
+}
+
 /// The module state arena a graph on `runtime` is admitted against, in bytes,
 /// and whether the graph's `capacity:` envelope set it. `default_state` and
 /// `default_buffer` are the target's planning figures (`state_arena_kb`,
@@ -324,9 +332,10 @@ pub fn kernel_pool_domain(target: &str, pool: &str) -> Option<(u64, &'static str
             "channel-id domain (MAX_CHANNELS)",
         )),
         "owners" => Some((kernel_max_owners(target), "owner-slot domain (MAX_OWNERS)")),
-        "events" | "timers" => {
-            fd_slot_domain().map(|n| (n, "tagged-fd slot domain (fd::SLOT_MASK + 1)"))
-        }
+        "events" | "timers" | "handles" => Some((
+            handle_index_domain(),
+            "handle index domain (handle::INDEX_LIMIT)",
+        )),
         "sandboxes" if linux => cfg_const(KERNEL_HOST_BACKEND, None, "MAX_SANDBOXES")
             .map(|n| (n, "sandbox-index domain (MAX_SANDBOXES)")),
         "tty_sessions" if linux => cfg_const(KERNEL_HOST_BACKEND, None, "MAX_TTY_SESSIONS")
@@ -335,10 +344,10 @@ pub fn kernel_pool_domain(target: &str, pool: &str) -> Option<(u64, &'static str
     }
 }
 
-/// Slots a tagged fd's slot field can name (`fd::SLOT_MASK` + 1): the
-/// domain of the event and timer tables, whose handles carry their slot there.
-fn fd_slot_domain() -> Option<u64> {
-    Some(fluxor_abi::registry::fd::SLOT_MASK as u64 + 1)
+/// Slots a handle's index field can name (`handle::INDEX_LIMIT`): the domain
+/// of every table a handle names a slot of (events, timers, routed handles).
+fn handle_index_domain() -> u64 {
+    fluxor_abi::registry::handle::INDEX_LIMIT as u64
 }
 
 /// What a config gives the kernel's boot plan to derive pool sizes from
@@ -625,7 +634,7 @@ pub const POOL_IDS: &[(&str, u16)] = &[
     ("store_grants", 0x000D),
     ("sandboxes", 0x000E),
     ("tty_sessions", 0x000F),
-    ("tracked_handles", 0x0010),
+    ("handles", 0x0010),
     ("state_free_list", 0x0011),
     ("net_policy_tables", 0x0012),
     ("net_policy_table_bytes", 0x0013),
@@ -635,6 +644,7 @@ pub const POOL_IDS: &[(&str, u16)] = &[
     ("net_route_segments", 0x0017),
     ("net_route_peers", 0x0018),
     ("net_route_held", 0x0019),
+    ("lends", 0x001A),
 ];
 
 /// An arena entry with this bit set is in KiB — mirror of

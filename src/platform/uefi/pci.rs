@@ -59,6 +59,9 @@ struct Bus {
     first_bus: u8,
     last_bus: u8,
     devices: [Device; MAX_DEVICES],
+    /// Each device's BAR sizes, probed the first time a BAR is mapped; 0
+    /// until then.
+    bar_sizes: [[u64; 6]; MAX_DEVICES],
     count: usize,
 }
 
@@ -67,6 +70,7 @@ static mut BUS: Bus = Bus {
     first_bus: 0,
     last_bus: 0,
     devices: [Device::EMPTY; MAX_DEVICES],
+    bar_sizes: [[0; 6]; MAX_DEVICES],
     count: 0,
 };
 
@@ -131,6 +135,7 @@ pub fn enumerate(ecam: u64, first_bus: u8, last_bus: u8) -> usize {
     b.first_bus = first_bus;
     b.last_bus = last_bus;
     b.count = 0;
+    b.bar_sizes = [[0; 6]; MAX_DEVICES];
     let mut pending = [first_bus; MAX_BUSES];
     let (mut head, mut tail) = (0usize, 1usize);
     while head < tail {
@@ -232,11 +237,9 @@ fn resolve(selector: &str) -> Result<usize, i32> {
     }
 }
 
-/// # Safety
-/// `arg`/`arg_len` describe a caller-owned selector.
-pub unsafe fn bind(arg: *const u8, arg_len: usize) -> i32 {
-    let bytes = core::slice::from_raw_parts(arg, arg_len);
-    let Ok(text) = core::str::from_utf8(bytes) else {
+/// Bind the device `selector` names; the bound handle.
+pub fn bind(selector: &[u8]) -> i32 {
+    let Ok(text) = core::str::from_utf8(selector) else {
         return errno::EINVAL;
     };
     let selector = text.trim_end_matches('\0').trim();
@@ -265,22 +268,41 @@ pub unsafe fn bind(arg: *const u8, arg_len: usize) -> i32 {
         d.vendor,
         d.device
     );
-    fluxor::kernel::ipc::fd::tag_fd(fluxor::kernel::ipc::fd::FD_TAG_PCIE_DEVICE, index as i32)
+    index as i32
 }
 
+/// The device index a bound handle's index names.
 fn bound(handle: i32) -> Option<usize> {
-    if handle < 0 {
-        return None;
-    }
-    let (tag, slot) = fluxor::kernel::ipc::fd::untag_fd(handle);
-    if tag != fluxor::kernel::ipc::fd::FD_TAG_PCIE_DEVICE {
-        return None;
-    }
-    devices()
-        .get(slot as usize)
-        .filter(|d| d.bound)
-        .map(|_| slot as usize)
+    let index = usize::try_from(handle).ok()?;
+    devices().get(index).filter(|d| d.bound).map(|_| index)
 }
+
+/// Device-register aperture `index`, `(address, len)`: the memory BARs of
+/// the enumerated devices, in device then BAR order, where the kernel reaches
+/// them. Never RAM, never the interrupt controller. `None` past the last, and
+/// for a BAR of 4 GiB or more, which an aperture answer cannot state.
+pub fn aperture(index: u8) -> Option<(u64, u64)> {
+    let mut left = usize::from(index);
+    for (i, d) in devices().iter().enumerate() {
+        let bars = if d.is_bridge { 2 } else { 6 };
+        for n in 0..bars {
+            let Some(address) = bar_address(d, n) else {
+                continue;
+            };
+            if left > 0 {
+                left -= 1;
+                continue;
+            }
+            let size = bar_size(i, n)?;
+            u32::try_from(size).ok()?;
+            return Some((reachable(address, size)?, size));
+        }
+    }
+    None
+}
+
+/// Handles the PCI table hands out at once: one per device.
+pub const HANDLE_SLOTS: usize = MAX_DEVICES;
 
 /// The requester ID of the device a handle is bound to: bus, device, function.
 pub fn requester_id(handle: i32) -> Option<u32> {
@@ -298,31 +320,29 @@ pub fn close(handle: i32) -> i32 {
     }
 }
 
-/// # Safety
-/// `arg` holds `arg_len` caller-owned bytes.
-pub unsafe fn cfg_read(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    let Some(index) = bound(handle).filter(|_| !arg.is_null() && arg_len >= 8) else {
+/// `CFG_READ32`: arg = `[offset u16][0 u16]`, the word written to arg[4..8].
+pub fn cfg_read(handle: i32, arg: &mut [u8]) -> i32 {
+    let Some(index) = bound(handle).filter(|_| arg.len() >= 8) else {
         return errno::EINVAL;
     };
-    let offset = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+    let offset = u16::from_le_bytes([arg[0], arg[1]]) as usize;
     let d = bus().devices[index];
     let Some(addr) = config(bus(), d.bus, d.dev, d.func, offset) else {
         return errno::EINVAL;
     };
     // SAFETY: inside the ECAM window MCFG described, mapped Device.
-    let value = mmio::read32(addr).to_le_bytes();
-    core::ptr::copy_nonoverlapping(value.as_ptr(), arg.add(4), 4);
+    let value = unsafe { mmio::read32(addr) };
+    arg[4..8].copy_from_slice(&value.to_le_bytes());
     0
 }
 
-/// # Safety
-/// `arg` holds `arg_len` caller-owned bytes.
-pub unsafe fn cfg_write(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    let Some(index) = bound(handle).filter(|_| !arg.is_null() && arg_len >= 8) else {
+/// `CFG_WRITE32`: arg = `[offset u16][0 u16][value u32]`.
+pub fn cfg_write(handle: i32, arg: &[u8]) -> i32 {
+    let Some(index) = bound(handle).filter(|_| arg.len() >= 8) else {
         return errno::EINVAL;
     };
-    let offset = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
-    let value = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+    let offset = u16::from_le_bytes([arg[0], arg[1]]) as usize;
+    let value = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]);
     let d = bus().devices[index];
     if write(bus(), d.bus, d.dev, d.func, offset, value) {
         0
@@ -331,20 +351,22 @@ pub unsafe fn cfg_write(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     }
 }
 
-/// Where the kernel reaches physical `address`. Every address the identity map
-/// covers and RAM does not hold is Device from boot. Above it, the top gigabytes
-/// of the map serve as aliases, one per physical gigabyte asked for.
-fn reachable(address: u64) -> Option<u64> {
+/// Where the kernel reaches the `len` bytes at physical `address`. Every
+/// address the identity map covers and RAM does not hold is Device from boot.
+/// Above it, the top gigabytes of the map serve as aliases, one per physical
+/// gigabyte asked for, so a span there must lie inside one gigabyte.
+fn reachable(address: u64, len: u64) -> Option<u64> {
     const GIB: u64 = 1 << 30;
     const IDENTITY_END: u64 = 512 * GIB;
     /// What `TCR_VALUE`'s output size can name.
     const PA_END: u64 = 1 << 40;
     const ALIASES: usize = 8;
     static mut ALIASED: [u64; ALIASES] = [u64::MAX; ALIASES];
-    if address < IDENTITY_END {
+    let end = address.checked_add(len)?;
+    if end <= IDENTITY_END {
         return Some(address);
     }
-    if address >= PA_END {
+    if address < IDENTITY_END || end > PA_END || address % GIB + len > GIB {
         return None;
     }
     let gb = address / GIB;
@@ -398,34 +420,78 @@ fn bar_address(d: &Device, n: usize) -> Option<u64> {
     }
 }
 
-/// # Safety
-/// `arg` holds `arg_len` caller-owned bytes.
-pub unsafe fn bar_map(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    let Some(index) = bound(handle).filter(|_| !arg.is_null() && arg_len >= 10) else {
+/// The size of BAR `n` of device `index`, by the standard probe: all ones
+/// written, and the bits that read back set are the address bits the BAR
+/// decodes. Memory decode is off meanwhile, so the device answers nothing at
+/// a half-written address. Probed once and kept; `None` for a BAR that
+/// decodes nothing.
+fn bar_size(index: usize, n: usize) -> Option<u64> {
+    let b = bus();
+    if b.bar_sizes[index][n] != 0 {
+        return Some(b.bar_sizes[index][n]);
+    }
+    let d = b.devices[index];
+    let reg = CFG_BAR0 + n * 4;
+    let probe = |reg: usize| {
+        let kept = read(b, d.bus, d.dev, d.func, reg);
+        write(b, d.bus, d.dev, d.func, reg, u32::MAX);
+        let mask = read(b, d.bus, d.dev, d.func, reg);
+        write(b, d.bus, d.dev, d.func, reg, kept);
+        (kept, mask)
+    };
+    let command = read(b, d.bus, d.dev, d.func, CFG_COMMAND) & 0xFFFF;
+    write(b, d.bus, d.dev, d.func, CFG_COMMAND, command & !CMD_MEMORY);
+    let (low, mask_low) = probe(reg);
+    let mask_high = if (low >> 1) & 3 == 2 {
+        probe(reg + 4).1
+    } else {
+        u32::MAX
+    };
+    write(b, d.bus, d.dev, d.func, CFG_COMMAND, command);
+    let mask = (u64::from(mask_high) << 32) | u64::from(mask_low & !0xF);
+    let size = (!mask).wrapping_add(1);
+    (size != 0).then(|| {
+        b.bar_sizes[index][n] = size;
+        size
+    })
+}
+
+/// `BAR_MAP`: in `[bar u8]`, out `[addr u64][len u32]`.
+pub fn bar_map(handle: i32, arg: &mut [u8]) -> i32 {
+    let Some(index) = bound(handle).filter(|_| arg.len() >= 12) else {
         return errno::EINVAL;
     };
     let d = bus().devices[index];
-    let Some(address) = bar_address(&d, usize::from(*arg)).and_then(reachable) else {
+    let n = usize::from(arg[0]);
+    let Some((address, size)) = bar_address(&d, n).and_then(|a| Some((a, bar_size(index, n)?)))
+    else {
         return errno::ENODEV;
     };
-    let bytes = address.to_le_bytes();
-    core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg.add(2), 8);
+    let Ok(len) = u32::try_from(size) else {
+        return errno::ERANGE;
+    };
+    let Some(address) = reachable(address, size) else {
+        return errno::ENODEV;
+    };
+    arg[0..8].copy_from_slice(&address.to_le_bytes());
+    arg[8..12].copy_from_slice(&len.to_le_bytes());
     0
 }
 
-/// # Safety
-/// `arg` holds `arg_len` caller-owned bytes.
-pub unsafe fn info(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    let Some(index) = bound(handle).filter(|_| !arg.is_null() && arg_len >= 32) else {
+/// `INFO`: the 32-byte record `[vendor u16][device u16][class u32][bus u8]
+/// [dev u8][func u8][0; 21]`.
+pub fn info(handle: i32, arg: &mut [u8]) -> i32 {
+    let Some(index) = bound(handle).filter(|_| arg.len() >= 32) else {
         return errno::EINVAL;
     };
     let d = bus().devices[index];
-    core::ptr::write_bytes(arg, 0, 32);
-    core::ptr::copy_nonoverlapping(d.vendor.to_le_bytes().as_ptr(), arg, 2);
-    core::ptr::copy_nonoverlapping(d.device.to_le_bytes().as_ptr(), arg.add(2), 2);
-    core::ptr::copy_nonoverlapping(d.class.to_le_bytes().as_ptr(), arg.add(4), 4);
-    *arg.add(8) = d.bus;
-    *arg.add(9) = d.dev;
-    *arg.add(10) = d.func;
+    let out = &mut arg[..32];
+    out.fill(0);
+    out[0..2].copy_from_slice(&d.vendor.to_le_bytes());
+    out[2..4].copy_from_slice(&d.device.to_le_bytes());
+    out[4..8].copy_from_slice(&d.class.to_le_bytes());
+    out[8] = d.bus;
+    out[9] = d.dev;
+    out[10] = d.func;
     32
 }

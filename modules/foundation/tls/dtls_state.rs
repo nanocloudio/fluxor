@@ -362,7 +362,6 @@ unsafe fn dtls_pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> b
 }
 
 unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
-    let sys = &*s.syscalls;
     let driver = &mut s.peer_sessions[idx].endpoint.driver;
     let hl = driver.suite.hash_len();
     let transcript_hash = match &driver.transcript {
@@ -377,47 +376,31 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
     let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
     let vc_hash = sha256(&verify_content[..vc_len]);
 
-    // Sign via kernel KEY_VAULT when the identity key is held there; fall
-    // back to the in-module signer on ENOSYS.
-    if s.identity_rsa_suite != 0 {
-        // RSASSA-PSS-SHA256 from the vault's resumable job: the same digest
-        // each call until it answers, since the transcript does not move.
-        const SIGN_MODE_DIGEST: u8 = 1;
+    // An RSA or P-256 identity is held by the key vault, which signs it as a
+    // resumable job: the same digest each call until it answers, since the
+    // transcript does not move.
+    if s.key_vault_handle >= 0 {
         let mut sig = [0u8; RSA_BYTES_MAX];
-        let mut sign_arg = [0u8; 6 + 32 + 12];
-        sign_arg[0] = SIGN_MODE_DIGEST;
-        sign_arg[2..6].copy_from_slice(&32u32.to_le_bytes());
-        sign_arg[6..38].copy_from_slice(&vc_hash);
-        let sig_ptr = sig.as_mut_ptr() as u64;
-        sign_arg[38..46].copy_from_slice(&sig_ptr.to_le_bytes());
-        sign_arg[46..48].copy_from_slice(&(RSA_BYTES_MAX as u16).to_le_bytes());
-        let rc = if s.key_vault_handle >= 0 {
-            (sys.provider_call)(
-                s.key_vault_handle,
-                kv::SIGN,
-                sign_arg.as_mut_ptr(),
-                sign_arg.len(),
-            )
-        } else {
-            -1
+        let n = match vault_sign_digest(s, &vc_hash, &mut sig) {
+            VaultSign::Done(n) => n,
+            VaultSign::Pending => return true,
+            VaultSign::Refused => {
+                s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
+                return true;
+            }
         };
-        if rc == abi::errno::EAGAIN || rc == abi::errno::EBUSY {
-            // In progress, or another peer's signature holds the vault's
-            // one job: either way, come back next step.
-            return true;
-        }
-        if rc != 0 {
-            s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
-            return true;
-        }
-        let sig_len = u16::from_le_bytes([sign_arg[48], sign_arg[49]]) as usize;
+        let mut der = [0u8; 72];
+        let (alg, body): (u16, &[u8]) = if s.identity_rsa_suite != 0 {
+            (SIG_RSA_PSS_RSAE_SHA256, &sig[..n])
+        } else {
+            let mut raw = [0u8; 64];
+            raw.copy_from_slice(&sig[..64]);
+            let (d, dl) = encode_der_signature(&raw);
+            der[..dl].copy_from_slice(&d[..dl]);
+            (SIG_ECDSA_SECP256R1_SHA256, &der[..dl])
+        };
         let driver = &mut s.peer_sessions[idx].endpoint.driver;
-        let msg_len = build_certificate_verify(
-            SIG_RSA_PSS_RSAE_SHA256,
-            &sig[..sig_len],
-            sig_len,
-            &mut driver.scratch,
-        );
+        let msg_len = build_certificate_verify(alg, body, body.len(), &mut driver.scratch);
         if let Some(ref mut t) = driver.transcript {
             t.update(&driver.scratch[..msg_len]);
         }
@@ -467,75 +450,8 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
         driver.hs_state = HandshakeState::SendFinished;
         return true;
     }
-    let mut raw_sig = [0u8; 64];
-    let mut signed_via_vault = false;
-    if s.key_vault_handle >= 0 {
-        // SIGN, `DIGEST` explicitly: `vc_hash` IS the digest. Leaving the
-        // mode to be inferred from the key type is how a message passed here
-        // gets signed as though it were one.
-        const SIGN_MODE_DIGEST: u8 = 1;
-        let mut sign_arg = [0u8; 6 + 32 + 12];
-        sign_arg[0] = SIGN_MODE_DIGEST;
-        sign_arg[2..6].copy_from_slice(&32u32.to_le_bytes());
-        core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(6), 32);
-        let sig_ptr = raw_sig.as_mut_ptr() as u64;
-        sign_arg[38..46].copy_from_slice(&sig_ptr.to_le_bytes());
-        sign_arg[46..48].copy_from_slice(&64u16.to_le_bytes());
-        let rc = (sys.provider_call)(
-            s.key_vault_handle,
-            kv::SIGN,
-            sign_arg.as_mut_ptr(),
-            sign_arg.len(),
-        );
-        if rc == 0 {
-            signed_via_vault = true;
-        }
-    }
-    if !signed_via_vault {
-        let mut k_random = [0u8; 32];
-        dev_csprng_fill(sys, k_random.as_mut_ptr(), 32);
-        let mut priv_key = [0u8; 32];
-        if s.key_len == 32 {
-            core::ptr::copy_nonoverlapping(s.key.as_ptr(), priv_key.as_mut_ptr(), 32);
-        } else if s.key_len > 32 {
-            extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
-        }
-        let signed = ecdsa_sign(&priv_key, &vc_hash, &k_random);
-        let mut j = 0;
-        while j < 32 {
-            core::ptr::write_volatile(&mut priv_key[j], 0);
-            j += 1;
-        }
-        match signed {
-            Some(sig) => raw_sig = sig,
-            None => {
-                // The configured identity key is not a usable P-256
-                // scalar (absent, or outside [1, n-1]). Signing under
-                // it would produce a CertificateVerify no peer can
-                // tie to this identity.
-                s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
-                return true;
-            }
-        }
-    }
-
-    let (der_sig, der_len) = encode_der_signature(&raw_sig);
-    let driver = &mut s.peer_sessions[idx].endpoint.driver;
-    let msg_len = build_certificate_verify(
-        SIG_ECDSA_SECP256R1_SHA256,
-        &der_sig,
-        der_len,
-        &mut driver.scratch,
-    );
-    if let Some(ref mut t) = driver.transcript {
-        t.update(&driver.scratch[..msg_len]);
-    }
-    let mut local = [0u8; SCRATCH_SIZE];
-    core::ptr::copy_nonoverlapping(driver.scratch.as_ptr(), local.as_mut_ptr(), msg_len);
-    if !driver.write_handshake_message(&local[..msg_len]) {
-        return false;
-    }
-    driver.hs_state = HandshakeState::SendFinished;
+    // No identity this handshake can sign under.
+    s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
     true
 }
 
@@ -1228,7 +1144,7 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> StepReturn {
             let peer = s.peer_sessions[i].peer;
             let count = s.peer_sessions[i].last_flight_record_count as usize;
             let mut record_off = 0usize;
-            let mut buf = [0u8; NET_SCRATCH_SIZE * 2];
+            let mut buf = [0u8; DTLS_FLIGHT_MAX];
             core::ptr::copy_nonoverlapping(
                 s.peer_sessions[i].last_flight.as_ptr(),
                 buf.as_mut_ptr(),

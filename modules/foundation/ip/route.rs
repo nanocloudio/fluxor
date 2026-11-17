@@ -224,7 +224,14 @@ pub(crate) unsafe fn step(s: &mut IpState) {
     s.rt_polled_ms = if now == 0 { 1 } else { now };
     let sys = &*s.syscalls;
     let mut head = [0u8; 8];
-    let rc = (sys.provider_call)(-1, nr::TAKE, head.as_mut_ptr(), head.len());
+    let rc = (sys.provider_call)(
+        -1,
+        nr::TAKE,
+        core::ptr::null_mut(),
+        0,
+        head.as_mut_ptr(),
+        head.len(),
+    );
     if rc != ERANGE && rc < 0 {
         // No provider, or not the registered net-identity provider: no
         // tables to realize.
@@ -278,7 +285,14 @@ fn take_counts(buf: &[u8]) -> Option<(u8, u16, u16)> {
 /// `table_full` against the counts the header still carries.
 unsafe fn take(s: &mut IpState, gen: u64) {
     let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(-1, nr::TAKE, s.rt_buf, s.rt_buf_len as usize);
+    let rc = (sys.provider_call)(
+        -1,
+        nr::TAKE,
+        core::ptr::null_mut(),
+        0,
+        s.rt_buf,
+        s.rt_buf_len as usize,
+    );
     let buf = core::slice::from_raw_parts(s.rt_buf, s.rt_buf_len as usize);
     if rc == ERANGE {
         s.rt_overflow = s.rt_overflow.wrapping_add(1);
@@ -482,7 +496,14 @@ unsafe fn report_flush(s: &mut IpState, n: &mut usize) {
     }
     let len = *n * nr::entry::SIZE;
     let sys = &*s.syscalls;
-    let rc = (sys.provider_call)(-1, nr::REPORT, s.rt_report.as_mut_ptr(), len);
+    let rc = (sys.provider_call)(
+        -1,
+        nr::REPORT,
+        core::ptr::null_mut(),
+        0,
+        s.rt_report.as_mut_ptr(),
+        len,
+    );
     *n = 0;
     if rc == EAGAIN {
         // The tables moved since they were taken: take them again at the

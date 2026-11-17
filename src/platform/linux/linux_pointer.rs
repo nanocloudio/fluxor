@@ -114,7 +114,10 @@ fn linux_pointer_emit(st: &mut LinuxPointerState) {
     }
 }
 
-fn linux_pointer_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn linux_pointer_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxPointerState` by the loader.
     let st = unsafe { instance_state::<LinuxPointerState>(state) };
     if st.out_chan < 0 {

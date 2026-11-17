@@ -30,7 +30,7 @@ use core::ptr::write_volatile;
 
 use abi::SyscallTable;
 use fluxor_abi as abi;
-use fluxor_rt::StepReturn;
+use fluxor_rt::{dev_nic_ring_info, StepReturn};
 
 // ============================================================================
 // Intel E810 Register Offsets (BAR0)
@@ -43,7 +43,6 @@ const E810_QINT_RQCTL: usize = 0x0015_0000; // RX Queue Interrupt Cause Control
 // NIC syscall opcodes
 const NIC_BAR_MAP: u32 = abi::registry::platform_nic_ring::NIC_BAR_MAP;
 const NIC_RING_CREATE: u32 = abi::registry::platform_nic_ring::NIC_RING_CREATE;
-const NIC_RING_INFO: u32 = abi::registry::platform_nic_ring::NIC_RING_INFO;
 
 // ============================================================================
 // Constants
@@ -104,32 +103,28 @@ unsafe fn mmio_write(base: usize, offset: usize, val: u32) {
 unsafe fn init_e810(s: &mut E810State) -> bool {
     let sys = &*s.syscalls;
 
-    // Map BAR0 (dev_idx: scan for E810 at idx 0)
-    let mut bar_arg = [0u8; 10];
-    let bp = bar_arg.as_mut_ptr();
-    *bp.add(0) = 0; // dev_idx
-    *bp.add(1) = 0; // bar_idx
-    let rc = (sys.provider_call)(-1, NIC_BAR_MAP, bp, 10);
+    // Map BAR0 (dev_idx: scan for E810 at idx 0): in `[dev_idx][bar_idx]`,
+    // answered `[addr u64][len u32]`.
+    let mut bar_arg = [0u8; 12];
+    let rc = (sys.provider_call)(
+        -1,
+        NIC_BAR_MAP,
+        bar_arg.as_mut_ptr(),
+        bar_arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         return false;
     }
-    let addr_bytes: [u8; 8] = [
-        *bp.add(2),
-        *bp.add(3),
-        *bp.add(4),
-        *bp.add(5),
-        *bp.add(6),
-        *bp.add(7),
-        *bp.add(8),
-        *bp.add(9),
-    ];
+    let mut addr_bytes = [0u8; 8];
+    addr_bytes.copy_from_slice(&bar_arg[0..8]);
     s.bar_base = u64::from_le_bytes(addr_bytes) as usize;
 
     // Create NIC DMA ring. PLATFORM_NIC_RING is a first-class contract
-    // for ring management; the kernel binds the returned handle and
-    // routes subsequent calls (NIC_RING_INFO/DESTROY) via that
-    // contract. Access is gated by the module's `platform_raw`
-    // permission.
+    // for ring management; the returned handle names the ring, and
+    // NIC_RING_INFO / NIC_RING_DESTROY are ops on it. Access is gated
+    // by the module's `platform_raw` permission.
     let mut ring_arg = [0u8; 8];
     let p = ring_arg.as_mut_ptr();
     write_volatile(p as *mut u16, RX_DESC_COUNT.to_le());
@@ -143,47 +138,22 @@ unsafe fn init_e810(s: &mut E810State) -> bool {
     }
     s.ring_handle = ring_handle;
 
-    // Get ring info
-    let mut info = [0u8; 32];
-    let info_rc = (sys.provider_call)(ring_handle, NIC_RING_INFO, info.as_mut_ptr(), 32);
-    if info_rc < 0 {
+    // Where the ring's three parts lie.
+    use abi::platform::bcm2712::nic_ring::info;
+    let (Some(rx), Some(tx), Some(bufs)) = (
+        dev_nic_ring_info(sys, ring_handle, info::RX_DESC),
+        dev_nic_ring_info(sys, ring_handle, info::TX_DESC),
+        dev_nic_ring_info(sys, ring_handle, info::BUFFERS),
+    ) else {
         return false;
-    }
-    let ip = info.as_ptr();
-    s.rx_desc_addr = u64::from_le_bytes([
-        *ip,
-        *ip.add(1),
-        *ip.add(2),
-        *ip.add(3),
-        *ip.add(4),
-        *ip.add(5),
-        *ip.add(6),
-        *ip.add(7),
-    ]);
-    s.rx_desc_count = u16::from_le_bytes([*ip.add(8), *ip.add(9)]);
-    s.tx_desc_addr = u64::from_le_bytes([
-        *ip.add(10),
-        *ip.add(11),
-        *ip.add(12),
-        *ip.add(13),
-        *ip.add(14),
-        *ip.add(15),
-        *ip.add(16),
-        *ip.add(17),
-    ]);
-    s.tx_desc_count = u16::from_le_bytes([*ip.add(18), *ip.add(19)]);
-    s.buf_pool_addr = u64::from_le_bytes([
-        *ip.add(20),
-        *ip.add(21),
-        *ip.add(22),
-        *ip.add(23),
-        *ip.add(24),
-        *ip.add(25),
-        *ip.add(26),
-        *ip.add(27),
-    ]);
-    s.buf_size = u16::from_le_bytes([*ip.add(28), *ip.add(29)]);
-    s.buf_count = u16::from_le_bytes([*ip.add(30), *ip.add(31)]);
+    };
+    s.rx_desc_addr = rx.0;
+    s.rx_desc_count = rx.2;
+    s.tx_desc_addr = tx.0;
+    s.tx_desc_count = tx.2;
+    s.buf_pool_addr = bufs.0;
+    s.buf_count = bufs.2;
+    s.buf_size = bufs.3;
 
     // E810 init: PF reset + admin queue setup (skeleton)
     // In a full implementation this would:

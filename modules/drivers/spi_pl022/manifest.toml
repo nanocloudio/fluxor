@@ -2,7 +2,7 @@ version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
 # The `spi` contract this driver registers itself as the provider of.
 provides = ["spi"]
-grants = ["rp_raw"]
+grants = ["rp_raw", "lend.borrow"]
 provider_contracts = ["spi"]
 deferred_ready = true
 
@@ -10,4 +10,10 @@ deferred_ready = true
 # claim is shared with every other DMA user in the graph.
 [[resources]]
 requires_contract = "platform_dma"
+access = "write"
+
+# The chip-select pin an OPEN names is claimed by this provider, as part of
+# the spi claim.
+[[resources]]
+requires_contract = "gpio"
 access = "write"

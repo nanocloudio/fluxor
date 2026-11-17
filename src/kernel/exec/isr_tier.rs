@@ -90,6 +90,23 @@ pub struct IsrMetrics {
 }
 
 impl IsrMetrics {
+    /// The `ISR_METRICS` answer: the six fields as `u32` LE, in order.
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        let fields = [
+            self.total_cycles_lo,
+            self.total_cycles_hi,
+            self.max_cycles,
+            self.invocations,
+            self.overruns,
+            self.budget_cycles,
+        ];
+        for (chunk, v) in out.chunks_exact_mut(4).zip(fields) {
+            chunk.copy_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
     const fn new() -> Self {
         Self {
             total_cycles_lo: 0,
@@ -742,29 +759,21 @@ pub fn poll_tier1b() {
 ///
 /// On success, writes IsrMetrics (24 bytes) to arg buffer.
 /// Returns bytes written on success, or negative errno.
-pub fn isr_metrics_dispatch(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
-        return crate::kernel::sys::errno::EINVAL;
-    }
-
-    // SAFETY: `arg_len >= 2` checked above; reading 2 bytes from `arg`.
-    let tier = unsafe { *arg };
-    // SAFETY: as above.
-    let slot = unsafe { *arg.add(1) };
-
+pub fn isr_metrics_dispatch(arg: &mut [u8]) -> i32 {
+    let (tier, slot) = match *arg {
+        [tier, slot, ..] => (tier, slot),
+        _ => return crate::kernel::sys::errno::EINVAL,
+    };
     match query_metrics(tier, slot) {
         Some(metrics) => {
-            let out_size = core::mem::size_of::<IsrMetrics>();
-            if arg_len < out_size {
-                return crate::kernel::sys::errno::EINVAL;
+            let bytes = metrics.to_bytes();
+            match arg.get_mut(..bytes.len()) {
+                Some(out) => {
+                    out.copy_from_slice(&bytes);
+                    bytes.len() as i32
+                }
+                None => crate::kernel::sys::errno::EINVAL,
             }
-            // SAFETY: `arg_len >= out_size` checked above; `IsrMetrics` is
-            // `Copy` plain data, so byte-copy preserves representation.
-            unsafe {
-                let src = &metrics as *const IsrMetrics as *const u8;
-                core::ptr::copy_nonoverlapping(src, arg, out_size);
-            }
-            out_size as i32
         }
         None => crate::kernel::sys::errno::EINVAL,
     }

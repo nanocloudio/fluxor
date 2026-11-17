@@ -72,11 +72,11 @@ const LOG_PERIOD: u32 = 4096;
 
 const MSG_PKT_FORWARD: u8 = 0x65;
 const DISP_TUNNEL: u8 = 3;
-const CMD_DG_BIND: u8 = 0x20;
-const CMD_DG_SEND_TO: u8 = 0x21;
-const MSG_DG_BOUND: u8 = 0x40;
-const MSG_DG_RX_FROM: u8 = 0x41;
-const MSG_DG_ERROR: u8 = 0x43;
+use abi::contracts::net::datagram as dg;
+use dg::{CMD_DG_BIND, CMD_DG_SEND_TO, MSG_DG_BOUND, MSG_DG_ERROR, MSG_DG_RX_FROM};
+/// The largest frame `dg_in` takes and `dg_out` writes, header included
+/// (`DG_IN_ACCEPTS_RECORD`, `DG_OUT_MAX_RECORD`): a sealed datagram whole.
+const DG_RECORD: usize = FRAME_MAX + 64;
 const ETH_HDR: usize = 14;
 
 /// Counters, by reason.
@@ -138,8 +138,8 @@ pub struct RtState {
     step_count: u32,
     logged: [u32; 5],
     pub stats: RtStats,
-    rx: [u8; FRAME_MAX + 64],
-    tx: [u8; FRAME_MAX + 64],
+    rx: [u8; DG_RECORD],
+    tx: [u8; DG_RECORD],
 }
 
 fn hexv(b: u8) -> Option<u8> {
@@ -323,14 +323,18 @@ unsafe fn text<'a>(d: *const u8, len: usize) -> Option<&'a [u8]> {
 /// vault (imported there, the same key on every host of the cell; never
 /// made here): a handle that answers tags (`SIGN`), or -1.
 unsafe fn open_cell_key(sys: &SyscallTable, label: &[u8]) -> i32 {
-    let mut arg = [0u8; 8 + kv::MAX_LABEL + 12];
-    arg[0..2].copy_from_slice(&kv::suite::HMAC_SHA256.to_le_bytes());
-    let usage = kv::usage::SIGN | kv::usage::VERIFY | kv::usage::PERSIST;
-    arg[2..6].copy_from_slice(&usage.to_le_bytes());
-    arg[7] = label.len() as u8;
-    arg[8..8 + label.len()].copy_from_slice(label);
-    let t = 8 + label.len();
-    let h = (sys.provider_call)(-1, kv::OPEN, arg.as_mut_ptr(), t + 12);
+    let mut arg = [0u8; kv::open::MAX_ARG];
+    let req = kv::open::Request {
+        suite: kv::suite::HMAC_SHA256,
+        usage: kv::usage::SIGN | kv::usage::VERIFY | kv::usage::PERSIST,
+        flags: 0,
+        label,
+    };
+    let Some(n) = kv::open::encode(&mut arg, &req) else {
+        return -1;
+    };
+    // An HMAC key has no public half: nothing comes back in `data`.
+    let h = (sys.provider_call)(-1, kv::OPEN, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0);
     if h < 0 {
         -1
     } else {
@@ -338,22 +342,30 @@ unsafe fn open_cell_key(sys: &SyscallTable, label: &[u8]) -> i32 {
     }
 }
 
-/// HMAC-SHA256 of `data` by the vault's slot `h` (`SIGN`, `RAW`).
+/// HMAC-SHA256 of `data` by the vault's slot `h` (`SIGN`, `RAW`, in place
+/// on a copy of `data`).
 unsafe fn vault_hmac(sys: &SyscallTable, h: i32, data: &[u8]) -> Option<[u8; 32]> {
-    let mut arg = [0u8; 6 + FRAME_MAX + 64 + 12];
-    if data.len() > FRAME_MAX + 64 {
+    let mut buf = [0u8; FRAME_MAX + 64];
+    if data.len() > buf.len() {
         return None;
     }
-    arg[0] = kv::sign_mode::RAW;
-    arg[2..6].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    arg[6..6 + data.len()].copy_from_slice(data);
+    buf[..data.len()].copy_from_slice(data);
+    let mut arg = kv::sign::encode(kv::sign_mode::RAW, data.len() as u32);
+    let n = data.len().max(32);
+    let rc = (sys.provider_call)(
+        h,
+        kv::SIGN,
+        arg.as_mut_ptr(),
+        arg.len(),
+        buf.as_mut_ptr(),
+        n,
+    );
+    if rc != 32 {
+        return None;
+    }
     let mut tag = [0u8; 32];
-    let t = 6 + data.len();
-    arg[t..t + 8].copy_from_slice(&(tag.as_mut_ptr() as u64).to_le_bytes());
-    arg[t + 8..t + 10].copy_from_slice(&32u16.to_le_bytes());
-    let rc = (sys.provider_call)(h, kv::SIGN, arg.as_mut_ptr(), t + 12);
-    let len = u16::from_le_bytes([arg[t + 10], arg[t + 11]]);
-    (rc == 0 && len == 32).then_some(tag)
+    tag.copy_from_slice(&buf[..32]);
+    Some(tag)
 }
 
 /// The IP packet at the start of `b` (IPv4 or IPv6), cut to its own
@@ -454,9 +466,8 @@ unsafe fn bind(s: &mut RtState) {
         return;
     }
     let sys = &*s.syscalls;
-    let port = RT_PORT.to_le_bytes();
     let mut f = [0u8; 16];
-    if write_frame(sys, s.dg_out, CMD_DG_BIND, &[&port, &[0]], &mut f) {
+    if write_frame(sys, s.dg_out, CMD_DG_BIND, &[&dg::bind(RT_PORT, 0)], &mut f) {
         s.bind_sent = true;
     }
 }
@@ -603,10 +614,9 @@ unsafe fn anchor(s: &mut RtState) {
             return;
         }
         match kind {
-            MSG_DG_BOUND if total >= HDR + 3 => {
-                let port = u16::from_le_bytes([s.rx[4], s.rx[5]]);
-                if port == RT_PORT {
-                    s.ep_id = s.rx[3];
+            MSG_DG_BOUND => {
+                if let Some((ep_id, RT_PORT)) = dg::dg_bound_parts(&s.rx[HDR..total]) {
+                    s.ep_id = ep_id;
                     s.bound = true;
                 }
             }
@@ -674,7 +684,7 @@ unsafe fn anchor(s: &mut RtState) {
             }
             MSG_DG_RX_FROM => s.stats.unbound = s.stats.unbound.wrapping_add(1),
             // `[ep_id][errno]`: a sealed datagram `ip` would not send.
-            MSG_DG_ERROR if total >= HDR + 2 && s.bound && s.rx[3] == s.ep_id => {
+            MSG_DG_ERROR if total == HDR + dg::ERROR_LEN && s.bound && s.rx[3] == s.ep_id => {
                 s.stats.send_refused = s.stats.send_refused.wrapping_add(1);
             }
             _ => {}
@@ -717,7 +727,11 @@ unsafe fn heartbeat(s: &mut RtState) {
     dev_log(&*s.syscalls, 3, line.as_ptr(), at);
 }
 
-fluxor_rt::module_facts! { state: RtState, arena: 0 }
+fluxor_rt::module_facts! {
+    state: RtState,
+    arena: 0,
+    records: [in 1 DG_IN_ACCEPTS_RECORD = DG_RECORD, out 0 DG_OUT_MAX_RECORD = DG_RECORD],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

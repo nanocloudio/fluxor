@@ -115,16 +115,20 @@ starting with `?` (the listing's own target) are refused `400`.
 | `PATCH /<name>` with `retain-until`, `legal-hold` or both, no body | `RETAIN` | `200`, no body |
 | `GET /?list…` | `LIST` | `200`, one page of names below the scope |
 
-Any other method — `POST`, `OPTIONS`, `CONNECT`, `PUBLISH` — and a
-request flagged `WEBSOCKET`, `WEBTRANSPORT` or `BROADCAST` are refused `400`.
+Any other method — `POST`, `OPTIONS`, the CONNECTs — any request that is
+not a CALL (a PUBLISH, an OPEN), and a request flagged `BROADCAST` are
+refused `400`.
 
 ### Request headers
+
+Headers are the request's meta fields, keyed by the field name in lower case
+(the HTTP binding's mapping of header lines), and the response's likewise.
 
 | Header | Requests | Meaning |
 |---|---|---|
 | `range` | `GET` | `bytes=a-b`, `bytes=a-` or `bytes=-n`: one range, answered `206` |
 | `content-type` | `PUT` | stored with the object; at most 255 bytes |
-| `content-length` | `PUT` | the streamed put's size hint; digits only |
+| `content-length` | `PUT` | checked; digits only |
 | `if-none-match: *` | `PUT` | create only: the store refuses an existing name |
 | `if-match: <hex etag>` | `PUT`, `DELETE` | only if the object's entity tag is this one; quoted or not |
 | `key-ref: <name>` | `PUT` | the name of the key that sealed the object: 1 to 64 bytes of visible ASCII, kept and returned, never interpreted |
@@ -187,8 +191,8 @@ change what the request means.
 | `key-ref` | `GET`, `HEAD` | the name the store keeps with the object, when it keeps one |
 | `next` | a listing page that is not the last | the cursor to resume after, below the scope, encoded as a listing line |
 
-The response's content type is the one the store keeps for the object; a store
-that keeps none answers an empty one. A read's fence is the one its read handle
+The response's `content-type` is the one the store keeps for the object; a
+store that keeps none answers without one; a listing's is `text/plain`. A read's fence is the one its read handle
 reports (`LAST_FENCE`), or the `HEAD` record's when the provider reports none;
 a write's is the one its commit reported. A store's `key_ref` that is not
 visible ASCII, which another writer could have stored, cannot be a header
@@ -229,9 +233,10 @@ way, so it goes back into `after=` as it came.
 
 ## Statuses
 
-`status` is an HTTP code, as the exchange contract requires. The refusals the
-module raises itself are marked `RAISED`; every other status is the store's
-answer and is not.
+The module speaks the exchange's HTTP binding: every answer carries its
+HTTP status as the `detail`, and the outcome is the class the binding gives
+it (`exchange_http::outcome_of`). The refusals the module raises itself are
+marked `RAISED`; every other status is the store's answer and is not.
 
 | Status | When | `RAISED` |
 |---|---|---|

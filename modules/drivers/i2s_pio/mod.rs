@@ -54,7 +54,6 @@ mod pio;
 const HAL_PIO_CONTRACT: u32 = abi::registry::pio::ID as u32;
 const DEV_PIO_STREAM_ALLOC: u32 = abi::registry::pio::STREAM_ALLOC;
 const DEV_PIO_STREAM_LOAD_PROGRAM: u32 = abi::registry::pio::STREAM_LOAD_PROGRAM;
-const DEV_PIO_STREAM_GET_BUFFER: u32 = abi::registry::pio::STREAM_GET_BUFFER;
 const DEV_PIO_STREAM_CONFIGURE: u32 = abi::registry::pio::STREAM_CONFIGURE;
 const DEV_PIO_STREAM_CAN_PUSH: u32 = abi::registry::pio::STREAM_CAN_PUSH;
 const DEV_PIO_STREAM_PUSH: u32 = abi::registry::pio::STREAM_PUSH;
@@ -62,18 +61,8 @@ const DEV_PIO_STREAM_FREE: u32 = abi::registry::pio::STREAM_FREE;
 const DEV_PIO_STREAM_SET_RATE: u32 = abi::registry::pio::STREAM_SET_RATE;
 
 // ============================================================================
-// HAL_PIO argument structs (mirrors abi::PioLoadProgramArgs, PioConfigureArgs)
+// HAL_PIO argument structs (mirrors the STREAM_CONFIGURE layout)
 // ============================================================================
-
-#[repr(C)]
-struct PioLoadProgramArgs {
-    program: *const u16,
-    program_len: u32,
-    wrap_target: u8,
-    wrap: u8,
-    sideset_bits: u8,
-    options: u8,
-}
 
 #[repr(C)]
 struct PioConfigureArgs {
@@ -140,8 +129,6 @@ struct I2sState {
     /// Diagnostic: count of audio buffers vs silence buffers
     audio_count: u16,
     silence_count: u16,
-    /// Last packed I2S sample (L/R u32) for hold-padding
-    last_sample: u32,
     /// Input buffer (i16 stereo pairs = 4 bytes per sample)
     in_buf: [u8; IN_BUF_SIZE],
 }
@@ -160,7 +147,6 @@ impl I2sState {
         self._pad1 = 0;
         self.audio_count = 0;
         self.silence_count = 0;
-        self.last_sample = 0;
     }
 
     #[inline(always)]
@@ -219,7 +205,7 @@ pub unsafe extern "C" fn module_new(
             let p = &*(params as *const I2sParams);
             s.data_pin = if p.data_pin == 0 { 28 } else { p.data_pin };
             s.clock_base = if p.clock_base == 0 { 26 } else { p.clock_base };
-            s.sample_rate = p.sample_rate; // 0 = auto-detect from upstream IOCTL
+            s.sample_rate = p.sample_rate; // 0 = from the stream's format record
         }
 
         let sys = s.sys();
@@ -243,19 +229,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         match s.phase {
             I2sPhase::Init => {
-                // Check for rate IOCTL before init (one-shot, non-blocking)
-                {
-                    let sys = &*s.syscalls;
-                    let mut rate_val = [0u8; 4];
-                    let rv = rate_val.as_mut_ptr();
-                    let res = dev_channel_ioctl(sys, s.in_chan, IOCTL_POLL_NOTIFY, rv, 4);
-                    if res == 0 {
-                        let new_rate = u32::from_le_bytes(rate_val);
-                        if new_rate > 0 {
-                            s.sample_rate = new_rate;
-                        }
-                    }
-                }
+                // A format record at the head of the input states the rate
+                // the stream is initialised at.
+                while take_format(s) {}
                 let r = step_init(s);
                 if r.is_error() {
                     return r;
@@ -280,12 +256,11 @@ unsafe fn step_init(s: &mut I2sState) -> StepReturn {
     let clock_base = s.clock_base;
 
     // Open PIO stream handle — tracked against HAL_PIO contract.
-    let mut alloc_arg = (pio::PIO_BUFFER_WORDS as u32).to_le_bytes();
     let handle = (provider_open)(
         HAL_PIO_CONTRACT,
         DEV_PIO_STREAM_ALLOC,
-        alloc_arg.as_mut_ptr(),
-        4,
+        core::ptr::null_mut(),
+        0,
     );
     if handle < 0 {
         dev_log(sys, 1, b"[i2s] alloc fail".as_ptr(), 16);
@@ -294,23 +269,38 @@ unsafe fn step_init(s: &mut I2sState) -> StepReturn {
     }
 
     // Load PIO program
-    let load_args = PioLoadProgramArgs {
-        program: pio::PROGRAM.as_ptr(),
-        program_len: pio::PROGRAM.len() as u32,
-        wrap_target: pio::WRAP_TARGET,
-        wrap: pio::WRAP,
-        sideset_bits: pio::SIDESET_BITS,
-        options: pio::OPTIONS,
-    };
+    let mut load_arg = abi::platform::rp::pio::load_program::encode(
+        pio::WRAP_TARGET,
+        pio::WRAP,
+        pio::SIDESET_BITS,
+        pio::OPTIONS,
+    );
+    let mut program = [0u8; 2 * pio::PROGRAM.len()];
+    let mut i = 0usize;
+    while i < pio::PROGRAM.len() {
+        let w = pio::PROGRAM[i].to_le_bytes();
+        program[2 * i] = w[0];
+        program[2 * i + 1] = w[1];
+        i += 1;
+    }
     let result = (provider_call)(
         handle,
         DEV_PIO_STREAM_LOAD_PROGRAM,
-        &load_args as *const _ as *mut u8,
-        core::mem::size_of::<PioLoadProgramArgs>(),
+        load_arg.as_mut_ptr(),
+        load_arg.len(),
+        program.as_mut_ptr(),
+        program.len(),
     );
     if result < 0 {
         dev_log(sys, 1, b"[i2s] load fail".as_ptr(), 15);
-        (provider_call)(handle, DEV_PIO_STREAM_FREE, core::ptr::null_mut(), 0);
+        (provider_call)(
+            handle,
+            DEV_PIO_STREAM_FREE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.phase = I2sPhase::Error;
         return StepReturn::error(-1);
     }
@@ -330,10 +320,19 @@ unsafe fn step_init(s: &mut I2sState) -> StepReturn {
         DEV_PIO_STREAM_CONFIGURE,
         &cfg_args as *const _ as *mut u8,
         core::mem::size_of::<PioConfigureArgs>(),
+        core::ptr::null_mut(),
+        0,
     );
     if result < 0 {
         dev_log(sys, 1, b"[i2s] config fail".as_ptr(), 17);
-        (provider_call)(handle, DEV_PIO_STREAM_FREE, core::ptr::null_mut(), 0);
+        (provider_call)(
+            handle,
+            DEV_PIO_STREAM_FREE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.phase = I2sPhase::Error;
         return StepReturn::error(-1);
     }
@@ -341,7 +340,14 @@ unsafe fn step_init(s: &mut I2sState) -> StepReturn {
     // Set stream consumption rate for stream_time (Q16.16: sample_rate << 16)
     let rate_q16 = s.sample_rate << 16;
     let mut rate_arg = rate_q16.to_le_bytes();
-    (provider_call)(handle, DEV_PIO_STREAM_SET_RATE, rate_arg.as_mut_ptr(), 4);
+    (provider_call)(
+        handle,
+        DEV_PIO_STREAM_SET_RATE,
+        rate_arg.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
 
     s.stream_handle = handle;
     s.phase = I2sPhase::Running;
@@ -368,57 +374,84 @@ unsafe fn step_init(s: &mut I2sState) -> StepReturn {
     StepReturn::Continue
 }
 
-/// Get PIO stream buffer via provider_query.
-#[inline(always)]
-unsafe fn pio_get_buffer(
-    provider_query: unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32,
-    handle: i32,
-) -> *mut u32 {
-    let mut buf_ptr: *mut u32 = core::ptr::null_mut();
-    (provider_query)(
-        handle,
-        DEV_PIO_STREAM_GET_BUFFER,
-        &mut buf_ptr as *mut _ as *mut u8,
-        4,
-    );
-    buf_ptr
-}
-
-/// Push words to PIO stream via provider_call.
+/// Push `bytes` (whole words, u32 LE) at `words` to the PIO stream; the
+/// provider copies them into its back buffer.
 #[inline(always)]
 unsafe fn pio_push(
-    provider_call: unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32,
+    provider_call: unsafe extern "C" fn(i32, u32, *mut u8, usize, *mut u8, usize) -> i32,
     handle: i32,
-    words: usize,
+    words: *const u8,
+    bytes: usize,
 ) -> i32 {
-    let mut arg = (words as u32).to_le_bytes();
-    (provider_call)(handle, DEV_PIO_STREAM_PUSH, arg.as_mut_ptr(), 4)
+    (provider_call)(
+        handle,
+        DEV_PIO_STREAM_PUSH,
+        core::ptr::null_mut(),
+        0,
+        words as *mut u8,
+        bytes,
+    )
+}
+
+/// Take a format record (`audio_sample::format`) at the head of the input
+/// and remember its rate. `false` when the head holds no format record (or
+/// nothing).
+unsafe fn take_format(s: &mut I2sState) -> bool {
+    use abi::contracts::audio_sample::format;
+    let sys = &*s.syscalls;
+    if dev_channel_record_len(sys, s.in_chan) != format::LEN as i32 {
+        return false;
+    }
+    let mut rec = [0u8; format::LEN];
+    if (sys.channel_read)(s.in_chan, rec.as_mut_ptr(), format::LEN) != format::LEN as i32 {
+        return false;
+    }
+    if let Some(rate) = format::parse(&rec) {
+        if rate > 0 {
+            s.sample_rate = rate;
+        }
+    }
+    true
+}
+
+/// Move what the input holds into `in_buf`, record by record, so a read never
+/// runs past a sample record into a format record. A format record's rate is
+/// remembered for the next stream init: reconfiguring a running state
+/// machine resets it to Ready and breaks its DMA. Stops when the input is
+/// empty or the next record does not fit (a mailbox record is taken whole).
+unsafe fn read_input(s: &mut I2sState) {
+    use abi::contracts::audio_sample::format;
+    let sys = &*s.syscalls;
+    loop {
+        let rec = dev_channel_record_len(sys, s.in_chan);
+        if rec <= 0 {
+            return;
+        }
+        let rec = rec as usize;
+        if rec == format::LEN {
+            if !take_format(s) {
+                return;
+            }
+            continue;
+        }
+        let fill = s.in_buf_fill as usize;
+        let space = IN_BUF_SIZE - fill;
+        if space == 0 {
+            return;
+        }
+        let read = (sys.channel_read)(s.in_chan, s.in_buf.as_mut_ptr().add(fill), rec.min(space));
+        if read <= 0 {
+            return;
+        }
+        s.in_buf_fill += read as u16;
+    }
 }
 
 /// Process audio data - loop to fill both DMA buffers
 unsafe fn step_running(s: &mut I2sState) -> StepReturn {
     let syscalls = &*s.syscalls;
     let provider_call = syscalls.provider_call;
-    let provider_query = syscalls.provider_query;
-    let channel_read = syscalls.channel_read;
     let stream_handle = s.stream_handle;
-    let in_chan = s.in_chan;
-
-    // Check for dynamic sample rate IOCTL (consumed but NOT applied at runtime —
-    // PIO CONFIGURE on a running SM resets it to Ready state, breaking DMA).
-    // Rate is applied at next stream init (file switch/reset).
-    {
-        let mut rate_val = [0u8; 4];
-        let rv = rate_val.as_mut_ptr();
-        let res = dev_channel_ioctl(syscalls, in_chan, IOCTL_POLL_NOTIFY, rv, 4);
-        if res == 0 {
-            let new_rate = u32::from_le_bytes(rate_val);
-            if new_rate > 0 {
-                s.sample_rate = new_rate;
-                // Rate will be used on next PIO init; don't reconfigure running PIO
-            }
-        }
-    }
 
     let mut buffers_filled = 0;
     while buffers_filled < 2 {
@@ -427,29 +460,17 @@ unsafe fn step_running(s: &mut I2sState) -> StepReturn {
             DEV_PIO_STREAM_CAN_PUSH,
             core::ptr::null_mut(),
             0,
+            core::ptr::null_mut(),
+            0,
         );
         if can_push == 0 {
             break;
         }
 
-        // === Unified read path ===
-        // channel_read handles both FIFO and mailbox channels transparently.
-        // For mailbox: returns the full message (or EAGAIN if no message ready).
-        // For FIFO: returns available bytes up to requested size.
         // in_buf is 4096 bytes (2× PIO buffer) so there's always room for
         // one partial PIO buffer + one full mailbox message.
         let max_bytes = pio::PIO_BUFFER_WORDS * 4; // 2048
-        {
-            let fill = s.in_buf_fill as usize;
-            let space = IN_BUF_SIZE - fill; // Use full 4096 buffer space
-            if space > 0 {
-                let read = (channel_read)(in_chan, s.in_buf.as_mut_ptr().add(fill), space);
-                if read > 0 {
-                    s.in_buf_fill += read as u16;
-                }
-                // EAGAIN and other errors: just try again next tick
-            }
-        }
+        read_input(s);
 
         let total = s.in_buf_fill as usize;
         if total < max_bytes {
@@ -464,32 +485,13 @@ unsafe fn step_running(s: &mut I2sState) -> StepReturn {
         let used_bytes = sample_pairs * 4;
         let trailing = total - used_bytes;
 
-        let buffer = pio_get_buffer(provider_query, stream_handle);
-        if buffer.is_null() {
-            // PIO not ready for more data — keep accumulated bytes for next tick
+        // Interleaved i16 LE stereo is the packed I2S word ((right << 16) |
+        // left, u32 LE) byte for byte: the words go out as they came in.
+        let result = pio_push(provider_call, stream_handle, s.in_buf.as_ptr(), used_bytes);
+        if result == E_BUSY {
+            // The last buffer still waits for the DMA — keep these for next tick.
             break;
         }
-
-        // Convert interleaved i16 stereo to packed u32 for I2S
-        let in_ptr = s.in_buf.as_ptr();
-        let mut last = s.last_sample;
-        let mut i = 0;
-        while i < sample_pairs {
-            let base = i * 4;
-            let l0 = *in_ptr.add(base);
-            let l1 = *in_ptr.add(base + 1);
-            let r0 = *in_ptr.add(base + 2);
-            let r1 = *in_ptr.add(base + 3);
-            let left = i16::from_le_bytes([l0, l1]);
-            let right = i16::from_le_bytes([r0, r1]);
-            last = ((right as u16 as u32) << 16) | (left as u16 as u32);
-            core::ptr::write_volatile(buffer.add(i), last);
-            i += 1;
-        }
-        s.last_sample = last;
-
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        let result = pio_push(provider_call, stream_handle, pio::PIO_BUFFER_WORDS);
         if result < 0 {
             dev_log(syscalls, 1, b"[i2s] push err".as_ptr(), 14);
             s.phase = I2sPhase::Error;

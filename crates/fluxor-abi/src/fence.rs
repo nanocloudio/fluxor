@@ -342,6 +342,64 @@ pub const TAG_VIEW_CONSISTENT: u8 = 5;
 /// witness(32) = 62.
 pub const WIRE_MAX_LEN: usize = 62;
 
+/// The fence trailer of a fenced one-shot op: the last [`TRAILER_LEN`] bytes
+/// of the op's `arg`, `[fence_len u16 LE][Fence::encode bytes]`, written by
+/// the provider with its answer. A caller sizes `arg` for its request (or
+/// answer, whichever is longer) plus the trailer.
+pub mod trailer {
+    use super::{Fence, WIRE_MAX_LEN};
+
+    /// Bytes the trailer takes at the end of `arg`.
+    pub const LEN: usize = 2 + WIRE_MAX_LEN;
+
+    /// `arg` split into its record and its trailer; `None` when `arg` is
+    /// shorter than the trailer.
+    pub fn split(arg: &mut [u8]) -> Option<(&mut [u8], &mut [u8])> {
+        let at = arg.len().checked_sub(LEN)?;
+        Some(arg.split_at_mut(at))
+    }
+
+    /// The record part of `arg`: everything before the trailer.
+    pub fn record(arg: &[u8]) -> Option<&[u8]> {
+        arg.get(..arg.len().checked_sub(LEN)?)
+    }
+
+    /// Write `f` into the trailer of `arg`; `false` when `arg` holds no
+    /// trailer.
+    pub fn put(arg: &mut [u8], f: &Fence) -> bool {
+        let Some((_, t)) = split(arg) else {
+            return false;
+        };
+        let Some(n) = f.encode(&mut t[2..]) else {
+            return false;
+        };
+        t[..2].copy_from_slice(&(n as u16).to_le_bytes());
+        true
+    }
+
+    /// Mark the trailer of `arg` empty: the op carries no fence.
+    pub fn clear(arg: &mut [u8]) -> bool {
+        match split(arg) {
+            Some((_, t)) => {
+                t.fill(0);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The fence the trailer of `arg` carries; `None` when it carries none
+    /// or does not decode.
+    pub fn get(arg: &[u8]) -> Option<Fence> {
+        let t = arg.get(arg.len().checked_sub(LEN)?..)?;
+        let n = usize::from(u16::from_le_bytes([t[0], t[1]]));
+        if n == 0 || n > WIRE_MAX_LEN {
+            return None;
+        }
+        Fence::decode(&t[2..2 + n]).map(|(f, _)| f)
+    }
+}
+
 /// Provider-dispatch opcode every storage / file / namespace /
 /// object provider answers to return the most recent `Fence` it
 /// advertised on `handle`.

@@ -10,9 +10,6 @@
 // random-access file I/O (seek+read, stat-then-read, etc.) where
 // channels would require expensive out-of-band coordination.
 //
-// STAT's output buffer selects its own shape by width — 8, 16 or 32
-// bytes. See `STAT`.
-//
 // ## No call waits on the device
 //
 // A provider answers inside its caller's `provider_call`, so inside the
@@ -79,12 +76,10 @@
 //
 // ## Handle identity
 //
-// `OPEN` and `OPENDIR` return a tagged FD: providers encode the
-// returned slot via `kernel_abi::fd::tag_fd(FD_TAG_FS, slot)`. The
-// kernel's FS vtable wrapper strips the tag before re-entering the
-// provider, so inbound ops see a raw slot. The tag is what lets
-// `provider_call` and `provider_query` (including `LAST_FENCE`)
-// resolve the contract from the handle through `fd_tag_contract`.
+// `OPEN` and `OPENDIR` answer the provider's own index; the kernel wraps it
+// in a handle (`kernel_abi::handle`) routed to that provider, and every later
+// op on the handle (`provider_query`'s `LAST_FENCE` included) reaches the
+// provider with its index.
 //
 // ## Durability vocabulary
 //
@@ -158,15 +153,12 @@ pub use super::super::super::registry::fs::OPEN;
 pub use super::super::super::registry::fs::READ;
 /// Set the absolute read/write offset. `handle=file`.
 ///
-/// `arg` is `[offset: u32 LE]`, or `[offset: u64 LE]` when `arg_len >= 8`.
-/// Providers MUST accept both widths and select on `arg_len`; callers with
-/// an offset that fits in 32 bits may keep sending the narrow form.
+/// `arg` in is exactly [`seek::ARG_LEN`] bytes, `[offset: u64 LE]`
+/// ([`seek::encode`] / [`seek::parse`]); any other length is `EINVAL`.
 ///
-/// Returns negative errno on failure; any non-negative value is success.
-/// Consumers must not require a particular success value — a provider may
-/// return 0 or the resulting absolute offset. A provider whose backing
-/// format cannot address the requested offset returns `EINVAL`; `fat32`
-/// does so past 4 GiB, which is the format's own file-size ceiling.
+/// Returns 0 or a negative errno. A provider whose backing format cannot
+/// address the requested offset returns `EINVAL`; `fat32` does so past
+/// 4 GiB, which is the format's own file-size ceiling.
 ///
 /// `EAGAIN` while the chain walk to the offset needs data still being
 /// fetched; the offset has not moved.
@@ -185,32 +177,19 @@ pub use super::super::super::registry::fs::SEEK;
 /// It does NOT publish the name that finds the file — see [`FSYNC_NAME`]
 /// and the durability vocabulary at the top of this file.
 pub use super::super::super::registry::fs::FSYNC;
-/// Report a handle's size and modification time.
+/// Report a handle's size, modification time, identity and name count.
 ///
-/// `arg` points at an output buffer. Its width selects the shape:
-///
-///   - `arg_len >= 32` → `[size: u64 LE, mtime: u64 LE, ino: u64 LE,
-///     nlink: u32 LE, reserved: u32 LE = 0]`
-///   - `arg_len >= 16` → `[size: u64 LE, mtime: u64 LE]`
-///   - `arg_len >= 8` → `[size: u32 LE, mtime: u32 LE]`
-///
-/// Providers MUST serve the first two and return the number of bytes
-/// written, so a consumer learns the width it actually got rather than
-/// assuming the one it asked for.
-///
-/// The wide form exists because 32 bits is a property of FAT32, not of
-/// filesystems: `ext4` addresses files past 4 GiB and stores timestamps that
-/// pass 2038. Making the width a function of the buffer the caller supplies
-/// means a consumer moves to 64-bit when it needs to, against a provider
-/// that already answers, instead of every consumer and provider changing on
-/// the same day. A provider whose true size exceeds what the narrow form can
-/// carry returns `EOVERFLOW` (`-75`) rather than a truncated number.
+/// `arg` out is exactly [`stat::LEN`] bytes, one [`Stat`] record:
+/// `[size: u64 LE][mtime: u64 LE][ino: u64 LE][nlink: u32 LE][0: u32]`.
+/// Any other length is `EINVAL`. Returns 0 or a negative errno. `mtime` is
+/// seconds since the Unix epoch, 0 when the volume carries no stamp.
 ///
 /// # The object-model fields
 ///
-/// The 32-byte form carries what an inode-based filesystem has and FAT32
-/// does not: a file's identity and its number of names. A provider serves it only with [`caps::STAT_OBJECT`] set; the
-/// rules for what it may put there are not optional:
+/// `ino` and `nlink` carry what an inode-based filesystem has and FAT32
+/// does not: a file's identity and its number of names. A provider without
+/// an answer writes 0 for either; the rules for what it may put there are
+/// not optional:
 ///
 ///   - **`ino` is opaque, and 0 means "this volume has no stable file
 ///     identity"** — not a valid identity that could collide with a real
@@ -223,9 +202,10 @@ pub use super::super::super::registry::fs::FSYNC;
 ///     owner, `query_key::CALLER_OWNER`), never by credentials stored on the
 ///     file: a format's own user, group and mode bits stay inside the
 ///     provider.
-///   - **`nlink` is the number of names.** [`UNLINK`] removes a name and
-///     queues storage for reclamation when the last one goes. A provider
-///     without hard links reports 1, which is true.
+///   - **`nlink` is the number of names, and 0 means "not counted".**
+///     [`UNLINK`] removes a name and queues storage for reclamation when
+///     the last one goes. A provider without hard links reports 1, which is
+///     true.
 pub use super::super::super::registry::fs::STAT;
 /// Write data. handle=file, arg=data, arg_len=data_len. Returns the bytes
 /// taken, which may be short; `EAGAIN` only when none were. The caller
@@ -598,9 +578,9 @@ pub use super::super::super::registry::fs::READLINK;
 /// moment `RENAME` answers 0.
 pub use super::super::super::registry::fs::RENAME;
 
-/// FS provider capability bitmap. `provider_call(handle, CAPS,
-/// out, out_len)` writes a `u32` (little-endian, 4 bytes) into
-/// `out`.
+/// FS provider capability bitmap: the contract-wide `CAPS` shape.
+/// `handle = -1` (or a bound handle); `arg` out is exactly 4 bytes, the
+/// `u32` LE [`caps`] word; no `data`. Returns 0.
 ///
 /// # Scope: what the bitmap covers (and what it doesn't)
 ///
@@ -629,17 +609,11 @@ pub use super::super::super::registry::fs::RENAME;
 /// is well-formed; callers wanting directory iteration check the
 /// bit first.
 ///
-/// # Wire shape
-///
-///   - `arg`/`out` is a `*mut u8` pointing at a 4-byte buffer.
-///   - `arg_len` MUST be `>= 4`.
-///   - Return value: `4` on success (bytes written), or a
-///     negative errno on error.
-///
 /// # Provider obligation
 ///
-/// All FS providers MUST implement `CAPS`. Bits not listed in
-/// [`caps`] are reserved and MUST be returned as 0.
+/// All FS providers MUST implement `CAPS`; `ENOSYS` from it means no
+/// provider. Bits not listed in [`caps`] are reserved and MUST be
+/// returned as 0.
 ///
 /// # `EAGAIN` and the probe rule
 ///
@@ -736,13 +710,6 @@ pub mod errno_classes {
 /// mutation opcode would succeed for valid input (rather than
 /// returning `ENOSYS`).
 ///
-/// Adding a new write opcode is a two-step ABI change:
-///   1. Reserve the next bit here and document it as
-///      "implemented by no provider yet, providers MUST return 0".
-///   2. Implement the opcode in linux + fat32 + wasm, flipping
-///      the bit on for each backend that supports it.
-///
-/// Bit positions are stable forever — never renumber.
 pub mod caps {
     // ── Handle-acquisition tier ─────────────────────────────
     // Opcodes called with handle = -1 that return a new FD.
@@ -755,19 +722,12 @@ pub mod caps {
     pub const OPEN_CREATE: u32 = 1 << 2;
 
     // ── Write tier (mutate state through an existing FD) ────
-    /// [`WRITE`] — write bytes through an FD. The
-    /// opcode predates `CAPS`; advertising the bit lets callers
-    /// distinguish read-only providers (e.g. FAT32 v1, wasm
-    /// fetch) from writable ones (linux) without trial-and-
-    /// error.
+    /// [`WRITE`] — write bytes through an FD. Clear on a read-only
+    /// provider (a wasm fetch backend).
     pub const WRITE: u32 = 1 << 3;
-    /// [`FSYNC`] — durability fence on an FD. As with
-    /// `WRITE`, the opcode predates the capability bitmap and
-    /// the bit is the discovery channel.
+    /// [`FSYNC`] — durability fence on an FD.
     pub const FSYNC: u32 = 1 << 4;
 
-    // Unimplemented capability bits remain clear until their opcode and
-    // provider implementations land in lockstep.
     /// [`UNLINK`] — remove a file by path.
     pub const UNLINK: u32 = 1 << 5;
     /// [`TRUNCATE`] — shrink a file, releasing the storage past
@@ -794,18 +754,90 @@ pub mod caps {
     // ── Object-model tier ───────────────────────────────────
     // What an inode-based filesystem carries and FAT32 does not. A provider
     // whose format has no answer clears the bit rather than fabricating one.
-    /// [`STAT`]'s 32-byte form is served — `ino` and `nlink` in addition to
-    /// size and mtime.
-    pub const STAT_OBJECT: u32 = 1 << 12;
-    // Bit 13 is unassigned.
-    /// A name can be added to an existing file, and `nlink` counts names.
-    pub const LINK: u32 = 1 << 14;
-    /// [`RMDIR`] — remove an empty directory by path.
-    pub const RMDIR: u32 = 1 << 16;
+    /// A name can be added to an existing file ([`LINK`]), and `nlink`
+    /// counts names.
+    pub const LINK: u32 = 1 << 12;
     /// Symbolic links exist on this volume and `READLINK` resolves one.
     /// Resolution stays in the consumer: a provider that silently follows
     /// links makes `O_NOFOLLOW` inexpressible and turns a symlink into a
     /// confused-deputy primitive on a system where a path is often the whole
     /// of an authority check.
-    pub const SYMLINK: u32 = 1 << 15;
+    pub const SYMLINK: u32 = 1 << 13;
+    /// [`RMDIR`] — remove an empty directory by path.
+    pub const RMDIR: u32 = 1 << 14;
+}
+
+/// [`SEEK`]'s argument: `[offset: u64 LE]`.
+pub mod seek {
+    /// Exact length, in bytes.
+    pub const ARG_LEN: usize = 8;
+
+    pub const fn encode(offset: u64) -> [u8; ARG_LEN] {
+        offset.to_le_bytes()
+    }
+
+    /// The offset, when `arg` is exactly [`ARG_LEN`] bytes.
+    pub fn parse(arg: &[u8]) -> Option<u64> {
+        let b: [u8; ARG_LEN] = arg.try_into().ok()?;
+        Some(u64::from_le_bytes(b))
+    }
+}
+
+/// [`STAT`]'s answer record.
+pub mod stat {
+    /// Exact length, in bytes.
+    pub const LEN: usize = 32;
+    /// `u64` LE — size in bytes.
+    pub const SIZE: usize = 0;
+    /// `u64` LE — modification time, Unix seconds; 0 unknown.
+    pub const MTIME: usize = 8;
+    /// `u64` LE — opaque file identity; 0 none.
+    pub const INO: usize = 16;
+    /// `u32` LE — number of names; 0 not counted.
+    pub const NLINK: usize = 24;
+}
+
+/// One [`STAT`] answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stat {
+    pub size: u64,
+    pub mtime: u64,
+    pub ino: u64,
+    pub nlink: u32,
+}
+
+impl Stat {
+    /// The record's bytes; the reserved word is zero.
+    pub fn encode(&self) -> [u8; stat::LEN] {
+        let mut o = [0u8; stat::LEN];
+        o[stat::SIZE..stat::SIZE + 8].copy_from_slice(&self.size.to_le_bytes());
+        o[stat::MTIME..stat::MTIME + 8].copy_from_slice(&self.mtime.to_le_bytes());
+        o[stat::INO..stat::INO + 8].copy_from_slice(&self.ino.to_le_bytes());
+        o[stat::NLINK..stat::NLINK + 4].copy_from_slice(&self.nlink.to_le_bytes());
+        o
+    }
+
+    /// Write the record into `arg`, which must be exactly [`stat::LEN`]
+    /// bytes. Returns 0, or `EINVAL` for any other length.
+    pub fn answer(&self, arg: &mut [u8]) -> i32 {
+        if arg.len() != stat::LEN {
+            return super::super::super::kernel_abi::errno::EINVAL;
+        }
+        arg.copy_from_slice(&self.encode());
+        0
+    }
+
+    /// Decode a record of exactly [`stat::LEN`] bytes.
+    pub fn decode(b: &[u8]) -> Option<Stat> {
+        if b.len() != stat::LEN {
+            return None;
+        }
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
+        Some(Stat {
+            size: u64_at(stat::SIZE),
+            mtime: u64_at(stat::MTIME),
+            ino: u64_at(stat::INO),
+            nlink: u32::from_le_bytes(b[stat::NLINK..stat::NLINK + 4].try_into().unwrap_or([0; 4])),
+        })
+    }
 }

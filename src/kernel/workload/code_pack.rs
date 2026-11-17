@@ -148,6 +148,19 @@ fn pool_base() -> *mut u8 {
     }
 }
 
+/// The pool's pages `first..first + pages`, for a protection flip. Only the
+/// region's own staging or release asks, on the scheduler thread.
+fn pages_mut(first: u32, pages: u32) -> &'static mut [u8] {
+    let len = pages as usize * PAGE;
+    if len == 0 {
+        return &mut [];
+    }
+    // SAFETY: `find_pages` placed the region inside the pool, so the range is
+    // within its `POOL_SIZE` bytes; the region is its owner's alone and only
+    // the scheduler thread reaches it.
+    unsafe { core::slice::from_raw_parts_mut(pool_base().wrapping_add(first as usize * PAGE), len) }
+}
+
 /// Is page `p` inside any live region?
 fn page_used(st: &State, p: u32) -> bool {
     st.regions
@@ -196,7 +209,7 @@ pub fn stage(pack: &[u8]) -> Result<Staged, i32> {
     };
     let base = pool_base().wrapping_add(first as usize * PAGE);
     let len = pages as usize * PAGE;
-    if !hal::ota_stage_protect(base, len, false) {
+    if !hal::ota_stage_protect(pages_mut(first, pages), false) {
         return Err(errno::EFAULT);
     }
     // SAFETY: `base..base+len` lies inside the pool (find_pages bounds it)
@@ -206,7 +219,8 @@ pub fn stage(pack: &[u8]) -> Result<Staged, i32> {
         core::ptr::write_bytes(base.add(pack.len()), 0, len - pack.len());
     }
     let mut ldr = ModuleLoader::new();
-    if let Err(e) = ldr.init_from_blob_with_len(base, pack.len()) {
+    // SAFETY: the copy above lives in the pool for as long as the pack does.
+    if let Err(e) = unsafe { ldr.init_from_blob_with_len(base, pack.len()) } {
         // The CREATE answers only EINVAL; this names which part of the
         // module table the loader refused.
         log::warn!("[live] code pack refused: {e:?}");
@@ -236,8 +250,7 @@ pub fn for_each_module(s: Staged, f: impl FnMut(u32, &[u8])) {
 /// Make a staged pack's region executable: from here its code may run.
 pub fn seal(s: Staged) -> bool {
     let r = state().regions[s.0];
-    let base = pool_base().wrapping_add(r.first_page as usize * PAGE);
-    hal::ota_stage_protect(base, r.pages as usize * PAGE, true)
+    hal::ota_stage_protect(pages_mut(r.first_page, r.pages), true)
 }
 
 /// The staged pack is `owner_slot`'s now: freed with the owner.
@@ -252,8 +265,7 @@ fn free(id: usize) {
     if !r.used {
         return;
     }
-    let base = pool_base().wrapping_add(r.first_page as usize * PAGE);
-    let _ = hal::ota_stage_protect(base, r.pages as usize * PAGE, false);
+    let _ = hal::ota_stage_protect(pages_mut(r.first_page, r.pages), false);
     st.loaders[id] = ModuleLoader::new();
     st.regions[id] = Region::EMPTY;
 }

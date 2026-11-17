@@ -1046,8 +1046,7 @@ fn main() {
         // Test hook: periodic self-trigger (no-op unless FLUXOR_TEST_REBUILD_EVERY set).
         if test_rebuild_every > 0 && iter.is_multiple_of(test_rebuild_every) {
             log::info!("[test] auto-triggering rebuild at iter {iter}");
-            // SAFETY: null/0 = the documented "reload current STATIC_CONFIG" sentinel.
-            unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+            scheduler::request_rebuild();
         }
 
         // Node-agent generation update: the agent recommits + republishes the
@@ -1093,8 +1092,7 @@ fn main() {
                             fluxor::kernel::workload::owner_plan::arm_staged_revocation_drains(
                                 arm_drain,
                             );
-                            // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
-                            unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+                            scheduler::request_rebuild();
                         }
                     }
                 }
@@ -1115,7 +1113,7 @@ fn main() {
         // the graph from STATIC_CONFIG. Single-threaded, so no quiesce is
         // needed (unlike bcm2712). `prepare_graph` does the destructive reset
         // and is fail-safe on error.
-        if scheduler::take_rebuild_request().is_some() {
+        if scheduler::take_rebuild_request() {
             log::info!("[reconfigure] rebuild requested; rebuilding graph");
             let (mc, lc) = build_graph_linux();
             module_count = mc;

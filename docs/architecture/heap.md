@@ -244,7 +244,7 @@ heap_per_param = { base = 4096, params = [
 |---|---|
 | `base` | the type's default cap, stated only by a type without a `heap_from_params` rule (whose `base` it otherwise is); it holds what the module allocates besides the tables, and each table's block header, rounding and canary ([rule 5](#rules-for-module-authors)) |
 | `params[].tag` | one of the module's own integer params (`u8`, `u16`, `u32`) whose value is a table's count; each param once |
-| `params[].default` | that param's schema default: the count of an instance that leaves it unset |
+| `params[].default` | that param's schema default: the count of an instance that leaves it unset; per ABI like any capacity, for a default the module computes per profile |
 | `params[].bytes_each` | heap bytes per entry of that table, per ABI like any capacity |
 
 Packing an instance, the composer reads each param's value (its `default`

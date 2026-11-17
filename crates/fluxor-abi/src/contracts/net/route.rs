@@ -30,17 +30,16 @@
 // bytes wide (IPv4 in the first four, the rest zero), so IPv6 needs no format
 // change.
 
-/// Provider class id (opcode class 0x20xx). Mirrors
+/// Provider class id (opcode class 0x16xx). Mirrors
 /// `kernel::module::provider::contract::NET_ROUTE`.
 pub const CLASS: u16 = super::super::super::registry::net_route::ID;
 
-/// Returns 0 when a net.route provider is present. handle=-1, arg=null.
-pub use super::super::super::registry::net_route::PROBE;
-
-/// Capability bitmap. handle=-1, arg = `[caps_out:u32]` (written). Returns 0.
+/// Capability bitmap. handle=-1 (or a bound handle); `arg` out is exactly 4
+/// bytes, the `u32` LE [`caps`] word; no `data`. Returns 0. Every provider
+/// implements it; `ENOSYS` from `CAPS` means there is no provider.
 pub use super::super::super::registry::net_route::CAPS;
 
-/// Replace the segment table, whole and atomically. handle=-1, arg =
+/// Replace the segment table, whole and atomically. handle=-1, `data` in =
 /// `[count:u8][segment]×count` ([`segment`]). Returns 0, or `EINVAL`
 /// (malformed: a segment 0, a gateway outside its prefix, two segments with
 /// one id or one gateway, trailing bytes), `ENOSPC` (past capacity), `EBUSY`
@@ -50,7 +49,7 @@ pub use super::super::super::registry::net_route::CAPS;
 /// error the table is as it was.
 pub use super::super::super::registry::net_route::SEGMENTS;
 
-/// Replace the peer-route table, whole and atomically. handle=-1, arg =
+/// Replace the peer-route table, whole and atomically. handle=-1, `data` in =
 /// `[count:u16][route]×count` ([`peer`]). Returns 0, `EINVAL` (malformed, or
 /// a default route: a prefix of length 0), `ENOSPC` (past capacity), `EBUSY`
 /// (another writer) or `EAGAIN`, as [`SEGMENTS`].
@@ -65,7 +64,7 @@ pub use super::super::super::registry::net_route::SEGMENTS;
 /// node answers for, not a link it is on) are not among them.
 pub use super::super::super::registry::net_route::ROUTES;
 
-/// Replace the held-address table, whole. handle=-1, arg =
+/// Replace the held-address table, whole. handle=-1, `data` in =
 /// `[count:u16][held]×count` ([`held`]), one entry per address. Realization
 /// is asynchronous: poll `READ`. Returns 0, `EINVAL` (malformed, or an
 /// address twice), `ENOSPC`, `EBUSY` (another writer, or a node whose held
@@ -73,7 +72,7 @@ pub use super::super::super::registry::net_route::ROUTES;
 /// [`SEGMENTS`].
 pub use super::super::super::registry::net_route::HOLD;
 
-/// Read the realization state. handle=-1, arg = the out buffer:
+/// Read the realization state. handle=-1, `data` out:
 /// `[state_generation:u64]` then one [`entry`] per segment, route and held
 /// address, in table order. The generation advances whenever a table or an
 /// entry's state changes, so a caller polls it. Returns the byte count
@@ -84,7 +83,7 @@ pub use super::super::super::registry::net_route::HOLD;
 pub use super::super::super::registry::net_route::READ;
 
 /// A realizing module provider (the bare-metal network stack) reports
-/// per-entry state. handle=-1, arg = `[entry]×n` ([`entry`]), each indexed
+/// per-entry state. handle=-1, `data` in = `[entry]×n` ([`entry`]), each indexed
 /// into the tables of the provider's last [`TAKE`]. Admitted only from the
 /// registered net-identity provider, holding `net_route.stack`; a platform that
 /// realizes the tables itself never calls it. All entries are recorded or
@@ -93,8 +92,8 @@ pub use super::super::super::registry::net_route::READ;
 /// TAKE (the provider takes again and reports against those).
 pub use super::super::super::registry::net_route::REPORT;
 
-/// The table contents, for a realizing module provider. handle=-1, arg = the
-/// out buffer: `[table_generation:u64][n_segments:u8][rsv:u8]
+/// The table contents, for a realizing module provider. handle=-1, `data`
+/// out: `[table_generation:u64][n_segments:u8][rsv:u8]
 /// [n_routes:u16][n_held:u16][rsv:u16]` then the segments, routes and held
 /// records in their wire layouts. Returns the byte count; `ERANGE` when the
 /// records do not fit, with the header still written as far as the buffer

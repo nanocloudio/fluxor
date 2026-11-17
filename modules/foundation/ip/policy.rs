@@ -171,34 +171,27 @@ unsafe fn read(
     cap: usize,
     state: &mut [u8; np::state::BYTES],
 ) -> i32 {
-    let mut arg = [0u8; 1 + np::MAX_TABLE_NAME + 8 + 4 + 8];
+    let mut arg = [0u8; np::name::ARG_MAX];
     let nl = name.len().min(np::MAX_TABLE_NAME);
-    arg[0] = nl as u8;
-    let mut i = 0;
-    while i < nl {
-        if let Some(d) = arg.get_mut(1 + i) {
-            *d = match name.get(i) {
-                Some(b) => *b,
-                None => 0,
-            };
-        }
-        i += 1;
-    }
-    let p = 1 + nl;
-    let w = |arg: &mut [u8], at: usize, v: u64, n: usize| {
-        let b = v.to_le_bytes();
-        let mut k = 0;
-        while k < n && k < 8 {
-            if let Some(d) = arg.get_mut(at + k) {
-                *d = b[k];
-            }
-            k += 1;
-        }
+    let Some(name) = name.get(..nl) else {
+        return -22;
     };
-    w(&mut arg, p, out as u64, 8);
-    w(&mut arg, p + 8, cap as u64, 4);
-    w(&mut arg, p + 12, state.as_mut_ptr() as u64, 8);
-    ((*s.syscalls).provider_call)(-1, np::READ, arg.as_mut_ptr(), p + 20)
+    if np::name::encode(name, &mut arg).is_none() {
+        return -22;
+    }
+    let len = np::name::arg_len(nl);
+    let rc = ((*s.syscalls).provider_call)(-1, np::READ, arg.as_mut_ptr(), len, out, cap);
+    // The state is answered in `arg` on success and on `ERANGE` alike.
+    if rc >= 0 || rc == -34 {
+        let mut i = 0;
+        while i < np::state::BYTES {
+            if let (Some(d), Some(v)) = (state.get_mut(i), arg.get(i)) {
+                *d = *v;
+            }
+            i += 1;
+        }
+    }
+    rc
 }
 
 #[inline(always)]
@@ -356,7 +349,14 @@ unsafe fn attach(s: &mut IpState) {
             k += 1;
         }
         let len = 1 + nl + np::ATTACH_TAIL + np::ATTACH_CAPACITY_TAIL;
-        let rc = ((*s.syscalls).provider_call)(-1, np::ATTACH, arg.as_mut_ptr(), len);
+        let rc = ((*s.syscalls).provider_call)(
+            -1,
+            np::ATTACH,
+            arg.as_mut_ptr(),
+            len,
+            core::ptr::null_mut(),
+            0,
+        );
         if rc != 0 {
             all = false;
         }

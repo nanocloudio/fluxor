@@ -2,17 +2,23 @@ version = "2.1.0"
 # timer_class: query timeout reads wall-clock (dev_millis).
 timer_class = "wall_clock"
 hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux"]
-grants = ["key_vault"]
 
 [[ports]]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+# Datagrams only: the stream leg is `tls_in`/`tls_out`, through a `tls`
+# that retains, so the transport keeps nothing for this port.
+datagram_only = true
+# A transport record whole, header included (`module_facts!` states the same).
+accepts_record = 1483
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+# One CMD_DG_SEND_TO of a 512-byte DNS message, header included.
+max_record = 523
 
 # The stream leg, for `upstream_transport = tls` (RFC 7858) or `https`
 # (RFC 8484). A graph wires these through a client-mode `tls` to the
@@ -28,11 +34,15 @@ content_type = "NetProto"
 name = "tls_in"
 direction = "input"
 content_type = "NetProto"
+# A stream record from the TLS leg whole, header included.
+accepts_record = 1483
 
 [[ports]]
 name = "tls_out"
 direction = "output"
 content_type = "NetProto"
+# A DoH request (head and message in one CMD_SEND), header included.
+max_record = 600
 
 # Module-scope observability. Optional 2nd output (out[1]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
@@ -59,6 +69,13 @@ requires_contract = "fs"
 access = "write"
 optional = true
 
+# TSIG keys (`update_allow`) are opened by label in the vault, which makes
+# and checks every MAC; the key never reaches this module.
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+active_when_params = ["update_allow"]
+
 # TSIG validity (RFC 8945 §5.2.3) is a calendar-time decision: a signed
 # UPDATE is accepted only inside its fudge window against the kernel's
 # trusted clock, and fails closed without one. Any update zone needs it —
@@ -67,3 +84,18 @@ optional = true
 [[requires_when]]
 capability = "time.wall"
 when       = { update_durability = ["volatile", "durable"] }
+
+# `full` serves every extension. `resolver` serves neither dynamic update nor
+# DNSSEC validation and holds none of their tables — the two zone generations,
+# the zone file image, the TSIG keys and transaction cache, the trust anchors,
+# some 21 KiB on an MCU — for a graph that resolves and forwards. An instance
+# that sets `update_*`, `dnssec` or `dnssec_anchor` on it refuses to construct.
+[[variant]]
+name     = "full"
+features = []
+default  = true
+
+[[variant]]
+name     = "resolver"
+features = ["resolver"]
+

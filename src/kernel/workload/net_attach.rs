@@ -480,6 +480,14 @@ pub fn take_queued(slot: usize, out: &mut [u8]) -> i32 {
     }) else {
         return 0;
     };
+    if op.op == net_lane::OP_ATTACH {
+        // The provider reads the lane's commands and writes its events: it is
+        // those ends of the two channels from here on.
+        use crate::kernel::ipc::channel::{channel_bind_end, End};
+        let me = slot as crate::kernel::exec::scheduler::ModuleId;
+        channel_bind_end(op.commands, End::Consumer, me);
+        channel_bind_end(op.events, End::Producer, me);
+    }
     let r = &mut out[..net_lane::RECORD_LEN];
     r.fill(0);
     r[net_lane::OFF_OP] = op.op;

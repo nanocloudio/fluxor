@@ -1,8 +1,8 @@
 # The ABI number registry: every contract id, opcode, grant, errno, poll
-# bit, ioctl command and channel message type is declared here once.
+# bit and channel message type is declared here once.
 # `fluxor abi-regen` generates `registry.rs` from it; nothing else may
 # restate a number. A contract's id is its opcode class byte, its vtable
-# index, its grant bit and, when it mints handles, their fd tag.
+# index, its grant bit and the contract field of its handles.
 #
 # Grants. A module may call an op only when it holds the op's grant. An op's
 # grant is its contract's own bit unless the op (or, as a default for its
@@ -16,6 +16,10 @@
 semantic_epoch = 1
 max_contracts = 64
 chain_next = 0x10000
+# The handle word: `0 | contract | generation | index`, high to low.
+handle_contract_bits = 7
+handle_generation_bits = 9
+handle_index_bits = 15
 
 [[grant]]
 name = "kernel.serial"
@@ -99,7 +103,7 @@ doc = "Stage an OTA image (`OTA_STAGE_WRITE`, `OTA_STAGE_CTRL`)."
 name = "metal_device.mmio"
 bit = 13
 reach = "kernel"
-doc = "Read and write device registers by physical address (`MMIO_READ32`, `MMIO_WRITE32`)."
+doc = "Open a device-register aperture and read and write registers in it (`MMIO_OPEN`, `MMIO_READ32`, `MMIO_WRITE32`)."
 
 [[grant]]
 name = "metal_device.pcie"
@@ -118,6 +122,12 @@ name = "seal_key"
 bit = 16
 reach = "kernel"
 doc = "Keep the key vault's durable image: the holder sees every persisted record and decides what reaches the medium."
+
+[[grant]]
+name = "lend.borrow"
+bit = 17
+reach = "kernel"
+doc = "Resolve and return a span another module lent to one of this module's edges (`RESOLVE`, `RETURN`): a privileged driver doing DMA into it."
 
 [[errno]]
 name = "OK"
@@ -259,26 +269,6 @@ bit = 0x08
 name = "WROTE"
 bit = 0x20
 
-[[ioctl]]
-name = "NOTIFY"
-value = 1
-
-[[ioctl]]
-name = "POLL_NOTIFY"
-value = 2
-
-[[ioctl]]
-name = "FLUSH"
-value = 3
-
-[[ioctl]]
-name = "SET_HUP"
-value = 4
-
-[[ioctl]]
-name = "WRITABLE"
-value = 5
-
 [[contract]]
 name = "kernel"
 grant = "none"
@@ -288,12 +278,13 @@ route = "class"
   [[contract.op]]
   name = "LOG_WRITE"
   op = 0x40
-  gate = { handle = "value", arg = "in", max = "any" }
+  gate = { handle = "value", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "SERIAL_WRITE"
   grant = "kernel.serial"
   op = 0x66
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "HANDLE_POLL"
@@ -328,12 +319,13 @@ route = "class"
   [[contract.op]]
   name = "ARENA_GET"
   op = 0x3A
-  gate = { handle = "global", arg = "out", max = 4 }
+  gate = { handle = "global", arg = "out", max = 12 }
+  addr_answer = true
 
   [[contract.op]]
   name = "RANDOM_FILL"
   op = 0x3C
-  gate = { handle = "global", arg = "out", max = "any" }
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "SYS_CLOCK_HZ"
@@ -343,18 +335,17 @@ route = "class"
   [[contract.op]]
   name = "SELF_INDEX"
   op = 0x42
+  gate = { handle = "global", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "MODULE_INSTANCE_PARAMS"
   op = 0x43
-
-  [[contract.op]]
-  name = "OWNER_TAG"
-  op = 0x4B
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "NET_IDENT_PROVIDER"
   op = 0x4C
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "BOOT_INCARNATION"
@@ -365,11 +356,12 @@ route = "class"
   name = "PROGRAM_INFO"
   op = 0x2B
   gate = { handle = "global", arg = "inout", max = 64 }
+  addr_answer = true
 
   [[contract.op]]
   name = "PROGRAM_READ"
   op = 0x2C
-  gate = { handle = "global", arg = "inout", max = "any" }
+  gate = { handle = "global", arg = "in", max = 8, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "SIGNING_ROOT"
@@ -389,36 +381,26 @@ route = "class"
   [[contract.op]]
   name = "MODULE_FLOW_BUDGET"
   op = 0x46
-  gate = { handle = "global", arg = "inout", max = "any" }
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "GET_HW_ETHERNET_MAC"
   op = 0x3D
+  gate = { handle = "global", arg = "out", max = 6 }
 
   [[contract.op]]
   name = "QUERY_OP"
   op = 0xFE
   route = "handle"
+  gate = { handle = "minted", arg = "out", max = 62 }
 
   [[contract.op]]
   name = "QUERY_CLASS"
   op = 0x01
 
-  [[contract.op]]
-  name = "QUERY_NAME"
-  op = 0x02
 
-  [[contract.op]]
-  name = "QUERY_CAPABILITIES"
-  op = 0x03
 
-  [[contract.op]]
-  name = "QUERY_STATE"
-  op = 0x04
 
-  [[contract.op]]
-  name = "QUERY_ERROR_COUNT"
-  op = 0x05
 
   [[contract.op]]
   name = "QUERY_HEAP_STATS"
@@ -441,49 +423,137 @@ route = "class"
   op = 0x0b
 
   [[contract.op]]
-  name = "QUERY_EVENT_OWNER"
-  op = 0x0c
-
-  [[contract.op]]
   name = "SIGNAL_CORE"
   grant = "kernel.signal_core"
   op = 0x52
 
+  # `provider_open(contract, BIND, arg)`: a handle bound to one provider of
+  # `contract`, through which every later op reaches it. `arg` names the
+  # provider: `[NAME][len u8][name]` for an instance-keyed layer (or the
+  # platform's own, `platform`), `[PORT][port_type u8][index u8]` for the
+  # module at the other end of one of the caller's ports (an edge contract).
+  gate = { handle = "global", arg = "in", max = 2 }
+  [[contract.op]]
+  name = "BIND"
+  op = 0x53
+  gate = { handle = "mints", arg = "in", max = 34 }
+
+  # Kernel to provider: the doorbell a signalling handle's minter waits on,
+  # delivered after the provider answered the signalling op with its index
+  # (`handle` = that index). `arg` = `[doorbell u32][contract u16][0 u16]`.
+  # A refusal closes the index and fails the mint. Never a module's call.
+  [[contract.op]]
+  name = "BIND_DOORBELL"
+  op = 0x54
+
+  # A module provider rings a doorbell the kernel handed it
+  # (`BIND_DOORBELL`): the minter is woken and its handle polls ready once.
+  # `arg` = `[doorbell u32]`. A doorbell whose handle closed is a no-op.
+  [[contract.op]]
+  name = "DOORBELL_RING"
+  op = 0x55
+  gate = { handle = "global", arg = "in", max = 4 }
+
 [[contract]]
+# The channel: a ring (FIFO) or a one-record mailbox between a producer and a
+# consumer. `channel_read` / `channel_write` / `channel_peek` /
+# `channel_discard` / `channel_poll` are the syscall table's own entries; the
+# ops below are the rest of the object. A record a write publishes keeps its
+# boundary (`RECORD_LEN`); the five lend ops act on a mailbox's record.
 name = "channel"
 grant = "none"
 id = 0x01
 manifest = true
 
+  # `arg` = the ring's capacity in bytes, `u32` LE (a power of two within the
+  # ring bounds), or empty for the default ring.
   [[contract.op]]
   name = "OPEN"
   op = 0x00
   admission = true
+  gate = { handle = "mints", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x01
+  gate = { handle = "channel", arg = "none", max = 0 }
+
+  # Either end: drop what is buffered (a mailbox's READY record; `EBUSY` while
+  # its record is lent), clear WROTE and the owed discard, and clear HUP unless
+  # the producer is gone. ERR stays.
+  [[contract.op]]
+  name = "FLUSH"
+  op = 0x02
+  gate = { handle = "channel", arg = "none", max = 0 }
+
+  # The producer: end of stream (`poll::HUP`), seen by a tap too.
+  [[contract.op]]
+  name = "SET_HUP"
+  op = 0x03
+  gate = { handle = "channel", arg = "none", max = 0 }
+
+  # The producer: `arg` out `u32` LE, the largest write the ring takes now (0
+  # for a full ring and for a mailbox).
+  [[contract.op]]
+  name = "WRITABLE"
+  op = 0x04
+  gate = { handle = "channel", arg = "out", max = 4 }
+
+  # The consumer: the unread bytes of the record at the head of the channel,
+  # as the call's result; `EAGAIN` when none is buffered.
+  [[contract.op]]
+  name = "RECORD_LEN"
+  op = 0x05
+  gate = { handle = "channel", arg = "none", max = 0 }
 
   [[contract.op]]
-  name = "IOCTL"
-  op = 0x06
-  gate = { handle = "channel", arg = "inout", max = "walk" }
-  walker = "channel_ioctl"
-
-  [[contract.op]]
-  name = "REGISTER_IOCTL"
+  name = "FACTS"
   op = 0x07
+  gate = { handle = "channel", arg = "out", max = 4 }
 
   [[contract.op]]
   name = "PORT"
   op = 0x0C
   gate = { handle = "global", arg = "inout", max = 2 }
 
+  # The producer lends the mailbox's record for writing (IDLE -> WRITING).
+  [[contract.op]]
+  name = "ACQUIRE_WRITE"
+  op = 0x10
+  gate = { handle = "channel", arg = "out", max = 16 }
+  addr_answer = true
+
+  # The lend's holder publishes `len` bytes (`u32` LE in `arg`; 0 cancels).
+  [[contract.op]]
+  name = "RELEASE_WRITE"
+  op = 0x11
+  gate = { handle = "channel", arg = "in", max = 4 }
+
+  # The consumer lends the READY record for reading (READY -> READING).
+  [[contract.op]]
+  name = "ACQUIRE_READ"
+  op = 0x12
+  gate = { handle = "channel", arg = "out", max = 16 }
+  addr_answer = true
+
+  # The lend's holder consumes the record (READING -> IDLE).
+  [[contract.op]]
+  name = "RELEASE_READ"
+  op = 0x13
+  gate = { handle = "channel", arg = "none", max = 0 }
+
+  # The consumer lends a READY record no in-place writer has processed for
+  # rewriting (READY -> WRITING); `RELEASE_WRITE` hands it on.
+  [[contract.op]]
+  name = "ACQUIRE_INPLACE"
+  op = 0x14
+  gate = { handle = "channel", arg = "out", max = 16 }
+  addr_answer = true
+
 [[contract]]
 name = "timer"
 grant = "none"
 id = 0x02
-mints = true
 manifest = true
 
   [[contract.op]]
@@ -510,19 +580,24 @@ manifest = true
   name = "CREATE"
   op = 0x04
   admission = true
+  gate = { handle = "mints", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "SET"
   op = 0x05
   admission = true
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "CANCEL"
   op = 0x06
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "DESTROY"
   op = 0x07
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "DISCIPLINE"
@@ -531,36 +606,24 @@ manifest = true
   gate = { handle = "global", arg = "in", max = 20 }
 
 [[contract]]
-name = "buffer"
-grant = "none"
+# Restart the stream a producer writes on one edge at a position the consumer
+# names, served by the module at the other end of the consumer's input port
+# (`contracts::stream_select` has the record).
+name = "stream_select"
 id = 0x03
+module_provided = true
 manifest = true
+route = "edge"
 
   [[contract.op]]
-  name = "ACQUIRE_WRITE"
+  name = "SELECT"
   op = 0x00
-
-  [[contract.op]]
-  name = "RELEASE_WRITE"
-  op = 0x01
-
-  [[contract.op]]
-  name = "ACQUIRE_READ"
-  op = 0x02
-
-  [[contract.op]]
-  name = "RELEASE_READ"
-  op = 0x03
-
-  [[contract.op]]
-  name = "ACQUIRE_INPLACE"
-  op = 0x04
+  gate = { handle = "minted", arg = "in", max = 8 }
 
 [[contract]]
 name = "event"
 grant = "none"
 id = 0x04
-mints = true
 manifest = true
 
   [[contract.op]]
@@ -589,642 +652,746 @@ manifest = true
   name = "BIND_IRQ"
   op = 0x51
   admission = true
+  gate = { handle = "minted", arg = "in", max = 5 }
 
 [[contract]]
 name = "key_vault"
 reach = "kernel"
 id = 0x05
-mints = true
-
-  [[contract.op]]
-  name = "PROBE"
-  op = 0x00
+manifest = true
+module_provided = true
 
   [[contract.op]]
   name = "STORE"
-  op = 0x01
+  op = 0x00
+  gate = { handle = "mints", arg = "in", max = 6, data = "in", data_max = 4096 }
 
   [[contract.op]]
   name = "ECDH"
-  op = 0x02
+  op = 0x01
+  gate = { handle = "minted", arg = "inout", max = 4, data = "inout", data_max = 256 }
 
   [[contract.op]]
   name = "SIGN"
-  op = 0x03
+  op = 0x02
+  gate = { handle = "minted", arg = "inout", max = 6, data = "inout", data_max = "any" }
 
   [[contract.op]]
   name = "VERIFY"
-  op = 0x04
+  op = 0x03
+  gate = { handle = "scoped", arg = "in", max = 8, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "DESTROY"
-  op = 0x05
+  op = 0x04
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "GENERATE"
-  op = 0x06
+  op = 0x05
+  gate = { handle = "mints", arg = "inout", max = 12, data = "out", data_max = 4096 }
 
   [[contract.op]]
   name = "PUBLIC"
-  op = 0x07
+  op = 0x06
+  gate = { handle = "minted", arg = "out", max = 4, data = "out", data_max = 4096 }
 
   [[contract.op]]
   name = "TIER"
-  op = 0x08
+  op = 0x07
+  gate = { handle = "global", arg = "out", max = 1 }
 
   [[contract.op]]
   name = "OPEN_OR_GENERATE"
-  op = 0x09
+  op = 0x08
+  gate = { handle = "mints", arg = "inout", max = 76, data = "out", data_max = 4096 }
 
   [[contract.op]]
   name = "OPEN"
-  op = 0x0A
+  op = 0x09
+  gate = { handle = "mints", arg = "inout", max = 76, data = "out", data_max = 4096 }
 
   [[contract.op]]
   name = "DESTROY_BY_LABEL"
-  op = 0x0B
+  op = 0x0A
+  gate = { handle = "global", arg = "in", max = 65 }
 
   [[contract.op]]
   name = "DESCRIBE"
+  op = 0x0B
+  gate = { handle = "minted", arg = "out", max = 8 }
+
+  [[contract.op]]
+  name = "DESCRIBE_SUITE"
   op = 0x0C
-
-  [[contract.op]]
-  name = "SUITE_QUERY"
-  op = 0x0D
-
-  [[contract.op]]
-  name = "SUITE_ENUM"
-  op = 0x0E
+  gate = { handle = "global", arg = "inout", max = 20 }
 
   [[contract.op]]
   name = "ATTEST_COMPOSITION"
-  op = 0x0F
+  op = 0x0D
+  gate = { handle = "minted", arg = "inout", max = 36, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "KEY_WRAP"
-  op = 0x10
+  op = 0x0E
+  gate = { handle = "minted", arg = "inout", max = 101, data = "out", data_max = 256 }
 
   [[contract.op]]
   name = "KEY_UNWRAP"
-  op = 0x11
+  op = 0x0F
+  gate = { handle = "minted_mints", arg = "none", max = 0, data = "in", data_max = 256 }
 
   [[contract.op]]
   name = "AEAD_SEAL"
-  op = 0x12
+  op = 0x10
+  gate = { handle = "minted", arg = "inout", max = 274, data = "inout", data_max = 65552 }
 
   [[contract.op]]
   name = "AEAD_OPEN"
-  op = 0x13
+  op = 0x11
+  gate = { handle = "minted", arg = "in", max = 274, data = "inout", data_max = 65552 }
 
   [[contract.op]]
   name = "DERIVE"
-  op = 0x14
+  op = 0x12
+  gate = { handle = "minted_mints", arg = "in", max = 202 }
 
   [[contract.op]]
   name = "AEAD_SEAL_UNITS"
-  op = 0x15
+  op = 0x13
+  gate = { handle = "minted", arg = "inout", max = 158, data = "inout", data_max = 65536 }
 
   [[contract.op]]
   name = "AEAD_OPEN_UNITS"
-  op = 0x16
+  op = 0x14
+  gate = { handle = "minted", arg = "in", max = 158, data = "inout", data_max = 65536 }
 
   [[contract.op]]
   name = "SHARE_SPLIT"
-  op = 0x17
+  op = 0x15
+  gate = { handle = "minted", arg = "in", max = 283, data = "out", data_max = 780 }
 
   [[contract.op]]
   name = "SHARE_REWRAP"
-  op = 0x18
+  op = 0x16
+  gate = { handle = "minted", arg = "in", max = 153, data = "inout", data_max = 260 }
 
   [[contract.op]]
   name = "SHARE_COMBINE"
-  op = 0x19
+  op = 0x17
+  gate = { handle = "minted_mints", arg = "in", max = 28, data = "in", data_max = 260 }
 
   [[contract.op]]
   name = "ATTEST_KEY"
-  op = 0x1A
+  op = 0x18
+  gate = { handle = "minted", arg = "in", max = 32, data = "out", data_max = 148 }
 
 [[contract]]
 name = "gpio"
 id = 0x06
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "CLAIM"
   op = 0x00
+  gate = { handle = "mints", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "RELEASE"
   op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "SET_MODE"
   op = 0x02
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "SET_PULL"
   op = 0x03
+  gate = { handle = "minted", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "SET_LEVEL"
   op = 0x04
+  gate = { handle = "minted", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "GET_LEVEL"
   op = 0x05
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "SET_OUTPUT"
   op = 0x06
+  gate = { handle = "mints", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "SET_INPUT"
   op = 0x07
+  gate = { handle = "mints", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "WATCH_EDGE"
   op = 0x0A
+  gate = { handle = "minted_mints", arg = "in", max = 1 }
+  signals = true
 
 [[contract]]
 name = "spi"
 id = 0x07
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "OPEN"
   op = 0x00
+  gate = { handle = "mints", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "BEGIN"
   op = 0x02
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "END"
   op = 0x03
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "SET_CS"
   op = 0x04
+  gate = { handle = "minted", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "CLAIM"
   op = 0x05
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "CONFIGURE"
   op = 0x06
+  gate = { handle = "minted", arg = "in", max = 5 }
 
   [[contract.op]]
   name = "TRANSFER_START"
   op = 0x07
+  gate = { handle = "minted", arg = "in", max = 13 }
 
   [[contract.op]]
   name = "TRANSFER_POLL"
   op = 0x08
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "POLL_BYTE"
   op = 0x09
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
-  name = "GET_CAPS"
+  name = "DESCRIBE"
   op = 0x0A
+  gate = { handle = "scoped", arg = "out", max = 4 }
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "i2c"
 id = 0x08
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "OPEN"
   op = 0x00
+  gate = { handle = "mints", arg = "in", max = 3 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "WRITE"
   op = 0x02
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = 64 }
 
   [[contract.op]]
   name = "READ"
   op = 0x03
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "WRITE_READ"
   op = 0x04
+  gate = { handle = "minted", arg = "in", max = 2, data = "in", data_max = 64 }
 
   [[contract.op]]
   name = "CLAIM"
   op = 0x05
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "RELEASE"
   op = 0x06
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
-  name = "GET_CAPS"
+  name = "POLL"
   op = 0x07
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = 64 }
 
 [[contract]]
 name = "pio"
 id = 0x09
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "STREAM_ALLOC"
   op = 0x00
+  gate = { handle = "mints", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "STREAM_LOAD_PROGRAM"
   op = 0x01
-
-  [[contract.op]]
-  name = "STREAM_GET_BUFFER"
-  op = 0x02
+  gate = { handle = "minted", arg = "in", max = 4, data = "in", data_max = 64 }
 
   [[contract.op]]
   name = "STREAM_CONFIGURE"
   op = 0x03
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "STREAM_CAN_PUSH"
   op = 0x04
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "STREAM_PUSH"
   op = 0x05
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = 8192 }
 
   [[contract.op]]
   name = "STREAM_FREE"
   op = 0x06
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "STREAM_TIME"
   op = 0x07
-
-  [[contract.op]]
-  name = "DIRECT_BUFFER"
-  op = 0x08
-
-  [[contract.op]]
-  name = "DIRECT_PUSH"
-  op = 0x09
+  gate = { handle = "scoped", arg = "out", max = 24 }
 
   [[contract.op]]
   name = "PROGRAM_STATUS"
   op = 0x0A
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "STREAM_SET_RATE"
   op = 0x0B
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "CMD_ALLOC"
   op = 0x10
+  gate = { handle = "mints", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "CMD_LOAD_PROGRAM"
   op = 0x11
+  gate = { handle = "minted", arg = "in", max = 4, data = "in", data_max = 64 }
 
   [[contract.op]]
   name = "CMD_CONFIGURE"
   op = 0x12
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "CMD_TRANSFER"
   op = 0x13
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = 1624 }
 
   [[contract.op]]
   name = "CMD_POLL"
   op = 0x14
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = 1616 }
 
   [[contract.op]]
   name = "CMD_FREE"
   op = 0x15
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "CMD_LEVEL"
   op = 0x16
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "RX_STREAM_ALLOC"
   op = 0x20
+  gate = { handle = "mints", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "RX_STREAM_LOAD_PROGRAM"
   op = 0x21
+  gate = { handle = "minted", arg = "in", max = 4, data = "in", data_max = 64 }
 
   [[contract.op]]
   name = "RX_STREAM_CONFIGURE"
   op = 0x22
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "RX_STREAM_CAN_PULL"
   op = 0x23
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "RX_STREAM_PULL"
   op = 0x24
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "RX_STREAM_FREE"
   op = 0x25
-
-  [[contract.op]]
-  name = "RX_STREAM_GET_BUFFER"
-  op = 0x26
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "RX_STREAM_SET_RATE"
   op = 0x27
+  gate = { handle = "minted", arg = "in", max = 4 }
 
 [[contract]]
 name = "uart"
 id = 0x0A
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "OPEN"
   op = 0x00
+  gate = { handle = "mints", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "WRITE"
   op = 0x02
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "READ"
   op = 0x03
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "POLL"
   op = 0x04
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "CONFIGURE"
   op = 0x05
+  gate = { handle = "minted", arg = "in", max = 4 }
 
 [[contract]]
 name = "adc"
 id = 0x0B
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "OPEN"
   op = 0x00
+  gate = { handle = "mints", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "READ"
   op = 0x02
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "POLL"
   op = 0x03
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "CONFIGURE"
   op = 0x04
+  gate = { handle = "minted", arg = "in", max = 4 }
 
 [[contract]]
 name = "pwm"
 id = 0x0C
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "OPEN"
   op = 0x00
+  gate = { handle = "mints", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "CONFIGURE"
   op = 0x02
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "SET_DUTY"
   op = 0x03
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "GET_DUTY"
   op = 0x04
+  gate = { handle = "minted", arg = "none", max = 0 }
 
 [[contract]]
 name = "fs"
 id = 0x0D
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "OPEN"
   op = 0x00
   admission = true
+  gate = { handle = "scoped_mints", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "READ"
   op = 0x01
+  gate = { handle = "minted", arg = "out", max = 1024 }
 
   [[contract.op]]
   name = "SEEK"
   op = 0x02
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x03
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "STAT"
   op = 0x04
+  gate = { handle = "minted", arg = "out", max = 32 }
 
   [[contract.op]]
   name = "FSYNC"
   op = 0x05
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "WRITE"
   op = 0x06
+  gate = { handle = "minted", arg = "in", max = 1024 }
 
   [[contract.op]]
   name = "OPENDIR"
   op = 0x07
   admission = true
+  gate = { handle = "scoped_mints", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "READDIR"
   op = 0x08
+  gate = { handle = "minted", arg = "out", max = 1024 }
 
   [[contract.op]]
   name = "OPEN_CREATE"
   op = 0x09
   admission = true
+  gate = { handle = "scoped_mints", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "UNLINK"
   op = 0x0A
+  gate = { handle = "scoped", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "MKDIR"
   op = 0x0B
+  gate = { handle = "scoped", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "PREALLOCATE"
   op = 0x0E
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "TRUNCATE"
   op = 0x0C
+  gate = { handle = "scoped", arg = "in", max = 263 }
 
   [[contract.op]]
   name = "WRITE_ASYNC"
   op = 0x0F
+  gate = { handle = "minted", arg = "in", max = 1024 }
 
   [[contract.op]]
   name = "FSYNC_SUBMIT"
   op = 0x10
+  gate = { handle = "minted", arg = "out", max = 8 }
 
   [[contract.op]]
   name = "FSYNC_POLL"
   op = 0x11
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "FSYNC_NAME"
   op = 0x12
+  gate = { handle = "scoped", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "RMDIR"
   op = 0x15
+  gate = { handle = "scoped", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "LINK"
   op = 0x13
+  gate = { handle = "scoped", arg = "in", max = 514 }
 
   [[contract.op]]
   name = "READLINK"
   op = 0x14
+  gate = { handle = "scoped", arg = "inout", max = 1024 }
 
   [[contract.op]]
   name = "RENAME"
   op = 0x0D
+  gate = { handle = "scoped", arg = "in", max = 514 }
 
   [[contract.op]]
   name = "CAPS"
   op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "storage.namespace"
 id = 0x0E
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "LOOKUP"
   op = 0x00
+  gate = { handle = "scoped_mints", arg = "in", max = 255 }
 
   [[contract.op]]
   name = "STAT"
   op = 0x01
+  gate = { handle = "minted", arg = "out", max = 50 }
 
   [[contract.op]]
   name = "LIST"
   op = 0x02
+  gate = { handle = "scoped", arg = "inout", max = 578, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "RENAME"
   op = 0x03
+  gate = { handle = "scoped", arg = "inout", max = 579 }
 
   [[contract.op]]
   name = "DELETE"
   op = 0x04
+  gate = { handle = "scoped", arg = "inout", max = 322 }
 
   [[contract.op]]
   name = "SUBSCRIBE"
   op = 0x05
-
-  [[contract.op]]
-  name = "TAKE_RUNG"
-  op = 0x09
+  gate = { handle = "scoped_mints", arg = "in", max = 258 }
+  signals = true
 
   [[contract.op]]
   name = "CLOSE"
   op = 0x06
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "CHANGES"
   op = 0x07
+  gate = { handle = "scoped", arg = "inout", max = 643, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "BIND"
   op = 0x08
+  gate = { handle = "scoped", arg = "inout", max = 580 }
 
   [[contract.op]]
   name = "CAPS"
   op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "storage.object"
 id = 0x0F
 module_provided = true
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "PUT"
   op = 0x20
-  gate = { handle = "scoped", arg = "in", max = "walk" }
-  walker = "storage_put"
+  gate = { handle = "scoped", arg = "inout", max = 908, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "GET"
   op = 0x21
-  gate = { handle = "scoped_mints", arg = "in", max = "any" }
+  gate = { handle = "scoped_mints", arg = "in", max = 257 }
 
   [[contract.op]]
   name = "HEAD"
   op = 0x22
-  gate = { handle = "scoped", arg = "in", max = "walk" }
-  walker = "storage_head"
+  gate = { handle = "scoped", arg = "inout", max = 666 }
 
   [[contract.op]]
   name = "RANGE_GET"
   op = 0x23
-  gate = { handle = "minted", arg = "in", max = "walk" }
-  walker = "storage_range_get"
+  gate = { handle = "minted", arg = "in", max = 8, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "DELETE"
   op = 0x24
-  gate = { handle = "scoped", arg = "in", max = "walk" }
-  walker = "storage_delete"
+  gate = { handle = "scoped", arg = "inout", max = 578 }
 
   [[contract.op]]
   name = "CLOSE"
@@ -1233,49 +1400,45 @@ manifest = true
   closes = true
 
   [[contract.op]]
-  name = "IMG_DECODE"
-  op = 0x30
-
-  [[contract.op]]
-  name = "IMG_RECV"
-  op = 0x31
-
-  [[contract.op]]
-  name = "IMG_CLOSE"
-  op = 0x32
-
-  [[contract.op]]
   name = "PUT_STREAMED_OPEN"
   op = 0x26
+  gate = { handle = "scoped_mints", arg = "in", max = 844 }
 
   [[contract.op]]
   name = "PUT_STREAMED_WRITE"
   op = 0x27
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "PUT_STREAMED_COMMIT"
   op = 0x28
+  gate = { handle = "minted", arg = "out", max = 64 }
 
   [[contract.op]]
   name = "PUT_STREAMED_ABORT"
   op = 0x29
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "RETAIN"
   op = 0x2C
-  gate = { handle = "scoped", arg = "in", max = "walk" }
-  walker = "storage_retain"
+  gate = { handle = "scoped", arg = "inout", max = 330 }
 
   [[contract.op]]
   name = "LIST"
   op = 0x2A
-  gate = { handle = "scoped", arg = "in", max = "walk" }
-  walker = "storage_list"
+  gate = { handle = "scoped", arg = "inout", max = 580, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "PRESENT"
   op = 0x2B
-  gate = { handle = "mints", arg = "inout", max = "any" }
+  gate = { handle = "scoped_mints", arg = "inout", max = 258, data = "in", data_max = "any" }
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "telemetry"
@@ -1286,19 +1449,22 @@ route = "class"
   name = "TLM_EMIT"
   op = 0x3E
   grant = "none"
-  gate = { handle = "global", arg = "in", max = "any" }
+  gate = { handle = "global", arg = "in", max = 144 }
 
   [[contract.op]]
   name = "TLM_SUBSCRIBE"
   op = 0x4D
+  gate = { handle = "global", arg = "in", max = 12 }
 
   [[contract.op]]
   name = "TLM_DRAIN"
   op = 0x4E
+  gate = { handle = "value", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "TLM_STATS"
   op = 0x4F
+  gate = { handle = "value", arg = "out", max = 20 }
 
 [[contract]]
 name = "resource"
@@ -1309,15 +1475,19 @@ route = "class"
   [[contract.op]]
   name = "ELASTIC_ALLOC"
   op = 0x3F
+  gate = { handle = "global", arg = "inout", max = 12 }
+  addr_answer = true
 
   [[contract.op]]
   name = "POOL_SAMPLE"
   grant = "resource.pool_sample"
   op = 0x25
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "LEDGER_DENY"
   op = 0x24
+  gate = { handle = "global", arg = "in", max = 2 }
 
 [[contract]]
 name = "runtime_params"
@@ -1329,14 +1499,17 @@ route = "class"
   [[contract.op]]
   name = "STORE"
   op = 0x34
+  gate = { handle = "global", arg = "in", max = 251 }
 
   [[contract.op]]
   name = "DELETE"
   op = 0x35
+  gate = { handle = "global", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "CLEAR_ALL"
   op = 0x36
+  gate = { handle = "global", arg = "in", max = 1 }
 
 [[contract]]
 name = "stream_clock"
@@ -1345,6 +1518,7 @@ id = 0x13
   [[contract.op]]
   name = "QUERY"
   op = 0x00
+  gate = { handle = "scoped", arg = "out", max = 24 }
 
 [[contract]]
 name = "trust"
@@ -1352,12 +1526,9 @@ id = 0x14
 manifest = true
 
   [[contract.op]]
-  name = "PROBE"
-  op = 0x00
-
-  [[contract.op]]
   name = "VERIFY"
-  op = 0x01
+  op = 0x00
+  gate = { handle = "global", arg = "out", max = 4, data = "in", data_max = "any" }
 
 [[contract]]
 name = "net_policy"
@@ -1365,30 +1536,31 @@ id = 0x15
 manifest = true
 
   [[contract.op]]
-  name = "PROBE"
-  op = 0x00
-
-  [[contract.op]]
-  name = "CAPS"
-  op = 0x01
-
-  [[contract.op]]
   name = "REPLACE"
   grant = "net_policy.replace"
-  op = 0x02
+  op = 0x00
+  gate = { handle = "global", arg = "inout", max = 33, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "CLEAR"
   grant = "net_policy.replace"
-  op = 0x03
+  op = 0x01
+  gate = { handle = "global", arg = "in", max = 33 }
 
   [[contract.op]]
   name = "READ"
-  op = 0x04
+  op = 0x02
+  gate = { handle = "global", arg = "inout", max = 33, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "ATTACH"
-  op = 0x05
+  op = 0x03
+  gate = { handle = "global", arg = "in", max = 1024 }
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "net_route"
@@ -1396,123 +1568,146 @@ id = 0x16
 manifest = true
 
   [[contract.op]]
-  name = "PROBE"
-  op = 0x00
-
-  [[contract.op]]
-  name = "CAPS"
-  op = 0x01
-
-  [[contract.op]]
   name = "SEGMENTS"
   grant = "net_route.table"
-  op = 0x02
+  op = 0x00
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "ROUTES"
   grant = "net_route.table"
-  op = 0x03
+  op = 0x01
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "HOLD"
   grant = "net_route.table"
-  op = 0x04
+  op = 0x02
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "READ"
   grant = "net_route.table"
-  op = 0x05
+  op = 0x03
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "REPORT"
   grant = "net_route.stack"
-  op = 0x06
+  op = 0x04
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "TAKE"
   grant = "net_route.stack"
-  op = 0x07
+  op = 0x05
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "workload"
 id = 0x17
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "CREATE"
   grant = "workload.create"
   op = 0x00
+  gate = { handle = "mints", arg = "in", max = 1024, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "START"
   grant = "workload.create"
   op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "WAIT"
   grant = "workload.create"
   op = 0x02
+  gate = { handle = "minted", arg = "out", max = 5 }
 
   [[contract.op]]
   name = "SIGNAL"
   grant = "workload.create"
   op = 0x03
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "DESTROY"
   grant = "workload.create"
   op = 0x04
+  gate = { handle = "scoped", arg = "in", max = 16 }
 
   [[contract.op]]
   name = "PAUSE"
   grant = "workload.create"
   op = 0x0B
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "RESUME"
   grant = "workload.create"
   op = 0x0C
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
-  name = "LANES"
+  name = "LANE"
   grant = "workload.create"
   op = 0x0D
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "NET_PROVIDE"
   grant = "workload.net"
   op = 0x0E
+  gate = { handle = "global", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "NET_LANE_TAKE"
   grant = "workload.net"
   op = 0x0F
+  gate = { handle = "global", arg = "out", max = 20 }
 
   [[contract.op]]
   name = "NET_LANE_ADMIT"
   grant = "workload.net"
   op = 0x10
+  gate = { handle = "global", arg = "in", max = 12 }
 
   [[contract.op]]
   name = "NET_RESOLVER"
   grant = "workload.net"
   op = 0x13
-
-  [[contract.op]]
-  name = "CAPS"
-  grant = "workload.create"
-  op = 0xFF
+  gate = { handle = "global", arg = "out", max = 256 }
 
   [[contract.op]]
   name = "LOOKUP"
   grant = "workload.create"
   op = 0x12
+  gate = { handle = "mints", arg = "inout", max = 16 }
 
   [[contract.op]]
   name = "MODULE_DIGESTS"
   grant = "workload.create"
   op = 0x11
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
+
+  [[contract.op]]
+  name = "OPTIONS"
+  grant = "workload.create"
+  op = 0x14
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
+
+  [[contract.op]]
+  name = "CAPS"
+  grant = "workload.create"
+  op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "host_process"
@@ -1522,31 +1717,38 @@ id = 0x18
 
   [[contract.op]]
   name = "READ"
-  op = 0x01
+  op = 0x00
+  gate = { handle = "global", arg = "in", max = 16, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "EXEC"
-  op = 0x02
+  op = 0x01
+  gate = { handle = "global", arg = "inout", max = 20, data = "inout", data_max = "any" }
 
   [[contract.op]]
   name = "TTY_OPEN"
-  op = 0x03
+  op = 0x02
+  gate = { handle = "global", arg = "in", max = 20, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "TTY_STEP"
-  op = 0x04
+  op = 0x03
+  gate = { handle = "global", arg = "inout", max = 13, data = "inout", data_max = "any" }
 
   [[contract.op]]
   name = "TTY_RESIZE"
-  op = 0x05
+  op = 0x04
+  gate = { handle = "global", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "TTY_CLOSE"
-  op = 0x06
+  op = 0x05
+  gate = { handle = "global", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "CAPS"
-  op = 0x00
+  op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "host_mount"
@@ -1554,191 +1756,234 @@ id = 0x19
 manifest = true
 
   [[contract.op]]
-  name = "PRIV"
-  op = 0x00
-
-  [[contract.op]]
   name = "MOUNT"
   grant = "host_mount.mount"
-  op = 0x01
+  op = 0x00
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "UMOUNT"
   grant = "host_mount.mount"
-  op = 0x02
+  op = 0x01
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "ROOT"
-  op = 0x03
+  op = 0x02
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "PROJECT"
   grant = "host_mount.mount"
-  op = 0x04
+  op = 0x03
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "REMOVE_TREE"
   grant = "host_mount.mount"
-  op = 0x05
+  op = 0x04
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "GROUP_TREE"
   grant = "host_mount.mount"
-  op = 0x06
+  op = 0x05
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "MKDIR_MODE"
   grant = "host_mount.mount"
-  op = 0x07
+  op = 0x06
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
+
+  [[contract.op]]
+  name = "CAPS"
+  op = 0xFF
+  gate = { handle = "scoped", arg = "out", max = 4 }
 
 [[contract]]
 name = "proc"
 id = 0x1A
-mints = true
 manifest = true
 
   [[contract.op]]
   name = "PROC_SPAWN"
   op = 0x00
+  gate = { handle = "mints", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "PROC_READ"
   op = 0x01
+  gate = { handle = "minted", arg = "out", max = 1024 }
 
   [[contract.op]]
   name = "PROC_STATUS"
   op = 0x02
+  gate = { handle = "minted", arg = "out", max = 4 }
 
   [[contract.op]]
   name = "PROC_CLOSE"
   op = 0x03
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
 [[contract]]
 name = "usb_host"
 reach = "kernel"
 id = 0x1B
-mints = true
 manifest = true
 
 [[contract]]
 name = "pcie_device"
 reach = "kernel"
 id = 0x1C
-mints = true
 manifest = true
 route = "class"
 
   [[contract.op]]
   name = "BIND"
   op = 0xA0
+  gate = { handle = "mints", arg = "in", max = 64 }
 
   [[contract.op]]
   name = "CLOSE"
   op = 0xA1
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "CFG_READ32"
   op = 0xA2
+  gate = { handle = "minted", arg = "inout", max = 8 }
 
   [[contract.op]]
   name = "CFG_WRITE32"
   op = 0xA3
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "BAR_MAP"
   op = 0xA4
+  gate = { handle = "minted", arg = "inout", max = 12 }
+  addr_answer = true
 
   [[contract.op]]
   name = "MSI_ALLOC"
   op = 0xA5
+  gate = { handle = "minted_mints", arg = "out", max = 20 }
+  addr_answer = true
+  signals = true
 
   [[contract.op]]
   name = "INFO"
   op = 0xA6
+  gate = { handle = "minted", arg = "out", max = 32 }
 
 [[contract]]
 name = "platform_nic_ring"
 reach = "kernel"
 id = 0x1D
-mints = true
 manifest = true
 route = "class"
 
   [[contract.op]]
   name = "NIC_BAR_MAP"
   op = 0xF0
+  gate = { handle = "global", arg = "inout", max = 12 }
+  addr_answer = true
 
   [[contract.op]]
   name = "NIC_BAR_UNMAP"
   op = 0xF1
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "NIC_RING_CREATE"
   op = 0xF2
+  gate = { handle = "mints", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "NIC_RING_DESTROY"
   op = 0xF3
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "NIC_RING_INFO"
   op = 0xF4
+  gate = { handle = "minted", arg = "inout", max = 16 }
+  addr_answer = true
 
 [[contract]]
 name = "platform_dma"
 reach = "kernel"
 id = 0x1E
-mints = true
 manifest = true
 route = "class"
 
   [[contract.op]]
   name = "ALLOC"
   op = 0x80
+  gate = { handle = "mints", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "FREE"
   op = 0x81
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "START"
   op = 0x82
+  gate = { handle = "minted", arg = "in", max = 14 }
 
   [[contract.op]]
   name = "BUSY"
   op = 0x83
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "ABORT"
   op = 0x84
+  gate = { handle = "minted", arg = "none", max = 0 }
+
+  [[contract.op]]
+  name = "CHANNEL"
+  op = 0x85
+  gate = { handle = "minted", arg = "out", max = 1 }
 
 [[contract]]
 name = "platform_dma_fd"
 reach = "kernel"
 id = 0x1F
-mints = true
 manifest = true
 route = "class"
 
   [[contract.op]]
   name = "CREATE"
   op = 0x85
+  gate = { handle = "mints", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "START"
   op = 0x86
+  gate = { handle = "minted", arg = "in", max = 14 }
 
   [[contract.op]]
   name = "RESTART"
   op = 0x87
+  gate = { handle = "minted", arg = "in", max = 12 }
 
   [[contract.op]]
   name = "FREE"
   op = 0x88
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "QUEUE"
   op = 0x89
+  gate = { handle = "minted", arg = "in", max = 12 }
 
 [[contract]]
 name = "reconfigure"
@@ -1749,73 +1994,89 @@ route = "class"
   [[contract.op]]
   name = "SET_PHASE"
   op = 0x68
+  gate = { handle = "global", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "CALL_DRAIN"
   op = 0x69
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "MARK_FINISHED"
   op = 0x6A
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "MODULE_COUNT"
   op = 0x6B
+  gate = { handle = "global", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "MODULE_INFO"
   op = 0x6C
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "TRIGGER_REBUILD"
   op = 0x6D
+  gate = { handle = "global", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "MODULE_UPSTREAM"
   op = 0x6E
+  gate = { handle = "global", arg = "inout", max = 1024 }
 
   [[contract.op]]
   name = "MODULE_DONE"
   op = 0x6F
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "SLOT_CAPACITY"
   op = 0x23
+  gate = { handle = "global", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "APPLY_ADD"
   grant = "reconfigure.owner"
   op = 0x47
+  gate = { handle = "global", arg = "out", max = 6, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "FREE_OWNER"
   grant = "reconfigure.owner"
   op = 0x48
+  gate = { handle = "global", arg = "in", max = 6 }
 
   [[contract.op]]
   name = "OWNER_PAUSE"
   grant = "reconfigure.owner"
   op = 0x49
+  gate = { handle = "global", arg = "in", max = 6 }
 
   [[contract.op]]
   name = "OWNER_RESUME"
   grant = "reconfigure.owner"
   op = 0x4A
+  gate = { handle = "global", arg = "in", max = 6 }
 
   [[contract.op]]
   name = "OWNER_RELEASED"
   grant = "reconfigure.owner"
   op = 0x22
+  gate = { handle = "global", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "OTA_STAGE_WRITE"
   grant = "reconfigure.ota"
   op = 0x20
+  gate = { handle = "global", arg = "in", max = 4, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "OTA_STAGE_CTRL"
   grant = "reconfigure.ota"
   op = 0x21
+  gate = { handle = "global", arg = "in", max = 1 }
 
 [[contract]]
 name = "monitor"
@@ -1826,26 +2087,32 @@ route = "class"
   [[contract.op]]
   name = "FAULT_MONITOR_SUBSCRIBE"
   op = 0x52
+  gate = { handle = "scoped", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "FAULT_MONITOR_POP"
   op = 0x53
+  gate = { handle = "global", arg = "out", max = 16 }
 
   [[contract.op]]
   name = "FAULT_STATS_QUERY"
   op = 0x54
+  gate = { handle = "value", arg = "out", max = 12 }
 
   [[contract.op]]
   name = "STEP_HISTOGRAM_QUERY"
   op = 0x55
+  gate = { handle = "value", arg = "out", max = 32 }
 
   [[contract.op]]
   name = "MODULE_STATE_QUERY"
   op = 0x57
+  gate = { handle = "value", arg = "out", max = 66 }
 
   [[contract.op]]
   name = "FAULT_RAISE"
   op = 0x56
+  gate = { handle = "global", arg = "in", max = 3 }
 
   [[contract.op]]
   name = "ARENA_USAGE"
@@ -1855,34 +2122,39 @@ route = "class"
   name = "ISR_METRICS"
   op = 0xE8
   grant = "none"
+  gate = { handle = "global", arg = "inout", max = 24 }
 
 [[contract]]
 name = "bridge"
 reach = "kernel"
 id = 0x22
-mints = true
 route = "class"
 
   [[contract.op]]
   name = "WRITE"
   op = 0xE0
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "READ"
   op = 0xE1
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "POLL"
   op = 0xE2
+  gate = { handle = "minted", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "INFO"
   op = 0xE3
+  gate = { handle = "minted", arg = "out", max = 16 }
 
   [[contract.op]]
-  name = "SELF_BRIDGES"
+  name = "SELF_BRIDGE"
   op = 0x44
   grant = "none"
+  gate = { handle = "mints", arg = "in", max = 2 }
 
 [[contract]]
 name = "flash"
@@ -1893,14 +2165,17 @@ route = "class"
   [[contract.op]]
   name = "RAW_ERASE"
   op = 0x38
+  gate = { handle = "global", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "RAW_PROGRAM"
   op = 0x39
+  gate = { handle = "global", arg = "in", max = 260 }
 
   [[contract.op]]
   name = "SIDEBAND"
   op = 0x10
+  gate = { handle = "global", arg = "in", max = 5, data = "out", data_max = "any" }
 
 [[contract]]
 name = "diag"
@@ -1911,11 +2186,7 @@ route = "class"
   [[contract.op]]
   name = "LOG_RING_DRAIN"
   op = 0x64
-
-  [[contract.op]]
-  name = "FAN_DIAG_SNAPSHOT"
-  op = 0x65
-  grant = "none"
+  gate = { handle = "global", arg = "none", max = 0, data = "out", data_max = "any" }
 
 [[contract]]
 name = "vault_store"
@@ -1926,201 +2197,249 @@ id = 0x26
   [[contract.op]]
   name = "ATTACH"
   op = 0x40
+  gate = { handle = "global", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "LOAD"
   op = 0x41
+  gate = { handle = "global", arg = "in", max = 8, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "DECIDE"
   op = 0x42
+  gate = { handle = "global", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "PENDING"
   op = 0x43
+  gate = { handle = "global", arg = "out", max = 16 }
 
   [[contract.op]]
   name = "READ"
   op = 0x44
+  gate = { handle = "global", arg = "in", max = 12, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "DONE"
   op = 0x45
+  gate = { handle = "global", arg = "in", max = 16 }
 
 [[contract]]
 name = "rp_raw"
 reach = "kernel"
 id = 0x27
-mints = true
 route = "class"
 
   [[contract.op]]
   name = "CLAIM"
   op = 0x50
+  gate = { handle = "mints", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "RELEASE"
   op = 0x51
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
   [[contract.op]]
   name = "PWM_PIN_ENABLE"
   op = 0x60
+  gate = { handle = "global", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "PWM_PIN_DISABLE"
   op = 0x61
+  gate = { handle = "global", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "PWM_SLICE_WRITE"
   op = 0x62
+  gate = { handle = "minted", arg = "in", max = 6 }
 
   [[contract.op]]
   name = "PWM_SLICE_READ"
   op = 0x63
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "PIO_SM_EXEC"
   op = 0x70
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "PIO_SM_WRITE_REG"
   op = 0x71
+  gate = { handle = "minted", arg = "in", max = 7 }
 
   [[contract.op]]
   name = "PIO_SM_READ_REG"
   op = 0x72
+  gate = { handle = "minted", arg = "in", max = 3 }
 
   [[contract.op]]
   name = "PIO_SM_ENABLE"
   op = 0x73
+  gate = { handle = "minted", arg = "in", max = 3 }
 
   [[contract.op]]
   name = "PIO_INSTR_ALLOC"
   op = 0x74
+  gate = { handle = "minted", arg = "inout", max = 6 }
 
   [[contract.op]]
   name = "PIO_INSTR_WRITE"
   op = 0x75
+  gate = { handle = "minted", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "PIO_INSTR_FREE"
   op = 0x76
+  gate = { handle = "minted", arg = "in", max = 5 }
 
   [[contract.op]]
   name = "PIO_PIN_SETUP"
   op = 0x77
+  gate = { handle = "minted", arg = "in", max = 3 }
 
   [[contract.op]]
   name = "PIO_GPIOBASE"
   op = 0x78
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "PIO_TXF_WRITE"
   op = 0x79
+  gate = { handle = "minted", arg = "in", max = 6 }
 
   [[contract.op]]
   name = "PIO_FSTAT_READ"
   op = 0x7A
+  gate = { handle = "minted", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "PIO_SM_RESTART"
   op = 0x7B
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "PIO_INPUT_SYNC_BYPASS"
   op = 0x7C
+  gate = { handle = "minted", arg = "in", max = 5 }
 
   [[contract.op]]
   name = "PIO_CMD_TRANSFER"
   op = 0x7D
+  gate = { handle = "minted", arg = "in", max = 32 }
 
   [[contract.op]]
   name = "PIO_CMD_POLL"
   op = 0x7E
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "PIO_PIN_LEVEL"
   op = 0x7F
+  gate = { handle = "global", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "SPI9_SEND"
   op = 0x90
+  gate = { handle = "global", arg = "in", max = 261 }
 
   [[contract.op]]
   name = "SPI9_RESET"
   op = 0x91
+  gate = { handle = "global", arg = "in", max = 4 }
 
   [[contract.op]]
   name = "SPI9_CS_SET"
   op = 0x92
+  gate = { handle = "global", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "SPI_REG_WRITE"
   op = 0xA0
+  gate = { handle = "minted", arg = "in", max = 5 }
 
   [[contract.op]]
   name = "SPI_REG_READ"
   op = 0xA1
+  gate = { handle = "minted", arg = "inout", max = 5 }
 
   [[contract.op]]
   name = "SPI_BUS_INFO"
   op = 0xA2
+  gate = { handle = "minted", arg = "out", max = 8 }
 
   [[contract.op]]
   name = "SPI_PIN_INIT"
   op = 0xA3
+  gate = { handle = "minted", arg = "in", max = 3 }
 
   [[contract.op]]
   name = "SPI_SET_ENABLE"
   op = 0xA4
+  gate = { handle = "minted", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "I2C_REG_WRITE"
   op = 0xB0
+  gate = { handle = "minted", arg = "in", max = 5 }
 
   [[contract.op]]
   name = "I2C_REG_READ"
   op = 0xB1
+  gate = { handle = "minted", arg = "inout", max = 5 }
 
   [[contract.op]]
   name = "I2C_BUS_INFO"
   op = 0xB2
+  gate = { handle = "minted", arg = "out", max = 4 }
 
   [[contract.op]]
   name = "I2C_PIN_INIT"
   op = 0xB3
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "I2C_SET_ENABLE"
   op = 0xB4
+  gate = { handle = "minted", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "UART_REG_WRITE"
   op = 0xC0
+  gate = { handle = "minted", arg = "in", max = 5 }
 
   [[contract.op]]
   name = "UART_REG_READ"
   op = 0xC1
+  gate = { handle = "minted", arg = "inout", max = 5 }
 
   [[contract.op]]
   name = "UART_PIN_INIT"
   op = 0xC2
+  gate = { handle = "minted", arg = "in", max = 2 }
 
   [[contract.op]]
   name = "UART_SET_ENABLE"
   op = 0xC3
+  gate = { handle = "minted", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "ADC_REG_WRITE"
   op = 0xD0
+  gate = { handle = "minted", arg = "in", max = 5 }
 
   [[contract.op]]
   name = "ADC_REG_READ"
   op = 0xD1
+  gate = { handle = "minted", arg = "inout", max = 5 }
 
   [[contract.op]]
   name = "ADC_PIN_INIT"
   op = 0xD2
+  gate = { handle = "minted", arg = "in", max = 1 }
 
 [[contract]]
 name = "metal_device"
@@ -2129,62 +2448,82 @@ id = 0x24
 manifest = true
 
   [[contract.op]]
+  name = "MMIO_OPEN"
+  grant = "metal_device.mmio"
+  op = 0xE8
+  gate = { handle = "mints", arg = "inout", max = 12 }
+  addr_answer = true
+
+  [[contract.op]]
   name = "MMIO_READ32"
   grant = "metal_device.mmio"
   op = 0xE4
+  gate = { handle = "minted", arg = "inout", max = 8 }
 
   [[contract.op]]
   name = "MMIO_WRITE32"
   grant = "metal_device.mmio"
   op = 0xE5
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "DMA_ALLOC_CONTIG"
   grant = "metal_device.dma"
   op = 0xE6
+  gate = { handle = "mints", arg = "inout", max = 12 }
+  addr_answer = true
 
   [[contract.op]]
   name = "CACHE_FLUSH_RANGE"
   grant = "metal_device.dma"
   op = 0xE7
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "DMA_FLUSH"
   grant = "metal_device.dma"
   op = 0xEA
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "DMA_INVALIDATE"
   grant = "metal_device.dma"
   op = 0xEB
+  gate = { handle = "minted", arg = "in", max = 8 }
 
   [[contract.op]]
   name = "DMA_ALLOC_STREAMING"
   grant = "metal_device.dma"
   op = 0xEC
+  gate = { handle = "mints", arg = "inout", max = 12 }
+  addr_answer = true
 
   [[contract.op]]
   name = "PCIE_RESCAN"
   grant = "metal_device.pcie"
   op = 0xF5
+  gate = { handle = "global", arg = "none", max = 0 }
 
   [[contract.op]]
   name = "PCIE_CFG_READ32"
   grant = "metal_device.pcie"
   op = 0xF6
+  gate = { handle = "global", arg = "inout", max = 8 }
 
   [[contract.op]]
   name = "PCIE_CFG_WRITE32"
   grant = "metal_device.pcie"
   op = 0xF7
+  gate = { handle = "global", arg = "in", max = 8 }
 
 
 
 [[contract]]
 # Custody of a keyed volume's key: the provider holds the key in its own
 # key_vault namespace (a label no other module type reaches) and answers
-# these instead of handing it out. Selected by the volume's name; every
-# argument is in place (`contracts::storage::custody` has the layouts).
+# these instead of handing it out. Bound by the volume's name; every
+# argument is one bounded record, and the bytes SEAL / OPEN transform travel
+# in `data` (`contracts::storage::custody` has the layouts).
 name = "storage.custody"
 id = 0x28
 module_provided = true
@@ -2193,31 +2532,141 @@ manifest = true
   [[contract.op]]
   name = "SEAL"
   op = 0x00
-  gate = { handle = "global", arg = "inout", max = "any" }
+  gate = { handle = "scoped", arg = "in", max = 4, data = "inout", data_max = "any" }
 
   [[contract.op]]
   name = "OPEN"
   op = 0x01
-  gate = { handle = "global", arg = "inout", max = "any" }
+  gate = { handle = "scoped", arg = "in", max = 4, data = "inout", data_max = "any" }
 
   [[contract.op]]
   name = "CUSTODIAN"
   op = 0x02
-  gate = { handle = "global", arg = "inout", max = "any" }
+  gate = { handle = "scoped", arg = "inout", max = 69 }
 
   [[contract.op]]
   name = "SPLIT"
   op = 0x03
-  gate = { handle = "global", arg = "inout", max = "any" }
+  gate = { handle = "scoped", arg = "inout", max = 975 }
 
   [[contract.op]]
   name = "DRILL"
   op = 0x04
-  gate = { handle = "global", arg = "in", max = "any" }
+  gate = { handle = "scoped", arg = "in", max = 524 }
+
+[[contract]]
+# A registered span of the lender's memory that outlives a call: opened on
+# the handle of the session it is lent to, named in that session's requests
+# by a cookie the lender chooses, and resolved only by the module serving the
+# session. A torn-down lender whose spans are still borrowed is quarantined
+# until every borrow is returned.
+name = "lend"
+grant = "none"
+id = 0x29
+route = "class"
+
+  [[contract.op]]
+  name = "OPEN"
+  op = 0x00
+  admission = true
+  gate = { handle = "minted_mints", arg = "in", max = 8, data = "inout", data_max = "any" }
+
+  [[contract.op]]
+  name = "RESOLVE"
+  grant = "lend.borrow"
+  op = 0x01
+  gate = { handle = "global", arg = "inout", max = 13 }
+  addr_answer = true
+
+  [[contract.op]]
+  name = "RETURN"
+  grant = "lend.borrow"
+  op = 0x02
+  gate = { handle = "global", arg = "in", max = 8 }
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x03
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
+
+[[contract]]
+# Logical-block I/O, served by the module at the other end of a consumer's
+# `blocks` port (`contracts::storage::block` has the records).
+name = "storage.block"
+id = 0x2A
+module_provided = true
+manifest = true
+route = "edge"
+
+  [[contract.op]]
+  name = "DESCRIBE"
+  op = 0x00
+  gate = { handle = "minted", arg = "out", max = 40 }
+
+  [[contract.op]]
+  name = "SUBMIT"
+  op = 0x01
+  gate = { handle = "minted", arg = "in", max = 40 }
+
+  [[contract.op]]
+  name = "REAP"
+  op = 0x02
+  gate = { handle = "minted", arg = "out", max = 80 }
+
+  [[contract.op]]
+  name = "EXEC"
+  op = 0x03
+  gate = { handle = "minted", arg = "inout", max = 120, data = "inout", data_max = "any" }
+
+  [[contract.op]]
+  name = "READ_STREAM"
+  op = 0x04
+  gate = { handle = "minted", arg = "in", max = 40 }
+
+[[contract]]
+# Whether every frame a NIC driver was handed on the edge `ip` writes has
+# left the wire, served by the driver at the other end of that edge
+# (`contracts::net::identity::tx_drain`).
+name = "net_tx_drain"
+id = 0x2B
+module_provided = true
+manifest = true
+route = "edge"
+
+  [[contract.op]]
+  name = "DRAINED"
+  op = 0x00
+  gate = { handle = "minted", arg = "out", max = 4 }
+
+[[contract]]
+# Decode an encoded image held in a store (a byte range of a storage.object
+# object) to raw pixels at a named size (`contracts::image_decode`).
+name = "image_decode"
+id = 0x2C
+module_provided = true
+manifest = true
+
+  [[contract.op]]
+  name = "DECODE"
+  op = 0x00
+  admission = true
+  gate = { handle = "scoped_mints", arg = "in", max = 274 }
+
+  [[contract.op]]
+  name = "RECV"
+  op = 0x01
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = "any" }
+
+  [[contract.op]]
+  name = "CLOSE"
+  op = 0x02
+  gate = { handle = "minted", arg = "none", max = 0 }
+  closes = true
 
 [[msgset]]
 name = "net_tlv"
-members = ["net_proto", "datagram", "packet", "session_ctrl", "identity", "peer_identity", "mux"]
+members = ["net_proto", "stream_retx", "stream_trace", "stream_cursor", "datagram", "packet", "session_ctrl", "identity", "peer_identity", "mux"]
 
   [[msgset.msg]]
   surface = "net_proto"
@@ -2251,33 +2700,8 @@ members = ["net_proto", "datagram", "packet", "session_ctrl", "identity", "peer_
 
   [[msgset.msg]]
   surface = "net_proto"
-  name = "MSG_RETRANSMIT"
-  value = 0x07
-
-  [[msgset.msg]]
-  surface = "net_proto"
-  name = "MSG_ACK"
-  value = 0x08
-
-  [[msgset.msg]]
-  surface = "net_proto"
-  name = "MSG_TRACE_CTX"
-  value = 0x09
-
-  [[msgset.msg]]
-  surface = "net_proto"
   name = "MSG_PEER"
-  value = 0x0A
-
-  [[msgset.msg]]
-  surface = "net_proto"
-  name = "MSG_HORIZON"
-  value = 0x0B
-
-  [[msgset.msg]]
-  surface = "net_proto"
-  name = "MSG_RESUMED"
-  value = 0x0C
+  value = 0x07
 
   [[msgset.msg]]
   surface = "net_proto"
@@ -2296,23 +2720,78 @@ members = ["net_proto", "datagram", "packet", "session_ctrl", "identity", "peer_
 
   [[msgset.msg]]
   surface = "net_proto"
-  name = "CMD_RESEND"
-  value = 0x18
-
-  [[msgset.msg]]
-  surface = "net_proto"
-  name = "CMD_DELIVERED"
-  value = 0x19
-
-  [[msgset.msg]]
-  surface = "net_proto"
-  name = "CMD_CONNECT"
+  name = "CMD_CONNECT_TO"
   value = 0x13
 
   [[msgset.msg]]
+  surface = "stream_retx"
+  name = "MSG_RETX_ACK"
+  value = 0xD0
+
+  [[msgset.msg]]
+  surface = "stream_retx"
+  name = "MSG_RETX_REQUEST"
+  value = 0xD1
+
+  [[msgset.msg]]
+  surface = "stream_retx"
+  name = "CMD_RETX_RESEND"
+  value = 0xD2
+
+  [[msgset.msg]]
+  surface = "stream_trace"
+  name = "MSG_TRACE_CTX"
+  value = 0xD3
+
+  [[msgset.msg]]
+  surface = "stream_cursor"
+  name = "MSG_CURSOR_HORIZON"
+  value = 0xD4
+
+  [[msgset.msg]]
+  surface = "stream_cursor"
+  name = "MSG_CURSOR_RESUMED"
+  value = 0xD5
+
+  [[msgset.msg]]
+  surface = "stream_cursor"
+  name = "CMD_CURSOR_DELIVERED"
+  value = 0xD6
+
+  [[msgset.range]]
   surface = "net_proto"
-  name = "CMD_CONNECT_TO"
-  value = 0x14
+  first = 0x01
+  last = 0x07
+
+  [[msgset.range]]
+  surface = "net_proto"
+  first = 0x10
+  last = 0x13
+
+  [[msgset.range]]
+  surface = "stream_retx"
+  first = 0xD0
+  last = 0xD2
+
+  [[msgset.range]]
+  surface = "stream_trace"
+  first = 0xD3
+  last = 0xD3
+
+  [[msgset.range]]
+  surface = "stream_cursor"
+  first = 0xD4
+  last = 0xD6
+
+  [[msgset.range]]
+  surface = "datagram"
+  first = 0x20
+  last = 0x22
+
+  [[msgset.range]]
+  surface = "datagram"
+  first = 0x40
+  last = 0x43
 
   [[msgset.msg]]
   surface = "datagram"

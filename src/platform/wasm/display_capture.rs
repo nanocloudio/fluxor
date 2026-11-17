@@ -124,7 +124,10 @@ unsafe fn alloc_state(
     raw
 }
 
-fn display_capture_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn display_capture_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this
     // module instance; cast back to the module-private type allocated by
     // `build`.

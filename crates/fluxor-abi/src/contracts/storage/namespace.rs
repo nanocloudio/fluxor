@@ -15,14 +15,26 @@
 //
 // ## Handle identity
 //
-// `LOOKUP` and `SUBSCRIBE` return a tagged FD: providers encode the
-// returned slot via `kernel_abi::fd::tag_fd(FD_TAG_STORAGE_NAMESPACE,
-// slot)`. The kernel vtable wrapper strips the tag before
-// re-entering the provider, so inbound ops see a raw slot. Tagging
-// is what lets `provider_query(handle, query_key::LAST_FENCE, …)`
-// resolve the contract from the handle and prevents handle
-// collisions when a graph hosts multiple storage providers issuing
-// identical raw slot numbers.
+// `LOOKUP` and `SUBSCRIBE` answer the provider's own index; the kernel
+// wraps it in a handle (`kernel_abi::handle`) routed to that provider, and
+// every later op on the handle reaches the provider with its index. So two
+// providers in one graph may hand out the same indices, and
+// `provider_query(handle, query_key::LAST_FENCE, …)` reaches the right one.
+//
+// A consumer that names its store reaches it through a handle bound to it
+// (`kernel_abi::bind`, `NAME`); every op below that takes `handle = -1`
+// takes that bound handle in its place, and the provider sees `-1`. A
+// handle such an op mints (`LOOKUP`, `SUBSCRIBE`) comes back routed to the
+// same provider, and every op on it reaches that provider with its own
+// handle.
+//
+// ## Call shape
+//
+// Every op is one flat `arg` record and at most one bulk `data` span. No
+// field of any record is an address or a kernel handle. Every path, prefix,
+// name and token is inline in `arg`, bounded by [`PATH_MAX`]; a listing page
+// or a change page travels in `data`. Each layout has one codec in this
+// module, with `const fn` lengths a caller sizes its `arg` with.
 //
 // ## Fence advertisement per op shape
 //
@@ -32,13 +44,12 @@
 //   - A `SUBSCRIBE` handle names a doorbell, not a view, and carries no
 //     fence: `LAST_FENCE` on it is `ENOSYS`. The `CHANGES` read it asks
 //     for carries its own.
-//   - Handle=-1 one-shot ops (`LIST`, `RENAME`, `DELETE`, `BIND`,
-//     `CHANGES`) carry a `[fence_out_ptr: u64 LE, fence_out_cap: u16 LE]`
-//     pair in their arg layout. The provider writes the encoded `Fence`
-//     (up to `fence::WIRE_MAX_LEN` bytes) into that buffer atomically
-//     with the op return; callers decode via `Fence::decode`. A null
-//     `fence_out_ptr`, or a `fence_out_cap` below `fence::WIRE_MAX_LEN`,
-//     is `EINVAL`, refused before the op acts.
+//   - One-shot ops (`LIST`, `RENAME`, `DELETE`, `BIND`, `CHANGES`) end
+//     their `arg` with the fence trailer (`fence::trailer`): the last
+//     `fence::trailer::LEN` bytes, which the provider writes as
+//     `[fence_len u16][Fence::encode bytes]` atomically with the op return.
+//     An `arg` too short to hold its record and the trailer is `EINVAL`,
+//     refused before the op acts.
 //
 // Typical advertisements: `ViewConsistent { source, revision }` for
 // snapshot reads, `LocalDurable { device_id }` for committed
@@ -62,12 +73,9 @@
 //               renames are out of scope for this surface.
 //   DELETE    — remove an entry. Recursive delete on directories is
 //               opt-in via a flag.
-//   SUBSCRIBE — watch a prefix: the provider signals the caller's own
-//               kernel event when something under it changes
-//               (level-triggered; no bytes are delivered).
-//   TAKE_RUNG — which of the caller's subscriptions on an event have
-//               changed since it last asked; the caller then reads
-//               them with CHANGES.
+//   SUBSCRIBE — watch a prefix: the subscription handle polls ready
+//               when something under it changes (no bytes are
+//               delivered); the caller then reads it with CHANGES.
 //   CHANGES   — what changed under a prefix since a revision, one
 //               bounded page per call.
 //   CLOSE     — release a LOOKUP or SUBSCRIBE handle.
@@ -83,9 +91,11 @@
 // (0x0A__).
 //
 // A subscription is a doorbell, not a stream: the provider never writes
-// a consumer's channel. It signals the consumer's own kernel event
-// (`kernel_abi::event`), and the consumer asks TAKE_RUNG which of its
-// subscriptions rang and reads each with CHANGES. The section
+// a consumer's channel. SUBSCRIBE is a signalling op: the kernel hands the
+// provider a doorbell for the subscription (`kernel_abi::doorbell`), the
+// provider rings it on a change, and the consumer's subscription handle
+// polls ready (`HANDLE_POLL`) and the consumer is woken. The consumer reads
+// the change with CHANGES through the subscription's handle. The section
 // "Subscriptions" of `docs/architecture/storage_capability_surface.md`
 // describes the protocol end to end.
 
@@ -94,8 +104,9 @@ pub use super::object::{write_answer, WriteAnswer};
 
 /// Look up a name under this namespace.
 ///
-/// `handle = -1`; `arg` points at the UTF-8 path (no null
-/// terminator), `arg_len` is its length. On success returns a
+/// `handle = -1`; `arg` (in) is the UTF-8 path itself (no length prefix, no
+/// null terminator), at most [`PATH_MAX`] bytes; the empty path is the
+/// namespace's root. On success returns a
 /// non-negative handle into the namespace's resolved-entry table
 /// (passed to `STAT` and `CLOSE`); on failure returns a negative
 /// errno (`-2 ENOENT`, `-22 EINVAL`, …).
@@ -110,8 +121,8 @@ pub use super::super::super::registry::storage_namespace::LOOKUP;
 
 /// Read metadata for a resolved entry.
 ///
-/// `handle` is a LOOKUP-returned handle; `arg` points at an output
-/// buffer of layout:
+/// `handle` is a LOOKUP-returned handle; `arg` (out, [`stat`] is the codec)
+/// receives:
 ///
 /// ```text
 ///   [size: u64 LE]                — bytes (0 for directories)
@@ -121,13 +132,15 @@ pub use super::super::super::registry::storage_namespace::LOOKUP;
 ///   [etag: etag_len bytes]        — opaque provider tag
 /// ```
 ///
-/// Returns the number of bytes written, or negative errno.
+/// Returns the number of bytes written, or negative errno: `EINVAL` when
+/// `arg` cannot hold the fixed fields ([`stat::ARG_LEN`] holds the whole
+/// record; a shorter one gets the etag only when it fits).
 pub use super::super::super::registry::storage_namespace::STAT;
 
 /// List entries under a prefix, in ascending bytewise name order, one page
 /// per call, resumed by a cursor.
 ///
-/// `handle = -1`; `arg` points at a request:
+/// `handle = -1`; `arg` (in/out) is:
 ///
 /// ```text
 ///   [prefix_len: u16 LE]
@@ -135,15 +148,12 @@ pub use super::super::super::registry::storage_namespace::STAT;
 ///   [cursor_len: u16 LE]          — 0 for the first page
 ///   [cursor: cursor_len bytes]    — otherwise exactly the cursor a previous
 ///                                   page returned
-///   [out_buf: ptr u64 LE]
-///   [out_cap: u32 LE]
-///   [fence_out_ptr: u64 LE]       — receives Fence::encode bytes
-///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
+///   [fence trailer: fence::trailer::LEN]   — written by the provider
 /// ```
 ///
-/// On success the provider writes batched entries into `out_buf`
-/// and the encoded fence into `fence_out_ptr`; the return value is
-/// the byte count written to `out_buf`. Each entry is:
+/// On success the provider writes batched entries into `data` (out) and the
+/// encoded fence into the trailer; the return value is the byte count
+/// written to `data`. Each entry is:
 ///
 /// ```text
 ///   [name_len: u8]
@@ -177,7 +187,7 @@ pub use super::super::super::registry::storage_namespace::STAT;
 ///     A filesystem tree is this shape.
 ///
 /// A consumer that turns a name into a key for `storage.object` or `fs`
-/// reads the bit; a provider that does not implement `CAPS` is key-shaped.
+/// reads the bit.
 ///
 /// ## Cursor
 ///
@@ -197,9 +207,8 @@ pub use super::super::super::registry::storage_namespace::STAT;
 ///
 /// A name is at most [`STORAGE_KEY_MAX`](super::handle::STORAGE_KEY_MAX)
 /// bytes, which is also the longest cursor. The prefix is a path, bounded by
-/// [`PATH_MAX`]: a directory-shaped provider's prefix names a directory
-/// however deep it sits, and a key-shaped provider holds no key under a
-/// prefix longer than a key.
+/// [`PATH_MAX`], the same bound: one bound serves every name a storage
+/// contract carries.
 ///
 /// `cursor_len` in the trailing record is **u8**, narrower than the `u16` the
 /// request carries. It is stated here because a consumer parses one shape,
@@ -228,25 +237,24 @@ pub use super::super::super::registry::storage_namespace::STAT;
 /// A provider MUST page rather than refuse: fill whole entries while keeping
 /// room for the trailing record, emit a cursor, and let the caller ask
 /// again. Answering ENOMEM because a whole listing does not fit turns the
-/// caller's buffer into a ceiling on how many entries a prefix may hold. A
+/// caller's `data` into a ceiling on how many entries a prefix may hold. A
 /// page MUST make progress: when not even one entry plus the trailer fits,
 /// the provider refuses with `ENOMEM` rather than return an empty page that
 /// is not the last ([`list::min_out_cap`] is what one entry needs).
 ///
 /// ## Errors
 ///
-///   - `EINVAL` — malformed request, a prefix longer than [`PATH_MAX`], a
-///     null output or fence pointer, `fence_out_cap` below
-///     `fence::WIRE_MAX_LEN`, or a cursor this provider did not issue for
-///     this prefix.
-///   - `ENOMEM` — `out_cap` cannot hold one entry plus the trailer.
+///   - `EINVAL` — malformed request (one with no room for the fence trailer
+///     included), a prefix longer than [`PATH_MAX`], or a cursor this
+///     provider did not issue for this prefix.
+///   - `ENOMEM` — `data` cannot hold one entry plus the page trailer.
 ///   - `EOVERFLOW` — a name in range exceeds `STORAGE_KEY_MAX`.
 pub use super::super::super::registry::storage_namespace::LIST;
 
 /// Rename or move an entry. Atomic within a single namespace
 /// provider.
 ///
-/// `handle = -1`; `arg` is:
+/// `handle = -1`; `arg` (in/out, [`rename`] is the codec) is:
 ///
 /// ```text
 ///   [src_len: u16 LE]
@@ -254,14 +262,13 @@ pub use super::super::super::registry::storage_namespace::LIST;
 ///   [dst_len: u16 LE]
 ///   [dst: dst_len bytes]
 ///   [flags: u8]                   — bit 0: replace-existing
-///   [fence_out_ptr: u64 LE]       — receives Fence::encode bytes
-///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
+///   [fence trailer: fence::trailer::LEN]   — written by the provider
 /// ```
 ///
 /// Returns 0 or negative errno. The provider writes the achieved
 /// fence — `LocalDurable { device_id }` for local providers,
 /// `ReplicatedDurable { source, .. }` once a quorum acks,
-/// `Volatile` for in-memory namespaces — into `fence_out_ptr`
+/// `Volatile` for in-memory namespaces — into the trailer
 /// atomically with returning success.
 ///
 /// `RENAME`, `DELETE` and `BIND` MAY answer `EINPROGRESS` when the
@@ -269,126 +276,80 @@ pub use super::super::super::registry::storage_namespace::LIST;
 /// provider decides it at its log position). The caller asks again later
 /// with byte-identical arguments; the answer to a later ask is the
 /// decision and its fence. The provider keys an undecided write by the
-/// calling module and the request's bytes, so asking again is never a
-/// second write. This is the same rule as `storage.object`'s writes.
+/// calling module and the request's record (the `arg` bytes before the
+/// trailer), so asking again is never a second write. This is the same rule
+/// as `storage.object`'s writes.
 pub use super::super::super::registry::storage_namespace::RENAME;
 
 /// Delete an entry.
 ///
-/// `handle = -1`; `arg` is:
+/// `handle = -1`; `arg` (in/out, [`delete`] is the codec) is:
 ///
 /// ```text
 ///   [path_len: u16 LE]
 ///   [path: path_len bytes]
 ///   [flags: u8]                   — bit 0: recursive
-///   [fence_out_ptr: u64 LE]       — receives Fence::encode bytes
-///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
+///   [fence trailer: fence::trailer::LEN]   — written by the provider
 /// ```
 ///
 /// Returns 0 or negative errno, or `EINPROGRESS` as for `RENAME`. Same
 /// fence-advertisement rules as `RENAME` — the encoded fence is written
-/// into `fence_out_ptr` atomically with the op return.
+/// into the trailer atomically with the op return.
 pub use super::super::super::registry::storage_namespace::DELETE;
 
-/// Watch a prefix: the provider signals the caller's kernel event whenever
-/// something under the prefix changes. Level-triggered — a doorbell, never a
-/// stream: no key, value or record is pushed anywhere.
+/// Watch a prefix: the subscription handle polls ready whenever something
+/// under the prefix changes. A doorbell, never a stream: no key, value or
+/// record is pushed anywhere.
 ///
-/// `handle = -1`; `arg` is ([`subscribe`] is the codec):
+/// `handle = -1` (or a bound handle); `arg` (in) is ([`subscribe`] is the
+/// codec):
 ///
 /// ```text
 ///   [prefix_len: u16 LE]
 ///   [prefix: prefix_len bytes]
-///   [event: i32 LE]               — a tagged event fd the CALLER owns
-///                                   (`kernel_abi::event::CREATE`)
 ///   [flags: u8]                   — bit 0: ring once now
 /// ```
 ///
-/// Returns a non-negative subscription handle (passed to `CLOSE`, named by
-/// [`TAKE_RUNG`] and [`CHANGES`]) or a negative errno. The handle carries no
+/// The provider answers its own index for the subscription; the kernel
+/// returns a subscription handle (passed to `CLOSE`, and the handle of the
+/// [`CHANGES`] reads it asks for) or a negative errno. The handle carries no
 /// fence.
 ///
 /// ## Delivery
 ///
-/// The provider keeps one *rung* bit per subscription. A change under the
-/// prefix that finds the bit clear sets it and signals the event; one that
-/// finds it set does nothing. [`TAKE_RUNG`] returns and clears the bits. A
-/// consumer's step is therefore: `event::POLL`, then `TAKE_RUNG` when the
-/// event fired, marking each returned subscription *pending*, then a
-/// [`CHANGES`] read of each pending one, clearing *pending* only when a read
-/// completes (a page with `more` clear). Whatever the interleaving, a change
-/// is followed by a completed read that observes it: if the bit was clear
-/// the signal follows the change; if set, the take that clears it is still
-/// to come, and the read follows the take.
-///
-/// Two obligations make that hold. `POLL` consumes the signal while a set
-/// bit sends no other, so a `TAKE_RUNG` that fails, or answers `more`, is
-/// owed and asked again on the next step whether or not the event fires
-/// again. And a read that fails leaves the subscription *pending*: its next
-/// step reads again, since no further signal may come. A consumer holding
-/// several subscriptions uses one event for all of them and takes once per
-/// step for the whole set.
+/// SUBSCRIBE signals (the registry's `signals`): after the provider answers,
+/// the kernel delivers `kernel::BIND_DOORBELL` with the provider's index and
+/// the subscription's doorbell, which the provider keeps. A change under the
+/// prefix rings it (`kernel::DOORBELL_RING`; the platform's own store rings
+/// it directly). The subscriber is woken, and `HANDLE_POLL` on the
+/// subscription answers `POLL_IN` once per ring — the poll takes it. A
+/// consumer's step is therefore: poll each subscription, and read each that
+/// rang with [`CHANGES`] until a page has `more` clear. Whatever the
+/// interleaving, a change is followed by a completed read that observes it:
+/// the ring follows the change, and the read follows the poll that took the
+/// ring. A read that fails leaves the subscription *pending* in the
+/// consumer: its next step reads again, since no further ring may come.
 ///
 /// ## Ownership and lifetime
 ///
-///   - The event must belong to the calling module (`query_key::EVENT_OWNER`).
-///     Before every signal the provider checks that the subscribing module
-///     occupancy still stands (`query_key::MODULE_LIVE`) and still owns the
-///     event; a subscription whose module is gone, or whose event slot
-///     another module now holds, is dropped, never signalled. A module that
-///     destroys its event closes the subscriptions naming it first: until a
-///     change finds the slot free or another module's they stay open, and
-///     they ring the slot if the module's own next `CREATE` takes it.
-///   - Idempotent: a repeat with the same owner, module occupancy, event and
-///     prefix returns the existing handle (and rings once again when bit 0
-///     is set), so a module re-running its subscribe path cannot leak.
-///   - A handle answers its opener alone — its owner and its module
-///     occupancy; to anyone else it is as if not open.
-///   - A subscription ends with its subscriber. Once the owner that opened
-///     it is released, or the module occupancy that opened it ends
-///     (finished, restarted, its slot reassigned), it is never signalled
-///     again, and the provider frees it: at once on the owner-release
-///     notification, or at its next change or the sweep a refusal at
-///     capacity makes first.
+///   - The subscription handle is its minter's: the kernel refuses it to any
+///     other owner, and wakes only the module that minted it. The provider
+///     never sees who the subscriber is beyond its owner (`CALLER_OWNER`).
+///   - A subscription ends with its handle. Closing it (`CLOSE`, or the
+///     subscriber's release) closes the provider's index and frees the
+///     doorbell, so a ring after the close rings nothing.
 ///
 /// ## Errors
 ///
 ///   - `EINVAL` — malformed request, a prefix longer than this provider can
-///     hold, an `event` that is not a tagged event fd the calling module
-///     owns, or a call from outside any module.
-///   - `ENOMEM` — the provider's subscription table is full after its dead
-///     subscriptions are swept, or the calling owner holds the provider's
-///     per-owner quota where it keeps one. A provider whose table is a
-///     resource-ledger pool counts the refusal against that pool.
+///     hold, or a call from outside any module.
+///   - `ENOMEM` — the provider's subscription table is full, or the calling
+///     owner holds the provider's per-owner quota where it keeps one. A
+///     provider whose table is a resource-ledger pool counts the refusal
+///     against that pool.
+///   - `ENOSPC` — the kernel's handle or event pool is spent; the provider's
+///     index is closed again.
 pub use super::super::super::registry::storage_namespace::SUBSCRIBE;
-
-/// Which of the caller's subscriptions on an event have rung since it last
-/// asked; returns and clears their rung bits.
-///
-/// `handle = -1`; `arg` is ([`take`] is the codec):
-///
-/// ```text
-///   [event: i32 LE]               — the event the subscriptions name
-///   [out_buf: ptr u64 LE]
-///   [out_cap: u32 LE]
-/// ```
-///
-/// On success the provider writes into `out_buf`:
-///
-/// ```text
-///   [more: u8]                    — 1: further rung subscriptions did not
-///                                   fit; the provider has signalled the
-///                                   event again
-///   [count: u16 LE]
-///   count × [handle: i32 LE]      — subscription handles
-/// ```
-///
-/// and returns the byte count. Only subscriptions the caller opened on that
-/// event are named; a handle that is not the caller's is never named or
-/// cleared. A failed take (`EINVAL` for a malformed request, `ENOMEM` when
-/// `out_cap` cannot hold the header and one handle) clears no bit, so the
-/// subscriptions it would have named stay rung for the take that follows.
-pub use super::super::super::registry::storage_namespace::TAKE_RUNG;
 
 /// Close a LOOKUP or SUBSCRIBE handle. A subscription closed by its opener
 /// is gone with its rung bit; its handle may name a later subscription.
@@ -398,19 +359,18 @@ pub use super::super::super::registry::storage_namespace::CLOSE;
 /// read a [`SUBSCRIBE`] doorbell asks for, and the primitive a long-poll watch
 /// server (a watch resumed from a revision) is a direct projection of.
 ///
-/// `handle = -1`; `arg` is ([`changes`] is the codec):
+/// `handle` is the subscription this read serves, or `-1` for a read no
+/// subscription serves. `arg` (in/out) is ([`changes`] is the codec):
 ///
 /// ```text
 ///   [prefix_len: u16 LE]
 ///   [prefix: prefix_len bytes]
-///   [sub: i32 LE]                 — the subscription this read serves, or -1
 ///   [token_len: u16 LE]
 ///   [token: token_len bytes]      — where to resume (below)
-///   [out_buf: ptr u64 LE]
-///   [out_cap: u32 LE]
-///   [fence_out_ptr: u64 LE]       — receives Fence::encode bytes
-///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
+///   [fence trailer: fence::trailer::LEN]   — written by the provider
 /// ```
+///
+/// A handle that is not one of the caller's subscriptions is `EBADF`.
 ///
 /// ## Tokens
 ///
@@ -458,19 +418,19 @@ pub use super::super::super::registry::storage_namespace::CLOSE;
 /// cut is left to the later page that holds it, so no `mod_rev` a consumer
 /// sees is ahead of what the read has delivered.
 ///
-/// The return value is the byte count written to `out_buf`; the encoded
-/// fence of the state the records were read at is written to
-/// `fence_out_ptr` — `ViewConsistent { source, revision }` from a versioned
+/// The page is written into `data` (out) and the return value is its byte
+/// count; the encoded fence of the state the records were read at is written
+/// into the trailer — `ViewConsistent { source, revision }` from a versioned
 /// store, `Volatile` from one that keeps nothing across a reset.
 ///
 /// ## Bounds and waits
 ///
 /// A provider pages rather than refuses, within a per-call budget it states;
-/// `ENOMEM` only when `out_cap` cannot hold the header, the next record and
+/// `ENOMEM` only when `data` cannot hold the header, the next record and
 /// the trailer ([`changes::min_out_cap`]). `EAGAIN` means "not now" (a busy
-/// device, a spent walk budget); when `sub` names one of the caller's
-/// subscriptions the provider rings it again once the cause clears, so a
-/// consumer woken only by its event never stalls on a wait.
+/// device, a spent walk budget); when the read came through one of the
+/// caller's subscriptions the provider rings it again once the cause clears,
+/// so a consumer woken only by its event never stalls on a wait.
 pub use super::super::super::registry::storage_namespace::CHANGES;
 
 /// Create a binding: `path → {kind, target}` — the one op that mints
@@ -478,26 +438,26 @@ pub use super::super::super::registry::storage_namespace::CHANGES;
 /// the replace flag is clear; RENAME covers moves, so BIND never
 /// implies one.
 ///
-/// `handle = -1`; `arg` is:
+/// `handle = -1`; `arg` (in/out, [`bind`] is the codec) is:
 ///
 /// ```text
 ///   [path_len: u16 LE]
 ///   [path: path_len bytes UTF-8]
 ///   [kind: u8]                    — 0=object, 1=namespace, 2=stream
 ///   [flags: u8]                   — bit 0: replace-existing
-///   [target_len: u16 LE]          — 0 permitted (kind=namespace needs no target)
+///   [target_len: u16 LE]          — 0 permitted (kind=namespace needs no
+///                                   target); at most [`PATH_MAX`]
 ///   [target: target_len bytes]    — provider-interpreted target key (an
 ///                                   object id, a volume key, a stream name);
 ///                                   opaque to this surface
-///   [fence_out_ptr: u64 LE]       — receives Fence::encode bytes
-///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
+///   [fence trailer: fence::trailer::LEN]   — written by the provider
 /// ```
 ///
 /// Returns 0 or negative errno, or `EINPROGRESS` as for `RENAME`. Same
 /// fence-advertisement rules as `RENAME`/`DELETE`: the achieved fence —
 /// `Volatile` for in-memory namespaces, `LocalDurable { device_id }` once
 /// locally committed, `ReplicatedDurable { source, .. }` once a quorum acks —
-/// is written into `fence_out_ptr` atomically with the op return.
+/// is written into the trailer atomically with the op return.
 ///
 /// ## Relation to `fs::OPEN_CREATE` and `fs::MKDIR`
 ///
@@ -511,18 +471,15 @@ pub use super::super::super::registry::storage_namespace::BIND;
 
 /// Capability bits: which optional ops this provider implements.
 ///
-/// `handle = -1`; `arg`/`arg_len` unused. Returns the `caps` bitmap
-/// (non-negative, so the bitmap is confined to bits 0..=30) or a
-/// negative errno. A provider that does not implement `CAPS` itself
-/// returns `ENOSYS`, which callers treat as "mandatory read surface
-/// only" (LOOKUP/STAT/LIST/CLOSE per its own errnos, no mutation ops).
+/// `handle = -1` (or a bound handle); `arg` out is exactly 4 bytes, the
+/// `u32` LE [`caps`] word; no `data`. Returns 0. Every provider implements
+/// it; `ENOSYS` from `CAPS` means there is no provider.
 pub use super::super::super::registry::storage_namespace::CAPS;
 
 /// Capability bits returned by [`CAPS`]. A provider sets bit B iff
 /// calling the corresponding opcode would succeed for valid input
 /// (rather than returning `ENOSYS`). Mirrors `fs::caps`: a bit names an
-/// opcode, a provider that does not implement the opcode reads it 0, and
-/// bit positions are stable — never renumbered.
+/// opcode, and a provider that does not implement the opcode reads it 0.
 /// [`caps::CHILD_NAMES`] is the one bit that names no opcode: it states the
 /// shape of the provider's `LIST` names.
 pub mod caps {
@@ -532,8 +489,7 @@ pub mod caps {
     pub const RENAME: u32 = 1 << 1;
     /// [`super::DELETE`].
     pub const DELETE: u32 = 1 << 2;
-    /// [`super::SUBSCRIBE`] and [`super::TAKE_RUNG`] —
-    /// change doorbells.
+    /// [`super::SUBSCRIBE`] — change doorbells.
     pub const SUBSCRIBE: u32 = 1 << 3;
     /// [`super::CHANGES`] — windowed change reads.
     pub const CHANGES: u32 = 1 << 4;
@@ -543,11 +499,10 @@ pub mod caps {
     pub const CHILD_NAMES: u32 = 1 << 5;
 }
 
-/// The longest namespace path: a `LIST` prefix or a `LOOKUP` path. A path is
-/// not a name — a directory-shaped provider's prefix walks its tree to any
-/// depth — so it has its own bound, sized for a host directory path. Names
-/// and cursors stay within `STORAGE_KEY_MAX`.
-pub const PATH_MAX: usize = 1024;
+/// The longest path, prefix, name, cursor or target this contract carries:
+/// the one bound every storage contract's names share, the `fs` path bound.
+pub const PATH_MAX: usize = super::handle::STORAGE_KEY_MAX;
+const _: () = assert!(PATH_MAX == 255);
 
 // ── Entry kind tags returned in STAT / LIST ─────────────────────────
 
@@ -589,19 +544,27 @@ pub fn is_trailer(page: &[u8], pos: usize) -> bool {
 /// kernel providers, bare-metal providers and PIC modules share one
 /// implementation of the layout.
 pub mod list {
+    use super::super::super::super::fence::trailer;
     use super::super::handle::STORAGE_KEY_MAX;
     use super::{is_trailer, PATH_MAX, TRAILER_HEADER_LEN, TRAILER_MARK};
 
     const _: () = assert!(STORAGE_KEY_MAX <= u8::MAX as usize);
 
-    /// Request bytes besides the prefix and cursor: the two length
-    /// prefixes, `out_buf`, `out_cap`, `fence_out_ptr` and `fence_out_cap`.
-    pub const REQUEST_FIXED_LEN: usize = 2 + 2 + 8 + 4 + 8 + 2;
+    /// Record bytes besides the prefix and cursor: the two length prefixes.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 2;
+
+    /// The `arg` for a prefix and cursor of these lengths, trailer included.
+    pub const fn arg_len(prefix_len: usize, cursor_len: usize) -> usize {
+        REQUEST_FIXED_LEN + prefix_len + cursor_len + trailer::LEN
+    }
+
+    /// The longest `arg`.
+    pub const ARG_MAX: usize = arg_len(PATH_MAX, STORAGE_KEY_MAX);
 
     /// An entry's bytes besides its name: `[name_len: u8][kind: u8]`.
     pub const ENTRY_FIXED_LEN: usize = 2;
 
-    /// Smallest `out_cap` that holds one entry with a name of this length
+    /// Smallest `data` that holds one entry with a name of this length
     /// and the trailer that resumes after it: what a provider needs to make
     /// progress past it.
     pub const fn min_out_cap(name_len: usize) -> usize {
@@ -614,10 +577,6 @@ pub mod list {
         pub prefix: &'a [u8],
         /// Empty for the first page.
         pub cursor: &'a [u8],
-        pub out_ptr: u64,
-        pub out_cap: u32,
-        pub fence_out_ptr: u64,
-        pub fence_out_cap: u16,
     }
 
     fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -625,28 +584,12 @@ pub mod list {
         Some(u16::from_le_bytes([s[0], s[1]]))
     }
 
-    fn u32_at(b: &[u8], at: usize) -> Option<u32> {
-        let s = b.get(at..at.checked_add(4)?)?;
-        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn u64_at(b: &[u8], at: usize) -> Option<u64> {
-        let s = b.get(at..at.checked_add(8)?)?;
-        Some(u64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
-    }
-
-    /// Parse and validate a request. `None` — the provider answers
-    /// `EINVAL` — when the bytes are not exactly one request, the prefix is
-    /// longer than `PATH_MAX` or the cursor longer than `STORAGE_KEY_MAX`,
-    /// either output pointer is null, or the fence buffer is smaller than
-    /// `fence::WIRE_MAX_LEN`.
-    ///
-    /// The length is exact: a `cursor_len` that disagrees with the bytes
-    /// supplied shifts the fixed tail, and reading a shifted tail yields a
-    /// plausible pointer to write into.
+    /// Parse and validate the request in `arg` (trailer included). `None` —
+    /// the provider answers `EINVAL` — when the bytes before the trailer are
+    /// not exactly one request, or the prefix is longer than `PATH_MAX` or
+    /// the cursor longer than `STORAGE_KEY_MAX`.
     pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let arg = trailer::record(arg)?;
         let prefix_len = u16_at(arg, 0)? as usize;
         if prefix_len > PATH_MAX {
             return None;
@@ -658,34 +601,20 @@ pub mod list {
             return None;
         }
         let cursor = arg.get(p + 2..p + 2 + cursor_len)?;
-        let p = p + 2 + cursor_len;
-        if arg.len() != p + REQUEST_FIXED_LEN - 4 {
+        if arg.len() != p + 2 + cursor_len {
             return None;
         }
-        let req = Request {
-            prefix,
-            cursor,
-            out_ptr: u64_at(arg, p)?,
-            out_cap: u32_at(arg, p + 8)?,
-            fence_out_ptr: u64_at(arg, p + 12)?,
-            fence_out_cap: u16_at(arg, p + 20)?,
-        };
-        if req.out_ptr == 0
-            || req.fence_out_ptr == 0
-            || (req.fence_out_cap as usize) < super::super::super::super::fence::WIRE_MAX_LEN
-        {
-            return None;
-        }
-        Some(req)
+        Some(Request { prefix, cursor })
     }
 
-    /// Encode `req` into `out`. Returns the bytes written, or `None` when
-    /// `out` is too small or a field exceeds its bound.
+    /// Encode `req` into `out` with an empty fence trailer. Returns the `arg`
+    /// length, or `None` when `out` is too small or a field exceeds its
+    /// bound.
     pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
         if req.prefix.len() > PATH_MAX || req.cursor.len() > STORAGE_KEY_MAX {
             return None;
         }
-        let total = REQUEST_FIXED_LEN + req.prefix.len() + req.cursor.len();
+        let total = arg_len(req.prefix.len(), req.cursor.len());
         let out = out.get_mut(..total)?;
         let mut p = 0;
         let mut put = |bytes: &[u8]| {
@@ -696,10 +625,7 @@ pub mod list {
         put(req.prefix);
         put(&(req.cursor.len() as u16).to_le_bytes());
         put(req.cursor);
-        put(&req.out_ptr.to_le_bytes());
-        put(&req.out_cap.to_le_bytes());
-        put(&req.fence_out_ptr.to_le_bytes());
-        put(&req.fence_out_cap.to_le_bytes());
+        put(&[0u8; trailer::LEN]);
         Some(total)
     }
 
@@ -842,7 +768,7 @@ pub mod list {
     }
 }
 
-// ── SUBSCRIBE / TAKE_RUNG / CHANGES wire codecs ──────────────────────
+// ── STAT / RENAME / DELETE / BIND / SUBSCRIBE / CHANGES codecs ──
 //
 // One implementation of each layout for providers and consumers alike: no
 // `std`, no allocation, so kernel providers, bare-metal providers and PIC
@@ -880,6 +806,219 @@ impl Put<'_> {
     }
 }
 
+/// The [`STAT`] answer: `[size u64][mtime u64][kind u8][etag_len u8][etag]`.
+pub mod stat {
+    use super::le_u64;
+
+    /// Longest etag a provider reports.
+    pub const ETAG_MAX: usize = 32;
+    /// The fixed fields.
+    pub const FIXED_LEN: usize = 8 + 8 + 1 + 1;
+    /// An `arg` that holds the whole answer.
+    pub const ARG_LEN: usize = FIXED_LEN + ETAG_MAX;
+
+    /// Write the answer into `out`, the etag only when it fits (its length
+    /// is then 0); the bytes written, or `None` when `out` cannot hold the
+    /// fixed fields.
+    pub fn encode(out: &mut [u8], size: u64, mtime: u64, kind: u8, etag: &[u8]) -> Option<usize> {
+        let o = out.get_mut(..FIXED_LEN)?;
+        o[0..8].copy_from_slice(&size.to_le_bytes());
+        o[8..16].copy_from_slice(&mtime.to_le_bytes());
+        o[16] = kind;
+        let etag = if etag.len() <= ETAG_MAX && out.len() >= FIXED_LEN + etag.len() {
+            etag
+        } else {
+            &[]
+        };
+        out[17] = etag.len() as u8;
+        out[FIXED_LEN..FIXED_LEN + etag.len()].copy_from_slice(etag);
+        Some(FIXED_LEN + etag.len())
+    }
+
+    /// A decoded answer.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Stat<'a> {
+        pub size: u64,
+        pub mtime: u64,
+        pub kind: u8,
+        pub etag: &'a [u8],
+    }
+
+    /// Decode the `n` bytes a successful `STAT` reported.
+    pub fn decode(ans: &[u8]) -> Option<Stat<'_>> {
+        let etag_len = *ans.get(17)? as usize;
+        Some(Stat {
+            size: le_u64(ans, 0)?,
+            mtime: le_u64(ans, 8)?,
+            kind: *ans.get(16)?,
+            etag: ans.get(FIXED_LEN..FIXED_LEN + etag_len)?,
+        })
+    }
+}
+
+/// The `[len: u16 LE][bytes]` field every path in a request is.
+fn path_at(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
+    let n = le_u16(b, at)? as usize;
+    if n > PATH_MAX {
+        return None;
+    }
+    Some((b.get(at + 2..at + 2 + n)?, at + 2 + n))
+}
+
+/// The [`RENAME`] request.
+pub mod rename {
+    use super::super::super::super::fence::trailer;
+    use super::{path_at, Put, PATH_MAX};
+
+    /// `flags` bit 0: replace an existing destination.
+    pub const FLAG_REPLACE: u8 = 1 << 0;
+
+    /// Record bytes besides the two paths: their lengths and `flags`.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 2 + 1;
+
+    pub const fn arg_len(src_len: usize, dst_len: usize) -> usize {
+        REQUEST_FIXED_LEN + src_len + dst_len + trailer::LEN
+    }
+
+    pub const ARG_MAX: usize = arg_len(PATH_MAX, PATH_MAX);
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request<'a> {
+        pub src: &'a [u8],
+        pub dst: &'a [u8],
+        pub flags: u8,
+    }
+
+    /// Parse the request in `arg` (trailer included); `None` — `EINVAL` —
+    /// unless the bytes before the trailer are exactly one request.
+    pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let rec = trailer::record(arg)?;
+        let (src, p) = path_at(rec, 0)?;
+        let (dst, p) = path_at(rec, p)?;
+        let flags = *rec.get(p)?;
+        (rec.len() == p + 1).then_some(Request { src, dst, flags })
+    }
+
+    /// Encode with an empty trailer; the `arg` length.
+    pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
+        if req.src.len() > PATH_MAX || req.dst.len() > PATH_MAX {
+            return None;
+        }
+        let mut p = Put { out, at: 0 };
+        p.bytes(&(req.src.len() as u16).to_le_bytes())?;
+        p.bytes(req.src)?;
+        p.bytes(&(req.dst.len() as u16).to_le_bytes())?;
+        p.bytes(req.dst)?;
+        p.bytes(&[req.flags])?;
+        p.bytes(&[0u8; trailer::LEN])?;
+        Some(p.at)
+    }
+}
+
+/// The [`DELETE`] request.
+pub mod delete {
+    use super::super::super::super::fence::trailer;
+    use super::{path_at, Put, PATH_MAX};
+
+    /// `flags` bit 0: delete a namespace and everything under it.
+    pub const FLAG_RECURSIVE: u8 = 1 << 0;
+
+    /// Record bytes besides the path: its length and `flags`.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 1;
+
+    pub const fn arg_len(path_len: usize) -> usize {
+        REQUEST_FIXED_LEN + path_len + trailer::LEN
+    }
+
+    pub const ARG_MAX: usize = arg_len(PATH_MAX);
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request<'a> {
+        pub path: &'a [u8],
+        pub flags: u8,
+    }
+
+    /// Parse the request in `arg` (trailer included); `None` — `EINVAL` —
+    /// unless the bytes before the trailer are exactly one request.
+    pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let rec = trailer::record(arg)?;
+        let (path, p) = path_at(rec, 0)?;
+        let flags = *rec.get(p)?;
+        (rec.len() == p + 1).then_some(Request { path, flags })
+    }
+
+    /// Encode with an empty trailer; the `arg` length.
+    pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
+        if req.path.len() > PATH_MAX {
+            return None;
+        }
+        let mut p = Put { out, at: 0 };
+        p.bytes(&(req.path.len() as u16).to_le_bytes())?;
+        p.bytes(req.path)?;
+        p.bytes(&[req.flags])?;
+        p.bytes(&[0u8; trailer::LEN])?;
+        Some(p.at)
+    }
+}
+
+/// The [`BIND`] request.
+pub mod bind {
+    use super::super::super::super::fence::trailer;
+    use super::{path_at, Put, PATH_MAX};
+
+    /// `flags` bit 0: replace an existing binding.
+    pub const FLAG_REPLACE: u8 = 1 << 0;
+
+    /// Record bytes besides the path and target: their lengths, `kind` and
+    /// `flags`.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 1 + 1 + 2;
+
+    pub const fn arg_len(path_len: usize, target_len: usize) -> usize {
+        REQUEST_FIXED_LEN + path_len + target_len + trailer::LEN
+    }
+
+    pub const ARG_MAX: usize = arg_len(PATH_MAX, PATH_MAX);
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request<'a> {
+        pub path: &'a [u8],
+        pub kind: u8,
+        pub flags: u8,
+        pub target: &'a [u8],
+    }
+
+    /// Parse the request in `arg` (trailer included); `None` — `EINVAL` —
+    /// unless the bytes before the trailer are exactly one request.
+    pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let rec = trailer::record(arg)?;
+        let (path, p) = path_at(rec, 0)?;
+        let kind = *rec.get(p)?;
+        let flags = *rec.get(p + 1)?;
+        let (target, end) = path_at(rec, p + 2)?;
+        (rec.len() == end).then_some(Request {
+            path,
+            kind,
+            flags,
+            target,
+        })
+    }
+
+    /// Encode with an empty trailer; the `arg` length.
+    pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
+        if req.path.len() > PATH_MAX || req.target.len() > PATH_MAX {
+            return None;
+        }
+        let mut p = Put { out, at: 0 };
+        p.bytes(&(req.path.len() as u16).to_le_bytes())?;
+        p.bytes(req.path)?;
+        p.bytes(&[req.kind, req.flags])?;
+        p.bytes(&(req.target.len() as u16).to_le_bytes())?;
+        p.bytes(req.target)?;
+        p.bytes(&[0u8; trailer::LEN])?;
+        Some(p.at)
+    }
+}
+
 /// The [`SUBSCRIBE`] request.
 pub mod subscribe {
     use super::{le_u16, Put, PATH_MAX};
@@ -887,27 +1026,33 @@ pub mod subscribe {
     /// `flags` bit 0: ring once now.
     pub const FLAG_RING_NOW: u8 = 1 << 0;
 
+    /// Request bytes besides the prefix: `prefix_len`, `flags`.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 1;
+
+    /// The `arg` for a prefix of `prefix_len` bytes.
+    pub const fn arg_len(prefix_len: usize) -> usize {
+        REQUEST_FIXED_LEN + prefix_len
+    }
+
+    /// The longest `arg`.
+    pub const ARG_MAX: usize = arg_len(PATH_MAX);
+
     /// A decoded request.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Request<'a> {
         pub prefix: &'a [u8],
-        /// The caller's tagged event fd.
-        pub event: i32,
         pub flags: u8,
     }
 
     /// Parse exactly one request; `None` — `EINVAL` — otherwise.
     pub fn parse(arg: &[u8]) -> Option<Request<'_>> {
         let plen = le_u16(arg, 0)? as usize;
-        if plen > PATH_MAX || arg.len() != 2 + plen + 5 {
+        if plen > PATH_MAX || arg.len() != arg_len(plen) {
             return None;
         }
-        let prefix = arg.get(2..2 + plen)?;
-        let e = arg.get(2 + plen..2 + plen + 4)?;
         Some(Request {
-            prefix,
-            event: i32::from_le_bytes([e[0], e[1], e[2], e[3]]),
-            flags: *arg.get(2 + plen + 4)?,
+            prefix: arg.get(2..2 + plen)?,
+            flags: *arg.get(2 + plen)?,
         })
     }
 
@@ -919,103 +1064,14 @@ pub mod subscribe {
         let mut p = Put { out, at: 0 };
         p.bytes(&(req.prefix.len() as u16).to_le_bytes())?;
         p.bytes(req.prefix)?;
-        p.bytes(&req.event.to_le_bytes())?;
         p.bytes(&[req.flags])?;
         Some(p.at)
     }
 }
 
-/// The [`TAKE_RUNG`] request and answer.
-pub mod take {
-    use super::{le_u16, le_u32, le_u64, Put};
-
-    /// Request bytes: `[event i32][out_ptr u64][out_cap u32]`.
-    pub const REQUEST_LEN: usize = 16;
-    /// Answer bytes before the handles: `[more u8][count u16]`.
-    pub const HEAD_LEN: usize = 3;
-    /// The smallest `out_cap` that makes progress: the head and one handle.
-    pub const MIN_OUT_CAP: usize = HEAD_LEN + 4;
-
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub struct Request {
-        pub event: i32,
-        pub out_ptr: u64,
-        pub out_cap: u32,
-    }
-
-    /// Parse exactly one request; `None` — `EINVAL` — otherwise, or when the
-    /// output pointer is null.
-    pub fn parse(arg: &[u8]) -> Option<Request> {
-        if arg.len() != REQUEST_LEN {
-            return None;
-        }
-        let r = Request {
-            event: le_u32(arg, 0)? as i32,
-            out_ptr: le_u64(arg, 4)?,
-            out_cap: le_u32(arg, 12)?,
-        };
-        (r.out_ptr != 0).then_some(r)
-    }
-
-    pub fn encode(out: &mut [u8], req: &Request) -> Option<usize> {
-        let mut p = Put { out, at: 0 };
-        p.bytes(&req.event.to_le_bytes())?;
-        p.bytes(&req.out_ptr.to_le_bytes())?;
-        p.bytes(&req.out_cap.to_le_bytes())?;
-        Some(p.at)
-    }
-
-    /// Writes one answer, the head last.
-    pub struct Writer<'a> {
-        out: &'a mut [u8],
-        count: u16,
-    }
-
-    impl<'a> Writer<'a> {
-        /// `None` when `out` cannot hold [`MIN_OUT_CAP`] (`ENOMEM`).
-        pub fn new(out: &'a mut [u8]) -> Option<Self> {
-            (out.len() >= MIN_OUT_CAP).then_some(Writer { out, count: 0 })
-        }
-
-        /// Append a handle; `false` when it does not fit (nothing written).
-        pub fn push(&mut self, handle: i32) -> bool {
-            let at = HEAD_LEN + self.count as usize * 4;
-            match self.out.get_mut(at..at + 4) {
-                Some(d) if self.count < u16::MAX => {
-                    d.copy_from_slice(&handle.to_le_bytes());
-                    self.count += 1;
-                    true
-                }
-                _ => false,
-            }
-        }
-
-        /// Write the head; the answer's length.
-        pub fn finish(self, more: bool) -> usize {
-            self.out[0] = u8::from(more);
-            self.out[1..3].copy_from_slice(&self.count.to_le_bytes());
-            HEAD_LEN + self.count as usize * 4
-        }
-    }
-
-    /// A decoded answer: `(more, handles)`.
-    pub fn decode(ans: &[u8]) -> Option<(bool, impl Iterator<Item = i32> + '_)> {
-        let more = *ans.first()? != 0;
-        let count = le_u16(ans, 1)? as usize;
-        let body = ans.get(HEAD_LEN..HEAD_LEN + count * 4)?;
-        if ans.len() != HEAD_LEN + count * 4 {
-            return None;
-        }
-        Some((
-            more,
-            body.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-        ))
-    }
-}
-
 /// The [`CHANGES`] request, page and tokens.
 pub mod changes {
+    use super::super::super::super::fence::trailer;
     use super::super::handle::STORAGE_KEY_MAX;
     use super::{le_u16, le_u32, le_u64, Put, PATH_MAX};
 
@@ -1038,8 +1094,16 @@ pub mod changes {
     pub const RECORD_FIXED_LEN: usize = 15;
     /// The trailer's bytes besides its token: `[token_len u16]`.
     pub const TRAILER_FIXED_LEN: usize = 2;
-    /// Request bytes besides the prefix and token.
-    pub const REQUEST_FIXED_LEN: usize = 2 + 4 + 2 + 8 + 4 + 8 + 2;
+    /// Record bytes besides the prefix and token: the two length prefixes.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 2;
+
+    /// The `arg` for a prefix and token of these lengths, trailer included.
+    pub const fn arg_len(prefix_len: usize, token_len: usize) -> usize {
+        REQUEST_FIXED_LEN + prefix_len + token_len + trailer::LEN
+    }
+
+    /// The longest `arg`.
+    pub const ARG_MAX: usize = arg_len(PATH_MAX, TOKEN_MAX);
 
     /// A bare revision token: "the changes after `since`".
     pub const fn revision_token(since: u64) -> [u8; REVISION_TOKEN_LEN] {
@@ -1053,7 +1117,7 @@ pub mod changes {
             .flatten()
     }
 
-    /// The smallest `out_cap` that makes progress past a record with a key
+    /// The smallest `data` that makes progress past a record with a key
     /// of `key_len` and a value of `val_len`, with a token of `token_len`.
     pub const fn min_out_cap(key_len: usize, val_len: usize, token_len: usize) -> usize {
         HEAD_LEN + RECORD_FIXED_LEN + key_len + val_len + TRAILER_FIXED_LEN + token_len
@@ -1062,54 +1126,29 @@ pub mod changes {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Request<'a> {
         pub prefix: &'a [u8],
-        /// The subscription this read serves, or -1.
-        pub sub: i32,
         pub token: &'a [u8],
-        pub out_ptr: u64,
-        pub out_cap: u32,
-        pub fence_out_ptr: u64,
-        pub fence_out_cap: u16,
     }
 
-    /// Parse exactly one request; `None` — `EINVAL` — when the bytes are not
-    /// one request, a field exceeds its bound, an output pointer is null or
-    /// the fence buffer is short.
+    /// Parse the request in `arg` (trailer included); `None` — `EINVAL` —
+    /// when the bytes before the trailer are not one request or a field
+    /// exceeds its bound.
     pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let arg = trailer::record(arg)?;
         let plen = le_u16(arg, 0)? as usize;
         if plen > PATH_MAX {
             return None;
         }
         let prefix = arg.get(2..2 + plen)?;
-        let mut p = 2 + plen;
-        let sub = le_u32(arg, p)? as i32;
-        p += 4;
+        let p = 2 + plen;
         let tlen = le_u16(arg, p)? as usize;
-        if tlen > TOKEN_MAX {
+        if tlen > TOKEN_MAX || arg.len() != p + 2 + tlen {
             return None;
         }
-        let token = arg.get(p + 2..p + 2 + tlen)?;
-        p += 2 + tlen;
-        if arg.len() != p + 22 {
-            return None;
-        }
-        let req = Request {
-            prefix,
-            sub,
-            token,
-            out_ptr: le_u64(arg, p)?,
-            out_cap: le_u32(arg, p + 8)?,
-            fence_out_ptr: le_u64(arg, p + 12)?,
-            fence_out_cap: le_u16(arg, p + 20)?,
-        };
-        if req.out_ptr == 0
-            || req.fence_out_ptr == 0
-            || (req.fence_out_cap as usize) < super::super::super::super::fence::WIRE_MAX_LEN
-        {
-            return None;
-        }
-        Some(req)
+        let token = arg.get(p + 2..)?;
+        Some(Request { prefix, token })
     }
 
+    /// Encode `req` into `out` with an empty fence trailer; the `arg` length.
     pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
         if req.prefix.len() > PATH_MAX || req.token.len() > TOKEN_MAX {
             return None;
@@ -1117,13 +1156,9 @@ pub mod changes {
         let mut p = Put { out, at: 0 };
         p.bytes(&(req.prefix.len() as u16).to_le_bytes())?;
         p.bytes(req.prefix)?;
-        p.bytes(&req.sub.to_le_bytes())?;
         p.bytes(&(req.token.len() as u16).to_le_bytes())?;
         p.bytes(req.token)?;
-        p.bytes(&req.out_ptr.to_le_bytes())?;
-        p.bytes(&req.out_cap.to_le_bytes())?;
-        p.bytes(&req.fence_out_ptr.to_le_bytes())?;
-        p.bytes(&req.fence_out_cap.to_le_bytes())?;
+        p.bytes(&[0u8; trailer::LEN])?;
         Some(p.at)
     }
 

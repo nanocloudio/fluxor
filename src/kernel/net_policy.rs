@@ -33,7 +33,7 @@
 //! REPLACE, CLEAR and ATTACH answer `EACCES` to a module not acting with the
 //! node's authority (`caller_authority`), whatever it holds; REPLACE and
 //! CLEAR also need the `net_policy.replace` grant, checked in the syscall
-//! layer before dispatch reaches here. PROBE, CAPS and READ are reads.
+//! layer before dispatch reaches here. CAPS and READ are reads.
 //!
 //! ## Concurrency
 //!
@@ -48,6 +48,7 @@
 
 use crate::abi::contracts::net::policy as wire;
 use crate::kernel::exec::scheduler::ModuleId;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 
 use crate::abi::contracts::resource as res;
@@ -487,31 +488,22 @@ fn node_authority() -> bool {
 /// The contract's dispatch, for a provider whose platform realizes `caps` and
 /// runs `hook` on every change. A provider with a hook and
 /// `caps::ENFORCED` is the enforcer of every table its hook applied.
-///
-/// # Safety
-/// `arg` points to `arg_len` caller-owned bytes for the call; pointers inside
-/// it are caller-owned buffers of the lengths they state (the provider
-/// contract).
-pub unsafe fn dispatch(
+pub fn dispatch(
     caps: u32,
     hook: Option<ApplyHook>,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
 ) -> i32 {
     if handle >= 0 {
         return errno::EINVAL;
     }
-    ensure_sized();
-    let a: &[u8] = if arg.is_null() || arg_len == 0 {
-        &[]
-    } else {
-        core::slice::from_raw_parts(arg, arg_len)
-    };
+    // SAFETY: provider-dispatch context; the store sizes itself once, before
+    // any table is written.
+    unsafe { ensure_sized() };
     let platform_enforces = hook.is_some() && caps & wire::caps::ENFORCED != 0;
     match opcode {
-        wire::PROBE => 1,
         wire::ATTACH => {
             // A bound enforcer makes its tables report ENFORCED, so attaching
             // is a claim about the node's packet policy: only a module acting
@@ -521,53 +513,39 @@ pub unsafe fn dispatch(
             if !node_authority() {
                 return errno::EACCES;
             }
-            attach(a)
+            // SAFETY: bindings are written under the store's writer flag.
+            unsafe { attach(arg) }
         }
-        wire::CAPS => {
-            if arg.is_null() || arg_len < 4 {
-                return errno::EINVAL;
-            }
-            core::ptr::copy_nonoverlapping(caps.to_le_bytes().as_ptr(), arg, 4);
-            0
-        }
+        wire::CAPS => crate::abi::kernel_abi::caps_word::answer(arg, caps),
+        // `arg` = the name record in, the new generation out; `data` = the
+        // rules.
         wire::REPLACE => {
             if !node_authority() {
                 return errno::EACCES;
             }
-            let Some((name, p)) = name_at(a) else {
+            let Some((name, _)) = name_at(arg) else {
                 return errno::EINVAL;
             };
-            let (Some(rptr), Some(rlen), Some(gptr)) =
-                (u64_at(a, p), u32_at(a, p + 8), u64_at(a, p + 12))
-            else {
+            let name = Name::of(name);
+            if arg.len() < 8 {
                 return errno::EINVAL;
-            };
-            let rlen = rlen as usize;
-            if rlen > table_bytes() {
+            }
+            let rule_bytes = data.as_slice();
+            if rule_bytes.len() > table_bytes() {
                 return errno::ENOSPC;
             }
-            let rule_bytes: &[u8] = if rlen == 0 || rptr == 0 {
-                &[]
-            } else {
-                core::slice::from_raw_parts(rptr as *const u8, rlen)
-            };
             if let Err(e) = wire::validate(rule_bytes, caps) {
                 return e;
             }
             if !take(&APPLYING) {
                 return errno::EAGAIN;
             }
-            let r = replace(name, rule_bytes, hook, platform_enforces);
+            // SAFETY: the store is written only by the holder of APPLYING.
+            let r = unsafe { replace(name.bytes(), rule_bytes, hook, platform_enforces) };
             APPLYING.store(false, Ordering::Release);
             match r {
                 Ok(g) => {
-                    if gptr != 0 {
-                        core::ptr::copy_nonoverlapping(
-                            g.to_le_bytes().as_ptr(),
-                            gptr as *mut u8,
-                            8,
-                        );
-                    }
+                    arg[..8].copy_from_slice(&g.to_le_bytes());
                     0
                 }
                 Err(e) => e,
@@ -577,18 +555,41 @@ pub unsafe fn dispatch(
             if !node_authority() {
                 return errno::EACCES;
             }
-            let Some((name, _)) = name_at(a) else {
+            let Some((name, _)) = name_at(arg) else {
                 return errno::EINVAL;
             };
             if !take(&APPLYING) {
                 return errno::EAGAIN;
             }
-            let r = clear(name, hook);
+            // SAFETY: as REPLACE.
+            let r = unsafe { clear(name, hook) };
             APPLYING.store(false, Ordering::Release);
             r
         }
-        wire::READ => read(a),
+        wire::READ => read(arg, data),
         _ => errno::ENOSYS,
+    }
+}
+
+/// A table name copied out of the `arg` it arrived in, which the answer
+/// overwrites.
+struct Name {
+    buf: [u8; wire::MAX_TABLE_NAME],
+    len: usize,
+}
+
+impl Name {
+    fn of(name: &[u8]) -> Self {
+        let mut buf = [0u8; wire::MAX_TABLE_NAME];
+        buf[..name.len()].copy_from_slice(name);
+        Self {
+            buf,
+            len: name.len(),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
     }
 }
 
@@ -686,44 +687,50 @@ unsafe fn clear(name: &[u8], hook: Option<ApplyHook>) -> i32 {
     0
 }
 
-/// READ: a table's state and rules, or (zero-length name) the store-wide
-/// generation.
-unsafe fn read(a: &[u8]) -> i32 {
-    let (name, p) = match a.first() {
-        Some(0) => (&[][..], 1),
-        _ => match name_at(a) {
-            Some(v) => v,
+/// READ: a table's state (into `arg`) and rules (into `data`), or
+/// (zero-length name) the store-wide generation.
+fn read(arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
+    let name = match arg.first() {
+        Some(0) => Name::of(&[]),
+        _ => match name_at(arg) {
+            Some((n, _)) => Name::of(n),
             None => return errno::EINVAL,
         },
     };
-    let (Some(optr), Some(ocap), Some(sptr)) = (u64_at(a, p), u32_at(a, p + 8), u64_at(a, p + 12))
-    else {
+    if arg.len() < wire::state::BYTES {
         return errno::EINVAL;
-    };
-    let ocap = ocap as usize;
+    }
+    let out = data.as_mut();
     let result = read_locked(|| {
-        if name.is_empty() {
-            return (0, state_bytes(NEXT_GENERATION - 1, 0, 0));
+        if name.len == 0 {
+            // SAFETY: `NEXT_GENERATION` is read under the sequence lock.
+            return (0, state_bytes(unsafe { NEXT_GENERATION } - 1, 0, 0));
         }
-        let tables = &raw const TABLES;
-        let Some((ti, t)) = (*tables).iter().enumerate().find(|(_, t)| t.is(name)) else {
-            return (errno::ENOENT, [0u8; wire::state::BYTES]);
-        };
-        let (applied, flags) = table_state(t);
-        let st = state_bytes(t.generation, applied, flags);
-        if t.len > ocap {
-            return (errno::ERANGE, st);
+        // SAFETY: the tables are read under the sequence lock; a torn read
+        // is retried.
+        unsafe {
+            let tables = &raw const TABLES;
+            let Some((ti, t)) = (*tables)
+                .iter()
+                .enumerate()
+                .find(|(_, t)| t.is(name.bytes()))
+            else {
+                return (errno::ENOENT, [0u8; wire::state::BYTES]);
+            };
+            let (applied, flags) = table_state(t);
+            let st = state_bytes(t.generation, applied, flags);
+            if t.len > out.len() {
+                return (errno::ERANGE, st);
+            }
+            out[..t.len].copy_from_slice(&rules(ti)[..t.len]);
+            (t.len as i32, st)
         }
-        if t.len > 0 && optr != 0 {
-            core::ptr::copy_nonoverlapping(rules(ti).as_ptr(), optr as *mut u8, t.len);
-        }
-        (t.len as i32, st)
     });
     let Some((rc, st)) = result else {
         return errno::EAGAIN;
     };
-    if rc != errno::ENOENT && sptr != 0 {
-        core::ptr::copy_nonoverlapping(st.as_ptr(), sptr as *mut u8, wire::state::BYTES);
+    if rc != errno::ENOENT {
+        arg[..wire::state::BYTES].copy_from_slice(&st);
     }
     rc
 }

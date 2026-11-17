@@ -220,16 +220,23 @@ fn kick_barrier() {
 // Device init
 // ============================================================================
 
+/// QEMU virt's virtio-mmio transports: 32 windows from here, `STRIDE`
+/// apart, transport `i` raising GIC INTID `FIRST_INTID + i`.
+const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+const VIRTIO_MMIO_STRIDE: usize = 0x200;
+const VIRTIO_MMIO_COUNT: usize = 32;
+const VIRTIO_MMIO_FIRST_INTID: u32 = 48;
+
 unsafe fn find_net_device() -> usize {
-    let mut addr = 0x0a00_0000usize;
+    let mut addr = VIRTIO_MMIO_BASE;
     let mut i = 0;
-    while i < 32 {
+    while i < VIRTIO_MMIO_COUNT {
         let magic = read_volatile(addr as *const u32);
         let device_id = read_volatile((addr + 0x008) as *const u32);
         if magic == 0x74726976 && device_id == 1 {
             return addr;
         }
-        addr += 0x200;
+        addr += VIRTIO_MMIO_STRIDE;
         i += 1;
     }
     0
@@ -606,13 +613,20 @@ pub unsafe extern "C" fn module_new(
 
         let sys = &*s.syscalls;
 
-        // Create an event and bind it to the virtio IRQ for interrupt-driven RX.
-        // QEMU virt virtio-mmio SPI 16 = GIC IRQ 48 (32 + 16).
-        // The kernel's ISR will ACK the device and signal this event.
+        // Create an event and bind it to the transport's IRQ: QEMU virt's
+        // transport `i` raises SPI 16 + `i` (GIC INTID 48 + `i`). The kernel's
+        // ISR acknowledges the transport it knows behind that line and
+        // signals this event.
         s.irq_event = dev_event_create(sys);
         if s.irq_event >= 0 {
-            let virtio_spi = 48u32; // SPI 16 = IRQ 48
-            dev_irq_bind(sys, s.irq_event, virtio_spi, s.device_base);
+            let transport = (s.device_base - VIRTIO_MMIO_BASE) / VIRTIO_MMIO_STRIDE;
+            let intid = VIRTIO_MMIO_FIRST_INTID + transport as u32;
+            dev_irq_bind(
+                sys,
+                s.irq_event,
+                intid,
+                abi::kernel_abi::event::ack::VIRTIO_MMIO,
+            );
         }
 
         dev_log(sys, 3, b"[virtio_net] init ok".as_ptr(), 20);

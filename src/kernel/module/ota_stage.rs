@@ -98,7 +98,7 @@ pub fn stage_write(offset: usize, data: &[u8]) -> i32 {
     // SAFETY: scheduler-thread statics, single writer.
     unsafe {
         if offset == 0 {
-            if !hal::ota_stage_protect(buf.bytes.as_mut_ptr(), STAGE_CAPACITY, false) {
+            if !hal::ota_stage_protect(&mut buf.bytes, false) {
                 return errno::ENOSYS; // no staging surface on this target
             }
             STAGED_LEN = 0;
@@ -230,7 +230,7 @@ fn commit() -> i32 {
     }
 
     // Make the staged region executable (cache maintenance / RX flip).
-    if !hal::ota_stage_protect(buf.bytes.as_mut_ptr(), staged_len, true) {
+    if !hal::ota_stage_protect(&mut buf.bytes[..staged_len], true) {
         log::error!("[ota] commit: stage protect failed");
         return errno::ERROR;
     }
@@ -251,9 +251,9 @@ fn commit() -> i32 {
         log::error!("[ota] commit: populate failed: {e}");
         return errno::EINVAL;
     }
-    // SAFETY: null/0 = "reload current STATIC_CONFIG", which populate
-    // just swapped to the staged config.
-    unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+    // The rebuild reloads STATIC_CONFIG, which populate just swapped to the
+    // staged config.
+    scheduler::request_rebuild();
 
     // SAFETY: scheduler-thread statics.
     unsafe {

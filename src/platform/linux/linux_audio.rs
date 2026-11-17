@@ -216,11 +216,11 @@ fn write_wav_header(
     Ok(())
 }
 
-unsafe fn linux_stream_time_dispatch(
+fn linux_stream_time_dispatch(
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    _data: fluxor::kernel::module::user_span::UserSpan<'_>,
 ) -> i32 {
     if opcode != STREAM_CLOCK_QUERY {
         return fluxor::kernel::sys::errno::ENOSYS;
@@ -228,11 +228,13 @@ unsafe fn linux_stream_time_dispatch(
     if handle >= 0 {
         return fluxor::kernel::sys::errno::EINVAL;
     }
-    if arg.is_null() || arg_len < 24 {
+    let Some(out) = arg.get_mut(..24) else {
         return fluxor::kernel::sys::errno::EINVAL;
-    }
+    };
 
-    let clock = &*core::ptr::addr_of!(LINUX_AUDIO_CLOCK);
+    // SAFETY: the audio clock is written only by the audio step on the
+    // scheduler thread, which is the thread running this call.
+    let clock = unsafe { &*core::ptr::addr_of!(LINUX_AUDIO_CLOCK) };
     if !clock.started || clock.sample_rate == 0 || clock.channels == 0 {
         return fluxor::kernel::sys::errno::ENODEV;
     }
@@ -246,7 +248,6 @@ unsafe fn linux_stream_time_dispatch(
     let queued: u32 = 0;
     let rate_q16 = clock.sample_rate << 16;
 
-    let out = core::slice::from_raw_parts_mut(arg, 24);
     out[0..8].copy_from_slice(&consumed.to_le_bytes());
     out[8..12].copy_from_slice(&queued.to_le_bytes());
     out[12..16].copy_from_slice(&rate_q16.to_le_bytes());
@@ -269,7 +270,10 @@ fn linux_audio_due_bytes(st: &LinuxAudioState) -> usize {
     aligned_due.min(4096) as usize
 }
 
-fn linux_audio_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn linux_audio_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxAudioState` by the loader.
     let st = unsafe { instance_state::<LinuxAudioState>(state) };
 

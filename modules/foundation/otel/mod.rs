@@ -588,6 +588,8 @@ unsafe fn step_drain(s: &mut OtelState) {
         let n = (sys.provider_call)(
             s.tlm_slot,
             tlm::TLM_DRAIN,
+            core::ptr::null_mut(),
+            0,
             s.accum.as_mut_ptr().add(used),
             room,
         );
@@ -687,7 +689,14 @@ unsafe fn step_flush(s: &mut OtelState) {
     // that range would index past it.
     if s.tlm_slot >= 0 && (s.tlm_slot as usize) < tlm::RING_CONSUMERS {
         let mut stats = [0u8; tlm::TLM_STATS_LEN];
-        let n = (sys.provider_call)(s.tlm_slot, tlm::TLM_STATS, stats.as_mut_ptr(), stats.len());
+        let n = (sys.provider_call)(
+            s.tlm_slot,
+            tlm::TLM_STATS,
+            stats.as_mut_ptr(),
+            stats.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         if n >= tlm::TLM_STATS_LEN as i32 {
             let off = 4 + (s.tlm_slot as usize) * 4;
             s.dropped =
@@ -833,7 +842,14 @@ pub unsafe extern "C" fn module_new(
                                   // unwired (`-1`), keeping otel in fire-and-forget mode.
         s.delivery_chan = dev_channel_port(sys, 0, 0);
         let filter = tlm::FILTER_ALL.to_le_bytes();
-        s.tlm_slot = (sys.provider_call)(-1, tlm::TLM_SUBSCRIBE, filter.as_ptr() as *mut u8, 4);
+        s.tlm_slot = (sys.provider_call)(
+            -1,
+            tlm::TLM_SUBSCRIBE,
+            filter.as_ptr() as *mut u8,
+            4,
+            core::ptr::null_mut(),
+            0,
+        );
 
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;

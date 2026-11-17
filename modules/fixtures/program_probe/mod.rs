@@ -104,15 +104,30 @@ unsafe fn probe_step(s: &mut State) {
     let r = |info: &[u8], o: usize| {
         u32::from_le_bytes([info[o], info[o + 1], info[o + 2], info[o + 3]])
     };
+    let at = pg::info::ADDR;
     let addr = u64::from_le_bytes([
-        s.info[0], s.info[1], s.info[2], s.info[3], s.info[4], s.info[5], s.info[6], s.info[7],
+        s.info[at],
+        s.info[at + 1],
+        s.info[at + 2],
+        s.info[at + 3],
+        s.info[at + 4],
+        s.info[at + 5],
+        s.info[at + 6],
+        s.info[at + 7],
     ]);
-    let size = r(&s.info, 8);
+    let size = r(&s.info, pg::info::SIZE);
     match s.phase {
         0 if s.delay > 0 => s.delay -= 1,
         0 => {
             s.info[0] = 0;
-            let rc = (sys.provider_call)(-1, PROGRAM_INFO, s.info.as_mut_ptr(), s.info.len());
+            let rc = (sys.provider_call)(
+                -1,
+                PROGRAM_INFO,
+                s.info.as_mut_ptr(),
+                s.info.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             if rc < 0 {
                 let mut line = [0u8; 16];
                 let mut n = 0;
@@ -132,9 +147,17 @@ unsafe fn probe_step(s: &mut State) {
                 s.phase = 2;
                 return;
             }
-            s.buf[0..4].fill(0);
-            s.buf[4..8].copy_from_slice(&s.at.to_le_bytes());
-            let got = (sys.provider_call)(-1, PROGRAM_READ, s.buf.as_mut_ptr(), s.buf.len());
+            // `arg` = `[slot 0][0; 3][offset]`; the bytes come back in `data`.
+            let mut req = [0u8; 8];
+            req[4..8].copy_from_slice(&s.at.to_le_bytes());
+            let got = (sys.provider_call)(
+                -1,
+                PROGRAM_READ,
+                req.as_mut_ptr(),
+                req.len(),
+                s.buf.as_mut_ptr(),
+                s.buf.len(),
+            );
             if got <= 0 {
                 s.at = size;
                 return;
@@ -165,12 +188,8 @@ unsafe fn probe_step(s: &mut State) {
 unsafe fn report(s: &mut State, addr: u64, size: u32) {
     let sys = &*s.syscalls;
     let r = |o: usize| u32::from_le_bytes([s.info[o], s.info[o + 1], s.info[o + 2], s.info[o + 3]]);
-    let kind = r(12);
-    let region = u64::from_le_bytes([
-        s.info[16], s.info[17], s.info[18], s.info[19], s.info[20], s.info[21], s.info[22],
-        s.info[23],
-    ]);
-    let region_len = r(24);
+    let kind = r(pg::info::KIND);
+    let region_end = r(pg::info::REGION_END);
     let mut line = [0u8; 120];
     let mut n = 0;
     let mut hx = [0u8; 8];
@@ -180,7 +199,7 @@ unsafe fn report(s: &mut State, addr: u64, size: u32) {
     put_hex32(&mut line, &mut n, kind);
     put(&mut line, &mut n, b" format=");
     let mut f = [0u8; 32];
-    f.copy_from_slice(&s.info[32..64]);
+    f.copy_from_slice(&s.info[pg::info::FORMAT..pg::info::FORMAT + 32]);
     hex8(&f, &mut hx);
     put(&mut line, &mut n, &hx);
     put(&mut line, &mut n, b" read=");
@@ -194,15 +213,15 @@ unsafe fn report(s: &mut State, addr: u64, size: u32) {
         put(&mut line, &mut n, b"none");
     }
     dev_log(sys, 3, line.as_ptr(), n);
-    if s.poke != 0 && region != 0 {
+    if s.poke != 0 && addr != 0 && region_end != 0 {
         // The first byte the module is not granted: the region's end on an
         // MPU (32-byte granular), the end of its last page under a page
-        // table, whose tail past the programs is the owner's padding.
+        // table, whose tail past the programs is the owner's padding (the
+        // region starts on a page).
+        let end = addr as usize + region_end as usize;
         #[cfg(target_arch = "aarch64")]
-        let end = (region_len as usize + 4095) & !4095;
-        #[cfg(not(target_arch = "aarch64"))]
-        let end = region_len as usize;
-        let past = (region as usize + end) as *const u8;
+        let end = (end + 4095) & !4095;
+        let past = end as *const u8;
         let mut l2 = [0u8; 48];
         let mut m = 0;
         put(&mut l2, &mut m, b"[prog] poking past region at ");

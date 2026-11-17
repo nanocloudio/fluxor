@@ -3,7 +3,7 @@
 // ============================================================================
 //
 // Thin typed wrappers around common `provider_call(handle=-1, op, ...)`
-// global operations — logging, timing, arena queries, channel ioctl,
+// global operations — logging, timing, arena queries, channel ops,
 // bridge I/O, flash sideband, runtime params.
 // Everything routes through `SyscallTable::provider_call`.
 
@@ -13,7 +13,14 @@ use crate::*;
 #[inline(always)]
 pub unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
-    (sys.provider_call)(-1, abi::registry::timer::MILLIS, buf.as_mut_ptr(), 8);
+    (sys.provider_call)(
+        -1,
+        abi::registry::timer::MILLIS,
+        buf.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     u64::from_le_bytes(buf)
 }
 
@@ -22,7 +29,14 @@ pub unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
 #[inline(always)]
 pub unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
-    (sys.provider_call)(-1, abi::registry::timer::MICROS, buf.as_mut_ptr(), 8);
+    (sys.provider_call)(
+        -1,
+        abi::registry::timer::MICROS,
+        buf.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     u64::from_le_bytes(buf)
 }
 
@@ -44,6 +58,8 @@ pub unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
         abi::registry::timer::TRUSTED_UNIX,
         buf.as_mut_ptr(),
         buf.len(),
+        core::ptr::null_mut(),
+        0,
     );
     if rc < 0 {
         // A platform without the surface is UNAVAILABLE, which is the same
@@ -65,6 +81,8 @@ pub unsafe fn dev_boot_incarnation(sys: &SyscallTable) -> Option<[u8; 16]> {
         abi::registry::kernel::BOOT_INCARNATION,
         buf.as_mut_ptr(),
         16,
+        core::ptr::null_mut(),
+        0,
     );
     if rc < 0 || buf == [0u8; 16] {
         None
@@ -79,7 +97,14 @@ pub unsafe fn dev_boot_incarnation(sys: &SyscallTable) -> Option<[u8; 16]> {
 #[inline(always)]
 pub unsafe fn dev_unix_millis(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
-    (sys.provider_call)(-1, abi::registry::timer::UNIX_MILLIS, buf.as_mut_ptr(), 8);
+    (sys.provider_call)(
+        -1,
+        abi::registry::timer::UNIX_MILLIS,
+        buf.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     u64::from_le_bytes(buf)
 }
 
@@ -89,12 +114,14 @@ pub unsafe fn dev_unix_millis(sys: &SyscallTable) -> u64 {
 /// unit-per-step pacing in that case.
 #[inline(always)]
 pub unsafe fn dev_flow_budget(sys: &SyscallTable, port_index: u8) -> u32 {
-    let arg = [port_index];
+    let mut arg = [port_index, 0];
     let r = (sys.provider_call)(
         -1,
         abi::registry::kernel::MODULE_FLOW_BUDGET,
-        arg.as_ptr() as *mut u8,
-        1,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
     );
     if r > 0 {
         r as u32
@@ -106,25 +133,15 @@ pub unsafe fn dev_flow_budget(sys: &SyscallTable, port_index: u8) -> u32 {
 /// Per-step consumption budget for one of this module's input ports. Uses the
 /// same class and live domain period as [`dev_flow_budget`].
 #[inline(always)]
-pub unsafe fn dev_input_flow_budget(
-    sys: &SyscallTable,
-    input_chan: i32,
-    input_port_index: u8,
-) -> u32 {
-    let channel = input_chan.to_le_bytes();
-    let arg = [
-        input_port_index,
-        1,
-        channel[0],
-        channel[1],
-        channel[2],
-        channel[3],
-    ];
+pub unsafe fn dev_input_flow_budget(sys: &SyscallTable, input_port_index: u8) -> u32 {
+    let mut arg = [input_port_index, 1];
     let r = (sys.provider_call)(
         -1,
         abi::registry::kernel::MODULE_FLOW_BUDGET,
-        arg.as_ptr() as *mut u8,
+        arg.as_mut_ptr(),
         arg.len(),
+        core::ptr::null_mut(),
+        0,
     );
     if r > 0 {
         r as u32
@@ -139,6 +156,8 @@ pub unsafe fn dev_log(sys: &SyscallTable, level: u8, msg: *const u8, len: usize)
     (sys.provider_call)(
         level as i32,
         abi::registry::kernel::LOG_WRITE,
+        core::ptr::null_mut(),
+        0,
         msg as *mut u8,
         len,
     );
@@ -148,43 +167,57 @@ pub unsafe fn dev_log(sys: &SyscallTable, level: u8, msg: *const u8, len: usize)
 #[inline(always)]
 pub unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u32) -> i32 {
     let mut buf = [events as u8];
-    (sys.provider_call)(fd, abi::registry::kernel::HANDLE_POLL, buf.as_mut_ptr(), 1)
+    (sys.provider_call)(
+        fd,
+        abi::registry::kernel::HANDLE_POLL,
+        buf.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Create an event via provider_call (EVENT::CREATE `event::CREATE`).
 #[inline(always)]
 pub unsafe fn dev_event_create(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, abi::registry::event::CREATE, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        -1,
+        abi::registry::event::CREATE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Poll an event via provider_call (EVENT::POLL `event::POLL`). Returns 1 if signaled (clears it), 0 if not.
 #[inline(always)]
 pub unsafe fn dev_event_poll(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.provider_call)(handle, abi::registry::event::POLL, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        handle,
+        abi::registry::event::POLL,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Bind an event to a hardware IRQ (kernel primitive BIND_IRQ, opcode `event::BIND_IRQ`).
-/// `irq`: GIC interrupt number. `mmio_base`: virtio-mmio base for auto-ACK (0 = none).
-pub unsafe fn dev_irq_bind(
-    sys: &SyscallTable,
-    event_handle: i32,
-    irq: u32,
-    mmio_base: usize,
-) -> i32 {
-    let mut buf = [0u8; 12];
-    let bp = buf.as_mut_ptr();
-    let irq_bytes = irq.to_le_bytes();
-    *bp = irq_bytes[0];
-    *bp.add(1) = irq_bytes[1];
-    *bp.add(2) = irq_bytes[2];
-    *bp.add(3) = irq_bytes[3];
-    let mb = (mmio_base as u64).to_le_bytes();
-    let mut i = 0;
-    while i < 8 {
-        *bp.add(4 + i) = mb[i];
-        i += 1;
-    }
-    (sys.provider_call)(event_handle, abi::registry::event::BIND_IRQ, bp, 12)
+/// `irq`: GIC interrupt number. `ack`: how the kernel quiets the device
+/// behind the line before it signals (`abi::kernel_abi::event::ack`).
+pub unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, ack: u8) -> i32 {
+    let mut arg = [0u8; 5];
+    arg[0..4].copy_from_slice(&irq.to_le_bytes());
+    arg[4] = ack;
+    (sys.provider_call)(
+        event_handle,
+        abi::registry::event::BIND_IRQ,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Query graph-level sample rate (kernel primitive GRAPH_SAMPLE_RATE, opcode `kernel::GRAPH_SAMPLE_RATE`).
@@ -266,6 +299,8 @@ pub unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
         abi::registry::kernel::REPORT_LATENCY,
         buf.as_mut_ptr(),
         4,
+        core::ptr::null_mut(),
+        0,
     );
 }
 
@@ -296,6 +331,8 @@ pub unsafe fn dev_report_step_effect(sys: &SyscallTable, effect: u8) {
         abi::registry::kernel::REPORT_STEP_EFFECT,
         buf.as_mut_ptr(),
         1,
+        core::ptr::null_mut(),
+        0,
     );
 }
 
@@ -307,113 +344,72 @@ pub unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> 
     // provider_call sees zeros on entry.
     core::ptr::write_volatile(buf.as_mut_ptr(), port_type);
     core::ptr::write_volatile(buf.as_mut_ptr().add(1), index);
-    (sys.provider_call)(-1, abi::registry::channel::PORT, buf.as_mut_ptr(), 2)
-}
-
-/// Channel ioctl via provider_call (CHANNEL::IOCTL `channel::IOCTL`).
-///
-/// Wire format is `[cmd:u32 LE][arg:arg_len bytes]`. Built-in cmds
-/// (`IOCTL_NOTIFY`, `IOCTL_POLL_NOTIFY` — `arg_len = 4`; `IOCTL_FLUSH`,
-/// `IOCTL_EOF` — `arg_len = 0`) are handled in the kernel. Any other
-/// Owner of the module that invoked the provider frame currently running,
-/// as `(slot, generation)`, or `None` when nothing is on the provider stack.
-///
-/// A provider inside a dispatch uses this to attribute the request it is
-/// serving: which owner's quota to charge, whose permissions apply. `None`
-/// means this module is stepping its own work rather than serving anybody —
-/// background reclamation, a heartbeat — and a provider MUST NOT fall back to
-/// the last caller it saw there, which would charge its own housekeeping to
-/// whoever happened to call it most recently.
-#[inline(always)]
-pub unsafe fn dev_caller_owner(sys: &SyscallTable) -> Option<(u16, u32)> {
-    let mut buf = [0u8; 8];
-    let rc = (sys.provider_query)(
-        -1,
-        abi::kernel_abi::query_key::CALLER_OWNER,
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
-    if rc < 8 {
-        return None;
-    }
-    Some((
-        u16::from_le_bytes([buf[0], buf[1]]),
-        u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-    ))
-}
-
-/// `cmd` is forwarded to a module-registered handler bound via
-/// [`dev_channel_register_ioctl`]; that handler reads up to `arg_len`
-/// bytes from `arg` and may write back into the same buffer.
-///
-/// On return the first `arg_len` bytes of `arg` carry the handler's
-/// response. Pass `arg = null` and `arg_len = 0` for arg-less cmds.
-#[inline(always)]
-pub unsafe fn dev_channel_ioctl(
-    sys: &SyscallTable,
-    handle: i32,
-    cmd: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
-    // Room for the largest argument a channel carries: a block `EXEC`
-    // request and its completion.
-    const MAX_IOCTL_ARG: usize = 128;
-    if arg_len > MAX_IOCTL_ARG {
-        return -22;
-    }
-    let mut buf = [0u8; 4 + MAX_IOCTL_ARG];
-    buf[..4].copy_from_slice(&cmd.to_le_bytes());
-    if arg_len > 0 {
-        if arg.is_null() {
-            return -22;
-        }
-        core::ptr::copy_nonoverlapping(arg, buf.as_mut_ptr().add(4), arg_len);
-    }
-    let result = (sys.provider_call)(
-        handle,
-        abi::registry::channel::IOCTL,
-        buf.as_mut_ptr(),
-        4 + arg_len,
-    );
-    if arg_len > 0 {
-        core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), arg, arg_len);
-    }
-    result
-}
-
-/// Bind a module-provided ioctl handler to `handle`. When any
-/// [`dev_channel_ioctl`] cmd arrives that the kernel does not recognise,
-/// the kernel calls `handler(state, cmd, arg)` with the opaque `state`
-/// pointer captured here. Pass `handler = None` to clear.
-///
-/// Registration is one-shot per channel; the last call wins. The
-/// `state` pointer is typically `&mut MyState as *mut c_void`.
-#[inline(always)]
-pub unsafe fn dev_channel_register_ioctl(
-    sys: &SyscallTable,
-    handle: i32,
-    state: *mut core::ffi::c_void,
-    handler: Option<
-        unsafe extern "C" fn(state: *mut core::ffi::c_void, cmd: u32, arg: *mut u8) -> i32,
-    >,
-) -> i32 {
-    let mut buf = [0u8; 16];
-    buf[..8].copy_from_slice(&(state as u64).to_le_bytes());
-    let hfn = match handler {
-        Some(h) => h as usize as u64,
-        None => 0u64,
-    };
-    buf[8..16].copy_from_slice(&hfn.to_le_bytes());
     (sys.provider_call)(
-        handle,
-        abi::registry::channel::REGISTER_IOCTL,
+        -1,
+        abi::registry::channel::PORT,
         buf.as_mut_ptr(),
-        16,
+        2,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
-/// Run one of the three mailbox acquires (`kernel_abi::buffer`): the buffer,
+/// One no-argument channel op on `handle`: its result.
+#[inline(always)]
+unsafe fn channel_op(sys: &SyscallTable, handle: i32, op: u32) -> i32 {
+    (sys.provider_call)(
+        handle,
+        op,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
+/// Drop what the channel holds and start its stream over
+/// (`kernel_abi::channel::FLUSH`): either end. `EBUSY` while a mailbox
+/// record is lent.
+#[inline(always)]
+pub unsafe fn dev_channel_flush(sys: &SyscallTable, handle: i32) -> i32 {
+    channel_op(sys, handle, abi::kernel_abi::channel::FLUSH)
+}
+
+/// End the stream (`kernel_abi::channel::SET_HUP`): the producer.
+#[inline(always)]
+pub unsafe fn dev_channel_set_hup(sys: &SyscallTable, handle: i32) -> i32 {
+    channel_op(sys, handle, abi::kernel_abi::channel::SET_HUP)
+}
+
+/// The largest write the channel's ring takes now
+/// (`kernel_abi::channel::WRITABLE`), or a negative errno: the producer. 0
+/// for a full ring and for a mailbox.
+#[inline(always)]
+pub unsafe fn dev_channel_writable(sys: &SyscallTable, handle: i32) -> i32 {
+    let mut out = [0u8; 4];
+    let rc = (sys.provider_call)(
+        handle,
+        abi::kernel_abi::channel::WRITABLE,
+        out.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc < 0 {
+        return rc;
+    }
+    u32::from_le_bytes(out).min(i32::MAX as u32) as i32
+}
+
+/// The unread bytes of the record at the head of the channel
+/// (`kernel_abi::channel::RECORD_LEN`): the consumer. `EAGAIN` when nothing
+/// is buffered.
+#[inline(always)]
+pub unsafe fn dev_channel_record_len(sys: &SyscallTable, handle: i32) -> i32 {
+    channel_op(sys, handle, abi::kernel_abi::channel::RECORD_LEN)
+}
+
+/// Run one of the three mailbox acquires (`kernel_abi::channel`): the buffer,
 /// or null, and the length the kernel reported through `len_out` when it is
 /// not null. The address comes back in the call's argument record, never in
 /// its `i32` result, so it survives on a 64-bit target.
@@ -424,9 +420,16 @@ pub unsafe fn dev_buffer_acquire(
     op: u32,
     len_out: *mut u32,
 ) -> *mut u8 {
-    use abi::kernel_abi::buffer::acquired;
+    use abi::kernel_abi::channel::acquired;
     let mut rec = [0u8; acquired::SIZE];
-    let rc = (sys.provider_call)(chan, op, rec.as_mut_ptr(), rec.len());
+    let rc = (sys.provider_call)(
+        chan,
+        op,
+        rec.as_mut_ptr(),
+        rec.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if !len_out.is_null() {
         *len_out = u32::from_le_bytes([
             rec[acquired::LEN],
@@ -444,7 +447,7 @@ pub unsafe fn dev_buffer_acquire(
 }
 
 /// Acquire write access to a mailbox channel's buffer
-/// (`kernel_abi::buffer::ACQUIRE_WRITE`). Returns the buffer, or null.
+/// (`kernel_abi::channel::ACQUIRE_WRITE`). Returns the buffer, or null.
 /// `capacity_out` receives the buffer's capacity, also when the mailbox is
 /// busy, so a producer can tell "busy" (non-zero) from "not a mailbox" (zero).
 #[inline(always)]
@@ -456,25 +459,27 @@ pub unsafe fn dev_buffer_acquire_write(
     dev_buffer_acquire(
         sys,
         chan,
-        abi::kernel_abi::buffer::ACQUIRE_WRITE,
+        abi::kernel_abi::channel::ACQUIRE_WRITE,
         capacity_out,
     )
 }
 
-/// Release a write buffer (`kernel_abi::buffer::RELEASE_WRITE`).
+/// Release a write buffer (`kernel_abi::channel::RELEASE_WRITE`).
 #[inline(always)]
 pub unsafe fn dev_buffer_release_write(sys: &SyscallTable, chan: i32, len: u32) -> i32 {
     let mut buf = len.to_le_bytes();
     (sys.provider_call)(
         chan,
-        abi::registry::buffer::RELEASE_WRITE,
+        abi::registry::channel::RELEASE_WRITE,
         buf.as_mut_ptr(),
         4,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
 /// Acquire in-place access to the pending message
-/// (`kernel_abi::buffer::ACQUIRE_INPLACE`). Returns the buffer, or null;
+/// (`kernel_abi::channel::ACQUIRE_INPLACE`). Returns the buffer, or null;
 /// `len_out` receives the message length.
 #[inline(always)]
 pub unsafe fn dev_buffer_acquire_inplace(
@@ -482,11 +487,16 @@ pub unsafe fn dev_buffer_acquire_inplace(
     chan: i32,
     len_out: *mut u32,
 ) -> *mut u8 {
-    dev_buffer_acquire(sys, chan, abi::kernel_abi::buffer::ACQUIRE_INPLACE, len_out)
+    dev_buffer_acquire(
+        sys,
+        chan,
+        abi::kernel_abi::channel::ACQUIRE_INPLACE,
+        len_out,
+    )
 }
 
 /// Acquire read access to the pending message
-/// (`kernel_abi::buffer::ACQUIRE_READ`). Returns the buffer, or null;
+/// (`kernel_abi::channel::ACQUIRE_READ`). Returns the buffer, or null;
 /// `len_out` receives the message length.
 #[inline(always)]
 pub unsafe fn dev_buffer_acquire_read(
@@ -494,35 +504,177 @@ pub unsafe fn dev_buffer_acquire_read(
     chan: i32,
     len_out: *mut u32,
 ) -> *const u8 {
-    dev_buffer_acquire(sys, chan, abi::kernel_abi::buffer::ACQUIRE_READ, len_out) as *const u8
+    dev_buffer_acquire(sys, chan, abi::kernel_abi::channel::ACQUIRE_READ, len_out) as *const u8
 }
 
-/// Release a read buffer (`kernel_abi::buffer::RELEASE_READ`).
+/// Release a read buffer (`kernel_abi::channel::RELEASE_READ`).
 #[inline(always)]
 pub unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
     (sys.provider_call)(
         chan,
-        abi::registry::buffer::RELEASE_READ,
+        abi::registry::channel::RELEASE_READ,
+        core::ptr::null_mut(),
+        0,
         core::ptr::null_mut(),
         0,
     )
 }
 
-/// Call the provider selected by name (`sel`): a keyed volume, or
-/// `platform` for the platform's own provider beneath the graph. The
-/// contract is the opcode's class byte. `op_handle` is `-1` for open-style
-/// ops, or a handle an open through the same `sel` returned (routed: it
-/// names its minting provider). Returns the provider's result, or negative
-/// errno (`EINVAL` / `ENODEV` when nothing carries `sel`, `EBADF` for a
-/// handle minted elsewhere).
+/// One provider call with no `data` span.
+///
+/// # Safety
+/// `arg[..arg_len]` is this module's own memory, live for the call.
 #[inline(always)]
-pub unsafe fn dev_provider_call_sel(
+pub unsafe fn dev_call(
     sys: &SyscallTable,
-    sel: &[u8],
-    op_handle: i32,
+    handle: i32,
     op: u32,
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    (sys.provider_call_sel)(sel.as_ptr(), sel.len(), op_handle, op, arg, arg_len)
+    (sys.provider_call)(handle, op, arg, arg_len, core::ptr::null_mut(), 0)
 }
+
+/// One provider call with a `data` span: the op's bulk bytes (a body, a
+/// page, a range), valid for this call only.
+///
+/// # Safety
+/// `arg[..arg_len]` and `data[..data_len]` are this module's own disjoint
+/// memory, live for the call.
+#[inline(always)]
+pub unsafe fn dev_call_data(
+    sys: &SyscallTable,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    (sys.provider_call)(handle, op, arg, arg_len, data, data_len)
+}
+
+/// A handle bound to the provider of `contract` registered under `name`: a
+/// keyed volume, or `platform` for the platform's own provider beneath the
+/// graph (`kernel::BIND`). Every op through it reaches that provider, and a
+/// handle an op through it mints is bound to the same one. Negative errno:
+/// `EINVAL` for a name past `bind::NAME_MAX`, `ENODEV` when nothing carries
+/// it.
+#[inline(always)]
+pub unsafe fn dev_bind_name(sys: &SyscallTable, contract: u16, name: &[u8]) -> i32 {
+    use abi::kernel_abi::bind;
+    let mut arg = [0u8; bind::ARG_MAX];
+    let Some(n) = bind::name(name, &mut arg) else {
+        return -22;
+    };
+    (sys.provider_open)(u32::from(contract), bind::BIND, arg.as_ptr(), n)
+}
+
+/// A handle bound to the module at the other end of this module's port
+/// `index` of `port_type` (`bind::PORT_IN` / `PORT_OUT` / `PORT_CTRL`), which
+/// serves the edge contract `contract` there. `ENODEV` when the port is not
+/// wired, `ENOSYS` when the module there does not serve `contract`.
+#[inline(always)]
+pub unsafe fn dev_bind_port(sys: &SyscallTable, contract: u16, port_type: u8, index: u8) -> i32 {
+    use abi::kernel_abi::bind;
+    let arg = bind::port(port_type, index);
+    (sys.provider_open)(u32::from(contract), bind::BIND, arg.as_ptr(), arg.len())
+}
+
+/// Lend `span[..len]` to the provider serving `session` (a bound or minted
+/// handle), named in that session's requests by `cookie`
+/// (`lend::OPEN`). `dir` is `LEND_IN` (the provider reads it), `LEND_OUT`
+/// (writes it) or `LEND_INOUT`. Returns the lend handle, closed with
+/// [`dev_lend_close`]; the memory must stay this module's until then.
+///
+/// # Safety
+/// `span[..len]` is this module's own memory and stays so, unmoved, until the
+/// lend is closed and every borrow of it returned.
+#[inline(always)]
+pub unsafe fn dev_lend_open(
+    sys: &SyscallTable,
+    session: i32,
+    dir: u8,
+    cookie: u32,
+    span: *mut u8,
+    len: usize,
+) -> i32 {
+    let mut arg = [0u8; 8];
+    arg[0] = dir;
+    arg[4..8].copy_from_slice(&cookie.to_le_bytes());
+    (sys.provider_call)(
+        session,
+        abi::registry::lend::OPEN,
+        arg.as_mut_ptr(),
+        8,
+        span,
+        len,
+    )
+}
+
+/// Close a lend this module opened. A span still borrowed is released by the
+/// borrower's last return.
+#[inline(always)]
+pub unsafe fn dev_lend_close(sys: &SyscallTable, lend: i32) -> i32 {
+    (sys.provider_call)(
+        lend,
+        abi::registry::lend::CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
+/// The provider borrows: the span lent under `cookie` to its session
+/// `inner` (the handle it was handed for that session), and its direction,
+/// one more borrow out. `None` when no such lend is bound to this module.
+/// Every borrow is given back with [`dev_lend_return`] before the request
+/// that used it is reported complete.
+#[inline(always)]
+pub unsafe fn dev_lend_resolve(
+    sys: &SyscallTable,
+    inner: i32,
+    cookie: u32,
+) -> Option<(*mut u8, usize, u8)> {
+    let mut arg = [0u8; 13];
+    arg[0..4].copy_from_slice(&inner.to_le_bytes());
+    arg[4..8].copy_from_slice(&cookie.to_le_bytes());
+    let rc = (sys.provider_call)(
+        -1,
+        abi::registry::lend::RESOLVE,
+        arg.as_mut_ptr(),
+        13,
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc < 0 {
+        return None;
+    }
+    let addr = u64::from_le_bytes([
+        arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7],
+    ]);
+    let len = u32::from_le_bytes([arg[8], arg[9], arg[10], arg[11]]) as usize;
+    Some((addr as usize as *mut u8, len, arg[12]))
+}
+
+/// Give back one borrow of the span lent under `cookie` to session `inner`.
+#[inline(always)]
+pub unsafe fn dev_lend_return(sys: &SyscallTable, inner: i32, cookie: u32) -> i32 {
+    let mut arg = [0u8; 8];
+    arg[0..4].copy_from_slice(&inner.to_le_bytes());
+    arg[4..8].copy_from_slice(&cookie.to_le_bytes());
+    (sys.provider_call)(
+        -1,
+        abi::registry::lend::RETURN,
+        arg.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
+/// `dev_lend_open` directions: what the provider may do with the span.
+pub const LEND_IN: u8 = 1;
+pub const LEND_OUT: u8 = 2;
+pub const LEND_INOUT: u8 = 3;

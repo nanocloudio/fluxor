@@ -989,7 +989,7 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     con.puts(" t_us=");
     con.dec(clock.elapsed_us());
     con.puts("\n");
-    devices::configure(&machine, zone);
+    devices::configure(&machine);
 
     // A graph with no modules is an image that only proves the boot: nothing is
     // left to run, so the summary repeats until the uptime limit.

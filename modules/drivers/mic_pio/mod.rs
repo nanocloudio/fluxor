@@ -41,22 +41,11 @@ const DEV_PIO_RX_STREAM_CONFIGURE: u32 = abi::registry::pio::RX_STREAM_CONFIGURE
 const DEV_PIO_RX_STREAM_CAN_PULL: u32 = abi::registry::pio::RX_STREAM_CAN_PULL;
 const DEV_PIO_RX_STREAM_PULL: u32 = abi::registry::pio::RX_STREAM_PULL;
 const DEV_PIO_RX_STREAM_FREE: u32 = abi::registry::pio::RX_STREAM_FREE;
-const DEV_PIO_RX_STREAM_GET_BUFFER: u32 = abi::registry::pio::RX_STREAM_GET_BUFFER;
 const DEV_PIO_RX_STREAM_SET_RATE: u32 = abi::registry::pio::RX_STREAM_SET_RATE;
 
 // ============================================================================
 // HAL_PIO argument structs
 // ============================================================================
-
-#[repr(C)]
-struct PioLoadProgramArgs {
-    program: *const u16,
-    program_len: u32,
-    wrap_target: u8,
-    wrap: u8,
-    sideset_bits: u8,
-    options: u8,
-}
 
 #[repr(C)]
 struct PioRxConfigureArgs {
@@ -250,23 +239,38 @@ unsafe fn step_init(s: &mut MicState) -> StepReturn {
     }
 
     // Load RX PIO program
-    let load_args = PioLoadProgramArgs {
-        program: pio::RX_PROGRAM.as_ptr(),
-        program_len: pio::RX_PROGRAM.len() as u32,
-        wrap_target: pio::WRAP_TARGET,
-        wrap: pio::WRAP,
-        sideset_bits: pio::SIDESET_BITS,
-        options: pio::OPTIONS,
-    };
+    let mut load_arg = abi::platform::rp::pio::load_program::encode(
+        pio::WRAP_TARGET,
+        pio::WRAP,
+        pio::SIDESET_BITS,
+        pio::OPTIONS,
+    );
+    let mut program = [0u8; 2 * pio::RX_PROGRAM.len()];
+    let mut i = 0usize;
+    while i < pio::RX_PROGRAM.len() {
+        let w = pio::RX_PROGRAM[i].to_le_bytes();
+        program[2 * i] = w[0];
+        program[2 * i + 1] = w[1];
+        i += 1;
+    }
     let result = (provider_call)(
         handle,
         DEV_PIO_RX_STREAM_LOAD_PROGRAM,
-        &load_args as *const _ as *mut u8,
-        core::mem::size_of::<PioLoadProgramArgs>(),
+        load_arg.as_mut_ptr(),
+        load_arg.len(),
+        program.as_mut_ptr(),
+        program.len(),
     );
     if result < 0 {
         dev_log(sys, 1, b"[mic] load fail".as_ptr(), 15);
-        (provider_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
+        (provider_call)(
+            handle,
+            DEV_PIO_RX_STREAM_FREE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.phase = MicPhase::Error;
         return StepReturn::error(-1);
     }
@@ -286,10 +290,19 @@ unsafe fn step_init(s: &mut MicState) -> StepReturn {
         DEV_PIO_RX_STREAM_CONFIGURE,
         &cfg_args as *const _ as *mut u8,
         core::mem::size_of::<PioRxConfigureArgs>(),
+        core::ptr::null_mut(),
+        0,
     );
     if result < 0 {
         dev_log(sys, 1, b"[mic] cfg fail".as_ptr(), 14);
-        (provider_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
+        (provider_call)(
+            handle,
+            DEV_PIO_RX_STREAM_FREE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.phase = MicPhase::Error;
         return StepReturn::error(-1);
     }
@@ -297,7 +310,14 @@ unsafe fn step_init(s: &mut MicState) -> StepReturn {
     // Set stream rate (Q16.16)
     let rate_q16 = s.sample_rate << 16;
     let mut rate_arg = rate_q16.to_le_bytes();
-    (provider_call)(handle, DEV_PIO_RX_STREAM_SET_RATE, rate_arg.as_mut_ptr(), 4);
+    (provider_call)(
+        handle,
+        DEV_PIO_RX_STREAM_SET_RATE,
+        rate_arg.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
 
     s.rx_handle = handle;
     s.phase = MicPhase::Running;
@@ -339,35 +359,26 @@ unsafe fn step_running(s: &mut MicState) -> StepReturn {
         DEV_PIO_RX_STREAM_CAN_PULL,
         core::ptr::null_mut(),
         0,
+        core::ptr::null_mut(),
+        0,
     );
     if can_pull <= 0 {
         return StepReturn::Continue;
     }
 
-    // Get buffer pointer
-    let mut buf_ptr: u32 = 0;
-    let words = (provider_call)(
+    // Take the captured buffer (the provider recycles it either way).
+    let copy_len = (provider_call)(
         rx_handle,
-        DEV_PIO_RX_STREAM_GET_BUFFER,
-        &mut buf_ptr as *mut u32 as *mut u8,
-        4,
+        DEV_PIO_RX_STREAM_PULL,
+        core::ptr::null_mut(),
+        0,
+        s.io_buf.as_mut_ptr(),
+        OUT_BUF_SIZE,
     );
-    if buf_ptr == 0 || words <= 0 {
+    if copy_len <= 0 {
         return StepReturn::Continue;
     }
-
-    let byte_count = (words as usize) * 4;
-    let copy_len = if byte_count > OUT_BUF_SIZE {
-        OUT_BUF_SIZE
-    } else {
-        byte_count
-    };
-
-    // Copy from RX buffer to io_buf
-    __aeabi_memcpy(s.io_buf.as_mut_ptr(), buf_ptr as *const u8, copy_len);
-
-    // Acknowledge the pull (release buffer for DMA reuse)
-    (provider_call)(rx_handle, DEV_PIO_RX_STREAM_PULL, core::ptr::null_mut(), 0);
+    let copy_len = copy_len as usize;
 
     // Write to output channel
     let written = (sys.channel_write)(out_chan, s.io_buf.as_ptr(), copy_len);

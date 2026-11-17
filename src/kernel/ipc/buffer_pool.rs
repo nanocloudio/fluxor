@@ -25,56 +25,37 @@
 //!
 //! ## Buffer Modes
 //!
-//! Each buffer supports two usage modes:
+//! Each buffer serves one of two modes:
 //!
-//! **FIFO (streaming):** Ring buffer for continuous byte streams (audio data).
-//! Uses channel_write/channel_read with copy semantics.
+//! **FIFO (ring):** the channel's ring of records, read and written with copy
+//! semantics (`channel_read` / `channel_write`). The record stays IDLE.
 //!
-//! **Mailbox (zero-copy):** Single-message handoff between producer and consumer.
-//! Uses buffer_acquire_write/release_write/acquire_read/release_read.
-//! Enabled automatically for aliased (buffer_group) channels.
+//! **Mailbox:** one record handed from producer to consumer, lent rather than
+//! copied (`ACQUIRE_WRITE` / `RELEASE_WRITE` / `ACQUIRE_READ` /
+//! `RELEASE_READ` / `ACQUIRE_INPLACE`). Enabled for aliased (`buffer_group`)
+//! channels.
 //!
-//! ## Mailbox State Machine
+//! ## The record machine
 //!
 //! ```text
-//!   STREAMING ──acquire_write──► PRODUCER ──release_write──► READY
-//!       ▲                                                     │
-//!       │                                                     ├──acquire_read──► CONSUMER ──release_read──► STREAMING
-//!       │                                                     │
-//!       │                                          acquire_inplace──► (READY_PROCESSED)──release_write──► STREAMING
-//!       │                                                                │
-//!       └────────────────────── mailbox_flush ◄───────────────────────────┘
+//!             acquire_write              publish(len>0)             acquire_read
+//!    IDLE ─────────────────► WRITING ─────────────────► READY ─────────────────► READING
+//!     ▲  ◄── cancel_write ──────┘ ▲                       │ ▲                      │
+//!     │     (len == 0)            │ acquire_inplace       │ └──── cancel_read ─────┤
+//!     │                           └─ (READY && !processed)┘     (bit untouched)    │
+//!     │◄────────────────────────── release_read ──────────────────────────────────┘
+//!     │◄── flush (READY only; processed = 0)       flush on WRITING/READING = EBUSY
 //! ```
 //!
-//! - **STREAMING**: idle, available for next produce/consume cycle
-//! - **PRODUCER**: writer holds buffer, filling with data
-//! - **READY**: data available; acquire_read or acquire_inplace may proceed
-//! - **CONSUMER**: reader holds buffer (read-only via acquire_read)
-//! - **READY_PROCESSED**: in-place module has processed; prevents double-processing
-//! - **mailbox_flush**: force-resets a slot holding a buffer to STREAMING (clears len, inplace_flag)
-//! - **mailbox_cancel_read**: CONSUMER → READY without consuming (preserves payload)
-//!
-//! ## In-place processing limit
-//!
-//! `acquire_inplace` only accepts READY (not READY_PROCESSED). After an in-place
-//! module releases, the buffer transitions to READY_PROCESSED, which prevents a
-//! second in-place module from re-processing the same data. At most one in-place
-//! transform is supported per alias chain. For multiple transforms, insert a FIFO
-//! copy step between them or change the state machine.
-//!
-//! ## Usage paths
-//!
-//! Mailbox acquire/release is used directly for zero-copy paths (e.g.
-//! I2S DMA via `acquire_read`). Modules using `channel_read`/`channel_write`
-//! get mailbox support transparently, but with a copy — not zero-copy.
+//! - A lend (WRITING or READING) names its `holder`; only the holder ends it,
+//!   by release or cancel. Otherwise it ends when the holder retires
+//!   ([`release_lends_of`]) or the channel closes ([`free_streaming`], which
+//!   abandons the memory rather than hand it to the next channel).
+//! - `processed` is set when a WRITING that began as an in-place acquire
+//!   publishes, and cleared when the record leaves READY for IDLE: at most
+//!   one in-place transform runs per record.
 //!
 //! Both modes use the same arena-allocated buffer.
-//!
-//! ## FIFO→Mailbox chaining
-//!
-//! A pipeline can mix FIFO and mailbox channels. A mailbox chain starts at the
-//! first module that produces whole buffers; prior stages use FIFO copy. See
-//! `docs/architecture/pipeline.md` §FIFO→Mailbox for the full pattern.
 
 use portable_atomic::{
     AtomicBool, AtomicI16, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering,
@@ -416,46 +397,30 @@ pub fn reset_buffer_arena() {
 }
 
 // ============================================================================
-// Buffer States
+// Record states
 // ============================================================================
 
-/// Buffer slot is unused (no arena memory assigned)
+/// Slot unused (no arena memory assigned).
 pub const STATE_FREE: u8 = 0;
-
-/// Buffer is owned by producer (being written) — zero-copy mode
-pub const STATE_PRODUCER: u8 = 1;
-
-/// Buffer has data ready for consumer — zero-copy mode
+/// The holder is writing the record.
+pub const STATE_WRITING: u8 = 1;
+/// The record is published, waiting for its reader.
 pub const STATE_READY: u8 = 2;
-
-/// Buffer is owned by consumer (being read) — zero-copy mode
-pub const STATE_CONSUMER: u8 = 3;
-
-/// Buffer is allocated for streaming FIFO (owned by a channel)
-pub const STATE_STREAMING: u8 = 4;
-
-/// Buffer processed by in-place module, ready for consumer read.
-/// Like READY but acquire_inplace won't accept it, preventing double-processing.
-pub const STATE_READY_PROCESSED: u8 = 5;
-
+/// The holder is reading the record.
+pub const STATE_READING: u8 = 3;
+/// No record: a mailbox between records, or a ring's buffer.
+pub const STATE_IDLE: u8 = 4;
 /// Slot being freed (`free_streaming`): no transition starts from it, and it
 /// becomes FREE once the slot is cleared.
 const STATE_CLOSING: u8 = 6;
 
-// ============================================================================
-// Error Codes
-// ============================================================================
-
 /// Success
 pub const BUF_OK: i32 = errno::OK;
-
-/// No buffer available
+/// Nothing to lend now.
 pub const BUF_EAGAIN: i32 = errno::EAGAIN;
-
 /// Invalid argument
 pub const BUF_EINVAL: i32 = errno::EINVAL;
-
-/// Buffer in wrong state for operation
+/// Record in the wrong state, or lent to someone else.
 pub const BUF_EBUSY: i32 = errno::EBUSY;
 
 // ============================================================================
@@ -465,24 +430,25 @@ pub const BUF_EBUSY: i32 = errno::EBUSY;
 /// A registry entry tracking an arena-allocated buffer.
 ///
 /// The actual buffer data lives in the buffer arena; this slot only holds
-/// metadata (pointer, capacity, state).
+/// metadata (pointer, capacity, record state).
 struct BufferRegistrySlot {
     /// Pointer to arena-allocated buffer data (null if not allocated)
     data_ptr: core::cell::UnsafeCell<*mut u8>,
     /// Buffer capacity in bytes (set at allocation time)
     capacity: AtomicU32,
-    /// Current valid data length (set by producer on release)
+    /// The record's length (set when it is published)
     len: AtomicU32,
-    /// Buffer state (FREE/PRODUCER/READY/CONSUMER/STREAMING/READY_PROCESSED)
+    /// Record state (FREE/IDLE/WRITING/READY/READING/CLOSING)
     state: AtomicU8,
-    /// Owner channel handle (-1 if not associated). Stored as `i16` so the
+    /// Owner channel slot (-1 if not associated). Stored as `i16` so the
     /// full configured `MAX_CHANNELS` range fits without silent narrowing.
     owner_channel: AtomicI16,
-    /// Set when current PRODUCER was acquired via in-place (not fresh write)
-    inplace_flag: AtomicU8,
-    /// Producer module index (`NO_MODULE` if unknown). The scheduler reads this to
-    /// compute a per-module channel-buffer range for an MPU/MMU region.
-    producer_module: AtomicU16,
+    /// The current WRITING began as an in-place acquire.
+    inplace: AtomicBool,
+    /// An in-place writer has processed the record.
+    processed: AtomicBool,
+    /// The module a lend (WRITING or READING) is lent to.
+    holder: AtomicU16,
 }
 
 // SAFETY: The `data_ptr` UnsafeCell is mutated only via dedicated
@@ -499,8 +465,9 @@ impl BufferRegistrySlot {
             len: AtomicU32::new(0),
             state: AtomicU8::new(STATE_FREE),
             owner_channel: AtomicI16::new(-1),
-            inplace_flag: AtomicU8::new(0),
-            producer_module: AtomicU16::new(NO_MODULE),
+            inplace: AtomicBool::new(false),
+            processed: AtomicBool::new(false),
+            holder: AtomicU16::new(NO_MODULE),
         }
     }
 
@@ -522,15 +489,14 @@ impl BufferRegistrySlot {
     #[inline]
     fn data_ptr(&self) -> *mut u8 {
         // SAFETY: `data_ptr` is an `UnsafeCell<*mut u8>`; reading a copy
-        // of the raw pointer is a single load. The producer/consumer
-        // handshake uses the atomic `len`/`owner_channel` fields to
-        // synchronise access to the pointed-at memory.
+        // of the raw pointer is a single load. The record state machine
+        // synchronises access to the pointed-at memory.
         unsafe { *self.data_ptr.get() }
     }
 
     /// Assign arena-allocated memory to this slot.
     fn assign(&self, ptr: *mut u8, capacity: usize, channel: i16) {
-        // SAFETY: the caller claimed this slot (FREE -> STREAMING) and has
+        // SAFETY: the caller claimed this slot (FREE -> IDLE) and has
         // not yet published it to a channel, so nothing else reads it.
         unsafe {
             *self.data_ptr.get() = ptr;
@@ -538,100 +504,24 @@ impl BufferRegistrySlot {
         self.capacity.store(capacity as u32, Ordering::Release);
         self.owner_channel.store(channel, Ordering::Release);
         self.len.store(0, Ordering::Release);
+        self.inplace.store(false, Ordering::Release);
+        self.processed.store(false, Ordering::Release);
+        self.holder.store(NO_MODULE, Ordering::Release);
     }
 
-    /// Try mailbox acquire write (STREAMING -> PRODUCER) — for channel's own buffer
-    fn try_mailbox_acquire_write(&self) -> bool {
+    #[inline]
+    fn cas(&self, from: u8, to: u8) -> bool {
         self.state
-            .compare_exchange(
-                STATE_STREAMING,
-                STATE_PRODUCER,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    /// Try in-place acquire (READY -> PRODUCER) — for aliased buffer chains.
-    /// The in-place module reads and modifies the same buffer without
-    /// going through CONSUMER -> STREAMING intermediate states.
-    fn try_inplace_acquire(&self) -> bool {
-        if self
-            .state
-            .compare_exchange(
-                STATE_READY,
-                STATE_PRODUCER,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.inplace_flag.store(1, Ordering::Release);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Release after writing (PRODUCER -> READY or READY_PROCESSED)
-    ///
-    /// If the current PRODUCER was acquired via in-place, releases to
-    /// READY_PROCESSED to prevent another in-place module from re-processing.
-    ///
-    /// Oversized writes (`data_len > capacity`) are rejected by returning
-    /// `false` and leaving the slot in `STATE_PRODUCER`; callers translate
-    /// to `EINVAL`. Sizing each write to fit the buffer is a caller
-    /// contract — silently truncating would drop the tail of the writer's
-    /// data and corrupt the consumer's view.
-    fn release_write(&self, data_len: u32) -> bool {
-        if self.state.load(Ordering::Acquire) != STATE_PRODUCER {
-            return false;
-        }
-        let cap = self.capacity.load(Ordering::Acquire);
-        if data_len > cap {
-            return false;
-        }
-        self.len.store(data_len, Ordering::Release);
-        let was_inplace = self.inplace_flag.swap(0, Ordering::AcqRel);
-        let next_state = if was_inplace != 0 {
-            STATE_READY_PROCESSED
-        } else {
-            STATE_READY
-        };
-        self.state.store(next_state, Ordering::Release);
-        true
-    }
-
-    /// Try mailbox acquire read (READY/READY_PROCESSED -> CONSUMER) — ignores channel ownership
-    fn try_mailbox_acquire_read(&self) -> bool {
-        // Accept both READY (from fresh write) and READY_PROCESSED (from in-place)
-        self.state
-            .compare_exchange(
-                STATE_READY,
-                STATE_CONSUMER,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-            || self
-                .state
-                .compare_exchange(
-                    STATE_READY_PROCESSED,
-                    STATE_CONSUMER,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-    }
-
-    /// Release after reading — return to STREAMING (mailbox) or FREE (pool)
-    fn release_read_to_streaming(&self) -> bool {
-        if self.state.load(Ordering::Acquire) != STATE_CONSUMER {
-            return false;
-        }
-        self.len.store(0, Ordering::Release);
-        self.state.store(STATE_STREAMING, Ordering::Release);
-        true
+    /// Whether the record is in `state` and lent to `caller` (the kernel,
+    /// `NO_MODULE`, may end any lend).
+    #[inline]
+    fn lent_to(&self, state: u8, caller: ModuleId) -> bool {
+        self.state() == state
+            && (caller == NO_MODULE || self.holder.load(Ordering::Acquire) == caller)
     }
 
     /// Clear the slot and mark it FREE. The state goes last, so a claimant
@@ -641,8 +531,9 @@ impl BufferRegistrySlot {
         self.owner_channel.store(-1, Ordering::Release);
         self.capacity.store(0, Ordering::Release);
         self.len.store(0, Ordering::Release);
-        self.inplace_flag.store(0, Ordering::Release);
-        self.producer_module.store(NO_MODULE, Ordering::Release);
+        self.inplace.store(false, Ordering::Release);
+        self.processed.store(false, Ordering::Release);
+        self.holder.store(NO_MODULE, Ordering::Release);
         // SAFETY: the slot's channel has detached it (`ChannelSlot::reset`
         // under the ring lock) or the whole graph is being torn down; nothing
         // reaches the slot through a channel any more.
@@ -690,36 +581,21 @@ fn valid_slot(slot: i32) -> bool {
 }
 
 // ============================================================================
-// Streaming Mode — FIFO channel buffers (arena-allocated)
+// Channel buffers (arena-allocated)
 // ============================================================================
 
-/// Allocate a streaming buffer from the dedicated buffer arena.
+/// Allocate a channel's buffer from the dedicated buffer arena, its record
+/// IDLE.
 ///
 /// `capacity` specifies the buffer size in bytes (e.g. 2048 for audio, 256 for events).
 /// Returns buffer slot index, or -1 if no slot or arena space available.
 pub fn alloc_streaming(channel: i16, capacity: usize) -> i32 {
-    alloc_streaming_for_module(channel, capacity, NO_MODULE)
-}
-
-/// Allocate a streaming buffer tagged with its producer module.
-pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module: ModuleId) -> i32 {
     for (i, slot) in BUFFER_REGISTRY.iter().enumerate() {
-        if slot
-            .state
-            .compare_exchange(
-                STATE_FREE,
-                STATE_STREAMING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
+        if slot.cas(STATE_FREE, STATE_IDLE) {
             let buf = alloc_buffer(capacity);
             match buf {
                 Some(ptr) => {
                     slot.assign(ptr, capacity, channel);
-                    slot.producer_module
-                        .store(producer_module, Ordering::Release);
                     return i as i32;
                 }
                 None => {
@@ -738,19 +614,19 @@ pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module
 
 /// Free a buffer slot and return its arena memory for reuse.
 ///
-/// A mailbox buffer may be in any state when its channel closes. One that is
-/// lent out — a writer in `PRODUCER` or a reader in `CONSUMER` holds its
-/// pointer — is not returned: the holder may still touch it, and memory
-/// handed to the next channel would take that write. It stays spent (counted
-/// as leaked) until the next `reset_buffer_arena`. Any other state means no
-/// pointer to it is outstanding.
+/// A mailbox record may be in any state when its channel closes. One that is
+/// lent out — WRITING or READING, its holder holding the pointer — is not
+/// returned: the holder may still touch it, and memory handed to the next
+/// channel would take that write. It stays spent (counted as leaked) until
+/// the next `reset_buffer_arena`. Any other state means no pointer to it is
+/// outstanding.
 pub fn free_streaming(slot: i32) {
     if !valid_slot(slot) {
         return;
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
-    // Take the slot out of every state a mailbox transition starts from, so
-    // the state judged below is the one it was freed in.
+    // Take the slot out of every state a transition starts from, so the
+    // state judged below is the one it was freed in.
     let mut prev_state = buf.state();
     loop {
         if prev_state == STATE_FREE || prev_state == STATE_CLOSING {
@@ -769,185 +645,240 @@ pub fn free_streaming(slot: i32) {
     let ptr = buf.data_ptr();
     let size = buf.capacity.load(Ordering::Acquire) as usize;
     buf.reset();
-    if matches!(prev_state, STATE_PRODUCER | STATE_CONSUMER) {
+    if matches!(prev_state, STATE_WRITING | STATE_READING) {
         abandon_buffer(size);
     } else {
         // SAFETY: the slot no longer names the buffer, its channel is
-        // closed, and no mailbox lend of it is outstanding.
+        // closed, and no lend of it is outstanding.
         unsafe { release_buffer(ptr, size) };
     }
 }
 
-/// Get raw data pointer for a streaming buffer.
-///
-/// Returns pointer to buffer data, or null if invalid/wrong state.
+/// The buffer behind a ring: its data, while the record is IDLE (a ring's
+/// buffer never leaves IDLE). Null for an invalid slot or a lent mailbox.
 pub fn get_streaming_ptr(slot: i32) -> *mut u8 {
     if !valid_slot(slot) {
         return core::ptr::null_mut();
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
-    let state = buf.state();
-    // Only allow access in STREAMING state (FIFO ring buffer).
-    // Mailbox mode uses dedicated acquire functions, not this path.
-    if state != STATE_STREAMING {
+    if buf.state() != STATE_IDLE {
         return core::ptr::null_mut();
     }
     buf.data_ptr()
 }
 
-/// Check if a slot is in streaming mode
+/// Whether the slot's record is IDLE.
 pub fn is_streaming(slot: i32) -> bool {
-    valid_slot(slot) && BUFFER_REGISTRY[slot as usize].state() == STATE_STREAMING
+    valid_slot(slot) && BUFFER_REGISTRY[slot as usize].state() == STATE_IDLE
 }
 
-/// Check if a mailbox buffer has data ready for reading (READY or READY_PROCESSED).
-/// Used by channel_poll to report POLL_IN for mailbox channels.
+/// Whether a mailbox holds a published record (READY).
 pub fn mailbox_has_data(slot: i32) -> bool {
-    valid_slot(slot)
-        && matches!(
-            BUFFER_REGISTRY[slot as usize].state(),
-            STATE_READY | STATE_READY_PROCESSED
-        )
+    valid_slot(slot) && BUFFER_REGISTRY[slot as usize].state() == STATE_READY
 }
 
-/// Check if a mailbox buffer is available for writing (STREAMING state).
-/// Used by channel_poll to report POLL_OUT for mailbox channels.
+/// Whether a mailbox takes a write now (IDLE).
 pub fn mailbox_can_write(slot: i32) -> bool {
-    valid_slot(slot) && BUFFER_REGISTRY[slot as usize].state() == STATE_STREAMING
+    valid_slot(slot) && BUFFER_REGISTRY[slot as usize].state() == STATE_IDLE
 }
 
-/// Force-reset a mailbox buffer back to STREAMING state.
-/// Used by IOCTL_FLUSH to unstick a mailbox buffer that's in READY/CONSUMER/PRODUCER.
-/// Returns true if the slot holds a buffer and was reset.
-pub fn mailbox_flush(slot: i32) -> bool {
+/// The READY record's length, while one is published.
+pub fn mailbox_ready_len(slot: i32) -> Option<u32> {
     if !valid_slot(slot) {
-        return false;
+        return None;
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
-    let mut cur = buf.state();
+    // Read the length, then confirm the record was READY before and after:
+    // `len` is stored before READY is (Release) and cleared after it is left.
+    if buf.state() != STATE_READY {
+        return None;
+    }
+    let len = buf.len.load(Ordering::Acquire);
+    (buf.state() == STATE_READY).then_some(len)
+}
+
+/// Drop a published record: READY → IDLE (`processed` cleared), IDLE stays.
+/// `EBUSY` while the record is lent (WRITING or READING): a flush never ends
+/// a lend. A slot with no buffer (FREE, CLOSING) answers 0.
+pub fn flush(slot: i32) -> i32 {
+    if !valid_slot(slot) {
+        return BUF_EINVAL;
+    }
+    let buf = &BUFFER_REGISTRY[slot as usize];
     loop {
-        // A slot with no buffer behind it stays as it is.
-        if cur == STATE_FREE || cur == STATE_CLOSING {
-            return false;
-        }
-        match buf.state.compare_exchange_weak(
-            cur,
-            STATE_STREAMING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(now) => cur = now,
+        match buf.state() {
+            STATE_READY => {
+                if buf.cas(STATE_READY, STATE_WRITING) {
+                    // Held exclusively for the instant it takes to clear it.
+                    buf.len.store(0, Ordering::Release);
+                    buf.processed.store(false, Ordering::Release);
+                    buf.state.store(STATE_IDLE, Ordering::Release);
+                    return BUF_OK;
+                }
+            }
+            STATE_WRITING | STATE_READING => return BUF_EBUSY,
+            _ => return BUF_OK,
         }
     }
+}
+
+// ============================================================================
+// Lends — a mailbox's record lent to its holder
+// ============================================================================
+
+/// Lend the record for writing (IDLE → WRITING) to `holder`: `(data, capacity)`,
+/// or `None` when it is not IDLE.
+pub fn acquire_write(slot: i32, holder: ModuleId) -> Option<(*mut u8, u32)> {
+    if !valid_slot(slot) {
+        return None;
+    }
+    let buf = &BUFFER_REGISTRY[slot as usize];
+    if !buf.cas(STATE_IDLE, STATE_WRITING) {
+        return None;
+    }
+    buf.holder.store(holder, Ordering::Release);
+    buf.inplace.store(false, Ordering::Release);
     buf.len.store(0, Ordering::Release);
-    buf.inplace_flag.store(0, Ordering::Release);
-    true
+    Some((buf.data_ptr(), buf.get_capacity()))
 }
 
-// ============================================================================
-// Zero-Copy Mailbox Mode — uses channel's own buffer
-// ============================================================================
-
-/// Acquire write access to a buffer slot's data (STREAMING → PRODUCER).
-///
-/// Returns (data_ptr, capacity) or (null, 0) if unavailable.
-pub fn mailbox_acquire_write(slot: i32) -> (*mut u8, u32) {
+/// Lend the READY record for rewriting in place (READY → WRITING) to
+/// `holder`, when no in-place writer has processed it: `(data, len)`.
+pub fn acquire_inplace(slot: i32, holder: ModuleId) -> Option<(*mut u8, u32)> {
     if !valid_slot(slot) {
-        return (core::ptr::null_mut(), 0);
+        return None;
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
-    if buf.try_mailbox_acquire_write() {
+    if buf.processed.load(Ordering::Acquire) || !buf.cas(STATE_READY, STATE_WRITING) {
+        return None;
+    }
+    // `processed` changes only while the record is WRITING or leaving READY
+    // for IDLE, both exclusive: read again now that this is exclusive.
+    if buf.processed.load(Ordering::Acquire) {
+        buf.state.store(STATE_READY, Ordering::Release);
+        return None;
+    }
+    buf.holder.store(holder, Ordering::Release);
+    buf.inplace.store(true, Ordering::Release);
+    Some((buf.data_ptr(), buf.len.load(Ordering::Acquire)))
+}
+
+/// The record `caller` holds for writing: `(data, capacity)`, or `EBUSY`
+/// when the record is not WRITING or is lent to someone else.
+pub fn writing(slot: i32, caller: ModuleId) -> Result<(*mut u8, u32), i32> {
+    if !valid_slot(slot) {
+        return Err(BUF_EINVAL);
+    }
+    let buf = &BUFFER_REGISTRY[slot as usize];
+    if !buf.lent_to(STATE_WRITING, caller) {
+        return Err(BUF_EBUSY);
+    }
+    Ok((buf.data_ptr(), buf.get_capacity()))
+}
+
+/// End a write lend `writing` confirmed: publish `len` bytes (WRITING →
+/// READY, `processed` set when the lend was in place), or with `drop`, end
+/// it without a record (WRITING → IDLE).
+pub fn finish_write(slot: i32, len: u32, drop: bool) {
+    if !valid_slot(slot) {
+        return;
+    }
+    let buf = &BUFFER_REGISTRY[slot as usize];
+    let inplace = buf.inplace.swap(false, Ordering::AcqRel);
+    buf.holder.store(NO_MODULE, Ordering::Release);
+    // A close that took the record meanwhile (WRITING → CLOSING) keeps it:
+    // the transition below is a CAS from WRITING, never a store.
+    if drop {
         buf.len.store(0, Ordering::Release);
-        (buf.data_ptr(), buf.get_capacity())
-    } else {
-        (core::ptr::null_mut(), 0)
+        buf.processed.store(false, Ordering::Release);
+        buf.cas(STATE_WRITING, STATE_IDLE);
+        return;
+    }
+    if inplace {
+        buf.processed.store(true, Ordering::Release);
+    }
+    buf.len.store(len, Ordering::Release);
+    // The record's bytes, its length and `processed` are visible before
+    // READY is: the reader's acquire CAS pairs with this one.
+    buf.cas(STATE_WRITING, STATE_READY);
+}
+
+/// Cancel `caller`'s write lend (WRITING → IDLE), publishing nothing.
+pub fn cancel_write(slot: i32, caller: ModuleId) -> i32 {
+    match writing(slot, caller) {
+        Ok(_) => {
+            finish_write(slot, 0, true);
+            BUF_OK
+        }
+        Err(e) => e,
     }
 }
 
-/// Release write on a buffer slot (PRODUCER → READY).
-pub fn mailbox_release_write(slot: i32, len: u32) -> i32 {
+/// Lend the READY record for reading (READY → READING) to `holder`:
+/// `(data, len)`, or `None` when none is published.
+pub fn acquire_read(slot: i32, holder: ModuleId) -> Option<(*const u8, u32)> {
     if !valid_slot(slot) {
-        return BUF_EINVAL;
-    }
-    if BUFFER_REGISTRY[slot as usize].release_write(len) {
-        BUF_OK
-    } else {
-        BUF_EBUSY
-    }
-}
-
-/// Acquire read access to a buffer slot (READY → CONSUMER).
-///
-/// Returns (data_ptr, data_len) or (null, 0) if no data ready.
-pub fn mailbox_acquire_read(slot: i32) -> (*const u8, u32) {
-    if !valid_slot(slot) {
-        return (core::ptr::null(), 0);
+        return None;
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
-    if buf.try_mailbox_acquire_read() {
-        let ptr = buf.data_ptr() as *const u8;
-        let len = buf.len.load(Ordering::Acquire);
-        (ptr, len)
-    } else {
-        (core::ptr::null(), 0)
+    if !buf.cas(STATE_READY, STATE_READING) {
+        return None;
     }
+    buf.holder.store(holder, Ordering::Release);
+    Some((buf.data_ptr() as *const u8, buf.len.load(Ordering::Acquire)))
 }
 
-/// Acquire in-place access to a buffer slot (READY → PRODUCER).
-///
-/// For aliased buffer chains: the in-place module gets a mutable pointer
-/// to the existing data. It reads, modifies in-place, then calls
-/// `mailbox_release_write` to transition back to READY.
-///
-/// Returns (data_ptr, data_len) or (null, 0) if buffer not in READY state.
-pub fn mailbox_acquire_inplace(slot: i32) -> (*mut u8, u32) {
-    if !valid_slot(slot) {
-        return (core::ptr::null_mut(), 0);
-    }
-    let buf = &BUFFER_REGISTRY[slot as usize];
-    if buf.try_inplace_acquire() {
-        let len = buf.len.load(Ordering::Acquire);
-        (buf.data_ptr(), len)
-    } else {
-        (core::ptr::null_mut(), 0)
-    }
-}
-
-/// Release read on a buffer slot (CONSUMER → STREAMING).
-pub fn mailbox_release_read(slot: i32) -> i32 {
-    if !valid_slot(slot) {
-        return BUF_EINVAL;
-    }
-    if BUFFER_REGISTRY[slot as usize].release_read_to_streaming() {
-        BUF_OK
-    } else {
-        BUF_EBUSY
-    }
-}
-
-/// Cancel a mailbox read without consuming data (CONSUMER → READY).
-///
-/// Used when channel_read discovers the caller's buffer is too small.
-/// The payload stays intact for a subsequent read with a larger buffer.
-pub fn mailbox_cancel_read(slot: i32) -> i32 {
+/// End `caller`'s read lend, consuming the record (READING → IDLE,
+/// `processed` cleared).
+pub fn release_read(slot: i32, caller: ModuleId) -> i32 {
     if !valid_slot(slot) {
         return BUF_EINVAL;
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
-    if buf
-        .state
-        .compare_exchange(
-            STATE_CONSUMER,
-            STATE_READY,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
-    {
-        BUF_OK
-    } else {
-        BUF_EBUSY
+    if !buf.lent_to(STATE_READING, caller) {
+        return BUF_EBUSY;
+    }
+    buf.holder.store(NO_MODULE, Ordering::Release);
+    buf.len.store(0, Ordering::Release);
+    buf.processed.store(false, Ordering::Release);
+    buf.cas(STATE_READING, STATE_IDLE);
+    BUF_OK
+}
+
+/// End `caller`'s read lend without consuming the record (READING → READY,
+/// `processed` untouched): the record is as it was before the acquire.
+pub fn cancel_read(slot: i32, caller: ModuleId) -> i32 {
+    if !valid_slot(slot) {
+        return BUF_EINVAL;
+    }
+    let buf = &BUFFER_REGISTRY[slot as usize];
+    if !buf.lent_to(STATE_READING, caller) {
+        return BUF_EBUSY;
+    }
+    buf.holder.store(NO_MODULE, Ordering::Release);
+    buf.cas(STATE_READING, STATE_READY);
+    BUF_OK
+}
+
+/// End every lend `module` holds, as its retirement does: a write lend is
+/// cancelled (nothing published), a read lend returned unconsumed.
+pub fn release_lends_of(module: ModuleId) {
+    if module == NO_MODULE {
+        return;
+    }
+    for (i, buf) in BUFFER_REGISTRY.iter().enumerate() {
+        if buf.holder.load(Ordering::Acquire) != module {
+            continue;
+        }
+        match buf.state() {
+            STATE_WRITING => {
+                cancel_write(i as i32, module);
+            }
+            STATE_READING => {
+                cancel_read(i as i32, module);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -963,11 +894,11 @@ pub fn get_capacity(slot: i32) -> u32 {
     BUFFER_REGISTRY[slot as usize].get_capacity()
 }
 
-/// Check if a channel has a ready buffer (includes in-place processed buffers)
+/// Whether a channel's record is published (READY).
 pub fn has_ready(channel: i16) -> bool {
     BUFFER_REGISTRY
         .iter()
-        .any(|s| s.owner() == channel && matches!(s.state(), STATE_READY | STATE_READY_PROCESSED))
+        .any(|s| s.owner() == channel && s.state() == STATE_READY)
 }
 
 /// Check if registry has any free slots
@@ -976,24 +907,21 @@ pub fn has_free() -> bool {
 }
 
 /// Snapshot of buffer-pool slot occupancy. Counters are `usize` so a
-/// fully-occupied 256-slot pool fits without overflow; the `capacity`
-/// field equals `MAX_BUFFER_SLOTS` and lets callers sanity-check the
-/// sum.
+/// fully-occupied pool fits without overflow; the `capacity` field is the
+/// registry's live slot count and lets callers sanity-check the sum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferPoolStats {
     /// Slots in `STATE_FREE` — available for `alloc_streaming`.
     pub free: usize,
-    /// Slots in `STATE_PRODUCER` — mailbox writer holds an exclusive
-    /// acquire.
-    pub producer: usize,
-    /// Slots in `STATE_READY` or `STATE_READY_PROCESSED` — data is
-    /// queued for the consumer.
+    /// Records WRITING — lent to their writer.
+    pub writing: usize,
+    /// Records READY — published, waiting for their reader.
     pub ready: usize,
-    /// Slots in `STATE_CONSUMER` — mailbox reader holds the slot.
-    pub consumer: usize,
-    /// Slots in `STATE_STREAMING` — FIFO-style pipe channel buffers.
-    pub streaming: usize,
-    /// Total slots in the registry (== `MAX_BUFFER_SLOTS`).
+    /// Records READING — lent to their reader.
+    pub reading: usize,
+    /// Records IDLE — ring buffers and empty mailboxes.
+    pub idle: usize,
+    /// Total slots in the registry.
     pub capacity: usize,
 }
 
@@ -1001,20 +929,20 @@ pub struct BufferPoolStats {
 pub fn stats() -> BufferPoolStats {
     let mut s = BufferPoolStats {
         free: 0,
-        producer: 0,
+        writing: 0,
         ready: 0,
-        consumer: 0,
-        streaming: 0,
+        reading: 0,
+        idle: 0,
         capacity: BUFFER_REGISTRY.len(),
     };
 
     for slot in BUFFER_REGISTRY.iter() {
         match slot.state() {
             STATE_FREE => s.free += 1,
-            STATE_PRODUCER => s.producer += 1,
-            STATE_READY | STATE_READY_PROCESSED => s.ready += 1,
-            STATE_CONSUMER => s.consumer += 1,
-            STATE_STREAMING => s.streaming += 1,
+            STATE_WRITING => s.writing += 1,
+            STATE_READY => s.ready += 1,
+            STATE_READING => s.reading += 1,
+            STATE_IDLE => s.idle += 1,
             _ => {}
         }
     }

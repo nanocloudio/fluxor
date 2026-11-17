@@ -247,7 +247,6 @@ pub fn csr_finish(info: &[u8], sig: &[u8; 64], out: &mut [u8]) -> Option<usize> 
 /// held, `Some(false)` when the vault is busy (asked again next step),
 /// `None` when it refused.
 unsafe fn identity_build_csr(s: &mut TlsState) -> Option<bool> {
-    let sys = &*s.syscalls;
     let mut info = [0u8; ID_CSR_MAX];
     let n = (s.label_id.subject_len as usize).min(IDENTITY_SUBJECT_MAX);
     let mut subject = [0u8; IDENTITY_SUBJECT_MAX];
@@ -255,22 +254,13 @@ unsafe fn identity_build_csr(s: &mut TlsState) -> Option<bool> {
     let point = s.label_id.point;
     let info_len = csr_info(&point, &subject[..n], &mut info)?;
     let digest = sha256(&info[..info_len]);
-    // SIGN: [mode:u8][_pad][input_len:u32][input][sig_ptr:u64][sig_cap:u16]
-    // [sig_len_out:u16]; DIGEST, because this IS the digest.
-    const SIGN_MODE_DIGEST: u8 = 1;
+    // DIGEST, because this IS the digest; resumable, so the identical call
+    // is made again next step while the vault's job runs.
     let mut sig = [0u8; 64];
-    let mut arg = [0u8; 6 + 32 + 12];
-    arg[0] = SIGN_MODE_DIGEST;
-    arg[2..6].copy_from_slice(&32u32.to_le_bytes());
-    arg[6..38].copy_from_slice(&digest);
-    arg[38..46].copy_from_slice(&(sig.as_mut_ptr() as u64).to_le_bytes());
-    arg[46..48].copy_from_slice(&64u16.to_le_bytes());
-    let rc = (sys.provider_call)(s.key_vault_handle, kv::SIGN, arg.as_mut_ptr(), arg.len());
-    if rc == abi::errno::EAGAIN || rc == abi::errno::EBUSY {
-        return Some(false);
-    }
-    if rc != 0 || u16::from_le_bytes([arg[48], arg[49]]) != 64 {
-        return None;
+    match vault_sign_digest(s, &digest, &mut sig) {
+        VaultSign::Done(64) => {}
+        VaultSign::Pending => return Some(false),
+        _ => return None,
     }
     let mut csr = [0u8; ID_CSR_MAX];
     let len = csr_finish(&info[..info_len], &sig, &mut csr)?;
@@ -342,28 +332,41 @@ unsafe fn identity_open(s: &mut TlsState, now: u64) -> bool {
     const USAGE: u32 = kv::usage::SIGN | kv::usage::EXPORT_PUBLIC | kv::usage::PERSIST;
     let n = (s.label_id.label_len as usize).min(IDENTITY_LABEL_MAX);
     let mut point = [0u8; ID_POINT_LEN];
-    let mut arg = [0u8; 8 + IDENTITY_LABEL_MAX + 12];
-    arg[0..2].copy_from_slice(&kv::suite::P256.to_le_bytes());
-    arg[2..6].copy_from_slice(&USAGE.to_le_bytes());
-    arg[7] = n as u8;
-    let a = arg.as_mut_ptr();
-    core::ptr::copy_nonoverlapping(s.label_id.label.as_ptr(), a.add(8), n);
-    let tail = 8 + n;
-    let pub_ptr = (point.as_mut_ptr() as u64).to_le_bytes();
-    core::ptr::copy_nonoverlapping(pub_ptr.as_ptr(), a.add(tail), 8);
-    let cap = (ID_POINT_LEN as u16).to_le_bytes();
-    core::ptr::copy_nonoverlapping(cap.as_ptr(), a.add(tail + 8), 2);
-    let rc = (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, a, tail + 12);
+    let mut arg = [0u8; kv::open::HEADER + IDENTITY_LABEL_MAX];
+    let req = kv::open::Request {
+        suite: kv::suite::P256,
+        usage: USAGE,
+        flags: 0,
+        label: &s.label_id.label[..n],
+    };
+    let Some(alen) = kv::open::encode(&mut arg, &req) else {
+        return false;
+    };
+    let rc = (sys.provider_call)(
+        -1,
+        kv::OPEN_OR_GENERATE,
+        arg.as_mut_ptr(),
+        alen,
+        point.as_mut_ptr(),
+        point.len(),
+    );
     if rc == abi::errno::EAGAIN {
         s.label_id.next_at = now + ID_OPEN_RETRY_MS;
         return false;
     }
-    let got = u16::from_le_bytes([*a.add(tail + 10), *a.add(tail + 11)]) as usize;
+    let got = kv::open::len(&arg).unwrap_or(0);
     if rc >= 0 && (got != ID_POINT_LEN || point[0] != 0x04) {
         // A key opened under the label that is not an uncompressed P-256
         // point is no use here; its slot is freed (the persisted key stays)
         // before the open is retried.
-        (sys.provider_call)(rc, kv::DESTROY, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            rc,
+            kv::DESTROY,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     if rc < 0 || got != ID_POINT_LEN || point[0] != 0x04 {
         // A refusal (another suite under the label, a vault without room) is
@@ -623,10 +626,6 @@ unsafe fn identity_admit(s: &mut TlsState) -> Option<&'static [u8]> {
     {
         return Some(b"[tls] refusing to construct: identity_label names the identity; cert_file / key_file would name a second one");
     }
-    let sys = &*s.syscalls;
-    if (sys.provider_call)(-1, kv::PROBE, core::ptr::null_mut(), 0) != 1 {
-        return Some(b"[tls] refusing to construct: identity_label needs a key vault, and this target has none");
-    }
     if s.identity_cert_in < 0 || s.identity_req_out < 0 {
         return Some(b"[tls] refusing to construct: identity_label needs identity_req and identity_cert wired to an issuer");
     }
@@ -791,7 +790,7 @@ unsafe fn creds_install(
                 b"is not a P-256, P-384 or RSA-2048/3072/4096 private key",
             ));
         }
-        if rsa.is_some() && (sys.provider_call)(-1, kv::PROBE, core::ptr::null_mut(), 0) != 1 {
+        if rsa.is_some_and(|suite| !vault_holds_suite(sys, suite)) {
             return Err((
                 CRED_KEY,
                 b"is an RSA key, and this target's vault does not hold RSA",
@@ -828,7 +827,14 @@ unsafe fn creds_install(
         }
         let deposited = identity_key_deposit(s);
         if old >= 0 {
-            (sys.provider_call)(old, kv::DESTROY, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                old,
+                kv::DESTROY,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         if !deposited {
             // Validated above against the vault's presence; a vault that
@@ -880,4 +886,20 @@ unsafe fn creds_install(
         s.label_id.adopted_generation = s.label_id.adopted_generation.wrapping_add(1);
     }
     Ok(())
+}
+
+/// Whether the key vault describes `suite`: the suite it imports and signs.
+unsafe fn vault_holds_suite(sys: &SyscallTable, suite: u16) -> bool {
+    let mut arg = kv::describe_suite::encode_cursor(suite);
+    let rc = (sys.provider_call)(
+        -1,
+        kv::DESCRIBE_SUITE,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    rc >= 0
+        && kv::describe_suite::parse(&arg)
+            .is_some_and(|r| r.suite == suite && r.flags & kv::describe_suite::flags::IMPORT != 0)
 }

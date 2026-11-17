@@ -360,7 +360,10 @@ fn write_ppm(path: &str, width: usize, height: usize, rgb565: &[u8]) -> std::io:
     Ok(())
 }
 
-fn linux_display_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn linux_display_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxDisplayState` by the loader.
     let st = unsafe { instance_state::<LinuxDisplayState>(state) };
 

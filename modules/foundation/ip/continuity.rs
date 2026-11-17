@@ -48,14 +48,21 @@
 //! [delivered_bytes u32][consumed_bytes u32]
 //! [trace_id 16][span_id 8][sampled_flags u8]
 //! [reorder_count u8] then per slot: [seq u32][len u16][bytes]
+//! [send_len u32][send bytes: SND.UNA onwards]
 //! ```
 //!
-//! Unacknowledged send bytes are not in the record: this module never
-//! holds them. The consumer above (`tls`, or the application) retains the
-//! exact bytes it handed down and replays them on `MSG_RETRANSMIT`, and
-//! its own checkpoint carries them. What the record fixes is the sequence
-//! allocation those bytes occupy, so a takeover retransmits the same
-//! ranges and never allocates a number twice.
+//! The send bytes are what this module keeps of a connection whose
+//! consumer keeps no copy (one not granted `RETX`): every byte from
+//! `SND.UNA` the peer has not acknowledged, at most `REC_SEND_MAX`, so the
+//! standby retransmits them byte for byte. A cut with more in flight is
+//! refused `NOT_READY` until acknowledgements bring it under. A connection
+//! granted `RETX` carries none: its consumer (`tls`) retains the exact bytes
+//! it handed down, replays them on `MSG_RETX_REQUEST`, and its own
+//! checkpoint carries them; a standby whose consumer retains refuses a
+//! record that carries any. Either way the record fixes the sequence
+//! allocation the bytes occupy, so a takeover retransmits the same ranges
+//! and never allocates a number twice. A send delta carries the segment's
+//! bytes in the same case (`DELTA_TCP_SEND` `[seq][len][fin][bytes?]`).
 //!
 //! The layout digest a pair agrees on at `PAIR_PREPARE` is the SHA-256 of
 //! `TCP_CODEC_LAYOUT`; a standby built from a different layout refuses
@@ -132,9 +139,23 @@ const REC_FIXED_LEN: usize = 4
     + 8
     + 1
     + 1;
-/// Largest record: the fixed part plus every reorder slot full.
-pub const TCP_RECORD_MAX: usize =
-    REC_FIXED_LEN + tcp::REORDER_SLOTS * (4 + 2 + tcp::REORDER_SLOT_BYTES) + REC_V6_TAIL;
+/// The most send bytes a record carries: one default send buffer on an
+/// MCU-class target, 16 KiB where buffers are larger (a cut waits for
+/// acknowledgements to bring what is in flight under it).
+#[cfg(target_arch = "aarch64")]
+pub const REC_SEND_MAX: usize = 16 * 1024;
+#[cfg(not(target_arch = "aarch64"))]
+pub const REC_SEND_MAX: usize = send_pool::BLOCK_DEFAULT as usize;
+/// Largest record: the fixed part plus every reorder slot full, then the
+/// send bytes.
+pub const TCP_RECORD_MAX: usize = REC_FIXED_LEN
+    + tcp::REORDER_SLOTS * (4 + 2 + tcp::REORDER_SLOT_BYTES)
+    + 4
+    + REC_SEND_MAX
+    + REC_V6_TAIL;
+/// A send delta: `[seq u32][len u16][fin u8]`, then the segment's bytes
+/// when this module keeps them.
+const SEND_DELTA_HEAD: usize = 7;
 
 // A strict pair's provider holds the out-of-order segments this module's
 // reorder slots keep (`session_ctrl`'s strict bounds): the record a slot
@@ -143,7 +164,7 @@ const _: () = assert!(tcp::REORDER_SLOTS <= tcr::TS_OOO_MAX);
 const _: () = assert!(tcp::REORDER_SLOT_BYTES <= tcr::TS_OOO_SEG);
 
 /// What `PAIR_PREPARE` binds: the layout of the record above.
-const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6:timers";
+const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6:timers:send";
 
 /// TIME-WAIT length in timer ticks, as the sweep enforces it.
 const TIMEWAIT_TICKS: u16 = 41;
@@ -280,6 +301,7 @@ impl TcpShadow {
         self.import = HandoffImport::new();
         self.conn.state = tcp::TcpState::Closed;
         self.conn.local_slot = tcp::LOCAL_SLOT_ANY;
+        self.conn.sbuf = tcp::SBUF_NONE;
         self.activated = activated;
     }
 
@@ -993,11 +1015,28 @@ pub(super) unsafe fn encode_record(
         i += 1;
     }
     out[count_pos] = n;
+    // The send bytes from SND.UNA (`unacked_kept` checked they fit).
+    let len_pos = p;
+    put(out, &mut p, &[0u8; 4]);
+    let kept = sb_read(&s.send_pool, c, c.snd_una, &mut out[p..p + REC_SEND_MAX]);
+    out[len_pos..len_pos + 4].copy_from_slice(&(kept as u32).to_le_bytes());
+    p += kept;
     if let Some((l6, r6)) = v6 {
         put(out, &mut p, &l6);
         put(out, &mut p, &r6);
     }
     p
+}
+
+/// The send bytes from `SND.UNA` this module keeps for connection `idx` (0
+/// for one granted `RETX`, whose consumer keeps them).
+unsafe fn unacked_kept(s: &IpState, idx: usize) -> u32 {
+    let c = &*s.tcp_conns.ptr(idx);
+    if c.sbuf == tcp::SBUF_NONE || tcp::seq_lt(c.snd_una, c.sbuf_seq) {
+        return 0;
+    }
+    c.sbuf_len
+        .saturating_sub(c.snd_una.wrapping_sub(c.sbuf_seq))
 }
 
 /// Decode a record into a connection, or the status refusing it.
@@ -1169,7 +1208,33 @@ unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) ->
         p += len;
         i += 1;
     }
+    if p + 4 > rec.len() {
+        return Err(sc::STATUS_CORRUPT);
+    }
+    let send_len = rd_u32(rec, p) as usize;
+    p += 4;
+    // Kept bytes sit between SND.UNA and SND.NXT, whole, and only where
+    // this side's consumer does not keep them itself.
+    conn.flags = if s.node_retx { net_flag::RETX } else { 0 };
+    let flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+    if send_len > REC_SEND_MAX
+        || send_len > flight
+        || p + send_len != rec.len()
+        || (send_len != 0 && conn.flags & net_flag::RETX != 0)
+    {
+        return Err(sc::STATUS_CORRUPT);
+    }
+    if send_len != 0 {
+        let sys = &*s.syscalls;
+        if send_len as u32 > s.send_pool.grant() || !sb_hold(&mut s.send_pool, sys, conn) {
+            return Err(sc::STATUS_NO_CAPACITY);
+        }
+        conn.sbuf_seq = conn.snd_una;
+        sb_append(&mut s.send_pool, conn, &rec[p..p + send_len]);
+        p += send_len;
+    }
     if p != rec.len() {
+        sb_release(&mut s.send_pool, conn);
         return Err(sc::STATUS_CORRUPT);
     }
     // Timers are stored as remaining durations until activation converts
@@ -1252,6 +1317,11 @@ fn convert_timers(s: &IpState, conn: &mut tcp::TcpConn, age_ticks: u16) -> u8 {
 /// Emit one delta for mirror `mi`. `false` when the channel refused it;
 /// nothing is consumed then.
 unsafe fn emit_delta(s: &mut IpState, mi: usize, kind: u8, body: &[u8]) -> bool {
+    emit_delta_parts(s, mi, kind, body, &[])
+}
+
+/// `emit_delta` of a body in two parts, `head` then `tail`, built in place.
+unsafe fn emit_delta_parts(s: &mut IpState, mi: usize, kind: u8, head: &[u8], tail: &[u8]) -> bool {
     let (flow, epoch, gen, next_no, prev) = {
         let m = &s.cont.mirrors[mi];
         (
@@ -1262,7 +1332,7 @@ unsafe fn emit_delta(s: &mut IpState, mi: usize, kind: u8, body: &[u8]) -> bool 
             m.prev_digest,
         )
     };
-    let mut buf = [0u8; sc::DELTA_APPLY_HEADER_LEN + 64];
+    let mut buf = [0u8; sc::DELTA_APPLY_HEADER_LEN + SEND_DELTA_HEAD + tcp::MSS as usize];
     let mut p = 0usize;
     put(&mut buf, &mut p, &flow);
     put(&mut buf, &mut p, &epoch.to_le_bytes());
@@ -1270,7 +1340,8 @@ unsafe fn emit_delta(s: &mut IpState, mi: usize, kind: u8, body: &[u8]) -> bool 
     put(&mut buf, &mut p, &next_no.to_le_bytes());
     put(&mut buf, &mut p, &prev);
     put(&mut buf, &mut p, &[kind]);
-    put(&mut buf, &mut p, body);
+    put(&mut buf, &mut p, head);
+    put(&mut buf, &mut p, tail);
     if !emit_frame(s, sc::CMD_SC_DELTA_APPLY, &buf[..p]) {
         return false;
     }
@@ -1382,7 +1453,13 @@ unsafe fn flush_recv_delta(s: &mut IpState, mi: usize) {
 /// May `len` bytes at `seq` be handed to the wire on `idx` now? Under a
 /// live strict mirror the send delta goes first and the segment waits
 /// for its acknowledgement; the caller retries next step.
-pub(super) unsafe fn send_gate(s: &mut IpState, idx: usize, seq: u32, len: u16) -> bool {
+pub(super) unsafe fn send_gate(
+    s: &mut IpState,
+    idx: usize,
+    seq: u32,
+    len: u16,
+    bytes: &[u8],
+) -> bool {
     let Some(mi) = mirror_of_conn(s, idx) else {
         return true;
     };
@@ -1399,11 +1476,13 @@ pub(super) unsafe fn send_gate(s: &mut IpState, idx: usize, seq: u32, len: u16) 
             return false;
         }
     }
-    let mut body = [0u8; 7];
-    body[..4].copy_from_slice(&seq.to_le_bytes());
-    body[4..6].copy_from_slice(&len.to_le_bytes());
-    body[6] = 0;
-    if !emit_delta(s, mi, sc::DELTA_TCP_SEND, &body) {
+    if !emit_delta_parts(
+        s,
+        mi,
+        sc::DELTA_TCP_SEND,
+        &send_delta(seq, len, false),
+        bytes,
+    ) {
         return false;
     }
     let m = &mut s.cont.mirrors[mi];
@@ -1416,9 +1495,26 @@ pub(super) unsafe fn send_gate(s: &mut IpState, idx: usize, seq: u32, len: u16) 
     false
 }
 
+/// A send delta's head, `[seq][len][fin]`; the segment's bytes follow it
+/// when this module keeps them.
+fn send_delta(seq: u32, len: u16, fin: bool) -> [u8; SEND_DELTA_HEAD] {
+    let mut out = [0u8; SEND_DELTA_HEAD];
+    out[..4].copy_from_slice(&seq.to_le_bytes());
+    out[4..6].copy_from_slice(&len.to_le_bytes());
+    out[6] = fin as u8;
+    out
+}
+
 /// Bytes at `seq` were handed to the wire on `idx`. Clears a strict gate;
 /// under the planned profile this is where the send delta is emitted.
-pub(super) unsafe fn on_sent(s: &mut IpState, idx: usize, seq: u32, len: u16, fin: bool) {
+pub(super) unsafe fn on_sent(
+    s: &mut IpState,
+    idx: usize,
+    seq: u32,
+    len: u16,
+    fin: bool,
+    bytes: &[u8],
+) {
     let Some(mi) = mirror_of_conn(s, idx) else {
         return;
     };
@@ -1441,11 +1537,7 @@ pub(super) unsafe fn on_sent(s: &mut IpState, idx: usize, seq: u32, len: u16, fi
         }
         return;
     }
-    let mut body = [0u8; 7];
-    body[..4].copy_from_slice(&seq.to_le_bytes());
-    body[4..6].copy_from_slice(&len.to_le_bytes());
-    body[6] = fin as u8;
-    if !emit_delta(s, mi, sc::DELTA_TCP_SEND, &body) {
+    if !emit_delta_parts(s, mi, sc::DELTA_TCP_SEND, &send_delta(seq, len, fin), bytes) {
         let m = &mut s.cont.mirrors[mi];
         m.deltas_dropped = m.deltas_dropped.wrapping_add(1);
         s.cont.stats.deltas_dropped = s.cont.stats.deltas_dropped.wrapping_add(1);
@@ -2003,6 +2095,7 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
         return;
     };
     (*s.tcp_conns.ptr_mut(idx)).pending_close_notify = NOTIFY_SHADOW_RESERVED;
+    sb_release(&mut s.send_pool, &mut s.cont.shadows[si].conn);
     s.cont.shadows[si].clear();
     let sh = &mut s.cont.shadows[si];
     sh.in_use = 1;
@@ -2044,6 +2137,7 @@ fn mirror_for(s: &IpState, flow: &[u8; 16], epoch: u32) -> Result<usize, u8> {
 }
 
 unsafe fn discard_shadow(s: &mut IpState, si: usize) {
+    sb_release(&mut s.send_pool, &mut s.cont.shadows[si].conn);
     let idx = s.cont.shadows[si].conn_idx;
     if (idx as usize) < s.tcp_conns.len() {
         let c = &mut *s.tcp_conns.ptr_mut(idx as usize);
@@ -2357,6 +2451,7 @@ unsafe fn cmd_checkpoint_commit(s: &mut IpState, flow: &[u8; 16], epoch: u32, p:
                 conn.local_slot,
             );
             if live.is_some() {
+                sb_release(&mut s.send_pool, &mut conn);
                 reply(
                     s,
                     flow,
@@ -2368,6 +2463,7 @@ unsafe fn cmd_checkpoint_commit(s: &mut IpState, flow: &[u8; 16], epoch: u32, p:
                 discard_shadow_to_prepared(s, si);
                 return;
             }
+            sb_release(&mut s.send_pool, &mut s.cont.shadows[si].conn);
             let sh = &mut s.cont.shadows[si];
             sh.conn = conn;
             sh.phase = SH_COMMITTED;
@@ -2475,8 +2571,9 @@ unsafe fn cmd_delta_apply(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]
         return;
     }
     let applied = {
+        let sys = &*s.syscalls;
         let sh = &mut s.cont.shadows[si];
-        apply_delta(&mut sh.conn, kind, body)
+        apply_delta(&mut s.send_pool, sys, &mut sh.conn, kind, body)
     };
     if !applied {
         reply(
@@ -2496,13 +2593,29 @@ unsafe fn cmd_delta_apply(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]
     reply(s, flow, epoch, sc::CR_DELTA_APPLIED, sc::STATUS_OK, &ack);
 }
 
-fn apply_delta(c: &mut tcp::TcpConn, kind: u8, body: &[u8]) -> bool {
+unsafe fn apply_delta(
+    pool: &mut send_pool::SendPool,
+    sys: &SyscallTable,
+    c: &mut tcp::TcpConn,
+    kind: u8,
+    body: &[u8],
+) -> bool {
     match kind {
-        sc::DELTA_TCP_SEND if body.len() >= 7 => {
+        sc::DELTA_TCP_SEND if body.len() >= SEND_DELTA_HEAD => {
             let seq = rd_u32(body, 0);
             let len = u32::from(rd_u16(body, 4));
             let fin = body[6] != 0;
             if seq != c.snd_nxt {
+                return false;
+            }
+            // The segment's bytes, kept where this side keeps them.
+            let bytes = &body[SEND_DELTA_HEAD..];
+            if !bytes.is_empty()
+                && (bytes.len() as u32 != len
+                    || c.flags & net_flag::RETX != 0
+                    || !sb_hold(pool, sys, c)
+                    || sb_append(pool, c, bytes) != bytes.len())
+            {
                 return false;
             }
             c.snd_nxt = seq.wrapping_add(len).wrapping_add(fin as u32);
@@ -2547,6 +2660,7 @@ fn apply_delta(c: &mut tcp::TcpConn, kind: u8, body: &[u8]) -> bool {
             c.snd_wnd = rd_u16(body, 4);
             c.cwnd = rd_u16(body, 6);
             c.ssthresh = rd_u16(body, 8);
+            sb_trim(pool, c);
             true
         }
         sc::DELTA_TCP_TIMERS if body.len() >= TIMERS_DELTA_LEN => {
@@ -2692,9 +2806,17 @@ unsafe fn cmd_cut_export(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
         reply(s, flow, epoch, sc::CR_CUT, sc::STATUS_NOT_READY, &[0; 4]);
         return;
     }
-    let mut buf = [0u8; TCP_RECORD_MAX];
-    let len = encode_record(s, idx, &mut buf);
-    let digest = sha256(&buf[..len]);
+    if unacked_kept(s, idx) as usize > REC_SEND_MAX {
+        // More in flight than a record carries: asked again once the peer
+        // has acknowledged enough of it.
+        reply(s, flow, epoch, sc::CR_CUT, sc::STATUS_NOT_READY, &[0; 4]);
+        return;
+    }
+    // Encoded straight into the mirror's export buffer: a record is too
+    // large for the stack.
+    let out: *mut [u8; TCP_RECORD_MAX] = &raw mut s.cont.mirrors[mi].export_buf;
+    let len = encode_record(s, idx, &mut *out);
+    let digest = sha256(&s.cont.mirrors[mi].export_buf[..len]);
     let m = &mut s.cont.mirrors[mi];
     m.ckpt_gen = m.ckpt_gen.wrapping_add(1);
     m.delta_no = 0;
@@ -2703,7 +2825,6 @@ unsafe fn cmd_cut_export(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
     m.gate_kind = GATE_NONE;
     m.recv_ring_len = 0;
     m.recv_pending = 0;
-    m.export_buf[..len].copy_from_slice(&buf[..len]);
     m.export_len = len as u32;
     m.export_off = 0;
     m.export_digest = digest;
@@ -2948,6 +3069,8 @@ unsafe fn cmd_activate(s: &mut IpState, flow: &[u8; 16], epoch_new: u32, p: &[u8
     // quiesce; this side's consumer decides the window from here.
     update_rcv_wnd(s, idx);
     let iss = (*s.tcp_conns.ptr(idx)).iss;
+    // The send block moved with the connection.
+    s.cont.shadows[si].conn.sbuf = tcp::SBUF_NONE;
     s.cont.shadows[si].clear();
     s.cont.shadows[si].activated = Activation {
         live: 1,

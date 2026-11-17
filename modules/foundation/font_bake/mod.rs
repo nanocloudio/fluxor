@@ -181,19 +181,36 @@ fn step_read(s: &mut State) {
         }
         let mut p = [0u8; MAX_PATH + 1];
         p[..s.input_len].copy_from_slice(&s.input[..s.input_len]);
-        let fd = unsafe { (sys.provider_call)(-1, fs::OPEN, p.as_mut_ptr(), s.input_len) };
+        let fd = unsafe {
+            (sys.provider_call)(
+                -1,
+                fs::OPEN,
+                p.as_mut_ptr(),
+                s.input_len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if fd < 0 {
             error(s, b"cannot open the font");
             s.phase = PH_WRITE;
             return;
         }
         s.fd = fd;
-        let mut st = [0u8; 16];
-        let r = unsafe { (sys.provider_call)(fd, fs::STAT, st.as_mut_ptr(), 16) };
-        let size = if r >= 16 {
-            u64::from_le_bytes([st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]]) as usize
-        } else {
-            0
+        let mut st = [0u8; fs::stat::LEN];
+        let r = unsafe {
+            (sys.provider_call)(
+                fd,
+                fs::STAT,
+                st.as_mut_ptr(),
+                st.len(),
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        let size = match fs::Stat::decode(&st) {
+            Some(st) if r == 0 => st.size as usize,
+            _ => 0,
         };
         s.font_cap = size.max(READ_CHUNK) + READ_CHUNK;
         s.font = unsafe { (sys.heap_alloc)(s.font_cap as u32) };
@@ -214,7 +231,16 @@ fn step_read(s: &mut State) {
         s.font = p;
         s.font_cap = cap;
     }
-    let r = unsafe { (sys.provider_call)(s.fd, fs::READ, s.font.add(s.font_len), READ_CHUNK) };
+    let r = unsafe {
+        (sys.provider_call)(
+            s.fd,
+            fs::READ,
+            s.font.add(s.font_len),
+            READ_CHUNK,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
     if r > 0 {
         s.font_len += r as usize;
         return;
@@ -224,7 +250,16 @@ fn step_read(s: &mut State) {
         s.phase = PH_WRITE;
     }
     if r == 0 {
-        unsafe { (sys.provider_call)(s.fd, fs::CLOSE, ptr::null_mut(), 0) };
+        unsafe {
+            (sys.provider_call)(
+                s.fd,
+                fs::CLOSE,
+                ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         s.fd = -1;
         s.phase = PH_BAKE;
     }

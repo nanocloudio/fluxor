@@ -1,7 +1,6 @@
 name = "vault_probe"
 version = "1.0.0"
 hardware_targets = ["bcm2712", "linux"]
-grants = ["key_vault"]
 
 # Does a node keep its keys? Opens one persistent Ed25519 key by label
 # (OPEN_OR_GENERATE, SIGN|EXPORT_PUBLIC|PERSIST) the way a node's CA is
@@ -18,6 +17,10 @@ grants = ["key_vault"]
 # device key).
 #
 # Params: 1 label (str, default "fluxor/vault_probe").
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
 
 [observability]
 exempt = "self-contained fixture; its key/FAIL log lines are the verdict"

@@ -13,7 +13,14 @@ use super::Cyw43State;
 unsafe fn get_millis(s: &Cyw43State) -> u64 {
     let sys = &*s.syscalls;
     let mut buf = [0u8; 8];
-    (sys.provider_call)(-1, dev_timer::MILLIS, buf.as_mut_ptr(), 8);
+    (sys.provider_call)(
+        -1,
+        dev_timer::MILLIS,
+        buf.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     u64::from_le_bytes(buf)
 }
 

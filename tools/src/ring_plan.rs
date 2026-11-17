@@ -202,8 +202,9 @@ mod plan {
     pub enum RingError {
         /// An edge asks for more than [`MAX_RING_BYTES`].
         OverCeiling { ends: RingEnds, request: u32 },
-        /// A producer's `max_record` is larger than the ring its edge is
-        /// granted, so its writes could never succeed.
+        /// A producer's `max_record`, with its records' length prefixes on a
+        /// ring, is larger than the ring its edge is granted, so its writes
+        /// could never succeed.
         RecordOverRing {
             ends: RingEnds,
             max_record: u32,
@@ -524,8 +525,15 @@ mod plan {
                 ends,
                 request: asked,
             })?;
+            // A ring keeps each record's length beside it; a mailbox's
+            // record is its whole buffer.
             let (producer_cap, max_record) = g.cap(e.from, DIR_OUT, e.from_port);
-            if max_record > ring {
+            let footprint = if group != 0 {
+                u64::from(max_record)
+            } else {
+                record_bytes(max_record)
+            };
+            if footprint > u64::from(ring) {
                 return Err(RingError::RecordOverRing {
                     ends,
                     max_record,

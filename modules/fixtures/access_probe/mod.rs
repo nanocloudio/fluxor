@@ -1,16 +1,19 @@
-//! Access probe — the bounds on `MMIO_READ32` and the DMA cache-maintenance
-//! opcodes, from a PIC module holding `platform_raw` and `dma`, on QEMU virt.
+//! Access probe — the bounds on register access through a `metal_device`
+//! aperture and on the DMA cache-maintenance opcodes, from a PIC module
+//! holding `metal_device` with its `mmio` and `dma` grants, on QEMU virt.
 //!
 //! On its first step it checks, in order (the case number is what a failure
 //! names):
-//!   1. a register read in DRAM (0x4000_0000) is refused EFAULT;
-//!   2. a read of the PL011's PeriphID0 (0x0900_0FE0) is served;
-//!   3. an unaligned read (0x0900_0FE1) is refused EFAULT;
-//!   4. a read in a gigabyte with nothing behind it (0x1_0000_0000 at
-//!      `-m 2G`) is refused EFAULT;
-//!   5. a cache flush of this module's own state is refused EFAULT;
+//!   1. opening an aperture past the machine's last is refused ENOENT, and a
+//!      read through a handle naming none is refused EBADF;
+//!   2. a read of the PL011's PeriphID0 (offset 0x0900_0FE0 in aperture 0,
+//!      the first gigabyte) is served;
+//!   3. an unaligned read (offset 0x0900_0FE1) is refused EFAULT;
+//!   4. a read past the aperture's end is refused EFAULT;
+//!   5. a cache flush naming no allocation of its own is refused EBADF;
 //!   6. a flush of a streaming DMA buffer it was given is served;
-//!   7. a flush of that buffer whose end wraps is refused EFAULT.
+//!   7. a flush running past that buffer's end, or whose end wraps, is
+//!      refused EFAULT.
 //!
 //! **Pipeline:** standalone — no channels required.
 
@@ -31,8 +34,11 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-const MMIO_READ32: u32 = abi::registry::metal_device::MMIO_READ32;
+use abi::contracts::hal::metal_device as md;
+
+const ENOENT: i32 = -2;
 const EFAULT: i32 = -14;
+const EBADF: i32 = -9;
 
 #[repr(C)]
 struct AccessProbeState {
@@ -41,40 +47,66 @@ struct AccessProbeState {
     _pad: [u8; 7],
 }
 
-unsafe fn mmio_read(sys: &SyscallTable, addr: u64) -> i32 {
-    let mut buf = [0u8; 12];
-    let ab = addr.to_le_bytes();
-    let bp = buf.as_mut_ptr();
-    let mut i = 0usize;
-    while i < 8 {
-        *bp.add(i) = ab[i];
-        i += 1;
+/// Open aperture `index`: its handle and length, or the errno.
+unsafe fn mmio_open(sys: &SyscallTable, index: u8) -> Result<(i32, u32), i32> {
+    let mut arg = [0u8; md::mmio::OPEN_LEN];
+    arg[0] = index;
+    let h = (sys.provider_call)(
+        -1,
+        md::MMIO_OPEN,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if h < 0 {
+        return Err(h);
     }
-    (sys.provider_call)(-1, MMIO_READ32, bp, 12)
+    Ok((h, u32::from_le_bytes([arg[8], arg[9], arg[10], arg[11]])))
+}
+
+unsafe fn mmio_read(sys: &SyscallTable, aperture: i32, offset: u32) -> i32 {
+    let mut arg = md::mmio::arg(offset, 0);
+    (sys.provider_call)(
+        aperture,
+        md::MMIO_READ32,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// The first failing case, or 0 when every case holds.
-unsafe fn run_cases(sys: &SyscallTable, own_state: u64) -> u8 {
-    if mmio_read(sys, 0x4000_0000) != EFAULT {
+unsafe fn run_cases(sys: &SyscallTable) -> u8 {
+    let forged = abi::kernel_abi::handle::encode(abi::registry::metal_device::ID, 0, 0x3FFF);
+    if mmio_open(sys, 0xFF) != Err(ENOENT) || mmio_read(sys, forged, 0x0900_0FE0) != EBADF {
         return 1;
     }
-    if mmio_read(sys, 0x0900_0FE0) != 0 {
+    let Ok((ap, len)) = mmio_open(sys, 0) else {
+        return 2;
+    };
+    if mmio_read(sys, ap, 0x0900_0FE0) != 0 {
         return 2;
     }
-    if mmio_read(sys, 0x0900_0FE1) != EFAULT {
+    if mmio_read(sys, ap, 0x0900_0FE1) != EFAULT {
         return 3;
     }
-    if mmio_read(sys, 0x1_0000_0000) != EFAULT {
+    if mmio_read(sys, ap, len) != EFAULT {
         return 4;
     }
-    if dev_dma_flush(sys, own_state, 64) != EFAULT {
+    if dev_dma_flush(sys, -1, 0, 64) != EBADF || dev_dma_flush(sys, forged, 0, 64) != EBADF {
         return 5;
     }
-    let buf = dev_dma_alloc_streaming(sys, 64, 64);
-    if buf == 0 || dev_dma_flush(sys, buf, 64) != 0 {
+    let Some(buf) = dev_dma_alloc_streaming(sys, 64, 64) else {
+        return 6;
+    };
+    if dev_dma_flush(sys, buf.handle, 0, 64) != 0 {
         return 6;
     }
-    if dev_dma_flush(sys, u64::MAX - 31, 64) != EFAULT {
+    if dev_dma_flush(sys, buf.handle, 32, 64) != EFAULT
+        || dev_dma_flush(sys, buf.handle, u32::MAX - 31, 64) != EFAULT
+    {
         return 7;
     }
     0
@@ -125,7 +157,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     }
     s.done = 1;
     let sys = &*s.syscalls;
-    let case = run_cases(sys, state as u64);
+    let case = run_cases(sys);
     if case == 0 {
         dev_log(sys, 3, c"[access_probe] ok".as_ptr().cast(), 17);
     } else {

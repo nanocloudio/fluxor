@@ -89,17 +89,38 @@ unsafe fn raw_slice_write(sys: &SyscallTable, slice: u8, reg: u8, value: u32) ->
     let vb = value.to_le_bytes();
     let mut buf = [slice, reg, vb[0], vb[1], vb[2], vb[3]];
     let h = fluxor_rt::dev_raw_claim(sys, abi::platform::rp::raw_claim::family::PWM, slice);
-    (sys.provider_call)(h, SYS_PWM_SLICE_WRITE, buf.as_mut_ptr(), 6)
+    (sys.provider_call)(
+        h,
+        SYS_PWM_SLICE_WRITE,
+        buf.as_mut_ptr(),
+        6,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn raw_pin_enable(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.provider_call)(-1, SYS_PWM_PIN_ENABLE, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(
+        -1,
+        SYS_PWM_PIN_ENABLE,
+        arg.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn raw_pin_disable(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.provider_call)(-1, SYS_PWM_PIN_DISABLE, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(
+        -1,
+        SYS_PWM_PIN_DISABLE,
+        arg.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
@@ -111,7 +132,14 @@ unsafe fn gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
 }
 
 unsafe fn gpio_release(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.provider_call)(handle, GPIO_RELEASE, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        handle,
+        GPIO_RELEASE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 // ============================================================================
@@ -132,10 +160,11 @@ unsafe fn find_free_slot(s: &PwmState) -> i32 {
 }
 
 unsafe fn get_slot(s: &PwmState, handle: i32) -> *const PwmSlot {
-    if handle < 0 || (handle as usize) >= MAX_SLOTS {
+    let idx = handle as usize;
+    if handle < 0 || idx >= MAX_SLOTS {
         return core::ptr::null();
     }
-    let slot = &*s.slots.as_ptr().add(handle as usize);
+    let slot = &*s.slots.as_ptr().add(idx);
     if !slot.in_use {
         return core::ptr::null();
     }
@@ -143,10 +172,11 @@ unsafe fn get_slot(s: &PwmState, handle: i32) -> *const PwmSlot {
 }
 
 unsafe fn get_slot_mut(s: &mut PwmState, handle: i32) -> *mut PwmSlot {
-    if handle < 0 || (handle as usize) >= MAX_SLOTS {
+    let idx = handle as usize;
+    if handle < 0 || idx >= MAX_SLOTS {
         return core::ptr::null_mut();
     }
-    let slot = &mut *s.slots.as_mut_ptr().add(handle as usize);
+    let slot = &mut *s.slots.as_mut_ptr().add(idx);
     if !slot.in_use {
         return core::ptr::null_mut();
     }
@@ -170,6 +200,8 @@ pub unsafe extern "C" fn pwm_provider_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return -22; // EINVAL

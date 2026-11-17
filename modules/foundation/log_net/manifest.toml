@@ -26,6 +26,8 @@ content_type = "NetProto"
 required = true
 rate_class_default = "control"
 buffer_size = { default = 2048, aarch64 = 8192 }
+# A transport record whole, header included (`module_facts!` states the same).
+accepts_record = 1483
 
 [[ports]]
 name = "net_out"
@@ -34,7 +36,8 @@ content_type = "NetProto"
 required = true
 rate_class_default = "control"
 buffer_size = { default = 2048, aarch64 = 8192 }
-max_record = 2048
+# One CMD_DG_SEND_TO of a 512-byte log chunk, header included.
+max_record = 523
 
 # Module-scope observability — exempt.
 [observability]

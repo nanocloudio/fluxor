@@ -8,6 +8,22 @@ Implements the kernel-side dispatch for `CMD_BIND` / `CMD_CONNECT_TO` /
 `MSG_DATA` / `MSG_CLOSED` / `MSG_ERROR` to anchor modules. It is the
 hosted-Linux counterpart of `rp1_gem` + `ip` on bare-metal Pi 5.
 
+It grants no stream sideband (`net_proto::flag`): `flags_granted` is 0 on
+every `MSG_BOUND` / `MSG_ACCEPTED` / `MSG_CONNECTED`. The host's TCP keeps
+its own copy of what is sent, so a stream is never offered `stream_retx`
+and a record layer above it keeps no retransmission window; it emits no
+trace context and serves no continuity cursors. An undefined flag bit is
+refused `EINVAL`. A stream bind that fails is answered `MSG_ERROR` with no
+connection and no tag; a datagram bind that fails, `MSG_DG_ERROR` on
+endpoint 0xFF. A datagram endpoint belongs to the owner the kernel attests
+for the lane its bind arrived on; a send or close from another owner's lane
+is refused `EPERM`.
+
+Records: `net_out` writes at most 1483 bytes per frame (a `MSG_DATA` of
+1460 bytes; a datagram of up to 1472 bytes of IPv4 payload — a larger one
+is dropped and counted, never cut), and `net_in` accepts commands up to
+49155 bytes.
+
 ```yaml
 modules:
   - name: linux_net   # name fixed by the platform.net stack

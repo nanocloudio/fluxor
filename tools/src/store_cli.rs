@@ -1072,43 +1072,69 @@ pub fn lock_store_manifest_resolver(
             .as_deref()
             .and_then(|want| named.iter().find(|p| p.target.as_deref() == Some(want)));
         let unambiguous = named.iter().all(|p| p.digest == named[0].digest);
-        let pin = match abi_match {
-            Some(p) => *p,
+        match abi_match {
+            Some(p) => manifest_text(&store, p),
             // One digest across every ABI: the artifact is ABI-agnostic,
             // so any pin is the right pin.
-            None if unambiguous => named[0],
+            None if unambiguous => manifest_text(&store, named[0]),
+            // No ABI asked (a member placed on another node is resolved for
+            // its capabilities and facts only): the pins are one module
+            // built for several ABIs, and they answer alike when their
+            // manifests do. Differing manifests are not one answer.
+            None if abi.is_none() => {
+                let first = manifest_text(&store, named[0]);
+                let ManifestPin::Resolved(text) = &first else {
+                    return first;
+                };
+                for p in &named[1..] {
+                    match manifest_text(&store, p) {
+                        ManifestPin::Resolved(t) if t == *text => {}
+                        ManifestPin::Resolved(_) => {
+                            return ManifestPin::Failed(format!(
+                                "module '{name}' is pinned for several targets with differing \
+                                 manifests; name the target to resolve it"
+                            ))
+                        }
+                        other => return other,
+                    }
+                }
+                first
+            }
             // The ABI needs the artifact built for it, so the right one is
             // missing rather than ambiguous. Falling through would validate
             // against another ABI's surface.
-            None => {
-                return ManifestPin::Failed(format!(
-                    "module '{name}' is pinned for several targets at differing digests \
-                     and none matches {}; pin it for this target",
-                    abi.as_deref().unwrap_or("the requested target")
-                ))
-            }
-        };
-        let pin_id = format!("pin {} ({})", pin.reference, pin.digest);
-        let manifest_bytes = match store.read_blob(&pin.digest) {
-            Ok(b) => b,
-            Err(e) => return ManifestPin::Failed(format!("{pin_id}: {e}")),
-        };
-        let manifest: ImageManifest = match serde_json::from_slice(&manifest_bytes) {
-            Ok(m) => m,
-            Err(e) => return ManifestPin::Failed(format!("{pin_id}: corrupt manifest: {e}")),
-        };
-        match store.module_manifest_toml_blob(&manifest) {
-            Ok(Some(bytes)) => match String::from_utf8(bytes) {
-                Ok(text) => ManifestPin::Resolved(text),
-                Err(e) => ManifestPin::Failed(format!(
-                    "{pin_id}: manifest.toml layer is not valid UTF-8 (corrupt artifact): {e}"
-                )),
-            },
-            // No manifest.toml layer — let an on-disk source manifest resolve it.
-            Ok(None) => ManifestPin::NotPinned,
-            Err(e) => ManifestPin::Failed(format!("{pin_id}: {e}")),
+            None => ManifestPin::Failed(format!(
+                "module '{name}' is pinned for several targets at differing digests \
+                 and none matches {}; pin it for this target",
+                abi.as_deref().unwrap_or("the requested target")
+            )),
         }
     }))
+}
+
+/// The `manifest.toml` a pinned module artifact carries, read from `store`.
+fn manifest_text(store: &OciStore, pin: &ModulePin) -> crate::modules::ManifestPin {
+    use crate::modules::ManifestPin;
+    let pin_id = format!("pin {} ({})", pin.reference, pin.digest);
+    let manifest_bytes = match store.read_blob(&pin.digest) {
+        Ok(b) => b,
+        Err(e) => return ManifestPin::Failed(format!("{pin_id}: {e}")),
+    };
+    let manifest: ImageManifest = match serde_json::from_slice(&manifest_bytes) {
+        Ok(m) => m,
+        Err(e) => return ManifestPin::Failed(format!("{pin_id}: corrupt manifest: {e}")),
+    };
+    match store.module_manifest_toml_blob(&manifest) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(text) => ManifestPin::Resolved(text),
+            Err(e) => ManifestPin::Failed(format!(
+                "{pin_id}: manifest.toml layer is not valid UTF-8 (corrupt artifact): {e}"
+            )),
+        },
+        // No manifest.toml layer — let an on-disk source manifest resolve it.
+        Ok(None) => ManifestPin::NotPinned,
+        Err(e) => ManifestPin::Failed(format!("{pin_id}: {e}")),
+    }
 }
 
 /// `fluxor store snapshot <name>` — freeze the current resolved set.
@@ -1407,6 +1433,43 @@ mod tests {
                 ManifestPin::Resolved(text) => assert_eq!(text, want, "silicon {silicon}"),
                 other => panic!("silicon {silicon}: expected Resolved, got {other:?}"),
             }
+        }
+
+        // No silicon asked: these pins carry differing manifests, so there is
+        // no one answer and the resolver says so.
+        let r_any =
+            lock_store_manifest_resolver(&proj, None, Some(&store_dir)).expect("resolver present");
+        assert!(matches!(r_any("mqtt_client"), ManifestPin::Failed(_)));
+    }
+
+    /// A module built for several targets from one `manifest.toml` resolves
+    /// with no target asked (a member placed on another node): its pins
+    /// differ, its manifest does not.
+    #[test]
+    fn one_manifest_pinned_for_several_targets_resolves_without_a_target() {
+        use crate::modules::ManifestPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = OciStore::open(tmp.path().join("store")).expect("open store");
+        let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
+        let d_a = publish_with_manifest(&store, "stand_in", "aarch64", b"fmodA", toml);
+        let d_t = publish_with_manifest(&store, "stand_in", "thumbv8m", b"fmodB", toml);
+        assert_ne!(d_a, d_t);
+        pin_module(&proj, "stand_in", "aarch64", &d_a, "aarch64/stand_in:0.1.0");
+        pin_module(
+            &proj,
+            "stand_in",
+            "thumbv8m",
+            &d_t,
+            "thumbv8m/stand_in:0.1.0",
+        );
+        let store_dir = tmp.path().join("store");
+        let r_any =
+            lock_store_manifest_resolver(&proj, None, Some(&store_dir)).expect("resolver present");
+        match r_any("stand_in") {
+            ManifestPin::Resolved(text) => assert_eq!(text, toml),
+            other => panic!("expected Resolved, got {other:?}"),
         }
     }
 

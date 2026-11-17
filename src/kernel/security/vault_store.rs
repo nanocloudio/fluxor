@@ -24,6 +24,7 @@
 
 use crate::abi::errno::{EAGAIN, EBUSY, EINVAL, EIO, ENOSYS};
 use crate::abi::internal::vault_store as wire;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::security::crypto::sha256::Sha256;
 use portable_atomic::{AtomicBool, Ordering};
 
@@ -432,16 +433,20 @@ fn caller() -> (usize, u32) {
     (idx, scheduler::module_slot_generation(idx))
 }
 
-/// Dispatch an `abi::internal::vault_store` opcode.
+/// Dispatch an `abi::internal::vault_store` opcode. `LOAD`'s piece is
+/// `data` in and `READ`'s is `data` out; every other op is `a` alone.
+pub fn dispatch(op: u32, a: &mut [u8], mut data: UserSpan<'_>) -> i32 {
+    let _h = lock();
+    // SAFETY: the store lock is held for the call, so the store and its image
+    // are touched by this call alone.
+    unsafe { dispatch_locked(op, a, data.as_mut()) }
+}
+
+/// [`dispatch`] under the store lock.
 ///
 /// # Safety
-/// `arg` valid for `arg_len` bytes, as each opcode's layout requires.
-pub unsafe fn dispatch(op: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() {
-        return EINVAL;
-    }
-    let a = core::slice::from_raw_parts_mut(arg, arg_len);
-    let _h = lock();
+/// The store lock is held.
+unsafe fn dispatch_locked(op: u32, a: &mut [u8], data: &mut [u8]) -> i32 {
     let s = store();
     let who = caller();
     if op == wire::ATTACH {
@@ -451,10 +456,10 @@ pub unsafe fn dispatch(op: u32, arg: *mut u8, arg_len: usize) -> i32 {
         return ENOSYS;
     }
     match op {
-        wire::LOAD => load(s, a),
+        wire::LOAD => load(s, a, data),
         wire::DECIDE => decide(s),
         wire::PENDING => pending(s, a),
-        wire::READ => read_image(s, a),
+        wire::READ => read_image(s, a, data),
         wire::DONE => done(s, a),
         _ => EINVAL,
     }
@@ -547,19 +552,16 @@ fn feed(sc: &mut Scan, image_len: usize, offset: usize, data: &[u8]) -> bool {
     true
 }
 
-unsafe fn load(s: &mut Store, a: &mut [u8]) -> i32 {
+unsafe fn load(s: &mut Store, a: &[u8], data: &[u8]) -> i32 {
     if a.len() < wire::LOAD_LEN {
         return EINVAL;
     }
     let phase = a[0];
     let slot = a[1];
     let offset = u32_at(a, 4) as usize;
-    let ptr = u64_at(a, 8) as usize as *const u8;
-    let len = u32_at(a, 16) as usize;
-    if slot >= SLOTS || ptr.is_null() || len == 0 {
+    if slot >= SLOTS || data.is_empty() {
         return EINVAL;
     }
-    let data = core::slice::from_raw_parts(ptr, len);
     match (phase, s.phase) {
         (wire::phase::SCAN, Phase::Scanning) => {
             if offset == 0 {
@@ -579,7 +581,7 @@ unsafe fn load(s: &mut Store, a: &mut [u8]) -> i32 {
             if !feed(&mut s.fill, image_len, offset, data) {
                 return EINVAL;
             }
-            live()[offset..offset + len].copy_from_slice(data);
+            live()[offset..offset + data.len()].copy_from_slice(data);
             if s.fill.got < image_len {
                 return 0;
             }
@@ -656,21 +658,20 @@ unsafe fn pending(s: &mut Store, a: &mut [u8]) -> i32 {
     1
 }
 
-unsafe fn read_image(s: &mut Store, a: &mut [u8]) -> i32 {
+unsafe fn read_image(s: &mut Store, a: &[u8], out: &mut [u8]) -> i32 {
     if a.len() < wire::READ_LEN {
         return EINVAL;
     }
     let seq = u64_at(a, 0);
     let offset = u32_at(a, 8) as usize;
-    let len = u32_at(a, 12) as usize;
-    let ptr = u64_at(a, 16) as usize as *mut u8;
-    if ptr.is_null() || offset + len > s.image_len {
+    let len = out.len();
+    if offset + len > s.image_len {
         return EINVAL;
     }
     if s.phase != Phase::Ready || seq != s.live_seq || s.writing.0 != seq {
         return EAGAIN;
     }
-    core::ptr::copy_nonoverlapping(live().as_ptr().add(offset), ptr, len);
+    out.copy_from_slice(&live()[offset..offset + len]);
     0
 }
 

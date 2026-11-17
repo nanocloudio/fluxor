@@ -1202,6 +1202,88 @@ fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// Read the module's port record bounds out of the ELF, as data
+/// (`module_facts!`'s `records:`): `(direction, index, bytes)` per entry.
+/// `None` for a module that declares none.
+fn read_embedded_records(
+    sections: &[ElfSection],
+    symbols: &[ElfSymbol],
+) -> Option<Vec<(u8, u8, u32)>> {
+    let sym = symbols
+        .iter()
+        .find(|s| s.name.contains("FLUXOR_MODULE_RECORDS"))?;
+    let sec = sections.get(sym.section_idx as usize)?;
+    let start = (sym.value as usize).checked_sub(sec.addr)?;
+    let word = |i: usize| -> Option<u32> {
+        let b = sec.data.get(start + 4 * i..start + 4 * i + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let n = word(0)? as usize;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let key = word(1 + 2 * k)?;
+        out.push(((key >> 8) as u8, key as u8, word(2 + 2 * k)?));
+    }
+    Some(out)
+}
+
+/// Hold a module's stated record bounds (`module_facts!`'s `records:`) and
+/// its manifest's port figures (`max_record` on an output, `accepts_record`
+/// on an input) equal: every entry names a port whose manifest states the
+/// same figure, and every `NetProto` port has an entry. The code sizes its
+/// frames and scratch from the one, the composer checks edges against the
+/// other, so a drift between them is a frame one side cannot handle.
+fn check_record_bounds(
+    name: &str,
+    manifest: &Manifest,
+    stated: Option<&[(u8, u8, u32)]>,
+) -> Result<()> {
+    let stated = stated.unwrap_or(&[]);
+    let figure = |p: &crate::manifest::PortSpec| {
+        if p.direction == 1 {
+            ("max_record", p.max_record)
+        } else {
+            ("accepts_record", p.accepts_record)
+        }
+    };
+    for &(dir, index, bytes) in stated {
+        let Some(port) = manifest.find_port_spec(dir, index) else {
+            return Err(Error::Module(format!(
+                "{name}: `module_facts!` states a record bound for {} port {index}, which \
+                 its manifest does not declare",
+                ["input", "output", "control"]
+                    .get(dir as usize)
+                    .unwrap_or(&"input")
+            )));
+        };
+        let (key, declared) = figure(port);
+        if declared != bytes {
+            return Err(Error::Module(format!(
+                "{name}: port `{}` declares `{key} = {declared}` but `module_facts!` states \
+                 {bytes} B for this build — make them the same figure",
+                port.name.as_deref().unwrap_or("?")
+            )));
+        }
+    }
+    for port in &manifest.ports {
+        if crate::manifest::CONTENT_TYPES.get(port.content_type as usize) != Some(&"NetProto") {
+            continue;
+        }
+        let dir = port.direction;
+        if !stated.iter().any(|&(d, i, _)| d == dir && i == port.index) {
+            let (key, _) = figure(port);
+            return Err(Error::Module(format!(
+                "{name}: NetProto port `{}` has no record bound in `module_facts!` — add \
+                 `{} {} NAME = <{key}>` to its `records:`",
+                port.name.as_deref().unwrap_or("?"),
+                ["in", "out", "ctrl"].get(dir as usize).unwrap_or(&"in"),
+                port.index
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A `[capacities] heap_from_params` rule's `base` — or a `heap_per_demand`
 /// or `heap_per_param` rule's, for a type with no `heap_from_params` rule —
 /// is the module type's default heap cap, which the composer grows from. It
@@ -1767,6 +1849,14 @@ pub fn pack_fmod(
     // arena from the manifest.
     module_manifest.arena_bytes = read_embedded_arena_bytes(&sections, &symbols).unwrap_or(0);
 
+    // Record bounds: the figures the code sizes its frames by
+    // (`module_facts!`'s `records:`) are the manifest's, port for port.
+    check_record_bounds(
+        name,
+        &module_manifest,
+        read_embedded_records(&sections, &symbols).as_deref(),
+    )?;
+
     // Provider-ness: the manifest names the contracts, the dispatch entry
     // point serves them. One without the other is a module that cannot be
     // registered, or a dispatch nothing reaches.
@@ -2136,6 +2226,67 @@ fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `module_facts!`'s record bounds and the manifest's port figures are
+    /// one figure: a drift, an entry naming no port, and a NetProto port with
+    /// no entry are all refused at pack.
+    #[test]
+    fn record_bounds_hold_code_and_manifest_equal() {
+        use super::check_record_bounds;
+        let toml = r#"
+version = "1.0.0"
+hardware_targets = ["linux"]
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+accepts_record = 1483
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+max_record = { default = 1603, aarch64 = 8195 }
+"#;
+        let m = crate::manifest::Manifest::from_toml_str_for_target(toml, Some("aarch64")).unwrap();
+        check_record_bounds("m", &m, Some(&[(0, 0, 1483), (1, 0, 8195)])).unwrap();
+        let e = check_record_bounds("m", &m, Some(&[(0, 0, 1483), (1, 0, 1603)]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("max_record = 8195") && e.contains("1603"), "{e}");
+        let e = check_record_bounds("m", &m, Some(&[(0, 0, 1483)]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("net_out") && e.contains("no record bound"),
+            "{e}"
+        );
+        let e = check_record_bounds("m", &m, Some(&[(0, 0, 1483), (1, 0, 8195), (1, 3, 9)]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("output port 3"), "{e}");
+        assert!(check_record_bounds("m", &m, None).is_err());
+    }
+
+    /// A NetProto port states its bound in the manifest, or the manifest is
+    /// refused.
+    #[test]
+    fn a_netproto_port_without_its_bound_is_refused() {
+        let toml = r#"
+version = "1.0.0"
+hardware_targets = ["linux"]
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+"#;
+        let e = crate::manifest::Manifest::from_toml_str_for_target(toml, None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("accepts_record"), "{e}");
+    }
 
     fn blob(type_hash: u32, ordinal: u8, slot: u8, bytes: &[u8]) -> ProgramBlob {
         ProgramBlob {

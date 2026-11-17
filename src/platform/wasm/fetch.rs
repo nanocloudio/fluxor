@@ -84,7 +84,10 @@ unsafe fn alloc_state(out_chan: i32, url: &[u8]) -> *mut FetchState {
     raw
 }
 
-fn fetch_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn fetch_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
     // type allocated by the new_fn and operate within that allocation.
@@ -155,11 +158,7 @@ fn fetch_step(state: *mut u8) -> i32 {
                     host_fetch_close(st.handle);
                     st.handle = -1;
                 }
-                let _ = channel::channel_ioctl(
-                    st.out_chan,
-                    channel::IOCTL_SET_HUP,
-                    core::ptr::null_mut(),
-                );
+                let _ = channel::channel_set_hup(st.out_chan);
                 return 0;
             }
             // Write the freshly-fetched bytes in `WRITE_CHUNK_BYTES`

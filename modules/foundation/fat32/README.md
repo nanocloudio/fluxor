@@ -21,7 +21,7 @@ implementation accepts, not merely one this provider can read back.
 
 | Port | Direction | Purpose |
 |---|---|---|
-| `blocks` | input | Block source (`nvme`, `sd`, `crypt_block`, `file_block`). Reads and writes both ride its synchronous ioctls. |
+| `blocks` | input | Block source (`nvme`, `sd`, `crypt_block`, `file_block`). Reads and writes ride its `storage.block` requests; a mount over a streaming source reads through `READ_STREAM`. |
 
 ## Capabilities
 

@@ -18,11 +18,6 @@
 //! Parameters (from YAML):
 //!   path: Directory to enumerate (e.g., "/samples")
 //!   pattern: Optional glob pattern (e.g., "*.raw")
-//!
-//! # Seek Protocol
-//!
-//! Downstream (bank) sends IOCTL_NOTIFY with file index (0, 1, 2, ...).
-//! Fat32 starts streaming that file's data.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -38,7 +33,7 @@ use core::ffi::c_void;
 
 use fluxor_abi as abi;
 
-use abi::{errno, SyscallTable};
+use abi::SyscallTable;
 
 // ============================================================================
 // Constants
@@ -292,12 +287,12 @@ mod params_def {
 
         // Instance selector for multi-volume routing. When set (e.g.
         // `volume: "nvme0"`), this fat32 registers as a KEYED FS provider,
-        // which a caller reaches by naming the volume in
-        // `provider_call_sel` (the `mount` module does, per op), letting a
+        // which a caller reaches through a handle bound to the volume's name
+        // (`kernel::BIND`; the `mount` module binds each volume), letting a
         // boot volume and a data volume coexist without shadowing. Absent →
         // selector 0 = the single default FS provider. The hash is the
         // shared `provider_selector::hash`, which the kernel also applies to
-        // the name a `provider_call_sel` carries, so the two agree.
+        // the name a bind carries, so the two agree.
         11, volume, str, 0
             => |s, d, len| {
                 if len > 0 {
@@ -663,13 +658,13 @@ struct Fat32State {
     /// Provider instance selector (FNV-1a hash of the `volume:` param).
     /// `0` when no `volume:` is given → this fat32 is the single unkeyed
     /// (default) FS provider. Non-zero → a keyed volume
-    /// backend, reached by name through `provider_call_sel`. Exposed to
+    /// backend, reached through a handle bound to its name. Exposed to
     /// the loader through the `module_provider_selector` export.
     selector: u32,
     /// Channel handle for the upstream block source (nvme.blocks /
-    /// sd.blocks). Every sector read — init MBR/boot/dir, write-path
-    /// FAT walks, FS_CONTRACT sync block reads — flows through this
-    /// channel via ioctls on the producer side.
+    /// sd.blocks). A streamed sector read — mount discovery over a source
+    /// that offers a stream — arrives on this channel after a
+    /// `storage.block` `READ_STREAM`.
     in_chan: i32,
     /// `storage.block` requests on `in_chan`, and the pipelined writes and
     /// fences built from them.
@@ -787,7 +782,7 @@ struct Fat32State {
     tick_count: u32,
     last_observe_ms: u64,
 
-    /// NVMe namespace id used by the block ioctls. `0` forwards to the
+    /// NVMe namespace id used by the block requests. `0` forwards to the
     /// consumer's driver-wide default (nvme falls back to its own
     /// `namespace` param in that case).
     namespace: u32,
@@ -1307,31 +1302,47 @@ unsafe fn log_info(s: &Fat32State, msg: &[u8]) {
     dev_log(s.sys(), 3, msg.as_ptr(), msg.len());
 }
 
-/// Seek the block source's stream to absolute `lba`.
-///
-/// Mount discovery over a source that is not a writable `storage.block`
-/// source rides its streaming channel (see [`start_read`]). That seek is
-/// `IOCTL_NOTIFY`, whose argument is four bytes, so this is the one place in
-/// the provider that cannot express the full 64-bit address.
-///
-/// It refuses rather than truncates. A volume whose boot sector sits past
-/// the 2 TiB a 32-bit seek can name is not mountable through a streaming
-/// source, and saying so is the only honest answer; wrapping the address
-/// would mount whatever happens to live at the aliased sector.
-#[inline]
-unsafe fn seek_block(s: &Fat32State, lba: u64) -> i32 {
-    if lba > u64::from(u32::MAX) {
-        return errno::EOVERFLOW;
+/// `prefix` followed by `rc`'s magnitude in decimal (the prefix carries the
+/// sign).
+unsafe fn log_rc(s: &Fat32State, prefix: &[u8], rc: i32) {
+    let mut line = [0u8; 64];
+    let n = prefix.len().min(line.len() - 10);
+    line[..n].copy_from_slice(&prefix[..n]);
+    let mut digits = [0u8; 10];
+    let mut v = rc.unsigned_abs();
+    let mut k = 0;
+    loop {
+        digits[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
     }
-    let mut pos = lba as u32;
-    let pos_ptr = &mut pos as *mut u32 as *mut u8;
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_NOTIFY, pos_ptr, 4)
+    let mut at = n;
+    while k > 0 {
+        k -= 1;
+        line[at] = digits[k];
+        at += 1;
+    }
+    log_info(s, &line[..at]);
 }
 
-/// Flush SD's output buffer (our input)
+/// Restart the block source's stream at absolute `lba`.
+///
+/// Mount discovery over a source that is not a writable `storage.block`
+/// source rides its streaming channel (see [`start_read`]): a one-block
+/// `READ_STREAM` through the bound `storage.block` handle, whose blocks then
+/// arrive on the channel.
+#[inline]
+unsafe fn seek_block(s: &Fat32State, lba: u64) -> i32 {
+    s.blk.read_stream(&*s.syscalls, lba, 1)
+}
+
+/// Drop what the block source's stream (our input) still holds.
 #[inline]
 unsafe fn flush_input(s: &Fat32State) -> i32 {
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0)
+    dev_channel_flush(s.sys(), s.in_chan)
 }
 
 /// Whether the block source is read through synchronous `storage.block`
@@ -1339,15 +1350,15 @@ unsafe fn flush_input(s: &Fat32State) -> i32 {
 ///
 /// A writable source with no read stream — a transform (`crypt_block`,
 /// `loam_volume`) or a file-backed source (`file_block`) — has nothing to
-/// answer a seek, so it is mounted and read through requests. A source that
-/// offers `F_READ_STREAM` (`nvme`) is read through its stream: a directory
-/// walk is many sectors, and one device round trip per sector in the
-/// caller's step outlasts the step. A read-only source (`sd`) and one that
-/// has not attached yet keep the streamed mount; [`init_step`] switches over
-/// if it turns out to be a stream-less writable source.
+/// answer a stream read, so it is mounted and read through requests. A
+/// source that offers `F_READ_STREAM` (`nvme`) is read through its stream: a
+/// directory walk is many sectors, and one device round trip per sector in
+/// the caller's step outlasts the step. A source that has not attached yet
+/// keeps the streamed mount; [`init_step`] switches over if it turns out to
+/// be a stream-less writable source.
 unsafe fn writable_block_source(s: &Fat32State) -> bool {
-    use abi::contracts::storage::block::caps as bc;
-    s.blk.caps(&*s.syscalls) == 0
+    use abi::contracts::storage::block::describe as bc;
+    s.blk.describe(&*s.syscalls) == 0
         && s.blk.flags() & bc::F_WRITE != 0
         && s.blk.flags() & bc::F_READ_STREAM == 0
 }
@@ -1385,6 +1396,9 @@ unsafe fn start_read(s: &mut Fat32State, lba: u64) -> i32 {
     }
     flush_input(s);
     let rc = seek_block(s, lba);
+    if rc == E_AGAIN {
+        return 1;
+    }
     if rc < 0 {
         return rc;
     }
@@ -1852,19 +1866,19 @@ const FS_TRUNCATE: u32 = abi::registry::fs::TRUNCATE;
 
 /// FS capability bits — must match
 /// `crates/fluxor-abi/src/contracts/storage/fs.rs::caps`.
-const FS_CAP_OPEN: u32 = 1 << 0;
-const FS_CAP_OPENDIR: u32 = 1 << 1;
-const FS_CAP_OPEN_CREATE: u32 = 1 << 2;
-const FS_CAP_WRITE: u32 = 1 << 3;
-const FS_CAP_FSYNC: u32 = 1 << 4;
-const FS_CAP_UNLINK: u32 = 1 << 5;
-const FS_CAP_TRUNCATE: u32 = 1 << 6;
-const FS_CAP_MKDIR: u32 = 1 << 7;
-const FS_CAP_RMDIR: u32 = 1 << 16;
-const FS_CAP_RENAME: u32 = 1 << 8;
-const FS_CAP_PREALLOCATE: u32 = 1 << 9;
-const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
-const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
+const FS_CAP_OPEN: u32 = abi::contracts::storage::fs::caps::OPEN;
+const FS_CAP_OPENDIR: u32 = abi::contracts::storage::fs::caps::OPENDIR;
+const FS_CAP_OPEN_CREATE: u32 = abi::contracts::storage::fs::caps::OPEN_CREATE;
+const FS_CAP_WRITE: u32 = abi::contracts::storage::fs::caps::WRITE;
+const FS_CAP_FSYNC: u32 = abi::contracts::storage::fs::caps::FSYNC;
+const FS_CAP_UNLINK: u32 = abi::contracts::storage::fs::caps::UNLINK;
+const FS_CAP_TRUNCATE: u32 = abi::contracts::storage::fs::caps::TRUNCATE;
+const FS_CAP_MKDIR: u32 = abi::contracts::storage::fs::caps::MKDIR;
+const FS_CAP_RMDIR: u32 = abi::contracts::storage::fs::caps::RMDIR;
+const FS_CAP_RENAME: u32 = abi::contracts::storage::fs::caps::RENAME;
+const FS_CAP_PREALLOCATE: u32 = abi::contracts::storage::fs::caps::PREALLOCATE;
+const FS_CAP_FSYNC_ASYNC: u32 = abi::contracts::storage::fs::caps::FSYNC_ASYNC;
+const FS_CAP_FSYNC_NAME: u32 = abi::contracts::storage::fs::caps::FSYNC_NAME;
 
 /// `Fence::LocalDurable` device id reported by fat32 handles once their
 /// data has been fsync'd. Opaque per `contracts::fence::DeviceId` (u64);
@@ -1881,7 +1895,7 @@ const FAT32_FS_DEVICE_ID: u64 = 0x6661_7433_325f_6673; // "fat32_fs"
 /// has not attached has no geometry, and a guess latched at mount is exactly
 /// the failure the `CAPS` probe rule exists to stop.
 unsafe fn fs_device_block_size(s: &Fat32State) -> u32 {
-    match s.blk.caps(&*s.syscalls) {
+    match s.blk.describe(&*s.syscalls) {
         0 => s.blk.block_size(),
         E_NOSYS => BLOCK_SIZE as u32,
         _ => 0,
@@ -3050,7 +3064,7 @@ unsafe fn fs_pump(s: &mut Fat32State) {
     if s.syscalls.is_null() || s.in_chan < 0 {
         return;
     }
-    if s.blk.caps(&*s.syscalls) != 0 {
+    if s.blk.describe(&*s.syscalls) != 0 {
         return;
     }
     s.blk.reap(&*s.syscalls);
@@ -3217,7 +3231,7 @@ unsafe fn fs_scratch_settle(s: &mut Fat32State, slot: usize) {
 /// the buffer is still lent, or a metadata write to the same sectors is
 /// still in flight — or the source's refusal.
 unsafe fn fs_data_submit(s: &mut Fat32State, slot: usize) -> i32 {
-    use abi::contracts::storage::block::caps as bc;
+    use abi::contracts::storage::block::describe as bc;
     if s.open_files[slot].scratch_dirty == 0 {
         return 0;
     }
@@ -3347,6 +3361,25 @@ fn fs_fnv64(bytes: &[u8]) -> u64 {
 
 /// The identity of a request: who asked, and its byte-identical opcode,
 /// handle and argument.
+/// Owner of the module that invoked the provider frame running now, as
+/// `(slot, generation)`; `None` when nothing is on the provider stack.
+unsafe fn caller_owner(sys: &SyscallTable) -> Option<(u16, u32)> {
+    let mut buf = [0u8; 8];
+    let rc = (sys.provider_query)(
+        -1,
+        abi::kernel_abi::query_key::CALLER_OWNER,
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    if rc < 8 {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([buf[0], buf[1]]),
+        u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+    ))
+}
+
 unsafe fn fs_op_key(
     s: &Fat32State,
     opcode: u32,
@@ -3354,7 +3387,7 @@ unsafe fn fs_op_key(
     arg: *const u8,
     arg_len: usize,
 ) -> OpSlot {
-    let (owner_slot, owner_gen) = dev_caller_owner(s.sys()).unwrap_or((OWNER_NONE, 0));
+    let (owner_slot, owner_gen) = caller_owner(s.sys()).unwrap_or((OWNER_NONE, 0));
     let hash = if arg.is_null() || arg_len == 0 {
         0
     } else {
@@ -4073,7 +4106,7 @@ unsafe fn fs_claim_slot(s: &mut Fat32State) -> Option<usize> {
     // means the open did not arrive through a dispatch — there is nobody to
     // charge, and charging the last caller seen would bill a workload for
     // this provider's own housekeeping.
-    let owner = dev_caller_owner(s.sys());
+    let owner = caller_owner(s.sys());
     let (owner_slot, owner_generation) = owner.unwrap_or((OWNER_NONE, 0));
 
     if s.max_open_per_owner > 0 && owner_slot != OWNER_NONE {
@@ -4203,10 +4236,9 @@ unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 
     of.dirty = 0;
     of.dir_lba = 0;
     of.dir_off = 0;
-    // FS handles carry their contract in the tag; the vtable
-    // wrapper strips it on re-entry so inbound ops see the raw
-    // slot.
-    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot as i32)
+    // The bare slot: the kernel wraps it in a handle and hands it back on
+    // every op through that handle.
+    slot as i32
 }
 
 /// FS_READ: copy what the FD's scratch already mirrors, and start fetching
@@ -4385,10 +4417,11 @@ unsafe fn fs_step_read_ahead(s: &mut Fat32State) {
 
 /// FS_SEEK: walk the cluster chain to the target cluster — from the
 /// cursor's own cluster when a read-only cursor moves forward, from the
-/// chain head otherwise. Answers the resulting offset, or `EAGAIN` with the
-/// cursor where it was while a FAT sector of the walk is still on its way.
+/// chain head otherwise. Answers 0, or `EAGAIN` with the cursor where it was
+/// while a FAT sector of the walk is still on its way. A target past the end
+/// of the file leaves the cursor at the end.
 unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 4 {
+    if arg.is_null() || arg_len != abi::contracts::storage::fs::seek::ARG_LEN {
         return E_INVAL;
     }
     let slot_idx = handle as usize;
@@ -4398,22 +4431,14 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
     if s.open_files[slot_idx].in_use != OF_OPEN {
         return E_INVAL;
     }
-    // The offset is 32 bits or 64, selected by the buffer the caller gave.
-    // FAT32 cannot address past 4 GiB whichever form arrives, so a wide
-    // offset that does not fit is refused rather than wrapped — a silently
-    // truncated seek reads the wrong part of the file and looks like data
-    // corruption to the caller.
-    let wide = arg_len >= 8;
-    let raw: u64 = if wide {
-        let a = core::slice::from_raw_parts(arg, 8);
-        u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]])
-    } else {
-        let v = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-        if v < 0 {
-            return E_INVAL;
-        }
-        v as u64
-    };
+    // FAT32 cannot address past 4 GiB, so an offset that does not fit is
+    // refused rather than wrapped — a silently truncated seek reads the
+    // wrong part of the file and looks like data corruption to the caller.
+    let raw =
+        match abi::contracts::storage::fs::seek::parse(core::slice::from_raw_parts(arg, arg_len)) {
+            Some(v) => v,
+            None => return E_INVAL,
+        };
     if raw > u64::from(u32::MAX) {
         return E_INVAL;
     }
@@ -4422,7 +4447,7 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
     // "FS_SEEK to s.cursor before every append" pattern — so the pending run
     // stays intact and coalescing survives.
     if target == s.open_files[slot_idx].offset {
-        return target as i32;
+        return 0;
     }
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
@@ -4447,7 +4472,7 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         of.scratch_pos = (target % bps) as u16;
         of.scratch_avail = 0;
         of.cursor_positioned = 1;
-        return target as i32;
+        return 0;
     }
     if s.open_files[slot_idx].writable != 0
         && s.open_files[slot_idx].fixed_capacity != 0
@@ -4465,7 +4490,7 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         of.scratch_pos = (target % bps) as u16;
         of.scratch_avail = 0;
         of.cursor_positioned = 1;
-        return target as i32;
+        return 0;
     }
     // A real reposition. A dirty run goes to the device first, so nothing
     // the walk below decides depends on bytes only this FD has seen; if it
@@ -4527,7 +4552,7 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
             of.offset = size;
             of.scratch_avail = 0;
             of.scratch_pos = 0;
-            return size as i32;
+            return 0;
         }
         cluster = next;
         walked += 1;
@@ -4544,7 +4569,7 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
     of.cursor_positioned = 1;
     of.scratch_pos = within_sector as u16;
     of.scratch_avail = 0;
-    target as i32
+    0
 }
 
 /// `OWNER_RELEASED`: close every handle this provider opened on behalf of an
@@ -4702,16 +4727,16 @@ unsafe fn fs_step_detached(s: &mut Fat32State) -> bool {
     busy
 }
 
-/// FS_STAT: report a handle's size and modification time, in the width the
-/// caller's buffer selects — `[size: u64, mtime: u64]` at 16 bytes or more,
-/// `[size: u32, mtime: u32]` at 8.
+/// FS_STAT: report a handle's size and modification time as the one
+/// `fs::Stat` record. FAT32 has no file identity and no hard links, so
+/// `ino` is 0 and `nlink` 1.
 ///
 /// `mtime` is 0: FAT32 stores a modification time in the directory entry,
 /// but this provider does not maintain one, and returning a fabricated value
 /// would be worse than returning none. Reporting 0 says "unknown"; the
 /// alternative says "1980" and means the same thing while looking like data.
 unsafe fn fs_op_stat(s: &Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
+    if arg.is_null() || arg_len != abi::contracts::storage::fs::stat::LEN {
         return E_INVAL;
     }
     let slot_idx = handle as usize;
@@ -4721,21 +4746,13 @@ unsafe fn fs_op_stat(s: &Fat32State, handle: i32, arg: *mut u8, arg_len: usize) 
     if s.open_files[slot_idx].in_use != OF_OPEN {
         return E_INVAL;
     }
-    let size = u64::from(s.open_files[slot_idx].size);
-    let mtime = u64::from(s.open_files[slot_idx].mtime);
-    if arg_len >= 16 {
-        let out = core::slice::from_raw_parts_mut(arg, 16);
-        out[..8].copy_from_slice(&size.to_le_bytes());
-        out[8..].copy_from_slice(&mtime.to_le_bytes());
-        return 16;
-    }
-    let out = core::slice::from_raw_parts_mut(arg, 8);
-    // A FAT32 file cannot exceed 4 GiB, so the narrow form can always carry
-    // it; the check states the invariant rather than trusting it.
-    debug_assert!(size <= u64::from(u32::MAX));
-    out[..4].copy_from_slice(&(size as u32).to_le_bytes());
-    out[4..].copy_from_slice(&(mtime as u32).to_le_bytes());
-    8
+    let st = abi::contracts::storage::fs::Stat {
+        size: u64::from(s.open_files[slot_idx].size),
+        mtime: u64::from(s.open_files[slot_idx].mtime),
+        ino: 0,
+        nlink: 1,
+    };
+    st.answer(core::slice::from_raw_parts_mut(arg, arg_len))
 }
 
 /// Same component walk as `fs_resolve_path`, but the terminal name
@@ -4824,7 +4841,7 @@ unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i
     of.size = 0;
     of.scratch_avail = 0;
     of.scratch_pos = 0;
-    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot as i32)
+    slot as i32
 }
 
 /// FS_READDIR: walk dir entries from the cursor, emit one byte
@@ -7430,7 +7447,7 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     of.offset = 0;
     of.dir_lba = loc.lba;
     of.dir_off = loc.off;
-    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot as i32)
+    slot as i32
 }
 
 // ============================================================================
@@ -9375,6 +9392,8 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return E_INVAL;
@@ -9435,7 +9454,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     // genuinely cannot carry the record. A capability answer is only
     // meaningful once there is a volume to answer about.
     if opcode == FS_CAPS {
-        if arg.is_null() || arg_len < 4 {
+        if arg.is_null() || arg_len != abi::kernel_abi::caps_word::LEN {
             return E_INVAL;
         }
         if s.init_phase != Fat32InitPhase::Done {
@@ -9458,7 +9477,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         }
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
-        return 4;
+        return 0;
     }
     // CLOSE never waits and always releases, whatever the mount or the
     // device is doing; so does an owner release.
@@ -9781,7 +9800,7 @@ fluxor_rt::module_facts! { state: Fat32State }
 
 /// FNV-1a hash of a `volume:` param string via the shared kernel/module
 /// `provider_selector::hash`, so this fat32's declared selector matches the
-/// kernel's hash of the name a `provider_call_sel("<volume>", …)` carries.
+/// kernel's hash of the name a `BIND` by name (`"<volume>"`) carries.
 ///
 /// # Safety
 /// `d` must point to `len` readable bytes.
@@ -9791,8 +9810,8 @@ unsafe fn hash_selector(d: *const u8, len: usize) -> u32 {
 
 /// Instance selector for this fat32 volume (0 = unkeyed default provider).
 /// The loader calls this after `module_new` so `state` holds the parsed
-/// `volume:` param; a keyed volume is reached by name through
-/// `provider_call_sel`, never bound.
+/// `volume:` param; a keyed volume is reached only through a handle bound
+/// to its name, never by the class byte.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(
     not(feature = "host-test"),
@@ -9843,7 +9862,9 @@ pub unsafe extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
 
         s.in_chan = in_chan;
-        s.blk.bind(in_chan);
+        // Every buffer a block request names lies in this state: the sector
+        // cache, the write-back runs, the zero block.
+        s.blk.bind(0, state, core::mem::size_of::<Fat32State>());
 
         // Parse params
         let is_tlv =
@@ -9868,7 +9889,11 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut Fat32State);
-        if s.syscalls.is_null() || s.in_chan < 0 {
+        if s.syscalls.is_null() {
+            return StepReturn::error(-1);
+        }
+        if s.in_chan < 0 {
+            log_info(s, b"[fat32] no block stream channel on blocks");
             return StepReturn::error(-1);
         }
 
@@ -10147,8 +10172,8 @@ fn fmt_plan(total: u32, spc: u32) -> Option<(u32, u32, u32)> {
 unsafe fn format_begin(s: &mut Fat32State) -> StepReturn {
     // The format writes through `storage.block` requests whichever way the
     // mount reads, so what it needs is a source that takes writes.
-    if s.blk.caps(&*s.syscalls) != 0
-        || s.blk.flags() & abi::contracts::storage::block::caps::F_WRITE == 0
+    if s.blk.describe(&*s.syscalls) != 0
+        || s.blk.flags() & abi::contracts::storage::block::describe::F_WRITE == 0
         || !s.blk.is_async()
     {
         log_info(
@@ -10220,7 +10245,7 @@ unsafe fn format_zero_step(s: &mut Fat32State) -> StepReturn {
     let t0 = dev_micros(sys);
     let spent = |sys: &SyscallTable| dev_micros(sys).wrapping_sub(t0) >= FMT_ZERO_STEP_US;
     let mut n = 0u32;
-    let zeroes = blk::caps::F_DISCARD | blk::caps::F_DISCARD_ZEROES;
+    let zeroes = blk::describe::F_DISCARD | blk::describe::F_DISCARD_ZEROES;
     let discard = s.blk.flags() & zeroes == zeroes;
     // Every request is submitted, never waited for: the zeroes come from
     // `zero_buf`, which never changes, so a source that borrows the buffer
@@ -10424,6 +10449,12 @@ unsafe fn format_meta_step(s: &mut Fat32State) -> StepReturn {
 unsafe fn init_step(s: &mut Fat32State) -> StepReturn {
     match s.init_phase {
         Fat32InitPhase::Idle => {
+            // How the volume is read follows from the source's description,
+            // so the mount waits until the source gives one: a driver still
+            // bringing its device up answers EAGAIN.
+            if s.blk.describe(&*s.syscalls) == E_AGAIN {
+                return StepReturn::Continue;
+            }
             s.sync_src = u8::from(writable_block_source(s));
             // Every request this provider makes is submitted and reaped; a
             // source that cannot queue would have to be waited on inside
@@ -10435,7 +10466,10 @@ unsafe fn init_step(s: &mut Fat32State) -> StepReturn {
             match start_read(s, 0) {
                 0 => {}
                 1 => return StepReturn::Continue,
-                _ => return StepReturn::error(-1),
+                rc => {
+                    log_rc(s, b"[fat32] blk0 read not started rc=-", rc);
+                    return StepReturn::error(-1);
+                }
             }
             s.init_phase = Fat32InitPhase::WaitBlock0;
             StepReturn::Continue
@@ -10991,10 +11025,10 @@ pub unsafe fn test_intent_lba(state: *const u8) -> u32 {
 
 /// Host-test only: force an already-`module_new`'d `Fat32State` into a
 /// mounted state with an explicit minimal FAT32 geometry, bypassing the
-/// async init state machine (which needs the NOTIFY+channel block-source
-/// protocol). The harness backs the sync block ioctls (`provider_call`
-/// opcode `channel::IOCTL`) with a zeroed RAM disk; the geometry below must match
-/// what the harness sizes that disk for.
+/// async init state machine (which needs a streaming block source). The
+/// harness backs the synchronous `storage.block` requests with a zeroed RAM
+/// disk; the geometry below must match what the harness sizes that disk
+/// for.
 ///
 /// Geometry: 512 B sectors, 8 sectors/cluster (4 KiB clusters),
 /// 32 reserved sectors, 2 FATs of `fat_size_32` sectors each, root at
@@ -11033,7 +11067,7 @@ pub unsafe fn test_force_ready(state: *mut u8, fat_size_32: u32, fsinfo_sector: 
 
 /// Host-test only: mount the volume the block source actually holds, by
 /// running the real MBR / boot-sector parser over LBA 0 through the
-/// synchronous block ioctls.
+/// synchronous `storage.block` requests.
 ///
 /// [`test_force_ready`] hard-codes a geometry instead, which leaves
 /// `parse_mbr` and `parse_boot_sector` — the code that decides where every
@@ -11100,7 +11134,7 @@ pub unsafe fn test_volume_id(state: *const u8) -> u32 {
 
 /// Host-test only: read a writable OpenFile slot's first cluster, so a test
 /// can assert which cluster the allocator handed out (e.g. that the FSINFO
-/// next-free hint was honoured). `slot` is the untagged fd.
+/// next-free hint was honoured). `slot` is the file's slot.
 #[cfg(feature = "host-test")]
 pub unsafe fn test_file_start_cluster(state: *mut u8, slot: i32) -> u32 {
     let s = &*(state as *const Fat32State);

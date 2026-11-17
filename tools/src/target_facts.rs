@@ -76,8 +76,9 @@ pub struct NetCeilings {
     pub datagram_endpoints: u32,
     /// Local addresses, primary included (`MAX_LOCAL_ADDRS`).
     pub local_addresses: u32,
-    /// Packets the decision seam holds by default (`MAX_PACKET_HOLD`, the
-    /// default of `ip`'s declared `packet_holds`).
+    /// Packets the profile sizes the decision seam for (`MAX_PACKET_HOLD`,
+    /// the figure a graph turning the seam on declares as `ip`'s
+    /// `packet_holds`).
     pub packet_hold: u32,
 }
 

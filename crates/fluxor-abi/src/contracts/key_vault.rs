@@ -3,169 +3,384 @@
 //
 // Layer: contracts (public, stable).
 //
-// All operations run in the registered backend; private key material
-// never leaves it (kernel static slots on the software backend, a
-// PKCS#11 token on a hardware backend). Callers see opaque `i32`
-// handles. Arg buffers use little-endian tightly-packed layouts;
-// fields starting with `*_out` are written back by the backend.
+// All operations run in the vault; private key material never leaves it
+// (the software backend's slots, a PKCS#11 token on a hardware backend).
+// Callers see opaque `i32` handles. A module that calls the vault claims it
+// in its manifest (`[[resources]] requires_contract = "key_vault"`), so a
+// graph without a vault is refused when it is composed; nothing asks at
+// run time whether one is there.
 //
-// Backend discovery is three-step: `PROBE` answers "is any backend
-// wired", `SUITE_QUERY` answers "can you use this suite, and what does it
-// cost" (per-suite, with sizes), and `TIER` answers "what isolation level
-// does it provide" (ordinal, [`tier`]). A consumer MUST NOT claim a
-// hardware guarantee it did not read from `TIER`.
+// ## Call shape
+//
+// Every op is one flat `arg` record (little-endian, tightly packed) and at
+// most one bulk `data` span. No field of any record is an address or a
+// handle: an op that names a key names it in the call's `handle`, and an op
+// that needs two keys is two calls. Each layout has one codec below, with
+// the `const fn` lengths a caller sizes its `arg` with.
+//
+// - Small answers (a handle's facts, a suite record, a tier, a tag) are
+//   written back into `arg`; the call returns the bytes it wrote there.
+// - Signatures, public keys, records, wrapped keys and envelopes are
+//   written into `data`; the call returns their length.
+// - Ops that transform bytes (`SIGN`, `ECDH`, the AEADs, `SHARE_REWRAP`)
+//   work IN PLACE: the input is the head of `data` and the answer is
+//   written over `data` from byte 0.
+// - An answer that does not fit `data` is `ERANGE`. An op whose answer has
+//   no fixed length carries a `len` field in `arg`; on `ERANGE` the vault
+//   writes the length it needs there. Nothing is consumed or minted by a
+//   call answered `ERANGE`.
+//
+// ## Resumable `SIGN`
+//
+// A suite whose signature is not cheap to compute inside one caller step
+// (P-256, RSA, ML-DSA: [`describe_suite::flags::RESUMABLE_SIGN`]) signs as
+// a job the vault keeps against the key:
+//
+// 1. The call that starts the job answers `EAGAIN`, always.
+// 2. The caller repeats the IDENTICAL call — same handle, same `arg`, same
+//    input bytes at the head of `data` — once per step. Each answers
+//    `EAGAIN` until the last, which writes the signature over `data` and
+//    returns its length.
+// 3. A different `SIGN` on a key whose job is under way answers `EBUSY` and
+//    starts nothing; the caller asks again later. A job not advanced for
+//    [`sign::JOB_IDLE_MS`] is abandoned, and the next call on the key
+//    replaces it.
+// 4. `EBUSY` also answers a call that finds every job the vault can hold
+//    already under way.
+//
+// A backend that signs whole (a token) never answers `EAGAIN`; a caller
+// handles it anyway. Backend facts — which suites exist, how big each
+// answer is, which sign resumably — come from [`DESCRIBE_SUITE`]; the
+// isolation a backend gives comes from [`TIER`]. A consumer MUST NOT claim
+// a hardware guarantee it did not read from `TIER`.
 
-/// Returns 1 if a key-vault backend is present, 0 if not. Call with
-/// handle=-1 and arg=null to detect at `module_new`.
-pub use super::super::registry::key_vault::PROBE;
-
-/// Store (import) a private key. handle=-1.
-///
-/// arg layout:
-/// ```text
-/// [suite:u16][usage_mask:u32][key_len:u32][key_bytes[key_len]]
-/// ```
-/// Returns an opaque handle (>= 0) or negative errno. Pass the handle back
-/// unmodified to SIGN / ECDH / PUBLIC / DESTROY; do not decode it.
-///
-/// `key_len` is a `u32` so that the field never bounds a key's encoding: an
-/// ML-DSA-87 private key is 4896 bytes.
+/// Import a private key. handle=-1. arg in [`store`]; `data` in = the key's
+/// bytes (their length is the key's). Returns an opaque handle (>= 0) or a
+/// negative errno. Pass the handle back unmodified; do not decode it.
 ///
 /// STORE is an *import* path: the key existed outside the backend and is
-/// received-then-wiped, not never-present. A non-extractable HSM may refuse
-/// it entirely; [`SUITE_QUERY`] reports import support per suite rather
-/// than as one global bit, because tokens differ by algorithm.
+/// received-then-wiped, not never-present. A non-extractable backend may
+/// refuse it entirely; [`DESCRIBE_SUITE`] reports import per suite
+/// ([`describe_suite::flags::IMPORT`]) because tokens differ by algorithm.
 ///
-/// `key_len` is what [`SUITE_QUERY`] reported as `priv_len_out` for the
-/// suite, which is not always the algorithm's encoded private key. FIPS
-/// 204 KeyGen is a deterministic function of a 32-byte seed, so a backend
-/// may hold ML-DSA keys AS that seed and report 32 — the seed reproduces
-/// the encoded key exactly, and a caller holding an already-expanded key
-/// learns from the reported length that this backend is not where it can
-/// import one.
+/// The key's length is the suite's `priv_len`, which is not always the
+/// algorithm's encoded private key. FIPS 204 KeyGen is a deterministic
+/// function of a 32-byte seed, so a backend may hold ML-DSA keys AS that
+/// seed and report 32 — the seed reproduces the encoded key exactly, and a
+/// caller holding an already-expanded key learns from the reported length
+/// that this backend is not where it can import one. An RSA key is its
+/// PKCS#1 `RSAPrivateKey` DER, any length up to the suite's `priv_len`.
 pub use super::super::registry::key_vault::STORE;
 
-/// ECDH: derive shared secret. handle = slot.
+/// ECDH: derive the shared secret. handle = the key (must permit
+/// [`usage::AGREE`]). arg inout [`ecdh`]; `data` inout: the peer's public
+/// key in its first `len` bytes, the shared secret written over `data` from
+/// byte 0. Returns the secret's length (32 for P-256), `ERANGE` with the
+/// requirement in `len`.
 ///
-/// arg layout:
-/// ```text
-/// [peer_len:u32][peer_bytes[peer_len]]
-/// [out_ptr:u64][out_cap:u16][out_len_out:u16]
-/// ```
-/// Returns 0 on success, `-ERANGE` with the requirement in `out_len_out`
-/// when short, negative errno otherwise.
-///
-/// Refused unless the slot's `usage_mask` carries [`usage::AGREE`]. A
-/// signing key used for key agreement is a cross-purpose reuse, and the
+/// A signing key used for key agreement is a cross-purpose reuse, and the
 /// place to stop it is the mask rather than the caller's discipline.
 pub use super::super::registry::key_vault::ECDH;
 
-/// Sign with the slot's private key. handle = slot.
+/// Sign with the key. handle = the key (must permit [`usage::SIGN`]). arg
+/// inout [`sign`]; `data` inout: the input in its first `len` bytes, the
+/// signature written over `data` from byte 0. Returns the signature's
+/// length; `ERANGE` with the requirement in `len`; `EAGAIN` / `EBUSY` under
+/// the resumable rule (module header).
 ///
-/// arg layout:
-/// ```text
-/// [sign_mode:u8][_pad:u8][input_len:u32][input[input_len]]
-/// [sig_out_ptr:u64][sig_out_cap:u16][sig_len_out:u16]
-/// ```
-/// Returns 0 on success, `-ERANGE` with `sig_len_out` set to the
-/// requirement when the buffer is short, negative errno otherwise.
-///
-/// `sign_mode` is on the wire rather than inferred from the suite — see
-/// [`sign_mode`]. Inferring it means a caller that hands a P-256 slot a
+/// `mode` is on the wire rather than inferred from the suite — see
+/// [`sign_mode`]. Inferring it means a caller that hands a P-256 key a
 /// message rather than its digest gets a valid signature over the wrong
 /// thing, with nothing on the wire saying which convention applied.
 ///
-/// The signature is variable-length. A fixed `[u8; 64]` is exactly right
-/// for ES256 and Ed25519 and wrong for every suite past them: ML-DSA-65's
-/// is 3309 bytes. Sizing from [`SUITE_QUERY`] is what lets a caller
-/// allocate correctly without knowing which suite the slot holds.
-///
-/// - P-256: ECDSA over the digest with `DIGEST`. The software backend uses
-///   the deterministic RFC 6979 nonce; a hardware backend may use random-k,
-///   producing different-but-valid signatures (verify, don't byte-compare).
-///   The 64-byte low-s `r‖s` output is exactly the JWS ES256 segment.
+/// - P-256: ECDSA over the digest with `DIGEST` (at most 64 bytes). The
+///   software backend uses the deterministic RFC 6979 nonce; a hardware
+///   backend may use random-k, producing different-but-valid signatures
+///   (verify, don't byte-compare). The 64-byte low-s `r‖s` output is
+///   exactly the JWS ES256 segment. Resumable.
 /// - Ed25519: `RAW` over the full message (RFC 8032 is not prehashed).
-///   Output is the 64-byte `R‖S`, deterministic by spec on every backend.
+///   Output is the 64-byte `R‖S`.
 /// - HMAC-SHA256: `RAW` over the full message; the 32-byte output is the
-///   RFC 2104 tag. Deterministic, and the only thing the key ever yields.
+///   RFC 2104 tag.
 /// - ML-DSA: `RAW` over the full message. The pure FIPS 204 variant is not
-///   prehashed — HashML-DSA is a different algorithm, not a mode of this
-///   one — and `PREHASH` is refused rather than answered with it. The
-///   signature is 2420 / 3309 / 4627 bytes by parameter set, so a caller
-///   must size its buffer from [`SUITE_QUERY`] and not from a constant.
+///   prehashed — HashML-DSA is a different algorithm — and `PREHASH` is
+///   refused rather than answered with it. The signature is 2420 / 3309 /
+///   4627 bytes by parameter set. Resumable.
+/// - RSA: RSASSA-PSS-SHA256 with a 32-byte salt over a 32-byte SHA-256
+///   digest (`DIGEST`); the signature is the modulus width. Resumable.
 pub use super::super::registry::key_vault::SIGN;
 
-/// ECDSA verify (P-256) with a caller-supplied public key — the stored
-/// slots are not consulted. handle=-1.
-/// arg layout: [hash_len:u16][sig_len:u16][pub_len:u16][_pad:u16]
-///             [hash_bytes[hash_len]][sig_bytes[sig_len]][pub_bytes[pub_len]]
-/// - sig_len must be 64 (raw r‖s); pub_len >= 64 (SEC1 uncompressed,
-///   with or without the leading 0x04 byte).
+/// Verify a signature. arg in [`verify`]; `data` in = message ‖ signature ‖
+/// public key, at the lengths `arg` gives. Returns 1 if valid, 0 if not,
+/// a negative errno on malformed input.
 ///
-/// With a slot handle instead of -1 the slot must hold an
-/// [`suite::HMAC_SHA256`] key permitting [`usage::VERIFY`], and the same
-/// layout carries the message in the hash field, the 32-byte tag in the
-/// signature field and `pub_len = 0`; the backend recomputes the tag and
-/// compares in constant time. The tag is checked inside the backend rather
-/// than handed to the caller to compare, so the comparison cannot be
+/// With handle=-1: ECDSA P-256 under the caller's public key (the stored
+/// keys are not consulted). The message is the digest; the signature is the
+/// 64-byte raw `r‖s`; the public key is SEC1 uncompressed, with or without
+/// its leading 0x04.
+///
+/// With a key's handle: the key must hold an [`suite::HMAC_SHA256`] key
+/// permitting [`usage::VERIFY`]; the message is the whole message, the
+/// signature the 32-byte tag, and the public key empty. The vault recomputes
+/// the tag and compares in constant time, so the comparison cannot be
 /// written wrong at any of the places it would otherwise be written.
-///
-/// Returns 1 if valid, 0 if invalid, negative errno on malformed input.
 pub use super::super::registry::key_vault::VERIFY;
 
-/// Zeroise and free the slot. handle = slot. Returns 0.
+/// Zeroise and free the key. handle = the key. Returns 0.
 pub use super::super::registry::key_vault::DESTROY;
 
-/// Generate a keypair inside the backend. handle=-1.
-///
-/// arg layout:
-/// ```text
-/// [suite:u16][usage_mask:u32][flags:u8][_pad:u8]
-/// [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
-/// ```
-/// Returns an opaque handle (>= 0) or negative errno, with the public key
-/// written into `pub_out_ptr` and its length into `pub_len_out`;
-/// `-ERANGE` with the requirement in `pub_len_out` when short.
+/// Generate a key inside the backend. handle=-1. arg inout [`generate`];
+/// `data` out = the public key. Returns an opaque handle (>= 0), with the
+/// public key's length in `len`; `ERANGE` with the requirement in `len`.
 ///
 /// The private key is born in backend custody and never exists in the
 /// clear anywhere — the only path that gives true "key never leaves", and
 /// the only one a non-extractable HSM supports.
 ///
-/// `usage_mask` is sealed into the key here and checked on every later
-/// operation. Sealed at birth rather than checked at the call site,
-/// because a call-site check is one some call site will not have.
+/// `usage` is sealed into the key here and checked on every later
+/// operation: sealed at birth rather than checked at the call site, because
+/// a call-site check is one some call site will not have.
 pub use super::super::registry::key_vault::GENERATE;
 
-/// Return the public key for a slot (for JWK/JWKS/kid derivation).
-///
-/// handle = slot. arg layout:
-/// `[out_ptr:u64][out_cap:u16][out_len_out:u16]`. Returns 0, or `-ERANGE`
-/// with the requirement in `out_len_out`.
-///
-/// Public material only, and refused unless the slot's `usage_mask`
-/// carries [`usage::EXPORT_PUBLIC`] — which never implies the private half
-/// may be exported.
+/// The key's public half (for JWK/JWKS/kid derivation). handle = the key
+/// (must permit [`usage::EXPORT_PUBLIC`], which never implies the private
+/// half may be exported). arg out [`public`]; `data` out = the public key.
+/// Returns its length; `ERANGE` with the requirement in `arg`.
 pub use super::super::registry::key_vault::PUBLIC;
 
-/// Report the backend's isolation tier. handle=-1, arg → 1-byte
-/// buffer; writes a `u8` ordinal (see [`tier`]), returns 1.
+/// The backend's isolation tier. handle=-1. arg out `[tier u8]` (a
+/// [`tier`] ordinal); returns 1.
 ///
 /// Tiers are mutually-exclusive ordinal levels (not independent
 /// capabilities, hence not per-suite); a consumer with a security
-/// requirement checks `tier >= N` and MUST NOT claim a hardware
-/// guarantee it did not read from here.
+/// requirement checks `tier >= N` and MUST NOT claim a hardware guarantee
+/// it did not read from here.
 pub use super::super::registry::key_vault::TIER;
 
-/// Key suites: what a slot's key bytes mean, which operations it admits,
-/// and how big each answer is.
+/// Open the key named by `label`, generating it if it does not exist.
+/// handle=-1. arg inout [`open`]; `data` out = the public key. Returns an
+/// opaque handle (>= 0) with the public key's length in `len`, or:
+/// - `EACCES`: the key exists under another suite, or with fewer uses than
+///   `usage` asks for;
+/// - `EBUSY`: another instance of the caller's module type holds it open;
+/// - `ENOMEM`: no slot is free;
+/// - `ERANGE`: `data` is short for the public key, whose length is in
+///   `len` (nothing was opened or made);
+/// - `EAGAIN`: the vault's store cannot be read yet, or the key (`PERSIST`)
+///   is not on the store's medium yet; asked again, the same key is
+///   answered once it is;
+/// - `ERROR`: the store's medium refused the key's record.
+///
+/// **This is the operation that makes an issuer key survive a restart**,
+/// and it is one operation rather than "does it exist?" then "create it"
+/// because those two are a race: two instances starting together would
+/// both see absence and both generate.
+///
+/// `usage` is sealed into the key at creation. On an existing key it is
+/// CHECKED, not applied: a key's permitted uses must not be something a
+/// later caller can widen by asking.
+pub use super::super::registry::key_vault::OPEN_OR_GENERATE;
+
+/// Open an existing key by label, failing (`ENOENT`) if absent. handle=-1,
+/// as [`OPEN_OR_GENERATE`].
+///
+/// Separate from `OPEN_OR_GENERATE` because "use the existing issuer key"
+/// and "use it, creating one if needed" are different intentions, and a
+/// verifier that silently generated a key would verify nothing while
+/// appearing to work.
+pub use super::super::registry::key_vault::OPEN;
+
+/// Destroy the key named by `label`, wherever it is stored. handle=-1. arg
+/// in [`destroy_by_label`]. Returns 0, `ENOENT` when no key has the label,
+/// `EAGAIN` while the vault's store cannot be read yet or its medium still
+/// holds the record (asked again once it does not, the label names nothing:
+/// `ENOENT`), or `ERROR` when the sealed record could not be removed (it
+/// would come back).
+///
+/// By label rather than by handle because the point is to remove the
+/// PERSISTED key: destroying a handle frees a slot and leaves the sealed
+/// record, which would come back on the next open.
+pub use super::super::registry::key_vault::DESTROY_BY_LABEL;
+
+/// What a key is. handle = the key. arg out [`describe`]; returns 8.
+///
+/// Exists so a consumer can check what it actually got rather than what it
+/// asked for. `persisted` sits next to `tier` and is deliberately separate
+/// from it: a caller that conflates the two is the failure mode this whole
+/// surface is shaped to prevent.
+pub use super::super::registry::key_vault::DESCRIBE;
+
+/// What the vault can do with a suite. handle=-1. arg inout
+/// [`describe_suite`]: in a cursor, out the record of the first suite the
+/// vault supports whose id is at least the cursor, and the cursor that
+/// follows it. Returns [`describe_suite::LEN`]; `ENOENT` past the last.
+///
+/// One op answers both questions a caller has: "can you use suite S?"
+/// (cursor = S; the answer is S's record exactly when the record's `suite`
+/// is S) and "which suites can you use?" (cursor 0, then each `next` until
+/// `ENOENT`).
+///
+/// Lengths rather than a capability bitmap, because a bitmap answers "is
+/// P-256 supported" and cannot answer "how big is an ML-DSA-65 signature",
+/// which is what a caller sizing a buffer needs.
+pub use super::super::registry::key_vault::DESCRIBE_SUITE;
+
+/// Sign the running composition. handle = a signing key. arg inout
+/// [`attest_composition`]; `data` out = `[record][signature]`, where the
+/// record is the kernel's composition record (`scheduler::attest`, prefix
+/// `"FXAT"`) ending in the vault's tier byte, and the signature is over the
+/// record in the key's suite convention: ECDSA over the record's SHA-256 for
+/// P-256, the whole record for Ed25519 and ML-DSA. Returns the length
+/// written; `ERANGE` with the requirement in `len`.
+///
+/// The challenge is the caller's, so the answer cannot be replayed; the
+/// record carries the boot incarnation, so it cannot outlive the boot. What
+/// the signature MEANS is the tier byte's: `DEVICE_HW` says this hardware
+/// runs exactly this closure, `SOFTWARE` says a readable process does. The
+/// composition digest — SHA-256 of the record with the challenge zeroed —
+/// is the identity [`KEY_WRAP`] binds to.
+pub use super::super::registry::key_vault::ATTEST_COMPOSITION;
+
+/// Wrap the key for one destination vault. handle = the key (must permit
+/// [`usage::WRAP`]). arg inout [`key_wrap`]; `data` out = the wrapped key
+/// (layout [`wrap`]). Returns its length; `ERANGE` with the requirement in
+/// `len`.
+///
+/// The wrapped key is `["FXKW"][eph_pub:65][attest_digest:32][nonce:12]
+/// [sealed][tag:16]`, `sealed` being `[suite:u16][usage:u32][key_len:u8]
+/// [key]` under a key derived from an ephemeral ECDH with `dest_pub`,
+/// salted by `attest_digest`, and authenticated with every header byte
+/// before it (magic to nonce) as AAD. The key never appears in the clear on
+/// any surface: only the vault holding `dest_pub`'s private half can open
+/// it, and only while its composition still digests to `attest_digest`.
+pub use super::super::registry::key_vault::KEY_WRAP;
+
+/// Unwrap into a fresh key. handle = the key holding this vault's P-256
+/// private key (must permit [`usage::AGREE`]). No arg; `data` in = the
+/// wrapped key. Returns the new key's handle, or `EACCES` when the wrapped
+/// key's `attest_digest` is not this composition's digest — the composition
+/// changed since it was attested, and the key was wrapped for the one that
+/// was — or `EINVAL` when it does not open.
+pub use super::super::registry::key_vault::KEY_UNWRAP;
+
+/// Seal bytes under an [`suite::AEAD_KEY`] key (must permit
+/// [`usage::SEAL`]) with a nonce the vault draws. arg inout [`aead`]: in
+/// the associated data and the plaintext's length, out the nonce; `data`
+/// inout: the plaintext in its first `len` bytes, sealed in place with the
+/// 16-byte tag appended. Returns `len + 16`; `ERANGE` (with `len + 16` in
+/// `len`) when `data` is shorter.
+///
+/// The nonce is fresh from the CSPRNG per call; the caller keeps it with
+/// the ciphertext. What the bytes mean — a resumption ticket, a checkpoint
+/// — is the caller's; the vault only guarantees that the key never leaves
+/// it.
+pub use super::super::registry::key_vault::AEAD_SEAL;
+
+/// Open what [`AEAD_SEAL`] produced. handle = the key (must permit
+/// [`usage::OPEN`]). arg in [`aead`]: the nonce, the associated data and
+/// the sealed length (ciphertext and tag); `data` inout: the sealed bytes,
+/// opened in place. Returns `len - 16`, or `EINVAL` when the tag does not
+/// verify (the bytes are zeroed: unauthenticated plaintext is never left
+/// behind).
+pub use super::super::registry::key_vault::AEAD_OPEN;
+
+/// Derive a purpose key from a [`suite::KDF_KEY`] key. handle = the master
+/// (must permit [`usage::DERIVE`]). arg in [`derive`]. Returns a new handle,
+/// owned by the caller, holding `HKDF-SHA256(ikm = master, salt =
+/// derive::SALT, info = label ‖ context)` as a key of the target suite with
+/// the target uses. A derived key is never persisted: it is derived again
+/// when needed.
+pub use super::super::registry::key_vault::DERIVE;
+
+/// Seal one storage unit in place under an AEAD key ([`suite::AEAD_KEY`] or
+/// [`suite::AEAD_AES256_GCM`], must permit [`usage::SEAL`]) with the nonce
+/// the caller names. arg inout [`units`]: in the nonce and associated data,
+/// out the 16-byte tag; `data` inout = the unit, sealed in place. Returns 0.
+///
+/// The caller chooses the nonce, so its uniqueness under the key is the
+/// caller's obligation — the reason this exists beside [`AEAD_SEAL`], whose
+/// vault-drawn random nonces suit a record now and then and not a storage
+/// device writing the same key for years. The tag stays apart from the unit
+/// because a block device keeps it apart.
+pub use super::super::registry::key_vault::AEAD_SEAL_UNITS;
+
+/// Open one storage unit in place, checking its tag. arg in [`units`] (the
+/// nonce, the tag, the associated data); `data` inout = the unit. Returns 0,
+/// or `EINVAL` when the tag does not verify (the unit is zeroed, so
+/// unauthenticated plaintext is never left behind).
+pub use super::super::registry::key_vault::AEAD_OPEN_UNITS;
+
+/// Split a 32-byte key 2-of-3 and wrap each share to its own recipient.
+/// handle = the key (must permit [`usage::WRAP`]; a [`suite::KDF_KEY`],
+/// [`suite::AEAD_KEY`] or [`suite::AEAD_AES256_GCM`]). arg in
+/// [`share::split`]; `data` out = three [`share`] envelopes, for share
+/// indices 1, 2 and 3 in recipient order. Returns
+/// [`share::split::OUT_LEN`]; `ERANGE` when `data` is shorter.
+///
+/// The shares exist only inside the call: each is sealed to its recipient
+/// as it is made, and the scratch is zeroed. Any two envelopes, opened by
+/// their recipients, give the key back through [`SHARE_COMBINE`]; one gives
+/// nothing.
+pub use super::super::registry::key_vault::SHARE_SPLIT;
+
+/// Open one share envelope and seal the share to another recipient.
+/// handle = the P-256 key the envelope is wrapped to (must permit
+/// [`usage::AGREE`] and [`usage::EXPORT_PUBLIC`]: an envelope names its
+/// recipient by public key). arg in [`share::rewrap`]; `data` inout = the
+/// envelope, rewrapped in place. Returns [`share::P256_LEN`].
+///
+/// What a custodian does to release its share: the share leaves this vault
+/// only sealed to the new recipient, bound to a new purpose, lease fence,
+/// expiry and policy digest. The recovery set, protected resource, epoch
+/// and share index are carried over and cannot be changed.
+pub use super::super::registry::key_vault::SHARE_REWRAP;
+
+/// Reconstruct a key from two share envelopes, one envelope per call.
+/// handle = the key the envelope is wrapped to (must permit
+/// [`usage::AGREE`] and [`usage::EXPORT_PUBLIC`], held in any backend).
+/// arg in [`share::combine`]; `data` in = the envelope.
+///
+/// The first envelope is opened and its share held by the vault for the
+/// caller: the call answers `EINPROGRESS`. The second — the same recovery
+/// set, resource, epoch and AEAD, another share index, the same `arg` —
+/// reconstructs the key into a fresh handle, owned by the caller, which the
+/// call returns. Each call answers, without holding anything:
+/// - `EINVAL`: the envelope is malformed or does not open, or it does not
+///   pair with the share held (another set, resource, epoch or AEAD, or the
+///   same index);
+/// - `EACCES`: the envelope is not wrapped to the handle opening it, has
+///   expired (or carries an expiry with no wall clock to check it), was
+///   already consumed, or is for another resource or epoch than asked.
+///
+/// A refusal drops the share held, so the caller starts again from the
+/// first envelope; a first envelope of another set replaces it. Neither a
+/// share nor the key is ever written to the caller, and the new key is
+/// never persisted: a volume attaches again after a restart.
+pub use super::super::registry::key_vault::SHARE_COMBINE;
+
+/// Attest a key: evidence of what a handle is, bound to a caller's
+/// challenge, never its bytes. handle = the key attested. arg in
+/// `[challenge:32]` ([`attest_key`]); `data` out = the record. Returns
+/// [`attest_key::RECORD_LEN`].
+///
+/// The record commits to the key without revealing it, names its suite,
+/// uses, owner namespace, persistence and the vault's tier, and carries the
+/// composition digest. The caller signs it with the key it attests under
+/// ([`SIGN`]: P-256 over the record's SHA-256 with `DIGEST`, Ed25519 and
+/// ML-DSA over the record with `RAW`), so a verifier that trusts that key's
+/// public half learns which composition holds which kind of key under which
+/// policy.
+pub use super::super::registry::key_vault::ATTEST_KEY;
+
+/// Key suites: what a key's bytes mean, which operations it admits, and
+/// how big each answer is.
 ///
 /// A `u16` because the space this has to hold is large: each post-quantum
 /// family comes in several parameter sets, and every hybrid is its own
 /// entry.
 ///
-/// **Naming a suite is not implementing it.** [`SUITE_QUERY`] is the only
-/// thing that says whether a backend can use one: `P384` and `ML_KEM_768`
-/// are ids a backend may report `ENOSYS` for.
+/// **Naming a suite is not implementing it.** [`DESCRIBE_SUITE`] is the
+/// only thing that says whether a backend can use one.
 pub mod suite {
     /// No suite. Never valid: a key that does not say what it is cannot be
     /// used, and defaulting one picks the answer for the caller.
@@ -179,41 +394,30 @@ pub mod suite {
     pub const ML_DSA_65: u16 = 5;
     pub const ML_DSA_87: u16 = 6;
     pub const ML_KEM_768: u16 = 7;
-    /// A 32-byte ChaCha20-Poly1305 key for [`AEAD_SEAL`] / [`AEAD_OPEN`]:
-    /// the shape a resumption-ticket key or any other sealing key takes.
-    /// It signs nothing and has no public half.
+    /// A 32-byte ChaCha20-Poly1305 key for [`super::AEAD_SEAL`] /
+    /// [`super::AEAD_OPEN`]: the shape a resumption-ticket key or any other
+    /// sealing key takes. It signs nothing and has no public half.
     pub const AEAD_KEY: u16 = 8;
     /// A 32-byte HMAC-SHA256 key (RFC 2104): a shared secret whose tag is
-    /// produced by [`SIGN`] and checked by [`VERIFY`] against the slot.
-    /// The shape a TSIG key (RFC 8945) takes. It has no public half and is
-    /// never readable back: the only answers a holder gets are tags.
+    /// produced by [`super::SIGN`] and checked by [`super::VERIFY`] against
+    /// the key. The shape a TSIG key (RFC 8945) takes. It has no public half
+    /// and is never readable back: the only answers a holder gets are tags.
     pub const HMAC_SHA256: u16 = 9;
     /// RSA keys by modulus width, for RSASSA-PSS-SHA256 signatures over a
-    /// caller-supplied SHA-256 digest ([`sign_mode::DIGEST`]) with a
-    /// 32-byte salt — the one encoding TLS 1.3 asks of an rsaEncryption
-    /// key. One suite per width because [`SUITE_QUERY`] reports fixed
-    /// lengths per suite. The private key a backend holds is the PKCS#1
-    /// `RSAPrivateKey` DER with its CRT fields; the reported private
-    /// length is the CEILING for the width, and [`STORE`] admits any DER
-    /// up to it. A signature is the modulus width; the public half is the
+    /// caller-supplied SHA-256 digest with a 32-byte salt — the one encoding
+    /// TLS 1.3 asks of an rsaEncryption key. One suite per width because
+    /// [`super::DESCRIBE_SUITE`] reports fixed lengths per suite. The
+    /// private key is the PKCS#1 `RSAPrivateKey` DER with its CRT fields;
+    /// the reported private length is the CEILING for the width. A
+    /// signature is the modulus width; the public half is the
     /// `RSAPublicKey` DER.
-    ///
-    /// A private operation is milliseconds on the fastest target this
-    /// runs on, and a [`SIGN`] runs inside the caller's step, so RSA
-    /// signing is RESUMABLE: the first `SIGN` on a slot starts the
-    /// operation and answers `EAGAIN` after a bounded amount of it; each
-    /// further `SIGN` with the same digest advances it and answers
-    /// `EAGAIN` until the last, which answers the signature. A `SIGN`
-    /// with another digest, or on another slot, while one is in progress
-    /// answers `EBUSY`. A backend that signs whole (a token) simply never
-    /// answers `EAGAIN`.
     pub const RSA_2048: u16 = 10;
     pub const RSA_3072: u16 = 11;
     pub const RSA_4096: u16 = 12;
-
     /// A sealing key for AES-256-GCM, 32 bytes, no public half. Offered
     /// only where the block cipher runs in constant time: elsewhere
-    /// `SUITE_QUERY` answers `ENOSYS`, and `AEAD_KEY` is the sealing suite.
+    /// [`super::DESCRIBE_SUITE`] skips it, and `AEAD_KEY` is the sealing
+    /// suite.
     pub const AEAD_AES256_GCM: u16 = 13;
     /// A key-derivation master, 32 bytes, no public half: its only use is
     /// [`super::usage::DERIVE`], which makes purpose keys from it. A volume,
@@ -224,14 +428,11 @@ pub mod suite {
     pub const MAX_ID: u16 = KDF_KEY;
 }
 
-/// How [`SIGN`] should treat the bytes it is given.
+/// How [`SIGN`] treats the bytes it is given.
 ///
 /// On the wire rather than inferred from the suite. Inference would hold
-/// only while each suite has one convention — a P-256 slot gets a digest,
-/// an Ed25519 slot gets the whole message — and it requires the caller to
-/// know which without the wire ever saying, so a caller that hands a P-256
-/// slot a message rather than its digest gets a valid signature over the
-/// wrong thing.
+/// only while each suite has one convention, and it requires the caller to
+/// know which without the wire ever saying.
 pub mod sign_mode {
     /// Sign the bytes as given. Ed25519's convention (RFC 8032 signs the
     /// full message).
@@ -242,12 +443,10 @@ pub mod sign_mode {
     /// before signing.
     pub const PREHASH: u8 = 2;
     /// As `RAW`, with a domain-separation context string prefixed
-    /// (Ed25519ctx, ML-DSA's context parameter).
-    ///
-    /// The [`SIGN`] arg layout carries no context field, so a backend
-    /// that cannot express the request refuses it rather than signing
-    /// under the empty context: a signature in a domain the caller did
-    /// not ask for is worse than no signature, because it verifies.
+    /// (Ed25519ctx, ML-DSA's context parameter). The [`super::sign`] layout
+    /// carries no context field, so a backend refuses it rather than
+    /// signing under the empty context: a signature in a domain the caller
+    /// did not ask for is worse than no signature, because it verifies.
     pub const CONTEXT: u8 = 3;
 }
 
@@ -257,8 +456,7 @@ pub mod sign_mode {
 /// A key created for signing must not later be usable for key agreement,
 /// however convenient that would be at the call site. Cross-purpose reuse
 /// is the shape behind a long list of protocol breaks, and the only
-/// reliable place to stop it is where the key is born — a check at the
-/// call site is a check some call site will not have.
+/// reliable place to stop it is where the key is born.
 pub mod usage {
     pub const SIGN: u32 = 1 << 0;
     pub const VERIFY: u32 = 1 << 1;
@@ -266,102 +464,370 @@ pub mod usage {
     /// The public half may be exported. Never implies the private half
     /// can be.
     pub const EXPORT_PUBLIC: u32 = 1 << 3;
-    /// The key may be persisted across a restart — and note that
-    /// persistence says nothing about isolation, which is [`TIER`]'s
-    /// business.
+    /// The key may be persisted across a restart — and persistence says
+    /// nothing about isolation, which is [`super::TIER`]'s business.
     pub const PERSIST: u32 = 1 << 4;
-    /// The key may leave the vault WRAPPED ([`KEY_WRAP`]): sealed to a
-    /// destination vault's public key and bound to that vault's attested
-    /// composition, never in the clear. A key without this bit never
-    /// leaves at all.
+    /// The key may leave the vault WRAPPED ([`super::KEY_WRAP`]): sealed to
+    /// a destination vault's public key and bound to that vault's attested
+    /// composition, never in the clear. A key without this bit never leaves
+    /// at all.
     pub const WRAP: u32 = 1 << 5;
-    /// The key may seal ([`AEAD_SEAL`], [`AEAD_SEAL_UNITS`]).
+    /// The key may seal ([`super::AEAD_SEAL`], [`super::AEAD_SEAL_UNITS`]).
     pub const SEAL: u32 = 1 << 6;
+    /// The key may open ([`super::AEAD_OPEN`], [`super::AEAD_OPEN_UNITS`]).
+    pub const OPEN: u32 = 1 << 7;
     /// Derive purpose keys from this key ([`super::DERIVE`]).
     pub const DERIVE: u32 = 1 << 8;
-    /// The key may open ([`AEAD_OPEN`], [`AEAD_OPEN_UNITS`]).
-    pub const OPEN: u32 = 1 << 7;
 }
 
 /// Longest key label. Labels name a key across restarts, so this bounds
 /// what a backend must be able to store and index.
 pub const MAX_LABEL: usize = 64;
 
-/// Open the key named by `label`, generating it if it does not exist.
-///
-/// handle=-1. arg layout:
-/// ```text
-/// [suite:u16][usage_mask:u32][flags:u8][label_len:u8]
-/// [label[label_len]]
-/// [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
-/// ```
-/// Returns an opaque handle (>= 0), or a negative errno:
-/// - `-EACCES`: the key exists under another suite, or with fewer uses than
-///   `usage_mask` asks for;
-/// - `-EBUSY`: another instance of the caller's module type holds the key
-///   open;
-/// - `-ENOMEM`: no slot is free;
-/// - `-ERANGE`: the public-key buffer is short (nothing was opened or made);
-/// - `-EAGAIN`: the vault's store cannot be read yet, or the key (`PERSIST`)
-///   is not on the store's medium yet; asked again, the same key is answered
-///   once it is;
-/// - `-1`: the store's medium refused the key's record.
-///
-/// **This is the operation that makes an issuer key survive a restart**,
-/// and it is one operation rather than "does it exist?" then "create it"
-/// because those two are a race: two instances starting together would
-/// both see absence and both generate, and one would then be signing
-/// under a key nothing else trusts.
-///
-/// `usage_mask` is sealed into the key at creation. On an existing key it
-/// is CHECKED, not applied: reopening with a wider mask than the key was
-/// born with is refused, because a key's permitted uses must not be
-/// something a later caller can widen by asking.
-///
-/// Writes the public key into `pub_out_ptr` and its length into
-/// `pub_len_out`. When the buffer is too small the call returns `-ERANGE`
-/// with `pub_len_out` set to what was required — the caller resizes once
-/// rather than guessing, which matters when a suite's public key is 2 KB.
-pub use super::super::registry::key_vault::OPEN_OR_GENERATE;
+/// The little-endian `u16` at `b[at..]`.
+fn rd16(b: &[u8], at: usize) -> Option<u16> {
+    let s = b.get(at..at.checked_add(2)?)?;
+    Some(u16::from_le_bytes([s[0], s[1]]))
+}
 
-/// Open an existing key by label, failing if absent.
-///
-/// handle=-1, same arg layout as [`OPEN_OR_GENERATE`]. Returns `-ENOENT`
-/// when no key of that label exists.
-///
-/// Separate from `OPEN_OR_GENERATE` because "use the existing issuer key"
-/// and "use it, creating one if needed" are different intentions, and a
-/// verifier that silently generated a key would verify nothing while
-/// appearing to work.
-pub use super::super::registry::key_vault::OPEN;
+/// The little-endian `u32` at `b[at..]`.
+fn rd32(b: &[u8], at: usize) -> Option<u32> {
+    let s = b.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
 
-/// Destroy the key named by `label`, wherever it is stored.
-///
-/// handle=-1. arg layout: `[label_len:u8][label[label_len]]`.
-/// Returns 0, `-ENOENT` when no key has the label, `-EAGAIN` while the
-/// vault's store cannot be read yet or its medium still holds the record
-/// (asked again once it does not, the label names nothing: `-ENOENT`), or
-/// the generic error (`-1`) when the sealed record could not be removed (it
-/// would come back).
-///
-/// By label rather than by handle because the point is to remove the
-/// PERSISTED key: destroying a handle frees a slot and leaves the sealed
-/// blob, which would come back on the next open.
-pub use super::super::registry::key_vault::DESTROY_BY_LABEL;
+/// Write `bytes` at `b[at..]`; false when they do not fit.
+fn wr(b: &mut [u8], at: usize, bytes: &[u8]) -> bool {
+    match at
+        .checked_add(bytes.len())
+        .and_then(|end| b.get_mut(at..end))
+    {
+        Some(d) => {
+            d.copy_from_slice(bytes);
+            true
+        }
+        None => false,
+    }
+}
 
-/// Report what a slot is.
-///
-/// handle = slot. arg layout:
-/// `[suite_out:u16][usage_out:u32][tier_out:u8][persisted_out:u8]`.
-/// Returns 8 on success.
-///
-/// Exists so a consumer can check what it actually got rather than what
-/// it asked for. `persisted_out` sits next to `tier_out` and is
-/// deliberately separate from it: a caller that conflates the two is the
-/// failure mode this whole surface is shaped to prevent.
-pub use super::super::registry::key_vault::DESCRIBE;
+/// The `len` field of an op that has one: read and rewritten at `at`.
+fn len_at(arg: &[u8], at: usize) -> Option<usize> {
+    rd32(arg, at).map(|n| n as usize)
+}
 
-/// `persisted_out` values of [`DESCRIBE`].
+/// Write `n` into the `len` field at `at`; false when `arg` is short.
+fn set_len_at(arg: &mut [u8], at: usize, n: usize) -> bool {
+    wr(arg, at, &(n as u32).to_le_bytes())
+}
+
+/// [`STORE`]: arg in `[suite:u16][usage:u32]`; `data` in = the key.
+pub mod store {
+    pub const ARG_LEN: usize = 6;
+    /// Most bytes a key may hold: the RSA-4096 DER ceiling, with room.
+    pub const KEY_MAX: usize = 4096;
+
+    pub const fn encode(suite: u16, usage: u32) -> [u8; ARG_LEN] {
+        let s = suite.to_le_bytes();
+        let u = usage.to_le_bytes();
+        [s[0], s[1], u[0], u[1], u[2], u[3]]
+    }
+
+    /// `(suite, usage)`.
+    pub fn parse(arg: &[u8]) -> Option<(u16, u32)> {
+        Some((super::rd16(arg, 0)?, super::rd32(arg, 2)?))
+    }
+}
+
+/// [`SIGN`]: arg inout `[mode:u8][0:u8][len:u32]`. In: `len` is how many
+/// bytes at the head of `data` are the input. Out on `ERANGE`: `len` is the
+/// signature length `data` must hold.
+pub mod sign {
+    pub const ARG_LEN: usize = 6;
+    pub const LEN: usize = 2;
+    /// Most bytes a P-256 `DIGEST` input may hold.
+    pub const DIGEST_MAX: usize = 64;
+    /// A resumable job not advanced for this long is abandoned.
+    pub const JOB_IDLE_MS: u64 = 1000;
+
+    pub const fn encode(mode: u8, len: u32) -> [u8; ARG_LEN] {
+        let l = len.to_le_bytes();
+        [mode, 0, l[0], l[1], l[2], l[3]]
+    }
+
+    /// `(mode, len)`.
+    pub fn parse(arg: &[u8]) -> Option<(u8, usize)> {
+        if arg.len() < ARG_LEN {
+            return None;
+        }
+        Some((arg[0], super::len_at(arg, LEN)?))
+    }
+
+    /// The length field: the requirement after `ERANGE`.
+    pub fn len(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, LEN)
+    }
+
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, LEN, n)
+    }
+}
+
+/// [`ECDH`]: arg inout `[len:u32]`. In: `len` is the peer key's length at
+/// the head of `data`. Out on `ERANGE`: the secret's length.
+pub mod ecdh {
+    pub const ARG_LEN: usize = 4;
+    pub const LEN: usize = 0;
+    /// Most bytes a peer key may hold.
+    pub const PEER_MAX: usize = 256;
+
+    pub const fn encode(len: u32) -> [u8; ARG_LEN] {
+        len.to_le_bytes()
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, LEN)
+    }
+
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, LEN, n)
+    }
+}
+
+/// [`VERIFY`]: arg in `[msg_len:u32][sig_len:u16][pub_len:u16]`; `data` in =
+/// message ‖ signature ‖ public key.
+pub mod verify {
+    pub const ARG_LEN: usize = 8;
+
+    /// The lengths of the three parts of `data`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Lens {
+        pub msg: usize,
+        pub sig: usize,
+        pub public: usize,
+    }
+
+    impl Lens {
+        /// Bytes of `data` the three parts take.
+        pub const fn total(&self) -> usize {
+            self.msg + self.sig + self.public
+        }
+    }
+
+    pub const fn encode(msg: u32, sig: u16, public: u16) -> [u8; ARG_LEN] {
+        let m = msg.to_le_bytes();
+        let s = sig.to_le_bytes();
+        let p = public.to_le_bytes();
+        [m[0], m[1], m[2], m[3], s[0], s[1], p[0], p[1]]
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<Lens> {
+        Some(Lens {
+            msg: super::rd32(arg, 0)? as usize,
+            sig: super::rd16(arg, 4)? as usize,
+            public: super::rd16(arg, 6)? as usize,
+        })
+    }
+
+    /// `data` split into `(message, signature, public key)`, or `None` when
+    /// it does not hold them.
+    pub fn split(data: &[u8], l: Lens) -> Option<(&[u8], &[u8], &[u8])> {
+        let msg_end = l.msg;
+        let sig_end = msg_end.checked_add(l.sig)?;
+        let end = sig_end.checked_add(l.public)?;
+        if end > data.len() {
+            return None;
+        }
+        Some((
+            &data[..msg_end],
+            &data[msg_end..sig_end],
+            &data[sig_end..end],
+        ))
+    }
+}
+
+/// [`GENERATE`]: arg inout `[suite:u16][usage:u32][flags:u8][0:u8][len:u32]`.
+/// Out: `len` is the public key's length (written, or required on
+/// `ERANGE`).
+pub mod generate {
+    pub const ARG_LEN: usize = 12;
+    pub const LEN: usize = 8;
+
+    /// Bits of `flags`.
+    pub mod flags {
+        /// Request a non-extractable private key. A backend that cannot
+        /// honour this refuses the GENERATE outright rather than silently
+        /// producing an extractable key — a caller asking for
+        /// non-extractability is asking for a guarantee, and quietly not
+        /// providing it is worse than saying no.
+        pub const NON_EXTRACTABLE: u8 = 0x01;
+    }
+
+    pub const fn encode(suite: u16, usage: u32, flags: u8) -> [u8; ARG_LEN] {
+        let s = suite.to_le_bytes();
+        let u = usage.to_le_bytes();
+        [s[0], s[1], u[0], u[1], u[2], u[3], flags, 0, 0, 0, 0, 0]
+    }
+
+    /// `(suite, usage, flags)`.
+    pub fn parse(arg: &[u8]) -> Option<(u16, u32, u8)> {
+        if arg.len() < ARG_LEN {
+            return None;
+        }
+        Some((super::rd16(arg, 0)?, super::rd32(arg, 2)?, arg[6]))
+    }
+
+    pub fn len(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, LEN)
+    }
+
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, LEN, n)
+    }
+}
+
+/// [`PUBLIC`]: arg out `[len:u32]`, written only on `ERANGE` (the
+/// requirement).
+pub mod public {
+    pub const ARG_LEN: usize = 4;
+    /// Longest public key any suite has (ML-DSA-87's 2592 bytes, with room).
+    pub const MAX: usize = 4096;
+
+    pub fn len(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, 0)
+    }
+
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, 0, n)
+    }
+}
+
+/// [`TIER`]: arg out `[tier:u8]`.
+pub mod tier_arg {
+    pub const ARG_LEN: usize = 1;
+}
+
+/// [`OPEN`] / [`OPEN_OR_GENERATE`]: arg inout
+/// `[suite:u16][usage:u32][flags:u8][label_len:u8][len:u32][label]`. Out:
+/// `len` is the public key's length (written, or required on `ERANGE`).
+pub mod open {
+    pub const HEADER: usize = 12;
+    pub const LEN: usize = 8;
+    pub const LABEL: usize = HEADER;
+    pub const MAX_ARG: usize = HEADER + super::MAX_LABEL;
+
+    pub const fn arg_len(label_len: usize) -> usize {
+        HEADER + label_len
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Request<'a> {
+        pub suite: u16,
+        pub usage: u32,
+        pub flags: u8,
+        pub label: &'a [u8],
+    }
+
+    /// Encode `r` into `out`; the bytes written, `None` when the label is
+    /// empty, too long or `out` short.
+    pub fn encode(out: &mut [u8], r: &Request<'_>) -> Option<usize> {
+        let n = arg_len(r.label.len());
+        if r.label.is_empty() || r.label.len() > super::MAX_LABEL || out.len() < n {
+            return None;
+        }
+        out[..HEADER].fill(0);
+        out[0..2].copy_from_slice(&r.suite.to_le_bytes());
+        out[2..6].copy_from_slice(&r.usage.to_le_bytes());
+        out[6] = r.flags;
+        out[7] = r.label.len() as u8;
+        out[LABEL..n].copy_from_slice(r.label);
+        Some(n)
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<Request<'_>> {
+        if arg.len() < HEADER {
+            return None;
+        }
+        let label_len = arg[7] as usize;
+        if label_len == 0 || label_len > super::MAX_LABEL {
+            return None;
+        }
+        Some(Request {
+            suite: super::rd16(arg, 0)?,
+            usage: super::rd32(arg, 2)?,
+            flags: arg[6],
+            label: arg.get(LABEL..LABEL + label_len)?,
+        })
+    }
+
+    pub fn len(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, LEN)
+    }
+
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, LEN, n)
+    }
+}
+
+/// [`DESTROY_BY_LABEL`]: arg in `[label_len:u8][label]`.
+pub mod destroy_by_label {
+    pub const MAX_ARG: usize = 1 + super::MAX_LABEL;
+
+    pub const fn arg_len(label_len: usize) -> usize {
+        1 + label_len
+    }
+
+    pub fn encode(out: &mut [u8], label: &[u8]) -> Option<usize> {
+        let n = arg_len(label.len());
+        if label.is_empty() || label.len() > super::MAX_LABEL || out.len() < n {
+            return None;
+        }
+        out[0] = label.len() as u8;
+        out[1..n].copy_from_slice(label);
+        Some(n)
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<&[u8]> {
+        let n = *arg.first()? as usize;
+        if n == 0 || n > super::MAX_LABEL {
+            return None;
+        }
+        arg.get(1..1 + n)
+    }
+}
+
+/// [`DESCRIBE`]: arg out `[suite:u16][usage:u32][tier:u8][persisted:u8]`.
+pub mod describe {
+    pub const ARG_LEN: usize = 8;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Described {
+        pub suite: u16,
+        pub usage: u32,
+        pub tier: u8,
+        /// A [`super::persisted`] value.
+        pub persisted: u8,
+    }
+
+    pub const fn encode(d: &Described) -> [u8; ARG_LEN] {
+        let s = d.suite.to_le_bytes();
+        let u = d.usage.to_le_bytes();
+        [s[0], s[1], u[0], u[1], u[2], u[3], d.tier, d.persisted]
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<Described> {
+        if arg.len() < ARG_LEN {
+            return None;
+        }
+        Some(Described {
+            suite: super::rd16(arg, 0)?,
+            usage: super::rd32(arg, 2)?,
+            tier: arg[6],
+            persisted: arg[7],
+        })
+    }
+}
+
+/// `persisted` values of [`DESCRIBE`].
 pub mod persisted {
     /// Gone after a restart.
     pub const NO: u8 = 0;
@@ -373,170 +839,354 @@ pub mod persisted {
     pub const CLEAR: u8 = 2;
 }
 
-/// Ask whether a backend can use `suite`, and what it costs.
+/// [`DESCRIBE_SUITE`]: arg inout. In `[cursor:u16]`; out the record
+/// `[suite:u16][next:u16][usage:u32][priv_len:u16][pub_len:u16]
+/// [sig_len:u16][secret_len:u16][flags:u8][0:u8 ×3]`.
 ///
-/// handle=-1. arg layout:
-/// ```text
-/// [suite:u16][_pad:u16]
-/// [usage_out:u32][priv_len_out:u16][pub_len_out:u16][sig_len_out:u16]
-/// ```
-/// Returns 14 when the suite is supported, `-ENOSYS` when it is not.
-///
-/// Lengths rather than a capability bitmap, because a bitmap answers "is
-/// P-256 supported" and cannot answer "how big is an ML-DSA-65
-/// signature" — which is what a caller sizing a buffer actually needs,
-/// and the question a suite whose signature is 4627 bytes forces.
-pub use super::super::registry::key_vault::SUITE_QUERY;
+/// `usage` is every use the vault permits a key of the suite (its supported
+/// operations); `priv_len` what [`STORE`] takes (0 where import is refused),
+/// `pub_len` the longest public key, `sig_len` the signature (or tag),
+/// `secret_len` the [`ECDH`] secret, each 0 where the suite has none.
+pub mod describe_suite {
+    pub const LEN: usize = 20;
+    pub const ARG_LEN: usize = LEN;
 
-/// Enumerate supported suites.
-///
-/// handle=-1. arg layout:
-/// `[cursor:u16][_pad:u16][out_ptr:u64][out_cap:u16][count_out:u16]`;
-/// writes `count_out` `u16` suite ids. Returns the next cursor, or 0 when
-/// the enumeration is complete.
-pub use super::super::registry::key_vault::SUITE_ENUM;
+    pub mod flags {
+        /// [`super::super::STORE`] imports a key of the suite.
+        pub const IMPORT: u8 = 0x01;
+        /// [`super::super::GENERATE`] makes one.
+        pub const GENERATE: u8 = 0x02;
+        /// [`super::super::SIGN`] runs as a resumable job (module header).
+        pub const RESUMABLE_SIGN: u8 = 0x04;
+    }
 
-/// Sign the running composition. handle = a signing slot. arg layout:
-/// `[challenge:32][out_ptr:u64][out_cap:u16][out_len_out:u16]`; the
-/// output is `[record][signature]`, where the record is the kernel's
-/// composition record (`scheduler::attest`, prefix `"FXAT"`) ending in
-/// the vault's tier byte, and the signature is over the record in the
-/// slot's suite convention: ECDSA over the record's SHA-256 for P-256,
-/// the whole record for Ed25519 and ML-DSA. Returns 0, or `-ERANGE` with
-/// the requirement in `out_len_out`.
-///
-/// The challenge is the caller's, so the answer cannot be replayed; the
-/// record carries the boot incarnation, so it cannot outlive the boot.
-/// What the signature MEANS is the tier byte's: `DEVICE_HW` says this
-/// hardware runs exactly this closure, `SOFTWARE` says a readable process
-/// does. It proves bytes and wiring, never that they are correct or
-/// intended. The composition digest — SHA-256 of the record with the
-/// challenge zeroed — is the identity [`KEY_WRAP`] binds to.
-pub use super::super::registry::key_vault::ATTEST_COMPOSITION;
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Record {
+        pub suite: u16,
+        /// The cursor that continues the enumeration.
+        pub next: u16,
+        pub usage: u32,
+        pub priv_len: u16,
+        pub pub_len: u16,
+        pub sig_len: u16,
+        pub secret_len: u16,
+        pub flags: u8,
+    }
 
-/// Wrap a slot's key for one destination vault. handle = the slot (must
-/// permit [`usage::WRAP`]). arg layout:
-/// `[dest_pub_len:u16][dest_pub][attest_digest:32][out_ptr:u64][out_cap:u16][out_len_out:u16]`
-/// where `dest_pub` is the destination's P-256 public key and
-/// `attest_digest` the composition digest from its [`ATTEST_COMPOSITION`]
-/// record. Output: `["FXKW"][eph_pub:65][attest_digest:32][nonce:12][sealed][tag:16]`,
-/// `sealed` being `[suite:u16][usage:u32][key_len:u8][key]` under a key
-/// derived from an ephemeral ECDH with `dest_pub`, salted by
-/// `attest_digest`, and authenticated with every header byte before it
-/// (magic to nonce) as AAD. Returns 0, or `-ERANGE`.
-///
-/// The key never appears in the clear on any surface: only the vault
-/// holding `dest_pub`'s private half can open it, and only while its
-/// composition still digests to `attest_digest` ([`KEY_UNWRAP`]).
-pub use super::super::registry::key_vault::KEY_WRAP;
+    pub const fn encode_cursor(cursor: u16) -> [u8; ARG_LEN] {
+        let c = cursor.to_le_bytes();
+        let mut a = [0u8; ARG_LEN];
+        a[0] = c[0];
+        a[1] = c[1];
+        a
+    }
 
-/// Unwrap into a fresh slot. handle = the slot holding this vault's P-256
-/// private key (must permit [`usage::AGREE`]). arg layout:
-/// `[blob_len:u16][blob]`. Returns the new slot's handle, or `-EACCES`
-/// when the blob's `attest_digest` is not this composition's digest —
-/// the composition changed since it was attested, and the key was wrapped
-/// for the one that was — or `-EINVAL` when the blob does not open.
-pub use super::super::registry::key_vault::KEY_UNWRAP;
+    pub fn parse_cursor(arg: &[u8]) -> Option<u16> {
+        super::rd16(arg, 0)
+    }
 
-/// Seal bytes under an [`suite::AEAD_KEY`] slot. handle = the slot (must
-/// permit [`usage::SEAL`]). arg layout:
-/// `[aad_len:u16][aad][pt_len:u16][pt][out_ptr:u64][out_cap:u16][out_len_out:u16]`;
-/// output `[nonce:12][ct][tag:16]`. Returns 0, or `-ERANGE`.
-///
-/// The nonce is fresh from the CSPRNG per call. What the bytes mean — a
-/// resumption ticket, a checkpoint — is the caller's; the vault only
-/// guarantees that the key never leaves it.
-pub use super::super::registry::key_vault::AEAD_SEAL;
+    pub const fn encode(r: &Record) -> [u8; LEN] {
+        let s = r.suite.to_le_bytes();
+        let n = r.next.to_le_bytes();
+        let u = r.usage.to_le_bytes();
+        let pr = r.priv_len.to_le_bytes();
+        let pu = r.pub_len.to_le_bytes();
+        let sg = r.sig_len.to_le_bytes();
+        let se = r.secret_len.to_le_bytes();
+        [
+            s[0], s[1], n[0], n[1], u[0], u[1], u[2], u[3], pr[0], pr[1], pu[0], pu[1], sg[0],
+            sg[1], se[0], se[1], r.flags, 0, 0, 0,
+        ]
+    }
 
-/// Open what [`AEAD_SEAL`] produced. handle = the slot (must permit
-/// [`usage::OPEN`]). arg layout:
-/// `[aad_len:u16][aad][blob_len:u16][blob][out_ptr:u64][out_cap:u16][out_len_out:u16]`;
-/// output the plaintext. Returns 0, `-EINVAL` when the tag does not
-/// verify, or `-ERANGE`.
-pub use super::super::registry::key_vault::AEAD_OPEN;
+    pub fn parse(arg: &[u8]) -> Option<Record> {
+        if arg.len() < LEN {
+            return None;
+        }
+        Some(Record {
+            suite: super::rd16(arg, 0)?,
+            next: super::rd16(arg, 2)?,
+            usage: super::rd32(arg, 4)?,
+            priv_len: super::rd16(arg, 8)?,
+            pub_len: super::rd16(arg, 10)?,
+            sig_len: super::rd16(arg, 12)?,
+            secret_len: super::rd16(arg, 14)?,
+            flags: arg[16],
+        })
+    }
+}
 
-/// Derive a purpose key from a [`suite::KDF_KEY`] slot. handle = the
-/// master (must permit [`usage::DERIVE`]). arg layout: see [`derive`].
-/// Returns a new handle, owned by the caller, holding
-/// `HKDF-SHA256(ikm = master, salt = derive::SALT, info = label ‖ context)`
-/// as a key of the target suite with the target uses. A derived key is
-/// never persisted: it is derived again when needed.
-pub use super::super::registry::key_vault::DERIVE;
+/// [`ATTEST_COMPOSITION`]: arg inout `[challenge:32][len:u32]`. Out on
+/// `ERANGE`: `len` is the length `data` must hold.
+pub mod attest_composition {
+    pub const ARG_LEN: usize = 36;
+    pub const LEN: usize = 32;
 
-/// Seal up to [`units::MAX_ENTRIES`] buffers in place under an AEAD slot
-/// ([`suite::AEAD_KEY`] or [`suite::AEAD_AES256_GCM`], must permit
-/// [`usage::SEAL`]), each with the nonce its entry names. arg layout: see
-/// [`units`]. Returns 0 when every entry sealed, or a negative errno when
-/// the request was refused before any.
-///
-/// The caller chooses the nonces, so their uniqueness under the key is the
-/// caller's obligation — the reason this exists beside [`AEAD_SEAL`], whose
-/// vault-drawn random nonces suit a record now and then and not a storage
-/// device writing the same key for years. The slot is owned by one module,
-/// so no other can seal under it.
-pub use super::super::registry::key_vault::AEAD_SEAL_UNITS;
+    pub fn encode(challenge: &[u8; 32]) -> [u8; ARG_LEN] {
+        let mut a = [0u8; ARG_LEN];
+        a[..32].copy_from_slice(challenge);
+        a
+    }
 
-/// Open up to [`units::MAX_ENTRIES`] buffers in place, verifying each tag.
-/// An entry whose tag does not verify has its status set to
-/// [`units::STATUS_AUTH_FAILED`] and its buffer zeroed, so unauthenticated
-/// plaintext is never left behind. Returns the number of entries that
-/// failed, or a negative errno when the request was refused before any.
-pub use super::super::registry::key_vault::AEAD_OPEN_UNITS;
+    pub fn parse(arg: &[u8]) -> Option<[u8; 32]> {
+        let mut c = [0u8; 32];
+        c.copy_from_slice(arg.get(..32)?);
+        Some(c)
+    }
 
-/// Split a 32-byte key 2-of-3 and wrap each share to its own recipient.
-/// handle = the key (must permit [`usage::WRAP`]; a [`suite::KDF_KEY`],
-/// [`suite::AEAD_KEY`] or [`suite::AEAD_AES256_GCM`]). arg layout: see
-/// [`share::split`]. Writes three [`share`] envelopes, for share indices 1,
-/// 2 and 3 in recipient order. Returns 0, or `-ERANGE` with the requirement
-/// in `out_len_out`.
-///
-/// The shares exist only inside the call: each is sealed to its recipient
-/// as it is made, and the scratch is zeroed. Any two envelopes, opened by
-/// their recipients, give the key back through [`SHARE_COMBINE`]; one gives
-/// nothing.
-pub use super::super::registry::key_vault::SHARE_SPLIT;
+    pub fn len(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, LEN)
+    }
 
-/// Open one share envelope and seal the share to another recipient.
-/// handle = the P-256 key the envelope is wrapped to (must permit
-/// [`usage::AGREE`] and [`usage::EXPORT_PUBLIC`]: an envelope names its
-/// recipient by public key). arg layout: see [`share::rewrap`]. Returns 0, or
-/// `-ERANGE`.
-///
-/// What a custodian does to release its share: the share leaves this vault
-/// only sealed to the new recipient, bound to a new purpose, lease fence,
-/// expiry and policy digest. The recovery set, protected resource, epoch
-/// and share index are carried over and cannot be changed.
-pub use super::super::registry::key_vault::SHARE_REWRAP;
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, LEN, n)
+    }
+}
 
-/// Open two share envelopes and reconstruct their key into a fresh handle,
-/// owned by the caller. handle=-1. arg layout: see [`share::combine`]. The
-/// two opener handles are the caller's recipient keys, each permitting
-/// [`usage::AGREE`] and [`usage::EXPORT_PUBLIC`], held in any backend.
-/// Returns the handle, or:
-/// - `-EINVAL`: an envelope is malformed or does not open, or the two do
-///   not belong together — another recovery set, resource, epoch or AEAD,
-///   or the same share index twice;
-/// - `-EACCES`: an envelope is not wrapped to the handle opening it, has
-///   expired (or carries an expiry with no wall clock to check it), was
-///   already consumed, or is for another resource or epoch than asked.
-///
-/// Reconstruction happens only here, and the key it yields is a handle:
-/// neither share nor key is ever written to the caller. The new key is
-/// never persisted; a volume attaches again after a restart.
-pub use super::super::registry::key_vault::SHARE_COMBINE;
+/// [`KEY_WRAP`]: arg inout `[dest_pub:65][attest_digest:32][len:u32]`, the
+/// destination's P-256 public key and the composition digest from its
+/// [`ATTEST_COMPOSITION`] record. Out on `ERANGE`: `len` is the wrapped
+/// key's length.
+pub mod key_wrap {
+    pub const DEST_PUB: usize = 0;
+    pub const ATTEST: usize = super::wrap::EPH_PUB_LEN;
+    pub const LEN: usize = ATTEST + 32;
+    pub const ARG_LEN: usize = LEN + 4;
 
-/// Attest a key: signed evidence of what a handle is, bound to a caller's
-/// challenge, never its bytes. handle = the key attested. arg layout: see
-/// [`attest_key`]. The output is `[record][signature]`, the signature made
-/// by the signer handle the argument names (must permit [`usage::SIGN`]) in
-/// its suite's convention, as [`ATTEST_COMPOSITION`] signs. Returns 0, or
-/// `-ERANGE` with the requirement in `out_len_out`.
-///
-/// The record commits to the key without revealing it, names its suite,
-/// uses, owner namespace, persistence and the vault's tier, and carries the
-/// composition digest, so a verifier that trusts the signer's public key
-/// learns which composition holds which kind of key under which policy.
-pub use super::super::registry::key_vault::ATTEST_KEY;
+    pub fn encode(dest_pub: &[u8; super::wrap::EPH_PUB_LEN], attest: &[u8; 32]) -> [u8; ARG_LEN] {
+        let mut a = [0u8; ARG_LEN];
+        a[DEST_PUB..ATTEST].copy_from_slice(dest_pub);
+        a[ATTEST..LEN].copy_from_slice(attest);
+        a
+    }
+
+    /// `(dest_pub, attest_digest)`.
+    pub fn parse(arg: &[u8]) -> Option<(&[u8], &[u8])> {
+        if arg.len() < ARG_LEN {
+            return None;
+        }
+        Some((&arg[DEST_PUB..ATTEST], &arg[ATTEST..LEN]))
+    }
+
+    pub fn len(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, LEN)
+    }
+
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, LEN, n)
+    }
+}
+
+/// [`AEAD_SEAL`] / [`AEAD_OPEN`]: arg `[nonce:12][len:u32][aad_len:u16]
+/// [aad]`. `AEAD_SEAL`: `nonce` out (the vault draws it), `len` in = the
+/// plaintext's length (out on `ERANGE`: `len + TAG_LEN`). `AEAD_OPEN`:
+/// `nonce` in, `len` in = the sealed length (ciphertext and tag).
+pub mod aead {
+    pub const NONCE: usize = 0;
+    pub const NONCE_LEN: usize = 12;
+    pub const LEN: usize = 12;
+    pub const AAD_LEN: usize = 16;
+    pub const AAD: usize = 18;
+    pub const HEADER: usize = AAD;
+    pub const MAX_AAD: usize = 256;
+    pub const MAX_ARG: usize = HEADER + MAX_AAD;
+    pub const TAG_LEN: usize = 16;
+    /// Longest plaintext one call seals: a ticket, a checkpoint chunk.
+    pub const MAX_LEN: usize = 65536;
+
+    pub const fn arg_len(aad_len: usize) -> usize {
+        HEADER + aad_len
+    }
+
+    /// Encode a request into `out`: the bytes written, `None` when `aad` is
+    /// too long or `out` short. `nonce` is ignored by `AEAD_SEAL`.
+    pub fn encode(out: &mut [u8], nonce: &[u8; NONCE_LEN], len: u32, aad: &[u8]) -> Option<usize> {
+        let n = arg_len(aad.len());
+        if aad.len() > MAX_AAD || out.len() < n {
+            return None;
+        }
+        out[NONCE..NONCE + NONCE_LEN].copy_from_slice(nonce);
+        out[LEN..LEN + 4].copy_from_slice(&len.to_le_bytes());
+        out[AAD_LEN..AAD_LEN + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
+        out[AAD..n].copy_from_slice(aad);
+        Some(n)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Request<'a> {
+        pub nonce: [u8; NONCE_LEN],
+        pub len: usize,
+        pub aad: &'a [u8],
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<Request<'_>> {
+        let aad_len = super::rd16(arg, AAD_LEN)? as usize;
+        if aad_len > MAX_AAD {
+            return None;
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(arg.get(NONCE..NONCE + NONCE_LEN)?);
+        Some(Request {
+            nonce,
+            len: super::len_at(arg, LEN)?,
+            aad: arg.get(AAD..AAD + aad_len)?,
+        })
+    }
+
+    pub fn set_nonce(arg: &mut [u8], nonce: &[u8; NONCE_LEN]) -> bool {
+        super::wr(arg, NONCE, nonce)
+    }
+
+    pub fn nonce(arg: &[u8]) -> Option<[u8; NONCE_LEN]> {
+        let mut n = [0u8; NONCE_LEN];
+        n.copy_from_slice(arg.get(NONCE..NONCE + NONCE_LEN)?);
+        Some(n)
+    }
+
+    pub fn set_len(arg: &mut [u8], n: usize) -> bool {
+        super::set_len_at(arg, LEN, n)
+    }
+
+    pub fn len(arg: &[u8]) -> Option<usize> {
+        super::len_at(arg, LEN)
+    }
+}
+
+/// [`DERIVE`]: arg in `[target_suite:u16][target_usage:u32][label_len:u8]
+/// [0:u8][context_len:u16][label][context]`.
+pub mod derive {
+    pub const TARGET_SUITE: usize = 0;
+    pub const TARGET_USAGE: usize = 2;
+    pub const LABEL_LEN: usize = 6;
+    pub const CONTEXT_LEN: usize = 8;
+    /// Where the label starts; the context follows it.
+    pub const LABEL: usize = 10;
+    pub const MAX_LABEL: usize = 64;
+    pub const MAX_CONTEXT: usize = 128;
+    pub const MAX_ARG: usize = LABEL + MAX_LABEL + MAX_CONTEXT;
+    /// The HKDF salt every derivation uses.
+    pub const SALT: &[u8] = b"fluxor/v1";
+
+    pub const fn arg_len(label_len: usize, context_len: usize) -> usize {
+        LABEL + label_len + context_len
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Request<'a> {
+        pub suite: u16,
+        pub usage: u32,
+        pub label: &'a [u8],
+        pub context: &'a [u8],
+    }
+
+    pub fn encode(out: &mut [u8], r: &Request<'_>) -> Option<usize> {
+        let n = arg_len(r.label.len(), r.context.len());
+        if r.label.is_empty()
+            || r.label.len() > MAX_LABEL
+            || r.context.len() > MAX_CONTEXT
+            || out.len() < n
+        {
+            return None;
+        }
+        out[..LABEL].fill(0);
+        out[TARGET_SUITE..TARGET_SUITE + 2].copy_from_slice(&r.suite.to_le_bytes());
+        out[TARGET_USAGE..TARGET_USAGE + 4].copy_from_slice(&r.usage.to_le_bytes());
+        out[LABEL_LEN] = r.label.len() as u8;
+        out[CONTEXT_LEN..CONTEXT_LEN + 2].copy_from_slice(&(r.context.len() as u16).to_le_bytes());
+        let c = LABEL + r.label.len();
+        out[LABEL..c].copy_from_slice(r.label);
+        out[c..n].copy_from_slice(r.context);
+        Some(n)
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<Request<'_>> {
+        let label_len = *arg.get(LABEL_LEN)? as usize;
+        let context_len = super::rd16(arg, CONTEXT_LEN)? as usize;
+        if label_len == 0 || label_len > MAX_LABEL || context_len > MAX_CONTEXT {
+            return None;
+        }
+        let c = LABEL + label_len;
+        Some(Request {
+            suite: super::rd16(arg, TARGET_SUITE)?,
+            usage: super::rd32(arg, TARGET_USAGE)?,
+            label: arg.get(LABEL..c)?,
+            context: arg.get(c..c + context_len)?,
+        })
+    }
+}
+
+/// [`AEAD_SEAL_UNITS`] / [`AEAD_OPEN_UNITS`]: arg `[nonce:12][tag:16]
+/// [aad_len:u16][aad]`. Seal: `tag` out. Open: `tag` in. `data` = the unit.
+pub mod units {
+    pub const NONCE: usize = 0;
+    pub const TAG: usize = 12;
+    pub const TAG_LEN: usize = 16;
+    pub const AAD_LEN: usize = 28;
+    pub const AAD: usize = 30;
+    pub const HEADER: usize = AAD;
+    /// Longest associated data per unit.
+    pub const MAX_AAD: usize = 128;
+    pub const MAX_ARG: usize = HEADER + MAX_AAD;
+    /// Longest unit one call seals or opens: bounds the work done inside
+    /// the caller's step.
+    pub const MAX_UNIT: usize = 65536;
+
+    pub const fn arg_len(aad_len: usize) -> usize {
+        HEADER + aad_len
+    }
+
+    /// Encode a request into `out`: the bytes written. `tag` is ignored by
+    /// a seal.
+    pub fn encode(
+        out: &mut [u8],
+        nonce: &[u8; 12],
+        tag: &[u8; TAG_LEN],
+        aad: &[u8],
+    ) -> Option<usize> {
+        let n = arg_len(aad.len());
+        if aad.len() > MAX_AAD || out.len() < n {
+            return None;
+        }
+        out[NONCE..NONCE + 12].copy_from_slice(nonce);
+        out[TAG..TAG + TAG_LEN].copy_from_slice(tag);
+        out[AAD_LEN..AAD_LEN + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
+        out[AAD..n].copy_from_slice(aad);
+        Some(n)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Request<'a> {
+        pub nonce: [u8; 12],
+        pub tag: [u8; TAG_LEN],
+        pub aad: &'a [u8],
+    }
+
+    pub fn parse(arg: &[u8]) -> Option<Request<'_>> {
+        let aad_len = super::rd16(arg, AAD_LEN)? as usize;
+        if aad_len > MAX_AAD {
+            return None;
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(arg.get(NONCE..NONCE + 12)?);
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(arg.get(TAG..TAG + TAG_LEN)?);
+        Some(Request {
+            nonce,
+            tag,
+            aad: arg.get(AAD..AAD + aad_len)?,
+        })
+    }
+
+    pub fn tag(arg: &[u8]) -> Option<[u8; TAG_LEN]> {
+        let mut t = [0u8; TAG_LEN];
+        t.copy_from_slice(arg.get(TAG..TAG + TAG_LEN)?);
+        Some(t)
+    }
+
+    pub fn set_tag(arg: &mut [u8], tag: &[u8; TAG_LEN]) -> bool {
+        super::wr(arg, TAG, tag)
+    }
+}
 
 /// Share envelopes (the recovery and attachment format): one 2-of-3 share
 /// of a 32-byte key, sealed to one recipient's P-256 key.
@@ -618,52 +1268,47 @@ pub mod share {
         pub const LEN: usize = 88;
     }
 
-    /// [`super::SHARE_SPLIT`]:
-    /// `[grant][recipient:65 ×3][out_ptr:u64][out_cap:u32][out_len_out:u32]`.
+    /// [`super::SHARE_SPLIT`]: arg in `[grant][recipient:65 ×3]`; `data` out
+    /// = the three envelopes.
     pub mod split {
-        use super::{grant, P256_PUB_LEN};
+        use super::{grant, P256_LEN, P256_PUB_LEN};
         pub const RECIPIENTS: usize = grant::LEN;
-        pub const OUT_PTR: usize = RECIPIENTS + 3 * P256_PUB_LEN;
-        pub const OUT_CAP: usize = OUT_PTR + 8;
-        pub const OUT_LEN: usize = OUT_CAP + 4;
-        pub const LEN: usize = OUT_LEN + 4;
+        pub const ARG_LEN: usize = RECIPIENTS + 3 * P256_PUB_LEN;
+        /// Bytes `data` must hold.
+        pub const OUT_LEN: usize = 3 * P256_LEN;
     }
 
-    /// [`super::SHARE_REWRAP`]:
-    /// `[grant][recipient:65][out_ptr:u64][out_cap:u32][out_len_out:u32]
-    ///  [env_len:u16][envelope]`.
+    /// [`super::SHARE_REWRAP`]: arg in `[grant][recipient:65]`; `data` inout
+    /// = the envelope.
     pub mod rewrap {
         use super::{grant, P256_PUB_LEN};
         pub const RECIPIENT: usize = grant::LEN;
-        pub const OUT_PTR: usize = RECIPIENT + P256_PUB_LEN;
-        pub const OUT_CAP: usize = OUT_PTR + 8;
-        pub const OUT_LEN: usize = OUT_CAP + 4;
-        pub const ENV_LEN: usize = OUT_LEN + 4;
-        pub const ENV: usize = ENV_LEN + 2;
+        pub const ARG_LEN: usize = RECIPIENT + P256_PUB_LEN;
     }
 
-    /// [`super::SHARE_COMBINE`]:
-    /// `[target_suite:u16][target_usage:u32][_pad:u16][opener_a:i32]
-    ///  [opener_b:i32][resource:16][epoch:u32][env_a_len:u16][env_b_len:u16]
-    ///  [env_a][env_b]`. The target suite is one a split source may hold,
-    /// and the uses may not include [`super::super::usage::PERSIST`].
+    /// [`super::SHARE_COMBINE`]: arg in `[target_suite:u16][target_usage:u32]
+    /// [0:u16][resource:16][epoch:u32]`; `data` in = one envelope. The
+    /// target suite is one a split source may hold, and the uses may not
+    /// include [`super::super::usage::PERSIST`].
     pub mod combine {
         pub const TARGET_SUITE: usize = 0;
         pub const TARGET_USAGE: usize = 2;
-        pub const OPENER_A: usize = 8;
-        pub const OPENER_B: usize = 12;
-        pub const RESOURCE: usize = 16;
-        pub const EPOCH: usize = 32;
-        pub const ENV_A_LEN: usize = 36;
-        pub const ENV_B_LEN: usize = 38;
-        pub const ENVS: usize = 40;
+        pub const RESOURCE: usize = 8;
+        pub const EPOCH: usize = 24;
+        pub const ARG_LEN: usize = 28;
+
+        pub fn encode(suite: u16, usage: u32, resource: &[u8; 16], epoch: u32) -> [u8; ARG_LEN] {
+            let mut a = [0u8; ARG_LEN];
+            a[TARGET_SUITE..TARGET_SUITE + 2].copy_from_slice(&suite.to_le_bytes());
+            a[TARGET_USAGE..TARGET_USAGE + 4].copy_from_slice(&usage.to_le_bytes());
+            a[RESOURCE..RESOURCE + 16].copy_from_slice(resource);
+            a[EPOCH..EPOCH + 4].copy_from_slice(&epoch.to_le_bytes());
+            a
+        }
     }
 }
 
-/// [`ATTEST_KEY`]: the argument, and the record it signs.
-///
-/// arg: `[challenge:32][signer:i32][_pad:u32][out_ptr:u64][out_cap:u32]
-/// [out_len_out:u32]`.
+/// [`ATTEST_KEY`]: arg in `[challenge:32]`; `data` out = the record.
 ///
 /// record: `["FXHA"][challenge:32][composition:32][backend:u8][tier:u8]
 /// [persisted:u8][_pad:u8][suite:u16][_pad:u16][usage:u32][namespace:u32]
@@ -675,12 +1320,7 @@ pub mod share {
 /// without one. A key a hardware backend holds has no readable bytes to
 /// commit to: its commitment is zero and its public thumbprint names it.
 pub mod attest_key {
-    pub const CHALLENGE: usize = 0;
-    pub const SIGNER: usize = 32;
-    pub const OUT_PTR: usize = 40;
-    pub const OUT_CAP: usize = 48;
-    pub const OUT_LEN: usize = 52;
-    pub const ARG_LEN: usize = 56;
+    pub const ARG_LEN: usize = 32;
 
     pub const MAGIC: [u8; 4] = *b"FXHA";
     pub const R_CHALLENGE: usize = 4;
@@ -703,52 +1343,7 @@ pub mod attest_key {
     }
 }
 
-/// Layout of a [`DERIVE`] argument.
-///
-/// `[target_suite:u16][target_usage:u32][label_len:u8][_pad:u8]
-///  [context_len:u16][label][context]`
-pub mod derive {
-    pub const TARGET_SUITE: usize = 0;
-    pub const TARGET_USAGE: usize = 2;
-    pub const LABEL_LEN: usize = 6;
-    pub const CONTEXT_LEN: usize = 8;
-    /// Where the label starts; the context follows it.
-    pub const LABEL: usize = 10;
-    pub const MAX_LABEL: usize = 64;
-    pub const MAX_CONTEXT: usize = 128;
-    /// The HKDF salt every derivation uses.
-    pub const SALT: &[u8] = b"fluxor/v1";
-}
-
-/// Layout of an [`AEAD_SEAL_UNITS`] / [`AEAD_OPEN_UNITS`] argument:
-/// a header, then `count` entries.
-pub mod units {
-    /// `[count:u16][_pad:u16]`
-    pub const HEADER_LEN: usize = 4;
-    pub const COUNT: usize = 0;
-    /// One entry: `[nonce:12][aad_len:u16][status:u8][_pad:u8]
-    /// [aad_ptr:u64][data_ptr:u64][data_len:u32][_pad:u32][tag_ptr:u64]`.
-    pub const ENTRY_LEN: usize = 48;
-    pub const NONCE: usize = 0;
-    pub const AAD_LEN: usize = 12;
-    /// Written by the vault: 0, or [`STATUS_AUTH_FAILED`].
-    pub const STATUS: usize = 14;
-    pub const AAD_PTR: usize = 16;
-    pub const DATA_PTR: usize = 24;
-    pub const DATA_LEN: usize = 32;
-    /// 16 bytes: written by a seal, checked by an open.
-    pub const TAG_PTR: usize = 40;
-    pub const STATUS_AUTH_FAILED: u8 = 1;
-    /// Entries one call carries.
-    pub const MAX_ENTRIES: usize = 32;
-    /// Bytes one call seals or opens, across its entries: bounds the work
-    /// done inside the caller's step.
-    pub const MAX_BYTES: usize = 256 * 1024;
-    /// Longest associated data per entry.
-    pub const MAX_AAD: usize = 128;
-}
-
-/// Layout constants for [`KEY_WRAP`] blobs.
+/// Layout constants for [`KEY_WRAP`] output.
 pub mod wrap {
     pub const MAGIC: [u8; 4] = *b"FXKW";
     pub const EPH_PUB_LEN: usize = 65;
@@ -758,21 +1353,13 @@ pub mod wrap {
     /// Sealed payload prefix before the key bytes.
     pub const SEALED_PREFIX: usize = 2 + 4 + 1;
     pub const TAG_LEN: usize = 16;
-}
-
-/// Flag bits for the [`GENERATE`] `flags` byte.
-pub mod generate_flags {
-    /// Request a non-extractable private key. A backend that cannot
-    /// honour this refuses the GENERATE outright rather than silently
-    /// producing an extractable key — a caller asking for
-    /// non-extractability is asking for a guarantee, and quietly not
-    /// providing it is worse than saying no.
-    pub const NON_EXTRACTABLE: u8 = 0x01;
+    /// Longest wrapped key: a 64-byte key.
+    pub const MAX_LEN: usize = SEALED_OFF + SEALED_PREFIX + 64 + TAG_LEN;
 }
 
 /// Isolation-tier ordinals written by the [`TIER`] opcode.
 pub mod tier {
-    /// Kernel static slots — in-process on hosted platforms. Isolates
+    /// The software backend — in-process on hosted platforms. Isolates
     /// against a compromised module, not a compromised host/kernel.
     pub const SOFTWARE: u8 = 0;
     /// Host process talking to an HSM (e.g. PKCS#11 to a token).

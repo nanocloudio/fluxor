@@ -103,7 +103,7 @@ fn sleep_until(_deadline_us: u64) -> u32 {
 /// reports, then invalidate every core's instruction cache (ARM DDI 0487, the
 /// sequence for modified code). A region that is not to be executed needs
 /// nothing: the kernel's RAM is mapped writable and executable.
-fn ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
+fn ota_stage_protect(region: &mut [u8], executable: bool) -> bool {
     if !executable {
         return true;
     }
@@ -111,8 +111,9 @@ fn ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
     // SAFETY: reads an identification register.
     unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
     let line = 4usize << ((ctr >> 16) & 0xF);
-    let end = (base as usize).saturating_add(len);
-    let mut p = base as usize & !(line - 1);
+    let base = region.as_mut_ptr() as usize;
+    let end = base.saturating_add(region.len());
+    let mut p = base & !(line - 1);
     while p < end {
         // SAFETY: cache maintenance by address over the caller's mapped region.
         unsafe { core::arch::asm!("dc cvau, {}", in(reg) p, options(nostack, preserves_flags)) };
@@ -177,27 +178,21 @@ pub fn seed_entropy(firmware: &[u8]) -> (bool, bool) {
     sources
 }
 
-fn csprng_fill(buf: *mut u8, len: usize) -> i32 {
+fn csprng_fill(buf: &mut [u8]) -> i32 {
     if !SEEDED.load(Ordering::Acquire) {
         return -1;
     }
     // SAFETY: stepped on one core, with interrupts unable to reach this pool.
     let state = unsafe { SEED };
-    let mut block = 0u64;
-    let mut done = 0usize;
     let fresh = rndr().unwrap_or(0);
-    while done < len {
+    for (block, chunk) in (0u64..).zip(buf.chunks_mut(32)) {
         let mut h = sha256::Sha256::new();
         h.update(&state);
         h.update(&[1]);
         h.update(&block.to_le_bytes());
         h.update(&fresh.to_le_bytes());
         let out = h.finalize();
-        let take = out.len().min(len - done);
-        // SAFETY: `buf` holds `len` bytes, by the caller's contract.
-        unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf.add(done), take) };
-        done += take;
-        block += 1;
+        chunk.copy_from_slice(&out[..chunk.len()]);
     }
     // Ratchet, so bytes already handed out cannot be recomputed from the pool.
     let mut h = sha256::Sha256::new();
@@ -210,17 +205,28 @@ fn csprng_fill(buf: *mut u8, len: usize) -> i32 {
     0
 }
 
-unsafe fn net_policy_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn net_policy_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     use fluxor::abi::contracts::net::policy::caps;
     let mut c = caps::FILTER | caps::EGRESS | caps::DNAT_LOCAL;
-    if fluxor::kernel::net_policy::enforcer_attached() {
+    // SAFETY: provider dispatch runs on the scheduler thread.
+    if unsafe { fluxor::kernel::net_policy::enforcer_attached() } {
         c |= caps::ENFORCED;
     }
-    fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, arg_len)
+    fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, data)
 }
 
-unsafe fn net_route_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    fluxor::kernel::net_route::dispatch(None, handle, opcode, arg, arg_len)
+fn net_route_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
+    fluxor::kernel::net_route::dispatch(None, handle, opcode, arg, data)
 }
 
 fn init_providers() {
@@ -228,6 +234,7 @@ fn init_providers() {
     provider::register(contract::NET_POLICY, net_policy_dispatch);
     provider::register(contract::NET_ROUTE, net_route_dispatch);
     fluxor::kernel::module::syscalls::register_system_extension(super::devices::dispatch);
+    fluxor::kernel::module::provider::register_platform_handle_slots(super::devices::handle_slots);
 }
 
 pub static HAL_OPS: HalOps = HalOps {

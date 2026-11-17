@@ -214,7 +214,10 @@ fn eth_read(st: &LinuxEthState, buf: &mut [u8]) -> Option<usize> {
     None
 }
 
-fn linux_eth_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn linux_eth_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxEthState` by the loader.
     let st = unsafe { instance_state::<LinuxEthState>(state) };
     if st.fd < 0 {

@@ -133,40 +133,47 @@ Every slot names its **suite**:
 - `KDF_KEY`, a derivation master whose only use is `DERIVE`.
 
 `AEAD_AES256_GCM` is offered only where AES runs in constant time (aarch64
-with the AES extension); elsewhere `SUITE_QUERY` answers `ENOSYS`.
+with the AES extension); elsewhere `DESCRIBE_SUITE` skips it.
 
 The suite decides what the key bytes mean, which operations the slot admits,
 and how big each answer is. Opcodes:
 
 | Opcode | Name | Semantics |
 |--------|------|-----------|
-| `0x0500` | `PROBE` | Returns 1 if a backend is present. Callers detect at `module_new`. |
-| `0x0501` | `STORE` | Import a raw private key of the named suite. Returns an opaque handle. |
-| `0x0502` | `ECDH` | Compute scalar mult against a caller-supplied public key. |
-| `0x0503` | `SIGN` | Sign under the slot's suite, in the sign mode that suite uses. |
-| `0x0504` | `VERIFY` | Verify — takes a caller-supplied public key. |
-| `0x0505` | `DESTROY` | Zeroise and free the slot. |
-| `0x0506` | `GENERATE` | Generate a key in-backend; the private half never exists outside it. |
-| `0x0507` | `PUBLIC` | Export the public half of a slot's key. |
-| `0x0508` | `TIER` | Report the backend tier (software vs hardware-backed). |
-| `0x0509` | `OPEN_OR_GENERATE` | Open the slot filed under a label, generating it if absent. |
-| `0x050A` | `OPEN` | Open the slot filed under a label. |
-| `0x050B` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label, and remove its sealed record. |
-| `0x050C` | `DESCRIBE` | Report a slot's suite, usage mask, tier and whether it is persisted. |
-| `0x050D` | `SUITE_QUERY` | Report a suite's usage mask and its private, public and signature lengths. |
-| `0x050E` | `SUITE_ENUM` | Enumerate the suites this backend supports. |
-| `0x050F` | `ATTEST_COMPOSITION` | Sign the running-composition record (§ Composition Attestation). |
-| `0x0510` | `KEY_WRAP` | Wrap a slot's key for one destination composition. |
-| `0x0511` | `KEY_UNWRAP` | Unwrap into a new slot, only as the composition it was wrapped for. |
-| `0x0512` | `AEAD_SEAL` | Seal under an `AEAD_KEY` slot. |
-| `0x0513` | `AEAD_OPEN` | Open under an `AEAD_KEY` slot. |
-| `0x0514` | `DERIVE` | Make a purpose key from a `KDF_KEY`: HKDF-SHA256 over a label and context, never persisted. |
-| `0x0515` | `AEAD_SEAL_UNITS` | Seal up to 32 buffers in place, each under the nonce its caller names. |
-| `0x0516` | `AEAD_OPEN_UNITS` | Open up to 32 buffers in place; a buffer that fails is zeroed and reported. |
-| `0x0517` | `SHARE_SPLIT` | Split a 32-byte symmetric key 2-of-3 and seal each share to its own recipient. |
-| `0x0518` | `SHARE_REWRAP` | Open one share envelope and seal the share to a new recipient under a new grant. |
-| `0x0519` | `SHARE_COMBINE` | Open two share envelopes and reconstruct their key into a new, never-persisted handle. |
-| `0x051A` | `ATTEST_KEY` | Sign challenge-bound evidence of a key's suite, uses, owner and tier, and a commitment to it. |
+| `0x0500` | `STORE` | Import a raw private key of the named suite (key bytes in `data`). Returns an opaque handle. |
+| `0x0501` | `ECDH` | Agree with the peer public key at the head of `data`; the secret is written over it. |
+| `0x0502` | `SIGN` | Sign the input at the head of `data`, in place, in the sign mode the suite uses. Resumable for P-256, RSA and ML-DSA. |
+| `0x0503` | `VERIFY` | Verify message ‖ signature ‖ caller-supplied public key in `data`. |
+| `0x0504` | `DESTROY` | Zeroise and free the slot. |
+| `0x0505` | `GENERATE` | Generate a key in-backend; the private half never exists outside it. Public half in `data`. |
+| `0x0506` | `PUBLIC` | Export the public half of a slot's key into `data`. |
+| `0x0507` | `TIER` | Report the backend tier (software vs hardware-backed). |
+| `0x0508` | `OPEN_OR_GENERATE` | Open the slot filed under a label, generating it if absent. |
+| `0x0509` | `OPEN` | Open the slot filed under a label. |
+| `0x050A` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label, and remove its sealed record. |
+| `0x050B` | `DESCRIBE` | Report a slot's suite, usage mask, tier and whether it is persisted. |
+| `0x050C` | `DESCRIBE_SUITE` | From a cursor: the next supported suite's usage mask, private, public, signature and secret lengths, import/generate/resumable-sign flags. |
+| `0x050D` | `ATTEST_COMPOSITION` | Sign the running-composition record (§ Composition Attestation). |
+| `0x050E` | `KEY_WRAP` | Wrap a slot's key for one destination composition. |
+| `0x050F` | `KEY_UNWRAP` | Unwrap into a new slot, only as the composition it was wrapped for. |
+| `0x0510` | `AEAD_SEAL` | Seal in place under an `AEAD_KEY` slot; the vault's nonce comes back in `arg`, the tag is appended. |
+| `0x0511` | `AEAD_OPEN` | Open in place under an `AEAD_KEY` slot. |
+| `0x0512` | `DERIVE` | Make a purpose key from a `KDF_KEY`: HKDF-SHA256 over a label and context, never persisted. |
+| `0x0513` | `AEAD_SEAL_UNITS` | Seal one unit in place under the nonce its caller names; the tag comes back in `arg`. |
+| `0x0514` | `AEAD_OPEN_UNITS` | Open one unit in place, checking the tag in `arg`; a unit that fails is zeroed. |
+| `0x0515` | `SHARE_SPLIT` | Split a 32-byte symmetric key 2-of-3 and seal each share to its own recipient. |
+| `0x0516` | `SHARE_REWRAP` | Open one share envelope and seal the share to a new recipient under a new grant, in place. |
+| `0x0517` | `SHARE_COMBINE` | One envelope per call: the first share is held (`EINPROGRESS`), the second reconstructs the key into a new, never-persisted handle. |
+| `0x0518` | `ATTEST_KEY` | The challenge-bound record of a key's suite, uses, owner and tier, and a commitment to it; the caller signs it. |
+
+Every op is one flat `arg` record and at most one `data` span; no field is
+an address or a handle. A module that calls the vault claims it in its
+manifest (`[[resources]] requires_contract = "key_vault"`), so a graph
+without one is refused when composed. `SIGN` for P-256, RSA and ML-DSA runs
+as a job the vault keeps against the key: the call that starts it answers
+`EAGAIN`, the caller repeats the identical call each step until the
+signature comes back, and a different `SIGN` on the key meanwhile answers
+`EBUSY`.
 
 `AEAD_SEAL` draws a random nonce per call, which suits a record now and then.
 The unit operations take the caller's nonces, which is what a storage device
@@ -221,9 +228,9 @@ modules.
   key answers `ENOENT` rather than reaching the slot's next key.
 - **Owners.** The slot records the module that created the key: its
   scheduler slot and that slot's occupancy. Any other module is refused
-  `EACCES`, including a later module in the same slot. A module's channel
-  ioctl handler runs as that module, so the handles it holds work in the
-  handler as in its step.
+  `EACCES`, including a later module in the same slot. A module's provider
+  dispatch runs as that module, so the handles it holds work there as in
+  its step.
 - **Labels.** Labels live in their owner's module-type namespace within the
   owner's realm: the node's, or one workload's (its durable owner uid). No
   module reaches another type's labels, nor another realm's: two workloads
@@ -288,7 +295,7 @@ A labelled key asked to persist is sealed through the platform HAL.
 - **Provisioning.** `fluxor-linux vault-import --module <type>` provisions a
   shared secret into a module type's namespace (the node's realm).
 
-Sizes come from `SUITE_QUERY` rather than from a caller's assumption,
+Sizes come from `DESCRIBE_SUITE` rather than from a caller's assumption,
 because they are not uniform: an ML-DSA-87 signature is 4627 bytes where a
 P-256 or Ed25519 one is 64. The private length a backend reports is
 what it actually holds, which is not always the algorithm's encoded private
@@ -313,8 +320,8 @@ polynomial scratch is a backend static dimensioned for the widest parameter
 set — a signing operation needs more of it than the stack any caller
 arrives on — and that is ~58 KB of kernel `.bss`, which an RP-class part
 with 256 KB of SRAM does not have to spare. A kernel built without
-`pq-vault` reports the ML-DSA suites as unsupported: `SUITE_QUERY` answers
-`ENOSYS` and `SUITE_ENUM` omits them, so a caller discovers the absence
+`pq-vault` reports the ML-DSA suites as unsupported: `DESCRIBE_SUITE`
+skips them, so a caller discovers the absence
 before it allocates rather than by storing a key the backend could not then
 sign with. Every length, usage mask and enumeration flows from one gate, so
 the suites cannot be half-present.
@@ -352,12 +359,12 @@ cannot be opened leaves the software backend alone.
 | Request | Served by |
 | --- | --- |
 | An operation on a handle | The backend that minted it; each backend resolves only its own handles |
-| `GENERATE`, `SUITE_QUERY` for a suite the token serves (P-256) | The token |
+| `GENERATE` for a suite the token serves (P-256), and that suite's `DESCRIBE_SUITE` record | The token |
 | `OPEN`, `OPEN_OR_GENERATE` for a suite the token serves | Software if it holds the label, else the token if it does; a new key is made in the token when it is asked to `PERSIST` with uses the token permits, in software otherwise. A workload's: software alone, since the token's labels name no realm |
 | `DESTROY_BY_LABEL` | Both: removed wherever the label is held (a workload's: software) |
 | Other labels, `STORE`, symmetric and every other suite | Software |
 | `TIER` | The token when present: the backend that holds identity keys |
-| `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The router, reaching each key through `ECDH`, `PUBLIC`, `SIGN` and `DESCRIBE` on its own backend |
+| `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The router, reaching each key through `ECDH`, `PUBLIC` and `DESCRIBE` on its own backend |
 
 A key's own custody is its `DESCRIBE`. A volume key reconstructed from
 shares opened by a token recipient key is a software session key:
@@ -427,13 +434,14 @@ build-time form, `${file:<path>}`, embeds the file instead, for targets
 with no file surface at runtime; a Linux image refuses it, and a
 credential named both ways refuses to construct.
 
-At `module_new` the TLS module issues `PROBE`. If the vault is present
-and an identity key is configured, it calls `STORE`, records the slot
-handle, and then wipes the in-module key bytes with volatile writes, so
-`CertificateVerify` signs only through the vault (`SIGN`). A key read
-from `key_file` at runtime is deposited the same way when it is read. The in-module
-path is retained only as the explicit not-present fallback — a module
-arena dump on a vault-enabled build does not reveal the identity key.
+The TLS module claims the vault in its manifest whenever it has an
+identity. At `module_new`, a P-256 or RSA identity key is deposited with
+`STORE` and the in-module key bytes are wiped with volatile writes, so
+`CertificateVerify` signs only through the vault's resumable `SIGN`, one
+identical call per step until it answers; a key the vault refuses refuses
+the module's construction. A key read from `key_file` at runtime is
+deposited the same way when it is read. A module arena dump does not reveal
+the identity key.
 
 An identity can also be born in the vault. With `identity_label` set, the
 TLS module opens a P-256 key under that label, or generates and persists it
@@ -646,25 +654,41 @@ appropriate for bcm2712; drop to 64 on slower silicon).
 
 ### TLS-level retransmit retention
 
-The IP module does not retain TCP segments for retransmission — that
-would duplicate state between IP and TLS. Instead it signals the
-consumer:
+`ip` retransmits from its own copy of what a connection sent, except on a
+channel whose every consumer keeps its own copy (`retains_send`, which
+`tls` declares on `cipher_in`): there `ip` grants the connection `RETX`
+and keeps nothing, so the ciphertext exists once. On such a connection
+`ip` signals the consumer over `stream_retx`:
 
-- `MSG_ACK(conn_id, acked_seq, isn)` — the peer acknowledged up to
+- `MSG_RETX_ACK(conn_id, acked_seq, isn)` — the peer acknowledged up to
   `acked_seq`; `isn` is the sequence number of the stream's first byte.
-- `MSG_RETRANSMIT(conn_id, from_seq)` — replay data from this sequence.
+- `MSG_RETX_REQUEST(conn_id, from_seq)` — replay data from this sequence.
 
-The TLS module holds each emitted ciphertext record in a per-session
-`retx_buf` (default 4 KB). Until the first `MSG_ACK` its base counts stream
-bytes; the first one anchors `retx_base_seq` at `isn` plus that offset, so
-the window is placed exactly whatever was sent before it arrived, and each
-`MSG_ACK` truncates it up to the absolute TCP sequence number. On
-`MSG_RETRANSMIT` up to one segment of it from `from_seq` goes back down as
-`CMD_RESEND` (`[conn_id][seq][bytes]`), which `ip` sends at those sequence
-numbers rather than as new data — no re-encryption, just re-delivery of the
+The TLS module holds each emitted ciphertext record of a `RETX`-granted
+connection in a per-session `retx_buf` (default 4 KB). Until the first
+`MSG_RETX_ACK` its base counts stream bytes; the first one anchors
+`retx_base_seq` at `isn` plus that offset, so the window is placed exactly
+whatever was sent before it arrived, and each acknowledgement truncates it
+up to the absolute TCP sequence number. On a request up to one segment of
+it from `from_seq` goes back down as `CMD_RETX_RESEND`
+(`[conn_id][seq][bytes]`), which `ip` sends at those sequence numbers
+rather than as new data — no re-encryption, just re-delivery of the
 ciphertext the peer is expecting. Because the window is the only copy, an
 anchored window that cannot take the next record holds the record back
-(`cipher_out` backpressure) rather than dropping bytes it retains.
+(`cipher_out` backpressure) rather than dropping bytes it retains. A
+connection without the grant (every `linux_net` connection, any `ip`
+connection on a channel shared with a plaintext consumer) holds no window
+and is never sent a `stream_retx` frame.
+
+### Who commands a provider
+
+A stream or datagram provider admits a bind, and a send or close on a
+datagram endpoint, as the owner the kernel attests for the channel the
+command arrived on — `channel::FACTS` answers the owner of the module that
+writes it (a fan-in's merge belongs to the graph's owner) — or, on a
+workload network lane, the owner `NET_LANE_TAKE` handed the provider. No
+record names an owner, so a consumer cannot bind as, or command the
+endpoint of, an owner it is not.
 
 ## Horizontal Scaling and Trust Domains
 

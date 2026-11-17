@@ -25,6 +25,8 @@ pub unsafe fn dev_param_store(sys: &SyscallTable, tag: u8, value: *const u8, len
         abi::contracts::storage::runtime_params::STORE,
         bp,
         1 + copy_len,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -37,6 +39,8 @@ pub unsafe fn dev_param_store_u8(sys: &SyscallTable, tag: u8, val: u8) -> i32 {
         abi::contracts::storage::runtime_params::STORE,
         buf.as_mut_ptr(),
         2,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -55,6 +59,8 @@ pub unsafe fn dev_param_delete(sys: &SyscallTable, tag: u8) -> i32 {
         abi::contracts::storage::runtime_params::DELETE,
         buf.as_mut_ptr(),
         1,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -66,6 +72,8 @@ pub unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
         abi::contracts::storage::runtime_params::CLEAR_ALL,
         core::ptr::null_mut(),
         0,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -73,8 +81,21 @@ pub unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
 /// Returns (ptr, size). ptr is null and size is 0 if no arena was allocated.
 #[inline(always)]
 pub unsafe fn dev_arena_get(sys: &SyscallTable) -> (*mut u8, u32) {
-    let mut buf = [0u8; 4];
-    let size = (sys.provider_call)(-1, abi::kernel_abi::ARENA_GET, buf.as_mut_ptr(), 4);
-    let addr = u32::from_le_bytes(buf);
-    (addr as *mut u8, if size > 0 { size as u32 } else { 0 })
+    let mut buf = [0u8; 12];
+    let rc = (sys.provider_call)(
+        -1,
+        abi::kernel_abi::ARENA_GET,
+        buf.as_mut_ptr(),
+        buf.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc < 0 {
+        return (core::ptr::null_mut(), 0);
+    }
+    let addr = u64::from_le_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+    let size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    (addr as usize as *mut u8, size)
 }

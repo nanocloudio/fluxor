@@ -71,21 +71,13 @@ pub fn provision_spare_lane_merge(
     }
     // The merge's sole output — the channel the consumer caches and reads — plus
     // `spare_count` producer-less spare input lanes.
-    let out_chan = crate::kernel::ipc::channel::channel_open(
-        crate::kernel::ipc::channel::CHANNEL_TYPE_PIPE,
-        null(),
-        0,
-    );
+    let out_chan = crate::kernel::ipc::channel::channel_open(&[]);
     if out_chan < 0 {
         return -1;
     }
     let mut lanes = [-1i32; MAX_PORTS];
     for lane in lanes.iter_mut().take(spare_count) {
-        let ch = crate::kernel::ipc::channel::channel_open(
-            crate::kernel::ipc::channel::CHANNEL_TYPE_PIPE,
-            null(),
-            0,
-        );
+        let ch = crate::kernel::ipc::channel::channel_open(&[]);
         if ch < 0 {
             return -1;
         }
@@ -201,18 +193,42 @@ pub fn merge_owning_lane(ch: i32) -> Option<usize> {
     None
 }
 
-/// Whether `handle` is one of `module_idx`'s channel ports — in, out or
-/// control. The gateway's authority check for a gated module's channel ops.
-pub fn module_owns_channel(module_idx: usize, handle: i32) -> bool {
-    if module_idx >= module_slots() || handle < 0 {
-        return false;
+/// The module at the other end of `module_idx`'s port `index` of
+/// `port_type` (0 in, 1 out, 2 ctrl), with that module's own port on the
+/// edge as `(port_type, index)`. `None` when the port is not wired, or when
+/// it is an output wired to more than one consumer: a port that reaches
+/// several modules names none of them.
+pub fn edge_peer(module_idx: usize, port_type: u8, index: u8) -> Option<(usize, u8, u8)> {
+    // SAFETY: SCHED scheduler-thread owned; edges are written at graph setup
+    // and live add, both on the scheduler thread.
+    let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
+    let edges = &sched.edges[..sched.edge_count];
+    match port_type {
+        0 | 2 => edges
+            .iter()
+            .find(|e| {
+                !e.tap
+                    && e.to_module == module_idx
+                    && e.to_port_index == index
+                    && e.is_ctrl() == (port_type == 2)
+            })
+            .map(|e| (e.from_module, 1, e.from_port_index)),
+        1 => {
+            let mut it = edges
+                .iter()
+                .filter(|e| !e.tap && e.from_module == module_idx && e.from_port_index == index);
+            let e = it.next()?;
+            if it.next().is_some() {
+                return None;
+            }
+            Some((
+                e.to_module,
+                if e.is_ctrl() { 2 } else { 0 },
+                e.to_port_index,
+            ))
+        }
+        _ => None,
     }
-    // SAFETY: SCHED scheduler-thread owned; ports are written at graph setup
-    // and read here; module_idx bounded above.
-    let ports = unsafe { &SCHED.ports[module_idx] };
-    ports.in_chans.contains(&handle)
-        || ports.out_chans.contains(&handle)
-        || ports.ctrl_chans.contains(&handle)
 }
 
 /// Read a port channel handle for a module. Mirror of `set_module_port`.
@@ -268,6 +284,13 @@ pub fn set_module_port(module_idx: usize, port_type: u8, port_index: u8, channel
     // SAFETY: SCHED scheduler-thread owned; module_idx bounded above.
     let ports = unsafe { &mut SCHED.ports[module_idx] };
     let idx = port_index as usize;
+    // The module is that end of the channel, unless an edge already named it.
+    let end = if port_type == 1 {
+        crate::kernel::ipc::channel::End::Producer
+    } else {
+        crate::kernel::ipc::channel::End::Consumer
+    };
+    crate::kernel::ipc::channel::channel_bind_end(channel, end, module_idx as ModuleId);
     match port_type {
         0 => {
             if idx < MAX_PORTS {
@@ -571,10 +594,10 @@ pub struct SchedulerState {
     pub(crate) reconfigure_phase: ReconfigurePhase,
     /// Number of modules in the current graph, set by `prepare_graph`.
     pub(crate) active_module_count: usize,
-    /// Pending rebuild request (config_ptr, len). Set by `request_rebuild`,
+    /// A rebuild is pending. Set by `request_rebuild`,
     /// consumed by the per-platform main loop, which performs a destructive
     /// reset + reload.
-    pub(crate) rebuild_request: Option<(*const u8, usize)>,
+    pub(crate) rebuild_request: bool,
     /// Transaction marker for `prepare_graph`. Set true at the *start* of
     /// graph preparation (before any destructive `reset_*` call) and
     /// cleared once the new graph is fully wired. While set, `step_modules`
@@ -677,7 +700,7 @@ impl SchedulerState {
             domain_pre_tick_overruns: [0; MAX_DOMAINS],
             reconfigure_phase: ReconfigurePhase::Running,
             active_module_count: 0,
-            rebuild_request: None,
+            rebuild_request: false,
             prepare_in_progress: false,
             module_code_base: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             module_code_size: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
@@ -977,7 +1000,7 @@ impl SchedulerState {
         self.starvation_window_ms = 0;
         self.reconfigure_phase = ReconfigurePhase::Running;
         self.active_module_count = 0;
-        self.rebuild_request = None;
+        self.rebuild_request = false;
         self.drain_started_ms = u64::MAX;
         self.exec_order_offset = 0;
         // `prepare_in_progress` is intentionally NOT cleared here. The
@@ -1364,6 +1387,21 @@ pub fn module_params(idx: usize) -> (*const u8, usize) {
     unsafe { (SCHED.module_params_ptr[idx], SCHED.module_params_len[idx]) }
 }
 
+/// Copy module `idx`'s instance params into `out`, as many as fit; answers
+/// their whole length (0 for a module with none).
+pub fn copy_module_params(idx: usize, out: &mut [u8]) -> usize {
+    let (src, len) = module_params(idx);
+    if src.is_null() || len == 0 {
+        return 0;
+    }
+    // SAFETY: the params the loader recorded for a live module stay mapped
+    // and unchanged while it is loaded, and the read ends here.
+    let params = unsafe { core::slice::from_raw_parts(src, len) };
+    let n = len.min(out.len());
+    out[..n].copy_from_slice(&params[..n]);
+    len
+}
+
 /// Store a BuiltInModule in the scheduler's module table (used by Linux platform).
 pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
     if idx >= module_slots() {
@@ -1594,13 +1632,15 @@ pub fn syscall_flow_budget(port_index: u8) -> i32 {
 }
 
 /// Input-port consumption budget. The logical port index is the stable graph
-/// contract. The channel descriptor is payload data (never a provider handle)
-/// and resolves runtime bridge/repacking aliases when necessary.
-pub fn syscall_input_flow_budget(port_index: u8, channel: i32) -> i32 {
+/// contract; the channel the calling module reads that port through (which a
+/// bridge or a repacking stage may have substituted for the edge's own)
+/// resolves the edge when the index alone does not.
+pub fn syscall_input_flow_budget(port_index: u8) -> i32 {
     let idx = current_module_index();
     if idx >= module_slots() {
         return 0;
     }
+    let channel = get_module_port(idx, 0, port_index);
     // SAFETY: scheduler-thread single accessor of SCHED, read through a raw pointer.
     let (class, domain) = unsafe {
         let p = &raw const SCHED;
@@ -2085,11 +2125,11 @@ fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
 /// single-domain target (Linux/rp) every module is in domain 0, so it
 /// degenerates exactly to the global `wake_pending_nonzero()`.
 pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
-    // Timers are fds (`fd::timer_pump`): service the ones that fired — their
+    // Timers are handles (`timer::timer_pump`): service the ones that fired — their
     // owners' wake bits latch, exactly as an event's would — and learn when
     // this domain's earliest unfired one is due. Pumped FIRST so a fire that
     // just happened reads as pending work to the idle decision below.
-    let timer_ms = crate::kernel::ipc::fd::timer_pump(domain_id as u8);
+    let timer_ms = crate::kernel::ipc::timer::timer_pump(domain_id as u8);
     let period = pacer_next_deadline_us_unbounded(domain_id);
     let Some(ms) = timer_ms else {
         return period;

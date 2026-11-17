@@ -6,7 +6,6 @@ timer_class = "wall_clock"
 # `linux` is here because a Linux graph that terminates TLS is a first-class
 # deployment, and a consumer cannot wire a module its target list excludes.
 hardware_targets = ["rp2350", "bcm2712", "linux", "uefi"]
-grants = ["key_vault"]
 
 # Ingress anchor role: tls terminates the client-visible secure stream in
 # front of the consumer it serves, so it owns the attachment a client sees
@@ -92,6 +91,16 @@ requires_contract = "fs"
 access = "read"
 active_when_params = ["cert_file", "key_file", "trust"]
 
+# The identity key lives in the key vault, which signs CertificateVerify
+# (resumably, across steps) and seals continuity state: an instance with an
+# identity — a key read from `key_file` or embedded by the builder under
+# it, or a label identity — calls it, and a graph with no vault is refused
+# when composed.
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+active_when_params = ["cert_file", "key_file", "identity_label"]
+
 # The build-time form, `${file:<path>}`, is for targets with no file surface
 # at runtime: the builder reads the file and embeds the chain, the key and
 # the anchors as extended tags 10, 11 and 12. A Linux image refuses it. A
@@ -127,8 +136,8 @@ active_when_params = ["cert_file", "key_file", "trust"]
 # client refuses a server selection it did not offer. Unset, both sides use
 # `h2,http/1.1` (`http/1.1` under `alpn_h1_only`). The negotiated name is
 # reported with the connection on `clear_out`: after the session generation
-# in `MSG_CONNECTED` / the port-qualified `MSG_ACCEPTED` comes
-# `[alpn_len:1][alpn]` (`net_proto::session_alpn`; length 0 for none), so
+# in `MSG_CONNECTED` / `MSG_ACCEPTED` comes
+# `[alpn_len:1][alpn]` (`net_proto::Opening`; length 0 for none), so
 # an HTTP client knows before its first byte whether to speak HTTP/2.
 #
 # Dial completions on `clear_out`: a `CMD_CONNECT_TO` is answered by the
@@ -139,25 +148,44 @@ active_when_params = ["cert_file", "key_file", "trust"]
 # certificate yet. Never a `MSG_CLOSED` for a connection the requester was
 # not told of.
 
+# The ip-facing input. `retains_send`: tls keeps every record it sends on a
+# connection the transport grants `stream_retx` (net_proto flag RETX) until
+# the peer acknowledges it, and resends from that copy; the composer marks
+# the edge so the transport may leave the copy to it. Data is streamed; no
+# other frame a transport writes is near 1600 bytes.
 [[ports]]
 name = "cipher_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 1600
+retains_send = true
 
+# A consumer's CMD_SEND carries at most 8192 bytes of clear data, sealed as
+# it is read.
 [[ports]]
 name = "clear_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 8197
 
+# One record per CMD_SEND, assembled in the frame scratch: a whole 8 KiB
+# command on aarch64, one segment's worth on the small-SRAM targets — what
+# `ip` accepts on each.
 [[ports]]
 name = "cipher_out"
 direction = "output"
 content_type = "NetProto"
+max_record = { default = 1600, aarch64 = 8195 }
+# Two of the largest records, so one in the ring never stops the next.
+buffer_size = { default = 8192, aarch64 = 16384 }
 
+# Decrypted data goes up in frames no larger than a transport's, so a
+# consumer that reads a transport reads tls.
 [[ports]]
 name = "clear_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 1483
 
 # Per-session peer-identity record emitted after handshake completion,
 # for every session — including one whose peer presented no credential,

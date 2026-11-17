@@ -334,7 +334,8 @@ Replication and streaming:
 | Capability | Meaning |
 |------------|---------|
 | `replication.state_machine` | Replicated commit-and-apply surface: per-entry committed stream, accepted-into-WAL index echo, quorum-durability notice, snapshot install / export, apply-pipeline reset |
-| `stream.ordered_ack` | A provider of the exchange contract that durably accepts records in order: a 200 answer means durable acceptance, LINK records report its backend link; the parent a requester requires when it only publishes, satisfied by either role below. Wire contract: `crates/fluxor-abi/src/contracts/exchange.rs` |
+| `exchange.request` | The surface an `ExchangeRequest` port carries, declared on the port (`[ports.facts]`). Fact `binding` (a set, e.g. `["http"]`): the bindings whose verbs the port carries. A requester's `request_out` names the ones it sends, a provider's `request_in` the ones it speaks, and the composer refuses an edge whose producer declares a binding its consumer does not — undeclared is none. Wire contract: `crates/fluxor-abi/src/contracts/exchange.rs` |
+| `stream.ordered_ack` | A provider of the exchange contract that durably accepts records in order: an answer with outcome OK means durable acceptance, LINK records report its backend link; the parent a requester requires when it only publishes, satisfied by either role below. Wire contract: `crates/fluxor-abi/src/contracts/exchange.rs` |
 | `stream.ordered_ack.sink` | A provider that accepts records and does not answer with data: an MQTT topic, a Kafka partition, an INSERT |
 | `stream.ordered_ack.exchange` | A provider that additionally answers each request with data on the same exchange: an HTTP GET, a SELECT |
 | `stream.line` | Line- or byte-delimited text stream: one command's output feeding the next command's input, unidirectional, backpressured by the channel, with no correlation and no acks |
@@ -503,7 +504,7 @@ service providers, in `provides`:
 gpio  spi  i2c  pio  channel  timer  platform_nic_ring  platform_dma
 fs  buffer  event  uart  adc  pwm  platform_dma_fd  pcie_device
 storage.namespace  storage.object  usb_host  proc  workload  trust
-net_policy  host_mount  net_route
+net_policy  host_mount  net_route  image_decode
 ```
 
 Naming is lowercase `snake_case`, with the two storage contracts in their

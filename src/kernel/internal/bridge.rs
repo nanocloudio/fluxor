@@ -728,11 +728,16 @@ pub fn bridge_reset_all() {
 ///
 /// Called from syscalls.rs when a bridge handle is accessed.
 /// Operations:
-///   - BRIDGE_WRITE: write data to bridge (producer side)
-///   - BRIDGE_READ: read data from bridge (consumer side)
+///   - BRIDGE_WRITE: write `data` to bridge (producer side)
+///   - BRIDGE_READ: read into `data` from bridge (consumer side)
 ///   - BRIDGE_POLL: check readiness (has_new for command, len>0 for ring, always for snapshot)
-///   - BRIDGE_INFO: get bridge type and stats
-pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+///   - BRIDGE_INFO: get bridge type and stats into `arg`
+pub fn bridge_dispatch(
+    slot: usize,
+    op: u32,
+    arg: &mut [u8],
+    mut data: crate::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     let bridge = match bridge_get(slot) {
         Some(b) => b,
         None => return crate::kernel::sys::errno::EINVAL,
@@ -741,12 +746,10 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
     match op {
         // BRIDGE_WRITE = 0
         0 => {
-            if arg.is_null() || arg_len == 0 {
+            if data.is_empty() {
                 return crate::kernel::sys::errno::EINVAL;
             }
-            // SAFETY: `arg` non-null + `arg_len > 0` checked above; caller
-            // owns the buffer for the duration of this call.
-            let data = unsafe { core::slice::from_raw_parts(arg, arg_len) };
+            let data = data.as_slice();
             match &bridge.inner {
                 BridgeInner::Snapshot(b) => {
                     b.write(data);
@@ -768,12 +771,10 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
         }
         // BRIDGE_READ = 1
         1 => {
-            if arg.is_null() || arg_len == 0 {
+            if data.is_empty() {
                 return crate::kernel::sys::errno::EINVAL;
             }
-            // SAFETY: `arg` non-null + `arg_len > 0` checked above; caller
-            // owns the buffer for the duration of this call.
-            let data = unsafe { core::slice::from_raw_parts_mut(arg, arg_len) };
+            let data = data.as_mut();
             match &bridge.inner {
                 BridgeInner::Snapshot(b) => {
                     let (n, _seq) = b.read(data);
@@ -818,11 +819,9 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
         // BRIDGE_INFO = 3: return [type:u8, 0:u8, from:u16, to:u16, 0:u16,
         // drops:u32, seq:u32]
         3 => {
-            if arg.is_null() || arg_len < 16 {
+            let Some(out) = arg.get_mut(..16) else {
                 return crate::kernel::sys::errno::EINVAL;
-            }
-            // SAFETY: `arg_len >= 16` (checked above) so 16-byte slice in-bounds.
-            let out = unsafe { core::slice::from_raw_parts_mut(arg, 16) };
+            };
             out[0] = bridge.bridge_type as u8;
             out[1] = 0;
             out[2..4].copy_from_slice(&bridge.from_module.to_le_bytes());

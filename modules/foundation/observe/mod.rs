@@ -257,7 +257,14 @@ unsafe fn drain_telemetry(s: &ObserveState) {
     let mut batch = [0u8; BATCH_BUF];
     // TLM_DRAIN copies whole records for this slot into the buffer and advances
     // the tail; `handle` is the slot id.
-    let n = (sys.provider_call)(s.tlm_slot, tlm::TLM_DRAIN, batch.as_mut_ptr(), BATCH_BUF);
+    let n = (sys.provider_call)(
+        s.tlm_slot,
+        tlm::TLM_DRAIN,
+        core::ptr::null_mut(),
+        0,
+        batch.as_mut_ptr(),
+        BATCH_BUF,
+    );
     if n <= 0 {
         return;
     }
@@ -271,7 +278,14 @@ unsafe fn drain_telemetry(s: &ObserveState) {
         }
         let m = render_record(&batch[off..off + rlen], &mut line);
         if m > 0 {
-            (sys.provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), m);
+            (sys.provider_call)(
+                3,
+                SYSTEM_LOG,
+                core::ptr::null_mut(),
+                0,
+                line.as_mut_ptr(),
+                m,
+            );
         }
         off += rlen;
     }
@@ -341,7 +355,14 @@ pub unsafe extern "C" fn module_new(
         sub[..4].copy_from_slice(&tlm::FILTER_ALL.to_le_bytes());
         sub[tlm::SUBSCRIBE_INTERVAL_OFFSET..]
             .copy_from_slice(&(s.interval_ms as u64).to_le_bytes());
-        s.tlm_slot = (sys.provider_call)(-1, tlm::TLM_SUBSCRIBE, sub.as_mut_ptr(), sub.len());
+        s.tlm_slot = (sys.provider_call)(
+            -1,
+            tlm::TLM_SUBSCRIBE,
+            sub.as_mut_ptr(),
+            sub.len(),
+            core::ptr::null_mut(),
+            0,
+        );
 
         0
     }

@@ -219,8 +219,8 @@ const PORT_REQUEST_OUT: u8 = 11;
 
 /// Exchanges the far side holds open between the request HEAD it hands the
 /// provider and the provider's terminal record — the ones it must ABORT
-/// when their session ends. A HEAD past it is answered `503`, marked
-/// RAISED, and never reaches the provider.
+/// when their session ends. A HEAD past it is answered BUSY, marked RAISED,
+/// and never reaches the provider.
 pub const OPEN_EXCHANGES_MAX: usize =
     if abi::config::TARGET_CLASS == abi::config::target_class::HOST {
         256
@@ -725,8 +725,9 @@ pub struct State {
     n_open: u16,
     open: [XOpen; OPEN_EXCHANGES_MAX],
     next_local: u64,
-    /// Far: requests answered 503 (the open table was full), 413 (the HEAD
-    /// no longer fit once its `peer` was written) or 400 (not a HEAD).
+    /// Far: requests answered BUSY (the open table was full), TOO_LARGE (the
+    /// HEAD no longer fit once its `peer` was written) or REFUSED (a HEAD
+    /// that broke the exchange's rules).
     pub x_refused: u32,
     /// Far: ABORTs written for exchanges a session left open.
     pub x_aborted: u32,
@@ -1158,8 +1159,8 @@ unsafe fn flush_closes(s: &mut State) {
         let mut f = [0u8; 3 + 5];
         let n = if s.transport == TRANSPORT_NET {
             f[0] = net_proto::CMD_CLOSE;
-            f[3..5].copy_from_slice(&(id as u16).to_le_bytes());
-            5
+            f[3..3 + net_proto::CLOSE_LEN].copy_from_slice(&net_proto::close(id as u16, false));
+            3 + net_proto::CLOSE_LEN
         } else {
             f[0] = mux::CMD_MUX_SESSION_CLOSE;
             mux::put_session_id(&mut f[3..], id);
@@ -2587,18 +2588,18 @@ unsafe fn net_input(s: &mut State) {
         }
         match msg {
             net_proto::MSG_BOUND if s.phase == PH_WAIT_BOUND => {
-                s.phase = PH_LISTENING;
+                if net_proto::bound_parts(p).is_some_and(|(_, port, _)| port == s.port) {
+                    s.phase = PH_LISTENING;
+                }
             }
-            net_proto::MSG_ACCEPTED if plen >= 2 => {
-                let port = if plen >= 4 {
-                    u16::from_le_bytes([p[2], p[3]])
-                } else {
-                    s.port
+            net_proto::MSG_ACCEPTED => {
+                let Some(a) = net_proto::accepted_parts(p) else {
+                    continue;
                 };
-                if s.role != ROLE_LISTEN || port != s.port {
+                if s.role != ROLE_LISTEN || a.local_port != s.port {
                     // Another consumer's listener.
                 } else if let (PH_LISTENING, Some(l)) = (s.phase, free_link(s)) {
-                    let generation = net_proto::session_generation(p, net_proto::ACCEPTED_FIXED);
+                    let generation = a.opening.generation;
                     s.links[l].conn = id;
                     s.links[l].generation = generation;
                     forget_close(s, id as u32);
@@ -2608,12 +2609,14 @@ unsafe fn net_input(s: &mut State) {
                     close_unused(s, id as u32);
                 }
             }
-            net_proto::MSG_CONNECTED
-                if plen >= net_proto::CONNECTED_FIXED
-                    && net_proto::connected_parts(p).1 == s.my_tag =>
-            {
-                if s.phase == PH_DIALING {
-                    let generation = net_proto::session_generation(p, net_proto::CONNECTED_FIXED);
+            net_proto::MSG_CONNECTED => {
+                let Some(c) = net_proto::connected_parts(p) else {
+                    continue;
+                };
+                if c.requester_tag != s.my_tag {
+                    // Another consumer's dial.
+                } else if s.phase == PH_DIALING {
+                    let generation = c.opening.generation;
                     s.links[0].conn = id;
                     s.links[0].generation = generation;
                     s.phase = PH_LINKED;
@@ -2625,28 +2628,35 @@ unsafe fn net_input(s: &mut State) {
                     close_unused(s, id as u32);
                 }
             }
-            net_proto::MSG_DATA if plen > 2 => {
+            net_proto::MSG_DATA => {
+                let Some((_, bytes)) = net_proto::data_parts(p) else {
+                    continue;
+                };
                 let Some(l) = link_of_conn(s, id) else {
                     continue;
                 };
                 s.links[l].last_rx_ms = dev_millis(sys) as u32;
+                let n = bytes.len();
                 let mut data = [0u8; RX_SCRATCH];
-                data[..plen - 2].copy_from_slice(&p[2..]);
-                feed(s, l, None, &data[..plen - 2]);
+                data[..n].copy_from_slice(bytes);
+                feed(s, l, None, &data[..n]);
             }
-            net_proto::MSG_CLOSED if plen >= 2 => {
+            net_proto::MSG_CLOSED if net_proto::closed_parts(p).is_some() => {
                 forget_close(s, id as u32);
                 if let Some(l) = link_of_conn(s, id) {
                     end_link(s, l, true, b"[remote_channel] session closed");
                 }
             }
             net_proto::MSG_ERROR => {
-                if s.phase == PH_DIALING
-                    && plen >= net_proto::ERROR_FIXED + net_proto::REQUESTER_TAG_LEN
-                    && net_proto::error_parts(p).2 == s.my_tag
-                {
-                    s.phase = PH_IDLE;
-                    s.retry_at_ms = later(dev_millis(sys) as u32, s.redial_ms);
+                let Some((_, _, tag)) = net_proto::error_parts(p) else {
+                    continue;
+                };
+                if tag != net_proto::REQUESTER_TAG_NONE {
+                    // A dial's failure: ours only by our tag.
+                    if s.phase == PH_DIALING && tag == s.my_tag {
+                        s.phase = PH_IDLE;
+                        s.retry_at_ms = later(dev_millis(sys) as u32, s.redial_ms);
+                    }
                 } else if let Some(l) = link_of_conn(s, id) {
                     end_link(s, l, true, b"[remote_channel] session failed");
                 }
@@ -3053,7 +3063,7 @@ unsafe fn take(s: &mut State, i: usize, targets: u8) {
         let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(at), max);
         if n == errno::EINVAL {
             // Over the maximum: refuse it by flushing it off the edge.
-            dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+            dev_channel_flush(sys, input);
             s.chans[i].refused_oversize = s.chans[i].refused_oversize.wrapping_add(1);
             log(
                 s,
@@ -3512,7 +3522,7 @@ unsafe fn ingest(s: &mut State, i: usize) {
                 let at = c.tx_stage as usize - tag;
                 let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(at), tag + max as usize);
                 if n == errno::EINVAL {
-                    dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                    dev_channel_flush(sys, input);
                     s.chans[i].refused_oversize = s.chans[i].refused_oversize.wrapping_add(1);
                     log(
                         s,
@@ -3779,9 +3789,9 @@ fn close_open(s: &mut State, k: usize) {
 }
 
 /// Far: the module's own answer to peer `p`'s exchange `id`, raised.
-fn far_refuse(s: &mut State, p: usize, id: &xc::ExchangeId, status: u16) {
+fn far_refuse(s: &mut State, p: usize, id: &xc::ExchangeId, outcome: u8) {
     let mut own = [0u8; OWN_RECORD_LEN];
-    let n = xc::write_refusal(id, status, &mut own).unwrap_or(0);
+    let n = xc::write_refusal(id, outcome, &mut own).unwrap_or(0);
     s.peers[p].own = own;
     s.peers[p].own_len = n as u8;
     s.x_refused = s.x_refused.wrapping_add(1);
@@ -3838,18 +3848,18 @@ unsafe fn x_inbound(s: &mut State, p: usize, stage: usize, len: usize) -> (u8, u
         return (X_CONSUME, len);
     }
     if s.n_open as usize == OPEN_EXCHANGES_MAX {
-        far_refuse(s, p, &id, xc::status::BUSY);
+        far_refuse(s, p, &id, xc::outcome::BUSY);
         return (X_CONSUME, len);
     }
     // The HEAD's `peer` is the session's verified fingerprint, whatever the
     // requester wrote: the provider authorises on it.
-    let (peer_at, peer_len) = match xc::parse_request(&s.pool[stage..stage + len]) {
-        Some(xc::Record::Head(h)) => (
-            xc::HDR + xc::REQ_HEAD_FIXED + h.target.len() + h.headers.len(),
+    let (peer_at, peer_len) = match xc::parse_request::<xc::Relayed>(&s.pool[stage..stage + len]) {
+        Ok(xc::Record::Head(h)) => (
+            xc::HDR + xc::REQ_HEAD_FIXED + h.target.len() + h.meta.len(),
             h.peer.len(),
         ),
         _ => {
-            far_refuse(s, p, &id, xc::status::BAD_REQUEST);
+            far_refuse(s, p, &id, xc::outcome::REFUSED);
             return (X_CONSUME, len);
         }
     };
@@ -3860,7 +3870,7 @@ unsafe fn x_inbound(s: &mut State, p: usize, stage: usize, len: usize) -> (u8, u
     };
     let out_len = len - peer_len + fp_len;
     if out_len > xc::RECORD_MAX {
-        far_refuse(s, p, &id, xc::status::TOO_LARGE);
+        far_refuse(s, p, &id, xc::outcome::TOO_LARGE);
         return (X_CONSUME, len);
     }
     // The body moves to follow the new `peer`: from its end when it moves
@@ -3882,7 +3892,7 @@ unsafe fn x_inbound(s: &mut State, p: usize, stage: usize, len: usize) -> (u8, u
     let fp = s.peers[p].fp;
     s.pool[stage + peer_at..stage + peer_at + fp_len].copy_from_slice(&fp[..fp_len]);
     let pl = (fp_len as u16).to_le_bytes();
-    s.pool[stage + xc::HDR + 5..stage + xc::HDR + 7].copy_from_slice(&pl);
+    s.pool[stage + xc::REQ_PEER_LEN_AT..stage + xc::REQ_PEER_LEN_AT + 2].copy_from_slice(&pl);
     let local = xc::ExchangeId::from_u64(s.next_local);
     s.pool[stage + 2..stage + xc::HDR].copy_from_slice(&local.0);
     (X_DELIVER, out_len)
@@ -3995,7 +4005,7 @@ unsafe fn far_take(s: &mut State) {
         let (input, stage, max) = (c.input, c.tx_stage as usize, c.entry.max_record as usize);
         let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(stage), max);
         if n == errno::EINVAL {
-            dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+            dev_channel_flush(sys, input);
             s.x_discarded = s.x_discarded.wrapping_add(1);
             continue;
         }
@@ -4099,7 +4109,7 @@ unsafe fn near_discard(s: &mut State) {
     for _ in 0..FRAMES_PER_STEP {
         let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(stage), max);
         if n == errno::EINVAL {
-            dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+            dev_channel_flush(sys, input);
         } else if n <= 0 {
             return;
         }
@@ -4150,7 +4160,14 @@ unsafe fn near_step(s: &mut State) {
 
 // ── Entry points ────────────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: State, arena: 0 }
+fluxor_rt::module_facts! {
+    state: State,
+    arena: 0,
+    records: [
+        in 0 TRANSPORT_IN_ACCEPTS_RECORD = RX_SCRATCH,
+        out 0 TRANSPORT_OUT_MAX_RECORD = TX_BUF,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -4427,7 +4444,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         let due = now.wrapping_sub(s.retry_at_ms) < 0x8000_0000;
         if s.phase == PH_IDLE && due && s.tx_len == 0 {
             if s.role == ROLE_LISTEN {
-                let p = s.port.to_le_bytes();
+                let p = net_proto::bind(s.port, 0);
                 if command(s, NO_LINK, net_proto::CMD_BIND, &p) {
                     s.phase = PH_WAIT_BOUND;
                 }
@@ -4435,10 +4452,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
                 let mut p = [0u8; net_proto::CONNECT_TO_MAX];
                 let n = net_proto::write_connect_to(
                     &mut p,
-                    SOCK_TYPE_STREAM,
-                    s.peer_port,
-                    &dial_target(s),
-                    Some(s.my_tag),
+                    &net_proto::ConnectTo {
+                        sock_type: SOCK_TYPE_STREAM,
+                        flags: 0,
+                        port: s.peer_port,
+                        target: dial_target(s),
+                        requester_tag: s.my_tag,
+                    },
                 );
                 if command(s, NO_LINK, net_proto::CMD_CONNECT_TO, &p[..n]) {
                     s.phase = PH_DIALING;

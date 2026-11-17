@@ -23,9 +23,10 @@ timer_class = "wall_clock"
 # then exactly that many consumed, the rest held for the next),
 # `abort_after` (an abortive close — the connection reset — once that many
 # bytes were echoed), `cursor`
-# (with `ack`: each CMD_DELIVERED's cursor is the bytes consumed, as its
-# in_bytes always is, logged; a stream resumed by a takeover continues from
-# its MSG_RESUMED in_bytes) and
+# (with `ack`, which asks for the continuity cursors on the bind or dial:
+# each CMD_CURSOR_DELIVERED's cursor is the bytes consumed, as its in_bytes
+# always is, logged; a stream resumed by a takeover continues from its
+# MSG_CURSOR_RESUMED in_bytes) and
 # `dial` (`a.b.c.d:port`: connect out and be the session's client
 # instead of listening).
 
@@ -34,6 +35,8 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 required = true
+# Frame bytes, header included (`module_facts!` NET_IN_ACCEPTS_RECORD).
+accepts_record = 1483
 buffer_size = { default = 4096, aarch64 = 65536 }
 
 [[ports]]
@@ -41,6 +44,9 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 required = true
+# One `echo_after` hold as a single CMD_SEND (`module_facts!`
+# NET_OUT_MAX_RECORD): what the transport's command input accepts.
+max_record = { default = 1603, aarch64 = 4101 }
 buffer_size = { default = 4096, aarch64 = 65536 }
 
 [[resources]]

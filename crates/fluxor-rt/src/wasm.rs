@@ -30,7 +30,14 @@ mod wasm_syscalls {
             config: *const u8,
             config_len: usize,
         ) -> i32;
-        pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32;
+        pub fn provider_call(
+            handle: i32,
+            op: u32,
+            arg: *mut u8,
+            arg_len: usize,
+            data: *mut u8,
+            data_len: usize,
+        ) -> i32;
         pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32;
         pub fn provider_close(handle: i32) -> i32;
     }
@@ -164,23 +171,8 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
     // No telemetry ring in the browser host — null gate → the SDK emit helpers
     // treat telemetry as unconditionally allowed (there is no consumer anyway).
     telemetry_enabled: core::ptr::null(),
-    // The browser host has no multi-volume mount routing; instance-keyed
-    // calls are unsupported (ENOSYS) — every wasm provider is the default one.
-    provider_call_sel: wasm_provider_call_sel,
     channel_discard: wasm_syscalls::channel_discard,
 };
-
-#[cfg(target_arch = "wasm32")]
-pub unsafe extern "C" fn wasm_provider_call_sel(
-    _sel: *const u8,
-    _sel_len: usize,
-    _op_handle: i32,
-    _op: u32,
-    _arg: *mut u8,
-    _arg_len: usize,
-) -> i32 {
-    -38 // ENOSYS
-}
 
 // On wasm32 `module_init_wasm` (in `crates/fluxor-rt/src/wasm_entry.rs`)
 // passes `&WASM_SYSCALLS` to the module's `module_new`. On native

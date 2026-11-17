@@ -60,14 +60,6 @@ const MAX_LINE_WORDS: usize = 240;
 /// MAX_CACHED_ROWS × MAX_LINE_WORDS words = 7680 words = 30720 bytes (per cache).
 const LINE_CACHE_WORDS: usize = MAX_CACHED_ROWS * MAX_LINE_WORDS;
 
-/// PIO base addresses (RP2350)
-const PIO0_BASE: u32 = 0x5020_0000;
-const PIO1_BASE: u32 = 0x5030_0000;
-const PIO2_BASE: u32 = 0x5040_0000;
-
-/// TXF register offset from PIO base: 0x010 + sm*4
-const TXF_OFFSET: u32 = 0x010;
-
 // ============================================================================
 // dev_system opcodes (raw PIO + DMA bridge)
 // ============================================================================
@@ -83,8 +75,9 @@ const PIO_TXF_WRITE: u32 = abi::registry::rp_raw::PIO_TXF_WRITE;
 const PIO_SM_RESTART: u32 = abi::registry::rp_raw::PIO_SM_RESTART;
 
 // DMA fd family — st7701s uses async DMA for display scan-out. See
-// `dma_raw::fd` in the platform ABI; handles are tagged DMA fds, kernel
-// rejects raw channel numbers on these opcodes.
+// `dma_raw::fd` in the platform ABI; a DMA fd handle is of the
+// PLATFORM_DMA_FD contract, so the kernel refuses a channel handle on these
+// opcodes.
 use abi::platform::rp::dma_raw::fd as dma_fd;
 
 // 9-bit SPI bit-bang (kernel raw PAC GPIO)
@@ -216,18 +209,16 @@ impl St7701sState {
         unsafe { &*self.syscalls }
     }
 
-    /// Get the PIO base address for a given PIO block number.
-    fn pio_base(pio_num: u8) -> u32 {
-        match pio_num {
-            0 => PIO0_BASE,
-            1 => PIO1_BASE,
-            _ => PIO2_BASE,
-        }
-    }
+    /// Offset of `stripe_b` in the stripe lend (`stripe_a` is at 0).
+    const STRIPE_B: u32 = (STRIPE_BUF_WORDS * 4) as u32;
 
-    /// Get TXF address for a given PIO block and SM.
-    fn txf_addr(pio_num: u8, sm: u8) -> u32 {
-        Self::pio_base(pio_num) + TXF_OFFSET + (sm as u32) * 4
+    /// Offset of the back buffer in the stripe lend.
+    fn back_buf_offset(&self) -> u32 {
+        if self.back_is_b != 0 {
+            Self::STRIPE_B
+        } else {
+            0
+        }
     }
 
     /// Get pointer to the back buffer (the one being filled by CPU).
@@ -323,9 +314,9 @@ unsafe fn spi9_send_inner(s: &St7701sState, cmd: u8, data: &[u8], hold_cs: bool)
     let total = 5 + data.len();
     if hold_cs {
         core::ptr::write_volatile(ap.add(total), 1);
-        (sys.provider_call)(-1, SPI9_SEND, ap, total + 1);
+        (sys.provider_call)(-1, SPI9_SEND, ap, total + 1, core::ptr::null_mut(), 0);
     } else {
-        (sys.provider_call)(-1, SPI9_SEND, ap, total);
+        (sys.provider_call)(-1, SPI9_SEND, ap, total, core::ptr::null_mut(), 0);
     }
 }
 
@@ -333,7 +324,14 @@ unsafe fn spi9_send_inner(s: &St7701sState, cmd: u8, data: &[u8], hold_cs: bool)
 unsafe fn spi9_reset(s: &St7701sState) {
     let sys = s.sys();
     let mut arg = [s.rst_pin, s.cs_pin, s.sck_pin, s.sda_pin];
-    (sys.provider_call)(-1, SPI9_RESET, arg.as_mut_ptr(), 4);
+    (sys.provider_call)(
+        -1,
+        SPI9_RESET,
+        arg.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// Send one init command from the INIT_SEQ table via kernel SPI.
@@ -346,7 +344,14 @@ unsafe fn spi9_send_init_cmd(s: &St7701sState, cmd: &init_seq::InitCmd) {
 unsafe fn spi9_cs_set(s: &St7701sState, level: u8) {
     let sys = s.sys();
     let mut arg = [s.cs_pin, level];
-    (sys.provider_call)(-1, SPI9_CS_SET, arg.as_mut_ptr(), 2);
+    (sys.provider_call)(
+        -1,
+        SPI9_CS_SET,
+        arg.as_mut_ptr(),
+        2,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 // ============================================================================
@@ -369,12 +374,26 @@ unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
 
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {
     let mut lvl = [level];
-    (sys.provider_call)(handle, abi::registry::gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+    (sys.provider_call)(
+        handle,
+        abi::registry::gpio::SET_LEVEL,
+        lvl.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 unsafe fn timer_set(sys: &SyscallTable, timer_fd: i32, delay_ms: u32) -> i32 {
     let mut ms_buf = delay_ms.to_le_bytes();
-    (sys.provider_call)(timer_fd, abi::registry::timer::SET, ms_buf.as_mut_ptr(), 4)
+    (sys.provider_call)(
+        timer_fd,
+        abi::registry::timer::SET,
+        ms_buf.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
@@ -392,6 +411,8 @@ unsafe fn pio_gpiobase(sys: &SyscallTable, pio: u8, base16: u8) -> i32 {
         PIO_GPIOBASE,
         arg.as_mut_ptr(),
         2,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -402,6 +423,8 @@ unsafe fn pio_instr_alloc(sys: &SyscallTable, pio: u8, count: u8, mask_out: &mut
         PIO_INSTR_ALLOC,
         arg.as_mut_ptr(),
         6,
+        core::ptr::null_mut(),
+        0,
     );
     if rc >= 0 {
         let p = arg.as_ptr();
@@ -423,6 +446,8 @@ unsafe fn pio_instr_write(sys: &SyscallTable, pio: u8, addr: u8, instr: u16) -> 
         PIO_INSTR_WRITE,
         arg.as_mut_ptr(),
         4,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -434,6 +459,8 @@ unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio: u8, sm: u8, reg: u8, value: 
         PIO_SM_WRITE_REG,
         arg.as_mut_ptr(),
         7,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -444,6 +471,8 @@ unsafe fn pio_sm_enable(sys: &SyscallTable, pio: u8, mask: u8, enable: u8) -> i3
         PIO_SM_ENABLE,
         arg.as_mut_ptr(),
         3,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -454,6 +483,8 @@ unsafe fn pio_sm_restart(sys: &SyscallTable, pio: u8, mask: u8) -> i32 {
         PIO_SM_RESTART,
         arg.as_mut_ptr(),
         2,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -465,6 +496,8 @@ unsafe fn pio_sm_exec(sys: &SyscallTable, pio: u8, sm: u8, instr: u16) -> i32 {
         PIO_SM_EXEC,
         arg.as_mut_ptr(),
         4,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -476,6 +509,8 @@ unsafe fn pio_txf_write(sys: &SyscallTable, pio: u8, sm: u8, value: u32) -> i32 
         PIO_TXF_WRITE,
         arg.as_mut_ptr(),
         6,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -486,6 +521,8 @@ unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) -> i
         PIO_PIN_SETUP,
         arg.as_mut_ptr(),
         3,
+        core::ptr::null_mut(),
+        0,
     )
 }
 
@@ -494,38 +531,52 @@ unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) -> i
 // ============================================================================
 
 unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
-    // fd::CREATE opens against PLATFORM_DMA_FD. The kernel
-    // tracks the returned tagged fd against this contract; follow-up
-    // fd::* ops route through PLATFORM_DMA_FD's vtable and reject
-    // handles from the sibling PLATFORM_DMA (channel) surface.
+    // fd::CREATE opens against PLATFORM_DMA_FD. The handle names that
+    // contract, so follow-up fd::* ops reach the DMA fd and a handle of
+    // the sibling PLATFORM_DMA (channel) surface is refused.
     const PLATFORM_DMA_FD: u32 = abi::registry::platform_dma_fd::ID as u32;
     (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)
 }
 
-unsafe fn dma_fd_start(
-    sys: &SyscallTable,
-    fd: i32,
-    read_addr: u32,
-    write_addr: u32,
-    count: u32,
-    dreq: u8,
-    flags: u8,
-) -> i32 {
-    let ra = read_addr.to_le_bytes();
-    let wa = write_addr.to_le_bytes();
-    let cnt = count.to_le_bytes();
-    let mut arg = [
-        ra[0], ra[1], ra[2], ra[3], wa[0], wa[1], wa[2], wa[3], cnt[0], cnt[1], cnt[2], cnt[3],
-        dreq, flags,
-    ];
-    (sys.provider_call)(fd, dma_fd::START, arg.as_mut_ptr(), 14)
+/// Cookie of the stripe buffers' lend on the DMA fd.
+const STRIPE_LEND: u32 = 1;
+
+/// DMA flags: 16-bit units, the memory side advancing.
+const STRIPE_DMA_FLAGS: u8 =
+    abi::platform::rp::dma_raw::flags::INCR | abi::platform::rp::dma_raw::flags::SIZE_HALF;
+
+/// Start the fd over `count` units at `offset` in the stripe lend, paced by
+/// `dreq` (the data state machine's TX FIFO).
+unsafe fn dma_fd_start(sys: &SyscallTable, fd: i32, offset: u32, count: u32, dreq: u8) -> i32 {
+    let mut arg = abi::platform::rp::dma_raw::start::encode(
+        STRIPE_LEND,
+        offset,
+        count,
+        dreq,
+        STRIPE_DMA_FLAGS,
+    );
+    (sys.provider_call)(
+        fd,
+        dma_fd::START,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
-unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, read_addr: u32, count: u32) -> i32 {
-    let ra = read_addr.to_le_bytes();
-    let cnt = count.to_le_bytes();
-    let mut arg = [ra[0], ra[1], ra[2], ra[3], cnt[0], cnt[1], cnt[2], cnt[3]];
-    (sys.provider_call)(fd, dma_fd::QUEUE, arg.as_mut_ptr(), 8)
+/// Queue `count` units at `offset` in the stripe lend behind the transfer
+/// running.
+unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, offset: u32, count: u32) -> i32 {
+    let mut arg = abi::platform::rp::dma_raw::reload::encode(STRIPE_LEND, offset, count);
+    (sys.provider_call)(
+        fd,
+        dma_fd::QUEUE,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 // ============================================================================
@@ -931,7 +982,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         Phase::AllocDmaFd => {
             let fd = unsafe { dma_fd_create(sys) };
-            if fd < 0 {
+            // Both stripes, one span, lent on the fd the transfers run on.
+            let lent = fd >= 0
+                && unsafe {
+                    dev_lend_open(
+                        sys,
+                        fd,
+                        LEND_IN,
+                        STRIPE_LEND,
+                        s.stripe_a.as_mut_ptr() as *mut u8,
+                        STRIPE_BUF_WORDS * 8,
+                    )
+                } >= 0;
+            if !lent {
+                let fd = if fd < 0 { fd } else { -12 };
                 unsafe {
                     dev_log(sys, 1, b"[lcd] DMA FD alloc fail".as_ptr(), 23);
                 }
@@ -1344,20 +1408,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 fill_vertical_stripes(s.stripe_b.as_mut_ptr(), s.width, sc - 2);
             }
 
-            let write_addr = St7701sState::txf_addr(s.pio_data, 1);
             let dreq = (s.pio_data * 8) + 1;
 
-            let rc = unsafe {
-                dma_fd_start(
-                    sys,
-                    s.dma_fd,
-                    s.stripe_a.as_ptr() as u32,
-                    write_addr,
-                    s.stripe_pixels,
-                    dreq,
-                    0x01,
-                )
-            };
+            let rc = unsafe { dma_fd_start(sys, s.dma_fd, 0, s.stripe_pixels, dreq) };
             if rc < 0 {
                 unsafe {
                     dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
@@ -1367,7 +1420,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             }
 
             let rc =
-                unsafe { dma_fd_queue(sys, s.dma_fd, s.stripe_b.as_ptr() as u32, s.stripe_pixels) };
+                unsafe { dma_fd_queue(sys, s.dma_fd, St7701sState::STRIPE_B, s.stripe_pixels) };
             if rc < 0 {
                 unsafe {
                     dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
@@ -1462,20 +1515,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             }
 
             // Start DMA chain: stripe_a first, stripe_b queued.
-            let write_addr = St7701sState::txf_addr(s.pio_data, 1);
             let dreq = (s.pio_data * 8) + 1;
 
-            let rc = unsafe {
-                dma_fd_start(
-                    sys,
-                    s.dma_fd,
-                    s.stripe_a.as_ptr() as u32,
-                    write_addr,
-                    s.stripe_pixels,
-                    dreq,
-                    0x01,
-                )
-            };
+            let rc = unsafe { dma_fd_start(sys, s.dma_fd, 0, s.stripe_pixels, dreq) };
             if rc < 0 {
                 unsafe {
                     dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
@@ -1484,7 +1526,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 return StepReturn::error(rc);
             }
             let rc =
-                unsafe { dma_fd_queue(sys, s.dma_fd, s.stripe_b.as_ptr() as u32, s.stripe_pixels) };
+                unsafe { dma_fd_queue(sys, s.dma_fd, St7701sState::STRIPE_B, s.stripe_pixels) };
             if rc < 0 {
                 unsafe {
                     dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
@@ -1538,9 +1580,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     }
                 }
 
-                let rc = unsafe {
-                    dma_fd_queue(sys, s.dma_fd, s.back_buf_ptr() as u32, s.stripe_pixels)
-                };
+                let rc =
+                    unsafe { dma_fd_queue(sys, s.dma_fd, s.back_buf_offset(), s.stripe_pixels) };
                 if rc < 0 {
                     unsafe {
                         dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);

@@ -186,7 +186,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
             // Arm timer for first read
             let mut delay = s.interval_ms.to_le_bytes();
-            (sys.provider_call)(s.timer_fd, TIMER_SET, delay.as_mut_ptr(), 4);
+            (sys.provider_call)(
+                s.timer_fd,
+                TIMER_SET,
+                delay.as_mut_ptr(),
+                4,
+                core::ptr::null_mut(),
+                0,
+            );
 
             s.initialized = true;
             return StepReturn::Continue;
@@ -199,13 +206,27 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 return StepReturn::Continue;
             }
             // Timer expired — start ADC read
-            (sys.provider_call)(s.adc_handle, ADC_READ, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                s.adc_handle,
+                ADC_READ,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             s.reading = true;
             return StepReturn::Continue;
         }
 
         // ADC read in progress — poll for result
-        let result = (sys.provider_call)(s.adc_handle, ADC_READ, core::ptr::null_mut(), 0);
+        let result = (sys.provider_call)(
+            s.adc_handle,
+            ADC_READ,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         if result <= 0 {
             return StepReturn::Continue; // still pending
         }
@@ -246,7 +267,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         // Re-arm timer for next read
         let mut delay = s.interval_ms.to_le_bytes();
-        (sys.provider_call)(s.timer_fd, TIMER_SET, delay.as_mut_ptr(), 4);
+        (sys.provider_call)(
+            s.timer_fd,
+            TIMER_SET,
+            delay.as_mut_ptr(),
+            4,
+            core::ptr::null_mut(),
+            0,
+        );
         s.reading = false;
 
         StepReturn::Continue

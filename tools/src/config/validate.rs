@@ -1274,7 +1274,7 @@ fn platform_contracts(runtime: &str, caller: ProviderCaller) -> Option<Vec<Strin
 }
 
 /// Contracts the kernel provides on every target, whatever the platform.
-const KERNEL_CONTRACTS: &[&str] = &["channel", "timer", "event", "buffer"];
+const KERNEL_CONTRACTS: &[&str] = &["channel", "timer", "event", "buffer", "key_vault"];
 
 /// A module claim nothing in the graph or on its target answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1882,8 +1882,8 @@ pub fn validate_single_provider(
 /// provides a contract or surface.
 ///
 /// The kernel's restart path releases everything the module registered or
-/// opened — its events, timers, platform handles, provider layers and channel
-/// ioctl handlers — flushes every connected input / output / control channel,
+/// opened — its events, timers, platform handles, provider layers and mailbox
+/// lends — flushes every connected input / output / control channel,
 /// and then resumes the **same** state allocation: state is not zeroed and
 /// `module_new` is not re-called. A module carrying an invariant across
 /// steps therefore resumes with its own bookkeeping describing handles
@@ -1928,8 +1928,8 @@ pub fn validate_fault_policy(
         if !m.provides.is_empty() {
             return Err(Error::Config(format!(
                 "module '{name}': fault_policy = \"restart\" is not available to a module that \
-                 provides {}. The restart releases the provider layer and the channel ioctl \
-                 handlers the module registered and does not run `module_new` again, so the \
+                 provides {}. The restart releases the provider layer the module registered and does \
+                 not run `module_new` again, so the \
                  module would resume as a provider nothing can reach. Choose \
                  `fault_policy: \"skip\"` to terminate it, or `fault_policy: \"restart_graph\"` \
                  to re-instantiate the whole graph.",
@@ -1943,7 +1943,7 @@ pub fn validate_fault_policy(
             "module '{name}': fault_policy = \"restart\" requires the module to attest \
              that it can resume after a fault, and `{name}`'s manifest does not. \
              This policy does NOT re-instantiate the module: it releases every handle, \
-             provider layer and ioctl handler the module holds, flushes every connected channel, and resumes the \
+             provider layer and lend the module holds, flushes every connected channel, and resumes the \
              SAME state allocation without zeroing it and without re-running \
              `module_new`. A module with state that spans steps therefore resumes with \
              stale handles and stale bookkeeping. Either add `resume_after_fault = true` \
@@ -2044,6 +2044,145 @@ pub fn validate_provider_domains(
                      core, and a module heap is touched from one core only — so a module \
                      provider and every module it serves share a domain. Place both in the \
                      same domain."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a graph whose edge contracts do not meet across their edges.
+///
+/// A port that reaches an edge contract (`contract = "storage.block"`) binds
+/// it through its one edge (`kernel::BIND` with `bind::PORT`), and the kernel
+/// routes every op to the module at the other end. So, for every such port:
+///
+///   1. it has exactly one edge — an input wired from one producer, an output
+///      feeding one consumer — since a port reaching several modules names
+///      none of them;
+///   2. the peer's port on that edge serves the contract (`serves = ...`),
+///      or, for a port whose module works on without it
+///      (`contract_optional = true`), serves none;
+///   3. a serving port answers one client: its consumers' lends are bound to
+///      the server's own port on the edge, so two clients on one served port
+///      would collide;
+///   4. both modules share an execution domain: the server's code runs in
+///      the client's frame, on the client's core, as every provider call
+///      does (see [`validate_provider_domains`]).
+///
+/// FAILS OPEN on a module whose manifest could not be resolved, like
+/// [`validate_port_capabilities`].
+pub fn validate_edge_contracts(
+    config: &Value,
+    modules: &[Value],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+    let port_of = |spec: &str| -> Option<crate::manifest::PortSpec> {
+        let (module, port) = spec.split_once('.')?;
+        manifests
+            .get(module)?
+            .ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some(port))
+            .cloned()
+    };
+    let domain_of = |module: &str| -> Result<Option<(u8, String)>> {
+        let Some(m) = modules
+            .iter()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(module))
+        else {
+            return Ok(None);
+        };
+        let name = m
+            .get("domain")
+            .and_then(|d| d.as_str())
+            .unwrap_or("the primary domain")
+            .to_string();
+        Ok(Some((resolve_domain_id(m, config)?, name)))
+    };
+    // Every endpoint's edges, by "module.port".
+    let mut edges_of: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in wiring {
+        let (Some(from), Some(to)) = (
+            entry.get("from").and_then(|v| v.as_str()),
+            entry.get("to").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        edges_of.entry(from.to_string()).or_default().push(to.to_string());
+        edges_of.entry(to.to_string()).or_default().push(from.to_string());
+    }
+    let mut ends: Vec<_> = edges_of.iter().collect();
+    ends.sort();
+    for (end, peers) in ends {
+        let Some(spec) = port_of(end) else {
+            continue;
+        };
+        if let Some(served) = &spec.serves {
+            let clients: Vec<&String> = peers
+                .iter()
+                .filter(|p| port_of(p).and_then(|s| s.contract).as_deref() == Some(served))
+                .collect();
+            if clients.len() > 1 {
+                return Err(Error::Config(format!(
+                    "`{end}` serves `{served}` to {}. A served port answers the one client \
+                     wired to it; give each client its own source, or put one client in \
+                     front of the rest.",
+                    clients.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(" and "),
+                )));
+            }
+        }
+        let Some(wanted) = &spec.contract else {
+            continue;
+        };
+        if peers.len() != 1 {
+            return Err(Error::Config(format!(
+                "`{end}` reaches the edge contract `{wanted}`, which it binds through its one \
+                 edge, but it is wired to {}. Wire it to exactly one module that serves \
+                 `{wanted}`.",
+                if peers.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    peers.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(" and ")
+                },
+            )));
+        }
+        let peer = &peers[0];
+        let (Some((client_mod, _)), Some((peer_mod, _))) = (end.split_once('.'), peer.split_once('.'))
+        else {
+            continue;
+        };
+        if !manifests.contains_key(peer_mod) {
+            continue;
+        }
+        let serves = port_of(peer).and_then(|p| p.serves);
+        if serves.is_none() && spec.contract_optional {
+            continue;
+        }
+        if serves.as_deref() != Some(wanted.as_str()) {
+            return Err(Error::Config(format!(
+                "`{end}` reaches `{wanted}`, but `{peer}` wired to it {}. Wire a port that \
+                 declares `serves = \"{wanted}\"`.",
+                match serves {
+                    Some(other) => format!("serves `{other}`"),
+                    None => "serves no edge contract".to_string(),
+                },
+            )));
+        }
+        if let (Some((c_dom, c_name)), Some((p_dom, p_name))) =
+            (domain_of(client_mod)?, domain_of(peer_mod)?)
+        {
+            if c_dom != p_dom {
+                return Err(Error::Config(format!(
+                    "module '{client_mod}' (domain '{c_name}') reaches `{wanted}` served by \
+                     module '{peer_mod}' (domain '{p_name}'). A provider call runs the \
+                     provider's code in the caller's frame, on the caller's core, and a \
+                     module heap is touched from one core only — so the two ends of an edge \
+                     contract share a domain. Place both in the same domain."
                 )));
             }
         }
@@ -2261,17 +2400,23 @@ pub fn validate_port_capabilities(
 /// ports declare, the producer's terms must fit the consumer's: a set is a
 /// subset (everything the producer may send, the consumer takes), an exact
 /// number is equal, a ceiling is not exceeded. A fact only one end declares is
-/// unconstrained on that edge — the honest reading of an undeclared fact.
+/// unconstrained on that edge — the honest reading of an undeclared fact —
+/// except a fact in `UNDECLARED_IS_NONE`, which a consumer that declares
+/// nothing takes none of: a requester whose `request_out` declares an
+/// exchange `binding` is refused against a provider whose `request_in` does
+/// not speak it.
 ///
-/// Fan-in is refused outright. An encoded stream is a sequence of records a
-/// reader reassembles across reads; a merge interleaves two producers' bytes,
-/// and no reader can recover a record boundary from that.
+/// Fan-in onto an encoded input is refused outright. An encoded stream is a
+/// sequence of records a reader reassembles across reads; a merge interleaves
+/// two producers' bytes, and no reader can recover a record boundary from
+/// that. Exchange requests are whole records each, so their fan-in stands.
 ///
 /// FAILS OPEN on a module whose manifest could not be resolved, like
 /// [`validate_port_capabilities`] and for the same reason.
 pub fn validate_port_facts(config: &Value, manifests: &HashMap<String, Manifest>) -> Result<()> {
     use fluxor_contracts::vocabulary::{
         fact_rule, facts_for, surface_capability, FactRule, PORT_SCOPED_CAPABILITIES,
+        UNDECLARED_IS_NONE,
     };
     let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
         Some(w) => w,
@@ -2307,12 +2452,17 @@ pub fn validate_port_facts(config: &Value, manifests: &HashMap<String, Manifest>
         let Some(capability) = surface(&in_port) else {
             continue;
         };
-        producers_into.entry(to).or_default().push(from);
+        if capability != "exchange.request" {
+            producers_into.entry(to).or_default().push(from);
+        }
 
         let schema = facts_for(capability).unwrap_or(&[]);
+        let none: Vec<String> = Vec::new();
         for (fact, sent) in &out_port.facts {
-            let Some(taken) = in_port.facts.get(fact) else {
-                continue;
+            let taken = match in_port.facts.get(fact) {
+                Some(taken) => taken,
+                None if UNDECLARED_IS_NONE.contains(&(capability, fact.as_str())) => &none,
+                None => continue,
             };
             let Some(&(_, admitted)) = schema.iter().find(|(n, _)| n == fact) else {
                 continue;

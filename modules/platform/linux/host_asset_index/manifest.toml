@@ -11,22 +11,18 @@ builtin = true
 # Wiring (downstream is foundation/http or any HANDLER_FILE consumer):
 #   - from: web_assets.stream
 #     to: http.file_data
-#   - from: http.file_ctrl
-#     to: web_assets.seek
 #
-# Foundation/http selects which asset by sending IOCTL_NOTIFY(idx) on
-# its file_ctrl output, where idx matches the route's source_index.
+# `stream` serves `stream_select`: the consumer binds it through the input
+# port it reads the stream on and calls `SELECT(idx)`, where idx matches the
+# route's source_index. Each asset ends with the stream's HUP.
+provider_contracts = ["stream_select"]
 
 [[ports]]
 name = "stream"
 direction = "output"
 content_type = "OctetStream"
 required = true
-
-[[ports]]
-name = "seek"
-direction = "ctrl_input"
-content_type = "OctetStream"
+serves = "stream_select"
 
 [[params]]
 name = "paths"

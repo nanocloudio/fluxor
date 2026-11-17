@@ -33,8 +33,8 @@
 //! All index logic (directory derivation, paging, etag synthesis) lives
 //! in the host shim, where the key space actually is. Rust is the
 //! transport: a small LOOKUP/STAT handle table plus two host bindings
-//! that render the contract wire format straight into the caller's
-//! buffer.
+//! that render the contract wire format straight into the call's `arg`
+//! (`STAT`) or `data` (`LIST`).
 //!
 //!   - `host_ns_stat` — write a `STAT` record for an exact key.
 //!   - `host_ns_list` — write a `LIST` page (entries + trailing cursor
@@ -57,10 +57,10 @@
 
 use crate::abi::contracts::storage::namespace as dev_ns;
 use crate::abi::fence as dev_fence;
-use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE};
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 
-const MAX_OPEN: usize = 16;
+pub(super) const MAX_OPEN: usize = 16;
 /// Longest `LOOKUP` path: every path in this index is a whole key of the
 /// object tier, which `PUT` bounds by `STORAGE_KEY_MAX`.
 const MAX_PATH_LEN: usize = crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
@@ -113,38 +113,37 @@ pub fn register() {
     provider::register(dev_class::STORAGE_NAMESPACE, wasm_ns_dispatch);
 }
 
-unsafe fn wasm_ns_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    // `provider_call` passes tagged handles through unchanged (mirrors
-    // the `object`/`fs` siblings); strip to recover the raw slot. LIST is
-    // prefix-driven from `arg`, so a tagged or -1 handle is both fine.
-    let raw = slot_of(handle);
-
-    // Per-handle fence: a volatile browser index advertises Volatile.
-    if opcode == dev_fence::QUERY_OP {
-        if arg.is_null() || arg_len < dev_fence::WIRE_MAX_LEN {
-            return errno::EINVAL;
+fn wasm_ns_dispatch(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
+    // Every per-handle op arrives with the slot index LOOKUP returned. LIST
+    // is prefix-driven from `arg`, so an index or -1 is both fine.
+    let raw = handle;
+    // SAFETY: provider dispatch runs on the one wasm thread, which alone
+    // touches the slot table; the host bindings take only slices of `arg`,
+    // `data` and the slot table, each valid for the call.
+    unsafe {
+        // Per-handle fence: a volatile browser index advertises Volatile.
+        if opcode == dev_fence::QUERY_OP {
+            let slots = &*core::ptr::addr_of!(SLOTS);
+            if !slots.get(raw as usize).is_some_and(|s| s.in_use) {
+                return errno::ENOSYS;
+            }
+            return match dev_fence::Fence::Volatile.encode(arg) {
+                Some(n) => n as i32,
+                None => errno::EINVAL,
+            };
         }
-        let idx = raw as usize;
-        let slots = &*core::ptr::addr_of!(SLOTS);
-        if idx >= MAX_OPEN || !slots[idx].in_use {
-            return errno::ENOSYS;
+        match opcode {
+            dev_ns::LOOKUP => ns_lookup(arg),
+            dev_ns::STAT => ns_stat(raw, arg),
+            dev_ns::LIST => ns_list(arg, data.as_mut()),
+            dev_ns::CLOSE => ns_close(raw),
+            // Read-only enumeration surface: no mutation or change ops. LIST
+            // is directory-shaped (namespace.rs::caps).
+            dev_ns::CAPS => {
+                crate::abi::kernel_abi::caps_word::answer(arg, dev_ns::caps::CHILD_NAMES)
+            }
+            _ => errno::ENOSYS,
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match dev_fence::Fence::Volatile.encode(buf) {
-            Some(n) => n as i32,
-            None => errno::EINVAL,
-        };
-    }
-
-    match opcode {
-        dev_ns::LOOKUP => ns_lookup(arg, arg_len),
-        dev_ns::STAT => ns_stat(raw, arg, arg_len),
-        dev_ns::LIST => ns_list(arg, arg_len),
-        dev_ns::CLOSE => ns_close(raw),
-        // Read-only enumeration surface: no mutation or change ops. LIST is
-        // directory-shaped (namespace.rs::caps).
-        dev_ns::CAPS => dev_ns::caps::CHILD_NAMES as i32,
-        _ => errno::ENOSYS,
     }
 }
 
@@ -153,8 +152,8 @@ unsafe fn wasm_ns_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
 /// real existence check happens in `STAT` (`host_ns_stat` → ENOENT),
 /// which is exactly how `truffle_scanner` uses the pair (LOOKUP then
 /// STAT, skipping entries whose STAT fails).
-unsafe fn ns_lookup(path_ptr: *mut u8, path_len: usize) -> i32 {
-    if path_ptr.is_null() || path_len == 0 || path_len > MAX_PATH_LEN {
+unsafe fn ns_lookup(path: &[u8]) -> i32 {
+    if path.is_empty() || path.len() > MAX_PATH_LEN {
         return errno::EINVAL;
     }
     let slots = &mut *core::ptr::addr_of_mut!(SLOTS);
@@ -163,36 +162,36 @@ unsafe fn ns_lookup(path_ptr: *mut u8, path_len: usize) -> i32 {
         None => return errno::ENOMEM,
     };
     let slot = &mut slots[idx];
-    core::ptr::copy_nonoverlapping(path_ptr, slot.path.as_mut_ptr(), path_len);
-    slot.path_len = path_len;
+    slot.path[..path.len()].copy_from_slice(path);
+    slot.path_len = path.len();
     slot.in_use = true;
-    tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)
+    idx as i32
 }
 
-/// `STAT` — `arg` is the output buffer; render the resolved entry's
-/// `[size][mtime][kind][etag_len][etag]` record via the host index.
-unsafe fn ns_stat(raw: i32, out_ptr: *mut u8, out_cap: usize) -> i32 {
-    let idx = raw as usize;
+/// `STAT` — `arg` receives the resolved entry's
+/// `[size][mtime][kind][etag_len][etag]` record, rendered by the host index.
+unsafe fn ns_stat(raw: i32, out: &mut [u8]) -> i32 {
     let slots = &*core::ptr::addr_of!(SLOTS);
-    if idx >= MAX_OPEN || !slots[idx].in_use {
+    let Some(slot) = slots.get(raw as usize).filter(|s| s.in_use) else {
+        return errno::EINVAL;
+    };
+    if out.len() < dev_ns::stat::FIXED_LEN {
         return errno::EINVAL;
     }
-    if out_ptr.is_null() || out_cap < 8 + 8 + 1 + 1 {
-        return errno::EINVAL;
-    }
-    let slot = &slots[idx];
-    host_ns_stat(slot.path.as_ptr(), slot.path_len, out_ptr, out_cap)
+    host_ns_stat(
+        slot.path.as_ptr(),
+        slot.path_len,
+        out.as_mut_ptr(),
+        out.len(),
+    )
 }
 
-/// `LIST` — parse the request, render one page through the host index,
-/// and write a `Volatile` fence. `arg` is the `namespace::LIST` request; the
-/// cursor is the last name the previous page returned, and the host renders
-/// the page in the contract's wire format.
-unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() {
-        return errno::EINVAL;
-    }
-    let Some(req) = dev_ns::list::parse_request(core::slice::from_raw_parts(arg, arg_len)) else {
+/// `LIST` — parse the request, render one page into `out` (the caller's
+/// `data`) through the host index, and write a `Volatile` fence into the
+/// trailer. The cursor is the last name the previous page returned, and the
+/// host renders the page in the contract's wire format.
+unsafe fn ns_list(arg: &mut [u8], out: &mut [u8]) -> i32 {
+    let Some(req) = dev_ns::list::parse_request(arg) else {
         return errno::EINVAL;
     };
     // Names are UTF-8 and, directory-shaped, never hold a `/`: a prefix or
@@ -206,28 +205,23 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
         req.prefix.len(),
         req.cursor.as_ptr(),
         req.cursor.len(),
-        req.out_ptr as usize as *mut u8,
-        req.out_cap as usize,
+        out.as_mut_ptr(),
+        out.len(),
     );
     if written < 0 {
         return written;
     }
-    let fbuf = core::slice::from_raw_parts_mut(
-        req.fence_out_ptr as usize as *mut u8,
-        req.fence_out_cap as usize,
-    );
-    let _ = dev_fence::Fence::Volatile.encode(fbuf);
+    let _ = dev_fence::trailer::put(arg, &dev_fence::Fence::Volatile);
     written
 }
 
 /// `CLOSE` — free the LOOKUP slot.
 unsafe fn ns_close(raw: i32) -> i32 {
-    let idx = raw as usize;
     let slots = &mut *core::ptr::addr_of_mut!(SLOTS);
-    if idx >= MAX_OPEN || !slots[idx].in_use {
+    let Some(slot) = slots.get_mut(raw as usize).filter(|s| s.in_use) else {
         return errno::EINVAL;
-    }
-    slots[idx].in_use = false;
-    slots[idx].path_len = 0;
+    };
+    slot.in_use = false;
+    slot.path_len = 0;
     errno::OK
 }

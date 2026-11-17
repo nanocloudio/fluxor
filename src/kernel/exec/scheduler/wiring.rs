@@ -358,6 +358,11 @@ fn insert_fan(
                 }
             };
             let mut new_edge = new_edge;
+            new_edge.retains_send = direction == FanDirection::Out
+                && group
+                    .iter()
+                    .take(group_count)
+                    .all(|&gi| edges[gi].retains_send);
             if record {
                 let Some(g) = fresh_record_group(&edges[..*edge_count]) else {
                     log::error!("[graph] record fan module={module_idx} has no buffer group left");

@@ -22,6 +22,20 @@ pub const MAX_RING_BYTES: u32 = 4 * 1024 * 1024;
 /// module ABI's `CHANNEL_BUFFER_SIZE`, which `buffer_pool` asserts equal.
 pub const DEFAULT_RING_BYTES: u32 = 8192;
 
+/// Bytes of ring the length prefix of one record takes: a ring keeps every
+/// write's boundary beside it.
+pub const RECORD_PREFIX_BYTES: u32 = 2;
+
+/// The longest record one prefix states; a longer write is several records.
+pub const RECORD_MAX_BYTES: u32 = u16::MAX as u32;
+
+/// Ring bytes one write of `len` bytes takes: the payload and a prefix per
+/// record it becomes. A producer port's `max_record` must fit its ring by
+/// this measure, not by its payload alone.
+pub const fn record_bytes(len: u32) -> u64 {
+    len as u64 + RECORD_PREFIX_BYTES as u64 * (len as u64).div_ceil(RECORD_MAX_BYTES as u64)
+}
+
 /// Alignment of every ring in the buffer arena: one cache line. The arena
 /// allocator rounds each allocation up to it.
 pub const RING_ALIGN: u32 = 64;

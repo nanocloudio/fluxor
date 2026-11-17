@@ -1704,7 +1704,7 @@ impl<const F: usize, const T: usize> TcProvider<F, T> {
     /// The worker acknowledged deliveries through `cursor` — each whole,
     /// its plaintext ending at or before clear byte `cursor_at` — and
     /// stands at its own `consumer_cursor` (opaque here; 0 for none) at
-    /// that byte (`net_proto::CMD_DELIVERED`).
+    /// that byte (`stream_cursor::CMD_CURSOR_DELIVERED`).
     pub fn worker_ack(
         &mut self,
         flow: &[u8; 16],

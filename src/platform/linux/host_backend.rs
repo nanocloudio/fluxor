@@ -2892,16 +2892,15 @@ pub unsafe fn hp_start(raw: i32) -> i32 {
 /// HP_READ: drain one chunk of merged stdout/stderr; 0 when nothing ready.
 /// # Safety
 /// Single-threaded platform dispatch only (process-global slot table).
-/// `out` must be valid for writes of `out_len` bytes.
-pub unsafe fn hp_read(raw: i32, out: *mut u8, out_len: usize) -> i32 {
+pub unsafe fn hp_read(raw: i32, out: &mut [u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if out.is_null() || out_len == 0 {
+    if out.is_empty() {
         return errno::EINVAL;
     }
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
-    let n = libc::read(slot.out_r, out as *mut libc::c_void, out_len);
+    let n = libc::read(slot.out_r, out.as_mut_ptr() as *mut libc::c_void, out.len());
     if n >= 0 {
         return n as i32;
     }
@@ -3010,24 +3009,20 @@ pub fn tty_capacity() -> usize {
 /// namespaces when isolated), and execs. Returns a session id (>= 0) for the
 /// step/resize/close ops, or a negative errno.
 ///
-/// `arg` = `[rows:u16 LE][cols:u16 LE][command line…]`.
+/// `arg` = `[rows:u16 LE][cols:u16 LE]`; `data` = the command line
+/// (NUL-bounded within it).
 ///
 /// # Safety
-/// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
-pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
+/// Single-threaded platform dispatch only.
+pub unsafe fn hp_tty_open(raw: i32, a: &[u8], cmd: &[u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len < 4 {
+    if a.len() < 4 {
         return errno::EINVAL;
     }
-    let a = core::slice::from_raw_parts(arg, arg_len);
     let rows = u16::from_le_bytes([a[0], a[1]]);
     let cols = u16::from_le_bytes([a[2], a[3]]);
-    let cmd_end = a[4..]
-        .iter()
-        .position(|&b| b == 0)
-        .map(|i| 4 + i)
-        .unwrap_or(arg_len);
-    let cmdline = match core::str::from_utf8(&a[4..cmd_end]) {
+    let cmd_end = cmd.iter().position(|&b| b == 0).unwrap_or(cmd.len());
+    let cmdline = match core::str::from_utf8(&cmd[..cmd_end]) {
         Ok(s) => s.trim(),
         Err(_) => return errno::EINVAL,
     };
@@ -3161,35 +3156,41 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
 
 /// HP_TTY_STEP: one pump step of a session — write pending stdin to the PTY,
 /// drain its output, and poll the child's liveness. `arg` in =
-/// `[sid:u32 LE][wlen:u32 LE][stdin bytes: wlen]`; `arg` out =
-/// `[rlen:u32 LE][state:u8][code:i32 LE][output: rlen]` (state 0 = running,
-/// 1 = exited). Returns 0, `EINVAL` for no such session, `EACCES` for one
+/// `[sid:u32 LE][wlen:u32 LE]`, `data` in = the stdin bytes in its first
+/// `wlen`; `arg` out = `[sid:u32 LE][rlen:u32 LE][state:u8][code:i32 LE]`
+/// (state 0 = running, 1 = exited), `data` out = the output in its first
+/// `rlen`. Returns 0, `EINVAL` for no such session, `EACCES` for one
 /// another module or owner opened.
 ///
 /// # Safety
-/// Single-threaded platform dispatch only. `arg` valid for `arg_len` r/w.
-pub unsafe fn hp_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
+/// Single-threaded platform dispatch only.
+pub unsafe fn hp_tty_step(arg: &mut [u8], data: &mut [u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len < 9 {
+    if arg.len() < 13 {
         return errno::EINVAL;
     }
-    let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
-    let wlen = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as usize;
+    let sid = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as usize;
+    let wlen = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]) as usize;
 
     let session = match tty_session(sid) {
         Ok(s) => s,
         Err(e) => return e,
     };
     let master = session.master;
-    // Write the stdin bytes straight from `arg` — the output drain below only
-    // touches `arg` after this. Partial writes and EINTR are retried; a full
+    // Write the stdin bytes straight from `data` — the output drain below only
+    // touches `data` after this. Partial writes and EINTR are retried; a full
     // PTY buffer (EAGAIN on the non-blocking master) drops the remainder: the
     // wire format carries no consumed-count, and interactive input stays far
     // below the kernel's PTY buffer.
-    let wn = wlen.min(arg_len - 8);
+    let wn = wlen.min(data.len());
     let mut woff = 0usize;
     while woff < wn {
-        let w = libc::write(master, arg.add(8 + woff) as *const libc::c_void, wn - woff);
+        let pending = &data[woff..wn];
+        let w = libc::write(
+            master,
+            pending.as_ptr() as *const libc::c_void,
+            pending.len(),
+        );
         if w > 0 {
             woff += w as usize;
         } else if w < 0 && *libc::__errno_location() == libc::EINTR {
@@ -3198,13 +3199,12 @@ pub unsafe fn hp_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
             break;
         }
     }
-    // Drain the PTY output into arg[9..].
-    let hdr = 9usize;
-    let cap = arg_len - hdr;
+    // Drain the PTY output into `data`.
     let mut rn = 0usize;
-    if cap > 0 {
+    if !data.is_empty() {
+        let out = &mut *data;
         loop {
-            let n = libc::read(master, arg.add(hdr) as *mut libc::c_void, cap);
+            let n = libc::read(master, out.as_mut_ptr() as *mut libc::c_void, out.len());
             if n > 0 {
                 rn = n as usize;
             } else if n < 0 && *libc::__errno_location() == libc::EINTR {
@@ -3234,24 +3234,24 @@ pub unsafe fn hp_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
             (0u8, 0)
         }
     };
-    core::ptr::copy_nonoverlapping((rn as u32).to_le_bytes().as_ptr(), arg, 4);
-    *arg.add(4) = state;
-    core::ptr::copy_nonoverlapping(code.to_le_bytes().as_ptr(), arg.add(5), 4);
+    arg[4..8].copy_from_slice(&(rn as u32).to_le_bytes());
+    arg[8] = state;
+    arg[9..13].copy_from_slice(&code.to_le_bytes());
     0
 }
 
 /// HP_TTY_RESIZE: set a session's window size. `arg` =
 /// `[sid:u32 LE][rows:u16 LE][cols:u16 LE]`. Refusals as [`hp_tty_step`].
 /// # Safety
-/// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
-pub unsafe fn hp_tty_resize(arg: *const u8, arg_len: usize) -> i32 {
+/// Single-threaded platform dispatch only.
+pub unsafe fn hp_tty_resize(arg: &[u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len < 8 {
+    if arg.len() < 8 {
         return errno::EINVAL;
     }
-    let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
-    let rows = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-    let cols = u16::from_le_bytes([*arg.add(6), *arg.add(7)]);
+    let sid = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as usize;
+    let rows = u16::from_le_bytes([arg[4], arg[5]]);
+    let cols = u16::from_le_bytes([arg[6], arg[7]]);
     let session = match tty_session(sid) {
         Ok(s) => s,
         Err(e) => return e,
@@ -3270,13 +3270,13 @@ pub unsafe fn hp_tty_resize(arg: *const u8, arg_len: usize) -> i32 {
 /// free the slot. `arg` = `[sid:u32 LE]`. Returns the child's exit code;
 /// refusals as [`hp_tty_step`].
 /// # Safety
-/// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
-pub unsafe fn hp_tty_close(arg: *const u8, arg_len: usize) -> i32 {
+/// Single-threaded platform dispatch only.
+pub unsafe fn hp_tty_close(arg: &[u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len < 4 {
+    if arg.len() < 4 {
         return errno::EINVAL;
     }
-    let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+    let sid = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as usize;
     match tty_session(sid) {
         Ok(s) => close_session(s),
         Err(e) => e,
@@ -3434,23 +3434,26 @@ impl Join {
 /// PTY session ops above). A process the command left behind holding its
 /// output open does not hold the step.
 ///
-/// `arg` on input holds the whitespace-split command line (NUL- or length-
-/// bounded). On return `arg` holds `[out_len:u32 LE][output…]` with the captured
-/// bytes truncated to fit `arg_len`; the return value is the child's exit code
-/// (0–255), `128+signo` if signalled, or a negative errno on a setup failure
-/// (EINVAL before START or while PAUSEd, ESRCH when the container is gone).
+/// `arg` = `[cmd_len:u32 LE]` on input, `[out_len:u32 LE]` on return. `data` holds the whitespace-split command line in its first
+/// `cmd_len` bytes (NUL-bounded within them) on input, and the captured
+/// output, truncated to fit `data`, on return. The return value is the
+/// child's exit code (0–255), `128+signo` if signalled, or a negative errno
+/// on a setup failure (EINVAL before START or while PAUSEd, ESRCH when the
+/// container is gone).
 ///
 /// # Safety
-/// Single-threaded platform dispatch only (process-global slot table). `arg`
-/// must be valid for reads and writes of `arg_len` bytes.
-pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
+/// Single-threaded platform dispatch only (process-global slot table).
+pub unsafe fn hp_exec(raw: i32, arg: &mut [u8], data: &mut [u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len < 4 {
+    let Some(len) = arg.get(..4) else {
         return errno::EINVAL;
-    }
-    // Read the command line out of `arg` before we reuse it for the output.
-    let cmd_bytes = core::slice::from_raw_parts(arg, arg_len);
-    let cmd_end = cmd_bytes.iter().position(|&b| b == 0).unwrap_or(arg_len);
+    };
+    let cmd_len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+    // Read the command line out of `data` before it is reused for the output.
+    let Some(cmd_bytes) = data.get(..cmd_len) else {
+        return errno::EINVAL;
+    };
+    let cmd_end = cmd_bytes.iter().position(|&b| b == 0).unwrap_or(cmd_len);
     let cmdline = match core::str::from_utf8(&cmd_bytes[..cmd_end]) {
         Ok(s) => s.trim(),
         Err(_) => return errno::EINVAL,
@@ -3519,11 +3522,11 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
         exec_with(&argv_ptrs, &envp, proc);
     }
 
-    // Parent: close the write end, drain the pipe into arg[4..]
+    // Parent: close the write end, drain the pipe into `data`
     // (truncating on overflow but still draining so the child never blocks)
     // until the child has exited and nothing is ready, then reap.
     libc::close(w);
-    let cap = arg_len - 4;
+    let cap = data.len();
     let mut written = 0usize;
     let mut scratch = [0u8; 4096];
     let mut status: libc::c_int = 0;
@@ -3548,7 +3551,7 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
                 let n = n as usize;
                 if written < cap {
                     let take = n.min(cap - written);
-                    core::ptr::copy_nonoverlapping(scratch.as_ptr(), arg.add(4 + written), take);
+                    data[written..written + take].copy_from_slice(&scratch[..take]);
                     written += take;
                 }
                 continue;
@@ -3568,8 +3571,7 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
         let rc = libc::waitpid(pid, &mut status, 0);
         reaped = rc == pid || (rc < 0 && *libc::__errno_location() != libc::EINTR);
     }
-    let out_len = (written as u32).to_le_bytes();
-    core::ptr::copy_nonoverlapping(out_len.as_ptr(), arg, 4);
+    arg[0..4].copy_from_slice(&(written as u32).to_le_bytes());
     if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
@@ -3585,13 +3587,12 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
 /// signals it. A workload already ended answers 0.
 /// # Safety
 /// Single-threaded platform dispatch only (process-global slot table).
-/// `arg` must be valid for reads of `arg_len` bytes.
-pub unsafe fn hp_signal(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
+pub unsafe fn hp_signal(raw: i32, arg: &[u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len < 1 {
+    let Some(&signo) = arg.first() else {
         return errno::EINVAL;
-    }
-    let signo = *arg as i32;
+    };
+    let signo = signo as i32;
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
@@ -3641,17 +3642,15 @@ unsafe fn hp_poll_reap(raw: i32, slot: &mut HpSlot) {
 /// HP_WAIT: non-blocking; returns [state:u8][code:i32 LE]. Caches the result.
 /// # Safety
 /// Single-threaded platform dispatch only (process-global slot table).
-/// `out` must be valid for writes of `out_len` bytes.
-pub unsafe fn hp_wait(raw: i32, out: *mut u8, out_len: usize) -> i32 {
+pub unsafe fn hp_wait(raw: i32, buf: &mut [u8]) -> i32 {
     use crate::kernel::sys::errno;
-    if out.is_null() || out_len < 5 {
+    if buf.len() < 5 {
         return errno::EINVAL;
     }
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
     hp_poll_reap(raw, slot);
-    let buf = core::slice::from_raw_parts_mut(out, out_len);
     if !slot.reaped && slot.paused {
         // Frozen and not exited → PAUSED, live, not terminal.
         // A workload that died BEFORE the freeze latched terminal in the

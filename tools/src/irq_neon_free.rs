@@ -54,7 +54,7 @@ pub const INDIRECT: &[IndirectSite] = &[
         ],
     },
     IndirectSite {
-        function: "fluxor::kernel::ipc::event::event_signal_from_isr",
+        function: "fluxor::kernel::ipc::event::raise",
         what: "HAL `wake_scheduler`",
         targets: &["fluxor::bcm_wake_scheduler", "fluxor::hal::wake_scheduler"],
     },

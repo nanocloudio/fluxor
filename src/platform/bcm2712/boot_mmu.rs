@@ -149,13 +149,15 @@ const DEVICE_APERTURE_GBS: [(usize, usize); 3] = [(64, 66), (96, 112), (112, 116
 #[cfg(not(feature = "board-pi5"))]
 const DEVICE_APERTURE_GBS: [(usize, usize); 2] = [(0, 1), (256, 257)];
 
-/// Whether `addr` lies in one of the board's device apertures — never DRAM,
-/// never firmware memory, never a hole with nothing behind it.
-pub fn is_device_aperture(addr: u64) -> bool {
-    let gb = (addr >> 30) as usize;
+/// The base of the `n`th gigabyte of the board's device apertures, in
+/// address order — never DRAM, never firmware memory, never a hole with
+/// nothing behind it. `None` past the last.
+pub fn device_gigabyte(n: u8) -> Option<u64> {
     DEVICE_APERTURE_GBS
         .iter()
-        .any(|&(first, end)| gb >= first && gb < end)
+        .flat_map(|&(first, end)| first..end)
+        .nth(usize::from(n))
+        .map(|gb| (gb as u64) << 30)
 }
 
 /// QEMU virt: RAM starts at 1 GB and is as large as the machine was given

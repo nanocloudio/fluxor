@@ -2,8 +2,10 @@
 //!
 //! Sits between the `otel` export engine and any provider of the exchange
 //! contract (`crates/fluxor-abi/src/contracts/exchange.rs`), as its requester: each
-//! framed body read from `payload` becomes one request HEAD on `request_out`
-//! carrying the whole batch inline, and the terminal response for it on
+//! framed body read from `payload` becomes one request HEAD, carrying the
+//! whole batch inline, on `request_out` (a CALL under the HTTP binding) or,
+//! where the graph wires `publish_out` instead, a PUBLISH with verb 0 for a
+//! provider that keeps records; and the terminal response for it on
 //! `response_in` maps to one `otel.delivery` status byte. See
 //! `manifest.toml` for the ports and the mapping.
 //!
@@ -17,8 +19,8 @@
 //! | Tag | Name         | Type | Default       | Description                        |
 //! |-----|--------------|------|---------------|------------------------------------|
 //! | 1   | path         | str  | `/v1/metrics` | Request target                     |
-//! | 2   | method       | u8   | 3 (POST)      | Exchange method constant           |
-//! | 3   | content_type | str  | (none)        | `content-type` header of a request |
+//! | 2   | method       | u8   | 3 (POST)      | HTTP method (`exchange_http::method`); 0 for a call with no verb |
+//! | 3   | content_type | str  | (none)        | `content-type` meta of a request   |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -38,6 +40,7 @@ use fluxor_abi as abi;
 use fluxor_rt::*;
 
 use abi::contracts::exchange as ex;
+use abi::contracts::exchange_http::{self as http, Http};
 use abi::contracts::telemetry as tlm;
 
 // ============================================================================
@@ -48,12 +51,11 @@ use abi::contracts::telemetry as tlm;
 const MAX_PATH: usize = 128;
 /// The longest `content-type` value the param holds.
 const MAX_CONTENT_TYPE: usize = 96;
-/// The header block a content type becomes: `content-type: <value>\r\n`.
-const CT_NAME: &[u8] = b"content-type: ";
-const MAX_HEADERS: usize = CT_NAME.len() + MAX_CONTENT_TYPE + 2;
+/// The meta a content type becomes: one `content-type` field.
+const MAX_META: usize = ex::meta_field_len(ex::META_CONTENT_TYPE.len(), MAX_CONTENT_TYPE);
 
 /// Response-body bytes granted with each request. The poster reads only the
-/// status, but a provider answering a sink-like endpoint usually has a short
+/// outcome, but a provider answering a sink-like endpoint usually has a short
 /// body to go with it; granting one record's room lets that arrive inside the
 /// response HEAD instead of leaving an exchange waiting on credit.
 const RESP_CREDIT: u32 = ex::BODY_MAX as u32;
@@ -78,18 +80,20 @@ struct PosterState {
     /// Request target (param 1).
     path: [u8; MAX_PATH],
     path_len: u16,
-    /// Exchange method constant (param 2; default POST).
+    /// HTTP method (param 2; default POST), the request's verb.
     method: u8,
-    /// The header block every request carries, `hdr_len` bytes (param 3).
-    headers: [u8; MAX_HEADERS],
-    hdr_len: u16,
+    /// Nonzero when `publish_out` is wired: each request is a PUBLISH.
+    publish: u8,
+    /// The meta every request carries, `meta_len` bytes (param 3).
+    meta: [u8; MAX_META],
+    meta_len: u16,
 
     /// Counter the exchange in flight was named from; `0` = idle.
     corr: u64,
     /// Monotonic counter source; skips 0 on wrap.
     next_corr: u64,
     /// Exchanges owed an ABORT, `0` for an empty entry: one superseded by a
-    /// newer batch, one whose answer is still streaming after its status was
+    /// newer batch, one whose answer is still streaming after its outcome was
     /// read. Each is sent before any further request.
     aborts: [u64; 2],
 
@@ -114,9 +118,10 @@ impl PosterState {
         let default = b"/v1/metrics";
         self.path[..default.len()].copy_from_slice(default);
         self.path_len = default.len() as u16;
-        self.method = ex::METHOD_POST;
-        self.headers = [0; MAX_HEADERS];
-        self.hdr_len = 0;
+        self.method = http::method::POST;
+        self.publish = 0;
+        self.meta = [0; MAX_META];
+        self.meta_len = 0;
         self.corr = 0;
         self.next_corr = 1;
         self.aborts = [0; 2];
@@ -138,7 +143,7 @@ impl PosterState {
 mod params_def {
     use super::PosterState;
 
-    use super::{p_u8, CT_NAME, MAX_CONTENT_TYPE, MAX_PATH};
+    use super::{ex, p_u8, MAX_CONTENT_TYPE, MAX_PATH};
 
     fluxor_rt::define_params! {
         PosterState;
@@ -157,22 +162,11 @@ mod params_def {
         3, content_type, str, 0 => |s, d, len| {
             let n = len.min(MAX_CONTENT_TYPE);
             if n > 0 {
-                let mut at = 0usize;
-                let mut i = 0usize;
-                while i < CT_NAME.len() {
-                    s.headers[at] = CT_NAME[i];
-                    at += 1;
-                    i += 1;
+                let mut w = ex::MetaWriter::new(&mut s.meta);
+                w.put(ex::META_CONTENT_TYPE, core::slice::from_raw_parts(d, n));
+                if let Some(m) = w.finish() {
+                    s.meta_len = m as u16;
                 }
-                i = 0;
-                while i < n {
-                    s.headers[at] = *d.add(i);
-                    at += 1;
-                    i += 1;
-                }
-                s.headers[at] = b'\r';
-                s.headers[at + 1] = b'\n';
-                s.hdr_len = (at + 2) as u16;
             }
         };
     }
@@ -198,14 +192,17 @@ unsafe fn send_delivery(s: &mut PosterState, status: u8) {
     );
 }
 
-/// The delivery a terminal response status means: 2xx is delivered; 429 and
-/// every 5xx — the OTLP retryable family, which includes the 502 and 504 a
-/// provider raises when the collector is unreachable or silent — retry;
-/// anything else is permanent, because retrying a refusal wedges the pipe.
-fn delivery_for_status(status: u16) -> u8 {
-    match status {
-        200..=299 => tlm::DELIVERY_DELIVERED,
-        429 | 500..=599 => tlm::DELIVERY_RETRY,
+/// The delivery a terminal response's outcome means: OK is delivered; a busy
+/// provider, an unreachable or silent peer and a failure retry — the OTLP
+/// retryable family, an HTTP collector's 429 and every 5xx; anything else is
+/// permanent, because retrying a refusal wedges the pipe.
+fn delivery_for_outcome(outcome: u8) -> u8 {
+    match outcome {
+        ex::outcome::OK => tlm::DELIVERY_DELIVERED,
+        ex::outcome::BUSY
+        | ex::outcome::UNAVAILABLE
+        | ex::outcome::TIMEOUT
+        | ex::outcome::FAILED => tlm::DELIVERY_RETRY,
         _ => tlm::DELIVERY_DROP,
     }
 }
@@ -257,7 +254,7 @@ unsafe fn step_responses(s: &mut PosterState) {
         if n <= 0 {
             return;
         }
-        let Some(record) = ex::parse_response(&s.in_buf[..n as usize]) else {
+        let Ok(record) = ex::parse_response::<Http>(&s.in_buf[..n as usize]) else {
             continue;
         };
         let live = ex::ExchangeId::from_u64(s.corr);
@@ -268,9 +265,9 @@ unsafe fn step_responses(s: &mut PosterState) {
             ex::Record::Link { state } if state == ex::link::DOWN && s.request_sent() => {
                 (Some(tlm::DELIVERY_RETRY), false)
             }
-            // The status decides; the body is not read.
+            // The outcome decides; the body is not read.
             ex::Record::Head(head) if open && head.id == live => (
-                Some(delivery_for_status(head.status)),
+                Some(delivery_for_outcome(head.outcome)),
                 head.flags & ex::flag::MORE != 0,
             ),
             ex::Record::Abort { id, reason } if open && id == live => {
@@ -329,13 +326,18 @@ unsafe fn step_payload(s: &mut PosterState) {
 
     let corr = s.next_corr;
     let plen = s.path_len as usize;
-    let hlen = s.hdr_len as usize;
+    let mlen = s.meta_len as usize;
     let head = ex::RequestHead {
         id: ex::ExchangeId::from_u64(corr),
         flags: 0,
-        method: s.method,
+        op: if s.publish != 0 {
+            ex::op::PUBLISH
+        } else {
+            ex::op::CALL
+        },
+        verb: if s.publish != 0 { 0 } else { s.method },
         target: &s.path[..plen],
-        headers: &s.headers[..hlen],
+        meta: &s.meta[..mlen],
         peer: &[],
         resp_credit: RESP_CREDIT,
         body: &s.in_buf[NET_FRAME_HDR..NET_FRAME_HDR + body_len],
@@ -343,8 +345,14 @@ unsafe fn step_payload(s: &mut PosterState) {
     // A batch is one encoded document and travels as one record. One that
     // does not fit is refused, permanently and reported: the producer's
     // encoding choice (compact protobuf, not JSON) is the fix, and a resend
-    // would not fit either.
-    let Some(n) = ex::write_request_head(&head, &mut s.req_buf) else {
+    // would not fit either. A `method` that is not a call's verb is refused
+    // the same way: no batch can be sent with it.
+    let written = if s.publish != 0 {
+        ex::write_request_head::<ex::Plain>(&head, &mut s.req_buf)
+    } else {
+        ex::write_request_head::<Http>(&head, &mut s.req_buf)
+    };
+    let Some(n) = written else {
         send_delivery(s, tlm::DELIVERY_DROP);
         return;
     };
@@ -394,7 +402,18 @@ pub unsafe extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
         let sys = &*s.syscalls;
         s.payload_chan = in_chan; // in[0]
-        s.request_chan = out_chan; // out[0]
+                                  // out[0] carries a CALL under the HTTP binding, out[2] a PUBLISH:
+                                  // the graph wires one of them.
+        let publish_chan = dev_channel_port(sys, 1, 2); // out[2]
+        if out_chan >= 0 && publish_chan >= 0 {
+            return -22;
+        }
+        s.publish = u8::from(publish_chan >= 0);
+        s.request_chan = if s.publish != 0 {
+            publish_chan
+        } else {
+            out_chan
+        };
         s.response_chan = dev_channel_port(sys, 0, 1); // in[1]
         s.delivery_chan = dev_channel_port(sys, 1, 1); // out[1]
 

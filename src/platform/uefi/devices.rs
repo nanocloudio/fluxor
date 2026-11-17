@@ -15,7 +15,6 @@ use super::{acpi, pci};
 
 /// What the tables said that a driver's call depends on.
 struct Facts {
-    zone: (u64, u64),
     rid_maps: [(u32, u32, u32); acpi::MAX_RID_MAPS],
     rid_map_count: usize,
     v2m_base: u64,
@@ -24,7 +23,6 @@ struct Facts {
 }
 
 static mut FACTS: Facts = Facts {
-    zone: (0, 0),
     rid_maps: [(0, 0, 0); acpi::MAX_RID_MAPS],
     rid_map_count: 0,
     v2m_base: 0,
@@ -43,9 +41,17 @@ fn facts() -> &'static mut Facts {
     unsafe { &mut *core::ptr::addr_of_mut!(FACTS) }
 }
 
-pub fn configure(machine: &acpi::Machine, zone: (u64, u64)) {
+pub fn configure(machine: &acpi::Machine) {
+    // QEMU virt's virtio-mmio transports: 32 from 0x0a00_0000, 0x200 apart,
+    // transport `i` on SPI 16 + `i`.
+    #[cfg(feature = "board-qemu-uefi")]
+    gic::configure_virtio_mmio(gic::VirtioMmio {
+        base: 0x0a00_0000,
+        stride: 0x200,
+        first_intid: 48,
+        count: 32,
+    });
     let f = facts();
-    f.zone = zone;
     f.rid_maps = machine.rid_maps;
     f.rid_map_count = machine.rid_map_count;
     if machine.v2m_count != 0 {
@@ -58,38 +64,13 @@ pub fn configure(machine: &acpi::Machine, zone: (u64, u64)) {
     }
 }
 
-fn in_zone(addr: u64, size: u64) -> bool {
-    let (lo, hi) = facts().zone;
-    addr >= lo && addr.checked_add(size).is_some_and(|end| end <= hi)
-}
-
-/// A raw register access reaches devices only: a 4-byte-aligned word that
-/// nothing in the firmware's memory map calls memory, and not the interrupt
-/// controller's distributor window, which the kernel owns.
-fn mmio_ok(addr: u64) -> bool {
-    let gicd = gic::gicd_base() as u64;
-    let in_gic = addr >= gicd && addr < gicd + 0x100_0000;
-    addr & 3 == 0 && !super::is_ram(addr) && !in_gic
-}
-
-unsafe fn u32_at(arg: *const u8, at: usize) -> u32 {
-    u32::from_le_bytes([
-        *arg.add(at),
-        *arg.add(at + 1),
-        *arg.add(at + 2),
-        *arg.add(at + 3),
-    ])
-}
-
-
-/// The `metal_device` table: device registers outside RAM and the GIC, DMA
+/// The `metal_device` table: the devices' memory BARs as apertures, DMA
 /// memory carved from the zone (one arena for both kinds: QEMU and Nitro keep
 /// PCI I/O coherent with the caches), and no scan-before-bind PCI table.
 pub static METAL_DEVICE: fluxor::kernel::module::metal_device::MetalDeviceOps =
     fluxor::kernel::module::metal_device::MetalDeviceOps {
-        mmio_ok,
+        aperture: pci::aperture,
         dma_alloc,
-        dma_range_ok: |addr, size| in_zone(addr, u64::from(size)),
         pci: None,
     };
 
@@ -101,32 +82,64 @@ fn dma_alloc(
     fluxor::kernel::mem::carve::carve(size, align).map(|ptr| ptr as u64)
 }
 
-/// The vector, the doorbell address and the payload, where `MSI_ALLOC` returns
-/// them: `[vec u8, pad u8 x3, target u64, data u32]` at `arg[4..20]`.
-unsafe fn write_msi(arg: *mut u8, vector: u32, target: u64, data: u32) {
-    *arg.add(4) = (vector & 0xFF) as u8;
-    *arg.add(5) = 0;
-    *arg.add(6) = 0;
-    *arg.add(7) = 0;
-    core::ptr::copy_nonoverlapping(target.to_le_bytes().as_ptr(), arg.add(8), 8);
-    core::ptr::copy_nonoverlapping(data.to_le_bytes().as_ptr(), arg.add(16), 4);
+/// The index an MSI vector answers: [`VECTOR_BASE`] plus its slot in
+/// [`VECTORS`], a band no device index shares.
+const VECTOR_BASE: i32 = 0x1000;
+/// MSI vectors held at once.
+const MAX_VECTORS: usize = 16;
+
+/// What an MSI vector raises: an LPI through the ITS, or a v2m frame's SPI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Raises {
+    Free,
+    Lpi(u32),
+    Spi(u32),
 }
 
-/// One MSI vector: a GICv2m frame turns a device's write into an SPI.
-unsafe fn msi_alloc(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+/// The vectors handed out, until the doorbell each rings is bound.
+static mut VECTORS: [(Raises, bool); MAX_VECTORS] = [(Raises::Free, false); MAX_VECTORS];
+
+fn vectors() -> &'static mut [(Raises, bool); MAX_VECTORS] {
+    // SAFETY: this runtime steps on one core.
+    unsafe { &mut *core::ptr::addr_of_mut!(VECTORS) }
+}
+
+/// Handles this runtime's platform tables hand out at once: bound devices and
+/// MSI vectors.
+pub fn handle_slots() -> usize {
+    pci::HANDLE_SLOTS + MAX_VECTORS
+}
+
+/// The `MSI_ALLOC` answer (`pcie_device::msi`): the doorbell address and its
+/// one-word window, the payload, the vector; and the vector's index.
+fn answer_msi(arg: &mut [u8], raises: Raises, vector: u32, target: u64, data: u32) -> i32 {
+    use pcie_device::msi;
+    let Some(slot) = vectors().iter().position(|v| v.0 == Raises::Free) else {
+        return errno::ENOMEM;
+    };
+    vectors()[slot] = (raises, false);
+    let out = &mut arg[..msi::ARG_LEN];
+    out.fill(0);
+    out[msi::ADDR..msi::ADDR + 8].copy_from_slice(&target.to_le_bytes());
+    out[msi::LEN..msi::LEN + 4].copy_from_slice(&4u32.to_le_bytes());
+    out[msi::DATA..msi::DATA + 4].copy_from_slice(&data.to_le_bytes());
+    out[msi::VEC] = (vector & 0xFF) as u8;
+    VECTOR_BASE + slot as i32
+}
+
+/// One MSI vector: the ITS turns a device's write into an LPI, or a GICv2m
+/// frame into an SPI. Its interrupt signals nothing until the kernel binds the
+/// vector's doorbell ([`bind_doorbell`]).
+fn msi_alloc(handle: i32, arg: &mut [u8]) -> i32 {
     const V2M_SETSPI: u64 = 0x040;
-    if arg.is_null() || arg_len < 20 {
+    if arg.len() < pcie_device::msi::ARG_LEN {
         return errno::EINVAL;
     }
-    let event = u32_at(arg, 0) as i32;
     if let Some(rid) = pci::requester_id(handle) {
         let device_id = facts().device_id(rid);
-        if let Some(result) = super::its::allocate(device_id, event) {
+        if let Some(result) = super::its::allocate(device_id) {
             return match result {
-                Ok((target, data)) => {
-                    write_msi(arg, data, target, data);
-                    0
-                }
+                Ok((target, data, lpi)) => answer_msi(arg, Raises::Lpi(lpi), data, target, data),
                 Err(why) => {
                     log::error!("[its] msi refused: {why}");
                     errno::ENOMEM
@@ -142,35 +155,69 @@ unsafe fn msi_alloc(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
         return errno::ENOMEM;
     }
     let spi = f.v2m_next_spi;
-    // Edge first, then enabled: a v2m frame delivers each MSI as one pulse.
-    gic::set_edge(spi);
-    let rc = gic::irq_bind(spi, event, 0, 0);
-    if rc != 0 {
-        return rc;
+    let rc = answer_msi(arg, Raises::Spi(spi), spi, f.v2m_base + V2M_SETSPI, spi);
+    if rc >= 0 {
+        f.v2m_next_spi += 1;
     }
-    f.v2m_next_spi += 1;
-    write_msi(arg, spi, f.v2m_base + V2M_SETSPI, spi);
-    0
+    rc
+}
+
+/// Bind the doorbell an MSI vector rings: its interrupt then signals it.
+/// `EBADF` for an index that names no vector, or one already bound.
+fn bind_doorbell(handle: i32, arg: &[u8]) -> i32 {
+    let Some((doorbell, _)) = fluxor::abi::kernel_abi::doorbell::parse_bind(arg) else {
+        return errno::EINVAL;
+    };
+    let Some(v) = handle
+        .checked_sub(VECTOR_BASE)
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| vectors().get_mut(i))
+        .filter(|v| v.0 != Raises::Free && !v.1)
+    else {
+        return errno::EBADF;
+    };
+    let rc = match v.0 {
+        Raises::Lpi(lpi) => gic::bind_lpi(lpi, doorbell as i32),
+        Raises::Spi(spi) => {
+            // Edge first, then enabled: a v2m frame delivers each MSI as one
+            // pulse.
+            // SAFETY: the GIC was configured at boot; `spi` is a v2m frame's
+            // SPI, not yet bound.
+            unsafe { gic::set_edge(spi) };
+            gic::irq_bind(spi, doorbell as i32, fluxor::kernel::sys::hal::IrqAck::None, 0)
+        }
+        Raises::Free => errno::EBADF,
+    };
+    if rc == 0 {
+        v.1 = true;
+    }
+    rc
 }
 
 /// The system extension.
-///
-/// # Safety
-/// The kernel's dispatch: `arg` holds `arg_len` bytes owned by the caller.
-pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub fn dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    _data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     match opcode {
         pcie_device::BIND => {
-            if arg.is_null() || arg_len == 0 {
+            if arg.is_empty() {
                 return errno::EINVAL;
             }
-            pci::bind(arg, arg_len)
+            pci::bind(arg)
         }
+        // A vector stays the device's: its interrupt is bound for good, and
+        // a ring after its handle closed rings nothing.
+        pcie_device::CLOSE if handle >= VECTOR_BASE => 0,
         pcie_device::CLOSE => pci::close(handle),
-        pcie_device::CFG_READ32 => pci::cfg_read(handle, arg, arg_len),
-        pcie_device::CFG_WRITE32 => pci::cfg_write(handle, arg, arg_len),
-        pcie_device::BAR_MAP => pci::bar_map(handle, arg, arg_len),
-        pcie_device::MSI_ALLOC => msi_alloc(handle, arg, arg_len),
-        pcie_device::INFO => pci::info(handle, arg, arg_len),
+        pcie_device::CFG_READ32 => pci::cfg_read(handle, arg),
+        pcie_device::CFG_WRITE32 => pci::cfg_write(handle, arg),
+        pcie_device::BAR_MAP => pci::bar_map(handle, arg),
+        pcie_device::MSI_ALLOC => msi_alloc(handle, arg),
+        fluxor::abi::kernel_abi::doorbell::BIND_DOORBELL => bind_doorbell(handle, arg),
+        pcie_device::INFO => pci::info(handle, arg),
         _ => errno::ENOSYS,
     }
 }

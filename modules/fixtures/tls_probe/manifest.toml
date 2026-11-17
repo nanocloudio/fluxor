@@ -25,6 +25,7 @@ direction = "input"
 content_type = "NetProto"
 required = true
 buffer_size = 2048
+accepts_record = 1483
 
 [[ports]]
 name = "net_out"
@@ -32,6 +33,7 @@ direction = "output"
 content_type = "NetProto"
 required = true
 buffer_size = 2048
+max_record = 264
 
 [[resources]]
 requires_contract = "channel"

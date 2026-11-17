@@ -840,9 +840,11 @@ pub fn reclaim_tables(ctx: &super::instance::ReclaimCtx<'_>) -> Result<(), i32> 
 }
 
 /// The provider: the shared store, linux capabilities, nftables as the hook.
-///
-/// # Safety
-/// As `crate::kernel::net_policy::dispatch`.
-pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    store::dispatch(caps(), Some(apply), handle, opcode, arg, arg_len)
+pub fn dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: crate::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
+    store::dispatch(caps(), Some(apply), handle, opcode, arg, data)
 }

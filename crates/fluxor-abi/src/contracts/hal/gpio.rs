@@ -28,7 +28,9 @@ pub use super::super::super::registry::gpio::SET_LEVEL;
 pub use super::super::super::registry::gpio::SET_MODE;
 pub use super::super::super::registry::gpio::SET_OUTPUT;
 pub use super::super::super::registry::gpio::SET_PULL;
-/// Bind event to GPIO edge. handle=gpio (pin).
-/// arg[0]=edge (1=rising, 2=falling, 3=both), arg[1..5]=event_handle (i32 LE).
-/// Sets up edge detection and auto-signals the event on each detected edge.
+/// Watch a claimed pin's edges. handle=the pin's claim, arg=`[edge u8]`
+/// (1=rising, 2=falling, 3=both). Returns a watch handle: a signalling handle
+/// (the kernel hands the provider its doorbell, `kernel::BIND_DOORBELL`) that
+/// polls `POLL_IN` once per detected edge (`HANDLE_POLL`) and wakes the
+/// watcher. Closing the watch (`provider_close`) stops the edge detection.
 pub use super::super::super::registry::gpio::WATCH_EDGE;

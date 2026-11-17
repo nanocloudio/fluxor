@@ -15,7 +15,8 @@
 // Per-op mapping:
 //   CREATE  — decode the `source_ref` FLXA subgraph → `apply_add`; stage paused
 //             (the START barrier); lease-gate the header endpoints; allocate a
-//             `WorkloadSlot`; return `tag_fd(FD_TAG_WORKLOAD, idx)`.
+//             `WorkloadSlot`; return its index (the kernel wraps it in a
+//             handle).
 //   START   — `owner_resume` (release the create-time pause).
 //   WAIT    — map the owner's live status → `[state:u8][code:i32 LE]`.
 //   SIGNAL  — TERM → `begin_drain`, KILL → `free_owner`.
@@ -35,7 +36,7 @@ use crate::kernel::exec::scheduler::live;
 use crate::kernel::exec::scheduler::{self, OwnerLiveStatus, OWNER_STATE_PAUSED};
 use crate::kernel::exec::step_guard::fault_type;
 use crate::kernel::ipc::channel::channel_write;
-use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_WORKLOAD};
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use crate::kernel::workload::code_pack;
 use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM, OWNER_TABLE_SLOTS};
@@ -132,11 +133,7 @@ fn provision_addr_ctl(slot: usize, addr_ctl_port: u8) -> i32 {
         return 0;
     }
     let cap = ADDR_CTL_RING_BYTES.to_le_bytes();
-    let ch = crate::kernel::ipc::channel::channel_open(
-        crate::kernel::ipc::channel::CHANNEL_TYPE_PIPE,
-        cap.as_ptr(),
-        cap.len(),
-    );
+    let ch = crate::kernel::ipc::channel::channel_open(&cap);
     if ch < 0 {
         NET_IDENT_PROVIDER_REG.store(NO_PROVIDER, Ordering::Release);
         return ch;
@@ -715,7 +712,7 @@ struct WorkloadSlot {
     /// a workload on it cannot leave the table (`net_route` SEGMENTS answers
     /// `EBUSY`) while that identity is installed.
     net_segment: u16,
-    /// The creating module's lanes into the subgraph (`wl::LANES`).
+    /// The creating module's lanes into the subgraph (`wl::LANE`).
     lanes: [CallerLane; wl::MAX_CALLER_LANES],
     lane_count: u8,
 }
@@ -1104,7 +1101,7 @@ unsafe fn begin_create(
     buf: &[u8],
     flxa_off: usize,
     flxa_len: usize,
-    pack: Option<(usize, usize, usize)>,
+    pack: Option<(&[u8], usize)>,
     src_start: usize,
     memory_bytes: u64,
     storage_bytes: u64,
@@ -1119,8 +1116,7 @@ unsafe fn begin_create(
     //    signing root signed; then the region is made executable, and the
     //    subgraph's names resolve in it first while the add instantiates.
     let staged = match pack {
-        Some((ptr, len, pins)) => {
-            let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+        Some((bytes, pins)) => {
             let staged = match code_pack::stage(bytes) {
                 Ok(s) => s,
                 Err(e) => return e,
@@ -1274,19 +1270,17 @@ unsafe fn begin_create(
     0
 }
 
-/// WORKLOAD_CREATE: stage a fmod-graph workload as a new owner subgraph. Returns
-/// a tagged `FD_TAG_WORKLOAD` handle, or a negative errno.
+/// WORKLOAD_CREATE: stage a fmod-graph workload as a new owner subgraph from
+/// the spec in `buf` and, for a pack source, the module table in `pack`.
+/// Returns the workload slot's index, or a negative errno.
 ///
 /// # Safety
-/// `arg` must be null or valid for reads and writes of `arg_len` bytes for the
-/// call. The `source_ref` (FLXA) region is mutated in place (identity + caps
-/// override) and `apply_add_encoded`'s handle write-back overwrites its first 6
-/// bytes — the caller's buffer is scratch after CREATE.
-unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < wl::CREATE_HEADER_SIZE {
+/// Scheduler thread.
+unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
+    let arg_len = buf.len();
+    if arg_len < wl::CREATE_HEADER_SIZE {
         return errno::EINVAL;
     }
-    let buf = core::slice::from_raw_parts(arg, arg_len);
 
     let posture = buf[16];
     let source_kind = buf[17];
@@ -1382,17 +1376,15 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             return errno::EINVAL;
         }
         let r = &buf[src_start..src_start + pack_ref::SIZE];
-        let ptr = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]) as usize;
-        let len = rd_u32(r, pack_ref::LEN) as usize;
         let pins = rd_u16(r, pack_ref::PIN_COUNT) as usize;
         let head = pack_ref::SIZE + pins * pack_ref::PIN_SIZE;
-        if ptr == 0 || len == 0 || source_ref_len < head {
+        if pack_bytes.is_empty() || source_ref_len < head {
             return errno::EINVAL;
         }
         (
             src_start + head,
             source_ref_len - head,
-            Some((ptr, len, pins)),
+            Some((pack_bytes, pins)),
         )
     } else {
         (src_start, source_ref_len, None)
@@ -1625,7 +1617,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     } else {
         slots[widx] = slot;
     }
-    tag_fd(FD_TAG_WORKLOAD, widx as i32)
+    widx as i32
 }
 
 /// Resolve a stripped workload slot index to its owner, or `None` if the slot
@@ -1674,64 +1666,52 @@ pub fn wait_state_map(rec: Option<&OwnerLiveStatus>) -> (u8, i32) {
 /// a torn-down handle reads as EXITED — the terminal state a status loop polls
 /// after teardown — never an error.
 ///
-/// # Safety
-/// `arg` must be valid for writes of `arg_len` (>= 5) bytes.
-unsafe fn workload_wait(owner: Option<OwnerHandle>, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 5 {
+fn workload_wait(owner: Option<OwnerHandle>, out: &mut [u8]) -> i32 {
+    if out.len() < 5 {
         return errno::EINVAL;
     }
     let rec = owner.and_then(scheduler::owner_live_status);
     let (state, code) = wait_state_map(rec.as_ref());
-    let out = core::slice::from_raw_parts_mut(arg, arg_len);
     out[0] = state;
     out[1..5].copy_from_slice(&code.to_le_bytes());
     5
 }
 
-/// WORKLOAD_CAPS: write the metal backend's honest capability set. Same
-/// prefix shape as the Linux backend: `[postures:u8][source_kinds:u8]
-/// [ops:u16 LE][net:u8]` then the namespace directory of the Tier-2 entries
-/// it realizes ([`GRAPH_OPTIONS`]), empty when `arg` is too short for it.
-///
-/// # Safety
-/// `arg` must be valid for writes of `arg_len` (>= 7) bytes.
-unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 7 {
-        return errno::EINVAL;
-    }
-    let out = core::slice::from_raw_parts_mut(arg, arg_len);
+/// `CAPS`: the metal backend's honest capability word.
+fn workload_caps() -> u32 {
     // Postures: SHARED only. ISOLATED/HARDENED need EL0-per-workload.
-    out[0] = wl::caps::POSTURE_SHARED;
+    let postures = wl::caps::POSTURE_SHARED;
     // Source kinds: an fmod graph, and a graph bringing its own modules where
     // the node has code space for packs. Never a host bundle: metal has no
     // rootfs to unpack one into.
-    out[1] = wl::caps::SOURCE_FMOD_GRAPH
+    let sources = wl::caps::SOURCE_FMOD_GRAPH
         | if code_pack::POOL_SIZE != 0 {
             wl::caps::SOURCE_FMOD_PACK
         } else {
             0
         };
-    // Ops: PAUSE only. READ (no metal owner-log tee), EXEC/TTY (no process to
-    // exec into) stay clear; the SIGNAL bit asserts real process-group signal
-    // delivery this backend does not provide (TERM→drain, KILL→free).
-    out[2..4].copy_from_slice(&(wl::caps::PAUSE | wl::caps::LOOKUP).to_le_bytes());
+    // Ops: PAUSE and LOOKUP. The SIGNAL bit asserts real process-group
+    // signal delivery this backend does not provide (TERM→drain, KILL→free).
+    let ops = wl::caps::PAUSE | wl::caps::LOOKUP;
     // Net: NET_ISO_OWN | NET_IDENTITY — a `net=own` workload's own IPv4
     // address is installed into the net-identity provider and ARP-answered,
     // and the workload's binds land on it: `ip` stamps a lane's bind with the
     // lane's owner and binds it to that owner's address (`lane_bind_target`),
     // and an owned address is served only by a listener bound to it, never by
     // a host wildcard listener. Both bits are honestly set.
-    out[4] = wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY;
-    // The Tier-2 entries realized: the owner's name-service context, read
-    // by the net provider for the owner's lanes; its environment, written
-    // into its modules' env binds; and, where the platform roots a
-    // workload's files, the volumes it is lent.
-    let n = write_option_directory(&mut out[5..], GRAPH_OPTIONS);
-    if n == 0 {
-        out[5..7].copy_from_slice(&0u16.to_le_bytes());
-        return 7;
+    let net = wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY;
+    postures | sources | ops | net
+}
+
+/// `OPTIONS`: the Tier-2 entries the graph backend realizes — the owner's
+/// name-service context, read by the net provider for the owner's lanes;
+/// its environment, written into its modules' env binds; and, where the
+/// platform roots a workload's files, the volumes it is lent.
+fn workload_options(out: &mut [u8]) -> i32 {
+    match write_option_directory(out, GRAPH_OPTIONS) {
+        0 => errno::ERANGE,
+        n => n as i32,
     }
-    (5 + n) as i32
 }
 
 /// The Tier-2 `(namespace, keys)` the graph backend realizes.
@@ -1749,7 +1729,7 @@ const GRAPH_OPTIONS: &[(&[u8], &[&[u8]])] = if LENDS_VOLUMES {
     ]
 };
 
-/// Write a `CAPS` namespace directory `[ns_count:u16] then ns_count ×
+/// Write an `OPTIONS` namespace directory `[ns_count:u16] then ns_count ×
 /// ([ns_len:u8][ns][key_count:u16] then key_count × ([key_len:u8][key]))`
 /// into `out`; its length, or 0 when `out` is too short for it.
 pub fn write_option_directory(out: &mut [u8], dir: &[(&[u8], &[&[u8]])]) -> usize {
@@ -1777,24 +1757,28 @@ pub fn write_option_directory(out: &mut [u8], dir: &[(&[u8], &[&[u8]])]) -> usiz
     at
 }
 
-/// The metal `workload` (0x1A) provider dispatch. CREATE/CAPS are the `handle
-/// = -1` globals; lifecycle ops carry the `FD_TAG_WORKLOAD` handle, stripped
-/// to a slot by `slot_of`. Matches `provider::ProviderDispatch` and the Linux
+/// The metal `workload` (0x1A) provider dispatch. CREATE/CAPS/OPTIONS are the
+/// `handle = -1` globals; lifecycle ops are handed the workload slot's index
+/// (what a workload handle's route carries). Matches `provider::ProviderDispatch` and the Linux
 /// `linux_workload_dispatch` signature.
 ///
 /// # Safety
 /// Scheduler-thread dispatch only: touches `static mut` provider state and the
 /// live graph without synchronization, and must run on the primary domain
-/// (core 0) — see the module header. `arg` must be null or valid for reads and
-/// writes of `arg_len` bytes for the call.
-pub unsafe fn workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// (core 0) — see the module header.
+pub unsafe fn workload_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
+) -> i32 {
     let timed = matches!(opcode, wl::CREATE | wl::DESTROY);
     let t0 = if timed {
         crate::kernel::sys::hal::now_micros()
     } else {
         0
     };
-    let rc = dispatch_op(handle, opcode, arg, arg_len);
+    let rc = dispatch_op(handle, opcode, arg, data);
     if timed {
         live_stats_record(
             opcode,
@@ -1885,7 +1869,7 @@ unsafe fn live_stats_record(opcode: u32, rc: i32, us: u64) {
     );
 }
 
-unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     if opcode == wl::CREATE {
         let pending_holder = &mut *core::ptr::addr_of_mut!(PENDING_HOLDER);
         let pending = pending_identity();
@@ -1896,9 +1880,9 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
             if !may_act_as(h) {
                 // Another owner's staged CREATE: continuing it is refused;
                 // any other spec waits for it, as the holder's own would.
-                let names_it = !arg.is_null()
-                    && arg_len >= 16
-                    && pending.is_some_and(|id| core::slice::from_raw_parts(arg, 16) == id);
+                let names_it = arg
+                    .get(..16)
+                    .is_some_and(|a| pending.is_some_and(|id| a == id));
                 return if names_it {
                     errno::EACCES
                 } else {
@@ -1909,7 +1893,8 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         // The owner that began a staged CREATE holds the workload it ends
         // in, whoever sends the call that finishes it.
         let holder = pending_holder.unwrap_or_else(scheduler::caller_owner);
-        let rc = workload_create(arg, arg_len);
+        // `arg` = the spec; `data` = a pack source's module table.
+        let rc = workload_create(arg, data.as_slice());
         if rc == errno::EINPROGRESS {
             *pending_holder = Some(holder);
         } else {
@@ -1917,28 +1902,27 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         }
         if rc >= 0 {
             let holders = &mut *core::ptr::addr_of_mut!(FMOD_HOLDERS);
-            if let Some(h) = holders.get_mut(slot_of(rc) as usize) {
+            if let Some(h) = holders.get_mut(rc as usize) {
                 *h = holder;
             }
         }
         return rc;
     }
     if opcode == wl::MODULE_DIGESTS {
-        if arg.is_null() {
-            return errno::EINVAL;
-        }
-        let out = core::slice::from_raw_parts_mut(arg, arg_len);
-        return code_pack::node_digests(scheduler::static_loader(), out);
+        return code_pack::node_digests(scheduler::static_loader(), data.as_mut());
     }
     if opcode == wl::CAPS {
-        return workload_caps(arg, arg_len);
+        return crate::abi::kernel_abi::caps_word::answer(arg, workload_caps());
+    }
+    if opcode == wl::OPTIONS {
+        return workload_options(data.as_mut());
     }
     // A net provider that is a module (the bare-metal `ip`): it claims the
     // role, takes the lanes staged workloads attach, and asks whether a
     // lane's owner may bind (see `net_attach`).
     if opcode == wl::NET_PROVIDE {
         // `[lanes:u8]`: the provider's lane capacity.
-        if arg.is_null() || arg_len < wl::net_lane::PROVIDE_LEN {
+        if arg.len() < wl::net_lane::PROVIDE_LEN {
             return errno::EINVAL;
         }
         let slot = scheduler::current_module_index();
@@ -1955,33 +1939,25 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
                 return errno::EBUSY;
             }
         }
-        return crate::kernel::workload::net_attach::provide_queued(slot, *arg as usize);
+        return crate::kernel::workload::net_attach::provide_queued(slot, arg[0] as usize);
     }
     if opcode == wl::NET_RESOLVER {
-        if arg.is_null() {
-            return errno::EINVAL;
-        }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return resolver_ctx_read(scheduler::current_module_index(), buf);
+        return resolver_ctx_read(scheduler::current_module_index(), arg);
     }
     if opcode == wl::NET_LANE_TAKE || opcode == wl::NET_LANE_ADMIT {
-        if arg.is_null() {
-            return errno::EINVAL;
-        }
         let slot = scheduler::current_module_index();
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
         return if opcode == wl::NET_LANE_TAKE {
-            crate::kernel::workload::net_attach::take_queued(slot, buf)
+            crate::kernel::workload::net_attach::take_queued(slot, arg)
         } else {
-            crate::kernel::workload::net_attach::admit_queued(slot, buf)
+            crate::kernel::workload::net_attach::admit_queued(slot, arg)
         };
     }
 
     if opcode == wl::LOOKUP {
-        if arg.is_null() || arg_len < 16 {
+        if arg.len() < 16 {
             return errno::EINVAL;
         }
-        let out = core::slice::from_raw_parts_mut(arg, arg_len);
+        let out = arg;
         let mut identity = [0u8; 16];
         identity.copy_from_slice(&out[..16]);
         if pending_identity() == Some(identity) {
@@ -2001,14 +1977,14 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         let owner = (&*core::ptr::addr_of!(FMOD_WORKLOADS))[widx].owner;
         out[0..2].copy_from_slice(&owner.slot.to_le_bytes());
         out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
-        return tag_fd(FD_TAG_WORKLOAD, widx as i32);
+        return widx as i32;
     }
     if opcode == wl::DESTROY && handle < 0 {
-        if arg.is_null() || arg_len < 16 {
+        if arg.len() < 16 {
             return errno::EINVAL;
         }
         let mut identity = [0u8; 16];
-        identity.copy_from_slice(core::slice::from_raw_parts(arg, 16));
+        identity.copy_from_slice(&arg[..16]);
         if pending_identity() == Some(identity) {
             let pending_holder = &mut *core::ptr::addr_of_mut!(PENDING_HOLDER);
             if !pending_holder.is_none_or(may_act_as) {
@@ -2026,7 +2002,7 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         };
     }
 
-    let raw = slot_of(handle);
+    let raw = handle;
     let owner_opt = slot_owner(raw);
     if raw >= 0 && !may_act_on(raw as usize) {
         return errno::EACCES;
@@ -2034,7 +2010,7 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
     // WAIT tolerates a reaped slot → EXITED: a status loop keeps polling
     // after DESTROY/KILL and must see the terminal state, not an error.
     if opcode == wl::WAIT {
-        return workload_wait(owner_opt, arg, arg_len);
+        return workload_wait(owner_opt, arg);
     }
     let Some(owner) = owner_opt else {
         return errno::EINVAL;
@@ -2055,10 +2031,10 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
             Err(_) => errno::EINVAL,
         },
         wl::SIGNAL => {
-            if arg.is_null() || arg_len < 4 {
+            if arg.len() < 4 {
                 return errno::EINVAL;
             }
-            let signo = rd_u32(core::slice::from_raw_parts(arg, arg_len), 0);
+            let signo = rd_u32(arg, 0);
             match signo {
                 // Graceful: move the owner to Draining (its graphs run dry).
                 wl::SIG_TERM => {
@@ -2074,9 +2050,8 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
                     remove_identity(&slots[raw as usize].net_addr);
                     slots[raw as usize].net_addr = [0u8; 16];
                     slots[raw as usize].net_segment = 0;
-                    // The lanes' channels close with the owner; the ids must
-                    // not outlive them, or LANES would name channels another
-                    // owner may be given.
+                    // The lanes' channels close with the owner; their handles
+                    // go with them.
                     slots[raw as usize].lanes = [NO_LANE; wl::MAX_CALLER_LANES];
                     slots[raw as usize].lane_count = 0;
                     let _ = live::free_owner(owner);
@@ -2085,27 +2060,35 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
                 _ => errno::ENOSYS, // portable subset only
             }
         }
-        wl::LANES => {
+        // `arg = [key u8][dir u8]`: the channel of one of the caller's lanes.
+        wl::LANE => {
             // An owner that has gone (drained out, torn down elsewhere) took
             // its channels with it.
             if scheduler::owners_mut().lookup(owner).is_none() {
                 return errno::EINVAL;
             }
-            let slot = &(&*core::ptr::addr_of!(FMOD_WORKLOADS))[raw as usize];
-            let n = slot.lane_count as usize;
-            let need = 1 + n * 9;
-            if arg.is_null() || arg_len < need {
+            let (Some(&key), Some(&dir)) = (arg.first(), arg.get(1)) else {
                 return errno::EINVAL;
+            };
+            let slot = &(&*core::ptr::addr_of!(FMOD_WORKLOADS))[raw as usize];
+            let Some(l) = slot
+                .lanes
+                .iter()
+                .take(slot.lane_count as usize)
+                .find(|l| l.key == key)
+            else {
+                return errno::ENOENT;
+            };
+            let ch = match dir {
+                wl::lane::TO_CALLER => l.to_caller,
+                wl::lane::FROM_CALLER => l.from_caller,
+                _ => return errno::EINVAL,
+            };
+            if ch < 0 {
+                errno::ENOENT
+            } else {
+                ch
             }
-            let out = core::slice::from_raw_parts_mut(arg, need);
-            out[0] = n as u8;
-            for (i, l) in slot.lanes.iter().take(n).enumerate() {
-                let o = 1 + i * 9;
-                out[o] = l.key;
-                out[o + 1..o + 5].copy_from_slice(&l.to_caller.to_le_bytes());
-                out[o + 5..o + 9].copy_from_slice(&l.from_caller.to_le_bytes());
-            }
-            need as i32
         }
         wl::DESTROY => destroy_slot(raw as usize),
         _ => errno::ENOSYS,

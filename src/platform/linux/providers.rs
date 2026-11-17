@@ -5,6 +5,7 @@
 use super::builtin_params::instance_state;
 use crate::abi::fence::{DeviceId, Fence};
 use crate::kernel::ipc::channel;
+use crate::kernel::module::user_span::UserSpan;
 
 /// Stable device id for the Linux host's local filesystem. One
 /// logical backing store from Fluxor's point of view, so a single
@@ -30,6 +31,38 @@ const LINUX_FS_DEVICE_ID: DeviceId = 0x6c69_6e75_785f_6673; // "linux_fs"
 /// a platform that already maps a 96 MiB state arena.
 const MAX_OPEN_FILES: usize = 256;
 
+/// How many handles the library's own provider tables can hand modules at
+/// once: the part of the `handles` pool the boot plan derives. Files, spawned
+/// processes, the control-plane store's subscriptions, reads, writes and
+/// grants (the node's store and every workload's own), host workloads and
+/// both vault backends' keys.
+pub fn handle_slots() -> usize {
+    use crate::abi::contracts::resource as res;
+    use crate::kernel::sys::resource_ledger::ceiling;
+    let pool = |p: u16| ceiling(p) as usize;
+    let workloads = pool(res::POOL_OWNERS).saturating_sub(1);
+    let node_store = pool(res::POOL_STORE_SUBS)
+        + pool(res::POOL_STORE_READS)
+        + pool(res::POOL_STORE_WRITES)
+        + pool(res::POOL_STORE_GRANTS);
+    let owner_store = workloads
+        * (pool(res::POOL_OWNER_STORE_SUBS)
+            + pool(res::POOL_OWNER_STORE_READS)
+            + pool(res::POOL_OWNER_STORE_WRITES));
+    #[cfg(feature = "host-hsm")]
+    let hsm = crate::platform::linux::hsm_key_vault::MAX_SLOTS;
+    #[cfg(not(feature = "host-hsm"))]
+    let hsm = 0;
+    MAX_OPEN_FILES
+        + MAX_PROCS
+        + node_store
+        + owner_store
+        + pool(res::POOL_SANDBOXES)
+        + workloads
+        + crate::kernel::security::key_vault::MAX_SLOTS
+        + hsm
+}
+
 struct LinuxFileSlot {
     fd: i32,
     /// `*mut libc::DIR` cast to a usize so the static can be initialized
@@ -47,64 +80,17 @@ struct LinuxFileSlot {
     /// Who opened the slot. Only that owner reaches it: a handle names a
     /// slot, and a slot answers its opener alone.
     owner: crate::kernel::workload::owner::OwnerHandle,
-    /// Bumped each time the slot is claimed and carried in the handle, so a
-    /// handle kept past its close names no slot (`slot_index`), never the
-    /// file that took the slot next — another module's, as often as not.
-    generation: u32,
     /// What the file holds is charged to its opener: a workload's file in
     /// its own root. Never the node's, nor one in a volume lent to it.
     charged: bool,
 }
 
-/// Bits of a handle that name the slot; the rest above them, up to the top
-/// of the field a provider may use (`fd::SLOT_FIELD_BITS`), carry the
-/// slot's generation. The bit above that field is the kernel's routed bit:
-/// a generation reaching it makes the kernel read the handle as a routed
-/// one that names no route, and every op on it answers `EBADF`.
-const SLOT_BITS: u32 = 8;
-const _: () = assert!(MAX_OPEN_FILES <= 1 << SLOT_BITS);
-const GEN_MASK: u32 = ((1 << crate::abi::registry::fd::SLOT_FIELD_BITS) - 1) >> SLOT_BITS;
-const _: () = assert!(
-    (GEN_MASK << SLOT_BITS | ((1 << SLOT_BITS) - 1)) >> crate::abi::registry::fd::SLOT_FIELD_BITS
-        == 0
-);
-
-/// The handle for slot `idx` at its current generation.
-fn slot_handle(idx: usize, generation: u32) -> i32 {
-    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
-    tag_fd(FD_TAG_FS, ((generation << SLOT_BITS) | idx as u32) as i32)
-}
-
-/// The slot a handle names, while it is the slot's current occupancy; an
-/// index past the table otherwise, which every arm refuses.
+/// The slot an index names; an index past the table otherwise, which every
+/// arm refuses. The index is the provider's own: the kernel's handle around
+/// it carries the generation that keeps a closed handle from naming the
+/// slot's next file.
 fn slot_index(handle: i32) -> usize {
-    if handle < 0 {
-        return usize::MAX;
-    }
-    let inner = crate::kernel::ipc::fd::slot_of(handle) as u32;
-    let idx = (inner & ((1 << SLOT_BITS) - 1)) as usize;
-    let generation = inner >> SLOT_BITS;
-    // SAFETY: single-threaded platform dispatch; `idx` is bounds-checked.
-    let current = unsafe {
-        (*core::ptr::addr_of!(LINUX_FILES))
-            .get(idx)
-            .map(|s| s.generation)
-    };
-    if current == Some(generation) {
-        idx
-    } else {
-        usize::MAX
-    }
-}
-
-/// The next generation of slot `idx`: never 0, so no handle is ever 0.
-unsafe fn next_generation(files: &[LinuxFileSlot], idx: usize) -> u32 {
-    let g = (files[idx].generation.wrapping_add(1)) & GEN_MASK;
-    if g == 0 {
-        1
-    } else {
-        g
-    }
+    usize::try_from(handle).unwrap_or(usize::MAX)
 }
 
 static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
@@ -114,7 +100,6 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
         in_use: false,
         last_fence: Fence::Volatile,
         owner: crate::kernel::workload::owner::OWNER_SYSTEM,
-        generation: 0,
         charged: false,
     };
     [EMPTY; MAX_OPEN_FILES]
@@ -143,7 +128,7 @@ fn free_slot_for(
     files.iter().position(|s| !s.in_use)
 }
 
-/// Claim a file slot for `fd` on behalf of `owner`. The tagged handle, or
+/// Claim a file slot for `fd` on behalf of `owner`. The slot's index, or
 /// `ENOMEM` with `fd` closed when the table, or the owner's share of it, is
 /// full.
 unsafe fn claim_file_slot(fd: i32, owner: crate::kernel::workload::owner::OwnerHandle) -> i32 {
@@ -163,17 +148,15 @@ unsafe fn claim_file_slot_charged(
         libc::close(fd);
         return errno::ENOMEM;
     };
-    let generation = next_generation(files, slot_idx);
     files[slot_idx] = LinuxFileSlot {
         fd,
         dir_ptr: 0,
         in_use: true,
         last_fence: Fence::Volatile,
         owner,
-        generation,
         charged,
     };
-    slot_handle(slot_idx, generation)
+    slot_idx as i32
 }
 
 /// Claim a directory slot for `dir` on behalf of `owner`.
@@ -187,17 +170,15 @@ unsafe fn claim_dir_slot(
         libc::closedir(dir);
         return errno::ENOMEM;
     };
-    let generation = next_generation(files, slot_idx);
     files[slot_idx] = LinuxFileSlot {
         fd: -1,
         dir_ptr: dir as usize,
         in_use: true,
         last_fence: Fence::Volatile,
         owner,
-        generation,
         charged: false,
     };
-    slot_handle(slot_idx, generation)
+    slot_idx as i32
 }
 
 /// The path-taking `fs` ops for a workload: each resolves beneath the
@@ -213,25 +194,25 @@ unsafe fn claim_dir_slot(
 unsafe fn tenant_fs_path_op(
     owner: crate::kernel::workload::owner::OwnerHandle,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
 ) -> Option<i32> {
     use crate::abi::contracts::storage::fs as dev_fs;
     use crate::kernel::sys::errno;
     use crate::platform::linux::owner_root as root;
 
-    let path_arg = |ptr: *const u8, len: usize| -> Result<&[u8], i32> {
-        if ptr.is_null() || len == 0 {
+    fn path_arg(b: &[u8]) -> Result<&[u8], i32> {
+        if b.is_empty() {
             return Err(errno::EINVAL);
         }
-        if len > LINUX_FS_PATH_MAX {
+        if b.len() > LINUX_FS_PATH_MAX {
             return Err(errno::E2BIG);
         }
-        Ok(core::slice::from_raw_parts(ptr, len))
-    };
+        Ok(b)
+    }
+    let arg_len = arg.len();
     Some(match opcode {
         dev_fs::OPEN => {
-            let path = match path_arg(arg, arg_len) {
+            let path = match path_arg(arg) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -248,7 +229,7 @@ unsafe fn tenant_fs_path_op(
             claim_file_slot_charged(fd, owner, !root::lent(owner, path))
         }
         dev_fs::OPEN_CREATE => {
-            let path = match path_arg(arg, arg_len) {
+            let path = match path_arg(arg) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -285,7 +266,7 @@ unsafe fn tenant_fs_path_op(
             claim_file_slot_charged(fd, owner, charged)
         }
         dev_fs::OPENDIR => {
-            let path = match path_arg(arg, arg_len) {
+            let path = match path_arg(arg) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -301,7 +282,7 @@ unsafe fn tenant_fs_path_op(
             claim_dir_slot(dir, owner)
         }
         dev_fs::UNLINK => {
-            let path = match path_arg(arg, arg_len) {
+            let path = match path_arg(arg) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -326,7 +307,7 @@ unsafe fn tenant_fs_path_op(
             errno::OK
         }
         dev_fs::MKDIR => {
-            let path = match path_arg(arg, arg_len) {
+            let path = match path_arg(arg) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -364,7 +345,7 @@ unsafe fn tenant_fs_path_op(
             }
         }
         dev_fs::RMDIR => {
-            let path = match path_arg(arg, arg_len) {
+            let path = match path_arg(arg) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -396,14 +377,14 @@ unsafe fn tenant_fs_path_op(
         }
         dev_fs::LINK => errno::ENOSYS,
         dev_fs::READLINK => {
-            if arg.is_null() || arg_len < 2 {
+            if arg_len < 2 {
                 return Some(errno::EINVAL);
             }
-            let path_len = usize::from(u16::from_le_bytes([*arg, *arg.add(1)]));
+            let path_len = usize::from(u16::from_le_bytes([arg[0], arg[1]]));
             if path_len == 0 || arg_len < 2 + path_len {
                 return Some(errno::EINVAL);
             }
-            let path = match path_arg(arg.add(2), path_len) {
+            let path = match path_arg(&arg[2..2 + path_len]) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -427,19 +408,19 @@ unsafe fn tenant_fs_path_op(
             if n == target.len() || n > arg_len {
                 return Some(errno::E2BIG);
             }
-            core::ptr::copy_nonoverlapping(target.as_ptr(), arg, n);
+            arg[..n].copy_from_slice(&target[..n]);
             n as i32
         }
         dev_fs::TRUNCATE => {
-            if arg.is_null() || arg_len < 9 {
+            if arg_len < 9 {
                 return Some(errno::EINVAL);
             }
-            let a = core::slice::from_raw_parts(arg, arg_len);
+            let a = &arg[..];
             let len = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
             if len > i64::MAX as u64 {
                 return Some(errno::EINVAL);
             }
-            let path = match path_arg(arg.add(8), arg_len - 8) {
+            let path = match path_arg(&arg[8..]) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -467,7 +448,7 @@ unsafe fn tenant_fs_path_op(
             out
         }
         dev_fs::FSYNC_NAME => {
-            let path = match path_arg(arg, arg_len) {
+            let path = match path_arg(arg) {
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
@@ -484,7 +465,7 @@ unsafe fn tenant_fs_path_op(
             out
         }
         dev_fs::RENAME => {
-            let Some((src, src_len, dst, dst_len)) = two_paths(arg, arg_len) else {
+            let Some((src, src_len, dst, dst_len)) = two_paths(arg) else {
                 return Some(errno::EINVAL);
             };
             // Within the owner's root, or within one volume: a name never
@@ -641,16 +622,11 @@ pub(crate) const LINUX_FS_PATH_MAX: usize = 255;
 /// validate one path and not the other — and the unvalidated one is the
 /// interesting half to an attacker.
 ///
-/// # Safety
-/// `arg` must point at `arg_len` readable bytes.
-unsafe fn two_paths(
-    arg: *const u8,
-    arg_len: usize,
-) -> Option<([u8; 256], usize, [u8; 256], usize)> {
-    if arg.is_null() || arg_len < 4 {
+fn two_paths(bytes: &[u8]) -> Option<([u8; 256], usize, [u8; 256], usize)> {
+    let arg_len = bytes.len();
+    if arg_len < 4 {
         return None;
     }
-    let bytes = core::slice::from_raw_parts(arg, arg_len);
     let a_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
     if arg_len < 2 + a_len + 2 {
         return None;
@@ -662,8 +638,8 @@ unsafe fn two_paths(
     }
     let mut a = [0u8; 256];
     let mut b = [0u8; 256];
-    validate_fs_path(arg.add(2), a_len, &mut a).ok()?;
-    validate_fs_path(arg.add(b_off), b_len, &mut b).ok()?;
+    validate_fs_path(&bytes[2..2 + a_len], &mut a).ok()?;
+    validate_fs_path(&bytes[b_off..b_off + b_len], &mut b).ok()?;
     Some((a, a_len, b, b_len))
 }
 
@@ -673,7 +649,7 @@ unsafe fn two_paths(
 /// Returns the path length in bytes (NOT counting the NUL) on
 /// success, or a negative errno:
 ///
-///   - `EINVAL` if the buffer is null, empty, or contains an
+///   - `EINVAL` if the path is empty or contains an
 ///     interior NUL byte (interior NULs let an attacker submit
 ///     `evil\0../etc/passwd` and have libc see `evil` while a
 ///     downstream policy check saw the longer string),
@@ -683,22 +659,15 @@ unsafe fn two_paths(
 /// validation. Per-arm length handling is how one of them ends up
 /// truncating an overlong path where the others reject it, which turns a
 /// caller's mistake into a silently different file.
-///
-/// # Safety
-/// `arg` must point at `arg_len` readable bytes.
-unsafe fn validate_fs_path(
-    arg: *const u8,
-    arg_len: usize,
-    out: &mut [u8; 256],
-) -> Result<usize, i32> {
+fn validate_fs_path(bytes: &[u8], out: &mut [u8; 256]) -> Result<usize, i32> {
     use crate::kernel::sys::errno;
-    if arg.is_null() || arg_len == 0 {
+    let arg_len = bytes.len();
+    if arg_len == 0 {
         return Err(errno::EINVAL);
     }
     if arg_len > LINUX_FS_PATH_MAX {
         return Err(errno::E2BIG);
     }
-    let bytes = core::slice::from_raw_parts(arg, arg_len);
     let mut i = 0;
     while i < arg_len {
         if bytes[i] == 0 {
@@ -774,32 +743,38 @@ unsafe fn fsync_parent_dir(path: &[u8]) -> i32 {
 
 /// FS provider dispatch.
 ///
-/// `OPEN` and `OPENDIR` self-tag their returns with `FD_TAG_FS` so
-/// the kernel resolves the contract from the handle via
-/// `fd_tag_contract`. Inbound ops arrive with the tag stripped by
-/// the FS vtable wrapper, so `handle` here is the raw slot index.
+/// `OPEN` and `OPENDIR` answer the slot's index, which the kernel wraps in
+/// a handle; every op on that handle arrives here with the index.
+pub fn linux_fs_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
+    // SAFETY: provider dispatch runs on the scheduler thread, the only
+    // thread touching the file-slot table.
+    unsafe { fs_dispatch_on_thread(handle, opcode, arg) }
+}
+
+/// [`linux_fs_dispatch`]'s body.
+///
 /// # Safety
-/// Single-threaded platform dispatch only: touches `static mut` provider
-/// state without synchronization. `arg` must be null or valid for reads
-/// and writes of `arg_len` bytes for the duration of the call.
-pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// Scheduler thread only: touches `static mut` provider state without
+/// synchronization.
+unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32 {
     use crate::abi::contracts::storage::fs as dev_fs;
     use crate::abi::fence as dev_fence;
     use crate::kernel::sys::errno;
 
+    let arg_len = arg.len();
+
     // Cross-cutting fence-introspection opcode. Public surface:
     // `provider_query(handle, query_key::LAST_FENCE, …)`. The
     // kernel forwards it as `provider_call(handle, QUERY_OP, …)`
-    // so the FS vtable wrapper strips the FD tag before this
-    // dispatcher sees the slot.
+    // over the handle's route, so this dispatcher sees the slot's index.
     if opcode == dev_fence::QUERY_OP {
-        if arg.is_null() || arg_len < dev_fence::WIRE_MAX_LEN {
+        if arg_len < dev_fence::WIRE_MAX_LEN {
             return errno::EINVAL;
         }
         let Some(fence) = slot_fence(handle) else {
             return errno::ENOSYS;
         };
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
+        let buf = &mut arg[..];
         return match fence.encode(buf) {
             Some(n) => n as i32,
             None => errno::EINVAL,
@@ -819,9 +794,6 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     // FSYNC_ASYNC stays clear: this provider fences with a blocking
     // `fsync(2)`. A workload's root offers no hard links.
     if opcode == dev_fs::CAPS {
-        if arg.is_null() || arg_len < 4 {
-            return errno::EINVAL;
-        }
         let caps: u32 = dev_fs::caps::OPEN
             | dev_fs::caps::OPENDIR
             | dev_fs::caps::OPEN_CREATE
@@ -833,10 +805,8 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             | dev_fs::caps::RENAME
             | dev_fs::caps::TRUNCATE
             | dev_fs::caps::FSYNC_NAME
-            // The host filesystem has a real object model and `fstat`
-            // answers all of it, plus `rmdir(2)`, `link(2)` and
+            // The host filesystem has `rmdir(2)`, `link(2)` and
             // `readlink(2)`.
-            | dev_fs::caps::STAT_OBJECT
             | dev_fs::caps::RMDIR
             | dev_fs::caps::LINK
             | dev_fs::caps::SYMLINK;
@@ -845,21 +815,19 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         } else {
             caps
         };
-        let bytes = caps.to_le_bytes();
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
-        return 4;
+        return crate::abi::kernel_abi::caps_word::answer(arg, caps);
     }
 
     // Handle ops below serve both, each slot its opener alone.
     if rooted {
-        if let Some(rc) = tenant_fs_path_op(owner, opcode, arg, arg_len) {
+        if let Some(rc) = tenant_fs_path_op(owner, opcode, arg) {
             return rc;
         }
     }
 
     match opcode {
         dev_fs::OPEN => {
-            if arg.is_null() || arg_len == 0 {
+            if arg_len == 0 {
                 return errno::EINVAL;
             }
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
@@ -870,7 +838,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             };
 
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+            if let Err(e) = validate_fs_path(arg, &mut path_buf) {
                 return e;
             }
 
@@ -909,7 +877,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
         dev_fs::OPEN_CREATE => {
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+            if let Err(e) = validate_fs_path(arg, &mut path_buf) {
                 return e;
             }
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
@@ -935,7 +903,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
         dev_fs::UNLINK => {
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+            if let Err(e) = validate_fs_path(arg, &mut path_buf) {
                 return e;
             }
             let rc = libc::unlink(path_buf.as_ptr() as *const libc::c_char);
@@ -947,7 +915,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
         dev_fs::MKDIR => {
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+            if let Err(e) = validate_fs_path(arg, &mut path_buf) {
                 return e;
             }
             // Idempotent: an existing directory is success (scp -r sends a `D` per
@@ -966,7 +934,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
         dev_fs::RMDIR => {
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+            if let Err(e) = validate_fs_path(arg, &mut path_buf) {
                 return e;
             }
             // Not idempotent, unlike MKDIR above: "the directory is gone" and
@@ -981,7 +949,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             fsync_parent_dir(&path_buf[..arg_len])
         }
         dev_fs::LINK => {
-            let Some((existing, existing_len, new, new_len)) = two_paths(arg, arg_len) else {
+            let Some((existing, existing_len, new, new_len)) = two_paths(arg) else {
                 return errno::EINVAL;
             };
             // A directory hard link is refused by the kernel too, but saying
@@ -1011,15 +979,15 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // buffer. The two are different numbers: a caller reading a long
             // target through a short path would otherwise be told its own
             // path length is the limit.
-            if arg.is_null() || arg_len < 2 {
+            if arg_len < 2 {
                 return errno::EINVAL;
             }
-            let path_len = usize::from(u16::from_le_bytes([*arg, *arg.add(1)]));
+            let path_len = usize::from(u16::from_le_bytes([arg[0], arg[1]]));
             if path_len == 0 || arg_len < 2 + path_len {
                 return errno::EINVAL;
             }
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg.add(2), path_len, &mut path_buf) {
+            if let Err(e) = validate_fs_path(&arg[2..2 + path_len], &mut path_buf) {
                 return e;
             }
             let mut target = [0u8; 512];
@@ -1041,21 +1009,21 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if n > arg_len {
                 return errno::E2BIG;
             }
-            core::ptr::copy_nonoverlapping(target.as_ptr(), arg, n);
+            arg[..n].copy_from_slice(&target[..n]);
             n as i32
         }
         dev_fs::TRUNCATE => {
             // `[len: u64 LE][path]`.
-            if arg.is_null() || arg_len < 9 {
+            if arg_len < 9 {
                 return errno::EINVAL;
             }
-            let a = core::slice::from_raw_parts(arg, arg_len);
+            let a = &arg[..];
             let len = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
             if len > i64::MAX as u64 {
                 return errno::EINVAL;
             }
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg.add(8), arg_len - 8, &mut path_buf) {
+            if let Err(e) = validate_fs_path(&arg[8..], &mut path_buf) {
                 return e;
             }
             // Shrink only, matching the contract. `truncate(2)` would happily
@@ -1079,14 +1047,14 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
         dev_fs::FSYNC_NAME => {
             let mut path_buf = [0u8; 256];
-            let len = match validate_fs_path(arg, arg_len, &mut path_buf) {
+            let len = match validate_fs_path(arg, &mut path_buf) {
                 Ok(n) => n,
                 Err(e) => return e,
             };
             fsync_parent_dir(&path_buf[..len])
         }
         dev_fs::RENAME => {
-            let Some((src_buf, src_len, dst_buf, dst_len)) = two_paths(arg, arg_len) else {
+            let Some((src_buf, src_len, dst_buf, dst_len)) = two_paths(arg) else {
                 return errno::EINVAL;
             };
             // `rename(2)` is atomic against a concurrent reader: the
@@ -1122,10 +1090,10 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
-            if arg.is_null() || arg_len < 4 {
+            if arg_len < 4 {
                 return errno::EINVAL;
             }
-            let capacity = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let capacity = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]);
             if capacity == 0 {
                 return errno::EINVAL;
             }
@@ -1188,10 +1156,14 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
-            if arg.is_null() || arg_len == 0 {
+            if arg_len == 0 {
                 return errno::EINVAL;
             }
-            let n = libc::read(files[slot_idx].fd, arg as *mut libc::c_void, arg_len);
+            let n = libc::read(
+                files[slot_idx].fd,
+                arg.as_mut_ptr() as *mut libc::c_void,
+                arg_len,
+            );
             if n < 0 {
                 errno::ERROR
             } else {
@@ -1208,7 +1180,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
-            if arg.is_null() || arg_len == 0 {
+            if arg_len == 0 {
                 return errno::EINVAL;
             }
             let fd = files[slot_idx].fd;
@@ -1234,7 +1206,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 }
                 ino = Some(st.st_ino);
             }
-            let n = libc::write(fd, arg as *const libc::c_void, arg_len);
+            let n = libc::write(fd, arg.as_ptr() as *const libc::c_void, arg_len);
             if let Some(ino) = ino {
                 settle_inode(slot_owner, fd, ino);
             }
@@ -1252,25 +1224,8 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
-            if arg.is_null() || arg_len < 4 {
+            let Some(offset) = dev_fs::seek::parse(arg).and_then(|v| i64::try_from(v).ok()) else {
                 return errno::EINVAL;
-            }
-            // 32-bit or 64-bit offset, selected by the buffer width the
-            // caller supplied. This backend has no 4 GiB ceiling, so the
-            // wide form is honoured as given.
-            let offset: i64 = if arg_len >= 8 {
-                let a = core::slice::from_raw_parts(arg, 8);
-                let v = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
-                if v > i64::MAX as u64 {
-                    return errno::EINVAL;
-                }
-                v as i64
-            } else {
-                let v = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-                if v < 0 {
-                    return errno::EINVAL;
-                }
-                i64::from(v)
             };
             let pos = libc::lseek(files[slot_idx].fd, offset, libc::SEEK_SET);
             if pos < 0 {
@@ -1280,9 +1235,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 // successful op on this handle — record Volatile so
                 // the slot fence describes the latest op.
                 record_slot_fence(slot_idx, Fence::Volatile);
-                // Any non-negative value is success; an offset past what an
-                // `i32` carries is reported as 0 rather than as an errno.
-                i32::try_from(pos).unwrap_or(0)
+                errno::OK
             }
         }
         dev_fs::CLOSE => {
@@ -1311,7 +1264,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
-            if arg.is_null() || arg_len < 8 {
+            if arg_len != dev_fs::stat::LEN {
                 return errno::EINVAL;
             }
             let mut stat: libc::stat = core::mem::zeroed();
@@ -1319,40 +1272,15 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if ret < 0 {
                 return errno::ERROR;
             }
-            let size = stat.st_size as u64;
-            let mtime = stat.st_mtime as u64;
             // Metadata read; no durability claim.
             record_slot_fence(slot_idx, Fence::Volatile);
-            if arg_len >= 32 {
-                // This backend is the one that genuinely has an object model
-                // to report: `fstat` already answered every field. A provider
-                // that has the answer and returns the short form instead
-                // makes the wide form untestable.
-                let out = core::slice::from_raw_parts_mut(arg, 32);
-                out[..8].copy_from_slice(&size.to_le_bytes());
-                out[8..16].copy_from_slice(&mtime.to_le_bytes());
-                out[16..24].copy_from_slice(&(stat.st_ino as u64).to_le_bytes());
-                out[24..28].copy_from_slice(&(stat.st_nlink as u32).to_le_bytes());
-                out[28..32].copy_from_slice(&0u32.to_le_bytes());
-                return 32;
+            dev_fs::Stat {
+                size: stat.st_size as u64,
+                mtime: stat.st_mtime as u64,
+                ino: stat.st_ino as u64,
+                nlink: stat.st_nlink as u32,
             }
-            if arg_len >= 16 {
-                let out = core::slice::from_raw_parts_mut(arg, 16);
-                out[..8].copy_from_slice(&size.to_le_bytes());
-                out[8..].copy_from_slice(&mtime.to_le_bytes());
-                return 16;
-            }
-            // The narrow form cannot carry this file. Saying so is the whole
-            // point of having two widths: clamping to `u32::MAX` would hand
-            // the caller a number that is not the size, with no way to tell
-            // it apart from a file that really is that long.
-            if size > u64::from(u32::MAX) {
-                return errno::EOVERFLOW;
-            }
-            let out = core::slice::from_raw_parts_mut(arg, 8);
-            out[..4].copy_from_slice(&(size as u32).to_le_bytes());
-            out[4..].copy_from_slice(&(mtime as u32).to_le_bytes());
-            8
+            .answer(arg)
         }
         dev_fs::FSYNC => {
             let slot_idx = slot_index(handle);
@@ -1380,7 +1308,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
         dev_fs::OPENDIR => {
             let mut path_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+            if let Err(e) = validate_fs_path(arg, &mut path_buf) {
                 return e;
             }
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
@@ -1404,7 +1332,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             {
                 return errno::EINVAL;
             }
-            if arg.is_null() || arg_len < 2 {
+            if arg_len < 2 {
                 return errno::EINVAL;
             }
             let dir = files[slot_idx].dir_ptr as *mut libc::DIR;
@@ -1429,19 +1357,14 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 // on aarch64 — `.cast::<u8>()` normalises both without
                 // tripping clippy::unnecessary_cast on the arch where the
                 // `as` form would be a no-op.
-                let name_ptr: *const u8 = ent.d_name.as_ptr().cast();
-                let mut nlen = 0usize;
-                while nlen < 255 && *name_ptr.add(nlen) != 0 {
-                    nlen += 1;
-                }
+                let name: &[u8] =
+                    core::slice::from_raw_parts(ent.d_name.as_ptr().cast(), ent.d_name.len());
+                let nlen = name.iter().take(255).position(|&b| b == 0).unwrap_or(255);
                 if nlen == 0 {
                     continue;
                 }
                 // Skip "." and ".." pseudo-entries.
-                if nlen == 1 && *name_ptr == b'.' {
-                    continue;
-                }
-                if nlen == 2 && *name_ptr == b'.' && *name_ptr.add(1) == b'.' {
+                if &name[..nlen] == b"." || &name[..nlen] == b".." {
                     continue;
                 }
                 let is_dir = ent.d_type == libc::DT_DIR;
@@ -1457,13 +1380,9 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                     }
                     break;
                 }
-                *arg.add(out_pos) = nlen as u8;
-                *arg.add(out_pos + 1) = if is_dir { 1 } else { 0 };
-                let mut i = 0usize;
-                while i < nlen {
-                    *arg.add(out_pos + 2 + i) = *name_ptr.add(i);
-                    i += 1;
-                }
+                arg[out_pos] = nlen as u8;
+                arg[out_pos + 1] = if is_dir { 1 } else { 0 };
+                arg[out_pos + 2..out_pos + 2 + nlen].copy_from_slice(&name[..nlen]);
                 out_pos += need;
                 count += 1;
             }
@@ -1474,9 +1393,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 record_slot_fence(slot_idx, Fence::Volatile);
                 0
             } else {
-                let cnt_le = count.to_le_bytes();
-                *arg = cnt_le[0];
-                *arg.add(1) = cnt_le[1];
+                arg[..2].copy_from_slice(&count.to_le_bytes());
                 record_slot_fence(slot_idx, Fence::Volatile);
                 out_pos as i32
             }
@@ -1492,7 +1409,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 // `do <cmd>` (sector) calls this via provider_call, gated by
 // `requires_contract="proc"`. SPAWN (handle=-1) allocates a slot, spawns the
 // command through `ProcExecutor` (background reader thread → non-blocking
-// `poll_stdout`), and returns a `FD_TAG_PROC`-tagged handle.
+// `poll_stdout`), and returns the process slot's index.
 // READ/STATUS/CLOSE carry that handle back. Completion is the real process exit
 // (STATUS=0 once exited AND drained) — never a quiescence guess.
 //
@@ -1636,23 +1553,20 @@ fn proc_grant() -> &'static ProcGrant {
     })
 }
 
-/// Process-executor provider dispatch.
-///
-/// # Safety
-/// Single-threaded platform dispatch only: touches `static mut` provider
-/// state without synchronization. `arg` must be null or valid for reads
-/// and writes of `arg_len` bytes for the duration of the call.
-pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::platform::linux::host_process::FD_TAG_PROC;
-    use crate::kernel::ipc::fd::{slot_of, tag_fd};
+/// Process-executor provider dispatch. SPAWN's command line is `data` in;
+/// READ answers into `arg`.
+pub fn linux_proc_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::sys::errno;
     use crate::kernel::workload::extbridge::OverloadPolicy;
     use crate::platform::proc_executor::{ProcExecutor, SpawnPolicy};
 
-    let procs = &mut *core::ptr::addr_of_mut!(LINUX_PROCS);
+    // SAFETY: provider dispatch runs on the scheduler thread, the only
+    // thread touching the process-slot table.
+    let procs = unsafe { &mut *core::ptr::addr_of_mut!(LINUX_PROCS) };
     match opcode {
         PROC_SPAWN => {
-            if arg.is_null() || arg_len == 0 {
+            let line = data.as_slice();
+            if line.is_empty() {
                 return errno::EINVAL;
             }
             // A host process acts with the node's authority: the node and an
@@ -1662,8 +1576,7 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             if !crate::kernel::exec::scheduler::caller_authority().is_system() {
                 return errno::EACCES;
             }
-            let bytes = core::slice::from_raw_parts(arg, arg_len);
-            let line = match core::str::from_utf8(bytes) {
+            let line = match core::str::from_utf8(line) {
                 Ok(s) => s.trim(),
                 Err(_) => return errno::EINVAL,
             };
@@ -1698,17 +1611,17 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                         std::time::Instant::now()
                             + std::time::Duration::from_millis(grant.timeout_ms),
                     );
-                    tag_fd(FD_TAG_PROC, slot as i32)
+                    slot as i32
                 }
                 Err(_) => errno::ERROR,
             }
         }
         PROC_READ => {
-            let slot = slot_of(handle) as usize;
-            if slot >= MAX_PROCS || !proc_owned(&procs[slot]) || arg.is_null() || arg_len == 0 {
+            let slot = usize::try_from(handle).unwrap_or(usize::MAX);
+            if slot >= MAX_PROCS || !proc_owned(&procs[slot]) || arg.is_empty() {
                 return errno::EINVAL;
             }
-            let out = core::slice::from_raw_parts_mut(arg, arg_len);
+            let out = arg;
             let p = &mut procs[slot];
             if p.staged_off >= p.staged_len {
                 // A whole frame into the stage, whatever the caller's size.
@@ -1726,7 +1639,7 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             n as i32
         }
         PROC_STATUS => {
-            let slot = slot_of(handle) as usize;
+            let slot = usize::try_from(handle).unwrap_or(usize::MAX);
             if slot >= MAX_PROCS || !proc_owned(&procs[slot]) {
                 return errno::EINVAL;
             }
@@ -1756,14 +1669,13 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             // ended it, and -1 when the status could not be read at all. A
             // caller acting on the command's success — a fence agent on a
             // power cut — reads it; one that only waits ignores it.
-            if !running && !arg.is_null() && arg_len >= 4 {
-                let code = e.exit_code().unwrap_or(-1);
-                core::ptr::copy_nonoverlapping(code.to_le_bytes().as_ptr(), arg, 4);
+            if let (false, Some(out)) = (running, arg.get_mut(..4)) {
+                out.copy_from_slice(&e.exit_code().unwrap_or(-1).to_le_bytes());
             }
             i32::from(running)
         }
         PROC_CLOSE => {
-            let slot = slot_of(handle) as usize;
+            let slot = usize::try_from(handle).unwrap_or(usize::MAX);
             if slot < MAX_PROCS && proc_owned(&procs[slot]) {
                 close_proc_slot(&mut procs[slot], std::time::Duration::from_millis(100));
             }
@@ -1780,20 +1692,15 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
 /// FNV-1a hash of "linux_net"
 pub const LINUX_NET_HASH: u32 = 0xFBCC7DC9;
 
-// Net protocol message types (downstream: linux_net → consumer)
-const MSG_ACCEPTED: u8 = 0x01;
-const MSG_DATA: u8 = 0x02;
-const MSG_CLOSED: u8 = 0x03;
-/// `MSG_CLOSED` kinds (net_proto `CLOSED_PEER_FIN`, `CLOSED_GONE`): the peer
-/// finished sending and the connection is still writable, or the
-/// connection is gone.
-const CLOSED_PEER_FIN: u8 = crate::abi::contracts::net::net_proto::CLOSED_PEER_FIN;
-const CLOSED_GONE: u8 = crate::abi::contracts::net::net_proto::CLOSED_GONE;
-/// net_proto `CLOSED_ID_GRACE_MS`: how long a closed connection's id stays the
-/// consumer's after MSG_CLOSED. Mirrored by value here because this file
-/// carries its own copy of the opcode table; the contract module is the
-/// authority.
-const CLOSED_ID_GRACE_MS: u32 = 5_000;
+// The stream and datagram surfaces this provider serves
+// (`contracts/net/net_proto.rs`, `contracts/net/datagram.rs`); the contract
+// modules are the only source of their values and layouts.
+use crate::abi::contracts::net::datagram as dgc;
+use crate::abi::contracts::net::net_proto as np;
+use np::{
+    CLOSED_GONE, CLOSED_ID_GRACE_MS, CLOSED_PEER_FIN, CMD_BIND, CMD_CLOSE, CMD_CONNECT_TO,
+    CMD_SEND, MSG_ACCEPTED, MSG_BOUND, MSG_CLOSED, MSG_CONNECTED, MSG_DATA, MSG_ERROR,
+};
 /// How long a deferred `CMD_CLOSE` waits for the connection's queued bytes to
 /// reach the wire before closing anyway.
 ///
@@ -1803,58 +1710,33 @@ const CLOSED_ID_GRACE_MS: u32 = 5_000;
 /// this the remainder is dropped, loudly, which is a reported loss rather than
 /// a silent one.
 const CLOSE_DRAIN_MAX_MS: u64 = 10_000;
-const MSG_BOUND: u8 = 0x04;
-const MSG_CONNECTED: u8 = 0x05;
-const MSG_ERROR: u8 = 0x06;
-/// Bind refusal / failure: `[port: u16 LE][errno: u8]`. The port is the
-/// routing key (consumers sharing net_out already filter by local_port).
-/// Emitted on a bind syscall failure and on an owner-gate refusal, so a
-/// requester never hangs waiting for MSG_BOUND on a failed bind.
-const MSG_BIND_REFUSED: u8 = 0x07;
 
-// Net protocol command types (upstream: consumer → linux_net)
-const CMD_BIND: u8 = 0x10;
-const CMD_SEND: u8 = 0x11;
-const CMD_CLOSE: u8 = 0x12;
-/// Reserved dial (`[sock_type][ip u32 LE][port][tag u16 LE?]`), unsupported. Answered with
-/// `MSG_ERROR ENOSYS` on its tag so a stale emitter fails on its first dial
-/// rather than dialling the address its bytes would decode to under the
-/// live shape.
-const CMD_CONNECT: u8 = 0x13;
-/// The dial: `[sock_type][af][port u16 LE][addr…][tag u16 LE?]`, decoded by the
-/// contract's `read_connect_to`. A name is resolved here — the provider is
-/// the resolver on every platform — through `getaddrinfo(3)` on a thread,
-/// so `/etc/hosts`, `resolv.conf`, nsswitch and systemd-resolved all apply
-/// and the scheduler never blocks on a lookup.
-const CMD_CONNECT_TO: u8 = 0x14;
-
-// Datagram surface (crates/fluxor-abi/src/contracts/net/datagram.rs, opcodes
-// 0x20..0x43). Disjoint from net_proto so the same channel can carry
-// both contracts.
-const DG_CMD_BIND: u8 = 0x20;
-const DG_CMD_SEND_TO: u8 = 0x21;
-const DG_CMD_CLOSE: u8 = 0x22;
-const DG_MSG_BOUND: u8 = 0x40;
-const DG_MSG_RX_FROM: u8 = 0x41;
-const DG_MSG_CLOSED: u8 = 0x42;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_MSG_ERROR: u8 = 0x43;
-const DG_AF_INET: u8 = 4;
+const DG_CMD_BIND: u8 = dgc::CMD_DG_BIND;
+const DG_CMD_SEND_TO: u8 = dgc::CMD_DG_SEND_TO;
+const DG_CMD_CLOSE: u8 = dgc::CMD_DG_CLOSE;
+const DG_MSG_BOUND: u8 = dgc::MSG_DG_BOUND;
+const DG_MSG_RX_FROM: u8 = dgc::MSG_DG_RX_FROM;
+const DG_MSG_CLOSED: u8 = dgc::MSG_DG_CLOSED;
+const DG_MSG_ERROR: u8 = dgc::MSG_DG_ERROR;
+const DG_AF_INET: u8 = dgc::AF_INET;
 /// Datagram destination given as a DNS name (`[len][name]`), resolved by
 /// this provider exactly as a stream dial is. A name not yet in the cache
 /// starts a lookup and the datagram is DROPPED: a datagram sender
 /// retransmits, and the next send after the answer lands goes out.
-const DG_AF_NAME: u8 = 1;
-/// Marker introducing the owner tag on `DG_CMD_SEND_TO` / `DG_CMD_CLOSE`. It
-/// sits at the offset that otherwise carries `af`, and is distinct from every
-/// defined address family, so the tagged and untagged shapes separate at a
-/// fixed offset rather than by a length rule over variable-length data.
-const DG_OWNER_TAG_MARK: u8 = 0xFF;
-/// Bytes the owner-tag field occupies: `[MARK][owner_tag: u16 LE]`.
-const DG_OWNER_TAG_FIELD: usize = 3;
+const DG_AF_NAME: u8 = dgc::AF_NAME;
+
+/// The largest record `net_out` writes, header included (the manifest's
+/// `max_record`): a `MSG_DATA` of 1460 bytes (`STREAM_CHUNK`) is 1465, and
+/// a datagram is delivered only while its `MSG_DG_RX_FROM` frame fits this
+/// bound — 1472 bytes of IPv4 payload, one Ethernet MTU. A larger host
+/// datagram is dropped and counted (`dg_rx_dropped`), never cut.
+pub const LINUX_NET_OUT_MAX_RECORD: usize = 1483;
+/// The largest record `net_in` accepts, header included (the manifest's
+/// `accepts_record`): the command scratch.
+pub const LINUX_NET_IN_ACCEPTS_RECORD: usize = 3 + LINUX_NET_CMD_MAX;
+/// Data bytes one `MSG_DATA` frame carries.
+const STREAM_CHUNK: usize = 1460;
+const _: () = assert!(3 + np::DATA_HEAD + STREAM_CHUNK <= LINUX_NET_OUT_MAX_RECORD);
 
 const CONN_TYPE_UDP_BOUND: u8 = 2;
 
@@ -1952,11 +1834,6 @@ struct LinuxNetConn {
     /// lane's events channel, and an attached lane may act only on the
     /// slots it created. Immutable for the life of the slot.
     lane: u16,
-    /// Datagram endpoints only: the `owner_tag` the consumer stamped on
-    /// `DG_CMD_BIND`. `DG_CMD_SEND_TO` / `DG_CMD_CLOSE` must present the same
-    /// value or the command is refused with `EPERM`. Zero is the host
-    /// wildcard, reachable by the untagged shape.
-    dg_owner_tag: u16,
     /// Unsent bytes. Empty until a send backs up; then grown as the backlog
     /// does (to the instance's `write_buf_max`) and kept until the slot is
     /// released.
@@ -2023,7 +1900,6 @@ impl LinuxNetConn {
             peer_fin: false,
             owner: crate::kernel::workload::owner::OWNER_SYSTEM,
             lane: 0,
-            dg_owner_tag: 0,
             write_buf: Vec::new(),
             alts: Vec::new(),
             attempt_started: None,
@@ -2101,8 +1977,8 @@ pub struct LinuxNetState {
     ready: Vec<libc::epoll_event>,
     ready_len: usize,
     /// One command frame's payload, `LINUX_NET_CMD_MAX` (48 KiB) bytes:
-    /// several times net_proto's `MAX_CMD_DATA` (8 KiB of `CMD_SEND` data
-    /// plus its conn id), so every conforming command fits. A frame whose
+    /// `net_in`'s `accepts_record` less the frame header, so every record
+    /// a producer the composer admitted can write fits. A frame whose
     /// payload is larger is drained and answered `EMSGSIZE`, never read in
     /// part.
     cmd_buf: [u8; LINUX_NET_CMD_MAX],
@@ -2935,23 +2811,32 @@ unsafe fn linux_net_send_msg<const N: usize>(st: &mut LinuxNetState, lane: usize
     }
 }
 
-/// `MSG_ERROR [conn_id: u16 LE][errno][requester_tag: u16 LE]`: the tagged
-/// terminal result of a failed dial.
-fn connect_error_frame(
-    conn_id: u16,
-    errno: u8,
-    tag: crate::abi::contracts::net::net_proto::RequesterTag,
-) -> [u8; 6] {
-    let c = conn_id.to_le_bytes();
-    let t = tag.to_le_bytes();
-    [MSG_ERROR, c[0], c[1], errno, t[0], t[1]]
+/// `MSG_ERROR [conn_id: u16 LE][errno][requester_tag: u16 LE]`, framed for
+/// `linux_net_send_msg`: with a tag, the terminal result of a failed dial;
+/// with tag 0, an established connection's or a bind's error.
+fn error_frame(conn_id: u16, errno: u8, tag: np::RequesterTag) -> [u8; 1 + np::ERROR_LEN] {
+    let mut m = [0u8; 1 + np::ERROR_LEN];
+    m[0] = MSG_ERROR;
+    m[1..].copy_from_slice(&np::error(conn_id, errno as i8, tag));
+    m
+}
+
+/// A transport reports no session facts and grants no sideband: it serves
+/// none (`net_proto::flag`). The host's TCP keeps its own copy of what is
+/// sent, so no stream here is ever offered `stream_retx`.
+const OPENING: np::Opening<'static> = np::Opening::PLAIN;
+
+/// Whether a `CMD_BIND` / `CMD_CONNECT_TO` request's flags are ones the
+/// contract defines (a defined bit this provider does not serve is simply
+/// not granted).
+fn flags_defined(flags: u8) -> bool {
+    flags & !np::flag::REQUESTABLE == 0
 }
 
 /// Report stream `conn_id`'s peer (`MSG_PEER`), the socket's remote end,
 /// queued after the `MSG_ACCEPTED` / `MSG_CONNECTED` it follows and ahead of
 /// the stream's data.
 unsafe fn linux_net_send_peer(st: &mut LinuxNetState, lane: usize, conn_id: usize, fd: i32) {
-    use crate::abi::contracts::net::net_proto as np;
     let mut ss: libc::sockaddr_storage = core::mem::zeroed();
     let mut len = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     if libc::getpeername(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
@@ -2982,30 +2867,52 @@ unsafe fn linux_net_send_peer(st: &mut LinuxNetState, lane: usize, conn_id: usiz
     linux_net_send_msg(st, lane, &msg);
 }
 
-/// `MSG_CONNECTED [conn_id: u16 LE][requester_tag: u16 LE]`.
-fn connected_frame(
-    conn_id: [u8; 2],
-    tag: crate::abi::contracts::net::net_proto::RequesterTag,
-) -> [u8; 5] {
-    let t = tag.to_le_bytes();
-    [MSG_CONNECTED, conn_id[0], conn_id[1], t[0], t[1]]
+/// `MSG_CONNECTED [conn_id][requester_tag][flags_granted][generation]
+/// [alpn_len]`, framed for `linux_net_send_msg`.
+fn connected_frame(conn_id: [u8; 2], tag: np::RequesterTag) -> [u8; 1 + np::CONNECTED_FIXED] {
+    let mut m = [0u8; 1 + np::CONNECTED_FIXED];
+    m[0] = MSG_CONNECTED;
+    let c = np::Connected {
+        conn_id: u16::from_le_bytes(conn_id),
+        requester_tag: tag,
+        opening: OPENING,
+    };
+    let _ = np::put_connected(&mut m[1..], &c);
+    m
 }
 
-/// Emit `MSG_BIND_REFUSED [port:2 LE][errno:1]` so a bind failure/refusal is
-/// surfaced to the requester rather than leaving it waiting for MSG_BOUND.
+/// `MSG_ACCEPTED [conn_id][local_port][flags_granted][generation]
+/// [alpn_len]`, framed for `linux_net_send_msg`.
+fn accepted_frame(conn_id: u16, local_port: u16) -> [u8; 1 + np::ACCEPTED_FIXED] {
+    let mut m = [0u8; 1 + np::ACCEPTED_FIXED];
+    m[0] = MSG_ACCEPTED;
+    let a = np::Accepted {
+        conn_id,
+        local_port,
+        opening: OPENING,
+    };
+    let _ = np::put_accepted(&mut m[1..], &a);
+    m
+}
+
+/// `MSG_BOUND [conn_id][local_port][flags_granted]`, framed for
+/// `linux_net_send_msg`.
+fn bound_frame(conn_id: u16, local_port: u16) -> [u8; 1 + np::BOUND_LEN] {
+    let mut m = [0u8; 1 + np::BOUND_LEN];
+    m[0] = MSG_BOUND;
+    m[1..].copy_from_slice(&np::bound(conn_id, local_port, OPENING.flags_granted));
+    m
+}
+
+/// A stream bind failed or was refused: `MSG_ERROR` with no connection and
+/// no tag, so its requester never waits on a `MSG_BOUND` that will not come.
 unsafe fn linux_net_send_bind_refused(st: &mut LinuxNetState, lane: usize, port: u16, errno: u8) {
-    let pb = port.to_le_bytes();
-    let msg = [MSG_BIND_REFUSED, pb[0], pb[1], errno];
-    linux_net_send_msg(st, lane, &msg);
+    log::warn!("[linux_net] lane {lane}: stream bind of port {port} refused (errno {errno})");
+    linux_net_send_msg(st, lane, &error_frame(0, errno, np::REQUESTER_TAG_NONE));
 }
 
 /// Emit the datagram contract's `DG_MSG_ERROR [ep_id][errno]` for a failed
-/// `DG_CMD_BIND`, alongside `MSG_BIND_REFUSED`: datagram-contract modules
-/// (dns et al.) parse only `DG_MSG_*` opcodes in their WaitBound states, so
-/// without this frame a refused UDP bind parks them forever instead of
-/// faulting. `ep_id` 0xFF = no endpoint was
-/// allocated. Emitting both frames is additive-safe: each surface's
-/// listeners match only their own opcode.
+/// `DG_CMD_BIND`: `ep_id` 0xFF = no endpoint was allocated.
 unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, lane: usize, errno: u8) {
     linux_net_send_dg_ep_error(st, lane, 0xFF, errno);
 }
@@ -3077,11 +2984,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     for (li, c) in st.conns.iter().enumerate() {
         if c.state == 3 && c.conn_type == 1 && c.fd >= 0 && c.port == port {
             if c.owner == commander && lane_may_touch(st, lane, li) {
-                // MSG_BOUND payload: [conn_id:2 LE][local_port:2 LE]
-                let pb = port.to_le_bytes();
-                let cb = (li as u16).to_le_bytes();
-                let msg = [MSG_BOUND, cb[0], cb[1], pb[0], pb[1]];
-                linux_net_send_msg(st, lane, &msg);
+                linux_net_send_msg(st, lane, &bound_frame(li as u16, port));
             } else {
                 log::warn!(
                     "[linux_net] bind port {port} refused: held by owner slot {} \
@@ -3169,51 +3072,23 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     // `fluxor run` kill a healthy, already-listening host after five seconds.
     log::warn!("[linux_net] listening on port {port} (slot {idx})");
 
-    // MSG_BOUND payload: `[conn_id:2 LE][local_port:2 LE]`. Consumers sharing
-    // net_out filter by local_port; without it a second anchor's BIND races on
-    // the same channel and steals server_conn_id.
-    //
-    // This file has two bind paths — this one and the owner-gated one above —
-    // and both must emit this exact shape. A short frame does not fail loudly:
-    // the consumer skips the port it cannot read, never latches an accept port,
-    // and falls back to claiming every accept, which is indistinguishable from
-    // working multi-anchor filtering until a second anchor exists.
-    let pb = port.to_le_bytes();
-    let cb = (idx as u16).to_le_bytes();
-    let msg = [MSG_BOUND, cb[0], cb[1], pb[0], pb[1]];
-    linux_net_send_msg(st, lane, &msg);
+    // Consumers sharing net_out filter accepts by the bound port.
+    linux_net_send_msg(st, lane, &bound_frame(idx as u16, port));
 }
 
 // ----------------------------------------------------------------------
 // Datagram surface — UDP bind / send_to / recvfrom on the same channel
 // ----------------------------------------------------------------------
 
-/// Decode the optional owner tag at the head of a `DG_CMD_SEND_TO` /
-/// `DG_CMD_CLOSE` payload. Returns `(claimed_tag, offset_of_next_field)` —
-/// the offset is `1` for the untagged shape, so an untagged command decodes
-/// exactly as it did before the tag existed. An absent tag reads as 0.
-fn dg_claimed_owner_tag(payload: &[u8]) -> (u16, usize) {
-    if payload.len() > DG_OWNER_TAG_FIELD && payload[1] == DG_OWNER_TAG_MARK {
-        (
-            u16::from_le_bytes([payload[2], payload[3]]),
-            1 + DG_OWNER_TAG_FIELD,
-        )
-    } else {
-        (0, 1)
-    }
-}
-
-unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u16, lane: usize) {
+unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     let commander = lane_owner(st, lane);
     if let Some(errno) = linux_net_new_bind_refusal(commander, 2, port) {
-        linux_net_send_bind_refused(st, lane, port, errno);
         linux_net_send_dg_error(st, lane, errno);
         return;
     }
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free slots for UDP bind");
-        linux_net_send_bind_refused(st, lane, port, 105); // ENOBUFS
         linux_net_send_dg_error(st, lane, 105);
         return;
     }
@@ -3221,7 +3096,6 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
     let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
     if fd < 0 {
         log::error!("[linux_net] UDP socket() failed");
-        linux_net_send_bind_refused(st, lane, port, 23); // ENFILE
         linux_net_send_dg_error(st, lane, 23);
         return;
     }
@@ -3256,7 +3130,6 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         log::error!("[linux_net] UDP bind() failed on port {port} (errno {errno})");
         libc::close(fd);
-        linux_net_send_bind_refused(st, lane, port, errno.clamp(0, 255) as u8);
         linux_net_send_dg_error(st, lane, errno.clamp(0, 255) as u8);
         return;
     }
@@ -3270,7 +3143,6 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
         port,
         owner: commander,
         lane: lane as u16,
-        dg_owner_tag: owner_tag,
         ..LinuxNetConn::empty()
     };
     st.watch(fd, idx, libc::EPOLLIN as u32);
@@ -3286,18 +3158,13 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
     linux_net_send_msg(st, lane, &msg);
 }
 
-/// Whether the consumer claiming `claimed_tag` may send on endpoint `ep`:
-/// the slot holds a live bound datagram endpoint and the tag recorded at
-/// bind is the one claimed. Answers `EPERM` on a live endpoint reached by
-/// a consumer that does not hold it, and nothing at all on a slot that
-/// holds no endpoint. Asked BEFORE the destination is read, so an
-/// unowned endpoint buys neither a datagram nor a name lookup.
-unsafe fn dg_endpoint_admits(
-    st: &mut LinuxNetState,
-    lane: usize,
-    ep: i16,
-    claimed_tag: u16,
-) -> bool {
+/// Whether `lane` may send on endpoint `ep`: the slot holds a live bound
+/// datagram endpoint and the owner the kernel attests for the lane's channel
+/// is the one that bound it. Answers `EPERM` on a live endpoint reached from
+/// another owner's channel, and nothing at all on a slot that holds no
+/// endpoint. Asked BEFORE the destination is read, so an unowned endpoint
+/// buys neither a datagram nor a name lookup.
+unsafe fn dg_endpoint_admits(st: &mut LinuxNetState, lane: usize, ep: i16) -> bool {
     if ep < 0 || (ep as usize) >= st.conns.len() {
         return false;
     }
@@ -3305,7 +3172,7 @@ unsafe fn dg_endpoint_admits(
     if c.state != 3 || c.conn_type != CONN_TYPE_UDP_BOUND || c.fd < 0 {
         return false;
     }
-    if c.dg_owner_tag != claimed_tag {
+    if c.owner != lane_owner(st, lane) {
         linux_net_send_dg_error(st, lane, 1); // EPERM
         return false;
     }
@@ -3314,9 +3181,7 @@ unsafe fn dg_endpoint_admits(
 
 unsafe fn linux_net_dg_cmd_send_to(
     st: &mut LinuxNetState,
-    lane: usize,
     ep: i16,
-    claimed_tag: u16,
     ip: [u8; 4],
     port: u16,
     data: &[u8],
@@ -3325,18 +3190,11 @@ unsafe fn linux_net_dg_cmd_send_to(
         return;
     }
     let idx = ep as usize;
-    let (state, conn_type, fd, bound_tag) = {
+    let (state, conn_type, fd) = {
         let c = &st.conns[idx];
-        (c.state, c.conn_type, c.fd, c.dg_owner_tag)
+        (c.state, c.conn_type, c.fd)
     };
     if state != 3 || conn_type != CONN_TYPE_UDP_BOUND || fd < 0 {
-        return;
-    }
-    // `ep` is an index, not an authority: the command channel merges every
-    // producer into one stream and carries no producer identity. The tag
-    // recorded at bind is what says who holds the endpoint.
-    if bound_tag != claimed_tag {
-        linux_net_send_dg_error(st, lane, 1); // EPERM
         return;
     }
     let mut addr: libc::sockaddr_in = core::mem::zeroed();
@@ -3420,13 +3278,14 @@ fn dg_note_arrival(conn: &mut LinuxNetConn, peer: (u32, u16), local: u32) {
     v.push((peer.0, peer.1, local));
 }
 
-unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, lane: usize, ep: i16, claimed_tag: u16) {
+unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, lane: usize, ep: i16) {
     if ep < 0 || (ep as usize) >= st.conns.len() {
         return;
     }
     let idx = ep as usize;
     // Close is the destructive half of the same authority question as send.
-    if st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND && st.conns[idx].dg_owner_tag != claimed_tag {
+    if st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND && st.conns[idx].owner != lane_owner(st, lane)
+    {
         linux_net_send_dg_error(st, lane, 1); // EPERM
         return;
     }
@@ -3435,12 +3294,7 @@ unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, lane: usize, ep: i16, c
     }
     st.conns[idx] = LinuxNetConn::empty();
 
-    let mut msg = [0u8; 3];
-    msg[0] = DG_MSG_CLOSED;
-    let ep_b = ep.to_le_bytes();
-    msg[1] = ep_b[0];
-    msg[2] = ep_b[1];
-    linux_net_send_msg(st, lane, &msg);
+    linux_net_send_msg(st, lane, &[DG_MSG_CLOSED, idx as u8]);
 }
 
 unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
@@ -3460,9 +3314,11 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
             && st.conns[i].fd >= 0
         {
             let mut from: libc::sockaddr_in = core::mem::zeroed();
+            // A datagram is delivered only while its frame fits `net_out`'s
+            // `max_record`; a larger one arrives truncated and is dropped.
             let mut iov = libc::iovec {
                 iov_base: st.msg_buf.as_mut_ptr().add(HDR) as *mut libc::c_void,
-                iov_len: st.msg_buf.len() - HDR,
+                iov_len: st.msg_buf.len().min(LINUX_NET_OUT_MAX_RECORD) - HDR,
             };
             let mut cbuf = [0u64; 8];
             let mut mh: libc::msghdr = core::mem::zeroed();
@@ -3554,7 +3410,7 @@ unsafe fn linux_net_cmd_connect_to(
     // and the public contract.
     const SOCK_TYPE_STREAM: u8 = 1;
     if sock_type != SOCK_TYPE_STREAM {
-        let msg = connect_error_frame(0, 22u8, tag); // EINVAL, no slot allocated (conn 0, u16 LE)
+        let msg = error_frame(0, 22u8, tag); // EINVAL, no slot allocated (conn 0, u16 LE)
         linux_net_send_msg(st, lane, &msg);
         return;
     }
@@ -3567,7 +3423,7 @@ unsafe fn linux_net_cmd_connect_to(
     if slot < 0 {
         log::error!("[linux_net] no free connection slots");
         // Tagged terminal result (ENOMEM) so the requester completes.
-        let msg = connect_error_frame(0, 12u8, tag);
+        let msg = error_frame(0, 12u8, tag);
         linux_net_send_msg(st, lane, &msg);
         return;
     }
@@ -3610,7 +3466,7 @@ unsafe fn linux_net_cmd_connect_to(
                 }
                 None => {
                     st.conns[idx] = LinuxNetConn::empty();
-                    let msg = connect_error_frame(0, 2u8, tag); // ENOENT
+                    let msg = error_frame(0, 2u8, tag); // ENOENT
                     linux_net_send_msg(st, lane, &msg);
                 }
             }
@@ -3678,12 +3534,12 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             }
             Ok(_) => {
                 st.conns[idx] = LinuxNetConn::empty();
-                let msg = connect_error_frame(0, libc::ENOENT as u8, tag);
+                let msg = error_frame(0, libc::ENOENT as u8, tag);
                 linux_net_send_msg(st, lane as usize, &msg);
             }
             Err(errno) => {
                 st.conns[idx] = LinuxNetConn::empty();
-                let msg = connect_error_frame(0, errno as u8, tag);
+                let msg = error_frame(0, errno as u8, tag);
                 linux_net_send_msg(st, lane as usize, &msg);
             }
         }
@@ -3705,7 +3561,7 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             let lane = st.conns[i].lane as usize;
             st.conns[i] = LinuxNetConn::empty();
             st.resolving = st.resolving.saturating_sub(1);
-            let msg = connect_error_frame(0, 2u8, tag); // ENOENT
+            let msg = error_frame(0, 2u8, tag); // ENOENT
             linux_net_send_msg(st, lane, &msg);
             had_work = true;
         }
@@ -3950,7 +3806,7 @@ unsafe fn linux_net_dial_failed(st: &mut LinuxNetState, idx: usize, mut dial: Di
     }
     log::error!("[linux_net] connect() failed errno={errno}");
     st.conns[idx] = LinuxNetConn::empty();
-    let msg = connect_error_frame(idx as u16, errno as u8, dial.tag);
+    let msg = error_frame(idx as u16, errno as u8, dial.tag);
     linux_net_send_msg(st, dial.lane as usize, &msg);
 }
 
@@ -4212,7 +4068,7 @@ unsafe fn sweep_held_slots(st: &mut LinuxNetState) {
     }
 }
 
-unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
+unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16, abort: bool) {
     let idx = conn_id as usize;
     if idx >= st.conns.len() || st.conns[idx].state == 0 {
         return;
@@ -4222,6 +4078,22 @@ unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
         // is released now, and MSG_CLOSED is not repeated.
         st.conns[idx] = LinuxNetConn::empty();
         return;
+    }
+    if abort && st.conns[idx].fd >= 0 {
+        // An abortive close: whatever is queued is dropped and the host
+        // resets the connection (`SO_LINGER` zero) instead of a FIN.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        libc::setsockopt(
+            st.conns[idx].fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            core::mem::size_of::<libc::linger>() as u32,
+        );
+        st.conns[idx].write_offset = st.conns[idx].write_len;
     }
     if st.conns[idx].fd >= 0 && st.conns[idx].write_len > st.conns[idx].write_offset {
         // Queued bytes first. The drain sweep finishes the close once they
@@ -4428,11 +4300,11 @@ unsafe fn accept_one_client(
     };
     st.watch(client_fd, idx, libc::EPOLLIN as u32);
 
-    // MSG_ACCEPTED payload: [conn_id:2 LE][listener_port:2 LE]
-    let pb = listener_port.to_le_bytes();
-    let cb = (idx as u16).to_le_bytes();
-    let msg = [MSG_ACCEPTED, cb[0], cb[1], pb[0], pb[1]];
-    linux_net_send_msg(st, lane as usize, &msg);
+    linux_net_send_msg(
+        st,
+        lane as usize,
+        &accepted_frame(idx as u16, listener_port),
+    );
     linux_net_send_peer(st, lane as usize, idx, client_fd);
     log::info!("[linux_net] accepted conn_id={idx}");
 }
@@ -4450,7 +4322,6 @@ unsafe fn forward_chunks(
     from: usize,
     total: usize,
 ) -> usize {
-    const MAX_DATA_FRAGMENT: usize = 1460; // mirrors net_proto::MAX_DATA_FRAGMENT
     let events = lane_events(st, lane);
     // Data never overtakes a queued control frame (an accept and its peer
     // report): it waits, as for a full channel.
@@ -4459,7 +4330,7 @@ unsafe fn forward_chunks(
     }
     let mut off = from;
     while off < total {
-        let chunk = (total - off).min(MAX_DATA_FRAGMENT);
+        let chunk = (total - off).min(STREAM_CHUNK);
         let payload_len = 2 + chunk;
         let frame_len = 3 + payload_len;
         if frame_len > st.msg_buf.len() {
@@ -4682,7 +4553,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             0,
         );
         if n > 0 {
-            // CHUNK the read into ≤MAX_DATA_FRAGMENT frames. The recv was
+            // CHUNK the read into ≤STREAM_CHUNK frames. The recv was
             // bounded by the room, so every chunk should fit; a short write
             // anyway leaves a tail to re-offer rather than bytes to drop.
             let total = n as usize;
@@ -4719,14 +4590,14 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
     had_work
 }
 
-/// Leading payload bytes kept from an oversized command: enough for the
-/// retired `CMD_CONNECT`'s tag at bytes 7..9.
-const OVERSIZED_HEAD: usize = 9;
+/// Leading payload bytes kept from an oversized command: a connection id,
+/// an endpoint id or a bind's port.
+const OVERSIZED_HEAD: usize = 2;
 
 /// Answer a command frame larger than `LINUX_NET_CMD_MAX` with `EMSGSIZE`,
 /// in the shape its requester waits on: a dial's `MSG_ERROR` on its tag
-/// (`CMD_CONNECT_TO`'s last two bytes, the retired `CMD_CONNECT`'s 7..9), a
-/// bind's `MSG_BIND_REFUSED` (with `DG_MSG_ERROR` for a datagram bind), a
+/// (`CMD_CONNECT_TO`'s last two bytes), a stream bind's untagged
+/// `MSG_ERROR`, a datagram bind's `DG_MSG_ERROR`, a
 /// datagram send's or close's `DG_MSG_ERROR` on its endpoint, and a stream
 /// command's `MSG_ERROR` on its connection. An oversized `CMD_SEND` has lost
 /// bytes from the middle of the stream, so the connection is closed after
@@ -4742,7 +4613,6 @@ unsafe fn linux_net_refuse_oversized(
     head: &[u8; OVERSIZED_HEAD],
     tail: [u8; 2],
 ) {
-    use crate::abi::contracts::net::net_proto as np;
     const EMSGSIZE: u8 = libc::EMSGSIZE as u8;
     log::warn!(
         "[linux_net] lane {lane}: command 0x{msg_type:02x} of {payload_len} B is larger than \
@@ -4750,11 +4620,7 @@ unsafe fn linux_net_refuse_oversized(
     );
     match msg_type {
         CMD_CONNECT_TO => {
-            let msg = connect_error_frame(0, EMSGSIZE, u16::from_le_bytes(tail));
-            linux_net_send_msg(st, lane, &msg);
-        }
-        CMD_CONNECT => {
-            let msg = connect_error_frame(0, EMSGSIZE, np::retired_connect_tag(head));
+            let msg = error_frame(0, EMSGSIZE, u16::from_le_bytes(tail));
             linux_net_send_msg(st, lane, &msg);
         }
         CMD_SEND | CMD_CLOSE => {
@@ -4764,9 +4630,11 @@ unsafe fn linux_net_refuse_oversized(
             if !live || !lane_may_touch(st, lane, idx) {
                 return;
             }
-            let cb = conn_id.to_le_bytes();
-            let msg = [MSG_ERROR, cb[0], cb[1], EMSGSIZE];
-            linux_net_send_msg(st, lane, &msg);
+            linux_net_send_msg(
+                st,
+                lane,
+                &error_frame(conn_id, EMSGSIZE, np::REQUESTER_TAG_NONE),
+            );
             if msg_type == CMD_SEND && st.conns[idx].state == 2 {
                 hold_closed_slot(st, idx);
             }
@@ -4775,7 +4643,6 @@ unsafe fn linux_net_refuse_oversized(
             linux_net_send_bind_refused(st, lane, u16::from_le_bytes([head[0], head[1]]), EMSGSIZE);
         }
         DG_CMD_BIND => {
-            linux_net_send_bind_refused(st, lane, u16::from_le_bytes([head[0], head[1]]), EMSGSIZE);
             linux_net_send_dg_error(st, lane, EMSGSIZE);
         }
         DG_CMD_SEND_TO | DG_CMD_CLOSE => {
@@ -4791,9 +4658,13 @@ unsafe fn linux_net_refuse_oversized(
     }
 }
 
-pub fn linux_net_step(state: *mut u8) -> i32 {
-    // SAFETY: `state` is the kernel-owned per-instance arena sized
-    // for `LinuxNetState` by the loader.
+/// One step of the built-in `linux_net` module.
+///
+/// # Safety
+/// `state` is the module's per-instance arena, holding a `LinuxNetState`
+/// pointer the platform stored at build; scheduler thread only.
+pub unsafe fn linux_net_step(state: *mut u8) -> i32 {
+    // SAFETY: the function's contract.
     unsafe {
         let st = instance_state::<LinuxNetState>(state);
 
@@ -4847,7 +4718,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                     let msg_type = hdr[0];
                     let payload_len = (hdr[1] as u16 | ((hdr[2] as u16) << 8)) as usize;
                     if payload_len > st.cmd_buf.len() {
-                        // Oversized command (a consumer exceeding MAX_CMD_DATA). The
+                        // Oversized command (past `accepts_record`). The
                         // body would NOT fit our scratch; DRAIN it from the FIFO so
                         // the next read starts on a real header, keeping the bytes
                         // its requester is named by (a conn id or endpoint at the
@@ -4886,57 +4757,55 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                     }
 
                     match msg_type {
-                        CMD_BIND if payload_len >= 2 => {
-                            let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                            linux_net_cmd_bind(st, port, lane);
-                            had_work = true;
-                        }
-                        CMD_CONNECT => {
-                            // Unsupported. Fail the emitter loudly on its tag rather
-                            // than dial whatever its address bytes decode to.
-                            let tag = crate::abi::contracts::net::net_proto::retired_connect_tag(
-                                &st.cmd_buf[..payload_len],
-                            );
-                            log::warn!(
-                                "[linux_net] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14) [tag {tag}]"
-                            );
-                            let msg = connect_error_frame(0, 38u8, tag); // ENOSYS
-                            linux_net_send_msg(st, lane, &msg);
-                            had_work = true;
-                        }
-                        CMD_CONNECT_TO => {
-                            use crate::abi::contracts::net::net_proto::read_connect_to;
-                            // Decode against a copy so the record's borrowed name does
-                            // not hold `cmd_buf` while the state is mutated.
-                            let mut rec =
-                                [0u8; crate::abi::contracts::net::net_proto::CONNECT_TO_MAX];
-                            let n = payload_len.min(rec.len());
-                            rec[..n].copy_from_slice(&st.cmd_buf[..n]);
-                            match read_connect_to(&rec[..n]) {
-                                Some((sock_type, port, target, tag)) if n == payload_len => {
-                                    let tag = tag.unwrap_or(0);
-                                    linux_net_cmd_connect_to(
-                                        st, sock_type, port, target, tag, lane,
-                                    );
+                        CMD_BIND => {
+                            match np::bind_parts(&st.cmd_buf[..payload_len]) {
+                                Some((port, flags)) if flags_defined(flags) => {
+                                    linux_net_cmd_bind(st, port, lane);
                                 }
                                 _ => {
-                                    // Malformed: a name past 253 bytes, an unknown family,
-                                    // a truncated address. EINVAL goes to the tag the
-                                    // record's last two bytes spell, as `read_connect_to`
-                                    // states.
-                                    let tag = crate::abi::contracts::net::net_proto::malformed_connect_to_tag(
-                                        &st.cmd_buf[..payload_len],
-                                    );
                                     log::warn!(
-                                        "[linux_net] malformed CMD_CONNECT_TO ({payload_len} B)"
+                                        "[linux_net] lane {lane}: malformed CMD_BIND \
+                                         ({payload_len} B)"
                                     );
-                                    let msg = connect_error_frame(0, 22u8, tag);
+                                    let msg = error_frame(0, 22, np::REQUESTER_TAG_NONE);
                                     linux_net_send_msg(st, lane, &msg);
                                 }
                             }
                             had_work = true;
                         }
-                        CMD_SEND if payload_len >= 3 => {
+                        CMD_CONNECT_TO => {
+                            // Decode against a copy so the record's borrowed name does
+                            // not hold `cmd_buf` while the state is mutated.
+                            let mut rec = [0u8; np::CONNECT_TO_MAX];
+                            let n = payload_len.min(rec.len());
+                            rec[..n].copy_from_slice(&st.cmd_buf[..n]);
+                            match np::read_connect_to(&rec[..n]) {
+                                Some(c) if n == payload_len && flags_defined(c.flags) => {
+                                    linux_net_cmd_connect_to(
+                                        st,
+                                        c.sock_type,
+                                        c.port,
+                                        c.target,
+                                        c.requester_tag,
+                                        lane,
+                                    );
+                                }
+                                _ => {
+                                    // Malformed or an undefined flag: EINVAL goes to
+                                    // the tag the record's last two bytes spell, as
+                                    // `read_connect_to` states.
+                                    let tag =
+                                        np::malformed_connect_to_tag(&st.cmd_buf[..payload_len]);
+                                    log::warn!(
+                                        "[linux_net] malformed CMD_CONNECT_TO ({payload_len} B)"
+                                    );
+                                    let msg = error_frame(0, 22u8, tag);
+                                    linux_net_send_msg(st, lane, &msg);
+                                }
+                            }
+                            had_work = true;
+                        }
+                        CMD_SEND if payload_len > np::DATA_HEAD => {
                             let conn_id = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
                             if !lane_may_touch(st, lane, conn_id as usize) {
                                 log::warn!(
@@ -4963,8 +4832,16 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                 }
                             }
                         }
-                        CMD_CLOSE if payload_len >= 2 => {
-                            let conn_id = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                        CMD_CLOSE => {
+                            let Some((conn_id, abort)) =
+                                np::close_parts(&st.cmd_buf[..payload_len])
+                            else {
+                                log::warn!(
+                                    "[linux_net] lane {lane}: malformed CMD_CLOSE ({payload_len} B)"
+                                );
+                                had_work = true;
+                                continue;
+                            };
                             if !lane_may_touch(st, lane, conn_id as usize) {
                                 log::warn!(
                                     "[linux_net] lane {lane} CMD_CLOSE on conn {conn_id} refused: \
@@ -4974,54 +4851,38 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                 had_work = true;
                                 continue;
                             }
-                            linux_net_cmd_close(st, conn_id);
+                            linux_net_cmd_close(st, conn_id, abort);
                             had_work = true;
                         }
                         DG_CMD_BIND | DG_CMD_SEND_TO | DG_CMD_CLOSE
                             if lane >= LINUX_NET_MAX_INBOUND =>
                         {
                             // The datagram surface is served on boot lanes
-                            // only. Its endpoint ids are a byte and its
-                            // authority is a consumer-stamped tag, not the
-                            // lane; routing and isolating it per lane is a
-                            // surface of its own. Refused in the surface's
-                            // own error shape so the sender faults rather
-                            // than waits.
+                            // only: its endpoint ids are a byte, and routing
+                            // and isolating it per attached lane is a surface
+                            // of its own. Refused in the surface's own error
+                            // shape so the sender faults rather than waits.
                             log::warn!(
                                 "[linux_net] lane {lane}: datagram command 0x{msg_type:02x} refused \
                                  on an attached lane"
                             );
-                            if msg_type == DG_CMD_BIND && payload_len >= 2 {
-                                let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                                linux_net_send_bind_refused(st, lane, port, 95);
-                                // EOPNOTSUPP
-                            }
                             linux_net_send_dg_error(st, lane, 95); // EOPNOTSUPP
                             had_work = true;
                         }
-                        DG_CMD_BIND if payload_len >= 3 => {
-                            // Payload (crates/fluxor-abi/src/contracts/net/datagram.rs):
-                            //   [port: u16 LE] [flags: u8] [owner_tag: u16 LE]?
-                            // A bind that omits the tag records tag 0.
-                            let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                            let owner_tag = if payload_len >= 5 {
-                                u16::from_le_bytes([st.cmd_buf[3], st.cmd_buf[4]])
-                            } else {
-                                0
-                            };
-                            linux_net_dg_cmd_bind(st, port, owner_tag, lane);
+                        DG_CMD_BIND => {
+                            match dgc::bind_parts(&st.cmd_buf[..payload_len]) {
+                                Some((port, _flags)) => linux_net_dg_cmd_bind(st, port, lane),
+                                None => linux_net_send_dg_error(st, lane, 22), // EINVAL
+                            }
                             had_work = true;
                         }
-                        DG_CMD_SEND_TO if payload_len >= 4 => {
+                        DG_CMD_SEND_TO if payload_len >= 2 => {
                             // Datagram contract:
                             //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...]
                             //   [ep_id:1][af:1=1][len:1][name…][port:2 LE][data...]
-                            // The owner-tagged form inserts [MARK][owner_tag:2 LE]
-                            // between `ep_id` and `af`.
-                            let (claimed_tag, dest_off) =
-                                dg_claimed_owner_tag(&st.cmd_buf[..payload_len]);
+                            let dest_off = 1;
                             let ep = st.cmd_buf[0] as i16;
-                            if !dg_endpoint_admits(st, lane, ep, claimed_tag) {
+                            if !dg_endpoint_admits(st, lane, ep) {
                                 had_work = true;
                                 continue;
                             }
@@ -5081,13 +4942,10 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                 st.cmd_buf.as_ptr().add(data_off),
                                 data_len,
                             );
-                            linux_net_dg_cmd_send_to(st, lane, ep, claimed_tag, ip, port, data);
+                            linux_net_dg_cmd_send_to(st, ep, ip, port, data);
                             had_work = true;
                         }
-                        DG_CMD_CLOSE if payload_len >= 1 => {
-                            // Payload: [ep_id: u8], or the owner-tagged form
-                            // [ep_id: u8][MARK][owner_tag: u16 LE].
-                            let (claimed_tag, _) = dg_claimed_owner_tag(&st.cmd_buf[..payload_len]);
+                        DG_CMD_CLOSE if payload_len == dgc::CLOSE_LEN => {
                             let ep = st.cmd_buf[0] as i16;
                             // A boot lane's datagram close must not free a
                             // slot an attached lane opened.
@@ -5100,7 +4958,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                 had_work = true;
                                 continue;
                             }
-                            linux_net_dg_cmd_close(st, lane, ep, claimed_tag);
+                            linux_net_dg_cmd_close(st, lane, ep);
                             had_work = true;
                         }
                         _ => {

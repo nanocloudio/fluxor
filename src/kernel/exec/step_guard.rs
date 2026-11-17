@@ -133,6 +133,22 @@ pub struct FaultStats {
     pub ticks_since_fault: u32,
 }
 
+impl FaultStats {
+    /// Bytes of the `FAULT_STATS_QUERY` answer.
+    pub const SIZE: usize = 12;
+
+    /// The `FAULT_STATS_QUERY` answer: the fields in order, LE.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..2].copy_from_slice(&self.fault_count.to_le_bytes());
+        b[2..4].copy_from_slice(&self.restart_count.to_le_bytes());
+        b[4] = self.last_fault_type;
+        b[5] = self.current_state;
+        b[8..12].copy_from_slice(&self.ticks_since_fault.to_le_bytes());
+        b
+    }
+}
+
 /// Per-module fault bookkeeping (stored in SchedulerState).
 #[derive(Clone, Copy)]
 pub struct ModuleFaultInfo {

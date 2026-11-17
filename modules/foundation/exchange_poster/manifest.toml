@@ -11,9 +11,10 @@ timer_class      = "agnostic"
 # else that answers a request. The poster is the requester.
 #
 #   payload       ->  one framed body per batch (net_proto [msg_type][len][body])
-#   request_out   ->  one request HEAD per batch: method and target from
-#                     params, a `content-type` header when one is set, the
-#                     batch inline as the whole body
+#   request_out   ->  one request HEAD per batch: a CALL whose HTTP method
+#                     and target come from params, a `content-type` meta
+#                     field when one is set, the batch inline as the whole
+#                     body
 #   response_in   <-  the provider's answer, by exchange id
 #   delivery_out  ->  one status byte per batch (delivered / retry / drop),
 #                     the `otel.delivery` backchannel — which is what turns a
@@ -23,10 +24,11 @@ timer_class      = "agnostic"
 # byte. A batch that does not fit one record is dropped, permanently and
 # reported — it is one encoded document, and the producer's encoding is the fix.
 #
-# Response mapping: a 2xx status -> delivered; 429 and every 5xx (the OTLP
-# retryable family, including the 502 and 504 a provider raises when the
-# collector is unreachable or silent) -> retry; any other status -> drop
-# (permanent; retrying wedges the pipe). A provider ABORT -> retry, except
+# Response mapping, by outcome alone: OK -> delivered; BUSY, UNAVAILABLE,
+# TIMEOUT and FAILED (the OTLP retryable family: an HTTP collector's 429 and
+# every 5xx, and a provider that could not reach the collector or heard
+# nothing back) -> retry; any other outcome -> drop (permanent; retrying
+# wedges the pipe). A provider ABORT -> retry, except
 # TOO_LARGE / MALFORMED -> drop. LINK DOWN -> the batch in flight retries.
 
 [[ports]]
@@ -44,12 +46,26 @@ direction    = "output"
 content_type = "ExchangeRequest"
 max_record   = 8192
 buffer_size  = 8192
+# The `method` param is an HTTP method: the requests carry its verbs.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name         = "response_in"
 index        = 1
 direction    = "input"
 content_type = "ExchangeResponse"
+max_record   = 8192
+buffer_size  = 8192
+
+# The same request as a PUBLISH, verb 0, for a provider that accepts records
+# for a durable destination: it carries no binding's verbs. A graph wires this
+# or `request_out`, never both.
+[[ports]]
+name         = "publish_out"
+index        = 2
+direction    = "output"
+content_type = "ExchangeRequest"
 max_record   = 8192
 buffer_size  = 8192
 

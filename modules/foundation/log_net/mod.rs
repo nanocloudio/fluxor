@@ -50,10 +50,15 @@ pub use fluxor_rt::datagram_endpoint::*;
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
 // crates/fluxor-rt/src/lib.rs (shared across consumers).
 
-/// Frame buffer: FRAME_HDR + DG_V4_PREFIX + log chunk.
-const NET_BUF_SIZE: usize = 600;
+/// Frame buffer: the larger of one record `net_in` accepts (frames read to
+/// be discarded) and one `CMD_DG_SEND_TO` this module writes.
+const NET_BUF_SIZE: usize = if NET_IN_ACCEPTS_RECORD > NET_OUT_MAX_RECORD {
+    NET_IN_ACCEPTS_RECORD
+} else {
+    NET_OUT_MAX_RECORD
+};
 
-/// Per-datagram log payload budget. Leaves ~72 B of slack vs NET_BUF_SIZE.
+/// Per-datagram log payload budget.
 const CHUNK_SIZE: usize = 512;
 
 /// LOG_RING_DRAIN (diag) opcode. Kept local to avoid bumping the SDK
@@ -274,7 +279,13 @@ unsafe fn discard_net_in(s: &mut LogNetState) {
 // Module interface
 // ============================================================================
 
-fluxor_rt::module_facts! { state: LogNetState }
+fluxor_rt::module_facts! {
+    state: LogNetState,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + DG_V4_PREFIX + CHUNK_SIZE,
+    ],
+}
 
 // Same figure as data, so `pack` records it in the manifest and a graph's
 // state-arena demand is summable host-side.
@@ -407,7 +418,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         // Drain up to CHUNK_SIZE bytes from the ring.
         let sys_ptr = s.syscalls;
         let chunk_ptr = s.chunk.as_mut_ptr();
-        let ret = ((*sys_ptr).provider_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
+        let ret = ((*sys_ptr).provider_call)(
+            -1,
+            LOG_RING_DRAIN,
+            core::ptr::null_mut(),
+            0,
+            chunk_ptr,
+            CHUNK_SIZE,
+        );
         if ret <= 0 {
             return StepReturn::Continue;
         }

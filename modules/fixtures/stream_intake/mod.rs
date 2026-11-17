@@ -29,16 +29,18 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_CLOSE: u8 = 0x12;
+use abi::contracts::net::net_proto as np;
+
+const NET_MSG_ACCEPTED: u8 = np::MSG_ACCEPTED;
+const NET_MSG_DATA: u8 = np::MSG_DATA;
+const NET_MSG_CLOSED: u8 = np::MSG_CLOSED;
+const NET_MSG_BOUND: u8 = np::MSG_BOUND;
+const NET_CMD_BIND: u8 = np::CMD_BIND;
+const NET_CMD_CLOSE: u8 = np::CMD_CLOSE;
 
 const LOG_PERIOD: u32 = 5000;
-/// One inbound frame: header + conn id + the largest data fragment.
-const BUF: usize = 3 + 2 + 1460;
+/// One inbound frame: the largest record `net_in` accepts.
+const BUF: usize = NET_IN_ACCEPTS_RECORD;
 /// Frames read per step.
 const FRAMES_PER_STEP: usize = 8;
 /// No connection is open.
@@ -109,14 +111,14 @@ unsafe fn say(sys: &SyscallTable, text: &[u8], value: Option<u32>) {
 
 unsafe fn send_bind(s: &mut IntakeState) {
     let sys = &*s.syscalls;
-    let payload = s.port.to_le_bytes();
+    let payload = np::bind(s.port, 0);
     let mut scratch = [0u8; 8];
     net_write_frame(
         sys,
         s.net_out,
         NET_CMD_BIND,
         payload.as_ptr(),
-        2,
+        payload.len(),
         scratch.as_mut_ptr(),
         8,
     );
@@ -124,14 +126,14 @@ unsafe fn send_bind(s: &mut IntakeState) {
 
 unsafe fn send_close(s: &mut IntakeState, id: u16) {
     let sys = &*s.syscalls;
-    let payload = id.to_le_bytes();
+    let payload = np::close(id, false);
     let mut scratch = [0u8; 8];
     net_write_frame(
         sys,
         s.net_out,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         scratch.as_mut_ptr(),
         8,
     );
@@ -178,29 +180,24 @@ unsafe fn service(s: &mut IntakeState) {
             break;
         }
         n += 1;
-        let p = s.buf.as_ptr().add(3);
-        let id = if plen >= 2 {
-            u32::from(*p) | (u32::from(*p.add(1)) << 8)
-        } else {
-            NO_CONN
-        };
+        let payload = &s.buf[3..3 + plen];
+        let id = np::conn_id_of(payload).map_or(NO_CONN, u32::from);
         match msg {
             NET_MSG_BOUND => {
-                if s.bound == 0 {
+                // A bind answered for another listener's port is another
+                // reader's, on the same fanned `ip.net_out`.
+                let ours = np::bound_parts(payload).is_some_and(|(_, port, _)| port == s.port);
+                if ours && s.bound == 0 {
                     s.bound = 1;
                     say(sys, b"[intake] bound port=", Some(u32::from(s.port)));
                 }
             }
-            NET_MSG_ACCEPTED if plen >= 2 => {
+            NET_MSG_ACCEPTED => {
                 // An accept on another listener's port belongs to another
                 // reader of the same fanned `ip.net_out`.
-                let port = if plen >= 4 {
-                    u16::from(*p.add(2)) | (u16::from(*p.add(3)) << 8)
-                } else {
-                    s.port
-                };
-                if port != s.port {
-                    continue;
+                match np::accepted_parts(payload) {
+                    Some(a) if a.local_port == s.port => {}
+                    _ => continue,
                 }
                 if s.conn == NO_CONN {
                     s.conn = id;
@@ -218,7 +215,10 @@ unsafe fn service(s: &mut IntakeState) {
                     return;
                 }
             }
-            NET_MSG_CLOSED if id == s.conn && s.conn != NO_CONN => {
+            NET_MSG_CLOSED
+                if s.conn != NO_CONN
+                    && np::closed_parts(payload).is_some_and(|(c, _)| u32::from(c) == s.conn) =>
+            {
                 if s.held_at < s.held_end {
                     s.close_pending = 1;
                     return;
@@ -230,7 +230,13 @@ unsafe fn service(s: &mut IntakeState) {
     }
 }
 
-fluxor_rt::module_facts! { state: IntakeState }
+fluxor_rt::module_facts! {
+    state: IntakeState,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        out 0 NET_OUT_MAX_RECORD = np::FRAME_HDR + np::BIND_LEN,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -293,6 +299,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             abi::kernel_abi::channel::PORT,
             arg.as_mut_ptr(),
             arg.len(),
+            core::ptr::null_mut(),
+            0,
         );
         s.resolved = 1;
     }

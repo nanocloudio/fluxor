@@ -3509,8 +3509,17 @@ mod continuity_tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         }
     }
 
@@ -4185,8 +4194,17 @@ mod rate_class_resolution_tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         }
     }
 
@@ -5143,6 +5161,9 @@ mod port_capability_tests {
                 name: Some(port.to_string()),
                 max_record,
                 requires_capability: Some(wanted.to_string()),
+                contract: None,
+                serves: None,
+                contract_optional: false,
                 ..port_default()
             }],
             ..Manifest::default()
@@ -5186,8 +5207,17 @@ mod port_capability_tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         }
     }
 
@@ -5634,6 +5664,95 @@ mod port_fact_tests {
         assert!(e.contains("[ports.facts]"), "{e}");
     }
 
+    fn exchange_port(name: &str, direction: &str, facts: &str) -> Manifest {
+        let table = if facts.is_empty() {
+            String::new()
+        } else {
+            format!("[ports.facts]\n{facts}\n")
+        };
+        manifest(&format!(
+            "[[ports]]\nname = \"{name}\"\ndirection = \"{direction}\"\n\
+             content_type = \"ExchangeRequest\"\n{table}"
+        ))
+    }
+
+    /// The exchange `binding` fact: a requester sending a binding's verbs
+    /// binds only a provider that declares the binding, and undeclared on
+    /// the provider is none, not unconstrained.
+    #[test]
+    fn an_exchange_requester_needs_a_provider_speaking_its_binding() {
+        let edge = json!([{"from": "req.request_out", "to": "prov.request_in"}]);
+        let speaks = || exchange_port("request_in", "input", "binding = [\"http\"]");
+        let (cfg, m) = graph(
+            &[
+                ("req", exchange_port("request_out", "output", "binding = \"http\"")),
+                ("prov", speaks()),
+            ],
+            edge.clone(),
+        );
+        validate_port_facts(&cfg, &m).unwrap();
+
+        let (cfg, m) = graph(
+            &[
+                ("req", exchange_port("request_out", "output", "binding = \"http\"")),
+                ("prov", exchange_port("request_in", "input", "")),
+            ],
+            edge.clone(),
+        );
+        let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
+        assert!(
+            e.contains("http") && e.contains("req.request_out") && e.contains("binding"),
+            "{e}"
+        );
+
+        // A requester that sends verb 0 binds any provider.
+        for prov in [speaks(), exchange_port("request_in", "input", "")] {
+            let (cfg, m) = graph(
+                &[("req", exchange_port("request_out", "output", "")), ("prov", prov)],
+                edge.clone(),
+            );
+            validate_port_facts(&cfg, &m).unwrap();
+        }
+    }
+
+    /// Exchange requests are whole records: several requesters may share a
+    /// provider's input, unlike an encoded stream.
+    #[test]
+    fn exchange_requesters_may_fan_into_one_provider() {
+        let (cfg, m) = graph(
+            &[
+                ("a", exchange_port("request_out", "output", "binding = \"http\"")),
+                ("b", exchange_port("request_out", "output", "")),
+                ("prov", exchange_port("request_in", "input", "binding = \"http\"")),
+            ],
+            json!([
+                {"from": "a.request_out", "to": "prov.request_in"},
+                {"from": "b.request_out", "to": "prov.request_in"}
+            ]),
+        );
+        validate_port_facts(&cfg, &m).unwrap();
+    }
+
+    #[test]
+    fn exchange_binding_facts_are_checked_at_parse() {
+        let e = Manifest::from_toml_str_for_target(
+            "version = \"0.1.0\"\n\n[[ports]]\nname = \"p\"\ndirection = \"input\"\n\
+             content_type = \"ExchangeRequest\"\n[ports.facts]\nbinding = \"grpc\"\n",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("not admitted"), "{e}");
+        let e = Manifest::from_toml_str_for_target(
+            "version = \"0.1.0\"\n\n[[ports]]\nname = \"p\"\ndirection = \"output\"\n\
+             content_type = \"ExchangeResponse\"\n[ports.facts]\nbinding = \"http\"\n",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("port-scoped"), "{e}");
+    }
+
     /// A pipeline-shaped manifest whose `max_payload` fact is written `fact`.
     fn per_target_fact_manifest(fact: &str) -> String {
         format!(
@@ -5851,8 +5970,17 @@ mod framed_edge_tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: std::collections::BTreeMap::new(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         }
     }
 
@@ -6332,18 +6460,21 @@ mod boot_plan_tests {
         check_boot_plan("linux", &s, NONE, NONE).expect("linux owners");
     }
 
-    /// Events and timers name their slot in a tagged fd's slot field, which
-    /// is their domain.
+    /// Events, timers and routes name their slot in the handle's index
+    /// field, which is their domain.
     #[test]
-    fn events_are_held_to_the_fd_slot_domain() {
-        let ask = figures(&[("events", 1 << 25)]);
+    fn events_are_held_to_the_handle_index_domain() {
+        let limit = fluxor_abi::registry::handle::INDEX_LIMIT as u64;
+        let ask = figures(&[("events", limit)]);
         check_boot_plan("linux", &shape(1, 0), &ask, NONE).expect("every slot the field names");
-        let ask = figures(&[("timers", (1 << 25) + 1)]);
-        let e = check_boot_plan("linux", &shape(1, 0), &ask, NONE).unwrap_err();
-        assert!(
-            e.contains("pool 'timers'") && e.contains("tagged-fd slot domain"),
-            "{e}"
-        );
+        for pool in ["timers", "handles"] {
+            let ask = figures(&[(pool, limit + 1)]);
+            let e = check_boot_plan("linux", &shape(1, 0), &ask, NONE).unwrap_err();
+            assert!(
+                e.contains(&format!("pool '{pool}'")) && e.contains("handle index domain"),
+                "{e}"
+            );
+        }
     }
 
     /// A static table (wasm) holds what an envelope asks of it, derived part
@@ -6714,5 +6845,220 @@ mod check_mode_file_tests {
             s(json!(vec!["abcdefgh"; 8])).is_err(),
             "over 64 bytes in all"
         );
+    }
+}
+
+/// Record bounds and send retention across an edge
+/// (`validate_record_limits`), and the edge flag a retaining consumer puts
+/// on the graph.
+#[cfg(test)]
+mod record_limit_tests {
+    use super::*;
+    use crate::manifest::{Manifest, PortSpec};
+    use std::collections::HashMap;
+
+    fn port(direction: u8, name: &str) -> PortSpec {
+        PortSpec {
+            direction,
+            content_type: crate::manifest::CONTENT_TYPES
+                .iter()
+                .position(|c| *c == "NetProto")
+                .unwrap() as u8,
+            flags: 0,
+            name: Some(name.to_string()),
+            index: 1,
+            buffer_size: 0,
+            max_record: 0,
+            rate_class_max: None,
+            rate_class_default: None,
+            requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
+            facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
+        }
+    }
+
+    /// A transport writing records of `max_record` on its `net_out`, which
+    /// retains for its consumers by `tcp_send_buf` blocks of a
+    /// `tcp_send_pool`, and serves `lanes`.
+    fn transport(max_record: u32) -> Manifest {
+        Manifest {
+            ports: vec![PortSpec {
+                max_record,
+                send_buffer_param: Some("tcp_send_buf".to_string()),
+                send_pool_param: Some("tcp_send_pool".to_string()),
+                send_pool_lanes_param: Some("lanes".to_string()),
+                ..port(1, "net_out")
+            }],
+            ..Manifest::default()
+        }
+    }
+
+    fn consumer(accepts_record: u32, retains_send: bool) -> Manifest {
+        Manifest {
+            ports: vec![PortSpec {
+                accepts_record,
+                retains_send,
+                ..port(0, "net_in")
+            }],
+            ..Manifest::default()
+        }
+    }
+
+    fn datagram_consumer() -> Manifest {
+        Manifest {
+            ports: vec![PortSpec {
+                accepts_record: 1483,
+                datagram_only: true,
+                ..port(0, "net_in")
+            }],
+            ..Manifest::default()
+        }
+    }
+
+    /// The `tcp_send_pool` the composer derives for an `ip` entry `ip`
+    /// feeding `consumers`, its schema defaulting to two 1460-byte blocks
+    /// and no lanes.
+    fn derived_pool(ip: serde_json::Value, consumers: Vec<Manifest>) -> Option<u64> {
+        let mut manifests = HashMap::new();
+        manifests.insert("ip".to_string(), transport(1483));
+        let mut names = vec!["ip".to_string()];
+        let mut edges = Vec::new();
+        for (k, m) in consumers.into_iter().enumerate() {
+            let n = format!("c{k}");
+            manifests.insert(n.clone(), m);
+            names.push(n);
+            edges.push((0u16, (k + 1) as u16, 0u8, 1u8, 1u8));
+        }
+        let mut modules = vec![ip];
+        let defaults = |_: &serde_json::Value, param: &str| match param {
+            "tcp_send_buf" => Some(1460),
+            "tcp_send_pool" => Some(2920),
+            "lanes" => Some(0),
+            _ => None,
+        };
+        derive_send_pools(&mut modules, &edges, &names, &manifests, &defaults).unwrap();
+        modules[0].get("tcp_send_pool").and_then(|v| v.as_u64())
+    }
+
+    fn check(tcp_send_buf: Option<u64>, consumers: &[(u32, bool)]) -> Result<()> {
+        let mut manifests = HashMap::new();
+        manifests.insert("ip".to_string(), transport(1483));
+        let mut names = vec!["ip".to_string()];
+        let mut edges = Vec::new();
+        let mut from = Vec::new();
+        let mut to = Vec::new();
+        let mut wiring = Vec::new();
+        for (k, &(accepts, retains)) in consumers.iter().enumerate() {
+            let n = format!("c{k}");
+            manifests.insert(n.clone(), consumer(accepts, retains));
+            names.push(n.clone());
+            edges.push((0u16, (k + 1) as u16, 0u8, 1u8, 1u8));
+            from.push("ip.net_out".to_string());
+            to.push(format!("{n}.net_in"));
+            wiring.push(serde_json::json!({"from": "ip.net_out", "to": format!("{n}.net_in")}));
+        }
+        let mut ip = serde_json::json!({"name": "ip"});
+        if let Some(v) = tcp_send_buf {
+            ip["tcp_send_buf"] = serde_json::json!(v);
+        }
+        let config = serde_json::json!({"modules": [ip], "wiring": wiring});
+        validate_record_limits(&config, &edges, &names, &manifests, &from, &to)
+    }
+
+    #[test]
+    fn a_producer_record_past_a_consumer_bound_is_refused_fans_included() {
+        check(None, &[(1483, false)]).unwrap();
+        check(None, &[(2048, false), (1500, true)]).unwrap();
+        let e = check(None, &[(2048, false), (1482, true)]).unwrap_err().to_string();
+        assert!(e.contains("1483") && e.contains("1482"), "{e}");
+        // An undeclared bound (a port with no record facts) is not compared.
+        check(None, &[(0, false)]).unwrap();
+    }
+
+    #[test]
+    fn no_send_buffer_needs_every_consumer_to_retain() {
+        check(Some(0), &[(1483, true)]).unwrap();
+        check(Some(1460), &[(1483, false)]).unwrap();
+        check(None, &[(1483, false)]).unwrap();
+        let e = check(Some(0), &[(1483, true), (1483, false)])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("tcp_send_buf: 0") && e.contains("retains_send"), "{e}");
+    }
+
+    #[test]
+    fn a_datagram_only_or_retaining_graph_derives_no_send_pool() {
+        let ip = || serde_json::json!({"name": "ip"});
+        assert_eq!(derived_pool(ip(), vec![datagram_consumer()]), Some(0));
+        assert_eq!(derived_pool(ip(), vec![consumer(1483, true)]), Some(0));
+        assert_eq!(derived_pool(ip(), vec![]), Some(0), "nothing consumes it");
+        assert_eq!(
+            derived_pool(ip(), vec![datagram_consumer(), consumer(1483, false)]),
+            Some(2920),
+            "one plaintext stream consumer keeps the default pool"
+        );
+        assert_eq!(
+            derived_pool(
+                serde_json::json!({"name": "ip", "tcp_send_buf": 4096}),
+                vec![consumer(1483, false)]
+            ),
+            Some(8192),
+            "the default pool's blocks, of the instance's size"
+        );
+        assert_eq!(
+            derived_pool(
+                serde_json::json!({"name": "ip", "lanes": 2}),
+                vec![datagram_consumer()]
+            ),
+            Some(2920),
+            "a workload lane keeps the pool"
+        );
+        assert_eq!(
+            derived_pool(
+                serde_json::json!({"name": "ip", "tcp_send_pool": 5840}),
+                vec![datagram_consumer()]
+            ),
+            Some(5840),
+            "a pool the graph sets is kept"
+        );
+    }
+
+    #[test]
+    fn no_send_pool_needs_no_plaintext_stream_consumer() {
+        let mut manifests = HashMap::new();
+        manifests.insert("ip".to_string(), transport(1483));
+        manifests.insert("dns".to_string(), datagram_consumer());
+        manifests.insert("app".to_string(), consumer(1483, false));
+        let names = vec!["ip".to_string(), "dns".to_string(), "app".to_string()];
+        let run = |wired: &[&str]| {
+            let edges: Vec<_> = wired
+                .iter()
+                .map(|n| {
+                    (
+                        0u16,
+                        names.iter().position(|x| x == n).unwrap() as u16,
+                        0u8,
+                        1u8,
+                        1u8,
+                    )
+                })
+                .collect();
+            let from: Vec<String> = wired.iter().map(|_| "ip.net_out".to_string()).collect();
+            let to: Vec<String> = wired.iter().map(|n| format!("{n}.net_in")).collect();
+            let config = serde_json::json!({"modules": [{"name": "ip", "tcp_send_pool": 0}]});
+            validate_record_limits(&config, &edges, &names, &manifests, &from, &to)
+        };
+        run(&["dns"]).unwrap();
+        let e = run(&["dns", "app"]).unwrap_err().to_string();
+        assert!(e.contains("tcp_send_pool: 0"), "{e}");
     }
 }

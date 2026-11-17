@@ -259,7 +259,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
             8 => {
                 let r = ((*s.syscalls).provider_call)(
                     3,
-                    abi::registry::kernel::LOG_WRITE, // LOG_WRITE
+                    abi::registry::kernel::LOG_WRITE,
+                    core::ptr::null_mut(),
+                    0, // LOG_WRITE
                     (state as usize).wrapping_add(0x0040_0000) as *mut u8,
                     16,
                 );

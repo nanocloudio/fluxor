@@ -20,7 +20,7 @@
 // MOUNT and UMOUNT wait on the device's I/O, and the device may be one this
 // node serves itself, so neither blocks the caller: the first call starts
 // the work and answers `EAGAIN`, and the caller asks again with the same
-// argument (a later step) until the answer is the result. The platform bounds
+// request (a later step) until the answer is the result. The platform bounds
 // the work it holds: a caller has a few jobs in flight at once (a further
 // request answers `EAGAIN` until one finishes), and an answer nobody collects
 // is dropped after a time. Both operations are idempotent against the host's
@@ -34,7 +34,11 @@
 // `fs` contract deliberately lacks — so no caller spawns a mode or removal
 // tool for it.
 //
-// The writes need the `host_mount.mount` grant; PRIV and ROOT the contract
+// Every op is a `handle = -1` call. `CAPS` answers its word in `arg`; every
+// other op takes no `arg`: a request travels as `data` in, little-endian,
+// and ROOT's answer as `data` out.
+//
+// The writes need the `host_mount.mount` grant; CAPS and ROOT the contract
 // alone. Making a
 // filesystem and checking one are userland tools; run them through the
 // process executor (`host_process::PROC_CLASS`).
@@ -42,24 +46,28 @@
 /// Provider contract class for host mounts.
 pub const CLASS: u16 = super::super::super::registry::host_mount::ID;
 
-/// The privileges this runtime holds for these ops, as a bit set:
-/// [`PRIV_SYS_ADMIN`] (it may mount: `MOUNT`, `UMOUNT`, a memory-backed
-/// `PROJECT`) and [`PRIV_CHOWN`] (it may give a file any group: `PROJECT`
+/// The privileges this runtime holds for these ops, as the [`caps`] word:
+/// [`caps::SYS_ADMIN`] (it may mount: `MOUNT`, `UMOUNT`, a memory-backed
+/// `PROJECT`) and [`caps::CHOWN`] (it may give a file any group: `PROJECT`
 /// and `GROUP_TREE` with a group the runtime is not a member of).
-/// `handle = -1`, no argument.
-pub use super::super::super::registry::host_mount::PRIV;
-/// [`PRIV`] bit: the runtime can mount in its own mount namespace — it holds
-/// `CAP_SYS_ADMIN` over the user namespace that owns that mount namespace,
-/// as `mount(2)` checks, probed with nothing mounted. Holding the capability
-/// in a user namespace of its own whose mount namespace is still the
-/// host's (`unshare -Urn`) is not enough, and clears the bit. In a user
-/// namespace that owns its mount namespace (`unshare -Urm`) the bit is set:
-/// a memory-backed `PROJECT` mounts there, while `MOUNT` of a block
-/// filesystem that user namespace may not mount still answers `EPERM`.
-pub const PRIV_SYS_ADMIN: i32 = 1 << 0;
-/// [`PRIV`] bit: `CAP_CHOWN` is held.
-pub const PRIV_CHOWN: i32 = 1 << 1;
-/// Mount a block device. `arg = [dev_len:u16 LE][dir_len:u16 LE][fs_len:u8]
+/// `arg` out is exactly 4 bytes, the `u32` LE word; no `data`. Returns 0.
+pub use super::super::super::registry::host_mount::CAPS;
+/// [`CAPS`] bits.
+pub mod caps {
+    /// The runtime can mount in its own mount namespace — it holds
+    /// `CAP_SYS_ADMIN` over the user namespace that owns that mount namespace,
+    /// as `mount(2)` checks, probed with nothing mounted. Holding the capability
+    /// in a user namespace of its own whose mount namespace is still the
+    /// host's (`unshare -Urn`) is not enough, and clears the bit. In a user
+    /// namespace that owns its mount namespace (`unshare -Urm`) the bit is set:
+    /// a memory-backed `PROJECT` mounts there, while `MOUNT` of a block
+    /// filesystem that user namespace may not mount still answers `EPERM`.
+    pub const SYS_ADMIN: u32 = 1 << 0;
+    /// `CAP_CHOWN` is held.
+    pub const CHOWN: u32 = 1 << 1;
+}
+
+/// Mount a block device. `data = [dev_len:u16 LE][dir_len:u16 LE][fs_len:u8]
 /// [flags:u8][dev][dir][fs]`: `dev` an absolute block-device path, `dir`
 /// relative to the mount root (created when absent, parents included; the
 /// directory itself is set to mode 0700), `fs` the filesystem type. Returns
@@ -69,10 +77,10 @@ pub const PRIV_CHOWN: i32 = 1 << 1;
 /// `EAGAIN` while the mount runs or while the caller's jobs are all running.
 /// A directory that already holds this device with the same access answers 0.
 pub use super::super::super::registry::host_mount::MOUNT;
-/// The mount root, written into `arg`. Returns its length, or `ENOSPC` when
-/// `arg` is too short.
+/// The mount root, written into `data`. Returns its length, or `ENOSPC`
+/// when `data` is too short.
 pub use super::super::super::registry::host_mount::ROOT;
-/// Unmount. `arg = [dir]`, relative to the mount root. Returns 1 when it
+/// Unmount. `data = [dir]`, relative to the mount root. Returns 1 when it
 /// unmounted, 0 when nothing was mounted there (also the answer to an
 /// unmount whose earlier answer was dropped), or a negative errno (`EBUSY`,
 /// `EPERM`, `EINVAL` for a path through a symlink) when it could not; `EAGAIN`
@@ -91,7 +99,7 @@ pub use super::super::super::registry::host_mount::ROOT;
 /// identification and the unmount is not seen.
 pub use super::super::super::registry::host_mount::UMOUNT;
 
-/// Give a directory tree under the mount root to a group. `arg =
+/// Give a directory tree under the mount root to a group. `data =
 /// [dir_len:u16][dir][group:u32][policy:u8]`: every file, directory and
 /// link inside `dir` (and `dir` itself) is group-owned by `group`; files get
 /// group read and write, directories group read, write and search and the
@@ -105,7 +113,7 @@ pub use super::super::super::registry::host_mount::UMOUNT;
 /// `MOUNT`.
 pub use super::super::super::registry::host_mount::GROUP_TREE;
 /// Project files into a directory under the mount root, replacing what an
-/// earlier projection there put, atomically for a reader. `arg =
+/// earlier projection there put, atomically for a reader. `data =
 /// [dir_len:u16][dir][group:u32][flags:u8][count:u16][entry]×count`, then
 /// `[size:u64]` with [`P_SIZE`] only; entry
 /// `[path_len:u16][path][mode:u16][data_len:u32][data]`, little-endian.
@@ -148,7 +156,7 @@ pub use super::super::super::registry::host_mount::GROUP_TREE;
 /// runtime may not give, a memory mount without `CAP_SYS_ADMIN`); `EAGAIN`
 /// while it runs, as `MOUNT`.
 pub use super::super::super::registry::host_mount::PROJECT;
-/// Remove a directory tree under the mount root. `arg = [dir]`, relative to
+/// Remove a directory tree under the mount root. `data = [dir]`, relative to
 /// the root. The walk never follows a symlink (a link is removed, not what
 /// it names) and never crosses into another mount: a memory filesystem a
 /// `PROJECT` mounted inside (or at) `dir` is detached first, and any other
@@ -164,7 +172,7 @@ pub use super::super::super::registry::host_mount::PROJECT;
 /// as `MOUNT`.
 pub use super::super::super::registry::host_mount::REMOVE_TREE;
 
-/// Make a directory under the mount root with an exact mode. `arg =
+/// Make a directory under the mount root with an exact mode. `data =
 /// [dir_len:u16][dir][mode:u16]`, little-endian: `dir` relative to the mount
 /// root, created when absent (missing parents mode 0755), every component
 /// reached without following a symlink; an existing directory is kept and

@@ -11,6 +11,8 @@ capabilities = ["transport.anchor.stream"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+# Frame bytes, header included (`module_facts!` NET_IN_ACCEPTS_RECORD).
+accepts_record = 1483
 
 # Session-control replies from the worker.
 [[ports]]
@@ -31,6 +33,8 @@ content_type = "OctetStream"
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+# A CMD_SEND of one worker read (`module_facts!` NET_OUT_MAX_RECORD).
+max_record = 517
 
 # Session-control commands to the worker.
 [[ports]]

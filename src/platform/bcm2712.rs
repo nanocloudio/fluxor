@@ -93,6 +93,15 @@ const TIMER_COUNTER: timer::Counter = timer::Counter::Virtual;
 const PSCI_CONDUIT: psci::Conduit = psci::Conduit::Hvc; // QEMU virt: PSCI by HVC
 #[cfg(not(feature = "board-pi5"))]
 const MPIDR_CORE_SHIFT: u32 = 0; // QEMU virt: core number in Aff0
+/// QEMU virt's virtio-mmio transports: 32 from 0x0a00_0000, 0x200 apart,
+/// transport `i` on SPI 16 + `i`.
+#[cfg(not(feature = "board-pi5"))]
+const QEMU_VIRTIO_MMIO: gic::VirtioMmio = gic::VirtioMmio {
+    base: 0x0a00_0000,
+    stride: 0x200,
+    first_intid: 48,
+    count: 32,
+};
 
 /// The 1 GB indices of MMIO the kernel reaches at EL1 while an isolated
 /// module's table is installed: the PCIe controllers (gigabyte 64, from
@@ -116,6 +125,8 @@ const FAULT_STASH: usize = 0x4007_0000;
 /// entry stub reads the core-number shift with its own MMU off.
 fn configure_arch() {
     gic::configure(GICD_BASE, GICC_BASE, TIMER_PPI);
+    #[cfg(not(feature = "board-pi5"))]
+    gic::configure_virtio_mmio(QEMU_VIRTIO_MMIO);
     timer::configure(TIMER_COUNTER);
     psci::configure(PSCI_CONDUIT);
     // `_start` parks on the same field, by the same constant.
@@ -148,7 +159,12 @@ static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
 #[cfg(feature = "board-pi5")]
 fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
     gic::set_irq_mux(pcie1_msi_mux);
-    irq_bind(spi_irq, gic::EVENT_HANDLE_MUX, 0, 0)
+    irq_bind(
+        spi_irq,
+        gic::EVENT_HANDLE_MUX,
+        fluxor::kernel::sys::hal::IrqAck::None,
+        0,
+    )
 }
 
 /// The IRQ multiplexer `register_pcie1_msi_spi` registers.
@@ -914,7 +930,7 @@ fn bcm_after_step(domain_id: usize) {
 /// ordered pair of domains that has carried frames, those pushed into the ring
 /// and those delivered. A latched panic on any core is reported with it.
 fn report_cross_domain() {
-    let (drops, bp, _sb) = cross::cross_domain_stats();
+    let (drops, bp) = cross::cross_domain_stats();
     let depth = cross::cross_domain_queue_depths();
     let passes: [u32; scheduler::MAX_DOMAINS] = core::array::from_fn(domains::domain_ticks);
     log::info!("[xdom] drops={drops} bp={bp} depth={depth:?} passes={passes:?}");
@@ -1307,14 +1323,15 @@ fn bcm_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
 /// cache the writes landed in and the instruction stream: clean D-cache
 /// to PoU + invalidate I-cache over the region, then DSB/ISB
 /// (ARM DDI 0487, self-modifying-code sequence).
-fn bcm_ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
+fn bcm_ota_stage_protect(region: &mut [u8], executable: bool) -> bool {
     if !executable {
         // Region is plain RW DRAM; nothing to undo.
         return true;
     }
     const LINE: usize = 64;
-    let start = (base as usize) & !(LINE - 1);
-    let end = (base as usize).saturating_add(len);
+    let base = region.as_mut_ptr() as usize;
+    let start = base & !(LINE - 1);
+    let end = base.saturating_add(region.len());
     let mut p = start;
     while p < end {
         // SAFETY: dc/ic by VA over a valid mapped DRAM region; cache
@@ -1427,19 +1444,66 @@ fn bcm_isr_tier_poll() {
     }
 }
 
-unsafe fn bcm_net_policy_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn bcm_net_policy_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     use fluxor::abi::contracts::net::policy::caps;
     // `ip` judges filter rules and translates `scope = local` services for
     // the node's own traffic; inbound translation is not realized here.
     let mut c = caps::FILTER | caps::EGRESS | caps::DNAT_LOCAL;
-    if fluxor::kernel::net_policy::enforcer_attached() {
+    // SAFETY: provider dispatch runs on the scheduler thread.
+    if unsafe { fluxor::kernel::net_policy::enforcer_attached() } {
         c |= caps::ENFORCED;
     }
-    fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, arg_len)
+    fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, data)
 }
 
-unsafe fn bcm_net_route_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    fluxor::kernel::net_route::dispatch(None, handle, opcode, arg, arg_len)
+fn bcm_net_route_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
+    fluxor::kernel::net_route::dispatch(None, handle, opcode, arg, data)
+}
+
+/// NIC rings are class-routed to the kernel bucket; the vtable gives a ring
+/// handle its close.
+static NIC_RING_VTABLE: fluxor::kernel::module::provider::ProviderVTable =
+    fluxor::kernel::module::provider::ProviderVTable {
+        contract: fluxor::abi::registry::platform_nic_ring::ID,
+        call: bcm_class_routed_call,
+        query: None,
+        default_close_op: fluxor::abi::platform::bcm2712::nic_ring::NIC_RING_DESTROY,
+        poll: None,
+    };
+
+fn bcm_class_routed_call(
+    handle: i32,
+    op: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
+    fluxor::kernel::module::provider::dispatch(
+        fluxor::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET,
+        handle,
+        op,
+        arg,
+        data,
+    )
+}
+
+/// Handles the bcm2712 platform's own provider tables can hand out at once:
+/// its NIC rings, bound PCIe devices and MSI vectors, and the store's and the
+/// owner roots' slots.
+fn bcm_platform_handle_slots() -> usize {
+    fluxor::platform::nic_ring::MAX_NIC_RINGS
+        + fluxor::platform::pcie::MAX_BOUND_HANDLES
+        + fluxor::platform::store::handle_slots()
+        + fluxor::platform::owner_root::handle_slots()
 }
 
 fn bcm_init_providers() {
@@ -1454,6 +1518,8 @@ fn bcm_init_providers() {
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::WORKLOAD, bcm_workload_dispatch);
+    provider::register_vtable(&NIC_RING_VTABLE);
+    provider::register_platform_handle_slots(bcm_platform_handle_slots);
     // net.policy (0x1E): the fluxor-native construct is the in-graph packet
     // filter, which READs the tables and ATTACHes; until one has, CAPS leaves
     // ENFORCED clear. Only `scope = local` DNAT is realized (`ip` translates
@@ -1496,11 +1562,15 @@ fn bcm_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
 /// (`kernel::workload::workload_graph`), which runs on the primary domain /
 /// core 0 (the system graph's domain) so the runtime `apply_add`/`free_owner`
 /// it drives honor the primary-only quiesce invariant.
-///
-/// # Safety
-/// Scheduler-thread dispatch only; see `workload_graph::workload_dispatch`.
-unsafe fn bcm_workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    fluxor::kernel::workload::workload_graph::workload_dispatch(handle, opcode, arg, arg_len)
+fn bcm_workload_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
+    // SAFETY: provider dispatch runs on the scheduler thread, the one
+    // `workload_graph::workload_dispatch` requires.
+    unsafe { fluxor::kernel::workload::workload_graph::workload_dispatch(handle, opcode, arg, data) }
 }
 
 /// Platform-specific per-module cleanup for BCM2712.
@@ -1528,142 +1598,107 @@ fn bcm_runtime_params(
     fluxor::kernel::sys::hal::RuntimeParams::Compiled
 }
 
-/// A raw register access (`MMIO_READ32`/`MMIO_WRITE32`) reaches device
-/// registers and nothing else: a 4-byte-aligned word inside one of the
-/// board's device apertures (`boot_mmu::is_device_aperture`). DRAM — the
-/// kernel's tables, module state, firmware memory — and address space with
-/// nothing behind it are refused, whatever `metal_device.mmio` grants. The first
-/// refusal is logged.
-fn mmio_target_ok(addr: u64) -> bool {
-    let ok = addr & 3 == 0 && boot_mmu::is_device_aperture(addr);
-    if !ok {
-        report_refused_access("MMIO", addr, 4);
-    }
-    ok
+/// A register aperture (`MMIO_OPEN`) is one gigabyte of the board's device
+/// apertures (`boot_mmu::device_gigabyte`): registers and nothing else. DRAM
+/// — the kernel's tables, module state, firmware memory — and address space
+/// with nothing behind it are never one, whatever `metal_device.mmio` grants.
+fn mmio_aperture(index: u8) -> Option<(u64, u64)> {
+    boot_mmu::device_gigabyte(index).map(|base| (base, 1 << 30))
 }
 
-/// Cache maintenance by address (`CACHE_FLUSH_RANGE`, `DMA_FLUSH`,
-/// `DMA_INVALIDATE`) acts on DMA buffers only: `[addr, addr + size)` must lie
-/// inside one of the arenas the DMA allocators hand out. Anywhere else an
-/// invalidate would discard the kernel's dirty lines, and an unmapped address
-/// would fault the kernel. The first refusal is logged.
-fn dma_range_ok(addr: u64, size: u32) -> bool {
-    use fluxor::platform::nic_ring as ring;
-    let arenas = [
-        (ring::dma_arena_base(), ring::DMA_ARENA_SIZE),
-        (ring::pcie1_dma_arena_base(), ring::pcie1_dma_arena_size()),
-        (
-            ring::pcie1_stream_arena_base(),
-            ring::PCIE1_STREAM_ARENA_SIZE,
-        ),
-    ];
-    let ok = addr.checked_add(u64::from(size)).is_some_and(|end| {
-        arenas.iter().any(|&(base, len)| {
-            let (base, len) = (base as u64, len as u64);
-            base != 0 && addr >= base && end <= base + len
-        })
-    });
-    if !ok {
-        report_refused_access("DMA cache maintenance", addr, size);
-    }
-    ok
-}
-
-fn report_refused_access(what: &str, addr: u64, size: u32) {
-    static REPORTED: AtomicBool = AtomicBool::new(false);
-    if !REPORTED.swap(true, Ordering::Relaxed) {
-        log::warn!(
-            "[platform] {what} at {addr:#x} (+{size}) refused: outside the device apertures \
-             and DMA arenas (further refusals not logged)"
-        );
-    }
-}
-
-unsafe fn bcm_system_extension_dispatch(
-    _handle: i32,
+fn bcm_system_extension_dispatch(
+    handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    _data: fluxor::kernel::module::user_span::UserSpan<'_>,
 ) -> i32 {
     use fluxor::abi::contracts::hal::pcie_device;
     use fluxor::abi::platform::bcm2712::nic_ring;
+    use fluxor::kernel::sys::errno;
     match opcode {
-        nic_ring::NIC_BAR_MAP => fluxor::platform::pcie::syscall_bar_map(arg, arg_len),
-        nic_ring::NIC_BAR_UNMAP => fluxor::platform::pcie::syscall_bar_unmap(arg, arg_len),
-        nic_ring::NIC_RING_CREATE => fluxor::platform::nic_ring::syscall_ring_create(arg, arg_len),
-        nic_ring::NIC_RING_DESTROY => {
-            fluxor::platform::nic_ring::syscall_ring_destroy(arg, arg_len)
-        }
-        nic_ring::NIC_RING_INFO => {
-            fluxor::platform::nic_ring::syscall_ring_info(_handle, arg, arg_len)
-        }
+        nic_ring::NIC_BAR_MAP => fluxor::platform::pcie::syscall_bar_map(arg),
+        nic_ring::NIC_BAR_UNMAP => fluxor::platform::pcie::syscall_bar_unmap(arg),
+        nic_ring::NIC_RING_CREATE => fluxor::platform::nic_ring::syscall_ring_create(arg),
+        nic_ring::NIC_RING_DESTROY => fluxor::platform::nic_ring::syscall_ring_destroy(handle),
+        nic_ring::NIC_RING_INFO => fluxor::platform::nic_ring::syscall_ring_info(handle, arg),
         // ── PCIE_DEVICE contract ──────────────────────────────────
         pcie_device::BIND => {
-            if arg.is_null() || arg_len == 0 {
-                return -22;
+            if arg.is_empty() {
+                return errno::EINVAL;
             }
-            let sel = core::slice::from_raw_parts(arg, arg_len);
-            fluxor::platform::pcie::bind_selector(sel)
+            // SAFETY: provider dispatch runs on the scheduler thread, the
+            // only one touching the bound-device table.
+            unsafe { fluxor::platform::pcie::bind_selector(arg) }
         }
-        pcie_device::CLOSE => fluxor::platform::pcie::syscall_device_close(_handle),
-        pcie_device::CFG_READ32 => {
-            fluxor::platform::pcie::syscall_device_cfg_read32(_handle, arg, arg_len)
-        }
-        pcie_device::CFG_WRITE32 => {
-            fluxor::platform::pcie::syscall_device_cfg_write32(_handle, arg, arg_len)
-        }
-        pcie_device::BAR_MAP => {
-            fluxor::platform::pcie::syscall_device_bar_map(_handle, arg, arg_len)
-        }
+        // SAFETY: as BIND.
+        pcie_device::CLOSE => unsafe { fluxor::platform::pcie::syscall_device_close(handle) },
+        pcie_device::CFG_READ32 => fluxor::platform::pcie::syscall_device_cfg_read32(handle, arg),
+        pcie_device::CFG_WRITE32 => fluxor::platform::pcie::syscall_device_cfg_write32(handle, arg),
+        pcie_device::BAR_MAP => fluxor::platform::pcie::syscall_device_bar_map(handle, arg),
         pcie_device::MSI_ALLOC => {
-            if arg.is_null() || arg_len < 20 || _handle < 0 {
-                return -22;
+            if arg.len() < pcie_device::msi::ARG_LEN || handle < 0 {
+                return errno::EINVAL;
             }
-            // The bound handle tells us which root complex's MSI mux
-            // to use. Only PCIe1 is wired.
-            match fluxor::platform::pcie::bound_device_root(_handle) {
-                None => fluxor::kernel::sys::errno::EINVAL,
-                Some(root) => {
-                    use fluxor::platform::pcie_aliases::PcieRoot;
-                    match root {
-                        PcieRoot::Pcie1 => {
-                            if !fluxor::platform::pcie::pcie1_msi_init() {
-                                return fluxor::kernel::sys::errno::ENODEV;
-                            }
-                            if !PCIE1_MSI_SPI_REGISTERED {
-                                let _ = register_pcie1_msi_spi(
-                                    fluxor::platform::pcie::BCM2712_PCIE1_MSI_SPI_IRQ,
-                                );
-                                PCIE1_MSI_SPI_REGISTERED = true;
-                            }
-                            let event_handle =
-                                i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-                            match fluxor::platform::pcie::pcie1_msi_alloc_vector(event_handle) {
-                                None => fluxor::kernel::sys::errno::ENOMEM,
-                                Some((vec, addr, data)) => {
-                                    *arg.add(4) = vec;
-                                    *arg.add(5) = 0;
-                                    *arg.add(6) = 0;
-                                    *arg.add(7) = 0;
-                                    let ab = addr.to_le_bytes();
-                                    for (i, byte) in ab.iter().enumerate() {
-                                        *arg.add(8 + i) = *byte;
-                                    }
-                                    let db = data.to_le_bytes();
-                                    for (i, byte) in db.iter().enumerate() {
-                                        *arg.add(16 + i) = *byte;
-                                    }
-                                    0
-                                }
-                            }
-                        }
-                        PcieRoot::Pcie2 => fluxor::kernel::sys::errno::ENOSYS,
-                    }
+            // SAFETY: as BIND — the bound-device table, the MSI mux state and
+            // PCIE1_MSI_SPI_REGISTERED are touched only on the scheduler
+            // thread.
+            unsafe { msi_alloc(handle, arg) }
+        }
+        pcie_device::INFO => fluxor::platform::pcie::syscall_device_info(handle, arg),
+        // The doorbell an MSI vector rings, bound once `MSI_ALLOC` answered.
+        fluxor::abi::kernel_abi::doorbell::BIND_DOORBELL => {
+            let (Some(vec), Some((doorbell, _))) = (
+                fluxor::platform::pcie::vector_of(handle),
+                fluxor::abi::kernel_abi::doorbell::parse_bind(arg),
+            ) else {
+                return errno::EBADF;
+            };
+            // SAFETY: as BIND — the MSI mux state is touched only on the
+            // scheduler thread, and the handler reads a whole slot.
+            unsafe { fluxor::platform::pcie::pcie1_msi_bind_doorbell(vec, doorbell as i32) }
+        }
+        _ => errno::ENOSYS,
+    }
+}
+
+/// PCIE_DEVICE `MSI_ALLOC`: arg out `[addr u64][len u32][data u32][vec u8]
+/// [0;3]` (`pcie_device::msi`, an address answer); answers the vector's
+/// index, which the kernel wraps in a signalling handle and hands the
+/// doorbell the vector rings. The bound handle names the root complex whose
+/// MSI mux serves it; only PCIe1 is wired.
+///
+/// # Safety
+/// Scheduler thread only (bound-device table, MSI mux state).
+unsafe fn msi_alloc(handle: i32, arg: &mut [u8]) -> i32 {
+    use fluxor::kernel::sys::errno;
+    use fluxor::platform::pcie_aliases::PcieRoot;
+    match fluxor::platform::pcie::bound_device_root(handle) {
+        None => errno::EINVAL,
+        Some(PcieRoot::Pcie2) => errno::ENOSYS,
+        Some(PcieRoot::Pcie1) => {
+            if !fluxor::platform::pcie::pcie1_msi_init() {
+                return errno::ENODEV;
+            }
+            if !PCIE1_MSI_SPI_REGISTERED {
+                let _ = register_pcie1_msi_spi(fluxor::platform::pcie::BCM2712_PCIE1_MSI_SPI_IRQ);
+                PCIE1_MSI_SPI_REGISTERED = true;
+            }
+            use fluxor::abi::contracts::hal::pcie_device::msi;
+            match fluxor::platform::pcie::pcie1_msi_alloc_vector() {
+                None => errno::ENOMEM,
+                Some((vec, addr, data)) => {
+                    let out = &mut arg[..msi::ARG_LEN];
+                    out.fill(0);
+                    out[msi::ADDR..msi::ADDR + 8].copy_from_slice(&addr.to_le_bytes());
+                    // The doorbell window: the one 32-bit word the device
+                    // writes `data` to.
+                    out[msi::LEN..msi::LEN + 4].copy_from_slice(&4u32.to_le_bytes());
+                    out[msi::DATA..msi::DATA + 4].copy_from_slice(&data.to_le_bytes());
+                    out[msi::VEC] = vec;
+                    fluxor::platform::pcie::VECTOR_BASE + i32::from(vec)
                 }
             }
         }
-        pcie_device::INFO => fluxor::platform::pcie::syscall_device_info(_handle, arg, arg_len),
-        _ => -38, // E_NOSYS
     }
 }
 
@@ -1671,9 +1706,8 @@ unsafe fn bcm_system_extension_dispatch(
 /// brcmstb scan-before-bind PCI operations.
 static METAL_DEVICE: fluxor::kernel::module::metal_device::MetalDeviceOps =
     fluxor::kernel::module::metal_device::MetalDeviceOps {
-        mmio_ok: mmio_target_ok,
+        aperture: mmio_aperture,
         dma_alloc: bcm_dma_alloc,
-        dma_range_ok,
         pci: Some(&METAL_PCI),
     };
 
@@ -1799,7 +1833,7 @@ static mut VC_MBOX_BUF: VcMboxBuf = VcMboxBuf([0; 32]);
 static VC_MBOX_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Clean+invalidate the buffer's lines to PoC. Same idiom as the
-/// `DMA_FLUSH`/`DMA_INVALIDATE` handlers above (the PoC pair) — NOT the
+/// `DMA_FLUSH`/`DMA_INVALIDATE` maintenance (the PoC pair) — NOT the
 /// OTA-staging sequence, which is the PoU/instruction-coherency idiom.
 ///
 /// # Safety
@@ -2056,7 +2090,7 @@ fn bcm_seal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
         return None;
     }
     let mut nonce = [0u8; 12];
-    if bcm_csprng_fill(nonce.as_mut_ptr(), 12) != 0 {
+    if bcm_csprng_fill(&mut nonce) != 0 {
         return None;
     }
     out[..12].copy_from_slice(&nonce);
@@ -2227,10 +2261,10 @@ unsafe fn rng200_restart() {
 /// reads as a failure for every non-empty fill.
 ///
 /// [`HalOps::csprng_fill`]: crate::kernel::sys::hal::HalOps::csprng_fill
-fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+fn bcm_csprng_fill(buf: &mut [u8]) -> i32 {
+    let len = buf.len();
     // SAFETY: iproc-rng200 MMIO is the documented BCM2712 RNG block;
-    // mapped by `boot_mmu::init_page_tables`. `buf`/`len` come from a
-    // caller-owned slice via the syscall ABI.
+    // mapped by `boot_mmu::init_page_tables`.
     unsafe {
         #[cfg(feature = "board-pi5")]
         {
@@ -2277,7 +2311,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
                 let bytes = word.to_le_bytes();
                 let mut j = 0;
                 while j < 4 && i < len {
-                    core::ptr::write_volatile(buf.add(i), bytes[j]);
+                    buf[i] = bytes[j];
                     i += 1;
                     j += 1;
                 }
@@ -2297,7 +2331,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
                 state = state
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                core::ptr::write_volatile(buf.add(i), (state >> 32) as u8);
+                buf[i] = (state >> 32) as u8;
                 i += 1;
             }
         }

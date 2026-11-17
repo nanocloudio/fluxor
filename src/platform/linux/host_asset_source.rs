@@ -27,7 +27,10 @@ struct HostAssetState {
     pending_pos: usize,
 }
 
-fn host_asset_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn host_asset_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `HostAssetState` by the loader.
     let st = unsafe { instance_state::<HostAssetState>(state) };
 

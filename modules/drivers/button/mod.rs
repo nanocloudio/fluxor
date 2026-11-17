@@ -193,7 +193,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         // ---- Read GPIO + debounce ----
 
-        let level = (sys.provider_call)(s.gpio_handle, GPIO_GET_LEVEL, core::ptr::null_mut(), 0);
+        let level = (sys.provider_call)(
+            s.gpio_handle,
+            GPIO_GET_LEVEL,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         if level < 0 {
             return StepReturn::Continue; // GPIO error, skip
         }

@@ -16,13 +16,14 @@ observes_owner_release = true
 # FAT32 filesystem provider. Every operation goes through the FS
 # contract (`provider_call(-1, FS_OPEN, …)`); the kernel routes the
 # dispatch here via `provider_contracts = ["fs"]`. Reads and writes
-# both use the block source's synchronous ioctls on the `blocks` port,
+# both go to the `storage.block` source bound through the `blocks` port,
 # so the module owns no outbound block channel of its own.
 
 [[ports]]
 name = "blocks"
 direction = "input"
 content_type = "OctetStream"
+contract = "storage.block"
 required = true
 # The volume is mounted from what arrives here: until then every FS call
 # answers EAGAIN, so a module that feeds this port cannot also be one of

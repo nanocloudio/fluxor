@@ -15,7 +15,10 @@ struct LinuxSurfaceTraitsProbeState {
     in_chan: i32,
 }
 
-fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-owned per-instance arena for this module;
     // size-matched to `LinuxSurfaceTraitsProbeState` by the loader.
     let st = unsafe { instance_state::<LinuxSurfaceTraitsProbeState>(state) };

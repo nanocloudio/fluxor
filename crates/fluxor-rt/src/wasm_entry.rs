@@ -91,7 +91,14 @@ macro_rules! wasm_entry {
                 // through `handle_core_primitive`, so it goes through
                 // `provider_call` rather than the read-only query path.
                 let params_size = unsafe {
-                    (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, core::ptr::null_mut(), 0)
+                    (sys.provider_call)(
+                        -1,
+                        OP_MODULE_INSTANCE_PARAMS,
+                        core::ptr::null_mut(),
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    )
                 };
                 let (params_ptr, params_len): (*const u8, usize) = if params_size > 0 {
                     let n = params_size as usize;
@@ -99,7 +106,16 @@ macro_rules! wasm_entry {
                     if buf.is_null() {
                         return -1;
                     }
-                    let got = unsafe { (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, buf, n) };
+                    let got = unsafe {
+                        (sys.provider_call)(
+                            -1,
+                            OP_MODULE_INSTANCE_PARAMS,
+                            core::ptr::null_mut(),
+                            0,
+                            buf,
+                            n,
+                        )
+                    };
                     if got < 0 || (got as usize) != n {
                         return -1;
                     }

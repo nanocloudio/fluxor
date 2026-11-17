@@ -38,7 +38,7 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use abi::contracts::storage::block::{self as blk, Cpl, Description, Req};
 use abi::contracts::storage::fs;
 use abi::fence::Fence;
 
@@ -46,8 +46,11 @@ use abi::fence::Fence;
 pub const QUEUE_DEPTH: usize = 8;
 /// `fs` calls one pump may issue. Each is decided now or parks the job.
 const PUMP_CALLS: u32 = 32;
-/// Blocks one request may carry.
-pub const MAX_BLOCKS: u32 = 64;
+/// Bytes one request may carry: a full-size request's transfers, with its
+/// preflush and its fence, fit one pump's calls, so an `EXEC` of it over a
+/// provider that is not busy is decided inside the call.
+const MAX_REQ_BYTES: u32 = 16 * 1024;
+const _: () = assert!(MAX_REQ_BYTES == BOUNCE as u32 * PUMP_CALLS / 2);
 /// Longest image path.
 const PATH_CAP: usize = 96;
 /// Longest `volume` name.
@@ -58,6 +61,11 @@ struct FileBlockState {
     syscalls: *const SyscallTable,
     /// The `blocks` output this source answers on.
     out_chan: i32,
+    /// This module's port reference on that edge, as the kernel hands it:
+    /// the session its consumer's lend is bound to. Set by the first op.
+    session: i32,
+    /// `fs` bound by name to `volume`, or -1 until first use.
+    fs_bound: i32,
     /// Open image handle, or -1. Set as soon as the open call answers; the
     /// source is attached once `ready` is.
     fd: i32,
@@ -99,26 +107,44 @@ struct FileBlockState {
     /// Selector of the fs provider the image lives on.
     volume: [u8; VOLUME_CAP],
     reqs: [Req; QUEUE_DEPTH],
+    /// Each queued data request's buffer, borrowed from its consumer's lend
+    /// from `SUBMIT` until its completion is decided; 0 for none.
+    bufs: [usize; QUEUE_DEPTH],
     done: [Cpl; QUEUE_DEPTH],
     /// One block of zeros, for extending the image and for `DISCARD`.
     zeros: [u8; 512],
+    /// The bytes of one `fs` transfer: a consumer's buffer is its own
+    /// memory, never handed on to the file's provider.
+    bounce: [u8; BOUNCE],
 }
+
+/// Bytes one `fs` transfer moves at most.
+const BOUNCE: usize = 1024;
 
 impl FileBlockState {
     unsafe fn sys(&self) -> &SyscallTable {
         &*self.syscalls
     }
 
-    /// One `fs` op on the image's provider. With a `volume`, every op — the
-    /// open and each op on the handle it returns — names that provider, so
-    /// none of them can land on whichever filesystem is the graph's default.
-    unsafe fn fs(&self, handle: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
+    /// One `fs` op on the image's provider. With a `volume`, the provider
+    /// is bound by name once and a handle-less op goes through that binding;
+    /// the handle the open returns is routed to the same provider, so none of
+    /// them can land on whichever filesystem is the graph's default.
+    unsafe fn fs(&mut self, handle: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
         let n = self.volume_len as usize;
-        if n == 0 {
-            (self.sys().provider_call)(handle, op, arg, len)
+        let target = if handle >= 0 || n == 0 {
+            handle
         } else {
-            dev_provider_call_sel(self.sys(), &self.volume[..n], handle, op, arg, len)
-        }
+            if self.fs_bound < 0 {
+                let h = dev_bind_name(self.sys(), abi::registry::fs::ID, &self.volume[..n]);
+                if h < 0 {
+                    return h;
+                }
+                self.fs_bound = h;
+            }
+            self.fs_bound
+        };
+        (self.sys().provider_call)(target, op, arg, len, core::ptr::null_mut(), 0)
     }
 }
 
@@ -190,21 +216,21 @@ fn image_id(s: &FileBlockState) -> u64 {
     h
 }
 
-fn caps_of(s: &FileBlockState) -> Option<Caps> {
+fn caps_of(s: &FileBlockState) -> Option<Description> {
     if s.ready == 0 {
         return None;
     }
-    Some(Caps {
+    Some(Description {
         logical_block_size: s.block_size,
         block_count: s.block_count,
-        max_blocks: MAX_BLOCKS,
+        max_blocks: MAX_REQ_BYTES.checked_div(s.block_size).unwrap_or(1).max(1),
         atomic_blocks: 1,
         queue_depth: QUEUE_DEPTH as u16,
-        flags: blk::caps::F_WRITE
-            | blk::caps::F_FLUSH
-            | blk::caps::F_DISCARD
-            | blk::caps::F_DISCARD_ZEROES
-            | blk::caps::F_ASYNC,
+        flags: blk::describe::F_WRITE
+            | blk::describe::F_FLUSH
+            | blk::describe::F_DISCARD
+            | blk::describe::F_DISCARD_ZEROES
+            | blk::describe::F_ASYNC,
         device_id: s.device_id,
     })
 }
@@ -252,8 +278,8 @@ unsafe fn position(s: &mut FileBlockState, off: u64) -> i32 {
     if s.fd_pos_valid != 0 && s.fd_pos == off {
         return 0;
     }
-    let mut arg = off.to_le_bytes();
-    let rc = s.fs(s.fd, fs::SEEK, arg.as_mut_ptr(), 8);
+    let mut arg = fs::seek::encode(off);
+    let rc = s.fs(s.fd, fs::SEEK, arg.as_mut_ptr(), arg.len());
     if rc < 0 {
         return rc;
     }
@@ -297,7 +323,7 @@ unsafe fn transfer_once(
 /// The file's byte-durability fence. 0 once durable; `EAGAIN` /
 /// `EINPROGRESS` while undecided — the re-ask (same handle, no argument) is
 /// identical by construction.
-unsafe fn fsync(s: &FileBlockState) -> i32 {
+unsafe fn fsync(s: &mut FileBlockState) -> i32 {
     let rc = s.fs(s.fd, fs::FSYNC, core::ptr::null_mut(), 0);
     if rc < 0 {
         rc
@@ -321,6 +347,7 @@ fn req_bytes(s: &FileBlockState, r: &Req) -> u64 {
 unsafe fn job_advance(
     s: &mut FileBlockState,
     r: &Req,
+    buf: *mut u8,
     job: &mut Job,
     calls: &mut u32,
 ) -> Option<i32> {
@@ -356,21 +383,30 @@ unsafe fn job_advance(
                 }
                 let off = r.lba * u64::from(s.block_size) + job.done;
                 let left = (total - job.done) as usize;
-                let (write, buf, len) = match r.op {
-                    blk::op::READ => (false, (r.buf_ptr as *mut u8).add(job.done as usize), left),
-                    blk::op::WRITE => (true, (r.buf_ptr as *mut u8).add(job.done as usize), left),
+                let at = buf.wrapping_add(job.done as usize);
+                let bounce = s.bounce.as_mut_ptr();
+                let (write, from, len) = match r.op {
+                    blk::op::READ => (false, bounce, left.min(BOUNCE)),
+                    blk::op::WRITE => {
+                        let len = left.min(BOUNCE);
+                        core::ptr::copy_nonoverlapping(at, bounce, len);
+                        (true, bounce, len)
+                    }
                     _ => {
                         let chunk = s.zeros.len().min(s.block_size as usize);
                         (true, s.zeros.as_mut_ptr(), left.min(chunk))
                     }
                 };
                 *calls -= 1;
-                let n = transfer_once(s, write, off, buf, len);
+                let n = transfer_once(s, write, off, from, len);
                 if n == E_AGAIN {
                     return None;
                 }
                 if n < 0 {
                     return Some(n);
+                }
+                if r.op == blk::op::READ {
+                    core::ptr::copy_nonoverlapping(bounce, at, n as usize);
                 }
                 // A short count is progress: advance by what moved.
                 job.done += n as u64;
@@ -430,9 +466,14 @@ unsafe fn pump(s: &mut FileBlockState) {
         let i = (s.head as usize + s.ndone as usize) % QUEUE_DEPTH;
         let r = s.reqs[i];
         let mut job = s.job;
-        let out = job_advance(s, &r, &mut job, &mut calls);
+        let out = job_advance(s, &r, s.bufs[i] as *mut u8, &mut job, &mut calls);
         match out {
             Some(status) => {
+                // The borrow goes back before the completion is reapable.
+                if s.bufs[i] != 0 {
+                    blk_give_back(s.sys(), s.session, &r);
+                    s.bufs[i] = 0;
+                }
                 s.done[i] = completion(s, &r, status);
                 s.ndone += 1;
                 s.job = Job::new();
@@ -445,10 +486,10 @@ unsafe fn pump(s: &mut FileBlockState) {
     }
 }
 
-/// `EXEC`: run `r` inside the call. Answers its status, or `EAGAIN` while
-/// it is undecided (the job stays parked for the identical re-ask) or while
-/// queued requests hold the job.
-unsafe fn exec(s: &mut FileBlockState, r: &Req, c: &mut Cpl) -> i32 {
+/// `EXEC`: run `r` inside the call over `buf` (the call's data span).
+/// Answers its status, or `EAGAIN` while it is undecided (the job stays
+/// parked for the identical re-ask) or while queued requests hold the job.
+unsafe fn exec(s: &mut FileBlockState, r: &Req, buf: *mut u8, c: &mut Cpl) -> i32 {
     pump(s);
     if s.ndone < s.count {
         return E_AGAIN;
@@ -460,7 +501,7 @@ unsafe fn exec(s: &mut FileBlockState, r: &Req, c: &mut Cpl) -> i32 {
     s.exec_parked = 1;
     let mut calls = PUMP_CALLS;
     let mut job = s.job;
-    let out = job_advance(s, r, &mut job, &mut calls);
+    let out = job_advance(s, r, buf, &mut job, &mut calls);
     s.job = job;
     match out {
         Some(status) => {
@@ -483,48 +524,84 @@ unsafe fn admitted(s: &FileBlockState, body: &[u8]) -> Result<Req, i32> {
     }
 }
 
-unsafe extern "C" fn file_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+/// Serves `storage.block` to the consumer wired to `blocks`: `DESCRIBE`,
+/// `EXEC`, `SUBMIT` and `REAP`. `handle` is this module's own port
+/// reference on that edge, the session its consumer's lend is bound to.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised; `arg[..arg_len]` and
+/// `data[..data_len]` are valid for the call.
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_provider_dispatch"]
+pub unsafe extern "C" fn module_provider_dispatch(
+    state: *mut u8,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    use abi::registry::storage_block as SB;
     if state.is_null() || arg.is_null() {
         return E_INVAL;
     }
     let s = &mut *(state as *mut FileBlockState);
-    match cmd {
-        blk::ioctl::CAPS => match caps_of(s) {
-            Some(c) => {
-                c.encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
-                blk::caps::LEN as i32
-            }
+    let arg = core::slice::from_raw_parts_mut(arg, arg_len);
+    match op {
+        SB::DESCRIBE => match caps_of(s) {
+            Some(c) if c.encode(arg) => 0,
+            Some(_) => E_INVAL,
             None if s.open_err < 0 => s.open_err,
             None => E_AGAIN,
         },
-        blk::ioctl::EXEC => {
-            let r = match admitted(s, core::slice::from_raw_parts(arg, blk::req::LEN)) {
+        SB::EXEC => {
+            if arg.len() < blk::exec::ARG_LEN {
+                return E_INVAL;
+            }
+            let r = match admitted(s, arg) {
                 Ok(r) => r,
                 Err(rc) => return rc,
             };
+            let want = if r.has_buffer() {
+                r.buf_len as usize
+            } else {
+                0
+            };
+            if data_len != want || (want != 0 && data.is_null()) {
+                return E_INVAL;
+            }
             let mut c = Cpl::bare(r.tag, E_AGAIN);
-            let rc = exec(s, &r, &mut c);
-            c.encode(core::slice::from_raw_parts_mut(
-                arg.add(blk::req::LEN),
-                blk::cpl::LEN,
-            ));
+            let rc = exec(s, &r, data, &mut c);
+            c.encode(&mut arg[blk::exec::CPL..]);
             rc
         }
-        blk::ioctl::SUBMIT => {
-            let r = match admitted(s, core::slice::from_raw_parts(arg, blk::req::LEN)) {
+        SB::SUBMIT => {
+            let r = match admitted(s, arg) {
                 Ok(r) => r,
                 Err(rc) => return rc,
             };
             if s.count as usize >= QUEUE_DEPTH {
                 return E_AGAIN;
             }
+            let buf = if r.has_buffer() {
+                match blk_borrow(s.sys(), handle, &r) {
+                    Ok(p) => p as usize,
+                    Err(rc) => return rc,
+                }
+            } else {
+                0
+            };
+            s.session = handle;
             let tail = (s.head as usize + s.count as usize) % QUEUE_DEPTH;
             s.reqs[tail] = r;
+            s.bufs[tail] = buf;
             s.count += 1;
             pump(s);
             0
         }
-        blk::ioctl::REAP => {
+        SB::REAP => {
             pump(s);
             if s.ndone == 0 {
                 return 0;
@@ -533,8 +610,11 @@ unsafe extern "C" fn file_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8
             s.head = ((s.head as usize + 1) % QUEUE_DEPTH) as u8;
             s.count -= 1;
             s.ndone -= 1;
-            c.encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
-            1
+            if c.encode(arg) {
+                1
+            } else {
+                E_INVAL
+            }
         }
         _ => E_NOSYS,
     }
@@ -575,8 +655,8 @@ unsafe fn open_image(s: &mut FileBlockState) -> i32 {
                 s.open_phase = OPEN_STAT;
             }
             OPEN_STAT => {
-                let mut st = [0u8; 16];
-                let rc = s.fs(s.fd, fs::STAT, st.as_mut_ptr(), 16);
+                let mut st = [0u8; fs::stat::LEN];
+                let rc = s.fs(s.fd, fs::STAT, st.as_mut_ptr(), st.len());
                 if rc == E_AGAIN {
                     return E_AGAIN;
                 }
@@ -673,14 +753,8 @@ pub unsafe extern "C" fn module_new(
         } else {
             params_def::set_defaults(s);
         }
-        if out_chan >= 0 {
-            dev_channel_register_ioctl(
-                &*s.syscalls,
-                out_chan,
-                state as *mut c_void,
-                Some(file_block_ioctl),
-            );
-        }
+        s.session = -1;
+        s.fs_bound = -1;
         0
     }
 }

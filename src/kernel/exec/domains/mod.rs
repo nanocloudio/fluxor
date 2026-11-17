@@ -392,12 +392,11 @@ fn poll_rebuild(domain_id: usize, platform: &Platform) {
         let t = exception::CORE_TICKS[0].load(Ordering::Relaxed);
         if t >= 450_000 && !FIRED.swap(true, Ordering::Relaxed) {
             log::warn!("[test] one-shot rebuild trigger at tick {t}");
-            // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
-            unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+            scheduler::request_rebuild();
         }
     }
 
-    if scheduler::take_rebuild_request().is_none() {
+    if !scheduler::take_rebuild_request() {
         return;
     }
     request_quiesce();

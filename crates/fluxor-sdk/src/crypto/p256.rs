@@ -382,17 +382,25 @@ pub fn u256_mul_wide(a: &U256, b: &U256) -> [u64; 8] {
     out
 }
 
+// On 32-bit ARM each u128 product is a run of 32-bit multiplies; inlined
+// into every point operation the field multiply makes a ladder bit's code
+// (a double and an add) outgrow the RP2350's 16 KB XIP cache, and every step
+// then refetches it from flash. Called, the multiply is one copy the cache
+// keeps. `mont_mul` still inlines into it, so the constant prime folds.
+
 /// Montgomery product mod p: `a·b·R⁻¹ mod p`. With both operands held as
 /// `x·R mod p` this is their product, in the same form. P-256's prime is
 /// `-1 mod 2^64`, so the reduction factor is 1. Constant-time per
 /// `mont_mul`.
-#[inline(always)]
+#[cfg_attr(target_arch = "arm", inline(never))]
+#[cfg_attr(not(target_arch = "arm"), inline(always))]
 pub fn fp_mul(a: &U256, b: &U256) -> U256 {
     mont_mul(a, b, &FP_P, 1)
 }
 
 /// Montgomery square mod p.
-#[inline(always)]
+#[cfg_attr(target_arch = "arm", inline(never))]
+#[cfg_attr(not(target_arch = "arm"), inline(always))]
 pub fn fp_sqr(a: &U256) -> U256 {
     mont_mul(a, a, &FP_P, 1)
 }

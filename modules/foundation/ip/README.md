@@ -25,6 +25,8 @@ IP Stack Service Module
 - `held.rs` — held addresses realized from `net.route` HOLD
 - `conn_arena.rs`, `index.rs`, `continuity.rs` — the connection table, the
   hashed indexes, transport continuity
+- `send_pool.rs` — the send buffers: one pool of blocks, each what one
+  connection has sent and the peer not yet acknowledged
 
 ## Interface (manifest)
 
@@ -62,6 +64,17 @@ declares (`workload`, `net_route`, `net_policy`) are described in
   minute apart, and given up at its end or on a NAK.
 - `expected_dhcp_server` — accept replies only from this server (0 = any).
 - `trace_sample_permille` — ingress head-sampling rate.
+- `tcp_send_buf` (65536 / 2920 / 1460 bytes) — the send buffer a connection
+  whose consumer keeps no copy is held to (see Retransmission); 0 keeps
+  nothing, allowed only when no consumer of `net_out` leaves retention here.
+- `tcp_send_pool` — the bytes of all the send buffers, as many
+  `tcp_send_buf` blocks as it holds (at most 128 on aarch64, 2 on an
+  MCU-class target). Derived by the composer from the graph when unset: 0
+  where every consumer of `net_out` retains its own copy (`retains_send`) or
+  opens no stream (`datagram_only`) and `lanes` is 0, else the default
+  pool's blocks of `tcp_send_buf`. On an MCU-class target the heap grows by
+  it (`heap_per_param`); a pool below one block or past the table refuses
+  the instance.
 - `dhcp_compat` — admit BOOTP replies and an ACK with no preceding OFFER
   (default 0 = strict). Both accept an address assignment the client cannot
   correlate to a selection it made.
@@ -133,14 +146,14 @@ IPv6 (aarch64; `v6t.rs`):
 
 ## Connecting by name
 
-A consumer opens a stream with `CMD_CONNECT_TO` (`net_proto`, 0x14), whose
+A consumer opens a stream with `CMD_CONNECT_TO` (`net_proto`, 0x13), whose
 target carries an address family: `AF_INET` dials the literal at once,
 `AF_INET6` dials from an IPv6 address of the dialler's own — a workload's
 own, or for the node its first armed one no workload owns (`ENETUNREACH`
 with none, or with the peer table full of live peers) — and `AF_NAME` is
-resolved here before the SYN goes out. The reserved `CMD_CONNECT` (0x13) is
-unsupported and answered `MSG_ERROR ENOSYS` on its tag, with one log line naming
-`CMD_CONNECT_TO`, so an emitter of it fails on its first dial.
+resolved here before the SYN goes out. A dial asking for a sideband the
+surface does not define (`flags` outside `TRACE | CURSORS`) is refused
+`EINVAL` on its tag.
 
 The stub resolver is this module's: it owns the datagram path and the DHCP
 lease's DNS server, so resolution needs no sibling module and no contract of
@@ -247,7 +260,13 @@ for a flow this host never held, once an anchor installs its tombstone
 (`CMD_SC_TOMBSTONE`, 0x89 on `cont_in`, `[flow_id:16][epoch:4][ttl_ms:4]`,
 held at most 120 s). Under the strict profile the relayed
 `CHECKPOINT_COMMITTED` that turns the mirror live also ends a quiesce and
-reopens the window. A record lands only on an address of the owner it
+reopens the window. The record carries the bytes this module keeps of the
+connection (`[send_len u32][bytes]` from `SND.UNA`, at most 1460 / 2920 B on
+RP and 16 KiB on aarch64; a cut with more in flight is refused `NOT_READY`
+until acknowledgements bring it under), and a send delta carries its
+segment's bytes, so a standby retransmits them byte for byte; a standby whose
+consumer retains them itself refuses a record that carries any. A record
+lands only on an address of the owner it
 names (0 names none and takes the address's owner); another owner's is
 refused `STATUS_CORRUPT`. An `ABORT` at the epoch a flow was activated
 under undoes that activation — the connection it made is reset, with an
@@ -256,14 +275,45 @@ RST to the peer — while the connection is still the one activated
 session). `transport_continuity` builds `TRANSPORT_CONTINUITY` over this
 and `tls`.
 
+## Sidebands
+
+`CMD_BIND` and `CMD_CONNECT_TO` carry `flags`; the grant comes back in
+`MSG_BOUND` / `MSG_ACCEPTED` / `MSG_CONNECTED`, and a listener's grant is
+every connection it accepts. `TRACE` is granted when asked: the
+connection's trace context (`stream_trace` `MSG_TRACE_CTX`) is queued with
+its accept and peer report, before any of its data, and is never sent to a
+connection that did not ask. `CURSORS` is a record layer's to serve and is
+never granted here. `RETX` is granted, never asked for, on the node's own
+channel when every consumer of `net_out` declares `retains_send` (the kernel
+says so through `channel::FACTS`); a workload lane never has it.
+
 ## Retransmission
 
-`ip` keeps no copy of the bytes it sends. The consumer that does (`tls`) is
-told what the peer acknowledged (`MSG_ACK`, with the stream's first sequence
-number, so its window is placed exactly), is asked to resend from `SND.UNA`
-on duplicate ACKs (early retransmit with two or three segments out), the RTO
-and each partial acknowledgement in recovery (`MSG_RETRANSMIT`), and answers
-with `CMD_RESEND`, sent again at its own sequence numbers rather than
+`ip` retransmits every connection. For a connection not granted `RETX` it
+keeps what it sent in a send buffer of `tcp_send_buf` bytes (default 1460 on
+RP2040, 2920 on RP2350, 64 KiB on aarch64), taken from one pool when a burst
+starts and given back when the peer has acknowledged all of it — granted on
+demand from the elastic region on aarch64, taken from the module heap at
+construction on an MCU-class target, as many as `tcp_send_pool` holds. A
+graph whose consumers of `net_out` all retain or send datagrams only, and
+that serves no workload lane, holds none and pays nothing for them. What is
+in flight is the least of the buffer, the congestion window and the peer's
+window. A send that finds the buffer full, or no block to be had, waits in
+its lane's stash exactly as it waits for a closed window: the lane stops
+reading commands, and the consumer's own writes into `net_in` back up. Three
+duplicate ACKs (early retransmit with two or three segments out), the RTO and
+each partial acknowledgement in recovery send again from that copy, from
+`SND.UNA`. `tcp_send_buf: 0` or `tcp_send_pool: 0` keeps nothing, and a
+graph may set either only when no consumer leaves retention here (the
+composer refuses it otherwise; a connection that would need a copy is
+refused `EOPNOTSUPP`).
+
+A connection granted `RETX` — its consumer (`tls`) keeps the exact bytes it
+handed down — gets no buffer here: the consumer is told what the peer
+acknowledged (`stream_retx` `MSG_RETX_ACK`, with the stream's first sequence
+number, so its window is placed exactly), is asked to resend from a sequence
+number on the same triggers (`MSG_RETX_REQUEST`), and answers with
+`CMD_RETX_RESEND`, sent again at its own sequence numbers rather than
 allocated anew. The RTO is RFC 6298's in milliseconds (one-second floor,
 sixty-second ceiling, doubled per expiry). See `docs/architecture/network.md`
 §Downstream messages.
@@ -295,12 +345,12 @@ random offset and echoed by the consumer on every `CMD_DG_SEND_TO` /
 refused with `ENOTSOCK` and metered.
 
 The bind identity is `(protocol, local_port, local_slot)` plus the owner
-stamp. A repeated bind of the same identity by the same owner resolves to the
+it is made as. A repeated bind of the same identity by the same owner resolves to the
 existing endpoint; a bind whose reachability overlaps one already held is
 refused with `EADDRINUSE`. The same port at two workloads' addresses is two
 endpoints.
 
-An owner-stamped bind — a TCP listener or a datagram endpoint — serves every
+An owner's bind — a TCP listener or a datagram endpoint — serves every
 address its owner holds, IPv4 and IPv6 alike, so a dual-stack workload is
 reached on both families through one bind; the host wildcard serves only the
 addresses no workload owns. What it sends leaves from the owner's own address
@@ -309,42 +359,16 @@ refused `ENETUNREACH`: a workload's traffic never leaves from the node's or
 another workload's address, except IPv4 to a destination outside its cluster
 prefixes, which leaves from the node's address and the endpoint's egress port.
 
-`ep_id` is an index, not an authority. The graph model permits several
-consumer modules to share this module's command channel — the kernel merges
-them into one stream — and `channel_read` carries no producer identity, so an
-index alone cannot say who sent a command. The owner tag is the authority:
-`CMD_DG_BIND` records an `owner_tag` on the endpoint, `CMD_DG_SEND_TO` and
-`CMD_DG_CLOSE` carry the tag they claim in a fixed position ahead of the
-payload, and a command whose tag does not equal the endpoint's is refused with
-`EPERM` and counted in `dg_ep_perm`. Liveness is decided first, so a released
-handle still answers `ENOTSOCK`; a tag mismatch is only ever reported for a
-slot that really holds an endpoint.
-
-The tag a consumer presents is its own owner slot, read from the kernel
-(`OWNER_TAG` — a module can only read its own). Every in-tree datagram
-consumer reaches this surface through `sdk/cores/datagram_endpoint.rs`, which
-stamps that slot on `CMD_DG_BIND` and presents it on every `CMD_DG_SEND_TO`.
-It is the same axis, and the same value, that `NET_CMD_BIND` already carries
-for TCP listeners.
-
-The decoder is tolerant, and an absent tag decodes as tag 0. What remains
-reachable by the untagged shape, exactly: owner slot 0 is `OWNER_SYSTEM`, so a
-base-graph, host-owned module binds untagged and its endpoint is recorded with
-`owner_tag = 0`. Such an endpoint accepts untagged send and close from any
-consumer sharing the command channel — so host-owned consumers are not
-separated from one another, and neither are two modules of the same workload.
-What the tag separates is owners. A module of a `net=own` workload binds with
-its workload's slot, and from that point an untagged command, or one bearing a
-different tag, is `EPERM`. A tagged command does not reach a tag-0 endpoint
-either — the presented tag must equal the recorded one, with no "any tag
-matches 0" rule.
-
-The tag is asserted by the consumer in the frame, not proved. The property is
-"the consumer that bound this endpoint named this tag", not an unguessable
-capability: tags are small owner-slot integers, and a module free to write
-arbitrary bytes can name any of them. What bounds the assertion is bind
-admission — a nonzero tag resolves to the `local_addrs` slot that owner owns,
-and a bind naming an owner with no address on this host is refused `EACCES`.
+`ep_id` is an index, not an authority. Who holds an endpoint is the
+kernel's to say: a bind is made as the owner `channel::FACTS` attests for
+the channel it arrived on (a workload lane's owner from `NET_LANE_TAKE`), on
+that owner's own address, and a send or close is admitted only on an
+endpoint its channel's owner holds — `EPERM` otherwise, counted in
+`dg_ep_perm`. Liveness is decided first, so a released handle still answers
+`ENOTSOCK`. No datagram or stream record carries an owner; a bind naming
+nothing but a port and flags is the only bind there is. Within one channel
+the owner is one: the modules sharing the node's `net_in` through a merge
+are the graph owner's, and a lane is one workload's.
 
 ## SYN resource defence
 

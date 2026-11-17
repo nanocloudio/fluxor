@@ -8,8 +8,8 @@
 //! Same semantics as `platform/linux/store.rs` — monotone revision clock,
 //! per-key revision as the CAS token, prefix enumeration with a paged cursor,
 //! a bounded key-only change history that pages `CHANGES` from a revision, and
-//! SUBSCRIBE as a doorbell on the subscriber's own kernel event (no bytes are
-//! ever written to a consumer's channel) — and deliberately the same WIRE,
+//! SUBSCRIBE as a doorbell the kernel hands it for the subscriber's handle (no
+//! bytes are ever written to a consumer's channel) — and deliberately the same WIRE,
 //! because a consumer parses one encoding
 //! whichever platform answers it. What differs is the backing: no `alloc` here,
 //! so the store's tables are fixed-capacity — sized once at boot from the plan
@@ -28,11 +28,9 @@
 
 use crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
 use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
-use crate::abi::fence::{Fence, WIRE_MAX_LEN};
-use crate::kernel::ipc::event::{event_owner, event_signal};
-use crate::kernel::ipc::fd::{
-    slot_of, tag_fd, untag_fd, FD_TAG_EVENT, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT,
-};
+use crate::abi::fence::{trailer, Fence};
+use crate::kernel::ipc::event::doorbell_ring;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 
@@ -150,23 +148,24 @@ const HIST_EMPTY: HistEntry = HistEntry {
     key_len: 0,
 };
 
-/// One subscription: a prefix, the subscriber's kernel event, and its rung
-/// bit — a doorbell, with nothing queued behind it.
+/// One subscription: a prefix and the doorbell its subscriber's handle polls
+/// — nothing queued behind it.
 #[derive(Clone, Copy)]
 struct Sub {
     in_use: bool,
     prefix: [u8; STORAGE_KEY_MAX],
     prefix_len: u16,
-    /// The subscriber's event, as a raw event slot.
-    event: i32,
-    /// Set when a change under the prefix signalled the event; cleared by
-    /// the subscriber's `TAKE_RUNG`. While set, further changes do nothing.
-    rung: bool,
+    /// The doorbell the kernel handed for the subscription's handle
+    /// (`BIND_DOORBELL`); -1 until then.
+    doorbell: i32,
+    /// A ring asked for before the doorbell was bound (SUBSCRIBE's ring-now
+    /// flag): rung as it is bound.
+    ring_owed: bool,
     /// The owner that subscribed, which the slot goes with.
     opener: OwnerHandle,
     /// The subscribing module occupancy — slot index and slot generation.
-    /// The subscription lives exactly as long as that occupancy does and
-    /// that module owns `event`; checked before every signal.
+    /// The subscription lives exactly as long as that occupancy does;
+    /// checked before every ring.
     module: u16,
     generation: u32,
 }
@@ -175,8 +174,8 @@ const SUB_EMPTY: Sub = Sub {
     in_use: false,
     prefix: [0; STORAGE_KEY_MAX],
     prefix_len: 0,
-    event: -1,
-    rung: false,
+    doorbell: -1,
+    ring_owed: false,
     opener: OWNER_SYSTEM,
     module: 0,
     generation: 0,
@@ -271,10 +270,9 @@ static mut TLM_TICK: u32 = 0;
 
 /// `[store] objs=.. rev=.. subs=.. put=.. del=.. list=.. ring=.. drop=.. lost=..`
 ///
-/// `ring` counts doorbells signalled; `drop` counts subscriptions dropped at a
-/// signal because their module occupancy ended or their event slot is no
-/// longer that module's. A watcher that saw nothing with `ring` climbing was
-/// told and did not read; with `drop` climbing it was never there to tell.
+/// `ring` counts doorbells rung; `drop` counts subscriptions dropped at a ring
+/// because their module occupancy ended or their handle closed. A watcher
+/// that saw nothing with `ring` climbing was told and did not read; with `drop` climbing it was never there to tell.
 /// `lost` counts `CHANGES` reads answered LOST (behind the history).
 unsafe fn telemetry(store: &Store) {
     TLM_TICK = TLM_TICK.wrapping_add(1);
@@ -457,17 +455,12 @@ impl Condition {
     }
 }
 
-/// Read a `[precondition:u8][etag_len:u8][etag]` block at `*p`, advancing past
-/// it. `None` when the block is cut short, names a kind this store does not
-/// know, or carries `ETAG` without a whole revision: each is a malformed
-/// request, and answering one as unconditional would turn a guard the caller
-/// asked for into no guard at all.
-fn read_condition(a: &[u8], p: &mut usize) -> Option<Condition> {
+/// The condition a request's `precondition` and `etag` state. `None` when it
+/// names a kind this store does not know, or carries `ETAG` without a whole
+/// revision: each is a malformed request, and answering one as unconditional
+/// would turn a guard the caller asked for into no guard at all.
+fn read_condition(kind: u8, etag: &[u8]) -> Option<Condition> {
     use obj_op::precondition as pre;
-    let kind = *a.get(*p)?;
-    let etag_len = *a.get(*p + 1)? as usize;
-    let etag = a.get(*p + 2..*p + 2 + etag_len)?;
-    *p += 2 + etag_len;
     match kind {
         pre::ANY => Some(Condition::Any),
         pre::ABSENT => Some(Condition::Absent),
@@ -552,8 +545,7 @@ fn opened_by_caller(in_use: bool, opener: OwnerHandle) -> bool {
 /// The calling module occupancy, `(slot index, slot generation)`, or `None`
 /// in kernel context. This store is a kernel provider: its dispatch runs in
 /// no provider frame, so the module making the call is the one the scheduler
-/// is stepping — the same module [`caller_owner`] reads and `event::CREATE`
-/// stamps an event with.
+/// is stepping — the same module [`caller_owner`] reads.
 ///
 /// [`caller_owner`]: crate::kernel::exec::scheduler::caller_owner
 fn caller_occupancy() -> Option<(u16, u32)> {
@@ -562,11 +554,9 @@ fn caller_occupancy() -> Option<(u16, u32)> {
     (idx < sched::module_slots()).then(|| (idx as u16, sched::module_slot_generation(idx)))
 }
 
-/// The raw event slot a tagged event fd names, or `None` when `fd` is not
-/// one.
-fn event_slot(fd: i32) -> Option<i32> {
-    let (tag, slot) = untag_fd(fd);
-    (fd >= 0 && tag == FD_TAG_EVENT).then_some(slot)
+/// Handles this store hands out at once: its subscriptions and read slots.
+pub fn handle_slots() -> usize {
+    plan_ceiling(res::POOL_STORE_SUBS) + plan_ceiling(res::POOL_STORE_READS)
 }
 
 /// Close every handle `opener` holds on the store: its `GET` reads and its
@@ -597,14 +587,6 @@ unsafe fn store_ref() -> Option<&'static mut Store> {
     Some(&mut *core::ptr::addr_of_mut!(STORE))
 }
 
-fn get_u16(b: &[u8], off: usize) -> Option<u16> {
-    b.get(off..off + 2)
-        .map(|s| u16::from_le_bytes([s[0], s[1]]))
-}
-fn get_u32(b: &[u8], off: usize) -> Option<u32> {
-    b.get(off..off + 4)
-        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-}
 fn get_u64(b: &[u8], off: usize) -> Option<u64> {
     b.get(off..off + 8)
         .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
@@ -616,36 +598,38 @@ fn etag_from_rev(rev: u64) -> [u8; 32] {
     e
 }
 
-/// The `[fence_out_ptr:u64][fence_out_cap:u16]` pair at `off`, or `None` —
-/// the op answers `EINVAL` before acting — when it is cut short, null, or
-/// smaller than `WIRE_MAX_LEN`.
-fn fence_out(a: &[u8], off: usize) -> Option<(u64, u16)> {
-    let ptr = get_u64(a, off)?;
-    let cap = get_u16(a, off + 8)?;
-    (ptr != 0 && cap as usize >= WIRE_MAX_LEN).then_some((ptr, cap))
+/// Write `fence` into the trailer of `arg`.
+fn write_fence(arg: &mut [u8], fence: Fence) {
+    let _ = trailer::put(arg, &fence);
 }
 
-unsafe fn write_fence(fence: Fence, ptr: u64, cap: u16) {
-    if ptr == 0 || cap == 0 {
-        return;
+/// A key copied out of a request, so the request's `arg` can take the answer.
+struct KeyBuf {
+    b: [u8; STORAGE_KEY_MAX],
+    n: usize,
+}
+
+impl KeyBuf {
+    fn of(key: &[u8]) -> Self {
+        let mut b = [0u8; STORAGE_KEY_MAX];
+        let n = key.len().min(STORAGE_KEY_MAX);
+        b[..n].copy_from_slice(&key[..n]);
+        KeyBuf { b, n }
     }
-    let out = core::slice::from_raw_parts_mut(ptr as *mut u8, cap as usize);
-    let _ = fence.encode(out);
+    fn get(&self) -> &[u8] {
+        &self.b[..self.n]
+    }
 }
 
-/// Whether subscription `s` may still be signalled: its module occupancy is
-/// live — the slot holds the same generation and its module has not finished
-/// — and its event slot is still that module's. A module that was freed,
-/// restarted, reassigned or finished, or that destroyed its event (whose slot
-/// another module's `CREATE` may now hold), fails it, and a stranger is never
-/// woken for it.
+/// Whether subscription `s` may still be rung: its module occupancy is live
+/// — the slot holds the same generation and its module has not finished. A
+/// module that was freed, restarted, reassigned or finished fails it.
 fn sub_live(s: &Sub) -> bool {
     use crate::kernel::exec::scheduler as sched;
     let idx = s.module as usize;
     idx < sched::module_slots()
         && sched::module_slot_generation(idx) == s.generation
         && !sched::module_is_finished(idx)
-        && event_owner(s.event) == Some(s.module)
 }
 
 /// Drop subscription `s`: its subscriber is gone, so nothing will read it.
@@ -655,27 +639,21 @@ fn drop_sub(s: &mut Sub) {
     unsafe { TLM_DROPPED = TLM_DROPPED.wrapping_add(1) };
 }
 
-/// Signal `s`'s event, after checking it is still the subscriber's to
-/// signal ([`sub_live`]); a dead subscription, or one whose signal answers
-/// that the event is gone, is dropped instead. Every signal this store sends
-/// goes through here.
-fn signal(s: &mut Sub) -> bool {
-    if !sub_live(s) || event_signal(s.event) < 0 {
+/// Ring `s`: a change under its prefix. The doorbell's handle polls ready
+/// once however many rings it takes before the subscriber polls. A dead
+/// subscription, or one whose doorbell names nothing (its handle closed), is
+/// dropped instead.
+fn ring(s: &mut Sub) {
+    if s.doorbell < 0 {
+        s.ring_owed = true;
+        return;
+    }
+    if !sub_live(s) || !doorbell_ring(s.doorbell) {
         drop_sub(s);
-        return false;
+        return;
     }
     // SAFETY: single-threaded provider dispatch.
     unsafe { TLM_RUNG = TLM_RUNG.wrapping_add(1) };
-    true
-}
-
-/// Ring `s`: a change under its prefix. A clear rung bit is set and the event
-/// signalled; a set one means the subscriber has a `TAKE_RUNG` still to come,
-/// which will see this change's subscription anyway, so nothing more is sent.
-fn ring(s: &mut Sub) {
-    if !s.rung && signal(s) {
-        s.rung = true;
-    }
 }
 
 /// Ring every subscription whose prefix `key` falls under. Called after every
@@ -707,67 +685,52 @@ unsafe fn reap_dead_subs() {
 }
 
 /// `storage.object` dispatch.
-///
-/// # Safety
-/// Single-threaded platform dispatch; `arg` must be null or valid for
-/// `arg_len` bytes.
-pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub fn dispatch_object(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     if !node_caller() {
         return errno::EACCES;
     }
+    // SAFETY: single-threaded platform dispatch owns the store's tables.
+    unsafe { object_call(handle, opcode, arg, data) }
+}
+
+/// # Safety
+/// Single-threaded platform dispatch.
+unsafe fn object_call(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     let Some(store) = store_ref() else {
         return errno::ENOSYS;
-    };
-    let a = if arg.is_null() {
-        &[][..]
-    } else {
-        core::slice::from_raw_parts(arg, arg_len)
     };
 
     telemetry(store);
     match opcode {
+        // Conditional writes and listing; no streamed put, no kept field,
+        // no grants.
+        obj_op::CAPS => crate::abi::kernel_abi::caps_word::answer(
+            arg,
+            obj_op::caps::WRITE
+                | obj_op::caps::IF_ABSENT
+                | obj_op::caps::IF_ETAG
+                | obj_op::caps::LIST,
+        ),
         obj_op::PUT => {
-            // [key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64]
-            // [precondition:u8][etag_len:u8][etag]
-            // [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
-            // [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some(req) = obj_op::put::parse(arg) else {
                 return errno::EINVAL;
             };
-            let Some(key) = a.get(2..2 + kl) else {
-                return errno::EINVAL;
-            };
-            if !writable_key(key) {
+            if !writable_key(req.key) {
                 return errno::EINVAL;
             }
-            let mut p = 2 + kl;
-            let Some(&ctl) = a.get(p) else {
+            let Some(condition) = read_condition(req.precondition, req.etag) else {
                 return errno::EINVAL;
             };
-            p += 1 + ctl as usize;
-            let Some(body_ptr) = get_u64(a, p) else {
-                return errno::EINVAL;
-            };
-            let Some(body_len) = get_u64(a, p + 8) else {
-                return errno::EINVAL;
-            };
-            p += 16;
-            let Some(condition) = read_condition(a, &mut p) else {
-                return errno::EINVAL;
-            };
-            let Some((kept, p)) = obj_op::Kept::parse(a, p) else {
-                return errno::EINVAL;
-            };
-            let Some((fence_ptr, fence_cap)) = fence_out(a, p) else {
-                return errno::EINVAL;
-            };
-            if body_len > MAX_VALUE as u64 {
+            let body = data.as_slice();
+            if body.len() > MAX_VALUE {
                 return errno::EINVAL;
             }
             // RAM: nothing here outlives a power cut, so it keeps none of them.
-            if !kept.is_none() {
+            if !req.kept.is_none() {
                 return errno::ENOSYS;
             }
+            let key = KeyBuf::of(req.key);
+            let key = key.get();
 
             let existing = store.get(key).map(|(_, r)| r);
             if condition.refuses(existing) {
@@ -781,11 +744,6 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 };
             }
 
-            let body = if body_len == 0 {
-                &[][..]
-            } else {
-                core::slice::from_raw_parts(body_ptr as *const u8, body_len as usize)
-            };
             match store.put(key, body) {
                 Ok(rev) => {
                     TLM_PUTS = TLM_PUTS.wrapping_add(1);
@@ -793,12 +751,11 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                     // Ordering holds; survival does not, and saying otherwise
                     // would let a caller conclude a write outlived a power cut.
                     write_fence(
+                        arg,
                         Fence::RevisionMonotone {
                             source: STORE_SOURCE,
                             revision: rev,
                         },
-                        fence_ptr,
-                        fence_cap,
                     );
                     notify(key);
                     0
@@ -807,7 +764,10 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             }
         }
         obj_op::GET => {
-            let Some((val, rev)) = store.get(a) else {
+            let Some(key) = obj_op::key::parse(arg) else {
+                return errno::EINVAL;
+            };
+            let Some((val, rev)) = store.get(key) else {
                 return errno::ENXIO;
             };
             let vlen = val.len();
@@ -820,11 +780,10 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             reads[idx].val_len = vlen as u16;
             reads[idx].val[..vlen].copy_from_slice(val);
             reads[idx].revision = rev;
-            tag_fd(FD_TAG_STORAGE_OBJECT, idx as i32)
+            idx as i32
         }
         obj_op::RANGE_GET => {
-            // [offset:u64][length:u32][out_ptr:u64]
-            let idx = slot_of(handle) as usize;
+            let idx = handle as usize;
             let reads = &*core::ptr::addr_of!(READS);
             if handle < 0
                 || idx >= reads.len()
@@ -832,83 +791,61 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             {
                 return errno::ENOSYS;
             }
-            let Some(offset) = get_u64(a, 0).map(|v| v as usize) else {
-                return errno::EINVAL;
-            };
-            let Some(length) = get_u32(a, 8).map(|v| v as usize) else {
-                return errno::EINVAL;
-            };
-            let Some(out_ptr) = get_u64(a, 12) else {
+            let Some(offset) = obj_op::range_get::parse(arg) else {
                 return errno::EINVAL;
             };
             let val = &reads[idx].val[..reads[idx].val_len as usize];
-            if offset >= val.len() {
+            let Some(tail) = usize::try_from(offset).ok().and_then(|o| val.get(o..)) else {
                 return 0;
-            }
-            let end = (offset + length).min(val.len());
-            let n = end - offset;
-            core::ptr::copy_nonoverlapping(val[offset..end].as_ptr(), out_ptr as *mut u8, n);
+            };
+            let out = data.as_mut();
+            let n = tail.len().min(out.len());
+            out[..n].copy_from_slice(&tail[..n]);
             n as i32
         }
         obj_op::HEAD => {
-            // [key_len:u16][key][out_ptr:u64][out_cap:u32][fence_ptr:u64][fence_cap:u16]
-            let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some(key) = obj_op::head::parse_request(arg) else {
                 return errno::EINVAL;
             };
-            if a.len() < 2 + kl {
-                return errno::EINVAL;
-            }
-            let Some((fptr, fcap)) = fence_out(a, 2 + kl + 12) else {
-                return errno::EINVAL;
-            };
-            let Some((val, rev)) = store.get(&a[2..2 + kl]) else {
+            let Some((val, rev)) = store.get(key) else {
                 return errno::ENXIO;
             };
             let vlen = val.len();
-            let out_ptr = get_u64(a, 2 + kl).unwrap_or(0);
-            let out_cap = get_u32(a, 2 + kl + 8).unwrap_or(0) as usize;
-            // [size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]
-            // [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8],
-            // the last three all zero: this store keeps none of them.
-            let mut rec = [0u8; 8 + 8 + 1 + 1 + 32 + obj_op::KEPT_FIXED_LEN];
-            rec[0..8].copy_from_slice(&(vlen as u64).to_le_bytes());
-            rec[17] = 32;
-            rec[18..50].copy_from_slice(&etag_from_rev(rev));
-            // The count returned is the count written: a record that does not
-            // fit is refused, not reported as delivered.
-            if out_ptr == 0 {
+            let Some(area) = obj_op::head::answer_area(arg) else {
                 return errno::EINVAL;
-            }
-            if rec.len() > out_cap {
+            };
+            // No content type, no clock, and none of the `Kept` fields: this
+            // store keeps none of them. The count returned is the count
+            // written: a record that does not fit is refused, not reported
+            // as delivered.
+            let Some(n) = obj_op::range::encode_head(
+                area,
+                vlen as u64,
+                0,
+                &[],
+                &etag_from_rev(rev),
+                obj_op::Kept::none(),
+            ) else {
                 return errno::ENOMEM;
-            }
-            core::ptr::copy_nonoverlapping(rec.as_ptr(), out_ptr as *mut u8, rec.len());
+            };
             write_fence(
+                arg,
                 Fence::ViewConsistent {
                     source: STORE_SOURCE,
                     revision: store.revision,
                 },
-                fptr,
-                fcap,
             );
-            rec.len() as i32
+            n as i32
         }
         obj_op::DELETE => {
-            // [key_len:u16][key][precondition:u8][etag_len:u8][etag]
-            // [fence_ptr:u64][fence_cap:u16]
-            let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some(req) = obj_op::delete::parse_request(arg) else {
                 return errno::EINVAL;
             };
-            let Some(key) = a.get(2..2 + kl) else {
+            let Some(condition) = read_condition(req.precondition, req.etag) else {
                 return errno::EINVAL;
             };
-            let mut p = 2 + kl;
-            let Some(condition) = read_condition(a, &mut p) else {
-                return errno::EINVAL;
-            };
-            let Some((fptr, fcap)) = fence_out(a, p) else {
-                return errno::EINVAL;
-            };
+            let key = KeyBuf::of(req.key);
+            let key = key.get();
             if condition.refuses(store.get(key).map(|(_, r)| r)) {
                 return errno::EAGAIN;
             }
@@ -916,12 +853,11 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let rev = deleted.unwrap_or(store.revision);
             TLM_DELS = TLM_DELS.wrapping_add(1);
             write_fence(
+                arg,
                 Fence::RevisionMonotone {
                     source: STORE_SOURCE,
                     revision: rev,
                 },
-                fptr,
-                fcap,
             );
             // Deleting an absent key moved nothing, so there is nothing to
             // ring for.
@@ -932,15 +868,14 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
         }
         obj_op::LIST => {
             TLM_LISTS = TLM_LISTS.wrapping_add(1);
-            let Some(req) = obj_op::list::parse_request(a) else {
+            let Some(req) = obj_op::list::parse_request(arg) else {
                 return errno::EINVAL;
             };
             let after = match list_cursor(req.cursor, req.prefix) {
                 Ok(after) => after,
                 Err(e) => return e,
             };
-            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
-            let mut page = obj_op::list::PageWriter::new(out, req.max_keys);
+            let mut page = obj_op::list::PageWriter::new(data.as_mut(), req.max_keys);
             // Bounded by `max_keys` steps of one object-table pass each.
             let mut last = [0u8; STORAGE_KEY_MAX];
             let mut last_len = 0usize;
@@ -979,17 +914,16 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 return errno::ENOMEM;
             };
             write_fence(
+                arg,
                 Fence::ViewConsistent {
                     source: STORE_SOURCE,
                     revision: store.revision,
                 },
-                req.fence_out_ptr,
-                req.fence_out_cap,
             );
             n as i32
         }
         obj_op::CLOSE => {
-            let idx = slot_of(handle) as usize;
+            let idx = handle as usize;
             let reads = &mut *core::ptr::addr_of_mut!(READS);
             if handle >= 0
                 && idx < reads.len()
@@ -1184,37 +1118,51 @@ unsafe fn since_page(store: &Store, prefix: &[u8], since: u64, out: &mut [u8]) -
 }
 
 /// `storage.namespace` dispatch.
-///
-/// # Safety
-/// Single-threaded platform dispatch; `arg` must be null or valid for
-/// `arg_len` bytes.
-pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub fn dispatch_namespace(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     if !node_caller() {
         return errno::EACCES;
     }
+    // SAFETY: single-threaded platform dispatch owns the store's tables.
+    unsafe { namespace_call(handle, opcode, arg, data) }
+}
+
+/// Whether `handle` names a subscription the calling module occupancy
+/// opened.
+///
+/// # Safety
+/// Single-threaded platform dispatch.
+unsafe fn callers_sub(handle: i32) -> bool {
+    let idx = handle as usize;
+    let subs = &*core::ptr::addr_of!(SUBS);
+    handle >= 0
+        && idx < subs.len()
+        && opened_by_caller(subs[idx].in_use, subs[idx].opener)
+        && caller_occupancy() == Some((subs[idx].module, subs[idx].generation))
+}
+
+/// # Safety
+/// Single-threaded platform dispatch.
+unsafe fn namespace_call(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     let Some(store) = store_ref() else {
         return errno::ENOSYS;
-    };
-    let a = if arg.is_null() {
-        &[][..]
-    } else {
-        core::slice::from_raw_parts(arg, arg_len)
     };
 
     telemetry(store);
     match opcode {
-        ns_op::CAPS => (ns_op::caps::SUBSCRIBE | ns_op::caps::CHANGES) as i32,
+        ns_op::CAPS => crate::abi::kernel_abi::caps_word::answer(
+            arg,
+            ns_op::caps::SUBSCRIBE | ns_op::caps::CHANGES,
+        ),
         ns_op::LIST => {
             TLM_LISTS = TLM_LISTS.wrapping_add(1);
-            let Some(req) = ns_op::list::parse_request(a) else {
+            let Some(req) = ns_op::list::parse_request(arg) else {
                 return errno::EINVAL;
             };
             let after = match list_cursor(req.cursor, req.prefix) {
                 Ok(after) => after,
                 Err(e) => return e,
             };
-            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
-            let mut page = ns_op::list::PageWriter::new(out);
+            let mut page = ns_op::list::PageWriter::new(data.as_mut());
             let mut last = [0u8; STORAGE_KEY_MAX];
             let mut last_len = 0usize;
             let mut more = false;
@@ -1247,53 +1195,29 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
                 return errno::ENOMEM;
             };
             write_fence(
+                arg,
                 Fence::ViewConsistent {
                     source: STORE_SOURCE,
                     revision: store.revision,
                 },
-                req.fence_out_ptr,
-                req.fence_out_cap,
             );
             n as i32
         }
         ns_op::SUBSCRIBE => {
-            let Some(req) = ns_op::subscribe::parse(a) else {
+            let Some(req) = ns_op::subscribe::parse(arg) else {
                 return errno::EINVAL;
             };
             let pl = req.prefix.len();
             if pl > STORAGE_KEY_MAX {
                 return errno::EINVAL;
             }
-            // The event must be the calling module's own: a subscription
-            // never wakes anybody but its subscriber.
-            let (Some(event), Some((module, generation))) =
-                (event_slot(req.event), caller_occupancy())
-            else {
+            let Some((module, generation)) = caller_occupancy() else {
                 return errno::EINVAL;
             };
-            if event_owner(event) != Some(module) {
-                return errno::EINVAL;
-            }
             let opener = crate::kernel::exec::scheduler::caller_owner();
             let ring_now = req.flags & ns_op::subscribe::FLAG_RING_NOW != 0;
 
             let subs = &mut *core::ptr::addr_of_mut!(SUBS);
-            // Idempotent on (owner, occupancy, event, prefix): a module that
-            // re-runs its subscribe path gets the handle it already holds,
-            // not a second slot.
-            if let Some(idx) = subs.iter().position(|s| {
-                s.in_use
-                    && s.opener == opener
-                    && s.module == module
-                    && s.generation == generation
-                    && s.event == event
-                    && &s.prefix[..s.prefix_len as usize] == req.prefix
-            }) {
-                if ring_now {
-                    ring(&mut subs[idx]);
-                }
-                return tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32);
-            }
             // Every caller here acts with the node's authority
             // (`node_caller`), so the pool's ceiling is the one quota; dead
             // stamps are swept before it refuses.
@@ -1312,101 +1236,64 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             subs[idx].opener = opener;
             subs[idx].module = module;
             subs[idx].generation = generation;
-            subs[idx].event = event;
             subs[idx].prefix_len = pl as u16;
             subs[idx].prefix[..pl].copy_from_slice(req.prefix);
-            // Bit 0 rings once now. The subscriber reads what the prefix
-            // holds itself, with `CHANGES` from the empty token.
-            if ring_now {
-                ring(&mut subs[idx]);
-            }
-            tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)
+            // Bit 0 rings once, as soon as the doorbell is bound. The
+            // subscriber reads what the prefix holds itself, with `CHANGES`
+            // from the empty token.
+            subs[idx].ring_owed = ring_now;
+            idx as i32
         }
-        ns_op::TAKE_RUNG => {
-            let Some(req) = ns_op::take::parse(a) else {
+        // The doorbell of the subscription the kernel just wrapped.
+        crate::abi::kernel_abi::doorbell::BIND_DOORBELL => {
+            let Some((doorbell, _)) = crate::abi::kernel_abi::doorbell::parse_bind(arg) else {
                 return errno::EINVAL;
             };
-            let (Some(event), Some((module, generation))) =
-                (event_slot(req.event), caller_occupancy())
-            else {
-                return errno::EINVAL;
-            };
-            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
-            let Some(mut answer) = ns_op::take::Writer::new(out) else {
-                return errno::ENOMEM;
-            };
-            let opener = crate::kernel::exec::scheduler::caller_owner();
-            // The caller's subscriptions on an event slot it no longer owns
-            // are dead — the slot is somebody else's now, or free — and are
-            // dropped rather than named.
-            let owned = event_owner(event) == Some(module);
             let subs = &mut *core::ptr::addr_of_mut!(SUBS);
-            let mut more = false;
-            for (idx, s) in subs.iter_mut().enumerate() {
-                // Only subscriptions this occupancy opened on this event are
-                // visible; anybody else's are as if not open.
-                if !s.in_use
-                    || s.event != event
-                    || s.opener != opener
-                    || s.module != module
-                    || s.generation != generation
-                {
-                    continue;
-                }
-                if !owned {
-                    drop_sub(s);
-                    continue;
-                }
-                if !s.rung {
-                    continue;
-                }
-                if !answer.push(tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)) {
-                    more = true;
-                    break;
-                }
-                s.rung = false;
+            let Some(s) = usize::try_from(handle)
+                .ok()
+                .and_then(|i| subs.get_mut(i))
+                .filter(|s| s.in_use && s.doorbell < 0)
+            else {
+                return errno::EBADF;
+            };
+            s.doorbell = doorbell as i32;
+            if core::mem::take(&mut s.ring_owed) {
+                ring(s);
             }
-            if more {
-                // The remainder keep their bits; signal again so the caller
-                // takes them on its next wake. The caller owns the event
-                // (`owned`), and is the one calling, so it is live.
-                let _ = event_signal(event);
-            }
-            answer.finish(more) as i32
+            0
         }
         ns_op::CHANGES => {
-            let Some(req) = ns_op::changes::parse_request(a) else {
+            // The handle is the subscription the read serves, or -1. This
+            // store reads RAM inside the call and never answers EAGAIN, so it
+            // has no subscription to re-ring; it still refuses a handle that
+            // is not one of the caller's.
+            if handle != -1 && !callers_sub(handle) {
+                return errno::EBADF;
+            }
+            let Some(req) = ns_op::changes::parse_request(arg) else {
                 return errno::EINVAL;
             };
-            // `req.sub` names the subscription to re-ring after an EAGAIN;
-            // this store reads RAM inside the call and never answers one.
-            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
-            let rc = changes_page(store, req.prefix, req.token, out);
+            let rc = changes_page(store, req.prefix, req.token, data.as_mut());
             if rc >= 0 {
                 write_fence(
+                    arg,
                     Fence::ViewConsistent {
                         source: STORE_SOURCE,
                         revision: store.revision,
                     },
-                    req.fence_out_ptr,
-                    req.fence_out_cap,
                 );
             }
             rc
         }
         ns_op::LOOKUP | ns_op::STAT => errno::ENOSYS,
         ns_op::CLOSE => {
-            let idx = slot_of(handle) as usize;
-            let subs = &mut *core::ptr::addr_of_mut!(SUBS);
             // The opening module occupancy as well as its owner: the node's
             // modules share one owner, and a stale handle number another
             // module now holds must not close that module's subscription.
-            if handle >= 0
-                && idx < subs.len()
-                && opened_by_caller(subs[idx].in_use, subs[idx].opener)
-                && caller_occupancy() == Some((subs[idx].module, subs[idx].generation))
-            {
-                subs[idx] = SUB_EMPTY;
+            if callers_sub(handle) {
+                let subs = &mut *core::ptr::addr_of_mut!(SUBS);
+                subs[handle as usize] = SUB_EMPTY;
             }
             0
         }

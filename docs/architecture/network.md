@@ -125,63 +125,55 @@ which keeps the stream aligned. The SDK helpers
 dropped frame's length so a consumer of a reliable stream can treat it
 as a lost frame and reconnect, where the plain reader logs it.
 
+Every record has exactly one length. The contract's accessors
+(`net_proto.rs`: `accepted_parts`, `connected_parts`, `bound_parts`,
+`error_parts`, `bind_parts`, `close_parts`, `read_connect_to`, …) answer
+`None` for any other, and a provider drops or refuses such a record rather
+than reading a field out of an adjacent byte.
+
 ### Upstream messages (consumer → provider)
 
 | Type | Name | Payload |
 |------|------|---------|
-| `0x10` | `CMD_BIND` | `[port: u16 LE]` — open a listener |
-| `0x11` | `CMD_SEND` | `[conn_id: u16 LE][data…]` — send bytes on a connection |
-| `0x12` | `CMD_CLOSE` | `[conn_id: u16 LE]` — tear down a connection |
-| `0x13` | `CMD_CONNECT` | reserved, unsupported — every provider answers `MSG_ERROR` ENOSYS on the requester tag |
-| `0x14` | `CMD_CONNECT_TO` | `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u16 LE?]` |
-| `0x18` | `CMD_RESEND` | `[conn_id: u16 LE][seq: u32 LE][data…]` — retained bytes again at their own sequence numbers |
-| `0x19` | `CMD_DELIVERED` | `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE]` (`DELIVERED_LEN`) — the consumer has consumed the connection's first `in_bytes` clear bytes and stands at its cursor (opaque to the transport) there; kept with the byte and handed to a consumer that resumes the stream after a takeover (`MSG_RESUMED`), redelivery starting at that byte |
+| `0x10` | `CMD_BIND` | `[port: u16 LE][flags: u8]` — open a listener; `flags` asks for sidebands on every connection it accepts |
+| `0x11` | `CMD_SEND` | `[conn_id: u16 LE][data…]` — send bytes on a connection (at least one) |
+| `0x12` | `CMD_CLOSE` | `[conn_id: u16 LE][how: u8]` — `how` 0 closes in order (FIN after everything queued), 1 (`CLOSE_ABORT`) resets |
+| `0x13` | `CMD_CONNECT_TO` | `[sock_type: u8][flags: u8][af: u8][port: u16 LE][addr…][requester_tag: u16 LE]` |
 
 `CMD_CONNECT_TO` carries one of three address families: `AF_INET` (4,
 `addr` is 4 bytes in network order), `AF_INET6` (6, 16 bytes), or
 `AF_NAME` (1, `[len: u8][name: len bytes]` — a DNS name of 1..=253 ASCII
 bytes, resolved by the provider). It accepts only `SOCK_TYPE_STREAM`
-(1); any other `sock_type`, a malformed name, or a family the provider
-does not serve fails with EINVAL on the requester tag, and a name that
-does not resolve fails with ENOENT. The trailing `requester_tag` is
-optional (absent means tag 0) and is echoed back in `MSG_CONNECTED`; see
-§Fan-out and filtering. See §Connecting by name for the parameter that
-feeds this record.
-
-The `data` portion of one `CMD_SEND` must not exceed `MAX_CMD_DATA`
-(8192 bytes); a consumer with more bytes issues multiple `CMD_SEND`s and
-the provider re-segments to MSS on the wire.
+(1); any other `sock_type`, a flag bit outside the requestable ones, a
+malformed name, or a family the provider does not serve fails with EINVAL
+on the requester tag, and a name that does not resolve fails with ENOENT.
+The `requester_tag` is always present (0 for a consumer that does not
+filter) and is echoed back in `MSG_CONNECTED`; see §Fan-out and
+filtering. See §Connecting by name for the parameter that feeds this
+record.
 
 ### Downstream messages (provider → consumer)
 
 | Type | Name | Payload |
 |------|------|---------|
-| `0x01` | `MSG_ACCEPTED` | `[conn_id: u16 LE][local_port: u16 LE]` — inbound connection established |
+| `0x01` | `MSG_ACCEPTED` | `[conn_id: u16 LE][local_port: u16 LE][flags_granted: u8][generation: u16 LE][alpn_len: u8][alpn…]` — inbound connection established |
 | `0x02` | `MSG_DATA` | `[conn_id: u16 LE][data…]` — received bytes |
 | `0x03` | `MSG_CLOSED` | `[conn_id: u16 LE][kind: u8]` — `kind` 1 (`CLOSED_PEER_FIN`): the peer finished sending, the connection is still writable and its id held; 2 (`CLOSED_GONE`): the connection is gone (reset, aborted, timed out or released) |
-| `0x04` | `MSG_BOUND` | `[conn_id: u16 LE][local_port: u16 LE]` — listener ready |
-| `0x05` | `MSG_CONNECTED` | `[conn_id: u16 LE][requester_tag: u16 LE]` — outbound connection established |
-| `0x06` | `MSG_ERROR` | `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE?]` |
-| `0x07` | `MSG_RETRANSMIT` | `[conn_id: u16 LE][from_seq: u32 LE]` — send retained bytes again from `from_seq` |
-| `0x08` | `MSG_ACK` | `[conn_id: u16 LE][acked_seq: u32 LE][isn: u32 LE]` — the peer has everything before `acked_seq` |
-| `0x09` | `MSG_TRACE_CTX` | `[conn_id: u16 LE][trace_id: 16][parent_span_id: 8][trace_flags: u8]` |
-| `0x0A` | `MSG_PEER` | `[conn_id: u16 LE][family: u8][addr: 16][port: u16 LE]` — who is at the other end, sent once before the stream's first `MSG_DATA` |
-| `0x0B` | `MSG_HORIZON` | `[conn_id: u16 LE][bytes_through: u64 LE]` — the consumer's clear bytes on the wire (under a crash-continuous pair, held by the standby first); from a record layer that opts in (`tls`'s `write_horizon`) |
-| `0x0C` | `MSG_RESUMED` | `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE][out_bytes: u64 LE]` (`RESUMED_LEN`) — the stream was resumed here by a continuity takeover: the predecessor consumer's last `CMD_DELIVERED` cursor and byte (both 0 when none was mirrored; redelivery starts at byte `in_bytes`) and its output horizon, after `MSG_PEER` and before any data |
+| `0x04` | `MSG_BOUND` | `[conn_id: u16 LE][local_port: u16 LE][flags_granted: u8]` — listener ready |
+| `0x05` | `MSG_CONNECTED` | `[conn_id: u16 LE][requester_tag: u16 LE][flags_granted: u8][generation: u16 LE][alpn_len: u8][alpn…]` — outbound connection established |
+| `0x06` | `MSG_ERROR` | `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE]` — tag 0 for an established connection's or a bind's error |
+| `0x07` | `MSG_PEER` | `[conn_id: u16 LE][family: u8][addr: 16][port: u16 LE]` — who is at the other end, sent once before the stream's first `MSG_DATA` |
 
-A stage that numbers sessions (`tls`) appends `[generation: u16 LE]` to
-`MSG_ACCEPTED` and `MSG_CONNECTED` (`put_session_generation`), and a
-consumer that binds work to a session (`remote_channel`) reads it back
-(`session_generation`), so it can tell a connection id's current session
-from a closed one's. After the generation comes `[alpn_len: u8][alpn…]`,
-the application protocol the stage negotiated (`put_session_alpn` /
-`session_alpn`; length 0 for none): an HTTP client reads `h2` there and
-runs HTTP/2 streams over the connection, `http/1.1` or nothing and it
-speaks HTTP/1.1. `tls` configures what it offers (client) and selects from
-in its own preference order (server) with `alpn` — a name or a list,
-`h2,http/1.1` when unset (`http/1.1` under `alpn_h1_only`). A port-less
-`MSG_ACCEPTED` (a sole consumer whose bind `tls` never saw) carries
-neither.
+`generation` and `alpn` are a session stage's facts: a transport writes 0
+and an empty name. A stage that numbers sessions (`tls`) writes the
+session's number, and a consumer that binds work to a session
+(`remote_channel`) reads it back, so it can tell a connection id's current
+session from a closed one's. `alpn` is the application protocol the stage
+negotiated: an HTTP client reads `h2` there and runs HTTP/2 streams over
+the connection, `http/1.1` or nothing and it speaks HTTP/1.1. `tls`
+configures what it offers (client) and selects from in its own preference
+order (server) with `alpn` — a name or a list, `h2,http/1.1` when unset
+(`http/1.1` under `alpn_h1_only`).
 
 `tls` holds a dial's `MSG_CONNECTED` until the handshake completes, so a
 dial that never completes one is answered as a failed connect — a tagged
@@ -195,50 +187,111 @@ or `AF_INET6`; for a dial to a service address it names that address, not
 the backend it was translated to, and a stage that relabels connection ids
 re-emits it under its own.
 
-`MSG_RETRANSMIT`, `MSG_ACK`, `CMD_RESEND` and `CMD_DELIVERED` are SDK
-constants (`net_proto.rs`, with `ack_parts` / `retransmit_parts` and the
-payload lengths), shared by every stage rather than private to `ip` and
-`tls`: any stage that
-retains its own send bytes, or defers its delivery horizon to its consumer,
-speaks them, and one that does not drops them as unknown opcodes. The IP
-module does not retain TCP payload for retransmission;
-the consumer does, if it wants to. `MSG_ACK` lets the consumer truncate
-its send buffer; `MSG_RETRANSMIT` fires on fast-retransmit or RTO and
-asks the consumer to re-supply bytes from an absolute TCP sequence
-number. The TLS module uses this to hold encrypted records until they
-are acknowledged; see `security.md`. `MSG_ACK` carries a third field,
-`[isn: u32 LE]`, the sequence number of the stream's first byte (ISS + 1),
-so a consumer that counted the bytes it handed down places them in
-sequence space at the first report, whatever it sent before that report
-reached it. `ip` reports from the segment that moves `SND.UNA`, straight
-onto an idle channel (an acknowledgement is cumulative, so a report never
-takes a place in the lane's event queue); one a full channel refused is
-reported again by the timer sweep, and one is always queued ahead of a
-`MSG_RETRANSMIT`. The consumer answers `MSG_RETRANSMIT` with `CMD_RESEND`
-(0x18, `[conn_id: u16 LE][seq: u32 LE][data…]`): bytes it already handed
-down, which `ip` sends again at their own sequence numbers — the part in
-`[SND.UNA, SND.NXT)`, up to one segment — rather than allocating them as
-new data. `MSG_RETRANSMIT` fires on duplicate ACKs (three, or with two or
-three segments outstanding one fewer than outstanding — early retransmit,
-RFC 5827, since `tls`'s 4 KiB window seldom has four out), on the RTO, and
-on each partial acknowledgement in recovery (RFC 6582), so a burst the peer
-dropped part of comes back hole by hole. The RTO is RFC 6298's, in
+### Sidebands
+
+What only particular pairs of stages share does not ride `net_proto`
+itself. Each is a surface of its own in the `net_tlv` msgset, with a
+dense range of values the registry declares, carried on the stream's own
+channel in order with it — the ordering against `MSG_ACCEPTED` and
+`MSG_DATA` is load-bearing. A connection carries a sideband only when its
+consumer asked for it (`flags` on `CMD_BIND` / `CMD_CONNECT_TO`) and the
+provider granted it (`flags_granted` on `MSG_BOUND` / `MSG_ACCEPTED` /
+`MSG_CONNECTED`); a listener's grant carries to every connection it
+accepts, and a provider grants only what it serves.
+
+| Bit | Surface | Frames |
+|-----|---------|--------|
+| `TRACE` 0x01 | `stream_trace` | `0xD3` `MSG_TRACE_CTX` `[conn_id][trace_id: 16][parent_span_id: 8][trace_flags: u8]` |
+| `CURSORS` 0x02 | `stream_cursor` | `0xD4` `MSG_CURSOR_HORIZON` `[conn_id][bytes_through: u64]`; `0xD5` `MSG_CURSOR_RESUMED` `[conn_id][consumer_cursor: u64][in_bytes: u64][out_bytes: u64]`; `0xD6` `CMD_CURSOR_DELIVERED` `[conn_id][consumer_cursor: u64][in_bytes: u64]` |
+| `RETX` 0x04 (granted, never asked) | `stream_retx` | `0xD0` `MSG_RETX_ACK` `[conn_id][acked_seq: u32][isn: u32]`; `0xD1` `MSG_RETX_REQUEST` `[conn_id][from_seq: u32]`; `0xD2` `CMD_RETX_RESEND` `[conn_id][seq: u32][data…]` |
+
+An undefined bit in a request is refused EINVAL. Every consumer on a
+fanned channel skips a message type it does not know and a `conn_id` it
+does not hold: another consumer's connection, its data and its sidebands
+are not its business.
+
+**Trace.** The transport mints a connection's W3C trace context and hands
+it up right after `MSG_ACCEPTED` / `MSG_PEER`, before the first data,
+queued like a control frame; each forwarding stage (`tls`) re-emits it with
+its own span id so the next stage parents its span correctly. A
+connection without `TRACE` never sees one.
+
+**Cursors.** A record layer (`tls`) reports the output horizon — the
+consumer's clear bytes on the wire, under a crash-continuous pair held by
+the standby first — and holds a delivery as unconsumed until the consumer
+acknowledges it (`CMD_CURSOR_DELIVERED`). After a continuity takeover the
+resuming consumer gets `MSG_CURSOR_RESUMED`: its predecessor's last
+cursor and byte and the output horizon, after `MSG_PEER` and before any
+data (§Transport continuity).
+
+**Retransmission.** The transport retransmits from its own copy of what
+each connection sent, except where every consumer of its output keeps its
+own copy (§Send retention).
+
+### Send retention
+
+`ip` owns TCP retransmission for every connection. A connection takes a
+send buffer from one byte pool of fixed blocks (`tcp_send_buf` bytes each:
+1460 on RP2040, 2920 on RP2350, 64 KiB on aarch64; on aarch64 the blocks
+come from the elastic region on demand, on the RPs from the module heap)
+when a burst starts and returns it once everything in it is acknowledged.
+Bytes enter the block when they are first sent; in flight is the least of
+the block, the congestion window and the peer's window; duplicate ACKs
+(three, or one fewer than outstanding with two or three segments out —
+early retransmit, RFC 5827), the RTO and each partial acknowledgement in
+recovery (RFC 6582) resend from it at the bytes' own sequence numbers. A
+send with no block to take, or a full one, waits in its lane's command
+stash, which stops the lane reading commands until it drains — the same
+back-pressure a full NIC ring applies. The RTO is RFC 6298's, in
 milliseconds of the module's clock: SRTT and RTTVAR from Karn-filtered
-samples (a segment's send to the acknowledgement covering it), RTO = SRTT +
-max(G, 4·RTTVAR) with G the 50 ms sweep window, one second before any
-sample and never below it, doubled on each expiry up to sixty seconds. A
-lost tail waits one RTO — a second on a fast path.
+samples, RTO = SRTT + max(G, 4·RTTVAR) with G the 50 ms sweep window, one
+second before any sample and never below it, doubled on each expiry up to
+sixty seconds.
 
-The `data` portion of one `MSG_DATA` frame never exceeds
-`MAX_DATA_FRAGMENT` (1460 bytes, one TCP MSS), so a consumer may size
-its frame scratch to `FRAME_HDR + CONN_ID_LEN + MAX_DATA_FRAGMENT` and
-be sure a whole frame always fits.
+A consumer that already keeps what it sends — `tls`, whose retransmission
+window holds the encrypted records — declares `retains_send` on its input
+port. The composer marks every edge into such a port (graph edge byte 9
+bit 1), the kernel carries the mark through a fan only when every fanned
+edge has it, and `ip` reads it for its own channel with `channel::FACTS`.
+On such a channel `ip` keeps no copy: it grants `RETX`, reports each
+movement of `SND.UNA` (`MSG_RETX_ACK`, whose `isn` places the consumer's
+bytes in sequence space however many it sent before the first report),
+and on the same triggers asks for the bytes again (`MSG_RETX_REQUEST`,
+always after the acknowledgement that places it); the consumer answers
+with `CMD_RETX_RESEND`, which `ip` sends at its own sequence numbers — the
+part in `[SND.UNA, SND.NXT)`, up to one segment — without allocating it as
+new data. A connection without the grant is never sent a `stream_retx`
+frame, and its consumer keeps nothing. `linux_net` never grants `RETX`:
+the host's TCP retains. Workload lanes are never marked; `ip` retains for
+them.
 
-`MSG_TRACE_CTX` carries W3C trace context for a connection. The ingress
-emits it right after `MSG_ACCEPTED`, and each forwarding stage (TLS)
-re-emits it with its own span id so the next stage parents its span
-correctly. It is best-effort (dropped if the channel is full) and a
-stage that does not trace discards it like any unknown frame.
+The pool is `tcp_send_pool` bytes, as many blocks as it holds, and the
+composer derives it from the graph (`send_pool_param` on the port): none
+where every consumer of `ip.net_out` retains (`retains_send`) or opens no
+stream (`datagram_only` on its input — `dns`, `quic`, `sntp`) and `ip`
+serves no workload lane, else the default pool's blocks of the instance's
+`tcp_send_buf`. On the RPs the heap grows by the pool, so a datagram-only
+graph pays nothing for it. `tcp_send_buf: 0` or `tcp_send_pool: 0` gives
+`ip` no blocks. The composer refuses either when a consumer of `ip.net_out`
+leaves retention to it (`send_buffer_param`, `send_pool_param` on the
+port), and at run time a bind or dial that was not granted `RETX` is
+refused EOPNOTSUPP. A continuity checkpoint of a connection `ip` retains
+for carries its unacknowledged bytes (§Transport continuity).
+
+### Record bounds
+
+No constant bounds a record on these surfaces. Every port that writes
+them declares the largest frame it writes, header included
+(`max_record`), and every port that reads them the largest it accepts
+(`accepts_record`); a `NetProto` port must declare its figure. The module
+states the same figure in `module_facts!` (`records:`), which is what its
+code sizes its scratch and chunks its data by, and `fluxor modules pack`
+refuses a build whose manifest says otherwise. The composer refuses every
+wiring edge — each consumer of a fan separately — whose producer may write
+more than its consumer accepts. The transports write `net_out` records of
+at most 1483 bytes (a `MSG_DATA` of one 1460-byte MSS, an IPv4
+`MSG_DG_RX_FROM` of 1472); `ip.net_in` accepts 1603 on the RPs and 8195
+on aarch64, `linux_net`'s 49155.
 
 ### Connection identity
 
@@ -308,8 +361,8 @@ address-bearing key on a connector, and a `u32` parameter given a string
 with a dot that is not a dotted quad — a host name on an address field —
 is an error, never a hash.
 
-The wire record is `CMD_CONNECT_TO` (0x14) in the table above:
-`[sock_type][af][port][addr…][tag?]`, with `AF_INET`, `AF_INET6` and
+The wire record is `CMD_CONNECT_TO` (0x13) in the table above:
+`[sock_type][flags][af][port][addr…][tag]`, with `AF_INET`, `AF_INET6` and
 `AF_NAME`. The SDK's `Target::parse` turns an authority into the target
 and its port, recognising literals as literals, and `write_connect_to`
 composes the record.
@@ -331,7 +384,7 @@ the only target every provider dials.
 Errors are synchronous or tagged, never a timeout: a name over 253 bytes,
 a malformed record, or a family the provider does not serve is EINVAL at
 the connect; a name that does not resolve is ENOENT on the requester
-tag; the unsupported `CMD_CONNECT` (0x13) is ENOSYS. The `ip` stub resolver
+tag. The `ip` stub resolver
 holds names whole up to the contract's 253 bytes. A misconfigured graph
 fails its first dial with a reason.
 
@@ -530,7 +583,8 @@ see only the frames they receive on their channels.
 Every TCP connection delivers into the same consumer ring (`net_out`), so
 receive windows are sized against that ring. After each delivery, and
 from the timer sweep for a window that backpressure closed, the module
-asks the kernel how many bytes the ring can take (`IOCTL_WRITABLE`) and
+asks the kernel how many bytes the ring can take (the channel's `WRITABLE`
+op) and
 computes each connection's share: an equal part of that room among the
 connections that received in the current or previous 50 ms epoch, less
 1/16 for `MSG_DATA` framing, capped at `MAX_RCV_WND` (4 KiB on aarch64,
@@ -1039,7 +1093,8 @@ replies and the defence of the address against a competing claim (a fenced
 address is not defended — its next owner may claim it). `MSG_ADDR_FENCED`
 reports the cutoff index and what the boundary is worth. After closing
 the gate the module asks the frame channel's reader — the NIC driver —
-to drain, over the `tx_drain` channel ioctl (`net::identity::tx_drain`):
+to drain, through the `net_tx_drain` edge contract's `DRAINED` op, bound
+through the frame port (`net::identity::tx_drain`):
 a driver that owns its transmit ring answers `EAGAIN` while any frame
 handed over is unread on the channel or unused by the hardware, then `0`
 with its completed transmit count, and the event goes out with
@@ -1175,8 +1230,8 @@ the small targets (`[type][len u16][plain]` after the partial record; type
 0xFF when not carried) — and the plaintext is held
 undelivered until the delta is acknowledged. What the clear-side consumer
 has consumed goes out as `DELTA_TLS_DELIVERED` (0x81, `[consumed u64]
-[consumer_cursor u64][cursor_at u64]`): with the `tls` parameter
-`delivery_ack` the consumer says so with `CMD_DELIVERED` (0x19, exactly
+[consumer_cursor u64][cursor_at u64]`): on a connection granted `CURSORS`
+the consumer says so with `CMD_CURSOR_DELIVERED` (0xD6, exactly
 `[conn_id][consumer_cursor u64][in_bytes u64]`: it has consumed the
 stream's first `in_bytes` clear bytes and stands at that cursor of its own
 there), otherwise a delivery handed up counts as consumed. `tls` counts as
@@ -1189,8 +1244,8 @@ the clear bytes of the consumed records (`[consumer_cursor:8][cursor_at:8]
 mirrored, and the provider core carries them as `TsState::consumer_cursor`
 / `cursor_at` / `in_bytes` (the `DeliveryAck` delta `[cursor][consumer_cursor]
 [cursor_at]`). At ACTIVATE the standby's `tls` tells its consumer
-`MSG_RESUMED` (0x0C, `[conn_id][consumer_cursor u64][in_bytes u64]
-[out_bytes u64]`, `out_bytes` in `MSG_HORIZON`'s numbering) after the
+`MSG_CURSOR_RESUMED` (0xD5, `[conn_id][consumer_cursor u64][in_bytes u64]
+[out_bytes u64]`, `out_bytes` in `MSG_CURSOR_HORIZON`'s numbering) after the
 stream's `MSG_PEER` and before any of its data, and redelivers from exactly
 byte `in_bytes`: the first delivery it holds is trimmed by what of it was
 consumed, so an acknowledgement inside a record resumes inside it. The
@@ -1536,7 +1591,7 @@ buffers within:
   no acknowledgement; mirror abandoned`, metric `txrec_cap_abandoned`), as
   the redelivery caps are.
 - `tls` opens the next inbound record only once the consumption before it is
-  mirrored, with `delivery_ack` or without it (without it a delivery is
+  mirrored, with `CURSORS` or without it (without it a delivery is
   consumed when handed up), so the standby holds no more deliveries than the
   caps.
 - The provider takes a half's next frame only while the gate has credits
@@ -1566,7 +1621,7 @@ primary at 32, the pair kept; a crash there, and the standby answers every
 request byte-exactly.
 
 Deliveries the standby owes its worker: a record's unconsumed deliveries
-— handed to the primary's worker, never acknowledged by it (`delivery_ack`)
+— handed to the primary's worker, never acknowledged by it (`CURSORS`)
 — cross in the CT_TLS record (`[deliv_count:1][deliv_len:4]` after the
 sealed length, `deliv_count × [len:2][plaintext]` before the sealed set,
 `delivered_in` the consumed cursor), up to four whole records' plaintext
@@ -1642,7 +1697,7 @@ standby that takes it over answers the peer's retransmitted FIN and ends the
 quiet period at what remained of it. A KeyUpdate that does not name the
 object the standby holds is refused `DERIVE`. Quiescent means drained — nothing stashed below `ip`'s
 send window, nothing held in `tls` — not nothing in flight: `tls`'s
-retransmit window, anchored by `ip`'s `MSG_ACK` (above), holds exactly
+retransmit window, anchored by `ip`'s `MSG_RETX_ACK` (above), holds exactly
 `[SND.UNA, SND.NXT)`, so the cut carries the bytes in flight and the standby
 resends them from the window it imports. Sessions move in ESTABLISHED,
 CLOSE-WAIT, our own closing states and TIME-WAIT, over IPv4 and IPv6,
@@ -1682,6 +1737,18 @@ named `tc_flow_id_v6` (`0xF6` then the first fifteen bytes of a SHA-256 of
 the tuple: the tuple does not fit sixteen bytes), which `ip` and the
 contract compute alike, so the retired host's `ip` suppresses its reset for
 the moved flow by the same name.
+
+A connection `ip` retains for (§Send retention) carries its
+unacknowledged bytes in the FXTC record, after the IPv6 addresses:
+`[send_len u32][bytes from SND.UNA]`, at most one send block (1460 B on
+RP2040, 2920 B on RP2350, 16 KiB on aarch64; a cut with more in flight is
+`NOT_READY`). Send deltas carry each segment's bytes, and the standby's
+`ip` imports them into a block of its own pool, so after a takeover it
+retransmits them byte for byte from `SND.UNA`. A tls-paired flow — the
+one the anchor surface moves — carries an empty send section, since `tls`
+holds those bytes; the provider refuses a non-empty one there. The layout
+label (`TCP_CODEC_LAYOUT`, `...:timers:send`) is what PAIR_PREPARE binds,
+so a standby built with the old layout refuses to pair.
 
 ### QUIC under the anchor surface (`quic_continuity`)
 

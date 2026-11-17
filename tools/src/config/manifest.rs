@@ -898,6 +898,186 @@ fn validate_wiring_capacity(
     Ok(())
 }
 
+/// A module entry's value for `param`, at the top level or inside its
+/// `params:` wrapper.
+fn entry_param<'a>(module: &'a Value, param: &str) -> Option<&'a Value> {
+    module
+        .get(param)
+        .or_else(|| module.get("params").and_then(|p| p.get(param)))
+}
+
+/// Whether a consumer input leaves retention to the provider feeding it:
+/// it keeps no copy of what it sends (`retains_send`) and may open a stream
+/// (not `datagram_only`).
+fn leaves_retention(in_port: &crate::manifest::PortSpec) -> bool {
+    !in_port.retains_send && !in_port.datagram_only
+}
+
+/// Size every send pool from the graph (`send_pool_param` on an output).
+///
+/// An instance that sets the param keeps its figure. One that leaves it
+/// unset gets 0 when no consumer of the port leaves retention to it (each
+/// keeps its own copy, or opens no stream) and it serves no workload lane
+/// (`send_pool_lanes_param`, the graph's value else the schema default);
+/// otherwise the buffers its type's default pool holds, each of the
+/// instance's `send_buffer_param`. The value is written into the entry, so
+/// it is packed, and a `heap_per_param` rule over it grows the heap by it.
+/// `default_of(entry, param)` is the param's default in the module the
+/// entry is built from (its schema, for the target); a param with none
+/// refuses the graph, since no pool can be derived from a figure that
+/// does not exist.
+fn derive_send_pools(
+    modules: &mut [Value],
+    edges: &[(u16, u16, u8, u8, u8)],
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    default_of: &dyn Fn(&Value, &str) -> Option<u64>,
+) -> Result<()> {
+    for (i, name) in module_names.iter().enumerate() {
+        let Some(manifest) = manifests.get(name) else {
+            continue;
+        };
+        let Some(module) = modules
+            .iter_mut()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+        else {
+            continue;
+        };
+        let value_of = |module: &Value, param: &str| -> Result<u64> {
+            match entry_param(module, param) {
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    Error::Config(format!(
+                        "module `{name}`: `{param}` is not a count of bytes"
+                    ))
+                }),
+                None => default_of(module, param).ok_or_else(|| {
+                    Error::Config(format!(
+                        "module `{name}`: its port declares `{param}` for its send pool, but \
+                         the module has no such parameter to derive the pool from"
+                    ))
+                }),
+            }
+        };
+        for out_port in manifest.ports.iter().filter(|p| p.direction == 1) {
+            let (Some(pool_param), Some(buf_param)) = (
+                out_port.send_pool_param.as_deref(),
+                out_port.send_buffer_param.as_deref(),
+            ) else {
+                continue;
+            };
+            if entry_param(module, pool_param).is_some() {
+                continue;
+            }
+            let stream_consumer = edges.iter().any(|&(from, to, to_port, fpi, tpi)| {
+                from as usize == i
+                    && fpi == out_port.index
+                    && manifests
+                        .get(&module_names[to as usize])
+                        .and_then(|m| m.find_port_spec(if to_port == 1 { 2 } else { 0 }, tpi))
+                        .is_some_and(leaves_retention)
+            });
+            let lanes = match out_port.send_pool_lanes_param.as_deref() {
+                Some(p) => value_of(module, p)?,
+                None => 0,
+            };
+            let pool = if stream_consumer || lanes > 0 {
+                let missing = |param: &str| {
+                    Error::Config(format!(
+                        "module `{name}`: its port declares `{param}` for its send pool, but \
+                         the module has no such parameter to derive the pool from"
+                    ))
+                };
+                let pool_default =
+                    default_of(module, pool_param).ok_or_else(|| missing(pool_param))?;
+                let buf_default =
+                    default_of(module, buf_param).ok_or_else(|| missing(buf_param))?;
+                let buffers = pool_default.checked_div(buf_default).unwrap_or(0);
+                value_of(module, buf_param)? * buffers
+            } else {
+                0
+            };
+            if let Some(obj) = module.as_object_mut() {
+                obj.insert(pool_param.to_string(), serde_json::json!(pool));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-edge record bounds and send retention.
+///
+/// 1. A producer port's `max_record` (the largest frame it writes, header
+///    included) must not exceed the consumer port's `accepts_record` (the
+///    largest it reads). Checked per wiring entry, so every consumer of a
+///    fanned output is held to it.
+/// 2. An output that names a `send_buffer_param` retains what it sends for
+///    consumers that do not: an instance that sets that parameter — or its
+///    `send_pool_param` — to 0 may only feed consumers whose input declares
+///    `retains_send` or `datagram_only`.
+fn validate_record_limits(
+    config: &Value,
+    edges: &[(u16, u16, u8, u8, u8)],
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    from_specs: &[String],
+    to_specs: &[String],
+) -> Result<()> {
+    let instance_param = |name: &str, key: &str| -> Option<u64> {
+        config
+            .get("modules")
+            .and_then(|m| m.as_array())?
+            .iter()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(name))?
+            .get(key)?
+            .as_u64()
+    };
+    for (i, &(from, to, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
+        let from_name = &module_names[from as usize];
+        let to_name = &module_names[to as usize];
+        let Some(out_port) = manifests
+            .get(from_name)
+            .and_then(|m| m.find_port_spec(1, from_port_index))
+        else {
+            continue;
+        };
+        let to_direction = if to_port == 1 { 2u8 } else { 0u8 };
+        let Some(in_port) = manifests
+            .get(to_name)
+            .and_then(|m| m.find_port_spec(to_direction, to_port_index))
+        else {
+            continue;
+        };
+        if out_port.max_record > 0
+            && in_port.accepts_record > 0
+            && out_port.max_record > in_port.accepts_record
+        {
+            return Err(Error::Config(format!(
+                "wiring[{i}] ({} → {}): the producer writes records of up to {} B \
+                 (`max_record`) but the consumer accepts at most {} B (`accepts_record`); \
+                 a record past the consumer's bound is one it cannot read. Raise the \
+                 consumer's bound or lower the producer's.",
+                from_specs[i], to_specs[i], out_port.max_record, in_port.accepts_record
+            )));
+        }
+        let retention_params = out_port
+            .send_buffer_param
+            .iter()
+            .chain(out_port.send_pool_param.iter());
+        for param in retention_params {
+            if leaves_retention(in_port) && instance_param(from_name, param) == Some(0) {
+                return Err(Error::Config(format!(
+                    "wiring[{i}] ({} → {}): `{from_name}` sets `{param}: 0`, so it keeps no \
+                     copy of what its consumers send, but `{}` does not retain what it sends \
+                     (`retains_send`) and may open a stream — a segment lost on the wire could \
+                     never be sent again. Give `{param}` a size or wire only retaining consumers.",
+                    from_specs[i], to_specs[i], to_specs[i]
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_wiring_types(
     edges: &[(u16, u16, u8, u8, u8)],
     force_flags: &[bool],

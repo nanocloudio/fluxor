@@ -3,7 +3,7 @@
 //!
 //! The TOML is the one place an ABI number is written: contract ids,
 //! opcode classes and opcodes, grants, errno values, poll bits and
-//! fd tags. The generated file holds only scalar constants and `match`-based
+//! the handle word's bit split. The generated file holds only scalar constants and `match`-based
 //! lookups, so it mounts into the kernel, the tools, the SDK runtime and
 //! every PIC module without putting an absolute address in anyone's
 //! `.rodata`. `fluxor abi-regen` writes it; `fluxor abi-regen --check`
@@ -30,8 +30,6 @@ pub struct Registry {
     pub errno: Vec<Errno>,
     #[serde(default)]
     pub poll: Vec<Poll>,
-    #[serde(default)]
-    pub ioctl: Vec<Ioctl>,
     #[serde(default)]
     pub contract: Vec<Contract>,
     #[serde(default)]
@@ -62,6 +60,19 @@ pub struct Msgset {
     pub members: Vec<String>,
     #[serde(default)]
     pub msg: Vec<Msg>,
+    /// The value ranges a member owns. A member that declares any holds
+    /// every one of its values inside them and fills each one densely, and
+    /// no other member's value falls inside them.
+    #[serde(default)]
+    pub range: Vec<MsgRange>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MsgRange {
+    pub surface: String,
+    pub first: u8,
+    pub last: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +90,11 @@ pub struct Header {
     pub max_contracts: u16,
     /// Bit ORed onto an opcode to reach the provider below the caller.
     pub chain_next: u32,
+    /// The handle word's fields, high to low below the clear sign bit:
+    /// contract, generation, index. They fill the 31 bits.
+    pub handle_contract_bits: u32,
+    pub handle_generation_bits: u32,
+    pub handle_index_bits: u32,
 }
 
 /// An op-level grant: a privileged family of ops inside a contract, held by
@@ -113,22 +129,12 @@ pub struct Poll {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Ioctl {
-    pub name: String,
-    pub value: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Contract {
     /// Registry module name; also the manifest spelling when `manifest`.
     pub name: String,
     /// Contract id: the opcode class byte, the vtable index, the bit in
-    /// the first grant word and, when it mints handles, their fd tag.
+    /// the first grant word and the contract field of its handles.
     pub id: u8,
-    /// Hands out tagged handles: the id is also the handle's fd tag.
-    #[serde(default)]
-    pub mints: bool,
     /// A module manifest may name it (`requires_contract`, `provides`).
     #[serde(default)]
     pub manifest: bool,
@@ -142,7 +148,10 @@ pub struct Contract {
     /// `"kernel"`: a gated module may not hold the contract's own bit.
     pub reach: Option<String>,
     /// `"class"`: routed to the kernel by its opcode class ahead of any
-    /// handle; absent, routed by the handle's contract.
+    /// handle. `"edge"`: served by the module at the other end of a graph
+    /// edge, reached only through a handle bound to that edge
+    /// (`kernel::BIND` with a port). Absent: routed by the handle's
+    /// contract.
     pub route: Option<String>,
     #[serde(default)]
     pub op: Vec<Op>,
@@ -161,11 +170,18 @@ pub struct Op {
     pub admission: bool,
     /// Served to gated modules through the gateway, under this rule.
     pub gate: Option<Gate>,
-    /// The argument carries pointers the gateway finds with this walker.
-    pub walker: Option<String>,
+    /// The op answers an address the kernel granted the caller (an arena,
+    /// a resolved lend): never served to a gated module, whose mapping the
+    /// answer need not lie in.
+    #[serde(default)]
+    pub addr_answer: bool,
     /// The op releases the handle it names.
     #[serde(default)]
     pub closes: bool,
+    /// The handle the op mints signals its minter: the kernel claims a
+    /// doorbell for it and hands the provider the doorbell to ring.
+    #[serde(default)]
+    pub signals: bool,
     /// Served to gated modules as a `provider_query` key writing at most
     /// this many bytes.
     pub query: Option<usize>,
@@ -174,13 +190,26 @@ pub struct Op {
     pub route: Option<String>,
 }
 
+/// The shape of one call: what the handle slot may name, the flat `arg`
+/// record (copied in and out for a gated caller, so always bounded) and the
+/// one bulk `data` span (checked in place, never copied).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gate {
     pub handle: String,
+    /// Which way `arg` moves.
     pub arg: String,
-    pub max: GateMax,
+    /// Most bytes `arg` may hold: at most [`ARG_MAX`].
+    pub max: usize,
+    /// Which way `data` moves; absent: no `data` span.
+    pub data: Option<String>,
+    /// Most bytes `data` may hold: a count, or `"any"` (the caller's own
+    /// region bounds it). Required with `data`.
+    pub data_max: Option<GateMax>,
 }
+
+/// Longest `arg` record any op takes: the gateway's copy for a gated caller.
+pub const ARG_MAX: usize = 1024;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
@@ -197,6 +226,7 @@ const HANDLES: &[(&str, &str)] = &[
     ("mints", "Mints"),
     ("scoped", "Scoped"),
     ("scoped_mints", "ScopedMints"),
+    ("minted_mints", "MintedMints"),
 ];
 const ARGS: &[(&str, &str)] = &[
     ("none", "None"),
@@ -221,18 +251,6 @@ impl Contract {
 
 fn shout(s: &str) -> String {
     s.to_ascii_uppercase().replace(['.', '-'], "_")
-}
-
-fn camel(s: &str) -> String {
-    s.split('_')
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
 }
 
 /// Parse `registry.toml`.
@@ -288,16 +306,6 @@ pub fn validate(r: &Registry) -> Result<()> {
             bad.push(format!("errno `{}` declared twice", e.name));
         }
     }
-    let mut seen = BTreeSet::new();
-    let mut ivals = BTreeSet::new();
-    for i in &r.ioctl {
-        if !seen.insert(i.name.as_str()) || !ivals.insert(i.value) {
-            bad.push(format!(
-                "ioctl `{}`: name or value {} declared twice",
-                i.name, i.value
-            ));
-        }
-    }
     if r.registry.chain_next.count_ones() != 1 || r.registry.chain_next <= 0xFFFF {
         bad.push("chain_next is one bit above the 16-bit opcode".to_string());
     }
@@ -320,6 +328,19 @@ pub fn validate(r: &Registry) -> Result<()> {
             "max_contracts {mc} is not a power of two in 2..=128"
         ));
     }
+    let h = &r.registry;
+    if h.handle_contract_bits + h.handle_generation_bits + h.handle_index_bits != 31
+        || h.handle_generation_bits == 0
+        || h.handle_index_bits == 0
+    {
+        bad.push("the handle word's contract, generation and index bits fill 31".to_string());
+    }
+    if u32::from(mc) > 1u32 << h.handle_contract_bits.min(16) {
+        bad.push(format!(
+            "max_contracts {mc} does not fit the handle's {} contract bits",
+            h.handle_contract_bits
+        ));
+    }
     let mut names = BTreeSet::new();
     let mut ids = BTreeMap::new();
     let mut opcodes: BTreeMap<u32, String> = BTreeMap::new();
@@ -336,12 +357,6 @@ pub fn validate(r: &Registry) -> Result<()> {
         if let Some(o) = ids.insert(c.id, c.name.as_str()) {
             bad.push(format!("contract `{}`: id {:#x} is `{o}`'s", c.name, c.id));
         }
-        if c.mints && c.id == 0 {
-            bad.push(format!(
-                "contract `{}` mints handles at id 0, the untagged tag",
-                c.name
-            ));
-        }
         if let Some(g) = c.grant.as_deref() {
             if g != "none" && !grants.contains(g) {
                 bad.push(format!("contract `{}`: unknown grant `{g}`", c.name));
@@ -353,11 +368,20 @@ pub fn validate(r: &Registry) -> Result<()> {
                 c.name
             ));
         }
-        if c.route.as_deref().is_some_and(|r| r != "class") {
-            bad.push(format!(
-                "contract `{}`: route is \"class\" or absent",
+        match c.route.as_deref() {
+            None | Some("class") => {}
+            Some("edge") => {
+                if !c.module_provided || !c.manifest {
+                    bad.push(format!(
+                        "contract `{}`: an edge contract is module-provided and named in manifests",
+                        c.name
+                    ));
+                }
+            }
+            Some(_) => bad.push(format!(
+                "contract `{}`: route is \"class\", \"edge\" or absent",
                 c.name
-            ));
+            )),
         }
         let mut op_names = BTreeSet::new();
         for op in &c.op {
@@ -400,24 +424,52 @@ pub fn validate(r: &Registry) -> Result<()> {
                         c.name, op.name, g.arg
                     ));
                 }
-                match (&g.max, op.walker.is_some()) {
-                    (GateMax::Word(w), true) if w == "walk" => {}
-                    (GateMax::Word(w), false) if w == "any" => {}
-                    (GateMax::Bytes(_), false) => {}
-                    _ => bad.push(format!(
-                        "{}::{}: gate max is a byte count, \"any\", or \"walk\" with a walker",
-                        c.name, op.name
-                    )),
-                }
-                if g.arg == "none" && !matches!(g.max, GateMax::Bytes(0)) {
+                if g.max > ARG_MAX {
                     bad.push(format!(
-                        "{}::{}: a gate with no argument has max 0",
+                        "{}::{}: arg max {} is past ARG_MAX {ARG_MAX}; bulk bytes go in `data`",
+                        c.name, op.name, g.max
+                    ));
+                }
+                if (g.arg == "none") != (g.max == 0) {
+                    bad.push(format!(
+                        "{}::{}: an op with no arg has max 0, and only it",
                         c.name, op.name
                     ));
                 }
-            } else if op.walker.is_some() || op.closes {
+                match (g.data.as_deref(), &g.data_max) {
+                    (None | Some("none"), None) => {}
+                    (Some(d), Some(m)) if d != "none" && ARGS.iter().any(|(k, _)| *k == d) => {
+                        if matches!(m, GateMax::Word(w) if w != "any")
+                            || matches!(m, GateMax::Bytes(0))
+                        {
+                            bad.push(format!(
+                                "{}::{}: data max is a non-zero count or \"any\"",
+                                c.name, op.name
+                            ));
+                        }
+                    }
+                    _ => bad.push(format!(
+                        "{}::{}: data is in/out/inout with a data_max, or absent without one",
+                        c.name, op.name
+                    )),
+                }
+            } else if op.closes {
+                bad.push(format!("{}::{}: closes without a gate", c.name, op.name));
+            }
+            if op.addr_answer && op.gate.is_none() {
                 bad.push(format!(
-                    "{}::{}: walker/closes without a gate",
+                    "{}::{}: an address answer still declares its shape",
+                    c.name, op.name
+                ));
+            }
+            if op.signals
+                && !op
+                    .gate
+                    .as_ref()
+                    .is_some_and(|g| g.handle.ends_with("mints"))
+            {
+                bad.push(format!(
+                    "{}::{}: a signalling op mints the handle it signals",
                     c.name, op.name
                 ));
             }
@@ -464,6 +516,51 @@ pub fn validate(r: &Registry) -> Result<()> {
                 bad.push(format!(
                     "msgset `{}`: {}::{} takes {:#04x}, which is {o}'s",
                     m.name, msg.surface, msg.name, msg.value
+                ));
+            }
+        }
+        for rg in &m.range {
+            if !members.contains(rg.surface.as_str()) {
+                bad.push(format!(
+                    "msgset `{}`: range for `{}`, which is not a member",
+                    m.name, rg.surface
+                ));
+            }
+            if rg.first > rg.last {
+                bad.push(format!(
+                    "msgset `{}`: `{}` range {:#04x}..={:#04x} is empty",
+                    m.name, rg.surface, rg.first, rg.last
+                ));
+                continue;
+            }
+            for v in rg.first..=rg.last {
+                match m.msg.iter().find(|x| x.value == v) {
+                    None => bad.push(format!(
+                        "msgset `{}`: `{}` range {:#04x}..={:#04x} is not dense: {v:#04x} is unassigned",
+                        m.name, rg.surface, rg.first, rg.last
+                    )),
+                    Some(x) if x.surface != rg.surface => bad.push(format!(
+                        "msgset `{}`: {}::{} takes {v:#04x}, inside `{}`'s range",
+                        m.name, x.surface, x.name, rg.surface
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+        for msg in &m.msg {
+            let owned: Vec<&MsgRange> = m
+                .range
+                .iter()
+                .filter(|rg| rg.surface == msg.surface)
+                .collect();
+            if !owned.is_empty()
+                && !owned
+                    .iter()
+                    .any(|rg| (rg.first..=rg.last).contains(&msg.value))
+            {
+                bad.push(format!(
+                    "msgset `{}`: {}::{} takes {:#04x}, outside every range `{}` declares",
+                    m.name, msg.surface, msg.name, msg.value, msg.surface
                 ));
             }
         }
@@ -616,22 +713,12 @@ pub fn emit(r: &Registry) -> String {
     for p in &r.poll {
         let _ = writeln!(w, "    pub const {}: u32 = {:#04x};", p.name, p.bit);
     }
-    let _ = writeln!(
-        w,
-        "}}\n\n/// Channel ioctl commands the kernel serves (`channel_ioctl`'s `cmd`).\npub mod ioctl {{"
-    );
-    for i in &r.ioctl {
-        let _ = writeln!(w, "    pub const {}: u32 = {};", i.name, i.value);
-    }
     let _ = writeln!(w, "}}\n");
 
     // One module per contract.
     for c in &r.contract {
         let _ = writeln!(w, "pub mod {} {{", c.module());
         let _ = writeln!(w, "    pub const ID: u16 = {:#06x};", c.id);
-        if c.mints {
-            let _ = writeln!(w, "    pub const FD_TAG: i32 = {};", c.id);
-        }
         for op in &c.op {
             let _ = writeln!(w, "    pub const {}: u32 = {:#06x};", op.name, c.opcode(op));
         }
@@ -738,49 +825,65 @@ pub fn emit(r: &Registry) -> String {
         "/// Whether an opcode class byte belongs to the registry: ids are dense.\n\
          pub fn class_registered(class: u32) -> bool {{\n    (class as usize) < CONTRACTS_ASSIGNED\n}}\n"
     );
-
-    // Handles: a minting contract's tag is its id.
-    let tag_bits = r.registry.max_contracts.trailing_zeros();
-    let shift = 31 - tag_bits;
+    let edge: Vec<String> = r
+        .contract
+        .iter()
+        .filter(|c| c.route.as_deref() == Some("edge"))
+        .map(|c| format!("{:#06x}", c.id))
+        .collect();
     let _ = writeln!(
         w,
-        "/// Whether a contract hands out tagged handles (its id is their tag).\n\
-         pub fn contract_mints(id: u16) -> bool {{\n    matches!(id, {})\n}}\n",
-        {
-            let v: Vec<String> = by_id
-                .iter()
-                .filter(|c| c.mints)
-                .map(|c| format!("{:#06x}", c.id))
-                .collect();
-            v.join(" | ")
+        "/// Whether a contract is served across a graph edge: by the module at\n\
+         /// the other end of the caller's port, through a handle bound to it.\n\
+         pub fn contract_is_edge(id: u16) -> bool {{\n    matches!(id, {})\n}}\n",
+        if edge.is_empty() {
+            "_ if false".to_string()
+        } else {
+            edge.join(" | ")
         }
+    );
+
+    // The handle word.
+    let (cb, gb, ib) = (
+        r.registry.handle_contract_bits,
+        r.registry.handle_generation_bits,
+        r.registry.handle_index_bits,
     );
     let _ = writeln!(
         w,
-        "/// Handle layout: bit 31 clear, a {tag_bits}-bit contract tag, then the slot.\n\
-         pub mod fd {{\n\
-         \x20   /// A handle with tag 0 is untagged (a channel port, a raw integer).\n\
-         \x20   pub const UNTAGGED: i32 = 0;\n\
-         \x20   pub const TAG_SHIFT: u32 = {shift};\n\
-         \x20   pub const TAG_MASK: i32 = {:#x};\n\
-         \x20   pub const SLOT_MASK: i32 = {:#x};\n\
-         \x20   /// Slot bits a provider's own index may use; the kernel owns the\n\
-         \x20   /// slot field's top bit (routed handles, the vault's hardware field).\n\
-         \x20   pub const SLOT_FIELD_BITS: u32 = {};\n\n\
-         \x20   /// Encode a tag and a slot; a negative slot (an errno) passes through,\n\
-         \x20   /// and an unencodable tag is `EINVAL` rather than an alias.\n\
-         \x20   pub const fn tag_fd(tag: i32, slot: i32) -> i32 {{\n\
-         \x20       if slot < 0 {{\n            return slot;\n        }}\n\
-         \x20       if tag < 0 || tag > TAG_MASK {{\n            return -22;\n        }}\n\
-         \x20       (tag << TAG_SHIFT) | (slot & SLOT_MASK)\n    }}\n\n\
-         \x20   /// Decode a handle into `(tag, slot)`.\n\
-         \x20   pub const fn untag_fd(fd: i32) -> (i32, i32) {{\n\
-         \x20       ((fd >> TAG_SHIFT) & TAG_MASK, fd & SLOT_MASK)\n    }}\n\n\
-         \x20   /// The slot of a handle.\n\
-         \x20   pub const fn slot_of(fd: i32) -> i32 {{\n        fd & SLOT_MASK\n    }}\n}}\n",
-        (1u32 << tag_bits) - 1,
-        (1u32 << shift) - 1,
-        shift - 1
+        "/// The handle word: bit 31 clear (a negative value is an errno), then\n\
+         /// the contract, the generation and the index. The kernel mints every\n\
+         /// handle a module holds; a provider sees only its own index.\n\
+         pub mod handle {{\n\
+         \x20   pub const CONTRACT_BITS: u32 = {cb};\n\
+         \x20   pub const GEN_BITS: u32 = {gb};\n\
+         \x20   pub const INDEX_BITS: u32 = {ib};\n\
+         \x20   pub const GEN_SHIFT: u32 = INDEX_BITS;\n\
+         \x20   pub const CONTRACT_SHIFT: u32 = INDEX_BITS + GEN_BITS;\n\
+         \x20   pub const CONTRACT_MASK: u16 = (1 << CONTRACT_BITS) - 1;\n\
+         \x20   pub const GEN_MASK: u16 = (1 << GEN_BITS) - 1;\n\
+         \x20   pub const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;\n\
+         \x20   /// Slots a table whose index a handle names may hold.\n\
+         \x20   pub const INDEX_LIMIT: usize = 1 << INDEX_BITS;\n\n\
+         \x20   /// The handle naming slot `index` of `contract`'s table at `generation`;\n\
+         \x20   /// fields wider than theirs are truncated.\n\
+         \x20   pub const fn encode(contract: u16, generation: u16, index: u32) -> i32 {{\n\
+         \x20       ((((contract & CONTRACT_MASK) as u32) << CONTRACT_SHIFT)\n\
+         \x20           | (((generation & GEN_MASK) as u32) << GEN_SHIFT)\n\
+         \x20           | (index & INDEX_MASK)) as i32\n    }}\n\n\
+         \x20   /// `(contract, generation, index)` of a handle; `None` for a negative\n\
+         \x20   /// value, which is an errno.\n\
+         \x20   pub const fn decode(h: i32) -> Option<(u16, u16, u32)> {{\n\
+         \x20       if h < 0 {{\n            return None;\n        }}\n\
+         \x20       let h = h as u32;\n\
+         \x20       Some((\n\
+         \x20           ((h >> CONTRACT_SHIFT) as u16) & CONTRACT_MASK,\n\
+         \x20           ((h >> GEN_SHIFT) as u16) & GEN_MASK,\n\
+         \x20           h & INDEX_MASK,\n\
+         \x20       ))\n    }}\n\n\
+         \x20   /// The contract a handle names, if it is one.\n\
+         \x20   pub const fn contract_of(h: i32) -> Option<u16> {{\n\
+         \x20       match decode(h) {{\n            Some((c, _, _)) => Some(c),\n            None => None,\n        }}\n    }}\n}}\n"
     );
 
     // Channel message types.
@@ -802,6 +905,39 @@ pub fn emit(r: &Registry) -> String {
             let _ = writeln!(w, "    pub mod {surface} {{");
             for m in msgs {
                 let _ = writeln!(w, "        pub const {}: u8 = {:#04x};", m.name, m.value);
+            }
+            let ranges: Vec<(u8, u8)> = r
+                .msgset
+                .iter()
+                .flat_map(|m| m.range.iter())
+                .filter(|rg| rg.surface == *surface)
+                .map(|rg| (rg.first, rg.last))
+                .collect();
+            if !ranges.is_empty() {
+                // Lookups, never a slice: a table of tuples is data a PIC
+                // module's `.rodata` would have to hold by address.
+                let _ = writeln!(
+                    w,
+                    "        /// Value ranges this surface owns, each filled densely.\n        pub const RANGE_COUNT: usize = {};",
+                    ranges.len()
+                );
+                let _ = writeln!(
+                    w,
+                    "        /// The `i`th range this surface owns, `(first, last)`.\n        pub const fn range(i: usize) -> Option<(u8, u8)> {{\n            match i {{"
+                );
+                for (i, (a, b)) in ranges.iter().enumerate() {
+                    let _ = writeln!(w, "                {i} => Some(({a:#04x}, {b:#04x})),");
+                }
+                let _ = writeln!(w, "                _ => None,\n            }}\n        }}");
+                let arms: Vec<String> = ranges
+                    .iter()
+                    .map(|(a, b)| format!("{a:#04x}..={b:#04x}"))
+                    .collect();
+                let _ = writeln!(
+                    w,
+                    "        /// Whether this surface owns message type `v`.\n        pub const fn owns(v: u8) -> bool {{\n            matches!(v, {})\n        }}",
+                    arms.join(" | ")
+                );
             }
             let _ = writeln!(w, "    }}");
         }
@@ -869,13 +1005,12 @@ pub fn emit(r: &Registry) -> String {
     let _ = writeln!(w, "        {}\n    )\n}}\n", admits.join(" | "));
 
     // Gateway rules.
-    let walkers: BTreeSet<&str> = ops
-        .iter()
-        .filter_map(|(_, _, op)| op.walker.as_deref())
-        .collect();
     let _ = writeln!(
         w,
-        "/// What the gateway serves a gated module.\npub mod gate {{\n\
+        "/// The shape of every call a module may make, and what the gateway serves\n\
+         /// a gated module.\npub mod gate {{\n\
+         \x20   /// Longest `arg` record any op takes.\n\
+         \x20   pub const ARG_MAX: usize = {ARG_MAX};\n\n\
          \x20   /// What a rule lets the caller name as the handle.\n\
          \x20   #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n    pub enum HandleUse {{"
     );
@@ -884,41 +1019,45 @@ pub fn emit(r: &Registry) -> String {
     }
     let _ = writeln!(
         w,
-        "    }}\n\n    /// Which way the argument buffer moves.\n\
-         \x20   #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n    pub enum ArgDir {{"
+        "    }}\n\n    /// Which way a buffer moves.\n\
+         \x20   #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n    pub enum Dir {{"
     );
     for (_, v) in ARGS {
         let _ = writeln!(w, "        {v},");
     }
     let _ = writeln!(
         w,
-        "    }}\n\n    /// How long the argument buffer may be.\n\
+        "    }}\n\n    /// How long the `data` span may be.\n\
          \x20   #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n    pub enum Bound {{\n\
          \x20       /// At most this many bytes.\n        Bytes(usize),\n\
-         \x20       /// Bounded by the caller's own region alone.\n        Any,\n\
-         \x20       /// The walked-struct bound the gateway copies.\n        Walk,\n    }}\n"
+         \x20       /// Bounded by the caller's own region alone.\n        Any,\n    }}\n"
     );
     let _ = writeln!(
         w,
-        "    /// An argument struct that carries pointers, and how to find them.\n\
-         \x20   #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n    pub enum Walker {{"
-    );
-    for k in &walkers {
-        let _ = writeln!(w, "        {},", camel(k));
-    }
-    let _ = writeln!(
-        w,
-        "    }}\n\n    /// One opcode a gated module may use.\n\
+        "    /// One opcode's shape.\n\
          \x20   #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n    pub struct OpRule {{\n\
-         \x20       pub handle: HandleUse,\n        pub dir: ArgDir,\n        pub bound: Bound,\n\
-         \x20       pub walk: Option<Walker>,\n        /// The op releases the handle it names.\n\
-         \x20       pub closes: bool,\n    }}\n"
+         \x20       pub handle: HandleUse,\n\
+         \x20       /// Which way the flat `arg` record moves.\n        pub arg: Dir,\n\
+         \x20       /// Most bytes `arg` holds (at most `ARG_MAX`).\n        pub arg_max: usize,\n\
+         \x20       /// Which way the bulk `data` span moves.\n        pub data: Dir,\n\
+         \x20       pub data_max: Bound,\n\
+         \x20       /// The op releases the handle it names.\n        pub closes: bool,\n\
+         \x20       /// The op answers a kernel-granted address: never served gated.\n\
+         \x20       pub addr_answer: bool,\n\
+         \x20       /// The handle the op mints signals its minter through a doorbell.\n\
+         \x20       pub signals: bool,\n    }}\n"
     );
     let _ = writeln!(
         w,
-        "    /// The rule for `op`, if gated modules may use it.\n\
+        "    /// The shape of `op`, if the registry declares one.\n\
          \x20   pub fn op_rule(op: u32) -> Option<OpRule> {{\n        match op {{"
     );
+    let dir_of = |k: &str| {
+        ARGS.iter()
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| *v)
+            .unwrap_or("None")
+    };
     for (code, _, op) in &ops {
         let Some(g) = &op.gate else { continue };
         let h = HANDLES
@@ -926,24 +1065,17 @@ pub fn emit(r: &Registry) -> String {
             .find(|(k, _)| *k == g.handle)
             .map(|(_, v)| *v)
             .unwrap_or("Global");
-        let d = ARGS
-            .iter()
-            .find(|(k, _)| *k == g.arg)
-            .map(|(_, v)| *v)
-            .unwrap_or("None");
-        let b = match &g.max {
-            GateMax::Bytes(n) => format!("Bound::Bytes({n})"),
-            GateMax::Word(s) if s == "walk" => "Bound::Walk".to_string(),
-            GateMax::Word(_) => "Bound::Any".to_string(),
-        };
-        let wk = match op.walker.as_deref() {
-            Some(k) => format!("Some(Walker::{})", camel(k)),
-            None => "None".to_string(),
+        let d = dir_of(&g.arg);
+        let dd = dir_of(g.data.as_deref().unwrap_or("none"));
+        let b = match &g.data_max {
+            Some(GateMax::Bytes(n)) => format!("Bound::Bytes({n})"),
+            Some(GateMax::Word(_)) => "Bound::Any".to_string(),
+            None => "Bound::Bytes(0)".to_string(),
         };
         let _ = writeln!(
             w,
-            "            {code:#06x} => Some(OpRule {{ handle: HandleUse::{h}, dir: ArgDir::{d}, bound: {b}, walk: {wk}, closes: {} }}),",
-            op.closes
+            "            {code:#06x} => Some(OpRule {{ handle: HandleUse::{h}, arg: Dir::{d}, arg_max: {}, data: Dir::{dd}, data_max: {b}, closes: {}, addr_answer: {}, signals: {} }}),",
+            g.max, op.closes, op.addr_answer, op.signals
         );
     }
     let _ = writeln!(w, "            _ => None,\n        }}\n    }}\n");
@@ -1004,4 +1136,54 @@ fn rustfmt(src: &str) -> Result<String> {
 /// The generated file's path under `repo`.
 pub fn gen_path(repo: &Path) -> PathBuf {
     repo.join(REGISTRY_GEN)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(REGISTRY_TOML),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_registry_is_valid() {
+        validate(&parse(&registry()).unwrap()).unwrap();
+    }
+
+    /// A surface that declares ranges holds every value inside them, fills
+    /// each one, and no other surface's value falls inside them.
+    #[test]
+    fn a_msgset_range_is_owned_and_dense() {
+        let text = registry();
+        let hole = text.replacen(
+            "  [[msgset.msg]]\n  surface = \"stream_retx\"\n  name = \"MSG_RETX_REQUEST\"\n  value = 0xD1\n",
+            "",
+            1,
+        );
+        assert_ne!(hole, text);
+        let e = validate(&parse(&hole).unwrap()).unwrap_err().to_string();
+        assert!(e.contains("not dense") && e.contains("0xd1"), "{e}");
+
+        let outside = text.replacen(
+            "name = \"MSG_RETX_REQUEST\"\n  value = 0xD1",
+            "name = \"MSG_RETX_REQUEST\"\n  value = 0xD7",
+            1,
+        );
+        let e = validate(&parse(&outside).unwrap()).unwrap_err().to_string();
+        assert!(e.contains("outside every range"), "{e}");
+
+        let foreign = text.replacen(
+            "  [[msgset.msg]]\n  surface = \"stream_trace\"",
+            "  [[msgset.msg]]\n  surface = \"mux\"\n  name = \"MSG_INTRUDER\"\n  value = 0xD5\n\n  [[msgset.msg]]\n  surface = \"stream_trace\"",
+            1,
+        );
+        let e = validate(&parse(&foreign).unwrap()).unwrap_err().to_string();
+        assert!(e.contains("MSG_INTRUDER"), "{e}");
+    }
 }

@@ -49,7 +49,7 @@ const FWD_IN_PORT: u8 = 1;
 const FRAMES_OUT_PORT: u8 = 1;
 const LOG_PERIOD: u32 = 5000;
 /// Largest frame the forward port can carry, plus its record prefix.
-const FWD_BUF: usize = 3 + 4 + 1 + 6 + 1536;
+const FWD_BUF: usize = FWD_IN_ACCEPTS_RECORD;
 
 #[repr(C)]
 pub struct DirectorState {
@@ -229,9 +229,9 @@ unsafe fn service_decide(s: &mut DirectorState) {
         }
         // `net_read_frame` leaves the 3-byte header in `buf[..3]` and the
         // payload after it.
-        let mut buf = [0u8; 3 + 64];
+        let mut buf = [0u8; DECIDE_IN_ACCEPTS_RECORD];
         let (msg, plen) = net_read_frame(sys, s.decide_in, buf.as_mut_ptr(), buf.len());
-        let rec = &buf[3..3 + plen.min(64)];
+        let rec = &buf[3..3 + plen];
         match msg {
             pkt::MSG_PKT_DECIDE => decide(s, rec, false),
             pkt::MSG_PKT_DECIDE6 => decide(s, rec, true),
@@ -381,7 +381,14 @@ unsafe fn log_counts(s: &mut DirectorState) {
 // Module interface
 // ============================================================================
 
-fluxor_rt::module_facts! { state: DirectorState }
+fluxor_rt::module_facts! {
+    state: DirectorState,
+    records: [
+        in 0 DECIDE_IN_ACCEPTS_RECORD = 3 + 64,
+        in 1 FWD_IN_ACCEPTS_RECORD = 1600,
+        out 0 DISPOSE_OUT_MAX_RECORD = 3 + pkt::DISPOSE_COPY_LEN,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

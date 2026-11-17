@@ -76,7 +76,7 @@
 
 use crate::abi::contracts::storage::fs as op;
 use crate::kernel::exec::scheduler;
-use crate::kernel::ipc::fd::{slot_of, tag_fd, untag_fd, FD_TAG_FS};
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 use crate::kernel::workload::storage::{
@@ -91,6 +91,11 @@ const PMAX: usize = 320;
 const MAX_ROOTS: usize = 80;
 /// Handles open through every root at once.
 const MAX_SLOTS: usize = 128;
+
+/// Handles the owner roots hand out at once: their open files.
+pub fn handle_slots() -> usize {
+    MAX_SLOTS
+}
 /// Undecided (`EINPROGRESS`) path operations one owner may have
 /// outstanding: the node provider's own operation slots.
 const MAX_PENDING: usize = 4;
@@ -110,7 +115,7 @@ const FILES: &[u8] = b"files";
 const TOMBSTONE: &[u8] = b"gone";
 
 /// The node's own `fs` provider: where every rooted request goes.
-pub type Backend = unsafe fn(i32, u32, *mut u8, usize) -> i32;
+pub type Backend = fn(i32, u32, &mut [u8], UserSpan<'_>) -> i32;
 
 static mut BACKEND: Option<Backend> = None;
 
@@ -120,16 +125,13 @@ fn backend() -> Option<Backend> {
 }
 
 /// The board's backend: the node's default `fs` layer.
-///
-/// # Safety
-/// As [`crate::kernel::module::provider::dispatch_node_default`].
-pub unsafe fn node_fs(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub fn node_fs(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     crate::kernel::module::provider::dispatch_node_default(
         crate::kernel::module::provider::contract::FS,
         handle,
         opcode,
         arg,
-        arg_len,
+        data,
     )
 }
 
@@ -151,6 +153,10 @@ impl Path {
     }
     fn bytes(&self) -> &[u8] {
         &self.b[..self.n]
+    }
+    /// The path as a request's `arg`.
+    fn arg(&mut self) -> &mut [u8] {
+        &mut self.b[..self.n]
     }
     fn push(&mut self, s: &[u8]) -> bool {
         let end = self.n + s.len();
@@ -275,19 +281,19 @@ fn fnv64(parts: &[&[u8]]) -> u64 {
 /// Ask the node's provider on the caller's behalf: the caller's module stays
 /// on the provider stack, so the provider sees (and caps, and sweeps at
 /// release) the workload's own handles.
-unsafe fn owner_call(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn owner_call(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     match backend() {
-        Some(b) => b(handle, opcode, arg, arg_len),
+        Some(b) => b(handle, opcode, arg, data),
         None => errno::ENOSYS,
     }
 }
 
 /// Ask the node's provider as the node: no module on the provider stack,
 /// so the request is nobody's — the layer's own jobs and probes.
-unsafe fn node_call(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn node_call(handle: i32, opcode: u32, arg: &mut [u8]) -> i32 {
     let saved = scheduler::current_module_index();
     scheduler::set_current_module(u32::MAX as usize);
-    let rc = owner_call(handle, opcode, arg, arg_len);
+    let rc = owner_call(handle, opcode, arg, UserSpan::empty());
     scheduler::set_current_module(saved);
     rc
 }
@@ -301,36 +307,37 @@ fn retry(rc: i32) -> bool {
 /// not a file the provider will open.
 unsafe fn probe_size(path: &Path) -> Result<Option<u64>, i32> {
     let mut p = *path;
-    let rc = node_call(-1, op::OPEN, p.b.as_mut_ptr(), p.n);
+    let rc = node_call(-1, op::OPEN, p.arg());
     if rc == errno::ENOENT {
         return Ok(None);
     }
     if rc < 0 {
         return Err(rc);
     }
-    let h = slot_of(rc);
-    let mut st = [0u8; 16];
-    let s = node_call(h, op::STAT, st.as_mut_ptr(), st.len());
-    node_call(h, op::CLOSE, core::ptr::null_mut(), 0);
-    if s < 16 {
-        return Err(if s < 0 { s } else { errno::EINVAL });
+    let h = rc;
+    let mut st = [0u8; op::stat::LEN];
+    let s = node_call(h, op::STAT, &mut st);
+    node_call(h, op::CLOSE, &mut []);
+    if s < 0 {
+        return Err(s);
     }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&st[..8]);
-    Ok(Some(u64::from_le_bytes(b)))
+    match op::Stat::decode(&st) {
+        Some(st) => Ok(Some(st.size)),
+        None => Err(errno::EINVAL),
+    }
 }
 
 /// Whether a directory is at `path`, as the node.
 unsafe fn probe_dir(path: &Path) -> Result<bool, i32> {
     let mut p = *path;
-    let rc = node_call(-1, op::OPENDIR, p.b.as_mut_ptr(), p.n);
+    let rc = node_call(-1, op::OPENDIR, p.arg());
     if rc == errno::ENOENT || rc == ENOTDIR {
         return Ok(false);
     }
     if rc < 0 {
         return Err(rc);
     }
-    node_call(slot_of(rc), op::CLOSE, core::ptr::null_mut(), 0);
+    node_call(rc, op::CLOSE, &mut []);
     Ok(true)
 }
 
@@ -487,8 +494,8 @@ unsafe fn ready_root(owner: OwnerHandle) -> Result<usize, i32> {
         }
         // A node with no file system has nothing to root a workload in: say
         // so, rather than "not yet" for ever.
-        let mut caps = [0u8; 4];
-        let rc = node_call(-1, op::CAPS, caps.as_mut_ptr(), caps.len());
+        let mut caps = [0u8; crate::abi::kernel_abi::caps_word::LEN];
+        let rc = node_call(-1, op::CAPS, &mut caps);
         if rc == errno::ENOSYS || rc == errno::ENODEV {
             return Err(rc);
         }
@@ -551,7 +558,7 @@ impl Req {
     }
     /// Ask (again). `None` while the answer is "ask again".
     unsafe fn ask(&mut self) -> Option<i32> {
-        let rc = node_call(self.handle, self.opcode, self.arg.as_mut_ptr(), self.len);
+        let rc = node_call(self.handle, self.opcode, &mut self.arg[..self.len]);
         if retry(rc) || rc == errno::EBUSY {
             return None;
         }
@@ -727,10 +734,10 @@ unsafe fn scan_fail(s: &mut Scan, rc: i32) {
 unsafe fn scan_reset(s: &mut Scan) {
     while s.depth > 0 {
         s.depth -= 1;
-        node_call(s.dirs[s.depth], op::CLOSE, core::ptr::null_mut(), 0);
+        node_call(s.dirs[s.depth], op::CLOSE, &mut []);
     }
     if s.held >= 0 {
-        node_call(s.held, op::CLOSE, core::ptr::null_mut(), 0);
+        node_call(s.held, op::CLOSE, &mut []);
     }
     s.held = -1;
     s.root = usize::MAX;
@@ -802,7 +809,7 @@ unsafe fn pump_scan() {
                         Req::path(op::OPEN, &p)
                     }
                 }
-                ScanStage::FileStat => Req::on(op::STAT, s.held, 16),
+                ScanStage::FileStat => Req::on(op::STAT, s.held, op::stat::LEN),
                 ScanStage::FileOpen | ScanStage::Idle => return,
             };
         }
@@ -812,7 +819,7 @@ unsafe fn pump_scan() {
         match s.stage {
             ScanStage::Tombstone => {
                 if rc >= 0 {
-                    s.held = slot_of(rc);
+                    s.held = rc;
                     s.stage = ScanStage::TombstoneClose;
                 } else if rc == errno::ENOENT {
                     s.stage = ScanStage::Make(0);
@@ -843,7 +850,7 @@ unsafe fn pump_scan() {
             }
             ScanStage::Walk | ScanStage::OpenSub => {
                 if rc >= 0 {
-                    s.dirs[s.depth] = slot_of(rc);
+                    s.dirs[s.depth] = rc;
                     s.depth += 1;
                     s.stage = ScanStage::ReadDir;
                 } else if s.stage == ScanStage::Walk {
@@ -861,7 +868,7 @@ unsafe fn pump_scan() {
                     s.stage = ScanStage::Entry;
                 } else {
                     s.depth -= 1;
-                    node_call(s.dirs[s.depth], op::CLOSE, core::ptr::null_mut(), 0);
+                    node_call(s.dirs[s.depth], op::CLOSE, &mut []);
                     if s.depth == 0 {
                         // Walked: the owner carries what its root holds.
                         let r = &mut rs[s.root];
@@ -878,7 +885,7 @@ unsafe fn pump_scan() {
             }
             ScanStage::FileOpen => {
                 if rc >= 0 {
-                    s.held = slot_of(rc);
+                    s.held = rc;
                     s.stage = ScanStage::FileStat;
                 } else {
                     s.total += ENTRY_COST;
@@ -887,13 +894,13 @@ unsafe fn pump_scan() {
             }
             ScanStage::FileStat => {
                 let mut size = 0u64;
-                if rc >= 8 {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&s.req.arg[..8]);
-                    size = u64::from_le_bytes(b);
+                if rc == 0 {
+                    if let Some(st) = op::Stat::decode(&s.req.arg[..op::stat::LEN]) {
+                        size = st.size;
+                    }
                 }
                 s.total += file_cost(size);
-                node_call(s.held, op::CLOSE, core::ptr::null_mut(), 0);
+                node_call(s.held, op::CLOSE, &mut []);
                 s.held = -1;
                 s.stage = ScanStage::Entry;
             }
@@ -905,7 +912,7 @@ unsafe fn pump_scan() {
 unsafe fn rm_done(m: &mut Remove, failed: Option<i32>) {
     let rs = roots();
     if m.held >= 0 {
-        node_call(m.held, op::CLOSE, core::ptr::null_mut(), 0);
+        node_call(m.held, op::CLOSE, &mut []);
         m.held = -1;
     }
     if m.root < MAX_ROOTS {
@@ -992,7 +999,7 @@ unsafe fn pump_remove() {
         match m.stage {
             RmStage::SweepOpen => {
                 if rc >= 0 {
-                    m.held = slot_of(rc);
+                    m.held = rc;
                     m.stage = RmStage::SweepRead;
                 } else if rc == errno::ENOENT {
                     m.stage = RmStage::Idle;
@@ -1006,14 +1013,14 @@ unsafe fn pump_remove() {
                     m.batch.load(&m.req.arg, rc as usize);
                     m.stage = RmStage::SweepEntry;
                 } else {
-                    node_call(m.held, op::CLOSE, core::ptr::null_mut(), 0);
+                    node_call(m.held, op::CLOSE, &mut []);
                     m.held = -1;
                     m.stage = RmStage::Idle;
                 }
             }
             RmStage::SweepCheck => {
                 if rc >= 0 {
-                    node_call(slot_of(rc), op::CLOSE, core::ptr::null_mut(), 0);
+                    node_call(rc, op::CLOSE, &mut []);
                     let n = m.candidate;
                     let known = rs.iter().any(|r| r.phase != Phase::Free && r.name == n);
                     if !known {
@@ -1035,7 +1042,7 @@ unsafe fn pump_remove() {
             }
             RmStage::Mark => {
                 if rc >= 0 {
-                    m.held = slot_of(rc);
+                    m.held = rc;
                     m.stage = RmStage::MarkClose;
                 } else if rc == errno::ENOENT {
                     // No root there (or no tombstone on a found one): nothing
@@ -1063,7 +1070,7 @@ unsafe fn pump_remove() {
             }
             RmStage::WalkOpen => {
                 if rc >= 0 {
-                    m.held = slot_of(rc);
+                    m.held = rc;
                     m.stage = RmStage::WalkRead;
                 } else if rc == errno::ENOENT && m.path.n > name.dir().n {
                     m.path.pop_comp();
@@ -1088,7 +1095,7 @@ unsafe fn pump_remove() {
                     let Some((n, is_dir)) = pick else {
                         continue; // only the tombstone here: read on
                     };
-                    node_call(m.held, op::CLOSE, core::ptr::null_mut(), 0);
+                    node_call(m.held, op::CLOSE, &mut []);
                     m.held = -1;
                     if !m.path.push_comp(n.bytes()) {
                         return rm_done(m, Some(errno::E2BIG));
@@ -1101,7 +1108,7 @@ unsafe fn pump_remove() {
                         m.stage = RmStage::Unlink;
                     }
                 } else {
-                    node_call(m.held, op::CLOSE, core::ptr::null_mut(), 0);
+                    node_call(m.held, op::CLOSE, &mut []);
                     m.held = -1;
                     if at_top {
                         m.stage = RmStage::Fence;
@@ -1200,7 +1207,7 @@ pub fn release(owner: OwnerHandle) {
     // SAFETY: owner release runs on the scheduler thread, as every dispatch.
     unsafe {
         for s in slots().iter_mut().filter(|s| s.in_use && s.owner == owner) {
-            node_call(s.inner, op::CLOSE, core::ptr::null_mut(), 0);
+            node_call(s.inner, op::CLOSE, &mut []);
             *s = SLOT_EMPTY;
         }
         let rs = roots();
@@ -1258,33 +1265,36 @@ pub fn release(owner: OwnerHandle) {
 /// acting with its authority, has nothing here (`ENOSYS`): it reaches the
 /// node's own `fs` layer.
 ///
-/// # Safety
-/// `arg` must satisfy the `fs` contract's requirements for `opcode`.
-pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub fn dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     let owner = scheduler::caller_owner();
     if !crate::kernel::workload::storage::rooted(owner) || backend().is_none() {
         return errno::ENOSYS;
     }
     if opcode == op::CAPS {
-        let rc = node_call(-1, op::CAPS, arg, arg_len);
-        if rc >= 0 && !arg.is_null() && arg_len >= 4 {
-            let mut b = [0u8; 4];
-            core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 4);
-            // No second name for a file: a hard link would be charged once
-            // and could be given back twice.
-            let caps = u32::from_le_bytes(b) & !(op::caps::LINK | op::caps::SYMLINK);
-            core::ptr::copy_nonoverlapping(caps.to_le_bytes().as_ptr(), arg, 4);
+        use crate::abi::kernel_abi::caps_word;
+        let rc = node_call(-1, op::CAPS, arg);
+        if rc != 0 {
+            return rc;
         }
-        return rc;
+        // No second name for a file: a hard link would be charged once and
+        // could be given back twice.
+        return match caps_word::parse(arg) {
+            Some(c) => caps_word::answer(arg, c & !(op::caps::LINK | op::caps::SYMLINK)),
+            None => errno::EINVAL,
+        };
     }
-    if handle >= 0 {
-        return handle_op(owner, handle, opcode, arg, arg_len);
+    // SAFETY: provider dispatch runs on the scheduler thread, which alone
+    // touches the root and slot tables.
+    unsafe {
+        if handle >= 0 {
+            return handle_op(owner, handle, opcode, arg, data);
+        }
+        let ri = match ready_root(owner) {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        path_op(owner, ri, opcode, arg)
     }
-    let ri = match ready_root(owner) {
-        Ok(i) => i,
-        Err(e) => return e,
-    };
-    path_op(owner, ri, opcode, arg, arg_len)
 }
 
 /// A free slot `owner` may take, or `ENOMEM` when the table, or the owner's
@@ -1298,23 +1308,22 @@ unsafe fn free_slot(owner: OwnerHandle) -> Result<usize, i32> {
 }
 
 unsafe fn claim(i: usize, owner: OwnerHandle, rc: i32, created: bool) -> i32 {
-    let (_tag, inner) = untag_fd(rc);
     slots()[i] = Slot {
         in_use: true,
         owner,
-        inner,
+        inner: rc,
         size_known: created,
         ..SLOT_EMPTY
     };
-    tag_fd(FD_TAG_FS, i as i32)
+    i as i32
 }
 
 unsafe fn handle_op(
     owner: OwnerHandle,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
 ) -> i32 {
     let i = handle as usize;
     let ss = slots();
@@ -1324,27 +1333,24 @@ unsafe fn handle_op(
     let inner = s.inner;
     match opcode {
         op::CLOSE => {
-            let rc = owner_call(inner, op::CLOSE, core::ptr::null_mut(), 0);
+            let rc = owner_call(inner, op::CLOSE, &mut [], UserSpan::empty());
             *s = SLOT_EMPTY;
             rc
         }
         op::READ => {
-            let rc = owner_call(inner, opcode, arg, arg_len);
+            let rc = owner_call(inner, opcode, arg, data.reborrow());
             if rc > 0 {
                 s.pos += rc as u64;
             }
             rc
         }
         op::SEEK => {
-            let rc = owner_call(inner, opcode, arg, arg_len);
-            if rc >= 0 && !arg.is_null() && arg_len >= 4 {
-                let mut b = [0u8; 8];
-                core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), arg_len.min(8));
-                s.pos = if arg_len >= 8 {
-                    u64::from_le_bytes(b)
-                } else {
-                    u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                };
+            let Some(to) = op::seek::parse(arg) else {
+                return errno::EINVAL;
+            };
+            let rc = owner_call(inner, opcode, arg, data.reborrow());
+            if rc == 0 {
+                s.pos = to;
             }
             rc
         }
@@ -1352,11 +1358,11 @@ unsafe fn handle_op(
             if let Err(e) = know_size(s) {
                 return e;
             }
-            let grow = (s.pos + arg_len as u64).saturating_sub(s.size);
+            let grow = (s.pos + arg.len() as u64).saturating_sub(s.size);
             if !reserve(owner, grow) {
                 return errno::ENOSPC;
             }
-            let rc = owner_call(inner, opcode, arg, arg_len);
+            let rc = owner_call(inner, opcode, arg, data.reborrow());
             let mut used = 0;
             if rc > 0 {
                 let end = s.pos + rc as u64;
@@ -1370,12 +1376,10 @@ unsafe fn handle_op(
             rc
         }
         op::PREALLOCATE => {
-            if arg.is_null() || arg_len < 4 {
+            let Some(b) = arg.get(..4) else {
                 return errno::EINVAL;
-            }
-            let mut b = [0u8; 4];
-            core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 4);
-            let cap = u32::from_le_bytes(b);
+            };
+            let cap = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             let reserved = match s.prealloc {
                 Some((c, r)) if c == cap => r,
                 _ => {
@@ -1394,7 +1398,7 @@ unsafe fn handle_op(
                     grow
                 }
             };
-            let rc = owner_call(inner, opcode, arg, arg_len);
+            let rc = owner_call(inner, opcode, arg, data.reborrow());
             if rc == errno::EINPROGRESS {
                 s.prealloc = Some((cap, reserved));
                 return rc;
@@ -1409,7 +1413,7 @@ unsafe fn handle_op(
             rc
         }
         op::STAT | op::FSYNC | op::FSYNC_SUBMIT | op::FSYNC_POLL | op::READDIR => {
-            owner_call(inner, opcode, arg, arg_len)
+            owner_call(inner, opcode, arg, data)
         }
         _ => errno::ENOSYS,
     }
@@ -1420,38 +1424,35 @@ unsafe fn know_size(s: &mut Slot) -> Result<(), i32> {
     if s.size_known {
         return Ok(());
     }
-    let mut st = [0u8; 16];
-    let rc = owner_call(s.inner, op::STAT, st.as_mut_ptr(), st.len());
-    if rc < 8 {
-        return Err(if rc < 0 { rc } else { errno::EINVAL });
+    let mut st = [0u8; op::stat::LEN];
+    let rc = owner_call(s.inner, op::STAT, &mut st, UserSpan::empty());
+    if rc < 0 {
+        return Err(rc);
     }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&st[..8]);
-    s.size = u64::from_le_bytes(b);
+    s.size = match op::Stat::decode(&st) {
+        Some(st) => st.size,
+        None => return Err(errno::EINVAL),
+    };
     s.size_known = true;
     Ok(())
 }
 
 /// The path, or the error, of a single-path request.
-fn path_arg(arg: *mut u8, arg_len: usize) -> Result<&'static [u8], i32> {
-    if arg.is_null() || arg_len == 0 {
+fn path_arg(arg: &[u8]) -> Result<&[u8], i32> {
+    if arg.is_empty() {
         return Err(errno::EINVAL);
     }
-    if arg_len > PATH_MAX {
+    if arg.len() > PATH_MAX {
         return Err(errno::E2BIG);
     }
-    // SAFETY: the caller's `arg[..arg_len]`, read before anything else
-    // touches it.
-    Ok(unsafe { core::slice::from_raw_parts(arg, arg_len) })
+    Ok(arg)
 }
 
 /// The `RENAME` / `LINK` two-path argument.
-fn two_paths(arg: *mut u8, arg_len: usize) -> Option<(&'static [u8], &'static [u8])> {
-    if arg.is_null() || arg_len < 4 {
+fn two_paths(a: &[u8]) -> Option<(&[u8], &[u8])> {
+    if a.len() < 4 {
         return None;
     }
-    // SAFETY: the caller's `arg[..arg_len]`.
-    let a = unsafe { core::slice::from_raw_parts(arg, arg_len) };
     let sl = usize::from(u16::from_le_bytes([a[0], a[1]]));
     let src = a.get(2..2 + sl)?;
     let rest = a.get(2 + sl..)?;
@@ -1507,7 +1508,7 @@ unsafe fn settle(
 /// Re-ask an undecided path operation, settling it once decided.
 unsafe fn reask(owner: OwnerHandle, ri: usize, pi: usize, req: &mut Path) -> i32 {
     let p = roots()[ri].pend[pi];
-    let rc = owner_call(-1, p.opcode, req.b.as_mut_ptr(), req.n);
+    let rc = owner_call(-1, p.opcode, req.arg(), UserSpan::empty());
     if retry(rc) {
         return rc;
     }
@@ -1520,11 +1521,11 @@ unsafe fn reask(owner: OwnerHandle, ri: usize, pi: usize, req: &mut Path) -> i32
     rc
 }
 
-unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: &[u8]) -> i32 {
     let name = roots()[ri].name;
     match opcode {
         op::OPEN | op::OPENDIR => {
-            let path = match path_arg(arg, arg_len).and_then(|p| rooted(&name, p, true)) {
+            let path = match path_arg(arg).and_then(|p| rooted(&name, p, true)) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -1533,14 +1534,14 @@ unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: *mut u8, arg_
                 Err(e) => return e,
             };
             let mut p = path;
-            let rc = owner_call(-1, opcode, p.b.as_mut_ptr(), p.n);
+            let rc = owner_call(-1, opcode, p.arg(), UserSpan::empty());
             if rc < 0 {
                 return rc;
             }
             claim(i, owner, rc, false)
         }
         op::OPEN_CREATE => {
-            let mut p = match path_arg(arg, arg_len).and_then(|p| rooted(&name, p, false)) {
+            let mut p = match path_arg(arg).and_then(|p| rooted(&name, p, false)) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -1563,7 +1564,7 @@ unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: *mut u8, arg_
                 if !reserve(owner, reserved) {
                     return errno::ENOSPC;
                 }
-                let rc = owner_call(-1, opcode, p.b.as_mut_ptr(), p.n);
+                let rc = owner_call(-1, opcode, p.arg(), UserSpan::empty());
                 settle(owner, ri, key, rc, reserved, refund)
             };
             if rc < 0 {
@@ -1572,7 +1573,7 @@ unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: *mut u8, arg_
             claim(i, owner, rc, true)
         }
         op::UNLINK | op::RMDIR | op::MKDIR | op::FSYNC_NAME => {
-            let mut p = match path_arg(arg, arg_len).and_then(|p| rooted(&name, p, false)) {
+            let mut p = match path_arg(arg).and_then(|p| rooted(&name, p, false)) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -1598,19 +1599,17 @@ unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: *mut u8, arg_
             if !reserve(owner, reserved) {
                 return errno::ENOSPC;
             }
-            let rc = owner_call(-1, opcode, p.b.as_mut_ptr(), p.n);
+            let rc = owner_call(-1, opcode, p.arg(), UserSpan::empty());
             settle(owner, ri, key, rc, reserved, refund)
         }
         op::TRUNCATE => {
-            if arg.is_null() || arg_len < 9 {
+            if arg.len() < 9 {
                 return errno::EINVAL;
             }
-            let a = core::slice::from_raw_parts(arg, arg_len);
             let mut lb = [0u8; 8];
-            lb.copy_from_slice(&a[..8]);
+            lb.copy_from_slice(&arg[..8]);
             let len = u64::from_le_bytes(lb);
-            let path = match path_arg(arg.add(8), arg_len - 8).and_then(|p| rooted(&name, p, false))
-            {
+            let path = match path_arg(&arg[8..]).and_then(|p| rooted(&name, p, false)) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -1628,11 +1627,11 @@ unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: *mut u8, arg_
                 Err(errno::EAGAIN) => return errno::EAGAIN,
                 Err(_) => 0,
             };
-            let rc = owner_call(-1, opcode, req.b.as_mut_ptr(), req.n);
+            let rc = owner_call(-1, opcode, req.arg(), UserSpan::empty());
             settle(owner, ri, key, rc, 0, refund)
         }
         op::RENAME => {
-            let Some((src, dst)) = two_paths(arg, arg_len) else {
+            let Some((src, dst)) = two_paths(arg) else {
                 return errno::EINVAL;
             };
             let (s, d) = match (rooted(&name, src, false), rooted(&name, dst, false)) {
@@ -1662,7 +1661,7 @@ unsafe fn path_op(owner: OwnerHandle, ri: usize, opcode: u32, arg: *mut u8, arg_
                     Err(_) => 0,
                 }
             };
-            let rc = owner_call(-1, opcode, req.b.as_mut_ptr(), req.n);
+            let rc = owner_call(-1, opcode, req.arg(), UserSpan::empty());
             settle(owner, ri, key, rc, 0, refund)
         }
         // No second name for a file (one inode charged once, given back

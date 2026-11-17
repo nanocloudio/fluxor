@@ -146,7 +146,8 @@ pub struct HalOps {
     /// unification on bare-metal aarch64, page-permission flips on
     /// hosted targets. Returns `false` on targets without a RAM
     /// staging surface (RP delivers OTA through flash graph slots).
-    pub ota_stage_protect: fn(base: *mut u8, len: usize, executable: bool) -> bool,
+    /// `region` is the caller's own, held exclusively across the flip.
+    pub ota_stage_protect: fn(region: &mut [u8], executable: bool) -> bool,
     /// Pipeline barrier after PIC call (DSB+ISB + interrupt restore check).
     pub pic_barrier: fn(),
 
@@ -188,17 +189,18 @@ pub struct HalOps {
 
     /// Fill buffer with cryptographically secure random bytes.
     /// Returns 0 on success, negative errno on failure.
-    pub csprng_fill: fn(buf: *mut u8, len: usize) -> i32,
+    pub csprng_fill: fn(buf: &mut [u8]) -> i32,
 
     /// Return the current CPU core ID (0-3). Returns 0 on single-core platforms.
     pub core_id: fn() -> usize,
 
     /// Bind an event handle to a hardware IRQ. Platform-specific.
-    /// `target_core` is the core that should take the IRQ (the core running the
-    /// owning domain — on the multi-core platform domain id == core id). On
-    /// single-core / no-IRQ platforms it is ignored.
+    /// `ack` says how the interrupt path quiets the device behind the line
+    /// before it signals. `target_core` is the core that should take the IRQ
+    /// (the core running the owning domain — on the multi-core platform
+    /// domain id == core id). On single-core / no-IRQ platforms it is ignored.
     /// Returns 0 on success, negative errno on failure.
-    pub irq_bind: fn(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) -> i32,
+    pub irq_bind: fn(irq: u32, event_handle: i32, ack: IrqAck, target_core: u8) -> i32,
 
     /// Block until the absolute `deadline_us` (microseconds since boot) OR an
     /// event/IRQ wakes the scheduler, whichever comes first; returns a
@@ -608,8 +610,8 @@ pub fn verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
 }
 
 /// See [`HalOps::ota_stage_protect`].
-pub fn ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
-    (ops().ota_stage_protect)(base, len, executable)
+pub fn ota_stage_protect(region: &mut [u8], executable: bool) -> bool {
+    (ops().ota_stage_protect)(region, executable)
 }
 
 #[inline(always)]
@@ -768,8 +770,8 @@ pub fn init_gpio(gpio: &[Option<crate::kernel::boot::config::GpioConfig>]) -> us
 }
 
 #[inline(always)]
-pub fn csprng_fill(buf: *mut u8, len: usize) -> i32 {
-    (ops().csprng_fill)(buf, len)
+pub fn csprng_fill(buf: &mut [u8]) -> i32 {
+    (ops().csprng_fill)(buf)
 }
 
 /// Return the current CPU core ID (0-3). Returns 0 on single-core platforms.
@@ -778,8 +780,19 @@ pub fn core_id() -> usize {
     (ops().core_id)()
 }
 
+/// How the interrupt path quiets the device behind a bound line before it
+/// signals the event (`event::ack` on the wire).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IrqAck {
+    /// The driver acknowledges the device itself.
+    None,
+    /// The line is the machine's virtio-mmio transport's; the kernel
+    /// acknowledges it.
+    VirtioMmio,
+}
+
 /// Bind an event handle to a hardware IRQ.
 #[inline(always)]
-pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) -> i32 {
-    (ops().irq_bind)(irq, event_handle, mmio_base, target_core)
+pub fn irq_bind(irq: u32, event_handle: i32, ack: IrqAck, target_core: u8) -> i32 {
+    (ops().irq_bind)(irq, event_handle, ack, target_core)
 }

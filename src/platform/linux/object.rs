@@ -24,7 +24,6 @@
 // binding a colliding name.
 use fluxor::abi::contracts::storage::object as obj_dev;
 use fluxor::abi::fence as obj_dev_fence;
-use fluxor::kernel::ipc::fd::{tag_fd, FD_TAG_STORAGE_OBJECT};
 use fluxor::kernel::sys::errno as obj_errno;
 
 const OBJ_MAX_OPEN: usize = 16;
@@ -55,7 +54,7 @@ unsafe fn obj_owned_slot(handle: i32) -> Option<usize> {
     if handle < 0 {
         return None;
     }
-    let idx = fluxor::kernel::ipc::fd::slot_of(handle) as usize;
+    let idx = handle as usize;
     let objs = &*core::ptr::addr_of!(LINUX_OBJECTS);
     objs.get(idx)
         .filter(|s| s.in_use && s.opener == fluxor::kernel::exec::scheduler::caller_owner())
@@ -89,53 +88,72 @@ struct HttpResult {
 
 /// Dispatch entry registered for the STORAGE_OBJECT contract from
 /// `linux_init_providers`.
-unsafe fn linux_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn linux_object_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     // A workload's objects are its own store's: never the HTTP origin and
     // never the node's store.
     let owner = fluxor::kernel::exec::scheduler::caller_owner();
     if fluxor::platform::linux::owner_root::rooted(owner) {
-        let Some(store) = fluxor::platform::linux::owner_root::store_for(owner) else {
+        // SAFETY: platform dispatch runs on the scheduler thread alone, the
+        // one thread that touches the owner roots' stores.
+        let Some(store) = (unsafe { fluxor::platform::linux::owner_root::store_for(owner) }) else {
             return obj_errno::EACCES;
         };
         return fluxor::platform::linux::store::dispatch_object_on(
-            store, false, handle, opcode, arg, arg_len,
+            store, false, handle, opcode, arg, data,
         );
     }
     // Control-plane store mode (FLUXOR_STORE_DIR set): the versioned store backs
     // storage.object here (PUT/GET/HEAD/DELETE/CAS + revision fence). Otherwise
     // this provider is the HTTP-backed object surface below.
-    if fluxor::platform::linux::store::store_active() {
-        return fluxor::platform::linux::store::dispatch_object(handle, opcode, arg, arg_len);
+    // SAFETY: platform dispatch runs on the scheduler thread alone.
+    if unsafe { fluxor::platform::linux::store::store_active() } {
+        return fluxor::platform::linux::store::dispatch_object(handle, opcode, arg, data);
     }
+    // SAFETY: platform dispatch runs on the scheduler thread alone, the one
+    // thread that touches the slot table.
+    unsafe { linux_object_call(handle, opcode, arg, data) }
+}
+
+/// # Safety
+/// Scheduler thread only: reads and writes the `static mut` slot table.
+unsafe fn linux_object_call(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     // Per-handle fence: HTTP fetches are volatile (no durability tier).
     if opcode == obj_dev_fence::QUERY_OP {
-        if arg.is_null() || arg_len < obj_dev_fence::WIRE_MAX_LEN {
+        if arg.len() < obj_dev_fence::WIRE_MAX_LEN {
             return obj_errno::EINVAL;
         }
         if obj_owned_slot(handle).is_none() {
             return obj_errno::ENOSYS;
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match obj_dev_fence::Fence::Volatile.encode(buf) {
+        return match obj_dev_fence::Fence::Volatile.encode(arg) {
             Some(n) => n as i32,
             None => obj_errno::EINVAL,
         };
     }
     match opcode {
-        obj_dev::GET => linux_obj_get(arg, arg_len),
-        obj_dev::HEAD => linux_obj_head(arg, arg_len),
-        obj_dev::RANGE_GET => linux_obj_range_get(handle, arg, arg_len),
+        obj_dev::GET => match obj_dev::key::parse(arg) {
+            Some(key) => linux_obj_alloc(key),
+            None => obj_errno::EINVAL,
+        },
+        obj_dev::HEAD => linux_obj_head(arg),
+        obj_dev::RANGE_GET => linux_obj_range_get(handle, arg, data),
         obj_dev::CLOSE => linux_obj_close(handle),
+        // A read-only origin: no write, no listing, nothing optional.
+        obj_dev::CAPS => fluxor::abi::kernel_abi::caps_word::answer(arg, 0),
         // An HTTP origin offers no enumeration of the paths it serves.
         obj_dev::LIST => obj_errno::ENOSYS,
         _ => obj_errno::ENOSYS,
     }
-}
-
-unsafe fn obj_read_u64(ptr: *const u8, off: usize) -> u64 {
-    let mut b = [0u8; 8];
-    core::ptr::copy_nonoverlapping(ptr.add(off), b.as_mut_ptr(), 8);
-    u64::from_le_bytes(b)
 }
 
 unsafe fn linux_obj_alloc(key: &[u8]) -> i32 {
@@ -152,38 +170,27 @@ unsafe fn linux_obj_alloc(key: &[u8]) -> i32 {
     slot.key_len = key.len();
     slot.in_use = true;
     slot.opener = fluxor::kernel::exec::scheduler::caller_owner();
-    tag_fd(FD_TAG_STORAGE_OBJECT, slot_idx as i32)
+    slot_idx as i32
 }
 
-/// `GET` — reserve a handle bound to the UTF-8 key.
-unsafe fn linux_obj_get(key_ptr: *mut u8, key_len: usize) -> i32 {
-    if key_ptr.is_null() || key_len == 0 {
+/// `RANGE_GET` — `[offset:u64]`. Issues a ranged HTTP GET for as many bytes
+/// as `data` holds and copies them into it.
+unsafe fn linux_obj_range_get(
+    handle: i32,
+    arg: &[u8],
+    mut data: fluxor::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
+    let Some(offset) = obj_dev::range_get::parse(arg) else {
         return obj_errno::EINVAL;
-    }
-    let key = core::slice::from_raw_parts(key_ptr, key_len);
-    linux_obj_alloc(key)
-}
-
-/// `RANGE_GET` — `[offset:u64][length:u32][out_ptr:u64]`. Issues a
-/// ranged HTTP GET and copies up to `length` bytes into `out_ptr`.
-unsafe fn linux_obj_range_get(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 + 4 + 8 {
-        return obj_errno::EINVAL;
-    }
+    };
     let Some(slot_idx) = obj_owned_slot(handle) else {
         return obj_errno::EINVAL;
     };
-    let objs = &*core::ptr::addr_of!(LINUX_OBJECTS);
-    let offset = obj_read_u64(arg, 0);
-    let length = {
-        let mut b = [0u8; 4];
-        core::ptr::copy_nonoverlapping(arg.add(8), b.as_mut_ptr(), 4);
-        u32::from_le_bytes(b) as u64
-    };
-    let out_ptr = obj_read_u64(arg, 12) as *mut u8;
-    if length == 0 || out_ptr.is_null() {
+    let length = data.len() as u64;
+    if length == 0 {
         return obj_errno::OK;
     }
+    let objs = &*core::ptr::addr_of!(LINUX_OBJECTS);
     let key = &objs[slot_idx].key[..objs[slot_idx].key_len];
 
     match http_request(key, Some((offset, length)), false) {
@@ -199,63 +206,37 @@ unsafe fn linux_obj_range_get(handle: i32, arg: *mut u8, arg_len: usize) -> i32 
             let n = core::cmp::min(length, avail) as usize;
             let end = core::cmp::min(start + n, res.body.len());
             let n = end.saturating_sub(start);
-            if n > 0 {
-                core::ptr::copy_nonoverlapping(res.body.as_ptr().add(start), out_ptr, n);
-            }
+            data.as_mut()[..n].copy_from_slice(&res.body[start..end]);
             n as i32
         }
         Err(code) => code,
     }
 }
 
-/// `HEAD` — fill the caller's out buffer with a `range::encode_head`
-/// record and write a Volatile fence.
-unsafe fn linux_obj_head(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
-        return obj_errno::EINVAL;
-    }
-    let key_len = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
+/// `HEAD` — take the key from `arg`, write the `range::encode_head` record
+/// over it and a Volatile fence into its trailer.
+fn linux_obj_head(arg: &mut [u8]) -> i32 {
+    let mut key = [0u8; OBJ_MAX_KEY];
+    let key_len = match obj_dev::head::parse_request(arg) {
+        Some(k) if k.len() <= OBJ_MAX_KEY => {
+            key[..k.len()].copy_from_slice(k);
+            k.len()
+        }
+        _ => return obj_errno::EINVAL,
     };
-    let fixed = 2 + key_len + 8 + 4 + 8 + 2;
-    if arg_len < fixed || key_len == 0 || key_len > OBJ_MAX_KEY {
-        return obj_errno::EINVAL;
-    }
-    let key = core::slice::from_raw_parts(arg.add(2), key_len);
-    let mut p = 2 + key_len;
-    let out_ptr = obj_read_u64(arg, p) as *mut u8;
-    p += 8;
-    let out_cap = {
-        let mut b = [0u8; 4];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 4);
-        u32::from_le_bytes(b) as usize
-    };
-    p += 4;
-    let fence_out_ptr = obj_read_u64(arg, p) as *mut u8;
-    p += 8;
-    let fence_out_cap = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
-    };
-    if out_ptr.is_null() || fence_out_ptr.is_null() || fence_out_cap < obj_dev_fence::WIRE_MAX_LEN {
-        return obj_errno::EINVAL;
-    }
-
-    let size = match http_request(key, None, true) {
+    let size = match http_request(&key[..key_len], None, true) {
         Ok(res) => res.content_length,
         Err(code) => return code,
     };
-    let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
+    let Some(out) = obj_dev::head::answer_area(arg) else {
+        return obj_errno::EINVAL;
+    };
     // mtime is 0: the HTTP-date `Last-Modified` header is not parsed.
     let written = match obj_dev::range::encode_head(out, size, 0, &[], &[], obj_dev::Kept::none()) {
         Some(n) => n,
         None => return obj_errno::ENOMEM,
     };
-    let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
-    let _ = obj_dev_fence::Fence::Volatile.encode(fbuf);
+    obj_dev_fence::trailer::put(arg, &obj_dev_fence::Fence::Volatile);
     written as i32
 }
 

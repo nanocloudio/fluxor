@@ -25,8 +25,8 @@
 //! FS_STAT looks up the response's `Content-Length` via
 //! `host_fetch_size` and maps its four-state return:
 //!
-//!   shim size >= 0 → OK; write `[size:u32, mtime:u32=0]` into the
-//!                   8-byte stat buffer
+//!   shim size >= 0 → OK; write the 32-byte `fs::Stat` record with
+//!                   `size` and every other field 0
 //!   shim size == -1 → ENOSYS  (headers in, no Content-Length —
 //!                    chunked / identity-of-unknown-length; consumer
 //!                    can safely commit a streaming response)
@@ -54,10 +54,9 @@
 
 use crate::abi::contracts::storage::fs as dev_fs;
 use crate::abi::fence as dev_fence;
-use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_FS};
 use crate::kernel::sys::errno;
 
-const MAX_OPEN_FILES: usize = 16;
+pub(super) const MAX_OPEN_FILES: usize = 16;
 
 struct FetchSlot {
     /// Host fetch handle from `host_fetch_open`. -1 when the slot is free.
@@ -124,24 +123,29 @@ pub fn register() {
     provider::register(dev_class::FS, wasm_fs_dispatch);
 }
 
-unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    // Per the provider contract (kernel/provider.rs::provider_call): a
-    // tagged handle passes through `dispatch` unchanged, and a typed
-    // inbound provider must strip the tag with `slot_of` to recover its
-    // raw FETCH_FILES slot. `fs_open` returns `tag_fd(FD_TAG_FS, slot)`,
-    // so every per-FD op (QUERY/READ/STAT/CLOSE) below receives a tagged
-    // fd — without this strip they indexed FETCH_FILES by the tagged
-    // value (tag<<26 == an out-of-range slot) and returned EINVAL on
-    // every read, so a fetch()-backed ROM never loaded. OPEN/CAPS ignore
-    // `handle`; stripping a -1 there is harmless.
-    let handle = slot_of(handle);
+fn wasm_fs_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    _data: crate::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
+    // SAFETY: provider dispatch runs on the scheduler thread, the only one
+    // touching FETCH_FILES; the host imports take spans of `arg` it holds.
+    unsafe { fs_dispatch_on_thread(handle, opcode, arg) }
+}
+
+/// # Safety
+/// Scheduler thread only (FETCH_FILES).
+unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32 {
+    // `fs_open` answers the FETCH_FILES slot's index, and every per-FD op
+    // (QUERY/READ/STAT/CLOSE) below is handed it back.
     // The wasm fetch model has no fsync path and no replication, so
     // every successful op is `Fence::Volatile`. Contract errno rule
     // (see `fence.rs::QUERY_OP`): `EINVAL` for malformed buffer,
     // `ENOSYS` for handles this provider does not own — closed,
     // stale, or out-of-range slots fall in the ENOSYS bucket.
     if opcode == dev_fence::QUERY_OP {
-        if arg.is_null() || arg_len < dev_fence::WIRE_MAX_LEN {
+        if arg.len() < dev_fence::WIRE_MAX_LEN {
             return errno::EINVAL;
         }
         let slot_idx = handle as usize;
@@ -149,8 +153,7 @@ unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
         if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
             return errno::ENOSYS;
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match dev_fence::Fence::Volatile.encode(buf) {
+        return match dev_fence::Fence::Volatile.encode(arg) {
             Some(n) => n as i32,
             None => errno::EINVAL,
         };
@@ -168,33 +171,24 @@ unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
     // names for one byte range would let a program write under one and
     // fail to find it under the other.
     if opcode == dev_fs::CAPS {
-        if arg.is_null() || arg_len < 4 {
-            return errno::EINVAL;
-        }
-        // WRITE is served now, so it is advertised. Before, this tier was
-        // read-only because its only backing was `fetch()` and an HTTP GET
-        // has nothing to write to — which left the `fs` contract half
-        // served here and made a read-only deployment the only honest one.
         // Writes go to the same persistent tier `storage.object` uses
         // (OPFS, IndexedDB where OPFS is absent), which is also what reads
-        // now consult first, so a path written here reads back as itself.
+        // consult first, so a path written here reads back as itself.
         let caps: u32 = dev_fs::caps::OPEN | dev_fs::caps::WRITE;
-        let bytes = caps.to_le_bytes();
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
-        return 4;
+        return crate::abi::kernel_abi::caps_word::answer(arg, caps);
     }
     match opcode {
-        dev_fs::OPEN => fs_open(arg, arg_len),
-        dev_fs::READ => fs_read(handle, arg, arg_len),
+        dev_fs::OPEN => fs_open(arg),
+        dev_fs::READ => fs_read(handle, arg),
         dev_fs::CLOSE => fs_close(handle),
-        dev_fs::STAT => fs_stat(handle, arg, arg_len),
-        dev_fs::WRITE => fs_write(handle, arg, arg_len),
+        dev_fs::STAT => fs_stat(handle, arg),
+        dev_fs::WRITE => fs_write(handle, arg),
         _ => errno::ENOSYS,
     }
 }
 
-unsafe fn fs_open(path_ptr: *mut u8, path_len: usize) -> i32 {
-    if path_ptr.is_null() || path_len == 0 {
+unsafe fn fs_open(path: &[u8]) -> i32 {
+    if path.is_empty() {
         return errno::EINVAL;
     }
     let files = &mut *core::ptr::addr_of_mut!(FETCH_FILES);
@@ -202,7 +196,7 @@ unsafe fn fs_open(path_ptr: *mut u8, path_len: usize) -> i32 {
         Some(i) => i,
         None => return errno::ENOMEM,
     };
-    let host_handle = host_fetch_open(path_ptr as *const u8, path_len);
+    let host_handle = host_fetch_open(path.as_ptr(), path.len());
     if host_handle < 0 {
         return errno::ENODEV;
     }
@@ -210,11 +204,11 @@ unsafe fn fs_open(path_ptr: *mut u8, path_len: usize) -> i32 {
     files[slot_idx].in_use = true;
     // FS handles carry their contract in the tag; the vtable wrapper
     // strips it on re-entry so inbound ops see the raw slot.
-    tag_fd(FD_TAG_FS, slot_idx as i32)
+    slot_idx as i32
 }
 
-unsafe fn fs_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
-    if buf.is_null() || len == 0 {
+unsafe fn fs_read(handle: i32, buf: &mut [u8]) -> i32 {
+    if buf.is_empty() {
         return errno::EINVAL;
     }
     let slot_idx = handle as usize;
@@ -222,7 +216,7 @@ unsafe fn fs_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
     if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
         return errno::EINVAL;
     }
-    let n = host_fetch_recv(files[slot_idx].host_handle, buf, len);
+    let n = host_fetch_recv(files[slot_idx].host_handle, buf.as_mut_ptr(), buf.len());
     if n > 0 {
         n
     } else if n == 0 {
@@ -234,8 +228,8 @@ unsafe fn fs_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
     }
 }
 
-unsafe fn fs_stat(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
+unsafe fn fs_stat(handle: i32, arg: &mut [u8]) -> i32 {
+    if arg.len() != dev_fs::stat::LEN {
         return errno::EINVAL;
     }
     let slot_idx = handle as usize;
@@ -256,45 +250,23 @@ unsafe fn fs_stat(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if size < 0 {
         return errno::ENODEV;
     }
-    // The buffer's width selects the shape, and the RETURN VALUE is the
-    // width actually written — the contract makes that a MUST so a
-    // consumer learns what it got instead of assuming what it asked for.
-    // Answering `OK` and writing one fixed shape into whatever buffer
-    // arrived would leave a consumer asking with sixteen bytes unable to
-    // tell a narrow answer from a wide one, with nothing to do but guess
-    // which it got. A consumer that refuses to guess cannot use the
-    // member at all.
-    //
     // This backing has no mtime (a fetched resource carries none it can
-    // vouch for), so mtime is reported as zero in whichever width the
-    // caller chose. Zero is the honest answer: it is not a timestamp
-    // that could be mistaken for a real one.
-    let size = size as u64;
-    if arg_len >= 16 {
-        core::ptr::copy_nonoverlapping(size.to_le_bytes().as_ptr(), arg, 8);
-        core::ptr::write_bytes(arg.add(8), 0, 8);
-        return 16;
+    // vouch for), no file identity and no name count, so each is reported
+    // as zero: not a value that could be mistaken for a real one.
+    dev_fs::Stat {
+        size: size as u64,
+        ..dev_fs::Stat::default()
     }
-    // Narrow form. A size past what 32 bits can carry is refused rather
-    // than truncated — a wrong number here reads as a shorter file.
-    let Ok(size_u) = u32::try_from(size) else {
-        return errno::EOVERFLOW;
-    };
-    core::ptr::copy_nonoverlapping(size_u.to_le_bytes().as_ptr(), arg, 4);
-    core::ptr::write_bytes(arg.add(4), 0, 4);
-    8
+    .answer(arg)
 }
 
-/// `WRITE` — append `arg[..arg_len]` to the open handle.
+/// `WRITE` — append `arg` to the open handle.
 ///
 /// Returns bytes written. The bytes are staged against the handle and
 /// published as one file at `CLOSE`, which is what makes several writes
 /// one file instead of a sequence a reader can catch halfway.
-unsafe fn fs_write(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() {
-        return errno::EINVAL;
-    }
-    if arg_len == 0 {
+unsafe fn fs_write(handle: i32, arg: &[u8]) -> i32 {
+    if arg.is_empty() {
         return 0;
     }
     let slot_idx = handle as usize;
@@ -302,7 +274,7 @@ unsafe fn fs_write(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
         return errno::EINVAL;
     }
-    let n = host_fetch_write(files[slot_idx].host_handle, arg as *const u8, arg_len);
+    let n = host_fetch_write(files[slot_idx].host_handle, arg.as_ptr(), arg.len());
     if n < 0 {
         return errno::ENODEV;
     }

@@ -48,12 +48,13 @@
 
 use super::super::super::fence::ObjectId;
 
-/// The longest key or entry name any storage surface carries. One bound for
-/// one concept: it is the `storage.namespace` `name_len` and trailing-cursor
-/// widths (a `u8`), the `storage.object` `LIST` cursor, and what the kernel
-/// gateway's argument copy is sized to carry (a prefix and a cursor of this
-/// length in one `LIST` request). A provider refuses to create a longer key,
-/// and refuses a listing that meets one rather than skip it.
+/// The longest key, path or entry name any storage surface carries. One
+/// bound for one concept: it is the `storage.namespace` `name_len` and
+/// trailing-cursor widths (a `u8`), `storage.namespace::PATH_MAX`, the
+/// `storage.object` key, prefix and `LIST` cursor, and the `fs` path. Every
+/// request that carries such names inline in its `arg` stays within the
+/// registry's `gate::ARG_MAX`. A provider refuses to create a longer key, and
+/// refuses a listing that meets one rather than skip it.
 pub const STORAGE_KEY_MAX: usize = 255;
 
 /// Surface kind a `StorageHandle` addresses. Numeric so it

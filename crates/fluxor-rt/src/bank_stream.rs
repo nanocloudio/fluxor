@@ -4,7 +4,7 @@
 // Layer: a module skeleton, expanded at a consumer module's top level by
 // `fluxor_rt::bank_stream!()`, so it shares the module's runtime scope —
 // `drain_pending`, `track_pending`, `msg_read`, `msg_write`, `dev_log`,
-// `dev_millis`, `dev_channel_ioctl`, the `POLL_*` / `IOCTL_*` / `MSG_*`
+// `dev_millis`, `dev_channel_flush` / `dev_channel_set_hup`, the `POLL_*` / `MSG_*`
 // opcodes and the `$crate::define_params!` machinery). NOT a wire contract.
 //
 // Owns everything a bank needs that does not depend on the
@@ -495,7 +495,7 @@ macro_rules! bank_stream {
         #[inline]
         pub unsafe fn signal_stream_eof(s: &BankState) {
             if s.out_chans[0] >= 0 {
-                dev_channel_ioctl(s.sys(), s.out_chans[0], IOCTL_EOF, core::ptr::null_mut(), 0);
+                dev_channel_set_hup(s.sys(), s.out_chans[0]);
             }
         }
 
@@ -560,7 +560,7 @@ macro_rules! bank_stream {
         ///   current track. Any of its unread bytes still buffered in the
         ///   ring would be decoded as a continuation of the previous
         ///   stream. Drop them so the consumer sees the boundary cleanly.
-        ///   IOCTL_FLUSH also clears HUP, so `signal_stream_eof` re-arms
+        ///   A flush also clears HUP, so `signal_stream_eof` re-arms
         ///   it immediately.
         ///
         /// - **Auto-advance** (`false`): the previous stream ended at EOF.
@@ -569,13 +569,7 @@ macro_rules! bank_stream {
         #[inline]
         pub unsafe fn select_index(s: &mut BankState, flush: bool) {
             if flush && s.out_chans[0] >= 0 {
-                dev_channel_ioctl(
-                    s.sys(),
-                    s.out_chans[0],
-                    IOCTL_FLUSH,
-                    core::ptr::null_mut(),
-                    0,
-                );
+                dev_channel_flush(s.sys(), s.out_chans[0]);
             }
             signal_stream_eof(s);
             if s.path_count > 0 {
@@ -894,7 +888,7 @@ macro_rules! bank_stream {
                 if s.paused == 0 && s.out_chans[0] >= 0 && s.path_count > 0 {
                     // Hold off until the consumer has acknowledged any
                     // pending stream boundary. HUP is sticky on the shared
-                    // channel slot; the consumer clears it via IOCTL_FLUSH
+                    // channel slot; the consumer clears it with a FLUSH
                     // at the end of its reset path. Skipping this gate
                     // would append the next file's bytes to the previous
                     // stream's tail in the same ring — the consumer (still

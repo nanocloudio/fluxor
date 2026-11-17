@@ -80,6 +80,8 @@ unsafe fn adc_reg_write(sys: &SyscallTable, offset: u8, val: u32) {
         ADC_REG_WRITE,
         bp,
         5,
+        core::ptr::null_mut(),
+        0,
     );
 }
 
@@ -92,6 +94,8 @@ unsafe fn adc_reg_read(sys: &SyscallTable, offset: u8) -> u32 {
         ADC_REG_READ,
         bp,
         5,
+        core::ptr::null_mut(),
+        0,
     );
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
@@ -120,6 +124,8 @@ pub unsafe extern "C" fn adc_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
 ) -> i32 {
     let s = &mut *(state as *mut AdcState);
     let sys = &*s.syscalls;
@@ -149,6 +155,8 @@ pub unsafe extern "C" fn adc_dispatch(
                     abi::platform::rp::adc_raw::PIN_INIT,
                     pin_buf.as_mut_ptr(),
                     1,
+                    core::ptr::null_mut(),
+                    0,
                 );
             }
 
@@ -167,7 +175,11 @@ pub unsafe extern "C" fn adc_dispatch(
             -16
         }
         ADC_CLOSE => {
-            let idx = handle as usize;
+            let idx = if handle < 0 {
+                usize::MAX
+            } else {
+                handle as usize
+            };
             if idx >= MAX_HANDLES {
                 return -22;
             }
@@ -176,7 +188,11 @@ pub unsafe extern "C" fn adc_dispatch(
         }
         ADC_READ => {
             // Start single-shot conversion
-            let idx = handle as usize;
+            let idx = if handle < 0 {
+                usize::MAX
+            } else {
+                handle as usize
+            };
             if idx >= MAX_HANDLES {
                 return -22;
             }
@@ -194,7 +210,11 @@ pub unsafe extern "C" fn adc_dispatch(
             0
         }
         ADC_POLL => {
-            let idx = handle as usize;
+            let idx = if handle < 0 {
+                usize::MAX
+            } else {
+                handle as usize
+            };
             if idx >= MAX_HANDLES {
                 return -22;
             }

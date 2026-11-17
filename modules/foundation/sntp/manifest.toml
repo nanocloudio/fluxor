@@ -42,11 +42,17 @@ timer_class = "wall_clock"
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+# Datagrams only (NTP over UDP): the transport keeps nothing for this port.
+datagram_only = true
+# A transport record whole, header included (`module_facts!` states the same).
+accepts_record = 1483
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+# One CMD_DG_SEND_TO carrying a 48-byte NTP request, header included.
+max_record = 59
 
 # `write`: DISCIPLINE sets the platform's wall clock.
 [[resources]]

@@ -3,10 +3,11 @@
 //! A minimal PIC module placed on a `tier: 2` domain. The kernel binds its
 //! declared `irq:` to `isr_tier2_trampoline`, so the module's `module_isr_entry`
 //! is dispatched straight from interrupt context (never the cooperative
-//! `module_step`). Each dispatch increments a private counter and exercises the
-//! ISR-safe bridge ABI by calling `SELF_BRIDGES` (`bridge::SELF_BRIDGES`) — proving on real
-//! silicon that (a) Tier-2 dispatch reaches `module_isr_entry`, and (b) the
-//! §D7-exempt bridge syscalls are reachable from ISR context. The kernel's
+//! `module_step`). `module_new` takes the module's first input bridge
+//! (`bridge::SELF_BRIDGE`); each dispatch increments a private counter and
+//! polls that bridge (`bridge::POLL`) — proving on real silicon that (a) Tier-2
+//! dispatch reaches `module_isr_entry`, and (b) the §D7-exempt bridge syscalls
+//! are reachable from ISR context. The kernel's
 //! global `tier2_dispatch_count` (surfaced on the `[therm]` line as `t2disp=`)
 //! climbs once per dispatch — the observable over UDP telemetry.
 //!
@@ -28,10 +29,7 @@ use abi::SyscallTable;
 use fluxor_abi as abi;
 use fluxor_rt::StepReturn;
 
-/// `bridge::SELF_BRIDGES` opcode — enumerate this module's own bridge fds.
-/// ISR-safe (exempt from the §D7 provider_call deny). Mirrors
-/// `crates/fluxor-abi/src/internal/bridge.rs::SELF_BRIDGES`.
-const SELF_BRIDGES: u32 = abi::registry::bridge::SELF_BRIDGES;
+use abi::internal::bridge;
 
 #[repr(C)]
 struct Tier2ProbeState {
@@ -39,11 +37,10 @@ struct Tier2ProbeState {
     out_chan: i32,
     /// Count of `module_isr_entry` dispatches (incremented from ISR context).
     isr_calls: u32,
-    /// Last `SELF_BRIDGES` return code (proves the ISR-bridge ABI is reachable).
-    self_bridges_rc: i32,
-    in_count: u8,
-    out_count: u8,
-    _pad: [u8; 2],
+    /// The first input bridge's handle, or the errno `SELF_BRIDGE` answered.
+    in_bridge: i32,
+    /// Last bridge `POLL` return code (proves the ISR-bridge ABI is reachable).
+    poll_rc: i32,
 }
 
 fluxor_rt::module_facts! { state: Tier2ProbeState }
@@ -75,9 +72,19 @@ pub extern "C" fn module_new(
         s.syscalls = syscalls as *const SyscallTable;
         s.out_chan = out_chan;
         s.isr_calls = 0;
-        s.self_bridges_rc = 0;
-        s.in_count = 0;
-        s.out_count = 0;
+        s.poll_rc = 0;
+        // A bridge handle is a kernel route: taken here, on the scheduler,
+        // never from the ISR entry.
+        let sys = &*s.syscalls;
+        let mut arg = [bridge::DIR_IN, 0];
+        s.in_bridge = (sys.provider_call)(
+            -1,
+            bridge::SELF_BRIDGE,
+            arg.as_mut_ptr(),
+            arg.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         0
     }
 }
@@ -103,15 +110,19 @@ pub extern "C" fn module_isr_entry(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut Tier2ProbeState);
         s.isr_calls = s.isr_calls.wrapping_add(1);
         // Exercise the ISR-safe bridge ABI from real ISR context. With no
-        // bridges wired this returns -ENODEV, but the call COMPLETING (not
+        // bridge wired the poll is refused, but the call COMPLETING (not
         // EACCES, not a fault that would stall dispatch) validates that the
-        // §D7 exemption + SELF_BRIDGES enumeration work on silicon.
+        // §D7 exemption works on silicon.
         if !s.syscalls.is_null() {
             let sys = &*s.syscalls;
-            let mut buf = [0u8; 36]; // SELF_BRIDGES_BUF_LEN = 4 + 8*4
-            s.self_bridges_rc = (sys.provider_call)(-1, SELF_BRIDGES, buf.as_mut_ptr(), buf.len());
-            s.in_count = buf[0];
-            s.out_count = buf[1];
+            s.poll_rc = (sys.provider_call)(
+                s.in_bridge,
+                bridge::POLL,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         0
     }

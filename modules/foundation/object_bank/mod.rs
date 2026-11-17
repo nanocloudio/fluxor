@@ -107,7 +107,14 @@ unsafe fn backend_close(s: &mut BankState) {
         // storage.object consumers free BOTH the provider-side slot
         // (OBJ_CLOSE) and the kernel routing entry (provider_close) —
         // a per-track GET leaks a slot otherwise.
-        (s.sys().provider_call)(s.fs_fd, OBJ_CLOSE, core::ptr::null_mut(), 0);
+        (s.sys().provider_call)(
+            s.fs_fd,
+            OBJ_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         (s.sys().provider_close)(s.fs_fd);
         s.fs_fd = -1;
     }
@@ -118,7 +125,21 @@ unsafe fn backend_close(s: &mut BankState) {
 /// and resets the read cursor.
 #[inline]
 unsafe fn backend_open_handle(s: &mut BankState, path: *mut u8, len: usize) -> i32 {
-    let fd = (s.sys().provider_call)(-1, OBJ_GET, path, len);
+    use abi::contracts::storage::object::key;
+    let mut arg = [0u8; key::ARG_MAX];
+    // SAFETY: the bank hands its own path slot, `len` bytes long.
+    let path = core::slice::from_raw_parts(path, len);
+    let Some(arg_len) = key::encode(&mut arg, path) else {
+        return E_INVAL;
+    };
+    let fd = (s.sys().provider_call)(
+        -1,
+        OBJ_GET,
+        arg.as_mut_ptr(),
+        arg_len,
+        core::ptr::null_mut(),
+        0,
+    );
     if fd >= 0 {
         s.obj_offset = 0;
     }
@@ -146,9 +167,15 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
     // The handle itself is NOT passed to LIST: the public contract
     // (`storage::namespace::LIST`) mandates `handle = -1` and carries the
     // prefix in the request arg, so a conforming provider would reject a
-    // handle-scoped LIST. (The wasm provider ignores the handle, so the
-    // old code worked there by accident.)
-    let handle = (s.sys().provider_call)(-1, NS_LOOKUP, dir_path.as_mut_ptr(), dlen);
+    // handle-scoped LIST.
+    let handle = (s.sys().provider_call)(
+        -1,
+        NS_LOOKUP,
+        dir_path.as_mut_ptr(),
+        dlen,
+        core::ptr::null_mut(),
+        0,
+    );
     if handle < 0 {
         if handle != -11 {
             log_info(s, b"[object_bank] LOOKUP fail");
@@ -159,10 +186,18 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
     }
     // The shape of the names LIST returns: a directory-shaped provider names
     // the prefix's children, joined to it to make a key; a key-shaped one
-    // (or one without CAPS) names whole keys.
-    let caps = (s.sys().provider_call)(-1, NS_CAPS, core::ptr::null_mut(), 0);
-    let child_names =
-        caps >= 0 && (caps as u32) & abi::contracts::storage::namespace::caps::CHILD_NAMES != 0;
+    // names whole keys.
+    let mut caps = [0u8; abi::kernel_abi::caps_word::LEN];
+    let rc = (s.sys().provider_call)(
+        -1,
+        NS_CAPS,
+        caps.as_mut_ptr(),
+        caps.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    let child_names = rc == 0
+        && u32::from_le_bytes(caps) & abi::contracts::storage::namespace::caps::CHILD_NAMES != 0;
     let parent: &[u8] = if child_names { &dir_path[..dlen] } else { &[] };
     // Reset path table — the scan owns it.
     s.path_count = 0;
@@ -177,18 +212,13 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
     // page.
     let mut cursor = [0u8; STORAGE_KEY_MAX];
     let mut cursor_len = 0usize;
-    let mut fence = [0u8; 64]; // >= fence::WIRE_MAX_LEN (62)
     let mut full = false;
     loop {
         let req = list::Request {
             prefix: &dir_path[..dlen],
             cursor: &cursor[..cursor_len],
-            out_ptr: s.buf.as_mut_ptr() as u64,
-            out_cap: BUF_SIZE as u32,
-            fence_out_ptr: fence.as_mut_ptr() as u64,
-            fence_out_cap: fence.len() as u16,
         };
-        let mut arg = [0u8; list::REQUEST_FIXED_LEN + MAX_PATH_LEN + STORAGE_KEY_MAX];
+        let mut arg = [0u8; list::ARG_MAX];
         let Some(arg_len) = list::encode_request(&mut arg, &req) else {
             log_info(s, b"[object_bank] LIST request too long");
             break;
@@ -196,7 +226,14 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
 
         // Contract: LIST is handle = -1 (prefix is in `arg`), not the
         // LOOKUP handle — see the readiness-gate note above.
-        let n = (s.sys().provider_call)(-1, NS_LIST, arg.as_mut_ptr(), arg_len);
+        let n = (s.sys().provider_call)(
+            -1,
+            NS_LIST,
+            arg.as_mut_ptr(),
+            arg_len,
+            s.buf.as_mut_ptr(),
+            BUF_SIZE,
+        );
         if n <= 0 {
             break;
         }
@@ -237,7 +274,14 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
         cursor[..next.len()].copy_from_slice(next);
         cursor_len = next.len();
     }
-    (s.sys().provider_call)(handle, NS_CLOSE, core::ptr::null_mut(), 0);
+    (s.sys().provider_call)(
+        handle,
+        NS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     (s.sys().provider_close)(handle);
 
     finish_scan(s);
@@ -245,20 +289,22 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
 }
 
 /// Stream one chunk via OBJ_RANGE_GET at the current cursor into s.buf.
-/// arg = [offset:u64 LE][length:u32 LE][out_ptr:u64 LE]; the provider
-/// returns the byte count (n>0), EAGAIN (-11) while pending, or 0 once
+/// arg = [offset:u64 LE], data = s.buf; the provider returns the byte count (n>0), EAGAIN (-11) while pending, or 0 once
 /// the window is exhausted at the tail.
 unsafe fn backend_stream(s: &mut BankState) -> ReadOutcome {
     let poll_out = (s.sys().channel_poll)(s.out_chans[0], POLL_OUT);
     if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 {
         return ReadOutcome::Yield(0);
     }
-    let mut rarg = [0u8; 8 + 4 + 8];
-    rarg[..8].copy_from_slice(&s.obj_offset.to_le_bytes());
-    rarg[8..12].copy_from_slice(&(BUF_SIZE as u32).to_le_bytes());
-    let out_ptr = s.buf.as_mut_ptr() as u64;
-    rarg[12..20].copy_from_slice(&out_ptr.to_le_bytes());
-    let n = (s.sys().provider_call)(s.fs_fd, OBJ_RANGE_GET, rarg.as_mut_ptr(), rarg.len());
+    let mut rarg = abi::contracts::storage::object::range_get::encode(s.obj_offset);
+    let n = (s.sys().provider_call)(
+        s.fs_fd,
+        OBJ_RANGE_GET,
+        rarg.as_mut_ptr(),
+        rarg.len(),
+        s.buf.as_mut_ptr(),
+        BUF_SIZE,
+    );
     if n > 0 {
         s.obj_offset = s.obj_offset.wrapping_add(n as u64);
         let written = (s.sys().channel_write)(s.out_chans[0], s.buf.as_ptr(), n as usize);

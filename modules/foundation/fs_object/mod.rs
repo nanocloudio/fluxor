@@ -97,7 +97,8 @@
 //! No grants (`PRESENT` answers `ENOSYS`: a store with no mesh roots), no
 //! streamed puts, no `ETAG` precondition (`ENOSYS`), no key reference,
 //! retention or legal hold (`ENOSYS`, and none in a `HEAD` record), no change
-//! subscription, and of the namespace surface only `LIST` and `CAPS`.
+//! subscription, and of the namespace surface only `LIST` and `CAPS`. Its
+//! `storage.object` `CAPS` says the same.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 
@@ -106,7 +107,7 @@ use core::ffi::c_void;
 use abi::contracts::storage::fs;
 use abi::contracts::storage::namespace as ns;
 use abi::contracts::storage::object as obj;
-use abi::fence::Fence;
+use abi::fence::{trailer, Fence};
 use abi::SyscallTable;
 use fluxor_abi as abi;
 
@@ -326,7 +327,7 @@ impl Fs {
     fn call(self, handle: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
         // SAFETY: `arg` names `len` bytes the caller owns for the call (or is
         // null with `len` 0).
-        unsafe { (self.table().provider_call)(handle, op, arg, len) }
+        unsafe { (self.table().provider_call)(handle, op, arg, len, core::ptr::null_mut(), 0) }
     }
 
     /// Call `op` on a path; the path buffer is the callee's to read.
@@ -412,18 +413,14 @@ impl Fs {
 
     /// (size, mtime) of the open file `fd`.
     fn stat(self, fd: i32) -> Result<(u64, u64), i32> {
-        let mut out = [0u8; 16];
-        let rc = self.call(fd, fs::STAT, out.as_mut_ptr(), 16);
+        let mut out = [0u8; fs::stat::LEN];
+        let rc = self.call(fd, fs::STAT, out.as_mut_ptr(), out.len());
         if rc < 0 {
             return Err(rc);
         }
-        if rc >= 16 {
-            Ok((u64_at(&out, 0).unwrap_or(0), u64_at(&out, 8).unwrap_or(0)))
-        } else {
-            Ok((
-                u64::from(u32_at(&out, 0).unwrap_or(0)),
-                u64::from(u32_at(&out, 4).unwrap_or(0)),
-            ))
+        match fs::Stat::decode(&out) {
+            Some(st) => Ok((st.size, st.mtime)),
+            None => Err(ERR_INVAL),
         }
     }
 
@@ -465,18 +462,6 @@ fn u16_at(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*b.get(at)?, *b.get(at + 1)?]))
 }
 
-fn u32_at(b: &[u8], at: usize) -> Option<u32> {
-    let x = b.get(at..at + 4)?;
-    Some(u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
-}
-
-fn u64_at(b: &[u8], at: usize) -> Option<u64> {
-    let x = b.get(at..at + 8)?;
-    let mut w = [0u8; 8];
-    w.copy_from_slice(x);
-    Some(u64::from_le_bytes(w))
-}
-
 /// The kind of request an identity names: the same argument bytes asked of
 /// two different ops are two requests.
 #[derive(Clone, Copy)]
@@ -488,12 +473,14 @@ enum Ask {
     NamespaceList = 4,
 }
 
-/// SHA-256 of the request's kind and arguments: what identifies a request
-/// asked again.
-fn ask_of(kind: Ask, a: &[u8]) -> [u8; 32] {
+/// SHA-256 of the request's kind, its record (the `arg` bytes before the
+/// fence trailer, which the provider writes) and `extra` (a `PUT`'s body
+/// length): what identifies a request asked again.
+fn ask_of(kind: Ask, a: &[u8], extra: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(&[kind as u8]);
-    h.update(a);
+    h.update(trailer::record(a).unwrap_or(a));
+    h.update(extra);
     h.finalize()
 }
 
@@ -507,18 +494,32 @@ fn valid_key(key: &[u8]) -> bool {
 /// not latched: the bitmap is asked for again on the next op.
 fn caps(s: &mut State) -> Option<u32> {
     if s.caps_known == 0 {
-        let mut out = [0u8; 4];
-        let rc = s.io().call(-1, fs::CAPS, out.as_mut_ptr(), 4);
+        let mut out = [0u8; abi::kernel_abi::caps_word::LEN];
+        let rc = s.io().call(-1, fs::CAPS, out.as_mut_ptr(), out.len());
         if rc == ERR_AGAIN {
             return None;
         }
-        if rc < 0 {
+        if rc != 0 {
             return Some(0);
         }
         s.fs_caps = u32::from_le_bytes(out);
         s.caps_known = 1;
     }
     Some(s.fs_caps)
+}
+
+/// `storage.object` `CAPS`: writes (and `ABSENT` puts) where the filesystem
+/// can publish and remove a file durably, and listing always. `EAGAIN` until
+/// the filesystem knows its own capabilities.
+fn op_caps(s: &mut State, a: &mut [u8]) -> i32 {
+    let Some(fs_caps) = caps(s) else {
+        return ERR_AGAIN;
+    };
+    let mut word = obj::caps::LIST;
+    if fs_caps & PUT_NEEDS == PUT_NEEDS && fs_caps & fs::caps::UNLINK != 0 {
+        word |= obj::caps::WRITE | obj::caps::IF_ABSENT;
+    }
+    abi::kernel_abi::caps_word::answer(a, word)
 }
 
 /// One base-32 symbol: a digit or an upper-case letter, legal in an 8.3
@@ -569,17 +570,10 @@ fn path_for(s: &State, key: &[u8], kind: u8, out: &mut [u8; PATH_MAX]) -> usize 
     path_of(s, &name_for(key, kind), out)
 }
 
-/// Write `fence` into a caller's `[ptr, cap]` pair, which `fence_ok` has
-/// already checked.
-fn write_fence(fence: Fence, ptr: u64, cap: u16) {
-    // SAFETY: the caller named `cap` (>= `WIRE_MAX_LEN`) writable bytes at
-    // `ptr` for the call.
-    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, cap as usize) };
-    let _ = fence.encode(out);
-}
-
-fn fence_ok(ptr: u64, cap: u16) -> bool {
-    ptr != 0 && (cap as usize) >= abi::fence::WIRE_MAX_LEN
+/// Write `fence` into the trailer of `arg`, which the op's parse has
+/// already found room for.
+fn write_fence(fence: Fence, arg: &mut [u8]) {
+    let _ = trailer::put(arg, &fence);
 }
 
 // ── object files ──────────────────────────────────────────────────────
@@ -740,47 +734,20 @@ fn release_write(s: &mut State) {
 
 // ── PUT ───────────────────────────────────────────────────────────────
 
-/// `[key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64][pre:u8]
-/// [etag_len:u8][etag][fence_ptr:u64][fence_cap:u16]`
-fn op_put(s: &mut State, a: &[u8]) -> i32 {
-    let Some(kl) = u16_at(a, 0) else {
+/// `storage.object::PUT`: the record and fence trailer in `a`, the body in
+/// `body`.
+fn op_put(s: &mut State, a: &mut [u8], body: &[u8]) -> i32 {
+    let Some(req) = obj::put::parse(a) else {
         return ERR_INVAL;
     };
-    let kl = kl as usize;
-    let Some(key) = a.get(2..2 + kl) else {
-        return ERR_INVAL;
-    };
-    let at = 2 + kl;
-    let Some(&cl) = a.get(at) else {
-        return ERR_INVAL;
-    };
-    let cl = cl as usize;
-    let Some(ct) = a.get(at + 1..at + 1 + cl) else {
-        return ERR_INVAL;
-    };
-    let at = at + 1 + cl;
-    let (Some(body_ptr), Some(body_len), Some(&pre), Some(&el)) = (
-        u64_at(a, at),
-        u64_at(a, at + 8),
-        a.get(at + 16),
-        a.get(at + 17),
-    ) else {
-        return ERR_INVAL;
-    };
-    let at = at + 18 + el as usize;
-    let Some((kept, at)) = obj::Kept::parse(a, at) else {
-        return ERR_INVAL;
-    };
-    let (Some(fence_ptr), Some(fence_cap)) = (u64_at(a, at), u16_at(a, at + 8)) else {
-        return ERR_INVAL;
-    };
-    if !valid_key(key) || !fence_ok(fence_ptr, fence_cap) {
+    let (key, ct, pre) = (req.key, req.content_type, req.precondition);
+    if !valid_key(key) {
         return ERR_INVAL;
     }
-    if (body_ptr == 0 && body_len != 0) || body_len > isize::MAX as u64 {
+    if body.len() > isize::MAX as usize {
         return ERR_INVAL;
     }
-    if pre == obj::precondition::ETAG || !kept.is_none() {
+    if pre == obj::precondition::ETAG || !req.kept.is_none() {
         return ERR_NOSYS;
     }
     if pre != obj::precondition::ANY && pre != obj::precondition::ABSENT {
@@ -792,15 +759,8 @@ fn op_put(s: &mut State, a: &[u8]) -> i32 {
     if caps & PUT_NEEDS != PUT_NEEDS {
         return ERR_NOSYS;
     }
-    // SAFETY: the caller named `body_len` readable bytes at `body_ptr`, and
-    // keeps them unchanged until the write is decided.
-    let body = if body_len == 0 {
-        &[][..]
-    } else {
-        unsafe { core::slice::from_raw_parts(body_ptr as *const u8, body_len as usize) }
-    };
-
-    if let Err(e) = claim_write(s, ask_of(Ask::Put, a), PUT_ROOT) {
+    let ask = ask_of(Ask::Put, a, &(body.len() as u64).to_le_bytes());
+    if let Err(e) = claim_write(s, ask, PUT_ROOT) {
         return e;
     }
     let rc = put_step(s, key, ct, body, pre);
@@ -831,7 +791,7 @@ fn op_put(s: &mut State, a: &[u8]) -> i32 {
     } else {
         Fence::Volatile
     };
-    write_fence(fence, fence_ptr, fence_cap);
+    write_fence(fence, a);
     0
 }
 
@@ -995,24 +955,13 @@ fn build_header(s: &mut State, key: &[u8], ct: &[u8]) {
 
 // ── DELETE ────────────────────────────────────────────────────────────
 
-/// `[key_len:u16][key][pre:u8][etag_len:u8][etag][fence_ptr:u64][fence_cap:u16]`
-fn op_delete(s: &mut State, a: &[u8]) -> i32 {
-    let Some(kl) = u16_at(a, 0) else {
+/// `storage.object::DELETE`: the record and fence trailer in `a`.
+fn op_delete(s: &mut State, a: &mut [u8]) -> i32 {
+    let Some(req) = obj::delete::parse_request(a) else {
         return ERR_INVAL;
     };
-    let kl = kl as usize;
-    let Some(key) = a.get(2..2 + kl) else {
-        return ERR_INVAL;
-    };
-    let at = 2 + kl;
-    let (Some(&pre), Some(&el)) = (a.get(at), a.get(at + 1)) else {
-        return ERR_INVAL;
-    };
-    let at = at + 2 + el as usize;
-    let (Some(fp), Some(fc)) = (u64_at(a, at), u16_at(a, at + 8)) else {
-        return ERR_INVAL;
-    };
-    if key.is_empty() || !fence_ok(fp, fc) {
+    let (key, pre) = (req.key, req.precondition);
+    if key.is_empty() {
         return ERR_INVAL;
     }
     if pre == obj::precondition::ABSENT || pre == obj::precondition::ETAG {
@@ -1021,10 +970,14 @@ fn op_delete(s: &mut State, a: &[u8]) -> i32 {
     if pre != obj::precondition::ANY {
         return ERR_INVAL;
     }
-    let ask = ask_of(Ask::Delete, a);
+    let mut kb = [0u8; KEY_MAX];
+    let kl = key.len().min(KEY_MAX);
+    kb[..kl].copy_from_slice(&key[..kl]);
+    let key = &kb[..kl];
+    let ask = ask_of(Ask::Delete, a, &[]);
     if s.settled != 0 && s.settled_ask == ask {
         s.settled = 0;
-        write_fence(Fence::Volatile, fp, fc);
+        write_fence(Fence::Volatile, a);
         return 0;
     }
     let Some(caps) = caps(s) else {
@@ -1066,7 +1019,7 @@ fn op_delete(s: &mut State, a: &[u8]) -> i32 {
                 ERR_AGAIN
             } else {
                 release_write(s);
-                write_fence(Fence::Volatile, fp, fc);
+                write_fence(Fence::Volatile, a);
                 return 0;
             }
         }
@@ -1085,7 +1038,7 @@ fn op_delete(s: &mut State, a: &[u8]) -> i32 {
             } else {
                 Fence::Volatile
             };
-            write_fence(fence, fp, fc);
+            write_fence(fence, a);
             return 0;
         }
         _ => ERR_INVAL,
@@ -1100,7 +1053,10 @@ fn op_delete(s: &mut State, a: &[u8]) -> i32 {
 // ── GET / RANGE_GET / CLOSE / HEAD ────────────────────────────────────
 
 fn op_get(s: &mut State, a: &[u8]) -> i32 {
-    if a.is_empty() || a.len() > KEY_MAX {
+    let Some(a) = obj::key::parse(a) else {
+        return ERR_INVAL;
+    };
+    if a.is_empty() {
         return ERR_INVAL;
     }
     let Some(slot) = s.reads.iter().position(|r| r.live == 0) else {
@@ -1125,15 +1081,15 @@ fn op_get(s: &mut State, a: &[u8]) -> i32 {
         size: size.saturating_sub(h.hdr_len as u64),
         live: 1,
     };
-    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_STORAGE_OBJECT, slot as i32)
+    slot as i32
 }
 
-/// The live read slot `handle` names (the kernel strips the tag).
+/// The live read slot `handle` names.
 fn read_slot(s: &State, handle: i32) -> Option<(usize, ReadSlot)> {
     if handle < 0 {
         return None;
     }
-    let slot = abi::kernel_abi::fd::slot_of(handle) as usize;
+    let slot = handle as usize;
     let r = *s.reads.get(slot)?;
     if r.live == 0 {
         return None;
@@ -1141,32 +1097,29 @@ fn read_slot(s: &State, handle: i32) -> Option<(usize, ReadSlot)> {
     Some((slot, r))
 }
 
-/// `[offset:u64][length:u32][out_ptr:u64]`
-fn op_range(s: &mut State, handle: i32, a: &[u8]) -> i32 {
+/// `[offset:u64]`, the range into `out`.
+fn op_range(s: &mut State, handle: i32, a: &[u8], out: &mut [u8]) -> i32 {
     let Some((_, r)) = read_slot(s, handle) else {
         return ERR_BADF;
     };
-    let (Some(offset), Some(len), Some(out)) = (u64_at(a, 0), u32_at(a, 8), u64_at(a, 12)) else {
+    let Some(offset) = obj::range_get::parse(a) else {
         return ERR_INVAL;
     };
-    if out == 0 && len != 0 {
-        return ERR_INVAL;
-    }
     if offset >= r.size {
         return 0;
     }
     // The count is answered as an `i32`.
-    let len = core::cmp::min(u64::from(len), r.size - offset);
+    let len = core::cmp::min(out.len() as u64, r.size - offset);
     let len = core::cmp::min(len, i32::MAX as u64) as usize;
     let io = s.io();
-    let mut seek = (offset + u64::from(r.hdr_len)).to_le_bytes();
-    let rc = io.call(r.fd, fs::SEEK, seek.as_mut_ptr(), 8);
+    let mut seek = fs::seek::encode(offset + u64::from(r.hdr_len));
+    let rc = io.call(r.fd, fs::SEEK, seek.as_mut_ptr(), seek.len());
     if rc < 0 {
         return rc;
     }
     // A short count is an answer: the caller asks for the rest at the
     // offset it reaches.
-    io.read_some(r.fd, out as *mut u8, len)
+    io.read_some(r.fd, out.as_mut_ptr(), len)
 }
 
 fn op_close(s: &mut State, handle: i32) -> i32 {
@@ -1178,27 +1131,15 @@ fn op_close(s: &mut State, handle: i32) -> i32 {
     0
 }
 
-/// `[key_len:u16][key][out_ptr:u64][out_cap:u32][fence_ptr:u64][fence_cap:u16]`
-fn op_head(s: &mut State, a: &[u8]) -> i32 {
-    let Some(kl) = u16_at(a, 0) else {
+/// `storage.object::HEAD`: the key in, the record out, in place in `a`.
+fn op_head(s: &mut State, a: &mut [u8]) -> i32 {
+    let Some(k) = obj::head::parse_request(a) else {
         return ERR_INVAL;
     };
-    let kl = kl as usize;
-    let Some(key) = a.get(2..2 + kl) else {
-        return ERR_INVAL;
-    };
-    let at = 2 + kl;
-    let (Some(out), Some(cap), Some(fp), Some(fc)) = (
-        u64_at(a, at),
-        u32_at(a, at + 8),
-        u64_at(a, at + 12),
-        u16_at(a, at + 20),
-    ) else {
-        return ERR_INVAL;
-    };
-    if out == 0 || !fence_ok(fp, fc) {
-        return ERR_INVAL;
-    }
+    let mut kb = [0u8; KEY_MAX];
+    let kl = k.len().min(KEY_MAX);
+    kb[..kl].copy_from_slice(&k[..kl]);
+    let key = &kb[..kl];
     let (fd, h) = match open_object(s, key) {
         Ok(x) => x,
         Err(e) => return e,
@@ -1210,38 +1151,32 @@ fn op_head(s: &mut State, a: &[u8]) -> i32 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let need = 8 + 8 + 1 + h.ct_len + 1 + ETAG_LEN + obj::KEPT_FIXED_LEN;
-    if (cap as usize) < need {
+    let Some(o) = obj::head::answer_area(a) else {
+        return ERR_INVAL;
+    };
+    let Some(n) = obj::range::encode_head(
+        o,
+        size.saturating_sub(h.hdr_len as u64),
+        mtime,
+        &s.hdr[h.ct_at..h.ct_at + h.ct_len],
+        &s.hdr[h.etag_at..h.etag_at + ETAG_LEN],
+        obj::Kept::none(),
+    ) else {
         return ERR_NOMEM;
-    }
-    // SAFETY: the caller named `cap` writable bytes at `out`.
-    let o = unsafe { core::slice::from_raw_parts_mut(out as *mut u8, cap as usize) };
-    o[..8].copy_from_slice(&size.saturating_sub(h.hdr_len as u64).to_le_bytes());
-    o[8..16].copy_from_slice(&mtime.to_le_bytes());
-    o[16] = h.ct_len as u8;
-    o[17..17 + h.ct_len].copy_from_slice(&s.hdr[h.ct_at..h.ct_at + h.ct_len]);
-    let at = 17 + h.ct_len;
-    o[at] = ETAG_LEN as u8;
-    o[at + 1..at + 1 + ETAG_LEN].copy_from_slice(&s.hdr[h.etag_at..h.etag_at + ETAG_LEN]);
-    let at = at + 1 + ETAG_LEN;
-    if obj::Kept::none().encode(&mut o[at..]).is_none() {
-        return ERR_NOMEM;
-    }
-    write_fence(Fence::Volatile, fp, fc);
-    need as i32
+    };
+    write_fence(Fence::Volatile, a);
+    n as i32
 }
 
 /// `abi::fence::QUERY_OP` on a read handle: what its reads achieved, which
 /// is `Volatile`.
-fn op_fence_query(s: &State, handle: i32, out: *mut u8, cap: usize) -> i32 {
-    if out.is_null() || cap < abi::fence::WIRE_MAX_LEN {
+fn op_fence_query(s: &State, handle: i32, buf: &mut [u8]) -> i32 {
+    if buf.len() < abi::fence::WIRE_MAX_LEN {
         return ERR_INVAL;
     }
     if read_slot(s, handle).is_none() {
         return ERR_NOSYS;
     }
-    // SAFETY: the caller named `cap` writable bytes at `out`.
-    let buf = unsafe { core::slice::from_raw_parts_mut(out, cap) };
     match Fence::Volatile.encode(buf) {
         Some(n) => n as i32,
         None => ERR_INVAL,
@@ -1454,7 +1389,7 @@ fn page_cursor(s: &State, emitted: usize, cut: bool) -> &[u8] {
 }
 
 /// `storage.object::LIST`.
-fn op_obj_list(s: &mut State, a: &[u8]) -> i32 {
+fn op_obj_list(s: &mut State, a: &mut [u8], out: &mut [u8]) -> i32 {
     let Some(req) = obj::list::parse_request(a) else {
         return ERR_INVAL;
     };
@@ -1462,13 +1397,16 @@ fn op_obj_list(s: &mut State, a: &[u8]) -> i32 {
         return ERR_INVAL;
     }
     let max = core::cmp::min(req.max_keys as usize, PAGE_KEYS);
-    let rc = run_scan(s, ask_of(Ask::ObjectList, a), req.prefix, req.cursor, max);
+    let rc = run_scan(
+        s,
+        ask_of(Ask::ObjectList, a, &[]),
+        req.prefix,
+        req.cursor,
+        max,
+    );
     if rc < 0 {
         return rc;
     }
-    // SAFETY: the caller named `out_cap` writable bytes at `out_ptr`.
-    let out =
-        unsafe { core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize) };
     let mut w = obj::list::PageWriter::new(out, max as u16);
     let mut emitted = 0usize;
     let mut cut = false;
@@ -1486,12 +1424,12 @@ fn op_obj_list(s: &mut State, a: &[u8]) -> i32 {
     let Some(n) = w.finish(page_cursor(s, emitted, cut)) else {
         return ERR_NOMEM;
     };
-    write_fence(Fence::Volatile, req.fence_out_ptr, req.fence_out_cap);
+    write_fence(Fence::Volatile, a);
     n as i32
 }
 
 /// `storage.namespace::LIST`, key-shaped: every key under the prefix.
-fn op_ns_list(s: &mut State, a: &[u8]) -> i32 {
+fn op_ns_list(s: &mut State, a: &mut [u8], out: &mut [u8]) -> i32 {
     let Some(req) = ns::list::parse_request(a) else {
         return ERR_INVAL;
     };
@@ -1500,7 +1438,7 @@ fn op_ns_list(s: &mut State, a: &[u8]) -> i32 {
     }
     let rc = run_scan(
         s,
-        ask_of(Ask::NamespaceList, a),
+        ask_of(Ask::NamespaceList, a, &[]),
         req.prefix,
         req.cursor,
         PAGE_KEYS,
@@ -1508,9 +1446,6 @@ fn op_ns_list(s: &mut State, a: &[u8]) -> i32 {
     if rc < 0 {
         return rc;
     }
-    // SAFETY: the caller named `out_cap` writable bytes at `out_ptr`.
-    let out =
-        unsafe { core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize) };
     let mut w = ns::list::PageWriter::new(out);
     let mut emitted = 0usize;
     let mut cut = false;
@@ -1528,7 +1463,7 @@ fn op_ns_list(s: &mut State, a: &[u8]) -> i32 {
     let Some(n) = w.finish(page_cursor(s, emitted, cut)) else {
         return ERR_NOMEM;
     };
-    write_fence(Fence::Volatile, req.fence_out_ptr, req.fence_out_cap);
+    write_fence(Fence::Volatile, a);
     n as i32
 }
 
@@ -1602,8 +1537,9 @@ pub extern "C" fn module_step(_state: *mut u8) -> StepReturn {
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
-/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
-/// (may be null when `arg_len` is 0) valid for the call.
+/// module's `module_new` initialised, `arg` points to `arg_len` bytes and
+/// `data` to `data_len` bytes (either may be null when its length is 0),
+/// disjoint and valid for the call.
 #[cfg_attr(
     not(feature = "host-test"),
     link_section = ".text.module_provider_dispatch"
@@ -1615,34 +1551,44 @@ pub unsafe extern "C" fn fs_object_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return ERR_INVAL;
     }
     // SAFETY: the kernel passes the state block `module_new` initialised.
     let s = unsafe { &mut *(state as *mut State) };
-    if opcode == abi::fence::QUERY_OP {
-        return op_fence_query(s, handle, arg, arg_len);
-    }
-    let a: &[u8] = if arg.is_null() || arg_len == 0 {
-        &[]
+    let a: &mut [u8] = if arg.is_null() || arg_len == 0 {
+        &mut []
     } else {
-        // SAFETY: the caller named `arg_len` readable bytes at `arg`.
-        unsafe { core::slice::from_raw_parts(arg as *const u8, arg_len) }
+        // SAFETY: the caller named `arg_len` bytes at `arg` for the call.
+        unsafe { core::slice::from_raw_parts_mut(arg, arg_len) }
     };
+    let d: &mut [u8] = if data.is_null() || data_len == 0 {
+        &mut []
+    } else {
+        // SAFETY: the caller named `data_len` bytes at `data`, disjoint from
+        // `arg`, for the call.
+        unsafe { core::slice::from_raw_parts_mut(data, data_len) }
+    };
+    if opcode == abi::fence::QUERY_OP {
+        return op_fence_query(s, handle, a);
+    }
     match opcode {
-        obj::PUT => op_put(s, a),
+        obj::PUT => op_put(s, a, d),
         obj::GET => op_get(s, a),
         obj::HEAD => op_head(s, a),
-        obj::RANGE_GET => op_range(s, handle, a),
+        obj::RANGE_GET => op_range(s, handle, a, d),
         obj::DELETE => op_delete(s, a),
         obj::CLOSE => op_close(s, handle),
-        obj::LIST => op_obj_list(s, a),
+        obj::LIST => op_obj_list(s, a, d),
         // No mesh roots: an unguarded store, served with `handle = -1`.
         obj::PRESENT => ERR_NOSYS,
+        obj::CAPS => op_caps(s, a),
         // Key-shaped, with no optional namespace opcode.
-        ns::CAPS => 0,
-        ns::LIST => op_ns_list(s, a),
+        ns::CAPS => abi::kernel_abi::caps_word::answer(a, 0),
+        ns::LIST => op_ns_list(s, a, d),
         _ => ERR_NOSYS,
     }
 }

@@ -3,14 +3,23 @@
 //!
 //! The kernel decodes every request, checks it and keeps the caches, so each
 //! op means one thing on every machine; a platform supplies only a
-//! [`MetalDeviceOps`] table (`hal::metal_device`). Errors: a malformed
-//! request is `EINVAL`, an address outside what the op may reach is
-//! `EFAULT`, an exhausted DMA arena is `ENOMEM`, and an op the machine has
-//! no hardware for is `ENOSYS` (the semantics text is
+//! [`MetalDeviceOps`] table (`hal::metal_device`). DMA memory is named by
+//! the handle its allocation minted, device registers by an aperture handle
+//! and an offset in it; the kernel keeps the allocations. A handle's index
+//! (what this provider answers and is handed) is the allocation's slot, or
+//! [`APERTURE_BASE`] plus the aperture's index.
+//! Errors: a malformed request is `EINVAL`, a register or range outside what
+//! the op may reach is `EFAULT`, a handle naming none of the caller's
+//! allocations is `EBADF`, an exhausted DMA arena is `ENOMEM`, and an op the
+//! machine has no hardware for is `ENOSYS` (the semantics text is
 //! `crates/fluxor-abi/src/contracts/hal/metal_device.rs`).
 
+use portable_atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+
 use crate::abi::contracts::hal::metal_device as op;
-use crate::kernel::sys::errno::{EFAULT, EINVAL, ENOMEM, ENOSYS};
+use crate::kernel::exec::scheduler::{self, ModuleId};
+use crate::kernel::module::user_span::UserSpan;
+use crate::kernel::sys::errno::{EBADF, EFAULT, EINVAL, ENOMEM, ENOSYS};
 use crate::kernel::sys::hal;
 
 /// Which DMA memory an allocation draws from.
@@ -29,49 +38,123 @@ pub struct PciOps {
     pub rescan: fn() -> i32,
     /// Read a config word: arg=[dev_idx:u8, _pad:u8, offset:u16 LE], value
     /// written to arg[4..8].
-    pub cfg_read32: unsafe fn(*mut u8, usize) -> i32,
+    pub cfg_read32: fn(&mut [u8]) -> i32,
     /// Write a config word: arg=[dev_idx:u8, _pad:u8, offset:u16 LE, value:u32 LE].
-    pub cfg_write32: unsafe fn(*mut u8, usize) -> i32,
+    pub cfg_write32: fn(&mut [u8]) -> i32,
 }
 
 /// What a platform supplies for `metal_device`.
 pub struct MetalDeviceOps {
-    /// Whether `addr` is a device register a module may reach.
-    pub mmio_ok: fn(u64) -> bool,
+    /// The machine's device-register aperture `index`, `(base, len)`: the
+    /// registers a module may reach (never DRAM, never the interrupt
+    /// controller). `None` past the last.
+    pub aperture: fn(u8) -> Option<(u64, u64)>,
     /// Carve `size` bytes aligned to `align` (a power of two, at least 64)
     /// from the arena for `kind`; `None` when it is exhausted.
     pub dma_alloc: fn(DmaKind, usize, usize) -> Option<u64>,
-    /// Whether `[addr, addr+size)` lies inside DMA memory this machine
-    /// hands out.
-    pub dma_range_ok: fn(u64, u32) -> bool,
     /// The scan-before-bind PCI operations, where the machine has them.
     pub pci: Option<&'static PciOps>,
 }
+
+/// The index an aperture handle carries: [`APERTURE_BASE`] plus the
+/// aperture's, above every allocation slot.
+pub const APERTURE_BASE: i32 = 1 << 16;
+const _: () = assert!(ALLOCS < APERTURE_BASE as usize);
 
 /// The alignment the contract requires of an invalidate (no supported
 /// machine has a data-cache line longer than this).
 const LINE: u64 = 64;
 
-/// Read `n` little-endian bytes at `at`.
-///
-/// # Safety
-/// `arg` holds at least `at + n` readable bytes.
-unsafe fn le(arg: *const u8, at: usize, n: usize) -> u64 {
-    let mut v = 0u64;
-    for i in 0..n {
-        v |= u64::from(*arg.add(at + i)) << (8 * i);
-    }
-    v
+/// Read `n` little-endian bytes at `at`; the caller checked `arg` holds them.
+fn le(arg: &[u8], at: usize, n: usize) -> u64 {
+    arg[at..at + n]
+        .iter()
+        .rev()
+        .fold(0u64, |v, b| (v << 8) | u64::from(*b))
 }
 
-/// Write `v` little-endian as `n` bytes at `at`.
-///
-/// # Safety
-/// `arg` holds at least `at + n` writable bytes.
-unsafe fn put(arg: *mut u8, at: usize, n: usize, v: u64) {
-    for i in 0..n {
-        *arg.add(at + i) = (v >> (8 * i)) as u8;
+/// Write `v` little-endian as `n` bytes at `at`; the caller checked `arg`
+/// holds them.
+fn put(arg: &mut [u8], at: usize, n: usize, v: u64) {
+    arg[at..at + n].copy_from_slice(&v.to_le_bytes()[..n]);
+}
+
+/// Most DMA allocations the machine's drivers hold at once: an NVMe
+/// controller's queues and per-slot write pages, twice over, with room for a
+/// NIC's rings. None on a machine without the contract.
+const ALLOCS: usize = if cfg!(feature = "aarch64-metal") {
+    512
+} else {
+    0
+};
+
+const FREE: u32 = 0;
+const FILLING: u32 = 1;
+const LIVE: u32 = 2;
+
+/// One allocation a handle names. `state` publishes the rest: written while
+/// `FILLING`, read only once `LIVE`, which it never leaves (the arenas are
+/// carved, never returned).
+struct Alloc {
+    state: AtomicU32,
+    addr: AtomicU64,
+    len: AtomicU32,
+    owner: AtomicU16,
+}
+
+static ALLOC: [Alloc; ALLOCS] = [const {
+    Alloc {
+        state: AtomicU32::new(FREE),
+        addr: AtomicU64::new(0),
+        len: AtomicU32::new(0),
+        owner: AtomicU16::new(0),
     }
+}; ALLOCS];
+
+/// Carve an allocation for the calling module and record it: its handle, or
+/// `ENOMEM` when the arena or the table is full. The slot is claimed first,
+/// so a full table never strands arena memory.
+fn allocate(
+    ops: &MetalDeviceOps,
+    kind: DmaKind,
+    size: u32,
+    align: usize,
+) -> Result<(i32, u64), i32> {
+    let slot = ALLOC
+        .iter()
+        .position(|a| {
+            a.state
+                .compare_exchange(FREE, FILLING, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        })
+        .ok_or(ENOMEM)?;
+    let a = &ALLOC[slot];
+    let Some(addr) = (ops.dma_alloc)(kind, size as usize, align) else {
+        a.state.store(FREE, Ordering::Release);
+        return Err(ENOMEM);
+    };
+    a.addr.store(addr, Ordering::Relaxed);
+    a.len.store(size, Ordering::Relaxed);
+    a.owner
+        .store(scheduler::current_module_id(), Ordering::Relaxed);
+    a.state.store(LIVE, Ordering::Release);
+    Ok((slot as i32, addr))
+}
+
+/// The address and length of the allocation `handle` names, when it names
+/// one of the calling module's.
+fn allocation(handle: i32) -> Option<(u64, u32)> {
+    let a = ALLOC.get(usize::try_from(handle).ok()?)?;
+    if a.state.load(Ordering::Acquire) != LIVE {
+        return None;
+    }
+    let owner: ModuleId = a.owner.load(Ordering::Relaxed);
+    (owner == scheduler::current_module_id()).then(|| {
+        (
+            a.addr.load(Ordering::Relaxed),
+            a.len.load(Ordering::Relaxed),
+        )
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -94,8 +177,8 @@ fn maintain(addr: u64, size: u32, m: Maint) {
         let mut line = addr & !(step - 1);
         let end = addr + u64::from(size);
         while line < end {
-            // SAFETY: the caller checked the range lies in DMA memory, which
-            // is mapped; maintenance by VA neither reads nor writes it.
+            // SAFETY: the range lies inside one DMA allocation, which is
+            // mapped; maintenance by VA neither reads nor writes it.
             unsafe {
                 match m {
                     Maint::CleanInvalidate => {
@@ -117,42 +200,66 @@ fn maintain(addr: u64, size: u32, m: Maint) {
 }
 
 /// The `metal_device` provider.
-///
-/// # Safety
-/// `arg` holds `arg_len` bytes owned by the caller for the call.
-pub unsafe fn dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub fn dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
     let Some(ops) = hal::metal_device() else {
         return ENOSYS;
     };
-    if arg.is_null() && !matches!(opcode, op::PCIE_RESCAN) {
-        return EINVAL;
-    }
+    let arg_len = arg.len();
     match opcode {
-        op::MMIO_READ32 | op::MMIO_WRITE32 => {
-            if arg_len < 12 {
+        // In `[index u8]`, out `[base u64][len u32]`; the result is the
+        // aperture's index, which the kernel wraps in a handle.
+        op::MMIO_OPEN => {
+            if arg_len < op::mmio::OPEN_LEN {
                 return EINVAL;
             }
-            let addr = le(arg, 0, 8);
-            if addr & 3 != 0 || !(ops.mmio_ok)(addr) {
+            let index = arg[0];
+            let Some((base, len)) = (ops.aperture)(index) else {
+                return crate::kernel::sys::errno::ENOENT;
+            };
+            let Ok(len) = u32::try_from(len) else {
+                return crate::kernel::sys::errno::ERANGE;
+            };
+            put(arg, 0, 8, base);
+            put(arg, 8, 4, u64::from(len));
+            APERTURE_BASE + i32::from(index)
+        }
+        // `handle` = an aperture, arg `[offset u32][value u32]`.
+        op::MMIO_READ32 | op::MMIO_WRITE32 => {
+            if arg_len < op::mmio::ARG_LEN {
+                return EINVAL;
+            }
+            let Some(index) = handle
+                .checked_sub(APERTURE_BASE)
+                .and_then(|i| u8::try_from(i).ok())
+            else {
+                return EBADF;
+            };
+            let Some((base, len)) = (ops.aperture)(index) else {
+                return EBADF;
+            };
+            let offset = le(arg, 0, 4);
+            if offset & 3 != 0 || offset + 4 > len {
                 return EFAULT;
             }
+            let addr = base + offset;
             if opcode == op::MMIO_READ32 {
-                put(
-                    arg,
-                    8,
-                    4,
-                    u64::from(core::ptr::read_volatile(addr as *const u32)),
-                );
+                // SAFETY: an aligned word inside a device aperture the
+                // platform vouched for and the kernel maps.
+                let v = unsafe { core::ptr::read_volatile(addr as *const u32) };
+                put(arg, 4, 4, u64::from(v));
             } else {
-                core::ptr::write_volatile(addr as *mut u32, le(arg, 8, 4) as u32);
+                // SAFETY: as the read.
+                unsafe { core::ptr::write_volatile(addr as *mut u32, le(arg, 4, 4) as u32) };
             }
             0
         }
+        // In `[size u32][align u32]`, out `[addr u64][len u32]`; the result
+        // is the allocation's handle.
         op::DMA_ALLOC_CONTIG | op::DMA_ALLOC_STREAMING => {
-            if arg_len < 16 {
+            if arg_len < 12 {
                 return EINVAL;
             }
-            let (size, align) = (le(arg, 0, 4) as usize, le(arg, 4, 4) as usize);
+            let (size, align) = (le(arg, 0, 4) as u32, le(arg, 4, 4) as usize);
             if size == 0 || !align.is_power_of_two() || (align as u64) < LINE {
                 return EINVAL;
             }
@@ -161,33 +268,39 @@ pub unsafe fn dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) 
             } else {
                 DmaKind::Streaming
             };
-            match (ops.dma_alloc)(kind, size, align) {
-                Some(addr) => {
-                    put(arg, 8, 8, addr);
-                    0
+            match allocate(ops, kind, size, align) {
+                Ok((h, addr)) => {
+                    put(arg, 0, 8, addr);
+                    put(arg, 8, 4, u64::from(size));
+                    h
                 }
-                None => ENOMEM,
+                Err(e) => e,
             }
         }
+        // `handle` = the allocation, arg `[offset u32][len u32]` within it.
         op::CACHE_FLUSH_RANGE | op::DMA_FLUSH | op::DMA_INVALIDATE => {
-            if arg_len < 12 {
+            if arg_len < 8 {
                 return EINVAL;
             }
-            let (addr, size) = (le(arg, 0, 8), le(arg, 8, 4) as u32);
-            if !(ops.dma_range_ok)(addr, size) {
+            let Some((base, total)) = allocation(handle) else {
+                return EBADF;
+            };
+            let (offset, len) = (le(arg, 0, 4) as u32, le(arg, 4, 4) as u32);
+            if offset.checked_add(len).is_none_or(|end| end > total) {
                 return EFAULT;
             }
+            let addr = base + u64::from(offset);
             let m = match opcode {
                 op::CACHE_FLUSH_RANGE => Maint::CleanInvalidate,
                 op::DMA_FLUSH => Maint::Clean,
                 _ => {
-                    if addr % LINE != 0 || u64::from(size) % LINE != 0 {
+                    if addr % LINE != 0 || u64::from(len) % LINE != 0 {
                         return EINVAL;
                     }
                     Maint::Invalidate
                 }
             };
-            maintain(addr, size, m);
+            maintain(addr, len, m);
             0
         }
         op::PCIE_RESCAN => match ops.pci {
@@ -195,8 +308,8 @@ pub unsafe fn dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) 
             None => ENOSYS,
         },
         op::PCIE_CFG_READ32 | op::PCIE_CFG_WRITE32 => match ops.pci {
-            Some(pci) if opcode == op::PCIE_CFG_READ32 => (pci.cfg_read32)(arg, arg_len),
-            Some(pci) => (pci.cfg_write32)(arg, arg_len),
+            Some(pci) if opcode == op::PCIE_CFG_READ32 => (pci.cfg_read32)(arg),
+            Some(pci) => (pci.cfg_write32)(arg),
             None => ENOSYS,
         },
         _ => ENOSYS,

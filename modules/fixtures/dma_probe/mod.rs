@@ -2,7 +2,7 @@
 //! non-cacheable DMA arena plumbing from a PIC module.
 //!
 //! On first step the module:
-//!   1. Calls `dev_dma_alloc(size, align)` to obtain a physical address.
+//!   1. Calls `dev_dma_alloc(size, align)` for an allocation and its address.
 //!   2. Writes a magic 32-bit pattern `0xFEEDF00D` at offset 0.
 //!   3. Reads it back through the same pointer (proves CPU/arena coherence).
 //!   4. Logs the physical address, size, alignment, and readback value.
@@ -145,7 +145,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         let sys = &*s.syscalls;
 
-        let phys = dev_dma_alloc(sys, s.size, s.align);
+        let phys = dev_dma_alloc(sys, s.size, s.align).map_or(0, |r| r.addr);
         s.phys = phys;
 
         if phys == 0 {

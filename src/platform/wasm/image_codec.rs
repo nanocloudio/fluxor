@@ -172,7 +172,10 @@ unsafe fn alloc_state(
     raw
 }
 
-fn step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
     // type allocated by the new_fn and operate within that allocation.
@@ -221,11 +224,7 @@ unsafe fn collect_step(st: &mut ImageCodecState) -> i32 {
                 // Producer EOFed without sending anything — nothing
                 // to decode. Mark done.
                 st.phase = Phase::Done as u8;
-                let _ = channel::channel_ioctl(
-                    st.out_chan,
-                    channel::IOCTL_SET_HUP,
-                    core::ptr::null_mut(),
-                );
+                let _ = channel::channel_set_hup(st.out_chan);
                 return 0;
             }
             transition_to_decode(st);
@@ -245,7 +244,7 @@ unsafe fn transition_to_decode(st: &mut ImageCodecState) {
     );
     if h < 0 {
         st.phase = Phase::Error as u8;
-        let _ = channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
+        let _ = channel::channel_set_hup(st.out_chan);
         return;
     }
     st.handle = h;
@@ -268,8 +267,7 @@ unsafe fn decoding_step(st: &mut ImageCodecState) -> i32 {
             st.phase = Phase::Error as u8;
             let _ = host_image_decode_close(st.handle);
             st.handle = -1;
-            let _ =
-                channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
+            let _ = channel::channel_set_hup(st.out_chan);
         }
     }
     0
@@ -304,16 +302,14 @@ unsafe fn outputting_step(st: &mut ImageCodecState) -> i32 {
             let _ = host_image_decode_close(st.handle);
             st.handle = -1;
             st.phase = Phase::Done as u8;
-            let _ =
-                channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
+            let _ = channel::channel_set_hup(st.out_chan);
             return 0;
         }
         if n < 0 {
             st.phase = Phase::Error as u8;
             let _ = host_image_decode_close(st.handle);
             st.handle = -1;
-            let _ =
-                channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
+            let _ = channel::channel_set_hup(st.out_chan);
             return 0;
         }
         let total = n as usize;

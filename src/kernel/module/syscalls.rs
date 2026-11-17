@@ -41,7 +41,7 @@ use core::ptr::null_mut;
 use crate::abi::{SyscallTable, ABI_VERSION};
 use crate::kernel::exec::scheduler::ModuleId;
 use crate::kernel::ipc::channel;
-use crate::kernel::module::block_lend;
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use crate::kernel::sys::hal;
 // ============================================================================
@@ -79,29 +79,9 @@ pub fn init_syscall_table() {
         provider_call: syscall_provider_call,
         provider_query: syscall_provider_query,
         provider_close: syscall_provider_close,
-        channel_peek: syscall_channel_peek,
-        provider_call_sel: syscall_provider_call_sel,
-        channel_discard: syscall_channel_discard,
+        channel_peek: channel::syscall_channel_peek,
+        channel_discard: channel::syscall_channel_discard,
     });
-}
-
-unsafe extern "C" fn syscall_channel_discard(handle: i32, len: usize) -> i32 {
-    // ISR-tier gate at the wrapper boundary, as for `channel_peek`.
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_discard") {
-        return crate::kernel::sys::errno::EACCES;
-    }
-    channel::channel_discard(handle, len)
-}
-
-unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
-    // ISR-tier gate at the syscall-wrapper boundary (matches the
-    // pattern below for provider_*). The inner `channel::channel_peek`
-    // also gates as defense in depth, but firing here means the
-    // module sees `EACCES` rather than any later validation error.
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_peek") {
-        return crate::kernel::sys::errno::EACCES;
-    }
-    channel::channel_peek(handle, buf, len)
 }
 
 // ── Handle-scoped provider dispatch ─────────────────────────────────
@@ -112,6 +92,25 @@ unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize)
 // ISR-tier gate, not by the grant check. The inner `provider::*`
 // functions also gate as defense in depth.
 
+/// The caller's `[ptr, ptr + len)` as a slice: empty for a zero length,
+/// `None` for a null pointer with a non-zero one.
+///
+/// # Safety
+/// The ungated syscall-table contract: the span is the calling module's own
+/// memory, live and unaliased for the call.
+unsafe fn caller_slice<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut [u8]> {
+    if len == 0 {
+        return Some(&mut []);
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's contract.
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
+}
+
+/// # Safety
+/// `config[..config_len]` is the calling module's own readable memory.
 unsafe extern "C" fn syscall_provider_open(
     contract: u32,
     open_op: u32,
@@ -131,29 +130,52 @@ unsafe extern "C" fn syscall_provider_open(
         );
         return E_NOSYS;
     }
-    // An open names the contract it opens and an op of that contract; the
-    // provider is chosen by the first, so the second must agree with it.
-    if (open_op >> 8) & 0xFF != contract {
+    let Ok(contract) = u16::try_from(contract) else {
         return errno::EINVAL;
-    }
-    if let Some(rc) = check_grant(open_op) {
-        return rc;
+    };
+    if open_op == crate::abi::registry::kernel::BIND {
+        // A bind names which provider of `contract` answers, never what the
+        // caller may ask of it: the caller holds the contract itself.
+        let Some(need) = crate::abi::registry::contract_grant(contract) else {
+            return E_NOSYS;
+        };
+        if let Some(rc) = refuse(u32::from(contract), need) {
+            return rc;
+        }
+    } else {
+        // An open names the contract it opens and an op of that contract; the
+        // provider is chosen by the first, so the second must agree with it.
+        if (open_op >> 8) & 0xFF != u32::from(contract) {
+            return errno::EINVAL;
+        }
+        if let Some(rc) = check_grant(open_op) {
+            return rc;
+        }
     }
     // Every provider_open mints a new held resource, so it is admission-gated.
     if admission_closed("provider_open") {
         return crate::kernel::sys::errno::EACCES;
     }
-    crate::kernel::module::provider::provider_open(contract as u16, open_op, config, config_len)
+    // SAFETY: the caller's contract; an open only reads its config.
+    let Some(config) = (unsafe { caller_slice(config as *mut u8, config_len) }) else {
+        return errno::EINVAL;
+    };
+    crate::kernel::module::provider::provider_open(contract, open_op, config)
 }
 
+/// # Safety
+/// `arg[..arg_len]` and `data[..data_len]` are the calling module's own
+/// memory, live for the call.
 unsafe extern "C" fn syscall_provider_call(
     handle: i32,
     op: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     // ISR-tier (Tier 1b/2) modules are denied `provider_call` in general,
-    // but the bridge ops and the `SELF_BRIDGES` enumeration are exempt:
+    // but the bridge ops and `SELF_BRIDGE` are exempt:
     // their underlying ring operations are lock-free and allocation-free, so
     // they are the *sanctioned* I/O path for an ISR-tier step body.
     if !crate::abi::internal::bridge::is_isr_safe(op)
@@ -179,39 +201,21 @@ unsafe extern "C" fn syscall_provider_call(
     if admission_class_op(op) && admission_closed("provider_call") {
         return crate::kernel::sys::errno::EACCES;
     }
-    crate::kernel::module::provider::provider_call(handle, op, arg, arg_len)
+    // The provider holds `arg` and `data` at once.
+    if crate::kernel::module::user_span::overlaps(arg, arg_len, data, data_len) {
+        return errno::EINVAL;
+    }
+    // SAFETY: the caller's contract, and the two spans are disjoint.
+    let (Some(arg), Some(data)) = (unsafe { caller_slice(arg, arg_len) }, unsafe {
+        crate::kernel::module::user_span::UserSpan::from_checked(data, data_len)
+    }) else {
+        return errno::EINVAL;
+    };
+    crate::kernel::module::provider::provider_call(handle, op, arg, data)
 }
 
-unsafe extern "C" fn syscall_provider_call_sel(
-    sel: *const u8,
-    sel_len: usize,
-    op_handle: i32,
-    op: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
-    if !crate::abi::internal::bridge::is_isr_safe(op)
-        && crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_call_sel")
-    {
-        return crate::kernel::sys::errno::EACCES;
-    }
-    // A selector names which provider answers, never what the caller may
-    // ask of it: the op is held to its grant as through a handle.
-    if let Some(rc) = check_grant(op) {
-        return rc;
-    }
-    if admission_class_op(op) && admission_closed("provider_call_sel") {
-        return crate::kernel::sys::errno::EACCES;
-    }
-    // SAFETY: same arg-validity contract as `provider_call`; `sel[..sel_len]`
-    // validity is the module's responsibility.
-    unsafe {
-        crate::kernel::module::provider::provider_call_sel(
-            sel, sel_len, op_handle, op, arg, arg_len,
-        )
-    }
-}
-
+/// # Safety
+/// `out[..out_len]` is the calling module's own writable memory.
 unsafe extern "C" fn syscall_provider_query(
     handle: i32,
     key: u32,
@@ -227,13 +231,17 @@ unsafe extern "C" fn syscall_provider_query(
     if let Some(rc) = check_handle_grant(handle) {
         return rc;
     }
+    // SAFETY: the caller's contract.
+    let Some(out) = (unsafe { caller_slice(out, out_len) }) else {
+        return errno::EINVAL;
+    };
     // Try the handle's vtable first; if no contract query is registered,
     // fall back to the built-in cross-class query dispatcher.
-    let vt_rc = crate::kernel::module::provider::provider_query(handle, key, out, out_len);
+    let vt_rc = crate::kernel::module::provider::provider_query(handle, key, out);
     if vt_rc != E_NOSYS {
         return vt_rc;
     }
-    kernel_query_dispatch(handle, key, out, out_len)
+    kernel_query_dispatch(handle, key, out)
 }
 
 unsafe extern "C" fn syscall_provider_close(handle: i32) -> i32 {
@@ -259,32 +267,6 @@ fn syscall_table() -> &'static SyscallTable {
 /// Get a reference to the full (unfiltered) syscall table for passing to PIC modules
 pub fn get_syscall_table() -> &'static SyscallTable {
     syscall_table()
-}
-
-// ============================================================================
-// Logging
-// ============================================================================
-
-unsafe extern "C" fn syscall_log(level: u8, msg: *const u8, len: usize) {
-    if msg.is_null() || len == 0 {
-        return;
-    }
-    let slice = core::slice::from_raw_parts(msg, len);
-    if let Ok(s) = core::str::from_utf8(slice) {
-        match level {
-            1 => log::error!("{s}"),
-            2 => log::warn!("{s}"),
-            3 => log::info!("{s}"),
-            4 => log::debug!("{s}"),
-            _ => log::trace!("{s}"),
-        }
-    }
-}
-
-/// Channel port discovery syscall - returns channel handle for a given port.
-/// Delegates to the scheduler which tracks per-module port assignments.
-unsafe extern "C" fn syscall_channel_port(port_type: u8, index: u8) -> i32 {
-    crate::kernel::exec::scheduler::channel_port_lookup(port_type, index)
 }
 
 // ============================================================================
@@ -323,15 +305,17 @@ fn admission_class_op(op: u32) -> bool {
     crate::abi::registry::op_admits(op)
 }
 
-pub fn channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
+/// A module's `channel::OPEN`: a ring of the capacity `config` asks for,
+/// the caller both its ends.
+pub fn channel_open(config: &[u8]) -> i32 {
     if admission_closed("channel_open") {
         return -1;
     }
-    channel::syscall_channel_open(chan_type, config, config_len)
+    channel::channel_open_for_module(config, crate::kernel::exec::scheduler::current_module_id())
 }
 
 pub fn channel_close(handle: i32) {
-    channel::syscall_channel_close(handle)
+    channel::channel_close(handle)
 }
 
 // ============================================================================
@@ -407,7 +391,6 @@ pub fn init_providers() {
     // …) or a host platform dispatcher (linux_fs_dispatch) registers
     // itself. If nothing is registered, `provider::dispatch(FS, …)`
     // returns ENOSYS naturally; no stub needed.
-    provider::register(dev_class::BUFFER, buffer_provider_dispatch);
     // KEY_VAULT: the router, on BOTH paths — this class-byte dispatch and
     // the KEY_VAULT_VTABLE below. It serves the kernel software backend
     // and, when a platform registers one behind it (the Linux PKCS#11
@@ -433,12 +416,16 @@ pub fn init_providers() {
     provider::register_vtable(&CHANNEL_VTABLE);
     provider::register_vtable(&TIMER_VTABLE);
     provider::register_vtable(&EVENT_VTABLE);
-    provider::register_vtable(&BUFFER_VTABLE);
     provider::register_vtable(&KEY_VAULT_VTABLE);
     provider::register_vtable(&FS_VTABLE);
     provider::register_vtable(&STORAGE_NAMESPACE_VTABLE);
     provider::register_vtable(&STORAGE_OBJECT_VTABLE);
     provider::register_vtable(&PCIE_DEVICE_VTABLE);
+    // Lends are class-routed to the kernel bucket; the vtable gives a lend
+    // handle its close.
+    provider::register(crate::abi::registry::lend::ID, system_provider_dispatch);
+    provider::register_vtable(&LEND_VTABLE);
+    provider::register_vtable(&BRIDGE_VTABLE);
 
     // HAL vtables for contracts whose `call` dispatch is supplied by a
     // PIC module (registered by the loader from its manifest's `provider_contracts`).
@@ -446,6 +433,7 @@ pub fn init_providers() {
     // chain so it picks up whatever provider is registered at call time.
     // Consumer modules with tracked handles dispatch through the vtable;
     // handle=-1 global opens fall through the same chain.
+    provider::register_vtable(&HAL_GPIO_VTABLE);
     provider::register_vtable(&HAL_SPI_VTABLE);
     provider::register_vtable(&HAL_I2C_VTABLE);
     provider::register_vtable(&HAL_PIO_VTABLE);
@@ -474,6 +462,7 @@ static CHANNEL_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: channel_provider_dispatch,
         query: None,
         default_close_op: kernel_abi::channel::CLOSE,
+        poll: Some(channel_handle_poll),
     };
 
 static TIMER_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -482,6 +471,7 @@ static TIMER_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: timer_provider_dispatch,
         query: None,
         default_close_op: kernel_abi::timer::DESTROY,
+        poll: Some(crate::kernel::ipc::timer::timer_poll),
     };
 
 static EVENT_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -490,14 +480,42 @@ static EVENT_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: event_provider_dispatch,
         query: None,
         default_close_op: kernel_abi::event::DESTROY,
+        poll: Some(crate::kernel::ipc::event::event_poll_ready),
     };
 
-static BUFFER_VTABLE: crate::kernel::module::provider::ProviderVTable =
+/// `HANDLE_POLL` on a channel handle.
+fn channel_handle_poll(handle: i32, events: u32) -> i32 {
+    channel::channel_poll(handle, events)
+}
+
+/// `HANDLE_POLL` on a bridge: readable when its ring holds a record.
+fn bridge_handle_poll(slot: i32, events: u32) -> i32 {
+    use crate::abi::internal::bridge;
+    if slot < 0 || events & crate::abi::kernel_abi::poll::IN == 0 {
+        return 0;
+    }
+    let ready = crate::kernel::bridge::bridge_dispatch(
+        slot as usize,
+        bridge::POLL - bridge::WRITE,
+        &mut [],
+        UserSpan::empty(),
+    );
+    if ready > 0 {
+        crate::abi::kernel_abi::poll::IN as i32
+    } else {
+        0
+    }
+}
+
+/// Bridges are class-routed to the kernel bucket; the vtable gives a bridge
+/// handle its poll.
+static BRIDGE_VTABLE: crate::kernel::module::provider::ProviderVTable =
     crate::kernel::module::provider::ProviderVTable {
-        contract: crate::kernel::module::provider::contract::BUFFER,
-        call: buffer_provider_dispatch,
+        contract: crate::abi::registry::bridge::ID,
+        call: system_provider_dispatch,
         query: None,
-        default_close_op: 0, // buffers released by explicit RELEASE opcodes
+        default_close_op: 0,
+        poll: Some(bridge_handle_poll),
     };
 
 // KEY_VAULT vtable: the router, over every backend.
@@ -507,6 +525,7 @@ static KEY_VAULT_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: key_vault_provider_dispatch,
         query: None,
         default_close_op: contracts::key_vault::DESTROY,
+        poll: None,
     };
 
 // PCIE_DEVICE shares `system_provider_dispatch` (same call path as
@@ -519,6 +538,16 @@ static PCIE_DEVICE_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: system_provider_dispatch,
         query: None,
         default_close_op: crate::abi::contracts::hal::pcie_device::CLOSE,
+        poll: None,
+    };
+
+static LEND_VTABLE: crate::kernel::module::provider::ProviderVTable =
+    crate::kernel::module::provider::ProviderVTable {
+        contract: crate::abi::registry::lend::ID,
+        call: system_provider_dispatch,
+        query: None,
+        default_close_op: crate::abi::registry::lend::CLOSE,
+        poll: None,
     };
 
 // FS contract has no built-in kernel implementation — a PIC filesystem
@@ -526,16 +555,9 @@ static PCIE_DEVICE_VTABLE: crate::kernel::module::provider::ProviderVTable =
 // registers as the provider. The vtable's `call` routes through the
 // class-byte dispatch chain so it picks up whichever provider is
 // registered, same shape as the HAL vtables.
-unsafe fn fs_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn fs_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    // PIC module providers register on a class byte and operate on
-    // raw slots; strip any FD tag before dispatching inward.
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::FS, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::FS, handle, op, arg, data)
 }
 
 static FS_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -544,6 +566,7 @@ static FS_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: fs_call,
         query: None,
         default_close_op: contracts::storage::fs::CLOSE,
+        poll: None,
     };
 
 // STORAGE_NAMESPACE / STORAGE_OBJECT vtables. Same shape as FS: the
@@ -554,14 +577,9 @@ static FS_VTABLE: crate::kernel::module::provider::ProviderVTable =
 // `default_close_op` so `provider_close` releases tracked handles
 // uniformly.
 
-unsafe fn storage_namespace_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn storage_namespace_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::STORAGE_NAMESPACE, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::STORAGE_NAMESPACE, handle, op, arg, data)
 }
 
 static STORAGE_NAMESPACE_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -570,16 +588,12 @@ static STORAGE_NAMESPACE_VTABLE: crate::kernel::module::provider::ProviderVTable
         call: storage_namespace_call,
         query: None,
         default_close_op: contracts::storage::namespace::CLOSE,
+        poll: None,
     };
 
-unsafe fn storage_object_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn storage_object_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::STORAGE_OBJECT, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::STORAGE_OBJECT, handle, op, arg, data)
 }
 
 static STORAGE_OBJECT_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -588,20 +602,32 @@ static STORAGE_OBJECT_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: storage_object_call,
         query: None,
         default_close_op: contracts::storage::object::CLOSE,
+        poll: None,
     };
 
 // HAL contracts whose `call` dispatch is a PIC module provider. The
 // vtable's `call` forwards to `provider::dispatch` with the right
 // class byte so the existing module-chain routing applies.
 
-unsafe fn hal_spi_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn hal_gpio_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
+    crate::kernel::module::provider::dispatch(class::GPIO, handle, op, arg, data)
+}
+
+/// A gpio claim or watch is closed with `RELEASE`, whoever serves it; a
+/// platform with its own gpio provider registers its own vtable over this.
+static HAL_GPIO_VTABLE: crate::kernel::module::provider::ProviderVTable =
+    crate::kernel::module::provider::ProviderVTable {
+        contract: crate::kernel::module::provider::contract::HAL_GPIO,
+        call: hal_gpio_call,
+        query: None,
+        default_close_op: contracts::hal::gpio::RELEASE,
+        poll: None,
     };
-    crate::kernel::module::provider::dispatch(class::SPI, h, op, arg, arg_len)
+
+fn hal_spi_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    use crate::kernel::module::provider::contract as class;
+    crate::kernel::module::provider::dispatch(class::SPI, handle, op, arg, data)
 }
 
 static HAL_SPI_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -610,16 +636,12 @@ static HAL_SPI_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: hal_spi_call,
         query: None,
         default_close_op: contracts::hal::spi::CLOSE,
+        poll: None,
     };
 
-unsafe fn hal_i2c_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn hal_i2c_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::I2C, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::I2C, handle, op, arg, data)
 }
 
 static HAL_I2C_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -628,16 +650,12 @@ static HAL_I2C_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: hal_i2c_call,
         query: None,
         default_close_op: contracts::hal::i2c::CLOSE,
+        poll: None,
     };
 
-unsafe fn hal_pio_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn hal_pio_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::PIO, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::PIO, handle, op, arg, data)
 }
 
 // PIO contracts open handles via multiple alloc variants (STREAM_ALLOC,
@@ -651,16 +669,12 @@ static HAL_PIO_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: hal_pio_call,
         query: None,
         default_close_op: crate::abi::platform::rp::pio::STREAM_FREE,
+        poll: None,
     };
 
-unsafe fn hal_uart_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn hal_uart_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::UART, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::UART, handle, op, arg, data)
 }
 
 static HAL_UART_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -669,16 +683,12 @@ static HAL_UART_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: hal_uart_call,
         query: None,
         default_close_op: contracts::hal::uart::CLOSE,
+        poll: None,
     };
 
-unsafe fn hal_adc_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn hal_adc_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::ADC, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::ADC, handle, op, arg, data)
 }
 
 static HAL_ADC_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -687,16 +697,12 @@ static HAL_ADC_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: hal_adc_call,
         query: None,
         default_close_op: contracts::hal::adc::CLOSE,
+        poll: None,
     };
 
-unsafe fn hal_pwm_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn hal_pwm_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::kernel::module::provider::contract as class;
-    let h = if handle >= 0 {
-        crate::kernel::ipc::fd::slot_of(handle)
-    } else {
-        handle
-    };
-    crate::kernel::module::provider::dispatch(class::PWM, h, op, arg, arg_len)
+    crate::kernel::module::provider::dispatch(class::PWM, handle, op, arg, data)
 }
 
 static HAL_PWM_VTABLE: crate::kernel::module::provider::ProviderVTable =
@@ -705,16 +711,17 @@ static HAL_PWM_VTABLE: crate::kernel::module::provider::ProviderVTable =
         call: hal_pwm_call,
         query: None,
         default_close_op: contracts::hal::pwm::CLOSE,
+        poll: None,
     };
 
 /// KEY_VAULT provider adapter — forwards to the router.
-unsafe fn key_vault_provider_dispatch(
+fn key_vault_provider_dispatch(
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
 ) -> i32 {
-    crate::kernel::security::key_vault_router::dispatch(handle, opcode, arg, arg_len)
+    crate::kernel::security::key_vault_router::dispatch(handle, opcode, arg, data)
 }
 
 // ============================================================================
@@ -786,100 +793,90 @@ fn check_handle_grant(handle: i32) -> Option<i32> {
 // Per-class provider dispatch functions (portable)
 // ============================================================================
 
-unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// A little-endian `u32` at the head of `arg`, when it holds one.
+fn arg_u32(arg: &[u8]) -> Option<u32> {
+    let b: [u8; 4] = arg.get(..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+/// A little-endian `u64` at `arg[at..at + 8]`, when it holds one.
+fn arg_u64(arg: &[u8], at: usize) -> Option<u64> {
+    let b: [u8; 8] = arg.get(at..at + 8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+/// Write `answer` at the head of `arg`; `EINVAL` when it does not fit.
+fn answer(arg: &mut [u8], answer: &[u8]) -> Result<(), i32> {
+    match arg.get_mut(..answer.len()) {
+        Some(out) => {
+            out.copy_from_slice(answer);
+            Ok(())
+        }
+        None => Err(E_INVAL),
+    }
+}
+
+fn channel_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
     use crate::abi::kernel_abi::channel as dev_channel;
     use crate::kernel::ipc::channel;
+    let me = crate::kernel::exec::scheduler::current_module_id();
     match opcode {
-        dev_channel::OPEN => {
-            if arg.is_null() || arg_len < 1 {
+        dev_channel::OPEN => channel_open(arg),
+        dev_channel::CLOSE => channel::close_as(handle, me),
+        dev_channel::PORT => match *arg {
+            [port_type, index, ..] => {
+                crate::kernel::exec::scheduler::channel_port_lookup(port_type, index)
+            }
+            _ => E_INVAL,
+        },
+        // `arg` out `[producer_owner u16][flags u8][0]` about a channel the
+        // caller is an end of.
+        dev_channel::FACTS => {
+            use crate::abi::kernel_abi::channel::facts;
+            let Some(out) = arg.get_mut(..facts::LEN) else {
                 return E_INVAL;
-            }
-            channel::syscall_channel_open(*arg, arg.add(1), arg_len - 1)
-        }
-        dev_channel::CLOSE => {
-            channel::syscall_channel_close(handle);
-            0
-        }
-        dev_channel::PORT => {
-            if arg.is_null() || arg_len < 2 {
-                return E_INVAL;
-            }
-            syscall_channel_port(*arg, *arg.add(1))
-        }
-        dev_channel::IOCTL => {
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
-            }
-            let cmd = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let payload_len = arg_len - 4;
-            // Built-in cmds have fixed-size args. The kernel handlers
-            // deref the arg pointer at a fixed width, so reject any
-            // mismatched length here rather than letting them read
-            // out-of-bounds bytes from the caller's buffer.
-            match cmd {
-                channel::IOCTL_NOTIFY | channel::IOCTL_POLL_NOTIFY | channel::IOCTL_WRITABLE => {
-                    if payload_len != 4 {
-                        return E_INVAL;
-                    }
-                }
-                channel::IOCTL_FLUSH | channel::IOCTL_SET_HUP => {
-                    if payload_len != 0 {
-                        return E_INVAL;
-                    }
-                }
-                _ => {
-                    // A handler receives the pointer and never a length, so
-                    // the commands whose record the contract fixes are held to
-                    // exactly that length here. Any other command belongs to a
-                    // module-registered handler and its own contract.
-                    if let Some(want) = block_lend::arg_len(cmd) {
-                        if payload_len != want {
-                            return E_INVAL;
-                        }
-                    }
-                }
-            }
-            let data_ptr = if payload_len > 0 {
-                arg.add(4)
-            } else {
-                core::ptr::null_mut()
             };
-            // A block request that lends its buffer is on the ledger from
-            // here until its completion is reaped.
-            let holder = crate::kernel::exec::scheduler::current_module_index();
-            let pending = match block_lend::begin(handle, holder, cmd, data_ptr, payload_len) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let rc = channel::syscall_channel_ioctl(handle, cmd, data_ptr);
-            block_lend::finish(pending, handle, cmd, rc, data_ptr, payload_len);
-            rc
-        }
-        dev_channel::REGISTER_IOCTL => {
-            if arg.is_null() || arg_len < 16 {
-                return E_INVAL;
+            let me = crate::kernel::exec::scheduler::current_module_index();
+            match crate::kernel::exec::scheduler::channel_facts(handle, me) {
+                Some((owner, flags)) => {
+                    out[facts::PRODUCER_OWNER..facts::PRODUCER_OWNER + 2]
+                        .copy_from_slice(&owner.to_le_bytes());
+                    out[facts::FLAGS] = flags;
+                    out[facts::FLAGS + 1] = 0;
+                    0
+                }
+                None => errno::EBADF,
             }
-            let state = u64::from_le_bytes([
-                *arg,
-                *arg.add(1),
-                *arg.add(2),
-                *arg.add(3),
-                *arg.add(4),
-                *arg.add(5),
-                *arg.add(6),
-                *arg.add(7),
-            ]) as *mut core::ffi::c_void;
-            let handler = u64::from_le_bytes([
-                *arg.add(8),
-                *arg.add(9),
-                *arg.add(10),
-                *arg.add(11),
-                *arg.add(12),
-                *arg.add(13),
-                *arg.add(14),
-                *arg.add(15),
-            ]) as *mut ();
-            channel::syscall_channel_register_ioctl_handler(handle, state, handler)
+        }
+        dev_channel::FLUSH => channel::flush_as(handle, me),
+        dev_channel::SET_HUP => channel::set_hup_as(handle, me),
+        dev_channel::WRITABLE => {
+            let Some(out) = arg.get_mut(..4) else {
+                return E_INVAL;
+            };
+            match channel::writable_as(handle, me) {
+                Ok(n) => {
+                    out.copy_from_slice(&(n.min(u32::MAX as usize) as u32).to_le_bytes());
+                    0
+                }
+                Err(e) => e,
+            }
+        }
+        dev_channel::RECORD_LEN => channel::record_len_as(handle, me),
+        dev_channel::ACQUIRE_WRITE => {
+            acquire_reply(arg, || channel::buffer_acquire_write(handle, me))
+        }
+        // The length is the record: without it nothing is published.
+        dev_channel::RELEASE_WRITE => match arg_u32(arg) {
+            Some(len) => channel::buffer_release_write(handle, me, len),
+            None => E_INVAL,
+        },
+        dev_channel::ACQUIRE_READ => {
+            acquire_reply(arg, || channel::buffer_acquire_read(handle, me))
+        }
+        dev_channel::RELEASE_READ => channel::buffer_release_read(handle, me),
+        dev_channel::ACQUIRE_INPLACE => {
+            acquire_reply(arg, || channel::buffer_acquire_inplace(handle, me))
         }
         _ => E_NOSYS,
     }
@@ -890,47 +887,16 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
 /// an address is never squeezed into the `i32` a call returns. The record is
 /// checked before anything is acquired: a caller that cannot be told where its
 /// buffer is must not be left holding one.
-unsafe fn acquire_reply(
-    arg: *mut u8,
-    arg_len: usize,
-    acquire: impl FnOnce() -> channel::Acquired,
-) -> i32 {
-    use crate::abi::kernel_abi::buffer::acquired as rec;
-    if arg.is_null() || arg_len < rec::SIZE {
+fn acquire_reply(arg: &mut [u8], acquire: impl FnOnce() -> channel::Acquired) -> i32 {
+    use crate::abi::kernel_abi::channel::acquired as rec;
+    let Some(out) = arg.get_mut(..rec::SIZE) else {
         return E_INVAL;
-    }
+    };
     let acquired = acquire();
-    let ptr = (acquired.ptr as usize as u64).to_le_bytes();
-    core::ptr::copy_nonoverlapping(ptr.as_ptr(), arg.add(rec::PTR), 8);
-    core::ptr::copy_nonoverlapping(acquired.len.to_le_bytes().as_ptr(), arg.add(rec::LEN), 4);
-    core::ptr::write_bytes(arg.add(rec::LEN + 4), 0, rec::SIZE - rec::LEN - 4);
+    out.fill(0);
+    out[rec::PTR..rec::PTR + 8].copy_from_slice(&(acquired.ptr as usize as u64).to_le_bytes());
+    out[rec::LEN..rec::LEN + 4].copy_from_slice(&acquired.len.to_le_bytes());
     acquired.status
-}
-
-unsafe fn buffer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::kernel_abi::buffer as dev_buffer;
-    use crate::kernel::ipc::channel;
-    match opcode {
-        dev_buffer::ACQUIRE_WRITE => {
-            acquire_reply(arg, arg_len, || channel::buffer_acquire_write(handle))
-        }
-        dev_buffer::RELEASE_WRITE => {
-            // The length is the message: without it nothing is published.
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
-            }
-            let len = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            channel::syscall_buffer_release_write(handle, len)
-        }
-        dev_buffer::ACQUIRE_READ => {
-            acquire_reply(arg, arg_len, || channel::buffer_acquire_read(handle))
-        }
-        dev_buffer::RELEASE_READ => channel::syscall_buffer_release_read(handle),
-        dev_buffer::ACQUIRE_INPLACE => {
-            acquire_reply(arg, arg_len, || channel::buffer_acquire_inplace(handle))
-        }
-        _ => E_NOSYS,
-    }
 }
 
 /// `TIMER::DISCIPLINE`: anchor the network-disciplined wall clock. Only a
@@ -1071,69 +1037,46 @@ pub(crate) fn trusted_unix_record() -> [u8; crate::abi::kernel_abi::trusted_time
     rec
 }
 
-unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn timer_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
     use crate::abi::kernel_abi::timer as dev_timer;
-    use crate::kernel::ipc::fd;
+    use crate::kernel::ipc::timer as fd;
+    let reply = |arg: &mut [u8], v: &[u8]| match answer(arg, v) {
+        Ok(()) => 0,
+        Err(e) => e,
+    };
     match opcode {
-        dev_timer::MILLIS => {
-            if arg.is_null() || arg_len < 8 {
-                return E_INVAL;
-            }
-            let ms = hal::now_millis();
-            core::ptr::write_unaligned(arg as *mut u64, ms);
-            0
-        }
-        dev_timer::MICROS => {
-            if arg.is_null() || arg_len < 8 {
-                return E_INVAL;
-            }
-            let us = hal::now_micros();
-            core::ptr::write_unaligned(arg as *mut u64, us);
-            0
-        }
-        dev_timer::UNIX_MILLIS => {
-            if arg.is_null() || arg_len < 8 {
-                return E_INVAL;
-            }
-            core::ptr::write_unaligned(arg as *mut u64, hal::now_unix_millis());
-            0
-        }
+        dev_timer::MILLIS => reply(arg, &hal::now_millis().to_le_bytes()),
+        dev_timer::MICROS => reply(arg, &hal::now_micros().to_le_bytes()),
+        dev_timer::UNIX_MILLIS => reply(arg, &hal::now_unix_millis().to_le_bytes()),
         dev_timer::TRUSTED_UNIX => {
             use crate::abi::kernel_abi::trusted_time as tt;
-            if arg.is_null() || arg_len < tt::LEN {
+            if arg.len() < tt::LEN {
                 return E_INVAL;
             }
-            let rec = trusted_unix_record();
-            core::ptr::copy_nonoverlapping(rec.as_ptr(), arg, tt::LEN);
-            0
+            reply(arg, &trusted_unix_record())
         }
         dev_timer::DISCIPLINE => {
-            if arg.is_null() || arg_len < 20 {
+            let (Some(unix_us), Some(mono_us), Some(err_us)) = (
+                arg_u64(arg, 0),
+                arg_u64(arg, 8),
+                arg.get(16..).and_then(arg_u32),
+            ) else {
                 return E_INVAL;
-            }
-            let a = core::slice::from_raw_parts(arg, 20);
-            let unix_us = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
-            let mono_us =
-                u64::from_le_bytes([a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]]);
-            let err_us = u32::from_le_bytes([a[16], a[17], a[18], a[19]]) as u64;
-            discipline_wall_clock(unix_us, mono_us, err_us)
+            };
+            discipline_wall_clock(unix_us, mono_us, u64::from(err_us))
         }
         dev_timer::CREATE => fd::timer_create(),
-        dev_timer::SET => {
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
-            }
-            let ms = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            fd::timer_set(handle, ms)
-        }
+        dev_timer::SET => match arg_u32(arg) {
+            Some(ms) => fd::timer_set(handle, ms),
+            None => E_INVAL,
+        },
         dev_timer::CANCEL => fd::timer_cancel(handle),
         dev_timer::DESTROY => fd::timer_destroy(handle),
         _ => E_NOSYS,
     }
 }
 
-/// A module occupancy as `CALLER_MODULE`, `MODULE_LIVE` and `EVENT_OWNER`
-/// carry it: `[module idx u16][0 u16][slot generation u32]`, laid out like
+/// A module occupancy as `CALLER_MODULE` and `MODULE_LIVE` carry it: `[module idx u16][0 u16][slot generation u32]`, laid out like
 /// the owner record so a provider stamps and compares both alike.
 fn module_record(idx: u16, gen: u32) -> [u8; 8] {
     let mut r = [0u8; 8];
@@ -1142,26 +1085,50 @@ fn module_record(idx: u16, gen: u32) -> [u8; 8] {
     r
 }
 
-unsafe fn event_provider_dispatch(handle: i32, opcode: u32, _arg: *mut u8, _arg_len: usize) -> i32 {
+fn event_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
     use crate::abi::kernel_abi::event as dev_event;
     use crate::kernel::ipc::event;
-    use crate::kernel::ipc::fd;
-    let slot = fd::slot_of(handle);
     match opcode {
-        dev_event::CREATE => fd::tag_fd(fd::FD_TAG_EVENT, event::event_create()),
-        dev_event::SIGNAL => event::event_signal(slot),
-        dev_event::POLL => event::event_poll(slot),
-        dev_event::DESTROY => event::event_destroy(slot),
+        dev_event::CREATE => event::event_create(),
+        dev_event::SIGNAL => event::event_signal(handle),
+        dev_event::POLL => event::event_poll(handle),
+        dev_event::DESTROY => event::event_destroy(handle),
+        dev_event::BIND_IRQ => bind_irq(handle, arg),
         _ => E_NOSYS,
     }
+}
+
+/// `event::BIND_IRQ`: `handle` = an event the caller owns; `arg = [irq u32]
+/// [ack u8]`, `ack` naming how the kernel quiets the device behind the line
+/// (`event::ack`). The interrupt signals the event's handle, so an event
+/// destroyed since is never signalled.
+fn bind_irq(handle: i32, arg: &[u8]) -> i32 {
+    use crate::abi::kernel_abi::event::ack;
+    let (Some(irq), Some(&how)) = (arg_u32(arg), arg.get(4)) else {
+        return E_INVAL;
+    };
+    let how = match how {
+        ack::NONE => hal::IrqAck::None,
+        ack::VIRTIO_MMIO => hal::IrqAck::VirtioMmio,
+        _ => return E_INVAL,
+    };
+    if !crate::kernel::ipc::event::owned_by_caller(handle) {
+        return errno::EBADF;
+    }
+    // Event-bound IRQs (e.g. virtio-mmio) are serviced on core 0.
+    hal::irq_bind(irq, handle, how, 0)
 }
 
 // ============================================================================
 // System Provider Dispatch (portable opcodes + extension point)
 // ============================================================================
 
-/// Platform-extension dispatch entry: `(handle, opcode, arg_ptr, arg_len) -> i32`.
-pub type ExtensionFn = unsafe fn(i32, u32, *mut u8, usize) -> i32;
+/// Platform-extension dispatch entry: the same call every kernel provider
+/// takes.
+pub type ExtensionFn = crate::kernel::module::provider::VTableCallFn;
+
+/// Platform-extension query entry: the same as a contract's query.
+pub type QueryExtensionFn = crate::kernel::module::provider::VTableQueryFn;
 
 /// Extension point for platform-specific system opcodes (PWM, PIO, DMA, SPI9, etc.)
 static mut SYSTEM_EXTENSION: Option<ExtensionFn> = None;
@@ -1178,17 +1145,23 @@ pub fn register_system_extension(f: ExtensionFn) {
 /// vtable doesn't claim the key. Used by platform code (RP, BCM2712)
 /// to expose chip-specific introspection (SYS_CLOCK_HZ, GPIO::GET_LEVEL
 /// for untracked handles, …).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-static mut DEV_QUERY_EXTENSION: Option<ExtensionFn> = None;
+static mut DEV_QUERY_EXTENSION: Option<QueryExtensionFn> = None;
 
-pub fn register_dev_query_extension(f: ExtensionFn) {
+pub fn register_dev_query_extension(f: QueryExtensionFn) {
     // SAFETY: as `register_system_extension` — boot-time installation.
     unsafe {
         DEV_QUERY_EXTENSION = Some(f);
     }
+}
+
+fn system_extension() -> Option<ExtensionFn> {
+    // SAFETY: written once at boot before any module runs; a word-sized copy.
+    unsafe { *core::ptr::addr_of!(SYSTEM_EXTENSION) }
+}
+
+fn dev_query_extension() -> Option<QueryExtensionFn> {
+    // SAFETY: as `system_extension`.
+    unsafe { *core::ptr::addr_of!(DEV_QUERY_EXTENSION) }
 }
 
 /// `PROGRAM_INFO`, `PROGRAM_READ`, `SIGNING_ROOT` and `SLOT_ADMITTED`:
@@ -1196,99 +1169,108 @@ pub fn register_dev_query_extension(f: ExtensionFn) {
 /// against, and the slots this boot admitted. A module names a program only
 /// by its slot among its own; whose programs they are comes from which module
 /// is running, never from the request.
-unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn handle_program_op(opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     use crate::abi::kernel_abi::{
         program as pg, FLASH_LAYOUT, PROGRAM_INFO, PROGRAM_READ, SIGNING_ROOT, SLOT_ADMITTED,
     };
-    use crate::abi::platform::rp::flash_layout::GRAPH_FLASH_LEN;
     use crate::kernel::exec::scheduler;
-    if opcode == SLOT_ADMITTED {
-        #[cfg(feature = "rp")]
-        return i32::from(crate::kernel::boot::config::admitted_slots());
-        #[cfg(not(feature = "rp"))]
-        return errno::ENOSYS;
-    }
-    // The least each op's buffer must hold: the flash partition; the root;
-    // the program's description; a read's request `[slot][0; 3][offset: u32
-    // LE]`.
-    let need = match opcode {
-        FLASH_LAYOUT => GRAPH_FLASH_LEN,
-        SIGNING_ROOT => 32,
-        PROGRAM_INFO => pg::INFO_LEN,
-        PROGRAM_READ => 8,
-        _ => return errno::ENOSYS,
-    };
-    if arg.is_null() || arg_len < need {
-        return E_INVAL;
-    }
-    if opcode == FLASH_LAYOUT {
-        #[cfg(feature = "rp")]
-        {
-            let answer = crate::platform::chip::GRAPH_FLASH.encode();
-            core::ptr::copy_nonoverlapping(answer.as_ptr(), arg, GRAPH_FLASH_LEN);
-            return GRAPH_FLASH_LEN as i32;
+    match opcode {
+        SLOT_ADMITTED => {
+            #[cfg(feature = "rp")]
+            return i32::from(crate::kernel::boot::config::admitted_slots());
+            #[cfg(not(feature = "rp"))]
+            return errno::ENOSYS;
         }
-        #[cfg(not(feature = "rp"))]
-        return errno::ENOSYS;
-    }
-    if opcode == SIGNING_ROOT {
-        return match crate::kernel::security::root::signing_root() {
-            Some(root) => {
-                core::ptr::copy_nonoverlapping(root.as_ptr(), arg, 32);
-                32
+        FLASH_LAYOUT => {
+            #[cfg(feature = "rp")]
+            {
+                use crate::abi::platform::rp::flash_layout::GRAPH_FLASH_LEN;
+                match answer(arg, &crate::platform::chip::GRAPH_FLASH.encode()) {
+                    Ok(()) => GRAPH_FLASH_LEN as i32,
+                    Err(e) => e,
+                }
             }
+            #[cfg(not(feature = "rp"))]
+            {
+                let _ = arg;
+                errno::ENOSYS
+            }
+        }
+        SIGNING_ROOT => match crate::kernel::security::root::signing_root() {
+            Some(root) => match answer(arg, &root) {
+                Ok(()) => 32,
+                Err(e) => e,
+            },
             None => errno::ENOENT,
-        };
+        },
+        PROGRAM_INFO => {
+            let Some(out) = arg.get_mut(..pg::INFO_LEN) else {
+                return E_INVAL;
+            };
+            let Some(p) = scheduler::module_program(scheduler::current_module_index(), out[0])
+            else {
+                return errno::ENOENT;
+            };
+            // An address answer: where the module may read the bytes in
+            // place, and how many; `0, 0` where it cannot dereference kernel
+            // memory and reads through PROGRAM_READ instead.
+            let (addr, len, region_end) = if cfg!(target_arch = "wasm32") {
+                (0u64, 0u32, 0u32)
+            } else {
+                let addr = p.addr as usize;
+                let end = (p.region as usize + p.region_len).saturating_sub(addr);
+                (addr as u64, p.size as u32, end as u32)
+            };
+            let put =
+                |out: &mut [u8], at: usize, v: &[u8]| out[at..at + v.len()].copy_from_slice(v);
+            out.fill(0);
+            put(out, pg::info::ADDR, &addr.to_le_bytes());
+            put(out, pg::info::LEN, &len.to_le_bytes());
+            put(out, pg::info::KIND, &p.kind.to_le_bytes());
+            put(out, pg::info::SIZE, &(p.size as u32).to_le_bytes());
+            put(out, pg::info::REGION_END, &region_end.to_le_bytes());
+            put(out, pg::info::FORMAT, &p.format);
+            pg::INFO_LEN as i32
+        }
+        PROGRAM_READ => {
+            // `[slot u8][0; 3][offset u32 LE]`; the bytes go to `data`.
+            let (Some(&slot), Some(offset)) = (arg.first(), arg.get(4..).and_then(arg_u32)) else {
+                return E_INVAL;
+            };
+            let Some(p) = scheduler::module_program(scheduler::current_module_index(), slot) else {
+                return errno::ENOENT;
+            };
+            let offset = offset as usize;
+            if offset >= p.size {
+                return 0;
+            }
+            let out = data.as_mut();
+            let n = (p.size - offset).min(out.len()).min(i32::MAX as usize);
+            // SAFETY: the loader bounded the program to `[addr, addr + size)`
+            // inside memory the kernel keeps for the module's life, and
+            // `offset + n <= size`.
+            let src = unsafe { core::slice::from_raw_parts(p.addr.add(offset), n) };
+            out[..n].copy_from_slice(src);
+            n as i32
+        }
+        _ => errno::ENOSYS,
     }
-    let slot = *arg;
-    let Some(p) = scheduler::module_program(scheduler::current_module_index(), slot) else {
-        return errno::ENOENT;
-    };
-    if opcode == PROGRAM_INFO {
-        // Where the module may read the bytes in place; 0 where it cannot
-        // dereference kernel memory and reads through PROGRAM_READ instead.
-        let (addr, region) = if cfg!(target_arch = "wasm32") {
-            (0u64, 0u64)
-        } else {
-            (p.addr as usize as u64, p.region as usize as u64)
-        };
-        let out = core::slice::from_raw_parts_mut(arg, pg::INFO_LEN);
-        out.fill(0);
-        out[0..8].copy_from_slice(&addr.to_le_bytes());
-        out[8..12].copy_from_slice(&(p.size as u32).to_le_bytes());
-        out[12..16].copy_from_slice(&p.kind.to_le_bytes());
-        out[16..24].copy_from_slice(&region.to_le_bytes());
-        out[24..28].copy_from_slice(&(p.region_len as u32).to_le_bytes());
-        out[32..64].copy_from_slice(&p.format);
-        return pg::INFO_LEN as i32;
-    }
-    let offset = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as usize;
-    if offset >= p.size {
-        return 0;
-    }
-    let n = (p.size - offset).min(arg_len).min(i32::MAX as usize);
-    // SAFETY: `offset + n <= size`, inside the section the loader bounded;
-    // the caller's buffer holds `arg_len >= n` bytes, and the request in it
-    // was read above, before it is overwritten.
-    core::ptr::copy_nonoverlapping(p.addr.add(offset), arg, n);
-    n as i32
 }
 
-/// `kernel_abi::SIGNAL_CORE`: raise an SGI on one core.
-///
-/// # Safety
-/// `arg` holds `arg_len` readable bytes.
-unsafe fn signal_core(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
-        return E_INVAL;
-    }
-    let (core, sgi) = (*arg, *arg.add(1));
+/// `kernel_abi::SIGNAL_CORE`: raise an SGI on one core. `arg = [core u8][sgi u8]`.
+fn signal_core(arg: &[u8]) -> i32 {
+    let (core, sgi) = match *arg {
+        [core, sgi, ..] => (core, sgi),
+        _ => return E_INVAL,
+    };
     #[cfg(feature = "aarch64-metal")]
     {
         if usize::from(core) >= crate::arch::aarch64::exception::MAX_CORES || sgi > 15 {
             return E_INVAL;
         }
-        crate::arch::aarch64::gic::send_sgi(u32::from(core), u32::from(sgi));
+        // SAFETY: the GIC is configured and initialised on every core before
+        // any module runs; `core` and `sgi` are in range.
+        unsafe { crate::arch::aarch64::gic::send_sgi(u32::from(core), u32::from(sgi)) };
         0
     }
     #[cfg(not(feature = "aarch64-metal"))]
@@ -1298,23 +1280,26 @@ unsafe fn signal_core(arg: *mut u8, arg_len: usize) -> i32 {
     }
 }
 
-unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// The kernel bucket's provider: every class-routed op (the kernel's own and
+/// every contract the registry routes by class) and the platform contracts
+/// that share it.
+fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     use crate::abi::contracts::resource;
     use crate::abi::contracts::telemetry;
     use crate::abi::internal::diag;
     use crate::abi::internal::{bridge, monitor, reconfigure};
-    use crate::abi::kernel_abi::event::BIND_IRQ;
+    use crate::abi::kernel_abi::doorbell::DOORBELL_RING;
     use crate::abi::kernel_abi::{
         ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, RANDOM_FILL,
+        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, RANDOM_FILL,
         REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE, SIGNAL_CORE,
     };
+    use crate::abi::registry::lend;
     use crate::kernel::exec::scheduler;
     match opcode {
-        SIGNAL_CORE => signal_core(arg, arg_len),
+        SIGNAL_CORE => signal_core(arg),
         // ── Core primitives ──
         SELF_INDEX
-        | OWNER_TAG
         | NET_IDENT_PROVIDER
         | BOOT_INCARNATION
         | ARENA_GET
@@ -1323,46 +1308,61 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | LOG_WRITE
         | SERIAL_WRITE
         | GET_HW_ETHERNET_MAC
-        | BIND_IRQ
         | HANDLE_POLL
         | RANDOM_FILL
         | MODULE_INSTANCE_PARAMS
         | MODULE_FLOW_BUDGET
-        | bridge::SELF_BRIDGES
-        | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
+        | bridge::SELF_BRIDGE
+        | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, data),
+        // A module provider rings a doorbell it was handed: `[doorbell u32]`.
+        DOORBELL_RING => match arg_u32(arg) {
+            Some(d) => crate::kernel::ipc::event::doorbell_ring_by(
+                d as i32,
+                scheduler::current_module_id(),
+            ),
+            None => E_INVAL,
+        },
         crate::abi::kernel_abi::PROGRAM_INFO
         | crate::abi::kernel_abi::PROGRAM_READ
         | crate::abi::kernel_abi::SIGNING_ROOT
         | crate::abi::kernel_abi::SLOT_ADMITTED
-        | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, arg_len),
-        resource::ELASTIC_ALLOC => handle_elastic_alloc(arg, arg_len),
+        | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, data),
+        // ── Lends ──
+        lend::OPEN => {
+            let mut span = data;
+            crate::kernel::ipc::lend::open(handle, arg, &mut span)
+        }
+        lend::RESOLVE => crate::kernel::ipc::lend::resolve(arg),
+        lend::RETURN => crate::kernel::ipc::lend::give_back(arg),
+        lend::CLOSE => crate::kernel::ipc::lend::close(handle),
+        resource::ELASTIC_ALLOC => handle_elastic_alloc(arg),
         // A module provider's refusal of a pool it serves, counted by the
         // ledger; `module_deny` admits the pool's server alone.
-        resource::LEDGER_DENY => {
-            if arg.is_null() || arg_len < 2 {
-                return E_INVAL;
-            }
-            // SAFETY: `arg_len >= 2` checked above.
-            let pool = u16::from_le_bytes(unsafe { [*arg, *arg.add(1)] });
-            crate::kernel::sys::resource_ledger::module_deny(
-                pool,
+        resource::LEDGER_DENY => match *arg {
+            [a, b, ..] => crate::kernel::sys::resource_ledger::module_deny(
+                u16::from_le_bytes([a, b]),
                 scheduler::current_module_index(),
-            )
-        }
+            ),
+            _ => E_INVAL,
+        },
         telemetry::TLM_EMIT
         | telemetry::TLM_SUBSCRIBE
         | telemetry::TLM_DRAIN
-        | telemetry::TLM_STATS => handle_telemetry_op(handle, opcode, arg, arg_len),
+        | telemetry::TLM_STATS => handle_telemetry_op(handle, opcode, arg, data),
         // ── Diagnostics / log transport ──
-        diag::LOG_RING_DRAIN | diag::FAN_DIAG_SNAPSHOT => handle_diag_op(opcode, arg, arg_len),
+        diag::LOG_RING_DRAIN => handle_diag_op(opcode, data),
         // ── Bridge channel operations ──
         bridge::WRITE | bridge::READ | bridge::POLL | bridge::INFO => {
-            let bridge_op = opcode - bridge::WRITE; // 0=write, 1=read, 2=poll, 3=info
-            let slot = crate::kernel::ipc::fd::slot_of(handle);
-            if slot < 0 {
+            // `handle` = the bridge's slot (its route's inner index).
+            if handle < 0 {
                 return E_INVAL;
             }
-            crate::kernel::bridge::bridge_dispatch(slot as usize, bridge_op, arg, arg_len)
+            crate::kernel::bridge::bridge_dispatch(
+                handle as usize,
+                opcode - bridge::WRITE,
+                arg,
+                data,
+            )
         }
         // ── Fault monitor ──
         monitor::FAULT_MONITOR_SUBSCRIBE
@@ -1370,7 +1370,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | monitor::FAULT_STATS_QUERY
         | monitor::FAULT_RAISE
         | monitor::STEP_HISTOGRAM_QUERY
-        | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg, arg_len),
+        | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg),
 
         // ── Live Reconfigure primitives (consumed by modules/reconfigure) ──
         reconfigure::SET_PHASE
@@ -1380,94 +1380,68 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | reconfigure::MODULE_INFO
         | reconfigure::MODULE_UPSTREAM
         | reconfigure::MODULE_DONE
-        | reconfigure::SLOT_CAPACITY => handle_reconfigure_op(opcode, arg, arg_len),
+        | reconfigure::SLOT_CAPACITY => handle_reconfigure_op(opcode, arg),
+        // `data` = the configuration to rebuild from; empty = the one this
+        // graph booted from. A rebuild reloads the boot configuration on
+        // every platform, so a supplied one has nowhere to go.
         reconfigure::TRIGGER_REBUILD => {
-            // arg = [config_ptr:usize, config_len:usize] (platform pointer size)
-            let ptr_size = core::mem::size_of::<usize>();
-            if arg.is_null() || arg_len < 2 * ptr_size {
-                return E_INVAL;
+            if !data.is_empty() {
+                return E_NOSYS;
             }
-            // SAFETY: `arg_len >= 2 * sizeof::<usize>()` checked above;
-            // `read_unaligned` handles any alignment of `arg`.
-            let config_ptr = unsafe { core::ptr::read_unaligned(arg as *const usize) } as *const u8;
-            // SAFETY: as above; second usize at arg + sizeof::<usize>().
-            let config_len =
-                unsafe { core::ptr::read_unaligned(arg.add(ptr_size) as *const usize) };
-            // SAFETY: `request_rebuild` is a kernel-internal scheduler API
-            // that takes ownership of the config pointer for the reconfigure
-            // ABI; the caller (this opcode handler) holds the only reference.
-            unsafe {
-                scheduler::request_rebuild(config_ptr, config_len);
-            }
+            scheduler::request_rebuild();
             0
         }
 
         // ── Live graph mutation ──
+        // `data` = the encoded subgraph, read in place for this call; the
+        // new owner's `[slot u16][generation u32]` is answered into `arg`.
         reconfigure::APPLY_ADD => {
             // A node whose plan seats no workload owner stages no add.
             if scheduler::live::add_capacity() == 0 {
                 return crate::kernel::sys::errno::ENOSPC;
             }
-            // SAFETY: `arg`/`arg_len` describe the caller's request buffer,
-            // valid for this call; the decoder borrows module params from it
-            // in place and writes the owner handle back into it. The
-            // calling module is the add's creator.
-            unsafe {
+            if arg.len() < 6 {
+                return E_INVAL;
+            }
+            // SAFETY: `data` is the caller's span for this call and the add
+            // completes within it. The calling module is the add's creator.
+            match unsafe {
                 scheduler::live::apply_add_encoded_by(
-                    arg,
-                    arg_len,
+                    data.as_slice(),
                     scheduler::current_module_index(),
                 )
+            } {
+                Ok(owner) => {
+                    scheduler::live::write_handle(&mut arg[..6], owner);
+                    0
+                }
+                Err(e) => e,
             }
         }
-        reconfigure::FREE_OWNER => {
-            // SAFETY: `arg`/`arg_len` describe a readable handle record.
-            unsafe { scheduler::live::free_owner_encoded(arg, arg_len) }
-        }
-        // Owner pause/resume.
-        reconfigure::OWNER_PAUSE => {
-            // SAFETY: `arg`/`arg_len` describe a readable handle record.
-            unsafe { scheduler::live::owner_pause_encoded(arg, arg_len) }
-        }
-        reconfigure::OWNER_RESUME => {
-            // SAFETY: `arg`/`arg_len` describe a readable handle record.
-            unsafe { scheduler::live::owner_resume_encoded(arg, arg_len) }
-        }
+        reconfigure::FREE_OWNER => scheduler::live::free_owner_encoded(arg),
+        reconfigure::OWNER_PAUSE => scheduler::live::owner_pause_encoded(arg),
+        reconfigure::OWNER_RESUME => scheduler::live::owner_resume_encoded(arg),
 
         // ── OTA RAM staging (Pi 5 / hosted Linux; ENOSYS elsewhere) ──
+        // `arg = [offset u32]`, `data` = the bytes to stage there.
         #[cfg(any(feature = "chip-bcm2712", feature = "host-linux"))]
-        reconfigure::OTA_STAGE_WRITE => {
-            // arg = [offset: u32 LE][payload bytes]
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
+        reconfigure::OTA_STAGE_WRITE => match arg_u32(arg) {
+            Some(offset) => {
+                crate::kernel::module::ota_stage::stage_write(offset as usize, data.as_slice())
             }
-            // SAFETY: 4-byte offset prefix bounds-checked above; the
-            // payload slice covers the caller's buffer for this call.
-            let (offset, data) = unsafe {
-                let off =
-                    u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
-                (off, core::slice::from_raw_parts(arg.add(4), arg_len - 4))
-            };
-            crate::kernel::module::ota_stage::stage_write(offset, data)
-        }
+            None => E_INVAL,
+        },
         #[cfg(any(feature = "chip-bcm2712", feature = "host-linux"))]
-        reconfigure::OTA_STAGE_CTRL => {
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            // SAFETY: 1-byte command bounds-checked above.
-            let cmd = unsafe { *arg };
-            crate::kernel::module::ota_stage::stage_ctrl(cmd)
-        }
+        reconfigure::OTA_STAGE_CTRL => match arg.first() {
+            Some(&cmd) => crate::kernel::module::ota_stage::stage_ctrl(cmd),
+            None => E_INVAL,
+        },
 
-        _ => {
-            // Delegate to platform extension for hardware-specific opcodes
-            if let Some(ext) = SYSTEM_EXTENSION {
-                ext(handle, opcode, arg, arg_len)
-            } else {
-                E_NOSYS
-            }
-        }
+        _ => match system_extension() {
+            // Platform extension for hardware-specific opcodes.
+            Some(ext) => ext(handle, opcode, arg, data),
+            None => E_NOSYS,
+        },
     }
 }
 
@@ -1478,16 +1452,18 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // The class-routed opcodes are split across small category handlers below
 // so the top-level match stays readable and each concern is local.
 
-/// `ELASTIC_ALLOC` (`resource` contract): grant a Tier B chunk from the kernel elastic region
-/// to the calling module. arg in `[bytes u32 LE]`, out `[ptr u64 LE]`; returns
-/// granted bytes or an accounted `ENOSPC`. EL0-isolated modules cannot reach
-/// this op at all — their SVC surface carries no `provider_call` — so grants
-/// are structurally EL1-only.
-unsafe fn handle_elastic_alloc(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
+/// `ELASTIC_ALLOC` (`resource` contract): grant a Tier B chunk from the
+/// kernel elastic region to the calling module. `arg` in `[bytes u32 LE]`,
+/// out `[addr u64 LE][len u32 LE]` (an address answer); returns 0 or an
+/// accounted `ENOSPC`.
+fn handle_elastic_alloc(arg: &mut [u8]) -> i32 {
+    let Some(bytes) = arg_u32(arg) else {
+        return E_INVAL;
+    };
+    if arg.len() < 12 {
         return E_INVAL;
     }
-    let bytes = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+    let bytes = bytes as usize;
     let idx = crate::kernel::exec::scheduler::current_module_index();
     if idx >= crate::kernel::exec::scheduler::module_slots() {
         return E_INVAL;
@@ -1510,11 +1486,9 @@ unsafe fn handle_elastic_alloc(arg: *mut u8, arg_len: usize) -> i32 {
     }
     match crate::kernel::mem::elastic::alloc(idx as ModuleId, bytes) {
         Some((ptr, len)) => {
-            let addr = (ptr as usize as u64).to_le_bytes();
-            for (i, b) in addr.iter().enumerate() {
-                *arg.add(i) = *b;
-            }
-            len as i32
+            arg[0..8].copy_from_slice(&(ptr as usize as u64).to_le_bytes());
+            arg[8..12].copy_from_slice(&(len as u32).to_le_bytes());
+            0
         }
         None => {
             crate::kernel::sys::resource_ledger::deny(
@@ -1525,7 +1499,7 @@ unsafe fn handle_elastic_alloc(arg: *mut u8, arg_len: usize) -> i32 {
     }
 }
 
-unsafe fn handle_telemetry_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn handle_telemetry_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     use crate::abi::contracts::telemetry as tlm;
     use crate::kernel::exec::scheduler;
     use crate::kernel::sys::telemetry_ring;
@@ -1540,38 +1514,29 @@ unsafe fn handle_telemetry_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
         tlm::MODULE_UNATTRIBUTED
     };
     match opcode {
+        // `arg` = one whole record, header first.
         tlm::TLM_EMIT => {
-            if arg.is_null() || arg_len < 12 {
+            if arg.len() < tlm::HEADER_SIZE || arg.len() > tlm::MAX_RECORD_SIZE {
                 return E_INVAL;
             }
-            let module_idx = caller;
-            let rec = core::slice::from_raw_parts(arg, arg_len);
-            telemetry_ring::emit(module_idx, rec);
+            telemetry_ring::emit(caller, arg);
             0
         }
+        // `arg = [filter u32]` and, optionally, `[pstatus_interval_ms u64]`.
         tlm::TLM_SUBSCRIBE => {
-            let filter = if !arg.is_null() && arg_len >= 4 {
-                u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)])
-            } else {
-                tlm::FILTER_ALL
-            };
-            // Optional trailing 8-byte LE PSTATUS cadence: the collector
-            // declares how often it wants the kernel to push its step-histogram
-            // / arena round. Absent (4-byte arg) → keep the kernel default.
-            let off = tlm::SUBSCRIBE_INTERVAL_OFFSET;
-            if !arg.is_null() && arg_len >= off + 8 {
-                let mut b = [0u8; 8];
-                for (i, v) in b.iter_mut().enumerate() {
-                    *v = *arg.add(off + i);
-                }
-                scheduler::set_pstatus_interval_ms(u64::from_le_bytes(b));
+            let filter = arg_u32(arg).unwrap_or(tlm::FILTER_ALL);
+            // The trailing PSTATUS cadence: how often the collector wants the
+            // kernel to push its step-histogram / arena round. Absent → keep
+            // the kernel default.
+            if let Some(ms) = arg_u64(arg, tlm::SUBSCRIBE_INTERVAL_OFFSET) {
+                scheduler::set_pstatus_interval_ms(ms);
             }
             telemetry_ring::subscribe(caller, filter)
         }
         tlm::TLM_DRAIN => {
-            // `handle` carries the slot id from TLM_SUBSCRIBE; `arg` is the
-            // caller's output buffer, filled with whole records only.
-            if arg.is_null() || handle < 0 {
+            // `handle` carries the slot id from TLM_SUBSCRIBE; whole records
+            // go to `data`.
+            if handle < 0 {
                 return E_INVAL;
             }
             // A drain advances the tail, so draining a slot you do not own
@@ -1580,21 +1545,19 @@ unsafe fn handle_telemetry_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             if !telemetry_ring::owns(handle as usize, caller) {
                 return E_INVAL;
             }
-            let out = core::slice::from_raw_parts_mut(arg, arg_len);
-            telemetry_ring::drain(handle as usize, out) as i32
+            telemetry_ring::drain(handle as usize, data.as_mut()) as i32
         }
         tlm::TLM_STATS => {
             // Layout: `[head u32][dropped u32 × CONSUMERS]`.
             let need = 4 + telemetry_ring::CONSUMERS * 4;
-            if arg.is_null() || arg_len < need {
+            let Some(out) = arg.get_mut(..need) else {
                 return E_INVAL;
-            }
+            };
             let (head, slots) = telemetry_ring::stats();
-            let out = core::slice::from_raw_parts_mut(arg, arg_len);
             out[0..4].copy_from_slice(&head.to_le_bytes());
-            for (i, (_active, _lag, dropped)) in slots.iter().enumerate() {
-                let off = 4 + i * 4;
-                out[off..off + 4].copy_from_slice(&dropped.to_le_bytes());
+            for (chunk, (_active, _lag, dropped)) in out[4..].chunks_exact_mut(4).zip(slots.iter())
+            {
+                chunk.copy_from_slice(&dropped.to_le_bytes());
             }
             need as i32
         }
@@ -1602,24 +1565,36 @@ unsafe fn handle_telemetry_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
     }
 }
 
-unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// `LOG_WRITE`: one message at a log level. Bytes that are not UTF-8 are
+/// dropped whole.
+fn log_write(level: u8, msg: &[u8]) {
+    if let Ok(s) = core::str::from_utf8(msg) {
+        match level {
+            1 => log::error!("{s}"),
+            2 => log::warn!("{s}"),
+            3 => log::info!("{s}"),
+            4 => log::debug!("{s}"),
+            _ => log::trace!("{s}"),
+        }
+    }
+}
+
+fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     use crate::abi::internal::bridge;
     use crate::abi::internal::monitor::ISR_METRICS;
-    use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
         ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, RANDOM_FILL,
+        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, RANDOM_FILL,
         REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE,
     };
     use crate::kernel::exec::scheduler;
     match opcode {
         SELF_INDEX => scheduler::current_module_index() as i32,
         BOOT_INCARNATION => {
-            if arg.is_null() || arg_len < 16 {
-                return E_INVAL;
-            }
             let v = crate::kernel::sys::incarnation::get();
-            core::ptr::copy_nonoverlapping(v.as_ptr(), arg, 16);
+            if let Err(e) = answer(arg, &v) {
+                return e;
+            }
             if v == [0u8; 16] {
                 // The entropy source has not answered: no incarnation yet,
                 // and a consumer must not mint against zeros.
@@ -1627,186 +1602,115 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             0
         }
-        // The calling module's owner slot (`owner_tag`). `apply_add` stamps
-        // every module of a `net=own` workload with its owner post-alloc
-        // (`set_module_owner`), so a bind-emitting module reads its owner here
-        // and appends it to `NET_CMD_BIND` / `DG_CMD_BIND` (metal owner-scoped
-        // binds). Slot 0
-        // (`OWNER_SYSTEM`, a base-graph module) is the host/wildcard tag — a
-        // legitimate value, not an error. A module can only read its OWN owner.
-        OWNER_TAG => scheduler::module_owner(scheduler::current_module_index()).slot as i32,
         // Net-identity provider self-registration: the calling BASE-GRAPH
         // module declares itself the node's shared network stack, carrying its
         // own `addr_ctl` / ingress input-port indices in `arg` (see
         // `kernel_abi::NET_IDENT_PROVIDER`). Workload modules are refused —
         // a tenant must not hijack identity installs.
         NET_IDENT_PROVIDER => {
-            if arg.is_null() || arg_len < 2 {
-                return crate::kernel::sys::errno::EINVAL;
-            }
+            let (addr_ctl, ingress) = match *arg {
+                [a, b, ..] => (a, b),
+                _ => return E_INVAL,
+            };
             let idx = scheduler::current_module_index();
             if !scheduler::module_owner(idx).is_system() {
                 return crate::kernel::sys::errno::EACCES;
             }
-            let a = core::slice::from_raw_parts(arg, 2);
             crate::kernel::workload::workload_graph::register_net_identity_provider(
-                idx as u16, a[0], a[1],
+                idx as u16, addr_ctl, ingress,
             )
         }
-        // Module-facing ISR-bridge enumeration. Returns the calling
-        // module's own input /
-        // output bridge fds (tagged), so an ISR-tier step body can then move
-        // data with the ISR-exempt bridge WRITE/READ/POLL/INFO ops.
-        bridge::SELF_BRIDGES => {
-            use crate::kernel::ipc::fd::{tag_fd, FD_TAG_BRIDGE};
+        // One of the calling module's own ISR bridges: `arg = [dir u8][index
+        // u8]`. Answers the bridge's slot, which the kernel wraps in a handle.
+        bridge::SELF_BRIDGE => {
+            let (Some(&dir), Some(&index)) = (arg.first(), arg.get(1)) else {
+                return crate::kernel::sys::errno::EINVAL;
+            };
             let idx = scheduler::current_module_index();
             if idx >= scheduler::MAX_MODULES {
                 return crate::kernel::sys::errno::ENODEV;
             }
-            let (in_b, out_b) =
-                match crate::kernel::exec::isr_tier::module_bridge_slots(idx as ModuleId) {
-                    Some(b) => b,
-                    None => return crate::kernel::sys::errno::ENODEV,
-                };
-            let in_n = in_b.iter().filter(|s| **s >= 0).count();
-            let out_n = out_b.iter().filter(|s| **s >= 0).count();
-            let need = 4 + (in_n + out_n) * 4;
-            if arg.is_null() || arg_len < need {
-                return crate::kernel::sys::errno::EINVAL;
-            }
-            // SAFETY: `arg` is the caller's output buffer; `arg_len >= need`
-            // checked above, so the `need`-byte slice is in bounds.
-            let out = unsafe { core::slice::from_raw_parts_mut(arg, need) };
-            out[0] = in_n as u8;
-            out[1] = out_n as u8;
-            out[2] = 0;
-            out[3] = 0;
-            let mut pos = 4;
-            for s in in_b.iter().chain(out_b.iter()).filter(|s| **s >= 0) {
-                let fd = tag_fd(FD_TAG_BRIDGE, *s as i32);
-                out[pos..pos + 4].copy_from_slice(&fd.to_le_bytes());
-                pos += 4;
-            }
-            need as i32
-        }
-        MODULE_FLOW_BUDGET => {
-            // arg[0] = graph port index. Optional arg[1]: 0=output,
-            // 1=input. Input requests may carry the raw channel
-            // descriptor in arg[2..6] for bridge/repacking resolution. The
-            // provider handle stays global (-1): raw channel handles are
-            // intentionally untagged and can collide with tracked provider
-            // handles during generic provider dispatch.
-            if arg.is_null() || arg_len < 1 {
-                return crate::kernel::sys::errno::EINVAL;
-            }
-            // SAFETY: non-null, len >= 1 checked above.
-            let port_index = unsafe { *arg };
-            let input = arg_len >= 2
-                // SAFETY: arg non-null (checked above); arg_len >= 2 gates this read.
-                && unsafe { *arg.add(1) } == 1;
-            if input {
-                let channel = if arg_len >= 6 {
-                    // SAFETY: non-null and arg_len >= 6 checked above.
-                    i32::from_le_bytes(unsafe {
-                        [*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]
-                    })
-                } else {
-                    -1
-                };
-                scheduler::syscall_input_flow_budget(port_index, channel)
-            } else {
-                scheduler::syscall_flow_budget(port_index)
+            let Some((in_b, out_b)) =
+                crate::kernel::exec::isr_tier::module_bridge_slots(idx as ModuleId)
+            else {
+                return crate::kernel::sys::errno::ENODEV;
+            };
+            let side = match dir {
+                bridge::DIR_IN => in_b,
+                bridge::DIR_OUT => out_b,
+                _ => return crate::kernel::sys::errno::EINVAL,
+            };
+            match side.iter().filter(|s| **s >= 0).nth(usize::from(index)) {
+                Some(&s) => i32::from(s),
+                None => crate::kernel::sys::errno::ENOENT,
             }
         }
+        // `arg = [port u8][dir u8]` (`0` output, `1` input). An input port's
+        // budget is resolved through the channel the calling module reads it
+        // by, which the kernel looks up itself.
+        MODULE_FLOW_BUDGET => match *arg {
+            [port, 1, ..] => scheduler::syscall_input_flow_budget(port),
+            [port, 0, ..] => scheduler::syscall_flow_budget(port),
+            _ => E_INVAL,
+        },
+        // The instance's params into `data`; an empty `data` asks only their
+        // length. Answers the bytes written (or the length).
         MODULE_INSTANCE_PARAMS => {
-            let idx = scheduler::current_module_index();
-            let (src, len) = scheduler::module_params(idx);
-            if src.is_null() || len == 0 {
-                return 0;
+            let out = data.as_mut();
+            let total = scheduler::copy_module_params(scheduler::current_module_index(), out);
+            if out.is_empty() {
+                total as i32
+            } else {
+                total.min(out.len()) as i32
             }
-            // Size query: `arg=null` or `arg_len=0` returns the full
-            // param length without copying, so callers can size the
-            // buffer before allocating. A real buffer gets
-            // `min(len, arg_len)` bytes.
-            if arg.is_null() || arg_len == 0 {
-                return len as i32;
-            }
-            let copy_len = len.min(arg_len);
-            // SAFETY: `copy_len <= min(len, arg_len)` so `src[..copy_len]`
-            // and `arg[..copy_len]` are both in-bounds; `src` is `&[u8]`,
-            // `arg` is the caller's `*mut u8` (non-null checked above).
-            unsafe {
-                core::ptr::copy_nonoverlapping(src, arg, copy_len);
-            }
-            copy_len as i32
         }
+        // `arg` out `[addr u64][size u32]`: the calling module's arena.
         ARENA_GET => {
-            let mut size_out: u32 = 0;
-            let ptr = scheduler::syscall_arena_get(&mut size_out);
-            // The wire field is 4 bytes, so a resident arena pointer must fit
-            // in u32 or it would be silently truncated into a wrong base. On
-            // pi5 `STATE_ARENA` (.bss) is linked sub-4GiB so this never trips;
-            // a hosted (PIE) Linux process can place .bss above 4GiB, where
-            // truncation would corrupt the module's arena base. Fail closed
-            // with a hard check.
-            if (ptr as usize) > u32::MAX as usize {
-                log::error!("[syscall] ARENA_GET: arena ptr {ptr:p} exceeds u32");
+            let (ptr, size) = scheduler::arena_get();
+            let Some(out) = arg.get_mut(..12) else {
                 return E_INVAL;
-            }
-            if !arg.is_null() && arg_len >= 4 {
-                let addr = ptr as u32;
-                *arg = addr as u8;
-                *arg.add(1) = (addr >> 8) as u8;
-                *arg.add(2) = (addr >> 16) as u8;
-                *arg.add(3) = (addr >> 24) as u8;
-            }
-            size_out as i32
-        }
-        REPORT_LATENCY => {
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
-            }
-            let frames = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let idx = scheduler::current_module_index();
-            scheduler::report_module_latency(idx, frames);
+            };
+            out[0..8].copy_from_slice(&(ptr as usize as u64).to_le_bytes());
+            out[8..12].copy_from_slice(&size.to_le_bytes());
             0
         }
-        REPORT_STEP_EFFECT => {
-            // Work signal: one byte of StepEffect. Heats the adaptive pacer
-            // for WorkDone/RunnableBacklog/Burst; never authorises re-step.
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
+        REPORT_LATENCY => match arg_u32(arg) {
+            Some(frames) => {
+                scheduler::report_module_latency(scheduler::current_module_index(), frames);
+                0
             }
-            let idx = scheduler::current_module_index();
-            scheduler::report_step_effect(idx, *arg);
-            0
-        }
+            None => E_INVAL,
+        },
+        // Work signal: one byte of StepEffect. Heats the adaptive pacer
+        // for WorkDone/RunnableBacklog/Burst; never authorises re-step.
+        REPORT_STEP_EFFECT => match arg.first() {
+            Some(&effect) => {
+                scheduler::report_step_effect(scheduler::current_module_index(), effect);
+                0
+            }
+            None => E_INVAL,
+        },
+        // `handle` = the level, `data` = the message.
         LOG_WRITE => {
-            syscall_log(handle as u8, arg, arg_len);
+            log_write(handle as u8, data.as_slice());
             0
         }
+        // Binary-safe raw write of `data` to the debug serial sink (the
+        // transport_buffer telemetry path). Returns bytes accepted.
         SERIAL_WRITE => {
-            // Binary-safe raw write to the debug serial sink (the transport_buffer
-            // telemetry path). Returns bytes accepted.
-            if arg.is_null() || arg_len == 0 {
+            if data.is_empty() {
                 return 0;
             }
-            let bytes = core::slice::from_raw_parts(arg, arg_len);
-            crate::kernel::sys::hal::serial_write(bytes) as i32
+            crate::kernel::sys::hal::serial_write(data.as_slice()) as i32
         }
         GET_HW_ETHERNET_MAC => {
-            if arg.is_null() || arg_len < 6 {
-                return E_INVAL;
-            }
             #[cfg(feature = "dtb")]
             {
                 match crate::kernel::boot::dtb::read_ethernet_mac() {
-                    Some(mac) => {
-                        for (i, byte) in mac.iter().enumerate() {
-                            *arg.add(i) = *byte;
-                        }
-                        6
-                    }
+                    Some(mac) => match answer(arg, &mac) {
+                        Ok(()) => 6,
+                        Err(e) => e,
+                    },
                     None => errno::ENODEV,
                 }
             }
@@ -1816,101 +1720,62 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 errno::ENODEV
             }
         }
-        BIND_IRQ => {
-            if arg.is_null() || arg_len < 4 {
-                return E_INVAL;
-            }
-            let irq = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let mmio_base = if arg_len >= 12 {
-                u64::from_le_bytes([
-                    *arg.add(4),
-                    *arg.add(5),
-                    *arg.add(6),
-                    *arg.add(7),
-                    *arg.add(8),
-                    *arg.add(9),
-                    *arg.add(10),
-                    *arg.add(11),
-                ]) as usize
-            } else {
-                0
-            };
-            let event_slot = crate::kernel::ipc::fd::slot_of(handle);
-            if event_slot < 0 {
-                return E_INVAL;
-            }
-            // Event-bound IRQs (e.g. virtio-mmio) are serviced on core 0.
-            hal::irq_bind(irq, event_slot, mmio_base, 0)
-        }
         HANDLE_POLL => {
-            let events = if !arg.is_null() && arg_len >= 1 {
-                *arg
-            } else {
-                0xFF
-            };
-            crate::kernel::ipc::fd::fd_poll(handle, events)
+            let events = arg.first().copied().unwrap_or(0xFF);
+            crate::kernel::ipc::handle::fd_poll(handle, events)
         }
+        // `data` = the bytes to fill, all of them or none.
         RANDOM_FILL => {
-            if arg.is_null() || arg_len == 0 {
+            let out = data.as_mut();
+            if out.is_empty() {
                 return E_INVAL;
             }
-            hal::csprng_fill(arg, arg_len)
+            hal::csprng_fill(out)
         }
-        ISR_METRICS => crate::kernel::exec::isr_tier::isr_metrics_dispatch(arg, arg_len),
+        ISR_METRICS => crate::kernel::exec::isr_tier::isr_metrics_dispatch(arg),
         _ => E_NOSYS,
     }
 }
 
 /// The `[module_idx:u16 LE]` that leads a reconfigure or monitor argument.
 /// `None` when the argument is too short to hold one.
-///
-/// # Safety
-/// `arg` is null or valid for `arg_len` bytes.
-unsafe fn module_arg(arg: *const u8, arg_len: usize) -> Option<usize> {
-    if arg.is_null() || arg_len < 2 {
-        return None;
+fn module_arg(arg: &[u8]) -> Option<usize> {
+    match *arg {
+        [a, b, ..] => Some(usize::from(u16::from_le_bytes([a, b]))),
+        _ => None,
     }
-    Some(usize::from(u16::from_le_bytes([*arg, *arg.add(1)])))
 }
 
-unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn handle_reconfigure_op(opcode: u32, arg: &mut [u8]) -> i32 {
     use crate::abi::internal::reconfigure;
     use crate::kernel::exec::scheduler;
     match opcode {
         reconfigure::SET_PHASE => {
-            if arg.is_null() || arg_len < 1 {
-                return E_INVAL;
-            }
-            let phase_byte = core::ptr::read(arg);
-            let phase = match phase_byte {
-                0 => scheduler::ReconfigurePhase::Running,
-                1 => scheduler::ReconfigurePhase::Draining,
-                2 => scheduler::ReconfigurePhase::Migrating,
+            let phase = match arg.first() {
+                Some(0) => scheduler::ReconfigurePhase::Running,
+                Some(1) => scheduler::ReconfigurePhase::Draining,
+                Some(2) => scheduler::ReconfigurePhase::Migrating,
                 _ => return E_INVAL,
             };
             scheduler::set_reconfigure_phase(phase);
             0
         }
-        reconfigure::CALL_DRAIN => {
-            let Some(idx) = module_arg(arg, arg_len) else {
-                return E_INVAL;
-            };
-            scheduler::call_module_drain(idx)
-        }
-        reconfigure::MARK_FINISHED => {
-            let Some(idx) = module_arg(arg, arg_len) else {
-                return E_INVAL;
-            };
-            scheduler::mark_module_finished(idx);
-            0
-        }
+        reconfigure::CALL_DRAIN => match module_arg(arg) {
+            Some(idx) => scheduler::call_module_drain(idx),
+            None => E_INVAL,
+        },
+        reconfigure::MARK_FINISHED => match module_arg(arg) {
+            Some(idx) => {
+                scheduler::mark_module_finished(idx);
+                0
+            }
+            None => E_INVAL,
+        },
         reconfigure::MODULE_COUNT => scheduler::active_module_count() as i32,
-        reconfigure::MODULE_INFO => {
-            let Some(idx) = module_arg(arg, arg_len) else {
-                return E_INVAL;
-            };
-            scheduler::module_info_flags(idx) as i32
-        }
+        reconfigure::MODULE_INFO => match module_arg(arg) {
+            Some(idx) => scheduler::module_info_flags(idx) as i32,
+            None => E_INVAL,
+        },
         reconfigure::MODULE_UPSTREAM => {
             // Arg layout: in `[module_idx:u16 LE][first_word:u16 LE]`, out
             // `[mask word u64 LE × W]` from offset 4, starting at mask word
@@ -1920,34 +1785,25 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
             // mask in windows sized to its own buffer and never needs the
             // kernel's slot count compiled in. `arg_len >= 12` (index, first
             // word, one word).
-            if arg_len < 12 {
+            if arg.len() < 12 {
                 return E_INVAL;
             }
-            let Some(idx) = module_arg(arg, arg_len) else {
+            let Some(idx) = module_arg(arg) else {
                 return E_INVAL;
             };
-            let first = usize::from(u16::from_le_bytes([*arg.add(2), *arg.add(3)]));
+            let first = usize::from(u16::from_le_bytes([arg[2], arg[3]]));
             let mut words = [0u64; crate::kernel::workload::bitmask::MODULE_MASK_WORDS];
             let total = scheduler::module_upstream_words(idx, &mut words);
-            let fit = ((arg_len - 4) / 8).min(total.saturating_sub(first));
-            for (w, word) in words.iter().skip(first).enumerate().take(fit) {
-                let bytes = word.to_le_bytes();
-                for (i, b) in bytes.iter().enumerate() {
-                    *arg.add(4 + w * 8 + i) = *b;
-                }
+            let window = words.iter().skip(first).take(total.saturating_sub(first));
+            for (chunk, word) in arg[4..].chunks_exact_mut(8).zip(window) {
+                chunk.copy_from_slice(&word.to_le_bytes());
             }
             total as i32
         }
-        reconfigure::MODULE_DONE => {
-            let Some(idx) = module_arg(arg, arg_len) else {
-                return E_INVAL;
-            };
-            if scheduler::module_is_finished(idx) {
-                1
-            } else {
-                0
-            }
-        }
+        reconfigure::MODULE_DONE => match module_arg(arg) {
+            Some(idx) => i32::from(scheduler::module_is_finished(idx)),
+            None => E_INVAL,
+        },
         // The boot plan's module-slot ceiling (derived + live-add reserve): a
         // fixed figure for the graph's life, where the committed slot count
         // grows under live adds.
@@ -1960,65 +1816,52 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
     }
 }
 
-unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: &mut [u8]) -> i32 {
     use crate::abi::internal::monitor;
     use crate::kernel::exec::scheduler;
     match opcode {
         monitor::FAULT_MONITOR_SUBSCRIBE => {
-            if handle < 0 {
-                crate::kernel::exec::step_guard::subscribe(-1)
-            } else {
-                let slot = crate::kernel::ipc::fd::slot_of(handle);
-                if slot < 0 {
-                    return E_INVAL;
-                }
-                crate::kernel::exec::step_guard::subscribe(slot)
+            // `handle` = an event the caller owns, signalled on each fault,
+            // or -1 to poll.
+            if handle >= 0 && !crate::kernel::ipc::event::owned_by_caller(handle) {
+                return errno::EBADF;
             }
+            crate::kernel::exec::step_guard::subscribe(handle)
         }
         monitor::FAULT_MONITOR_POP => {
             use crate::kernel::exec::step_guard::FaultRecord;
-            if arg.is_null() || arg_len < FaultRecord::SIZE {
+            let Some(out) = arg.get_mut(..FaultRecord::SIZE) else {
                 return E_INVAL;
-            }
+            };
             let mut rec = FaultRecord::default();
             let got = crate::kernel::exec::step_guard::pop_fault(&mut rec);
             if got == 1 {
-                let bytes = rec.to_bytes();
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, FaultRecord::SIZE);
+                out.copy_from_slice(&rec.to_bytes());
             }
             got
         }
+        // `handle` = the module index.
         monitor::FAULT_STATS_QUERY => {
             use crate::kernel::exec::step_guard::FaultStats;
-            if handle < 0 || handle as usize >= crate::kernel::exec::scheduler::module_slots() {
+            if handle < 0 || handle as usize >= scheduler::module_slots() {
                 return E_INVAL;
             }
-            if arg.is_null() || arg_len < core::mem::size_of::<FaultStats>() {
-                return E_INVAL;
+            let stats: [u8; FaultStats::SIZE] =
+                scheduler::get_fault_stats(handle as usize).to_bytes();
+            match answer(arg, &stats) {
+                Ok(()) => 0,
+                Err(e) => e,
             }
-            let stats = scheduler::get_fault_stats(handle as usize);
-            core::ptr::copy_nonoverlapping(
-                &stats as *const FaultStats as *const u8,
-                arg,
-                core::mem::size_of::<FaultStats>(),
-            );
-            0
         }
         monitor::FAULT_RAISE => {
-            if arg_len < 3 {
-                return E_INVAL;
-            }
-            let Some(idx) = module_arg(arg, arg_len) else {
+            let (Some(idx), Some(&kind)) = (module_arg(arg), arg.get(2)) else {
                 return E_INVAL;
             };
-            let kind = core::ptr::read(arg.add(2));
             scheduler::raise_module_fault(idx, kind);
             0
         }
+        // `handle` = the module index, or -1 for the whole graph.
         monitor::STEP_HISTOGRAM_QUERY => {
-            if arg.is_null() || arg_len < 32 {
-                return E_INVAL;
-            }
             let idx = if handle < 0 {
                 usize::MAX
             } else {
@@ -2027,51 +1870,33 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
             scheduler::query_step_histogram(idx, arg)
         }
         monitor::MODULE_STATE_QUERY => {
-            if arg.is_null() || arg_len < monitor::MODULE_STATE_LEN || handle < 0 {
+            if handle < 0 {
                 return E_INVAL;
             }
-            scheduler::query_module_state(handle as usize, arg, arg_len)
+            scheduler::query_module_state(handle as usize, arg)
         }
         _ => E_NOSYS,
     }
 }
 
-unsafe fn handle_diag_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn handle_diag_op(opcode: u32, mut data: UserSpan<'_>) -> i32 {
     use crate::abi::internal::diag;
-    if arg.is_null() || arg_len == 0 {
-        return E_INVAL;
-    }
     match opcode {
         diag::LOG_RING_DRAIN => {
+            let out = data.as_mut();
+            if out.is_empty() {
+                return E_INVAL;
+            }
             // Low 16 bits = payload length, next 15 bits = dropped count
             // (saturating). Top bit is kept clear so the return is always
             // a non-negative `i32`.
-            let out = core::slice::from_raw_parts_mut(arg, arg_len);
             let n = crate::kernel::sys::log_ring::drain_net(out);
             let dropped = crate::kernel::sys::log_ring::take_dropped_net();
             let dropped_sat = if dropped > 0x7FFF { 0x7FFF } else { dropped };
             ((dropped_sat << 16) | (n as u32 & 0xFFFF)) as i32
         }
-        diag::FAN_DIAG_SNAPSHOT => {
-            let f = FAN_DIAG_HANDLER.load(core::sync::atomic::Ordering::Acquire);
-            if f.is_null() {
-                return E_NOSYS;
-            }
-            let handler: unsafe fn(*mut u8, usize) -> i32 = core::mem::transmute(f);
-            handler(arg, arg_len)
-        }
         _ => E_NOSYS,
     }
-}
-
-/// Platform-injected handler for `FAN_DIAG_SNAPSHOT`. A null handler
-/// causes the syscall to return ENOSYS, which is the expected behaviour
-/// on platforms that don't expose fan-out / fan-in diagnostics.
-pub static FAN_DIAG_HANDLER: core::sync::atomic::AtomicPtr<()> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-
-pub fn register_fan_diag_handler(f: unsafe fn(*mut u8, usize) -> i32) {
-    FAN_DIAG_HANDLER.store(f as *mut (), core::sync::atomic::Ordering::Release);
 }
 
 // ============================================================================
@@ -2085,18 +1910,34 @@ pub fn register_fan_diag_handler(f: unsafe fn(*mut u8, usize) -> i32) {
 /// vtable resolves from the handle's FD tag and strips the tag
 /// before the provider sees the slot. Handle=-1 and untracked
 /// handles return `E_NOSYS`; one-shot ops without a handle (object
-/// `PUT`, namespace `RENAME`, …) carry an explicit `fence_out_ptr`
-/// in their arg layout instead — see the storage contract files.
-unsafe fn last_fence_query(handle: i32, out: *mut u8, out_len: usize) -> i32 {
+/// `PUT`, namespace `RENAME`, …) carry their fence in the `arg`
+/// trailer instead — see the storage contract files.
+fn last_fence_query(handle: i32, out: &mut [u8]) -> i32 {
     use crate::abi::fence::{QUERY_OP, WIRE_MAX_LEN};
 
-    if out.is_null() || out_len < WIRE_MAX_LEN {
+    if out.len() < WIRE_MAX_LEN {
         return E_INVAL;
     }
     if crate::kernel::module::provider::contract_of(handle).is_none() {
         return E_NOSYS;
     }
-    crate::kernel::module::provider::provider_call(handle, QUERY_OP, out, out_len)
+    crate::kernel::module::provider::provider_call(handle, QUERY_OP, out, UserSpan::empty())
+}
+
+/// Write a 4-byte LE answer at the head of `out`.
+fn query_u32(out: &mut [u8], v: u32) -> i32 {
+    match answer(out, &v.to_le_bytes()) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// Write a record at the head of `out` and answer its length.
+fn query_record(out: &mut [u8], record: &[u8]) -> i32 {
+    match answer(out, record) {
+        Ok(()) => record.len() as i32,
+        Err(e) => e,
+    }
 }
 
 /// Kernel-side cross-class query dispatcher.
@@ -2104,240 +1945,123 @@ unsafe fn last_fence_query(handle: i32, out: *mut u8, out_len: usize) -> i32 {
 /// Fallback path invoked by `syscall_provider_query` when the handle's
 /// contract vtable doesn't claim the key. Handles:
 ///  - cross-class common keys (`query_key::*`) applicable to any handle
-///  - per-contract defaults (SPI GET_CAPS, I2C GET_CAPS, …)
 ///  - SYSTEM-contract introspection (ARENA_USAGE, GRAPH_SAMPLE_RATE, …)
-unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32 {
+fn kernel_query_dispatch(handle: i32, key: u32, out: &mut [u8]) -> i32 {
     use crate::abi::kernel_abi::query_key as dev_query_key;
-    use crate::kernel::ipc::fd;
-    use crate::kernel::module::provider::contract as dev_class;
-
-    // Cross-class common queries (`query_key::*`) apply to any handle; any
-    // other key is its contract's, by class.
-    let common = matches!(
-        key,
-        dev_query_key::CLASS
-            | dev_query_key::NAME
-            | dev_query_key::CAPABILITIES
-            | dev_query_key::STATE
-            | dev_query_key::ERROR_COUNT
-            | dev_query_key::HEAP_STATS
-            | dev_query_key::LAST_FENCE
-            | dev_query_key::CALLER_OWNER
-            | dev_query_key::CALLER_MODULE
-            | dev_query_key::MODULE_LIVE
-            | dev_query_key::EVENT_OWNER
-    );
-    if common {
-        return match key {
-            dev_query_key::CLASS => {
-                if out.is_null() || out_len < 1 {
-                    return E_INVAL;
-                }
-                let (tag, _) = fd::untag_fd(handle);
-                let class = match tag {
-                    fd::FD_TAG_CHANNEL => dev_class::CHANNEL,
-                    fd::FD_TAG_EVENT => dev_class::EVENT,
-                    fd::FD_TAG_TIMER => dev_class::TIMER,
-                    _ => return E_INVAL,
-                };
-                *out = class as u8;
-                0
-            }
-            dev_query_key::STATE => E_NOSYS,
-            dev_query_key::HEAP_STATS => {
-                // The record is one length (`abi::heap_stats::LEN`); a
-                // buffer of any other is a caller reading another layout.
-                use crate::abi::heap_stats::LEN;
-                if out.is_null() || out_len != LEN {
-                    return E_INVAL;
-                }
-                let idx = crate::kernel::exec::scheduler::current_module_index();
-                let bytes = crate::kernel::mem::heap::heap_stats(idx).encode();
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, LEN);
-                LEN as i32
-            }
-            dev_query_key::LAST_FENCE => last_fence_query(handle, out, out_len),
-            dev_query_key::CALLER_OWNER => {
-                if out.is_null() || out_len < 8 {
-                    return E_INVAL;
-                }
-                let caller = crate::kernel::exec::scheduler::caller_module_index();
-                // Nothing on the provider stack means this module is stepping
-                // its own work, not serving a request. Answering with an
-                // owner here would let a provider charge background work to
-                // whoever called it last, which is worse than no answer.
-                if caller >= crate::kernel::exec::scheduler::module_slots() {
-                    return errno::ESRCH;
-                }
-                let owner = crate::kernel::exec::scheduler::module_owner(caller);
-                // The same encoder the `OWNER_RELEASED` notification uses, so
-                // a provider can compare the two records directly.
-                let record = crate::kernel::module::provider::encode_owner_record(owner);
-                core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
-                record.len() as i32
-            }
-            dev_query_key::CALLER_MODULE => {
-                if out.is_null() || out_len < 8 {
-                    return E_INVAL;
-                }
-                let caller = crate::kernel::exec::scheduler::caller_module_index();
-                // As CALLER_OWNER: nobody is calling when nothing is on the
-                // provider stack.
-                if caller >= crate::kernel::exec::scheduler::module_slots() {
-                    return errno::ESRCH;
-                }
-                let gen = crate::kernel::exec::scheduler::module_slot_generation(caller);
-                let record = module_record(caller as u16, gen);
-                core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
-                record.len() as i32
-            }
-            dev_query_key::MODULE_LIVE => {
-                if out.is_null() || out_len < 8 {
-                    return E_INVAL;
-                }
-                let mut rec = [0u8; 8];
-                core::ptr::copy_nonoverlapping(out as *const u8, rec.as_mut_ptr(), 8);
-                let idx = u16::from_le_bytes([rec[0], rec[1]]) as usize;
-                let gen = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
-                let live = idx < crate::kernel::exec::scheduler::module_slots()
-                    && crate::kernel::exec::scheduler::module_slot_generation(idx) == gen
-                    && !crate::kernel::exec::scheduler::module_is_finished(idx);
-                i32::from(live)
-            }
-            dev_query_key::EVENT_OWNER => {
-                if out.is_null() || out_len < 8 {
-                    return E_INVAL;
-                }
-                let (tag, _) = crate::kernel::ipc::fd::untag_fd(handle);
-                if handle < 0 || tag != crate::kernel::ipc::fd::FD_TAG_EVENT {
-                    return E_INVAL;
-                }
-                let slot = crate::kernel::ipc::fd::slot_of(handle);
-                let Some(owner) = crate::kernel::ipc::event::event_owner(slot) else {
-                    return errno::ENOENT;
-                };
-                let idx = owner as usize;
-                if idx >= crate::kernel::exec::scheduler::module_slots() {
-                    return errno::ENOENT;
-                }
-                let gen = crate::kernel::exec::scheduler::module_slot_generation(idx);
-                let record = module_record(owner, gen);
-                core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
-                record.len() as i32
-            }
-            _ => E_NOSYS,
-        };
-    }
-
-    let class = ((key >> 8) & 0xFF) as u16;
-    match class {
-        dev_class::SPI => {
-            use crate::abi::contracts::hal::spi as dev_spi;
-            match key {
-                dev_spi::GET_CAPS => {
-                    if out.is_null() || out_len < 4 {
-                        return E_INVAL;
-                    }
-                    // Return SPI capabilities: bit 0 = DMA, bit 1 = async
-                    *(out as *mut u32) = 0x03;
-                    0
-                }
-                _ => E_NOSYS,
+    use crate::kernel::exec::scheduler;
+    match key {
+        dev_query_key::CLASS => {
+            let Some(class) = crate::kernel::module::provider::contract_of(handle) else {
+                return E_INVAL;
+            };
+            match answer(out, &[class as u8]) {
+                Ok(()) => 0,
+                Err(e) => e,
             }
         }
-        dev_class::I2C => {
-            use crate::abi::contracts::hal::i2c as dev_i2c;
-            match key {
-                dev_i2c::GET_CAPS => {
-                    if out.is_null() || out_len < 4 {
-                        return E_INVAL;
-                    }
-                    // I2C capabilities: bit 0 = async bridge, bit 1 = multi-handle
-                    *(out as *mut u32) = 0x03;
-                    0
-                }
-                _ => E_NOSYS,
+        dev_query_key::HEAP_STATS => {
+            // The record is one length (`abi::heap_stats::LEN`); a
+            // buffer of any other is a caller reading another layout.
+            use crate::abi::heap_stats::LEN;
+            if out.len() != LEN {
+                return E_INVAL;
             }
+            let idx = scheduler::current_module_index();
+            query_record(out, &crate::kernel::mem::heap::heap_stats(idx).encode())
         }
-        // PIO queries route through the PIC pio_stream module directly.
-        dev_class::INTERNAL_DISPATCH_BUCKET => {
-            use crate::abi::internal::monitor::ARENA_USAGE;
-            use crate::abi::kernel_abi::{DOWNSTREAM_LATENCY, GRAPH_SAMPLE_RATE};
-            use crate::kernel::exec::scheduler;
-            match key {
-                crate::abi::kernel_abi::STREAM_TIME => {
-                    // STREAM_TIME: prefer a dedicated STREAM_CLOCK provider
-                    // (hosts register one — the audio sink's clock — without
-                    // any PIO hardware). If none is registered (bare-metal RP),
-                    // fall back to the active PIO stream's own time: on RP the
-                    // clock genuinely is a property of the PIO stream. handle=-1
-                    // resolves to the first active stream (see
-                    // `kernel_abi::STREAM_TIME`).
-                    use crate::abi::registry::pio::STREAM_TIME as PIO_STREAM_TIME;
-                    use crate::abi::registry::stream_clock::QUERY as STREAM_CLOCK_QUERY;
-                    use crate::kernel::module::provider;
-                    let rc = provider::dispatch(
-                        provider::contract::STREAM_CLOCK,
-                        handle,
-                        STREAM_CLOCK_QUERY,
-                        out,
-                        out_len,
-                    );
-                    if rc == E_NOSYS {
-                        provider::dispatch(
-                            provider::contract::HAL_PIO,
-                            handle,
-                            PIO_STREAM_TIME,
-                            out,
-                            out_len,
-                        )
-                    } else {
-                        rc
-                    }
-                }
-                ARENA_USAGE => {
-                    if out.is_null() || out_len < 4 {
-                        return E_INVAL;
-                    }
-                    let (used, total) = crate::kernel::module::loader::arena_usage();
-                    *(out as *mut u32) = ((used as u32) << 16) | (total as u32 & 0xFFFF);
-                    0
-                }
-                GRAPH_SAMPLE_RATE => {
-                    if out.is_null() || out_len < 4 {
-                        return E_INVAL;
-                    }
-                    *(out as *mut u32) = scheduler::graph_sample_rate();
-                    0
-                }
-                DOWNSTREAM_LATENCY => {
-                    if out.is_null() || out_len < 4 {
-                        return E_INVAL;
-                    }
-                    let idx = scheduler::current_module_index();
-                    *(out as *mut u32) = scheduler::downstream_latency(idx);
-                    0
-                }
-                _ => {
-                    if let Some(ext) = DEV_QUERY_EXTENSION {
-                        ext(handle, key, out, out_len)
-                    } else {
-                        E_NOSYS
-                    }
-                }
+        dev_query_key::LAST_FENCE => last_fence_query(handle, out),
+        dev_query_key::CALLER_OWNER => {
+            // A buffer that cannot hold the record is a malformed call,
+            // whatever the provider stack holds.
+            if out.len() < 8 {
+                return E_INVAL;
             }
+            let caller = scheduler::caller_module_index();
+            // Nothing on the provider stack means this module is stepping
+            // its own work, not serving a request. Answering with an
+            // owner here would let a provider charge background work to
+            // whoever called it last, which is worse than no answer.
+            if caller >= scheduler::module_slots() {
+                return errno::ESRCH;
+            }
+            // The same encoder the `OWNER_RELEASED` notification uses, so
+            // a provider can compare the two records directly.
+            let owner = scheduler::module_owner(caller);
+            query_record(
+                out,
+                &crate::kernel::module::provider::encode_owner_record(owner),
+            )
         }
-        _ => {
-            // SAFETY: `DEV_QUERY_EXTENSION` is a `Option<fn>` set once at
-            // boot; the copy out is a word-sized load.
-            if let Some(ext) = unsafe { DEV_QUERY_EXTENSION } {
-                // SAFETY: `ext` is the registered platform extension fn;
-                // arguments are passed straight through from the caller.
-                unsafe { ext(handle, key, out, out_len) }
+        dev_query_key::CALLER_MODULE => {
+            // A buffer that cannot hold the record is a malformed call,
+            // whatever the provider stack holds.
+            if out.len() < 8 {
+                return E_INVAL;
+            }
+            let caller = scheduler::caller_module_index();
+            // As CALLER_OWNER: nobody is calling when nothing is on the
+            // provider stack.
+            if caller >= scheduler::module_slots() {
+                return errno::ESRCH;
+            }
+            let gen = scheduler::module_slot_generation(caller);
+            query_record(out, &module_record(caller as u16, gen))
+        }
+        // `out` holds the occupancy to test on entry.
+        dev_query_key::MODULE_LIVE => {
+            let Some(rec) = out.get(..8) else {
+                return E_INVAL;
+            };
+            let idx = u16::from_le_bytes([rec[0], rec[1]]) as usize;
+            let gen = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+            let live = idx < scheduler::module_slots()
+                && scheduler::module_slot_generation(idx) == gen
+                && !scheduler::module_is_finished(idx);
+            i32::from(live)
+        }
+        crate::abi::kernel_abi::STREAM_TIME => {
+            // STREAM_TIME: prefer a dedicated STREAM_CLOCK provider
+            // (hosts register one — the audio sink's clock — without
+            // any PIO hardware). If none is registered (bare-metal RP),
+            // fall back to the active PIO stream's own time: on RP the
+            // clock genuinely is a property of the PIO stream. handle=-1
+            // resolves to the first active stream (see
+            // `kernel_abi::STREAM_TIME`).
+            use crate::abi::registry::pio::STREAM_TIME as PIO_STREAM_TIME;
+            use crate::abi::registry::stream_clock::QUERY as STREAM_CLOCK_QUERY;
+            use crate::kernel::module::provider;
+            let rc = provider::dispatch(
+                provider::contract::STREAM_CLOCK,
+                handle,
+                STREAM_CLOCK_QUERY,
+                out,
+                UserSpan::empty(),
+            );
+            if rc == E_NOSYS {
+                provider::dispatch(
+                    provider::contract::HAL_PIO,
+                    handle,
+                    PIO_STREAM_TIME,
+                    out,
+                    UserSpan::empty(),
+                )
             } else {
-                E_NOSYS
+                rc
             }
         }
+        crate::abi::internal::monitor::ARENA_USAGE => {
+            let (used, total) = crate::kernel::module::loader::arena_usage();
+            query_u32(out, ((used as u32) << 16) | (total as u32 & 0xFFFF))
+        }
+        crate::abi::kernel_abi::GRAPH_SAMPLE_RATE => query_u32(out, scheduler::graph_sample_rate()),
+        crate::abi::kernel_abi::DOWNSTREAM_LATENCY => {
+            let idx = scheduler::current_module_index();
+            query_u32(out, scheduler::downstream_latency(idx))
+        }
+        _ => match dev_query_extension() {
+            Some(ext) => ext(handle, key, out),
+            None => E_NOSYS,
+        },
     }
 }
 
@@ -2361,7 +2085,6 @@ pub const fn empty_syscall_table() -> SyscallTable {
         provider_query: stub_provider_query,
         provider_close: stub_provider_close,
         channel_peek: stub_channel_peek,
-        provider_call_sel: stub_provider_call_sel,
         channel_discard: stub_channel_discard,
     }
 }
@@ -2386,14 +2109,16 @@ pub fn release_module_handles(module_idx: ModuleId) {
     // Release events
     crate::kernel::ipc::event::release_owned_by(module_idx);
     // Release fd-based timers
-    crate::kernel::ipc::fd::release_timers_owned_by(module_idx);
+    crate::kernel::ipc::timer::release_timers_owned_by(module_idx);
     // Release module provider registrations
     crate::kernel::module::provider::release_module_providers(module_idx);
-    // Clear channel ioctl handlers registered by this module so a
-    // finalised module's function pointer cannot survive in the
-    // channel table — the next `channel_ioctl` cmd on a bound
-    // channel would otherwise call into freed code.
-    crate::kernel::ipc::channel::release_module_handlers(module_idx);
+    // End what it borrowed (its DMA went with its platform handles above),
+    // and close what it lent: a span still borrowed waits for its return,
+    // and `free_module_state` quarantines the memory under it.
+    crate::kernel::ipc::lend::release_module(usize::from(module_idx));
+    // A mailbox record it held for writing is cancelled, one it held for
+    // reading goes back unconsumed: nothing else would ever end those lends.
+    crate::kernel::ipc::buffer_pool::release_lends_of(module_idx);
 }
 
 unsafe extern "C" fn stub_channel_read(_handle: i32, _buf: *mut u8, _len: usize) -> i32 {
@@ -2425,6 +2150,8 @@ unsafe extern "C" fn stub_provider_call(
     _op: u32,
     _arg: *mut u8,
     _arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
 ) -> i32 {
     E_NOSYS
 }
@@ -2437,16 +2164,6 @@ unsafe extern "C" fn stub_provider_query(
     E_NOSYS
 }
 unsafe extern "C" fn stub_provider_close(_handle: i32) -> i32 {
-    E_NOSYS
-}
-unsafe extern "C" fn stub_provider_call_sel(
-    _sel: *const u8,
-    _sel_len: usize,
-    _op_handle: i32,
-    _op: u32,
-    _arg: *mut u8,
-    _arg_len: usize,
-) -> i32 {
     E_NOSYS
 }
 

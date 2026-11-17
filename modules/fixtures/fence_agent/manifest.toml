@@ -76,6 +76,7 @@ direction = "input"
 content_type = "NetProto"
 required = true
 buffer_size = 512
+accepts_record = 64
 rate_class_default = "control"
 
 [[ports]]
@@ -84,6 +85,7 @@ direction = "output"
 content_type = "NetProto"
 required = true
 buffer_size = 512
+max_record = 64
 rate_class_default = "control"
 
 # The host process executor that runs the actuator command.

@@ -361,6 +361,8 @@ impl CredFile {
                 abi::contracts::storage::fs::CLOSE,
                 core::ptr::null_mut(),
                 0,
+                core::ptr::null_mut(),
+                0,
             );
             self.fd = -1;
         }
@@ -373,7 +375,7 @@ impl CredFile {
             let mut p = [0u8; CRED_PATH_MAX + 1];
             let n = self.path_len as usize;
             p[..n].copy_from_slice(&self.path[..n]);
-            let rc = (sys.provider_call)(-1, fs::OPEN, p.as_mut_ptr(), n);
+            let rc = (sys.provider_call)(-1, fs::OPEN, p.as_mut_ptr(), n, core::ptr::null_mut(), 0);
             if rc == abi::errno::EAGAIN || rc == abi::errno::EINPROGRESS {
                 return CF_PENDING;
             }
@@ -391,7 +393,14 @@ impl CredFile {
         let mut chunk = [0u8; CRED_CHUNK];
         while reads < CRED_READS_PER_STEP {
             reads += 1;
-            let r = (sys.provider_call)(self.fd, fs::READ, chunk.as_mut_ptr(), CRED_CHUNK);
+            let r = (sys.provider_call)(
+                self.fd,
+                fs::READ,
+                chunk.as_mut_ptr(),
+                CRED_CHUNK,
+                core::ptr::null_mut(),
+                0,
+            );
             if r == abi::errno::EAGAIN {
                 return CF_PENDING;
             }

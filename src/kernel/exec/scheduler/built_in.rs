@@ -72,7 +72,7 @@ pub(crate) fn collect_ctrl_channels(edges: &[Edge], module_idx: usize, out: &mut
 // ============================================================================
 
 /// Pair of (module name, step function) for `run_builtin_graph`.
-pub type BuiltinModuleEntry = (&'static str, fn(*mut u8) -> i32);
+pub type BuiltinModuleEntry = (&'static str, BuiltInStepFn);
 
 /// Manually insert built-in modules and run the scheduler loop.
 /// Used on platforms without flash/PIC (e.g. aarch64 QEMU).
@@ -93,7 +93,7 @@ pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
     if count > 1 {
         let mut i = 0;
         while i < count - 1 {
-            let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, null(), 0);
+            let ch = channel::channel_open(&[]);
             if ch >= 0 {
                 channels[i] = ch;
                 chan_count += 1;

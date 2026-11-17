@@ -100,7 +100,7 @@ struct State {
 }
 
 unsafe fn call(sys: &SyscallTable, handle: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
-    (sys.provider_call)(handle, op, arg, len)
+    (sys.provider_call)(handle, op, arg, len, core::ptr::null_mut(), 0)
 }
 
 unsafe fn fail(s: &mut State, rc: i32, msg: &[u8]) -> StepReturn {

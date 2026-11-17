@@ -68,18 +68,23 @@ pub unsafe fn size_kernel_tables(
     crate::kernel::ipc::channel::size(edges, edge_derived as usize)
         .map_err(|e| refused(res::POOL_CHANNELS, e))?;
     let whole = |pool: u16| ledger::ceiling(pool) as usize;
-    // Event and timer handles name their slot in a tagged fd's slot field: a
-    // table past it would hand out handles that alias.
-    let fd_slots = crate::abi::kernel_abi::fd::SLOT_MASK as usize + 1;
-    for pool in [res::POOL_EVENTS, res::POOL_TIMERS] {
-        if whole(pool) > fd_slots {
-            ledger::refuse(pool, "past the tagged-fd slot domain");
+    // Event, timer and routed handles name their slot in the handle's index
+    // field: a table past it would hand out handles that alias. The routes'
+    // derived part is what the platform's own provider tables can hand out.
+    ledger::set_derived(
+        res::POOL_HANDLES,
+        crate::kernel::module::provider::platform_handle_slots() as u32,
+    );
+    let index_limit = crate::abi::kernel_abi::handle::INDEX_LIMIT;
+    for pool in [res::POOL_EVENTS, res::POOL_TIMERS, res::POOL_HANDLES] {
+        if whole(pool) > index_limit {
+            ledger::refuse(pool, "past the handle index domain");
             return Err(ledger::Refused);
         }
     }
     crate::kernel::ipc::event::size(whole(res::POOL_EVENTS))
         .map_err(|e| refused(res::POOL_EVENTS, e))?;
-    crate::kernel::ipc::fd::size_timers(whole(res::POOL_TIMERS))
+    crate::kernel::ipc::timer::size_timers(whole(res::POOL_TIMERS))
         .map_err(|e| refused(res::POOL_TIMERS, e))?;
     let owners = whole(res::POOL_OWNERS);
     sched
@@ -117,8 +122,10 @@ pub unsafe fn size_kernel_tables(
         crate::platform::linux::host_backend::size_tty_sessions(whole(res::POOL_TTY_SESSIONS))
             .map_err(|e| refused(res::POOL_TTY_SESSIONS, e))?;
     }
-    crate::kernel::module::provider::size_tracked(whole(res::POOL_TRACKED_HANDLES))
-        .map_err(|e| refused(res::POOL_TRACKED_HANDLES, e))?;
+    crate::kernel::module::provider::size_routes(whole(res::POOL_HANDLES))
+        .map_err(|e| refused(res::POOL_HANDLES, e))?;
+    crate::kernel::ipc::lend::size(whole(res::POOL_LENDS))
+        .map_err(|e| refused(res::POOL_LENDS, e))?;
     crate::kernel::module::loader::size_free_list(whole(res::POOL_STATE_FREE_LIST))
         .map_err(|e| refused(res::POOL_STATE_FREE_LIST, e))?;
     crate::kernel::net_policy::size(
@@ -434,6 +441,7 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
             e.buffer_bytes = edge.buffer_bytes;
             e.rate_class = edge.rate_class;
             e.wake_on_write = edge.wake_on_write;
+            e.retains_send = edge.retains_send;
             edges[i] = e;
         } else {
             log::error!("[graph] edge {i} missing");
@@ -966,7 +974,9 @@ unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
         // state buffer in-place. The state buffer is owned by the slot
         // and not shared with anyone else this tick.
         let state_ptr = m.state.as_ptr() as *mut u8;
-        return (m.step_fn())(state_ptr);
+        // SAFETY: `state_ptr` is this slot's own state buffer, which no
+        // other code touches during the step.
+        return unsafe { (m.step_fn())(state_ptr) };
     }
     0
 }
@@ -1095,7 +1105,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
             let bind_rc = crate::kernel::sys::hal::irq_bind(
                 irq as u32,
                 crate::kernel::exec::isr_tier::ISR_TIER2_EVENT,
-                crate::kernel::exec::isr_tier::isr_tier2_trampoline as usize,
+                crate::kernel::sys::hal::IrqAck::None,
                 domain as u8,
             );
             if bind_rc < 0 {

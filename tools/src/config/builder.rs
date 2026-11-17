@@ -1013,8 +1013,8 @@ fn validate_adaptive_tick(
 ///    least one Tier 1b/2 endpoint is rejected, regardless of
 ///    `edge_class`. The kernel-side bridge wiring
 ///    (`scheduler::wire_isr_bridges` + `pump_isr_bridges`) and the
-///    module-facing surface (`bridge::SELF_BRIDGES` enumerates a
-///    module's own bridge fds; the bridge `WRITE`/`READ`/`POLL`/`INFO`
+///    module-facing surface (`bridge::SELF_BRIDGE` hands a module a
+///    handle to each of its own bridges; the bridge `WRITE`/`READ`/`POLL`/`INFO`
 ///    ops are exempt from the ISR syscall deny-list, being lock-free
 ///    rings) both exist, but the end-to-end YAML-edge → bridge-fd
 ///    wiring is not silicon-validated, so the edge gate stays strict:
@@ -1944,7 +1944,7 @@ fn instance_heap_cap(
 /// The offset of the heap cap's value (params tag 0xEF, u32 LE) in a params
 /// TLV, walked as the kernel walks it: entries from byte 4 to the first
 /// 0xFF tag.
-fn heap_cap_offset(tlv: &[u8]) -> Option<usize> {
+pub(crate) fn heap_cap_offset(tlv: &[u8]) -> Option<usize> {
     let mut off = 4usize;
     while off + 2 <= tlv.len() {
         let (tag, len) = (tlv[off], tlv[off + 1] as usize);

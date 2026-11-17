@@ -146,28 +146,63 @@ struct State {
 // ============================================================================
 
 unsafe fn sys_self_index(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, SYS_SELF_INDEX, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        -1,
+        SYS_SELF_INDEX,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn sys_set_phase(sys: &SyscallTable, phase: u8) {
     let mut arg = [phase];
-    (sys.provider_call)(-1, SYS_RECONFIG_SET_PHASE, arg.as_mut_ptr(), 1);
+    (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_SET_PHASE,
+        arg.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 unsafe fn sys_call_drain(sys: &SyscallTable, idx: u16) -> i32 {
     let mut arg = idx.to_le_bytes();
-    (sys.provider_call)(-1, SYS_RECONFIG_CALL_DRAIN, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_CALL_DRAIN,
+        arg.as_mut_ptr(),
+        2,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn sys_mark_finished(sys: &SyscallTable, idx: u16) {
     let mut arg = idx.to_le_bytes();
-    (sys.provider_call)(-1, SYS_RECONFIG_MARK_FINISHED, arg.as_mut_ptr(), 2);
+    (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_MARK_FINISHED,
+        arg.as_mut_ptr(),
+        2,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 unsafe fn sys_fault_raise(sys: &SyscallTable, idx: u16, kind: u8) {
     let i = idx.to_le_bytes();
     let mut arg = [i[0], i[1], kind];
-    (sys.provider_call)(-1, SYS_FAULT_RAISE, arg.as_mut_ptr(), 3);
+    (sys.provider_call)(
+        -1,
+        SYS_FAULT_RAISE,
+        arg.as_mut_ptr(),
+        3,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// Write a single 12-byte status record to the output channel. Silently
@@ -185,16 +220,37 @@ unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, module_idx: u16, 
 }
 
 unsafe fn sys_module_count(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, SYS_RECONFIG_MODULE_COUNT, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_MODULE_COUNT,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn sys_slot_capacity(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, SYS_RECONFIG_SLOT_CAPACITY, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_SLOT_CAPACITY,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 unsafe fn sys_module_info(sys: &SyscallTable, idx: u16) -> u32 {
     let mut arg = idx.to_le_bytes();
-    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_INFO, arg.as_mut_ptr(), 2);
+    let rc = (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_MODULE_INFO,
+        arg.as_mut_ptr(),
+        2,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         0
     } else {
@@ -225,7 +281,14 @@ unsafe fn sys_module_upstream(
     core::ptr::write(p.add(1), i[1]);
     core::ptr::write(p.add(2), f[0]);
     core::ptr::write(p.add(3), f[1]);
-    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_UPSTREAM, p, arg.len());
+    let rc = (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_MODULE_UPSTREAM,
+        p,
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     let avail = if rc > first_word as i32 {
         (rc - first_word as i32) as usize
     } else {
@@ -267,22 +330,27 @@ unsafe fn upstream_draining(
 
 unsafe fn sys_module_done(sys: &SyscallTable, idx: u16) -> bool {
     let mut arg = idx.to_le_bytes();
-    (sys.provider_call)(-1, SYS_RECONFIG_MODULE_DONE, arg.as_mut_ptr(), 2) == 1
+    (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_MODULE_DONE,
+        arg.as_mut_ptr(),
+        2,
+        core::ptr::null_mut(),
+        0,
+    ) == 1
 }
 
-unsafe fn sys_trigger_rebuild(sys: &SyscallTable, ptr: usize, len: usize) {
-    // Arg layout: [ptr:usize, len:usize] in platform-native width.
-    let ptr_bytes = ptr.to_le_bytes();
-    let len_bytes = len.to_le_bytes();
-    let psz = core::mem::size_of::<usize>();
-    let mut buf = [0u8; 16]; // fits up to 64-bit usize
-    let mut i = 0;
-    while i < psz {
-        core::ptr::write_volatile(buf.as_mut_ptr().add(i), *ptr_bytes.as_ptr().add(i));
-        core::ptr::write_volatile(buf.as_mut_ptr().add(psz + i), *len_bytes.as_ptr().add(i));
-        i += 1;
-    }
-    (sys.provider_call)(-1, SYS_RECONFIG_TRIGGER_REBUILD, buf.as_mut_ptr(), psz * 2);
+/// Ask the kernel to rebuild the graph from its boot configuration (an
+/// empty `data`).
+unsafe fn sys_trigger_rebuild(sys: &SyscallTable) {
+    (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_TRIGGER_REBUILD,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 // ============================================================================
@@ -465,7 +533,7 @@ unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
         frame[5] = 0;
         let _ = (sys.channel_write)(s.gs_req_chan, frame.as_ptr(), GS_FRAME_HDR);
     }
-    sys_trigger_rebuild(sys, 0, 0);
+    sys_trigger_rebuild(sys);
 }
 
 // ============================================================================
@@ -582,6 +650,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 abi::kernel_abi::channel::PORT,
                 port_arg.as_mut_ptr(),
                 port_arg.len(),
+                core::ptr::null_mut(),
+                0,
             );
             return StepReturn::Ready;
         }

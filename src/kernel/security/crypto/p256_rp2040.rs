@@ -1204,47 +1204,127 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     }
 }
 
-/// ECDSA sign over a message hash. The nonce is derived deterministically
-/// from the private key and the hash (RFC 6979); the `_random_k` parameter
-/// is retained for API compatibility and ignored. Returns the 64-byte
-/// signature `r || s` in big-endian form, normalised to low-s.
-///
-/// Returns None when `private_key` is not a valid scalar in [1, n-1]:
-/// signing under `d == 0` produces a signature that verifies against the
-/// identity, and `d >= n` silently signs under `d mod n`.
-pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> Option<[u8; 64]> {
-    let d = decode_private_scalar(private_key)?;
-    let mut k = rfc6979_nonce(private_key, hash);
+/// `k·G` on the ladder of [`scalar_mul_ct`], a bounded number of bits per
+/// [`LadderState::step`], so a signature can be spread across calls.
+pub struct LadderState {
+    r0: JacobianPoint,
+    r1: JacobianPoint,
+    k: U256,
+    /// Next ladder bit, 255 down to 0; -1 once done.
+    bit: i16,
+    /// Bits one step covers; 0 runs to completion.
+    bits_per_step: u8,
+}
 
-    // r = (k * G).x mod n
-    let point = scalar_mul_base(&k);
-    let (rx, _) = point.to_affine();
-    let r = mod_n_reduce(&rx);
-
-    // z = hash (truncated to order bit length if needed)
-    let z = if hash.len() >= 32 {
-        u256_from_be(&hash[..32])
-    } else {
-        let mut buf = [0u8; 32];
-        // SAFETY: `hash.len() < 32` (else branch); right-pad into buf's
-        // trailing `hash.len()` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                hash.as_ptr(),
-                buf.as_mut_ptr().add(32 - hash.len()),
-                hash.len(),
-            );
+impl LadderState {
+    pub const fn empty() -> Self {
+        Self {
+            r0: JacobianPoint::identity(),
+            r1: JacobianPoint::identity(),
+            k: ZERO,
+            bit: -1,
+            bits_per_step: 0,
         }
-        u256_from_be(&buf)
-    };
-    let z = mod_n_reduce(&z);
+    }
 
+    fn new_base(k: &U256, bits_per_step: u8) -> Self {
+        Self {
+            r0: JacobianPoint::identity(),
+            r1: JacobianPoint::from_affine(&load_gx(), &load_gy()),
+            k: *k,
+            bit: 255,
+            bits_per_step,
+        }
+    }
+
+    pub fn complete(&self) -> bool {
+        self.bit < 0
+    }
+
+    /// Advance up to `bits_per_step` bits; true once the product is done.
+    pub fn step(&mut self) -> bool {
+        let mut left: i16 = if self.bits_per_step == 0 {
+            i16::MAX
+        } else {
+            self.bits_per_step as i16
+        };
+        while left > 0 && self.bit >= 0 {
+            let b = self.bit as u32;
+            let bit = ((self.k[(b >> 6) as usize] >> (b & 63)) & 1) as u8;
+            ct_swap(&mut self.r0, &mut self.r1, bit);
+            self.r1 = self.r0.add_jacobian(&self.r1);
+            self.r0 = self.r0.double();
+            ct_swap(&mut self.r0, &mut self.r1, bit);
+            self.bit -= 1;
+            left -= 1;
+        }
+        self.complete()
+    }
+}
+
+/// A resumable ECDSA signature: drive `scalar_mul.step()` until it answers
+/// true, then [`ecdsa_sign_finalise`].
+pub struct EcdsaSignState {
+    pub scalar_mul: LadderState,
+    d: U256,
+    k: U256,
+    z: U256,
+}
+
+impl EcdsaSignState {
+    pub const fn empty() -> Self {
+        Self {
+            scalar_mul: LadderState::empty(),
+            d: ZERO,
+            k: ZERO,
+            z: ZERO,
+        }
+    }
+
+    /// Zeroise the key, the nonce and the ladder's copy of it.
+    pub fn zeroise_secrets(&mut self) {
+        zeroize_u256(&mut self.d);
+        zeroize_u256(&mut self.k);
+        zeroize_u256(&mut self.scalar_mul.k);
+    }
+}
+
+/// Start an ECDSA signature over `hash`: the RFC 6979 nonce now, `k·G` on
+/// the ladder, `bits_per_step` bits per step (0: one step). `None` when
+/// `private_key` is not a scalar in [1, n-1]: signing under `d == 0`
+/// produces a signature that verifies against the identity, and `d >= n`
+/// silently signs under `d mod n`.
+pub fn ecdsa_sign_init(
+    private_key: &[u8; 32],
+    hash: &[u8],
+    bits_per_step: u8,
+) -> Option<EcdsaSignState> {
+    let d = decode_private_scalar(private_key)?;
+    let k = rfc6979_nonce(private_key, hash);
+    // z = hash (truncated to order bit length if needed)
+    let mut buf = [0u8; 32];
+    let n = hash.len().min(32);
+    buf[32 - n..].copy_from_slice(&hash[..n]);
+    let z = mod_n_reduce(&u256_from_be(&buf));
+    Some(EcdsaSignState {
+        scalar_mul: LadderState::new_base(&k, bits_per_step),
+        d,
+        k,
+        z,
+    })
+}
+
+/// The signature `r || s` (big-endian, low-s) of a state whose ladder is
+/// complete. Zeroises the state's secrets.
+pub fn ecdsa_sign_finalise(mut state: EcdsaSignState) -> [u8; 64] {
+    // r = (k * G).x mod n
+    let (rx, _) = state.scalar_mul.r0.to_affine();
+    let r = mod_n_reduce(&rx);
     // s = k^-1 * (z + r * d) mod n
-    let k_inv = fn_inv(&k);
-    let rd = fn_mul(&r, &d);
-    let z_rd = fn_add(&z, &rd);
+    let k_inv = fn_inv(&state.k);
+    let rd = fn_mul(&r, &state.d);
+    let z_rd = fn_add(&state.z, &rd);
     let mut s = fn_mul(&k_inv, &z_rd);
-
     // Low-s normalisation: if s > n/2 replace with n - s.
     let n_half = load_n_half();
     if u256_gte(&s, &n_half) != 0 {
@@ -1252,19 +1332,22 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
         let (ns, _) = u256_sub(&n, &s);
         s = ns;
     }
-
-    zeroize_u256(&mut k);
-
+    state.zeroise_secrets();
     let mut sig = [0u8; 64];
-    let rb = u256_to_be(&r);
-    let sb = u256_to_be(&s);
-    // SAFETY: two 32-byte copies into the two 32-byte halves of `sig`;
-    // disjoint sub-ranges totalling exactly 64 bytes.
-    unsafe {
-        core::ptr::copy_nonoverlapping(rb.as_ptr(), sig.as_mut_ptr(), 32);
-        core::ptr::copy_nonoverlapping(sb.as_ptr(), sig.as_mut_ptr().add(32), 32);
-    }
-    Some(sig)
+    sig[..32].copy_from_slice(&u256_to_be(&r));
+    sig[32..].copy_from_slice(&u256_to_be(&s));
+    sig
+}
+
+/// ECDSA sign over a message hash, in one call. The nonce is derived
+/// deterministically from the private key and the hash (RFC 6979); the
+/// `_random_k` parameter is ignored. Returns the 64-byte signature
+/// `r || s` in big-endian form, normalised to low-s, or `None` for a
+/// private scalar outside [1, n-1].
+pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> Option<[u8; 64]> {
+    let mut state = ecdsa_sign_init(private_key, hash, 0)?;
+    state.scalar_mul.step();
+    Some(ecdsa_sign_finalise(state))
 }
 
 /// ECDSA verify: check (r, s) over message hash with public key

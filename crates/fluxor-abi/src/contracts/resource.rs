@@ -59,7 +59,7 @@ pub const POOL_SANDBOXES: u16 = 0x000E;
 /// Interactive terminal sessions open at once (slots).
 pub const POOL_TTY_SESSIONS: u16 = 0x000F;
 /// Provider handles the kernel tracks for teardown at once (slots).
-pub const POOL_TRACKED_HANDLES: u16 = 0x0010;
+pub const POOL_HANDLES: u16 = 0x0010;
 /// State-arena free-list entries: the holes freed modules leave below the
 /// bump mark (slots).
 pub const POOL_STATE_FREE_LIST: u16 = 0x0011;
@@ -79,10 +79,13 @@ pub const POOL_NET_ROUTE_SEGMENTS: u16 = 0x0017;
 pub const POOL_NET_ROUTE_PEERS: u16 = 0x0018;
 /// `net.route` held addresses at once (slots).
 pub const POOL_NET_ROUTE_HELD: u16 = 0x0019;
+/// Lends open at once (slots): spans a module registered for the provider
+/// of one of its sessions to use past a call.
+pub const POOL_LENDS: u16 = 0x001A;
 
 /// Number of kernel pools — the ledger table size and the count of `POOL`
 /// records in one PSTATUS round.
-pub const KERNEL_POOL_COUNT: usize = 25;
+pub const KERNEL_POOL_COUNT: usize = 26;
 
 /// First id of the module-declared pool range.
 pub const POOL_MODULE_BASE: u16 = 0x0100;
@@ -93,7 +96,7 @@ pub const fn kernel_pool_class(_pool: u16) -> u8 {
     CLASS_MEMORY
 }
 
-const _: () = assert!(KERNEL_POOL_COUNT == POOL_NET_ROUTE_HELD as usize);
+const _: () = assert!(KERNEL_POOL_COUNT == POOL_LENDS as usize);
 
 /// An arena entry with this bit set is in KiB, not bytes. Arena sizes below
 /// 2 GiB are written in exact bytes, so a byte-precise budget stays exact; a

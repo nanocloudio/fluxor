@@ -243,7 +243,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         if s.rescans == 0 || now.wrapping_sub(s.last_rescan_ms) >= RESCAN_INTERVAL_MS {
             s.last_rescan_ms = now;
             s.rescans += 1;
-            let _ = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
+            let _ = (sys.provider_call)(
+                -1,
+                PCIE_RESCAN,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         if !table_populated(sys) {
             return StepReturn::Continue;

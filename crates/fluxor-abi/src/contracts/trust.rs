@@ -20,29 +20,29 @@
 //
 // Little-endian, tightly packed, like every other contract arg here.
 
-/// Provider class id (opcode class 0x1Dxx). Mirrors
+/// Provider class id (opcode class 0x14xx). Mirrors
 /// `kernel::module::provider::contract::TRUST`.
 pub const CLASS: u16 = super::super::registry::trust::ID;
 
-/// Returns 1 when a trust provider is present. Where none is registered
-/// nothing answers this class at all, so the caller sees a negative errno
-/// (`ENOSYS`) rather than 0. Call with handle=-1 and arg=null at
-/// `module_new` to find that out at start rather than at the first
-/// handshake; composition refuses a graph that asks for platform
-/// verification on a target with no provider before either, through the
-/// `trust.system` target capability.
-pub use super::super::registry::trust::PROBE;
+// Presence is a composition fact: a graph that asks for platform
+// verification on a target with no provider is refused through the
+// `trust.system` target capability, so a running consumer never asks. Where
+// no provider is registered `VERIFY` answers `ENOSYS`.
 
 /// Verify a certificate chain against the platform's trust policy.
 /// handle=-1.
 ///
-/// arg layout:
+/// `data` in, the request ([`encode_request`] writes it):
 /// ```text
 /// [purpose:u8][name_len:u8][cert_count:u8][reserved:u8]
 /// [unix_seconds:u64]
 /// [name[name_len]]                       -- ASCII, the expected identity
 /// [cert_len:u16][cert_der[cert_len]] * cert_count
-/// [result_out:u8][checks_out:u8][reason_out:u8][reserved_out:u8]
+/// ```
+///
+/// `arg` out, the verdict ([`OUT_LEN`] bytes):
+/// ```text
+/// [result:u8][checks:u8][reason:u8][reserved:u8]
 /// ```
 ///
 /// The chain is leaf-first, exactly as it arrived on the wire, and the
@@ -58,13 +58,13 @@ pub use super::super::registry::trust::PROBE;
 ///
 /// The call is malformed — answered with `-EINVAL`, and no verdict written
 /// — when `cert_count` is 0 or above [`MAX_CHAIN`], `name_len` is above
-/// [`MAX_NAME`], a certificate length is 0 or above [`MAX_CERT`], or the
-/// buffer does not carry every declared byte plus the trailing
+/// [`MAX_NAME`], a certificate length is 0 or above [`MAX_CERT`], the
+/// request does not carry every declared byte, or `arg` is shorter than
 /// [`OUT_LEN`]. An empty chain is therefore an error, not a refusal. A
 /// certificate that is present but does not parse as X.509 is the other
 /// way round: a verdict of [`result::REFUSED`] with [`reason::MALFORMED`].
 ///
-/// Returns 0 when a verdict was formed (read `result_out` for it) or a
+/// Returns 0 when a verdict was formed (read `result` for it) or a
 /// negative errno when none was. The two are different: a negative return
 /// says the platform did not answer, so a consumer must fail closed
 /// WITHOUT recording that the platform refused the chain — and must never
@@ -82,11 +82,11 @@ pub mod purpose {
     pub const CLIENT: u8 = 1;
 }
 
-/// `result_out`: the verdict.
+/// `result`: the verdict.
 pub mod result {
     /// The platform trusts this chain for this name and purpose.
     pub const TRUSTED: u8 = 0;
-    /// It does not. `reason_out` says the nearest thing to why. There is
+    /// It does not. `reason` says the nearest thing to why. There is
     /// no third verdict: a provider whose trust source is unreadable can
     /// build no path either, so it refuses ([`super::reason::UNKNOWN_CA`])
     /// rather than reporting a state the contract cannot carry. Only the
@@ -94,7 +94,7 @@ pub mod result {
     pub const REFUSED: u8 = 1;
 }
 
-/// `checks_out`: a bitmask of what the provider ACTUALLY applied, so a
+/// `checks`: a bitmask of what the provider ACTUALLY applied, so a
 /// consumer's log says what was checked rather than what it hoped was.
 ///
 /// A provider sets only the bits its policy really applies. A Linux
@@ -125,7 +125,7 @@ pub mod check {
     pub const OWN_CLOCK: u8 = 1 << 6;
 }
 
-/// `reason_out`: why a chain was refused. Advisory — it exists so an
+/// `reason`: why a chain was refused. Advisory — it exists so an
 /// operator reading a log is pointed at the right thing, and a consumer must
 /// not branch on it as though it were a contract.
 pub mod reason {
@@ -171,5 +171,117 @@ pub mod offset {
     pub const NAME: usize = 12;
 }
 
-/// Size of the trailing `*_out` block the provider writes back.
+/// The verdict's length: the whole of a VERIFY's `arg`.
 pub const OUT_LEN: usize = 4;
+
+/// Byte offsets of the verdict in a VERIFY's `arg`.
+pub mod verdict {
+    pub const RESULT: usize = 0;
+    pub const CHECKS: usize = 1;
+    pub const REASON: usize = 2;
+}
+
+/// Length of a VERIFY request naming `name_len` bytes of name and
+/// `cert_count` certificates of `cert_bytes` DER bytes in all.
+pub const fn request_len(name_len: usize, cert_count: usize, cert_bytes: usize) -> usize {
+    offset::NAME + name_len + 2 * cert_count + cert_bytes
+}
+
+/// A VERIFY request read from the call's `data`: its fixed fields and its
+/// chain, leaf-first.
+#[derive(Clone, Copy, Debug)]
+pub struct Request<'a> {
+    pub purpose: u8,
+    pub name: &'a [u8],
+    pub unix_seconds: u64,
+    chain: &'a [u8],
+    count: usize,
+}
+
+impl<'a> Request<'a> {
+    /// The chain's certificates, leaf first.
+    pub fn certs(&self) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let mut rest = self.chain;
+        (0..self.count).filter_map(move |_| {
+            let len = usize::from(u16::from_le_bytes([*rest.first()?, *rest.get(1)?]));
+            let der = rest.get(2..2 + len)?;
+            rest = rest.get(2 + len..)?;
+            Some(der)
+        })
+    }
+
+    /// How many certificates the chain holds.
+    pub fn cert_count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Read a VERIFY request: `None` when it is not exactly one request within
+/// the contract's bounds ([`MAX_NAME`], [`MAX_CHAIN`], [`MAX_CERT`], an empty
+/// chain or certificate).
+pub fn parse_request(b: &[u8]) -> Option<Request<'_>> {
+    let purpose = *b.get(offset::PURPOSE)?;
+    let name_len = usize::from(*b.get(offset::NAME_LEN)?);
+    let count = usize::from(*b.get(offset::CERT_COUNT)?);
+    if name_len > MAX_NAME || count == 0 || count > MAX_CHAIN {
+        return None;
+    }
+    let s = b.get(offset::UNIX_SECONDS..offset::UNIX_SECONDS + 8)?;
+    let unix_seconds = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+    let name = b.get(offset::NAME..offset::NAME + name_len)?;
+    let chain = b.get(offset::NAME + name_len..)?;
+    let mut at = 0;
+    for _ in 0..count {
+        let len = usize::from(u16::from_le_bytes([*chain.get(at)?, *chain.get(at + 1)?]));
+        if len == 0 || len > MAX_CERT {
+            return None;
+        }
+        at += 2;
+        chain.get(at..at + len)?;
+        at += len;
+    }
+    (at == chain.len()).then_some(Request {
+        purpose,
+        name,
+        unix_seconds,
+        chain,
+        count,
+    })
+}
+
+/// Write a VERIFY request into `out`: `chain` leaf-first, `name` the
+/// expected identity, `unix_seconds` the time the caller believes. Returns
+/// the request's length, or `None` when `out` cannot hold it or a bound
+/// ([`MAX_NAME`], [`MAX_CHAIN`], [`MAX_CERT`], an empty chain or
+/// certificate) is broken.
+pub fn encode_request(
+    out: &mut [u8],
+    purpose: u8,
+    name: &[u8],
+    unix_seconds: u64,
+    chain: &[&[u8]],
+) -> Option<usize> {
+    if name.len() > MAX_NAME || chain.is_empty() || chain.len() > MAX_CHAIN {
+        return None;
+    }
+    let head = out.get_mut(..offset::NAME)?;
+    head[offset::PURPOSE] = purpose;
+    head[offset::NAME_LEN] = name.len() as u8;
+    head[offset::CERT_COUNT] = chain.len() as u8;
+    head[offset::CERT_COUNT + 1] = 0;
+    head[offset::UNIX_SECONDS..offset::NAME].copy_from_slice(&unix_seconds.to_le_bytes());
+    let mut at = offset::NAME;
+    out.get_mut(at..at + name.len())?.copy_from_slice(name);
+    at += name.len();
+    for der in chain {
+        if der.is_empty() || der.len() > MAX_CERT {
+            return None;
+        }
+        out.get_mut(at..at + 2)?
+            .copy_from_slice(&(der.len() as u16).to_le_bytes());
+        at += 2;
+        out.get_mut(at..at + der.len())?.copy_from_slice(der);
+        at += der.len();
+    }
+    Some(at)
+}

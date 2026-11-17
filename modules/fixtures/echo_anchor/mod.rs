@@ -99,15 +99,17 @@ use fluxor_rt::*;
 // Stream-surface (net_proto) opcodes (subset we use — see net_proto.rs)
 // ============================================================================
 
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_ERROR: u8 = 0x06;
+use abi::contracts::net::net_proto as np;
 
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
+const NET_MSG_ACCEPTED: u8 = np::MSG_ACCEPTED;
+const NET_MSG_DATA: u8 = np::MSG_DATA;
+const NET_MSG_CLOSED: u8 = np::MSG_CLOSED;
+const NET_MSG_BOUND: u8 = np::MSG_BOUND;
+const NET_MSG_ERROR: u8 = np::MSG_ERROR;
+
+const NET_CMD_BIND: u8 = np::CMD_BIND;
+const NET_CMD_SEND: u8 = np::CMD_SEND;
+const NET_CMD_CLOSE: u8 = np::CMD_CLOSE;
 
 // ============================================================================
 // session-control opcodes (subset we use — see session_ctrl.rs)
@@ -154,16 +156,11 @@ const ANCHOR_ID: [u8; ANCHOR_ID_BYTES] = *b"DEMO-A01";
 // Config / buffers
 // ============================================================================
 
-/// Max net_proto frame we handle (3-byte header + up to 1024 payload).
-const NET_BUF_SIZE: usize = 1 + 1024 + 16;
+/// Largest net_proto frame read or written, header included: whatever a
+/// transport's `net_out` may carry.
+const NET_BUF_SIZE: usize = 1483;
 /// No accepted client.
 const NO_CONN: u16 = 0xFFFF;
-
-/// The `conn_id` at the head of a net_proto payload (`u16 LE`).
-#[inline(always)]
-unsafe fn conn_id_at(p: *const u8) -> u16 {
-    (*p as u16) | ((*p.add(1) as u16) << 8)
-}
 
 /// Max session-control frame (identity + a few fields).
 const CTRL_BUF_SIZE: usize = 128;
@@ -411,15 +408,14 @@ unsafe fn net_send_bind(s: &mut AnchorState) -> bool {
     if out_chan < 0 {
         return false;
     }
-    let port = s.listen_port.to_le_bytes();
-    let payload = [port[0], port[1]];
+    let payload = np::bind(s.listen_port, 0);
     let scratch = s.net_buf.as_mut_ptr();
     let wrote = net_write_frame(
         &*sys_ptr,
         out_chan,
         NET_CMD_BIND,
         payload.as_ptr(),
-        2,
+        payload.len(),
         scratch,
         NET_BUF_SIZE,
     );
@@ -458,14 +454,14 @@ unsafe fn net_send_close(s: &mut AnchorState, conn_id: u16) {
     if out_chan < 0 {
         return;
     }
-    let payload = conn_id.to_le_bytes();
+    let payload = np::close(conn_id, false);
     let scratch = s.net_buf.as_mut_ptr();
     net_write_frame(
         &*sys_ptr,
         out_chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         scratch,
         NET_BUF_SIZE,
     );
@@ -634,6 +630,16 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
 
     let buf = s.net_buf.as_mut_ptr();
     let (msg_type, payload_len) = net_read_frame(&*sys_ptr, chan, buf, NET_BUF_SIZE);
+    if msg_type == 0 {
+        return;
+    }
+    // The frame is copied out of the scratch the replies below reuse.
+    let mut frame = [0u8; NET_BUF_SIZE];
+    frame[..NET_FRAME_HDR + payload_len].copy_from_slice(core::slice::from_raw_parts(
+        buf,
+        NET_FRAME_HDR + payload_len,
+    ));
+    let payload = &frame[NET_FRAME_HDR..NET_FRAME_HDR + payload_len];
 
     match msg_type {
         NET_MSG_BOUND => {
@@ -642,11 +648,9 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             // the bound for our own `listen_port`, so a neighbour anchor's
             // listen completing first can't flip us to Listening. A frame
             // without its port is malformed and ignored.
-            if s.phase == AnchorPhase::WaitBoundNet && payload_len >= 4 {
-                let lo = *buf.add(NET_FRAME_HDR + 2);
-                let hi = *buf.add(NET_FRAME_HDR + 3);
-                if ((lo as u16) | ((hi as u16) << 8)) == s.listen_port {
-                    s.server_conn_id = conn_id_at(buf.add(NET_FRAME_HDR));
+            if let Some((conn_id, port, _)) = np::bound_parts(payload) {
+                if s.phase == AnchorPhase::WaitBoundNet && port == s.listen_port {
+                    s.server_conn_id = conn_id;
                     s.phase = AnchorPhase::Listening;
                     dev_log(&*sys_ptr, 3, b"[echo_anc] bound".as_ptr(), 16);
                 }
@@ -657,13 +661,9 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             // only accepts on our `listen_port`; a frame without its port is
             // malformed and ignored. An accept on another anchor's port
             // belongs to that anchor — ignore it (do NOT close it).
-            if payload_len >= 4 {
-                let new_id = conn_id_at(buf.add(NET_FRAME_HDR));
-                let ours = {
-                    let lo = *buf.add(NET_FRAME_HDR + 2);
-                    let hi = *buf.add(NET_FRAME_HDR + 3);
-                    ((lo as u16) | ((hi as u16) << 8)) == s.listen_port
-                };
+            if let Some(a) = np::accepted_parts(payload) {
+                let new_id = a.conn_id;
+                let ours = a.local_port == s.listen_port;
                 if !ours {
                     // Not for this anchor — leave it for the owning anchor.
                 } else if s.client_conn_id == NO_CONN && s.phase == AnchorPhase::Listening {
@@ -691,11 +691,13 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             // hold buffer (§11.2), flushed when the worker is live.
             let attach_window =
                 s.phase == AnchorPhase::Attaching || s.phase == AnchorPhase::WaitAttached;
-            if payload_len >= 3 && (s.phase == AnchorPhase::Active || attach_window) {
-                let id = conn_id_at(buf.add(NET_FRAME_HDR));
+            if let (Some((id, bytes)), true) = (
+                np::data_parts(payload),
+                s.phase == AnchorPhase::Active || attach_window,
+            ) {
                 if id == s.client_conn_id {
-                    let data_len = payload_len - 2;
-                    let data = buf.add(NET_FRAME_HDR + 2);
+                    let data_len = bytes.len();
+                    let data = bytes.as_ptr();
                     if s.phase == AnchorPhase::Active && s.handoff == HandoffPhase::Idle {
                         let out = s.data_out[s.active_w as usize];
                         // Best-effort forward — drop on data_out full.
@@ -734,8 +736,7 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
         }
         NET_MSG_CLOSED => {
             // [conn_id:2 LE]. Client gone → detach worker, return to Listening.
-            if payload_len >= 2 {
-                let id = conn_id_at(buf.add(NET_FRAME_HDR));
+            if let Some((id, _)) = np::closed_parts(payload) {
                 if id == s.client_conn_id {
                     match s.phase {
                         AnchorPhase::Active
@@ -763,8 +764,17 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             }
         }
         NET_MSG_ERROR => {
-            dev_log(&*sys_ptr, 1, b"[echo_anc] net error".as_ptr(), 20);
-            s.phase = AnchorPhase::Error;
+            // A bind refusal (tag 0 while binding) or an error on our own
+            // client; another consumer's errors on a fanned channel are not
+            // ours.
+            if let Some((id, _, np::REQUESTER_TAG_NONE)) = np::error_parts(payload) {
+                if s.phase == AnchorPhase::WaitBoundNet
+                    || (s.client_conn_id != NO_CONN && id == s.client_conn_id)
+                {
+                    dev_log(&*sys_ptr, 1, b"[echo_anc] net error".as_ptr(), 20);
+                    s.phase = AnchorPhase::Error;
+                }
+            }
         }
         _ => { /* ignore unknown upstream opcodes */ }
     }
@@ -1153,7 +1163,13 @@ unsafe fn enforce_handoff_deadline(s: &mut AnchorState) {
 // Module interface
 // ============================================================================
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE,
+        out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + np::DATA_HEAD + DATA_BUF_SIZE,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

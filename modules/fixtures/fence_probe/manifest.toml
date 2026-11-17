@@ -37,6 +37,7 @@ direction = "output"
 content_type = "NetProto"
 required = true
 buffer_size = 512
+max_record = 64
 
 [[ports]]
 name = "addr_evt_in"
@@ -44,6 +45,7 @@ direction = "input"
 content_type = "NetProto"
 required = true
 buffer_size = 512
+accepts_record = 64
 
 [[resources]]
 requires_contract = "channel"

@@ -42,8 +42,8 @@ const MAX_AUTHORITY_LEN: usize = 128;
 const DEFAULT_PORT: u16 = 8443;
 
 const NO_CONN: u16 = 0xFFFF;
-/// Largest inbound frame: header, conn id, one data fragment.
-const BUF: usize = 3 + 2 + 1460;
+/// Largest inbound frame (`net_in`'s record bound).
+const BUF: usize = NET_IN_ACCEPTS_RECORD;
 const FRAMES_PER_STEP: usize = 16;
 /// Between attempts, and before the first: the network is still coming up.
 const RETRY_MS: u32 = 2000;
@@ -185,10 +185,13 @@ unsafe fn send_connect(s: &mut ProbeState) {
     let mut p = [0u8; CONNECT_TO_MAX];
     let n = write_connect_to(
         &mut p,
-        SOCK_TYPE_STREAM,
-        s.port,
-        &dial_target(s),
-        Some(s.my_tag),
+        &net_proto::ConnectTo {
+            sock_type: SOCK_TYPE_STREAM,
+            flags: 0,
+            port: s.port,
+            target: dial_target(s),
+            requester_tag: s.my_tag,
+        },
     );
     let mut scratch = [0u8; 3 + CONNECT_TO_MAX];
     net_write_frame(
@@ -221,14 +224,14 @@ unsafe fn send_ping(s: &mut ProbeState) {
 
 unsafe fn send_close(s: &mut ProbeState, conn: u16) {
     let sys = &*s.syscalls;
-    let p = conn.to_le_bytes();
+    let p = net_proto::close(conn, false);
     let mut scratch = [0u8; 8];
     net_write_frame(
         sys,
         s.net_out,
         NET_CMD_CLOSE,
         p.as_ptr(),
-        2,
+        p.len(),
         scratch.as_mut_ptr(),
         8,
     );
@@ -302,17 +305,16 @@ unsafe fn service_net(s: &mut ProbeState, now: u32) {
             break;
         }
         let p = s.buf.as_ptr().add(3);
-        let id = if plen >= 2 {
-            (*p as u16) | ((*p.add(1) as u16) << 8)
-        } else {
-            NO_CONN
-        };
+        let payload = core::slice::from_raw_parts(p, plen);
+        let id = net_proto::conn_id_of(payload).unwrap_or(NO_CONN);
+        // A dial's failure names its requester by tag alone.
+        let my_failure = msg == NET_MSG_ERROR
+            && matches!(net_proto::error_parts(payload), Some((_, _, tag)) if tag == s.my_tag);
         match msg {
             NET_MSG_CONNECTED
-                if plen >= net_proto::CONNECTED_FIXED
-                    && s.phase == PH_DIALING
-                    && net_proto::connected_parts(core::slice::from_raw_parts(p, plen)).1
-                        == s.my_tag =>
+                if s.phase == PH_DIALING
+                    && matches!(net_proto::connected_parts(payload),
+                        Some(c) if c.requester_tag == s.my_tag) =>
             {
                 s.conn = id;
                 s.phase = PH_WAIT_PONG;
@@ -328,7 +330,7 @@ unsafe fn service_net(s: &mut ProbeState, now: u32) {
                 }
                 end_attempt(s, now, ok);
             }
-            NET_MSG_ERROR if s.phase == PH_DIALING => {
+            NET_MSG_ERROR if s.phase == PH_DIALING && my_failure => {
                 report_fail(s, REASON_ERROR);
                 end_attempt(s, now, false);
             }
@@ -343,7 +345,13 @@ unsafe fn service_net(s: &mut ProbeState, now: u32) {
     }
 }
 
-fluxor_rt::module_facts! { state: ProbeState }
+fluxor_rt::module_facts! {
+    state: ProbeState,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        out 0 NET_OUT_MAX_RECORD = net_proto::FRAME_HDR + CONNECT_TO_MAX,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

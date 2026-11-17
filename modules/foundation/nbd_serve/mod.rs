@@ -42,7 +42,7 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-use abi::contracts::storage::block::{self as blk, Cpl, Req};
+use abi::contracts::storage::block::{self as blk, Cpl};
 
 // ── Limits ───────────────────────────────────────────────────────────────
 
@@ -72,20 +72,20 @@ const STEP_REAP_BUDGET: usize = 16;
 /// Steps between `CMD_BIND` attempts until the transport answers.
 const BIND_RETRY_STEPS: u16 = 256;
 
-const IN_FRAME: usize = 3 + 2 + 1460;
+/// The largest transport frame read, header included
+/// (`NET_IN_ACCEPTS_RECORD`): whatever a transport's `net_out` may carry.
+const IN_FRAME: usize = 1483;
 const OUT_FRAME: usize = 3 + 2 + OUT_DATA_MAX;
 const NONE: u8 = 0xFF;
 
 // ── net_proto ────────────────────────────────────────────────────────────
 
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_ERROR: u8 = 0x06;
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
+use abi::contracts::net::net_proto as np;
+use np::{
+    CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
+    MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND, MSG_CLOSED as NET_MSG_CLOSED,
+    MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
+};
 
 // ── NBD protocol ─────────────────────────────────────────────────────────
 
@@ -239,7 +239,7 @@ pub struct NbdState {
     _pad0: [u8; 3],
     name: [u8; EXPORT_NAME_CAP],
 
-    // The source, once `CAPS` answered.
+    // The source, once `DESCRIBE` answered.
     ready: u8,
     async_src: u8,
     shift: u8,
@@ -399,10 +399,10 @@ unsafe fn net_cmd(s: &mut NbdState, cmd: u8, payload: &[u8]) -> bool {
 
 // ── Source geometry ──────────────────────────────────────────────────────
 
-/// Learn the source's geometry once `CAPS` answers. False while it attaches
+/// Learn the source's geometry once `DESCRIBE` answers. False while it attaches
 /// or when it cannot be published.
 unsafe fn learn_source(s: &mut NbdState) -> bool {
-    let rc = s.blocks.caps(s.sys());
+    let rc = s.blocks.describe(s.sys());
     if rc != 0 {
         return false;
     }
@@ -434,7 +434,7 @@ unsafe fn learn_source(s: &mut NbdState) -> bool {
     } else {
         1u32 << 30
     };
-    s.async_src = u8::from(flags & blk::caps::F_ASYNC != 0);
+    s.async_src = u8::from(flags & blk::describe::F_ASYNC != 0);
     let mut depth = if s.queue_depth == 0 { 1 } else { s.queue_depth };
     if depth as usize > MAX_SLOTS {
         depth = MAX_SLOTS as u8;
@@ -456,18 +456,18 @@ unsafe fn learn_source(s: &mut NbdState) -> bool {
     }
     s.max_request = maxreq & !(lbs - 1);
     let has = |f: u32| flags & f != 0;
-    s.ro = u8::from(s.read_only != 0 || !has(blk::caps::F_WRITE));
+    s.ro = u8::from(s.read_only != 0 || !has(blk::describe::F_WRITE));
     let mut tf = TF_HAS_FLAGS;
     if s.ro != 0 {
         tf |= TF_READ_ONLY;
     }
-    if has(blk::caps::F_FLUSH) {
+    if has(blk::describe::F_FLUSH) {
         tf |= TF_SEND_FLUSH;
     }
-    if s.ro == 0 && (has(blk::caps::F_FUA) || has(blk::caps::F_FLUSH)) {
+    if s.ro == 0 && (has(blk::describe::F_FUA) || has(blk::describe::F_FLUSH)) {
         tf |= TF_SEND_FUA;
     }
-    if s.ro == 0 && has(blk::caps::F_DISCARD) {
+    if s.ro == 0 && has(blk::describe::F_DISCARD) {
         tf |= TF_SEND_TRIM;
     }
     s.tflags = tf;
@@ -624,7 +624,7 @@ fn build_chunks(s: &mut NbdState) {
                 }
             }
             CMD_FLUSH => {
-                if s.src_flags & blk::caps::F_FLUSH != 0
+                if s.src_flags & blk::describe::F_FLUSH != 0
                     && take_slot(s, h, blk::op::FLUSH, 0, 0, 0, 0) == NONE
                 {
                     return;
@@ -716,21 +716,17 @@ unsafe fn issue(s: &mut NbdState) {
         }
         let sl = s.slots[i];
         let data = sl.op == blk::op::READ || sl.op == blk::op::WRITE;
-        let r = Req {
-            op: sl.op,
-            flags: sl.flags,
-            nblocks: sl.nblocks,
-            lba: sl.lba,
-            buf_ptr: if data {
-                s.bufs[i].as_mut_ptr() as u64
-            } else {
-                0
-            },
-            buf_len: if data { sl.len } else { 0 },
-            tag: (u64::from(s.gen) << 8) | i as u64,
-        };
+        let buf = s.bufs[i].as_mut_ptr();
+        let len = if data { sl.len } else { 0 };
+        let tag = (u64::from(s.gen) << 8) | i as u64;
         let sys = &*s.syscalls;
         if s.async_src != 0 {
+            let Some(offset) = s.blocks.offset_of(buf, len) else {
+                complete_slot(s, i, E_INVAL);
+                i += 1;
+                continue;
+            };
+            let r = BlockClient::data_req(sl.op, sl.flags, sl.lba, sl.nblocks, offset, len, tag);
             let rc = s.blocks.submit(sys, &r);
             if rc == 0 {
                 s.slots[i].state = SL_INFLIGHT;
@@ -740,7 +736,11 @@ unsafe fn issue(s: &mut NbdState) {
                 complete_slot(s, i, rc);
             }
         } else {
-            let rc = s.blocks.exec(sys, &r);
+            let mut r = BlockClient::exec_req(sl.op, sl.flags, sl.lba, sl.nblocks, len);
+            r.tag = tag;
+            let rc = s
+                .blocks
+                .exec(sys, &r, if data { buf } else { core::ptr::null_mut() });
             if rc == E_AGAIN {
                 return;
             }
@@ -1171,7 +1171,7 @@ fn handle_request(s: &mut NbdState) -> bool {
         CMD_TRIM => {
             if s.ro != 0 {
                 E_PERM
-            } else if !has(blk::caps::F_DISCARD) || !aligned {
+            } else if !has(blk::describe::F_DISCARD) || !aligned {
                 E_INVAL
             } else if !in_range {
                 E_NOSPC
@@ -1198,8 +1198,8 @@ fn handle_request(s: &mut NbdState) -> bool {
     }
     if fua
         && (cmd == CMD_WRITE || cmd == CMD_TRIM)
-        && (cmd == CMD_TRIM || !has(blk::caps::F_FUA))
-        && has(blk::caps::F_FLUSH)
+        && (cmd == CMD_TRIM || !has(blk::describe::F_FUA))
+        && has(blk::describe::F_FLUSH)
     {
         r.post_flush = PF_WANT;
     }
@@ -1236,7 +1236,7 @@ fn take_write_data(s: &mut NbdState) -> bool {
             }
             let len = min_u32(r.length - r.created, s.chunk_bytes);
             let lba = (r.offset + u64::from(r.created)) >> s.shift;
-            let flags = if r.fua != 0 && s.src_flags & blk::caps::F_FUA != 0 {
+            let flags = if r.fua != 0 && s.src_flags & blk::describe::F_FUA != 0 {
                 blk::F_FUA
             } else {
                 0
@@ -1438,8 +1438,7 @@ unsafe fn teardown(s: &mut NbdState) {
     } else if any_active(s) || s.ctrl_len != 0 || in_flight(s) != 0 {
         return;
     }
-    let id = s.conn_id.to_le_bytes();
-    if !net_cmd(s, NET_CMD_CLOSE, &id) {
+    if !net_cmd(s, NET_CMD_CLOSE, &np::close(s.conn_id, false)) {
         return;
     }
     let mut i = 0;
@@ -1477,38 +1476,46 @@ unsafe fn service_net(s: &mut NbdState) {
         if msg == 0 {
             return;
         }
-        if plen < 2 || plen != full {
+        if plen < np::CONN_ID_LEN || plen != full {
             continue;
         }
-        let id = u16::from_le_bytes([s.rx[3], s.rx[4]]);
+        let p = &s.rx[3..3 + plen];
+        let id = np::conn_id(p);
         let ours = s.phase != PH_IDLE && id == s.conn_id;
+        let gone = match msg {
+            NET_MSG_CLOSED => np::closed_parts(p).is_some(),
+            NET_MSG_ERROR => {
+                matches!(np::error_parts(p), Some((_, _, tag)) if tag == np::REQUESTER_TAG_NONE)
+            }
+            _ => false,
+        };
         match msg {
             NET_MSG_BOUND => {
-                s.bound = 1;
-                log(s, b"[nbd] listening");
+                if np::bound_parts(p).is_some_and(|(_, port, _)| port == s.port) {
+                    s.bound = 1;
+                    log(s, b"[nbd] listening");
+                }
             }
             NET_MSG_ACCEPTED => {
-                let port = if plen >= 4 {
-                    u16::from_le_bytes([s.rx[5], s.rx[6]])
-                } else {
-                    s.port
+                let Some(a) = np::accepted_parts(p) else {
+                    continue;
                 };
-                if port != s.port {
+                if a.local_port != s.port {
                     continue;
                 }
                 if s.phase != PH_IDLE {
                     // One client at a time: the export has one writer.
                     s.refused = s.refused.wrapping_add(1);
-                    net_cmd(s, NET_CMD_CLOSE, &id.to_le_bytes());
+                    net_cmd(s, NET_CMD_CLOSE, &np::close(id, false));
                     continue;
                 }
                 accept(s, id);
             }
-            NET_MSG_DATA if ours => {
-                s.rx_off = 5;
-                s.rx_len = (plen - 2) as u16;
+            NET_MSG_DATA if ours && plen > np::DATA_HEAD => {
+                s.rx_off = (3 + np::DATA_HEAD) as u16;
+                s.rx_len = (plen - np::DATA_HEAD) as u16;
             }
-            NET_MSG_CLOSED | NET_MSG_ERROR if ours => {
+            NET_MSG_CLOSED | NET_MSG_ERROR if ours && gone => {
                 s.peer_gone = 1;
                 s.closing = 1;
                 s.pstate = PS_STOP;
@@ -1521,7 +1528,10 @@ unsafe fn service_net(s: &mut NbdState) {
 
 // ── Module ABI ───────────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: NbdState }
+fluxor_rt::module_facts! {
+    state: NbdState,
+    records: [in 1 NET_IN_ACCEPTS_RECORD = IN_FRAME, out 0 NET_OUT_MAX_RECORD = OUT_FRAME],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -1553,7 +1563,9 @@ pub unsafe extern "C" fn module_new(
         core::ptr::write_bytes(state, 0, core::mem::size_of::<NbdState>());
         let s = &mut *(state as *mut NbdState);
         s.syscalls = syscalls as *const SyscallTable;
-        s.blocks.bind(in_chan);
+        // Every buffer a request names is one of `bufs`.
+        let bufs = s.bufs.as_mut_ptr() as *mut u8;
+        s.blocks.bind(0, bufs, core::mem::size_of_val(&s.bufs));
         s.net_out = out_chan;
         s.net_in = dev_channel_port(s.sys(), 0, 1);
         s.tx_req = NONE;
@@ -1590,8 +1602,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
         if s.bound == 0 {
             if s.bind_wait == 0 {
-                let port = s.port.to_le_bytes();
-                if net_cmd(s, NET_CMD_BIND, &port) {
+                if net_cmd(s, NET_CMD_BIND, &np::bind(s.port, 0)) {
                     s.bind_wait = BIND_RETRY_STEPS;
                 }
             } else {

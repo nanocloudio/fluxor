@@ -59,13 +59,22 @@ Ordered byte streams: TCP, TLS-over-TCP, HTTP/1.x, MQTT, WebSocket
 after upgrade. Operations: bind/listen, connect, accept/connected,
 send, receive, close, error. The contract is stream-only: only
 `SOCK_TYPE_STREAM` (1) is accepted on `CMD_CONNECT_TO`, and any other
-`sock_type` fails with EINVAL. The retransmit hints (`MSG_RETRANSMIT`
-0x07 / `MSG_ACK` 0x08), the consumer's answer (`CMD_RESEND` 0x18) and the
-delivery acknowledgement (`CMD_DELIVERED` 0x19) are contract constants
-any stage that retains its own send bytes, or defers its delivery horizon
-to its consumer, speaks (`ip` and `tls`); a stage that does neither drops
-them as unknown opcodes. The peer report (`MSG_PEER` 0x0A) names the
-stream's remote end once, before its first data.
+`sock_type` fails with EINVAL. Every record has one length. The peer
+report (`MSG_PEER` 0x07) names the stream's remote end once, before its
+first data.
+
+Three sidebands ride the stream's own channel as surfaces of their own,
+each owning a dense range of the `net_tlv` values: `stream_retx`
+(0xD0–0xD2, the retransmission hand-off to a consumer that keeps its own
+copy of what it sends), `stream_trace` (0xD3, the trace context) and
+`stream_cursor` (0xD4–0xD6, the continuity cursors). A connection carries
+one only when its consumer asked (`flags` on `CMD_BIND` /
+`CMD_CONNECT_TO`: `TRACE`, `CURSORS`) and its provider granted it
+(`flags_granted`; `RETX` is granted, never asked, where every consumer of
+the channel declares `retains_send`). Every consumer of a fanned channel
+skips unknown types and connections it does not hold. Record sizes are
+bounded per port (`max_record` / `accepts_record`), not by a constant.
+Details: `network.md` §Sidebands, §Send retention, §Record bounds.
 
 Who resolves: the provider that receives the `CMD_CONNECT_TO` record.
 A target is an IPv4 or IPv6 literal, or a DNS name (`AF_NAME`), and a
@@ -91,7 +100,7 @@ Addresses are big-endian, ports little-endian.
 
 | Opcode | Name | Payload |
 |--------|------|---------|
-| `0x20` | `CMD_DG_BIND` | `[port: u16 LE][flags: u8][owner_tag: u16 LE]?` — `BIND_FLAG_RX_ONLY` (0x01) is advisory |
+| `0x20` | `CMD_DG_BIND` | `[port: u16 LE][flags: u8]` — `BIND_FLAG_RX_ONLY` (0x01) is advisory |
 | `0x21` | `CMD_DG_SEND_TO` | `[ep_id: u8][af: u8][addr: 4\|16 BE][port: u16 LE][data…]` |
 | `0x22` | `CMD_DG_CLOSE` | `[ep_id: u8]` |
 | `0x40` | `MSG_DG_BOUND` | `[ep_id: u8][local_port: u16 LE]` |
@@ -105,15 +114,11 @@ giving address prefixes of 8 (`V4_ADDR_PREFIX`) or 20
 carries an explicit destination; there is no connected-default TX
 form.
 
-`CMD_DG_SEND_TO` and `CMD_DG_CLOSE` have an owner-tagged form that
-inserts `[OWNER_TAG_MARK = 0xFF][owner_tag: u16 LE]` between `ep_id`
-and the rest — at the offset `af` occupies, a value no address family
-takes, so the two shapes separate at a fixed position rather than by a
-length rule over variable-length data. The provider admits a command
-only when the presented tag equals the tag `CMD_DG_BIND` recorded, and
-refuses a mismatch with `EPERM`. An absent tag decodes as 0, so an
-endpoint bound with `owner_tag = 0` accepts untagged commands from any
-consumer sharing the channel.
+Every command has one shape, and none names an owner. The provider
+records against each endpoint the owner the kernel attests for the
+channel its bind arrived on (`channel::FACTS`, the owner of the module
+writing the channel), and refuses a send or close on it from a channel of
+another owner with `EPERM`.
 
 ### Packet Surface
 
@@ -200,9 +205,10 @@ release anything else, or everything on a build without it, counted
 fits the minimum MTU; the forwarding dispositions forward the frame whole.
 
 The hold is bounded twice. `packet_holds` slots — a declared capacity of
-`ip`, one frame each in its heap, defaulting to the profile's
-`abi::config::ip::MAX_PACKET_HOLD` (32 on the host profile) and at most
-the 256 a `pkt_id` slot names — a packet arriving with every slot taken is
+`ip`, one frame each in its heap, that a graph turning the seam on states
+(the profile's figure is `abi::config::ip::MAX_PACKET_HOLD`, 32 on the host
+profile; with the seam off there are none) and at most the 256 a `pkt_id`
+slot names — a packet arriving with every slot taken is
 refused and counted (`hold_refused`), never displaces one. The director's
 ring is not a third bound: a packet arriving while it is full is held with
 its record owed, and owed records go out in arrival order as it drains

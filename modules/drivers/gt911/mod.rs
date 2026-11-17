@@ -8,7 +8,7 @@
 //! 1. Address selection: INT low + RST pulse → addr 0x5D
 //! 2. Wait for boot (55ms + 50ms)
 //! 3. Open I2C handle, verify product ID (reg 0x8140)
-//! 4. Create event, bind to INT falling edge
+//! 4. Watch the INT pin's falling edge
 //!
 //! # Runtime
 //!
@@ -92,7 +92,8 @@ struct Gt911State {
     out_chan: i32,
     timer_fd: i32,
     i2c_handle: i32,
-    event_fd: i32,
+    /// The INT pin's edge watch.
+    watch_fd: i32,
 
     // GPIO handles
     int_handle: i32,
@@ -108,8 +109,8 @@ struct Gt911State {
     int_pin: u8,
     rst_pin: u8,
 
-    // I2C transfer buffer: 2 bytes tx_len + 2 bytes reg addr + space for rx
-    // Max rx: 4 bytes product ID, or 1 byte status, or 5*8=40 bytes point data
+    // Bytes an I2C read returns: 4 bytes product ID, 1 byte status, or
+    // 5*8=40 bytes point data.
     xfer_buf: [u8; 48],
     touch_count: u8,
 }
@@ -142,29 +143,56 @@ mod params_def {
 // I2C helpers
 // ============================================================================
 
-/// Set up xfer_buf for I2C write-read: 2-byte tx_len header + register address bytes + rx space.
-/// Format: [tx_len_lo, tx_len_hi, reg_hi, reg_lo, ...rx_space...]
-/// Returns total arg_len to pass to provider_call.
-unsafe fn setup_write_read(s: &mut Gt911State, reg: u16, rx_len: usize) -> usize {
-    let tx_len: u16 = 2; // 2 bytes register address
-    s.xfer_buf[0] = (tx_len & 0xFF) as u8;
-    s.xfer_buf[1] = (tx_len >> 8) as u8;
-    s.xfer_buf[2] = (reg >> 8) as u8; // Register address MSB first
-    s.xfer_buf[3] = (reg & 0xFF) as u8;
-    2 + 2 + rx_len // tx_len header + tx data + rx space
+/// Start a write of register address `reg` followed by a read of `rx_len`
+/// bytes; [`i2c_poll`] collects them into `xfer_buf`.
+unsafe fn i2c_read_reg_start(s: &mut Gt911State, reg: u16, rx_len: usize) -> i32 {
+    let sys = &*s.syscalls;
+    let mut tx = reg.to_be_bytes();
+    let mut arg = abi::contracts::hal::i2c::read::encode(rx_len as u16);
+    (sys.provider_call)(
+        s.i2c_handle,
+        abi::registry::i2c::WRITE_READ,
+        arg.as_mut_ptr(),
+        arg.len(),
+        tx.as_mut_ptr(),
+        tx.len(),
+    )
 }
 
-/// Set up xfer_buf for I2C write: register address + data.
-/// Returns total arg_len to pass to provider_call.
-unsafe fn setup_write(s: &mut Gt911State, reg: u16, data: &[u8]) -> usize {
-    s.xfer_buf[0] = (reg >> 8) as u8;
-    s.xfer_buf[1] = (reg & 0xFF) as u8;
+/// Start a write of register address `reg` followed by `bytes`.
+unsafe fn i2c_write_reg_start(s: &mut Gt911State, reg: u16, bytes: &[u8]) -> i32 {
+    let sys = &*s.syscalls;
+    let mut tx = [0u8; 8];
+    let r = reg.to_be_bytes();
+    tx[0] = r[0];
+    tx[1] = r[1];
     let mut i = 0;
-    while i < data.len() {
-        s.xfer_buf[2 + i] = data[i];
+    while i < bytes.len() && 2 + i < tx.len() {
+        tx[2 + i] = bytes[i];
         i += 1;
     }
-    2 + data.len()
+    (sys.provider_call)(
+        s.i2c_handle,
+        abi::registry::i2c::WRITE,
+        core::ptr::null_mut(),
+        0,
+        tx.as_mut_ptr(),
+        2 + i,
+    )
+}
+
+/// The started transfer: `E_AGAIN` while it runs, then its byte count (the
+/// bytes read land at `xfer_buf[0..]`) or its error.
+unsafe fn i2c_poll(s: &mut Gt911State) -> i32 {
+    let sys = &*s.syscalls;
+    (sys.provider_call)(
+        s.i2c_handle,
+        abi::registry::i2c::POLL,
+        core::ptr::null_mut(),
+        0,
+        s.xfer_buf.as_mut_ptr(),
+        s.xfer_buf.len(),
+    )
 }
 
 // ============================================================================
@@ -175,7 +203,6 @@ unsafe fn setup_write(s: &mut Gt911State, reg: u16, data: &[u8]) -> usize {
 const HAL_GPIO_CONTRACT: u32 = abi::registry::gpio::ID as u32;
 const HAL_I2C_CONTRACT: u32 = abi::registry::i2c::ID as u32;
 const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
-const EVENT_CONTRACT: u32 = abi::registry::event::ID as u32;
 
 unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
@@ -189,19 +216,40 @@ unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
 
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {
     let mut lvl = [level];
-    (sys.provider_call)(handle, abi::registry::gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+    (sys.provider_call)(
+        handle,
+        abi::registry::gpio::SET_LEVEL,
+        lvl.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    );
     // GPIO_SET_LEVEL
 }
 
 unsafe fn gpio_set_mode_input(sys: &SyscallTable, handle: i32) {
     let mut mode = [0u8]; // 0 = input
-    (sys.provider_call)(handle, abi::registry::gpio::SET_MODE, mode.as_mut_ptr(), 1);
+    (sys.provider_call)(
+        handle,
+        abi::registry::gpio::SET_MODE,
+        mode.as_mut_ptr(),
+        1,
+        core::ptr::null_mut(),
+        0,
+    );
     // GPIO_SET_MODE
 }
 
 unsafe fn timer_set(sys: &SyscallTable, timer_fd: i32, delay_ms: u32) -> i32 {
     let mut ms_buf = delay_ms.to_le_bytes();
-    (sys.provider_call)(timer_fd, abi::registry::timer::SET, ms_buf.as_mut_ptr(), 4)
+    (sys.provider_call)(
+        timer_fd,
+        abi::registry::timer::SET,
+        ms_buf.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    )
     // TIMER_SET
 }
 
@@ -256,7 +304,7 @@ pub unsafe extern "C" fn module_new(
     s.out_chan = out_chan;
     s.timer_fd = -1;
     s.i2c_handle = -1;
-    s.event_fd = -1;
+    s.watch_fd = -1;
     s.int_handle = -1;
     s.rst_handle = -1;
     s.phase = Gt911Phase::ResetLow;
@@ -349,26 +397,15 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         Gt911Phase::OpenI2c => {
             // Open I2C handle
-            let mut arg = [0u8; 7];
-            arg[0] = s.i2c_bus;
-            arg[1] = s.addr;
-            // arg[2] = padding
-            // arg[3..7] = freq_hz (400kHz default if < 7 bytes, but let's be explicit)
-            let freq: u32 = 400_000;
-            let fb = freq.to_le_bytes();
-            arg[3] = fb[0];
-            arg[4] = fb[1];
-            arg[5] = fb[2];
-            arg[6] = fb[3];
+            let mut arg = abi::contracts::hal::i2c::open::encode(s.i2c_bus, s.addr as u16);
 
             let handle = unsafe {
                 (sys.provider_open)(
                     HAL_I2C_CONTRACT,
                     abi::registry::i2c::OPEN,
                     arg.as_mut_ptr(),
-                    7,
+                    arg.len(),
                 )
-                // I2C_OPEN
             };
             if handle < 0 {
                 s.phase = Gt911Phase::Error;
@@ -381,17 +418,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         Gt911Phase::ReadIdStart => {
             // Read product ID: reg 0x8140, 4 bytes
-            let arg_len = unsafe { setup_write_read(s, REG_PRODUCT_ID, 4) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE_READ, // I2C_WRITE_READ
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-            };
-            if rc < 0 && rc != E_INPROGRESS {
-                // EINPROGRESS is expected
+            let rc = unsafe { i2c_read_reg_start(s, REG_PRODUCT_ID, 4) };
+            if rc < 0 {
                 s.phase = Gt911Phase::Error;
                 return StepReturn::error(rc);
             }
@@ -401,62 +429,37 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         Gt911Phase::ReadIdPoll => {
             // Poll for I2C completion
-            let arg_len = unsafe { setup_write_read(s, REG_PRODUCT_ID, 4) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE_READ, // I2C_WRITE_READ
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-            };
-            if rc == 0 {
+            let rc = unsafe { i2c_poll(s) };
+            if rc == E_AGAIN {
                 return StepReturn::Continue; // Still pending
             }
-            if rc < 0 {
+            if rc <= 0 {
                 s.phase = Gt911Phase::Error;
-                return StepReturn::error(rc);
+                return StepReturn::error(if rc == 0 { E_IO } else { rc });
             }
-            // Product ID is at xfer_buf[4..8] (after tx_len header + tx data)
+            // Product ID is at xfer_buf[0..4].
             // Expected: "911\0" or similar. Just verify non-zero.
             // GT911 returns ASCII: '9','1','1','\0'
-            let id_offset = 4; // 2 bytes tx_len + 2 bytes tx data
-            if s.xfer_buf[id_offset] == 0 {
+            if s.xfer_buf[0] == 0 {
                 s.phase = Gt911Phase::Error;
                 return StepReturn::error(-19); // ENODEV
             }
 
-            // Create event for INT pin edge detection
+            // Watch the INT pin's falling edge: the watch handle polls
+            // ready once per edge.
             unsafe {
-                s.event_fd = (sys.provider_open)(
-                    EVENT_CONTRACT,
-                    abi::registry::event::CREATE,
-                    core::ptr::null_mut(),
-                    0,
-                ); // EVENT_CREATE
-                if s.event_fd < 0 {
-                    s.phase = Gt911Phase::Error;
-                    return StepReturn::error(s.event_fd);
-                }
-
-                // Bind event to INT pin falling edge
-                // WATCH_EDGE: handle=gpio, arg[0]=edge(2=falling), arg[1..5]=event_fd(i32 LE)
-                let mut watch_arg = [0u8; 5];
-                watch_arg[0] = 2; // FALLING
-                let efd_bytes = s.event_fd.to_le_bytes();
-                watch_arg[1] = efd_bytes[0];
-                watch_arg[2] = efd_bytes[1];
-                watch_arg[3] = efd_bytes[2];
-                watch_arg[4] = efd_bytes[3];
-                let wrc = (sys.provider_call)(
+                let mut edge = [2u8]; // FALLING
+                s.watch_fd = (sys.provider_call)(
                     s.int_handle,
                     abi::registry::gpio::WATCH_EDGE,
-                    watch_arg.as_mut_ptr(),
-                    5,
-                ); // WATCH_EDGE
-                if wrc < 0 {
+                    edge.as_mut_ptr(),
+                    1,
+                    core::ptr::null_mut(),
+                    0,
+                );
+                if s.watch_fd < 0 {
                     s.phase = Gt911Phase::Error;
-                    return StepReturn::error(wrc);
+                    return StepReturn::error(s.watch_fd);
                 }
             }
 
@@ -465,20 +468,11 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
 
         Gt911Phase::Running => {
-            // Check if INT event fired (touch data available)
-            let poll = unsafe { dev_fd_poll(sys, s.event_fd, POLL_IN) };
-            if poll & (POLL_IN as i32) == 0 {
+            // An INT edge since the last poll (touch data available); the
+            // poll takes it.
+            let poll = unsafe { dev_fd_poll(sys, s.watch_fd, POLL_IN) };
+            if poll < 0 || poll & (POLL_IN as i32) == 0 {
                 return StepReturn::Continue; // No touch event pending
-            }
-            // Consume the event signal
-            unsafe {
-                (sys.provider_call)(
-                    s.event_fd,
-                    abi::registry::event::POLL,
-                    core::ptr::null_mut(),
-                    0,
-                );
-                // EVENT_POLL (clears)
             }
             // Read status register
             s.phase = Gt911Phase::ReadStatusStart;
@@ -487,16 +481,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         Gt911Phase::ReadStatusStart => {
             // Read status: reg 0x814E, 1 byte
-            let arg_len = unsafe { setup_write_read(s, REG_STATUS, 1) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE_READ,
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-            };
-            if rc < 0 && rc != E_INPROGRESS {
+            let rc = unsafe { i2c_read_reg_start(s, REG_STATUS, 1) };
+            if rc < 0 {
                 return StepReturn::error(rc);
             }
             s.phase = Gt911Phase::ReadStatusPoll;
@@ -504,25 +490,17 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
 
         Gt911Phase::ReadStatusPoll => {
-            let arg_len = unsafe { setup_write_read(s, REG_STATUS, 1) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE_READ,
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-            };
-            if rc == 0 {
+            let rc = unsafe { i2c_poll(s) };
+            if rc == E_AGAIN {
                 return StepReturn::Continue;
             }
-            if rc < 0 {
+            if rc <= 0 {
                 // I2C error — go back to waiting
                 s.phase = Gt911Phase::Running;
                 return StepReturn::Continue;
             }
 
-            let status = s.xfer_buf[4]; // After 2-byte header + 2-byte tx
+            let status = s.xfer_buf[0];
             let buffer_ready = (status & 0x80) != 0;
             let num_points = status & 0x0F;
 
@@ -562,16 +540,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         Gt911Phase::ReadPointsStart => {
             // Read touch point data: each point is 8 bytes
             let rx_len = (s.touch_count as usize) * POINT_SIZE;
-            let arg_len = unsafe { setup_write_read(s, REG_POINT1, rx_len) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE_READ,
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-            };
-            if rc < 0 && rc != E_INPROGRESS {
+            let rc = unsafe { i2c_read_reg_start(s, REG_POINT1, rx_len) };
+            if rc < 0 {
                 return StepReturn::error(rc);
             }
             s.phase = Gt911Phase::ReadPointsPoll;
@@ -580,26 +550,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         Gt911Phase::ReadPointsPoll => {
             let rx_len = (s.touch_count as usize) * POINT_SIZE;
-            let arg_len = unsafe { setup_write_read(s, REG_POINT1, rx_len) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE_READ,
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-            };
-            if rc == 0 {
+            let rc = unsafe { i2c_poll(s) };
+            if rc == E_AGAIN {
                 return StepReturn::Continue;
             }
-            if rc < 0 {
+            // The read answers the bytes it moved: anything short of the
+            // points asked for is a failed read.
+            if rc <= 0 || (rc as usize) < rx_len.min(POINT_SIZE) {
                 s.phase = Gt911Phase::ClearStatusStart;
                 return StepReturn::Burst;
             }
 
-            // Parse first touch point (offset 4 after tx_len header + tx data)
-            let base = 4; // 2 tx_len + 2 reg addr
-                          // GT911 point format: tracking_id(1), x_lo(1), x_hi(1), y_lo(1), y_hi(1), size_lo(1), size_hi(1), reserved(1)
+            // Parse the first touch point.
+            let base = 0;
+            // GT911 point format: tracking_id(1), x_lo(1), x_hi(1), y_lo(1), y_hi(1), size_lo(1), size_hi(1), reserved(1)
             let x = (s.xfer_buf[base + 1] as u16) | ((s.xfer_buf[base + 2] as u16) << 8);
             let y = (s.xfer_buf[base + 3] as u16) | ((s.xfer_buf[base + 4] as u16) << 8);
             let size = (s.xfer_buf[base + 5] as u16) | ((s.xfer_buf[base + 6] as u16) << 8);
@@ -635,17 +599,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         Gt911Phase::ClearStatusStart => {
             // Write 0 to status register (0x814E) to acknowledge
-            let arg_len = unsafe { setup_write(s, REG_STATUS, &[0x00]) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE,
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-                // I2C_WRITE
-            };
-            if rc < 0 && rc != E_INPROGRESS {
+            let rc = unsafe { i2c_write_reg_start(s, REG_STATUS, &[0x00]) };
+            if rc < 0 {
                 return StepReturn::error(rc);
             }
             s.phase = Gt911Phase::ClearStatusPoll;
@@ -653,16 +608,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
 
         Gt911Phase::ClearStatusPoll => {
-            let arg_len = unsafe { setup_write(s, REG_STATUS, &[0x00]) };
-            let rc = unsafe {
-                (sys.provider_call)(
-                    s.i2c_handle,
-                    abi::registry::i2c::WRITE,
-                    s.xfer_buf.as_mut_ptr(),
-                    arg_len,
-                )
-            };
-            if rc == 0 {
+            let rc = unsafe { i2c_poll(s) };
+            if rc == E_AGAIN {
                 return StepReturn::Continue;
             }
             // Done or error — return to waiting

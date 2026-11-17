@@ -4,9 +4,14 @@
 //! single-bit flag that can be signaled (from any context, including ISR)
 //! and polled (non-blocking, clears on read).
 //!
-//! Device-specific bindings (e.g. GPIO edge -> event) are handled by the
-//! respective device providers, not here. Providers call `event_signal()`
-//! when their hardware condition fires.
+//! An event handle names its slot (`abi::kernel_abi::handle`): the slot's
+//! generation moves on every claim, so a handle kept past its destroy names
+//! nothing. Every op checks the caller owns the event.
+//!
+//! A doorbell is an event slot the kernel claims for the minter of a
+//! signalling handle (`kernel::BIND_DOORBELL`): the provider rings it, the
+//! minter is woken and its handle polls ready once. The doorbell is the
+//! slot's handle word; ringing one whose handle closed rings nothing.
 //!
 //! The scheduler checks `EVENT_WAKE_PENDING` and steps only the affected
 //! modules via `step_woken_modules()`, providing intra-tick wake response.
@@ -38,6 +43,11 @@ struct EventSlot {
     /// Owning module index (below `scheduler::module_slots()`), or
     /// `NO_MODULE` if unowned.
     owner: AtomicU16,
+    /// The generation a handle to this slot carries; moved on every claim.
+    generation: AtomicU16,
+    /// For a doorbell, the module provider that may ring it (`NO_MODULE`:
+    /// the platform, which rings it directly). Unused for an event.
+    ringer: AtomicU16,
 }
 
 impl EventSlot {
@@ -46,9 +56,33 @@ impl EventSlot {
             allocated: AtomicBool::new(false),
             signaled: AtomicBool::new(false),
             owner: AtomicU16::new(NO_MODULE),
+            generation: AtomicU16::new(0),
+            ringer: AtomicU16::new(NO_MODULE),
         }
     }
+
+    fn free(&self) {
+        self.signaled.store(false, Ordering::Release);
+        self.owner.store(NO_MODULE, Ordering::Release);
+        self.ringer.store(NO_MODULE, Ordering::Release);
+        self.allocated.store(false, Ordering::Release);
+    }
 }
+
+impl crate::kernel::ipc::handle::Native for EventSlot {
+    fn live(&self) -> bool {
+        self.allocated.load(Ordering::Acquire)
+    }
+    fn generation(&self) -> u16 {
+        self.generation.load(Ordering::Acquire)
+    }
+    fn owner(&self) -> ModuleId {
+        self.owner.load(Ordering::Acquire)
+    }
+}
+
+/// The event contract's id: the contract field of every event handle.
+const EVENT: u16 = crate::abi::registry::event::ID;
 
 // ============================================================================
 // Static state
@@ -190,38 +224,42 @@ pub fn unpause_mask_modules(mask: &ModuleMask) -> ModuleMask {
 // Ownership validation
 // ============================================================================
 
-/// Check that the event handle is valid, allocated, and owned by the calling module.
-/// Returns Ok(&EventSlot) on success, Err(errno) on failure.
+/// The event `handle` names, when it is live and the calling module's.
 fn check_event_access(handle: i32) -> Result<&'static EventSlot, i32> {
-    if handle < 0 || handle as usize >= slots().len() {
-        return Err(errno::EINVAL);
-    }
-    let slot = &slots()[handle as usize];
-    if !slot.allocated.load(Ordering::Acquire) {
-        return Err(errno::EINVAL);
-    }
-    let owner = slot.owner.load(Ordering::Acquire);
-    let caller = crate::kernel::exec::scheduler::current_module_id();
-    if owner != NO_MODULE && owner != caller {
-        return Err(errno::EINVAL);
-    }
-    Ok(slot)
+    crate::kernel::ipc::handle::resolve_owned(
+        slots(),
+        EVENT,
+        handle,
+        crate::kernel::exec::scheduler::current_module_id(),
+    )
+    .map(|(_, s)| s)
 }
 
-// ============================================================================
-// Core event operations
-// ============================================================================
+/// Whether `handle` names a live event the calling module owns.
+pub fn owned_by_caller(handle: i32) -> bool {
+    check_event_access(handle).is_ok()
+}
 
-/// Create a new event owned by the currently executing module.
-/// Returns event handle (slot index, >=0) or negative errno.
-pub fn event_create() -> i32 {
+/// The live slot `handle` names, whoever owns it, from the committed table
+/// alone (never sizes it): the interrupt-safe lookup.
+#[inline]
+fn committed_slot(handle: i32) -> Option<&'static EventSlot> {
+    let (c, generation, idx) = crate::abi::kernel_abi::handle::decode(handle)?;
+    let slot = EVENT_SLOTS.committed().get(idx as usize)?;
+    (c == EVENT
+        && slot.allocated.load(Ordering::Acquire)
+        && slot.generation.load(Ordering::Acquire) == generation)
+        .then_some(slot)
+}
+
+/// Claim a free slot for `owner` (and, for a doorbell, `ringer`): its handle.
+fn claim(owner: ModuleId, ringer: ModuleId) -> i32 {
     use crate::abi::contracts::resource::POOL_EVENTS;
     use crate::kernel::sys::resource_ledger as ledger;
     if !ledger::enforced_allows(POOL_EVENTS, in_use_count() as u32 + 1) {
         ledger::deny(POOL_EVENTS);
         return errno::ENOSPC;
     }
-    let owner = crate::kernel::exec::scheduler::current_module_id();
     for (i, slot) in slots().iter().enumerate() {
         if slot
             .allocated
@@ -230,27 +268,28 @@ pub fn event_create() -> i32 {
         {
             slot.signaled.store(false, Ordering::Release);
             slot.owner.store(owner, Ordering::Release);
-            return i as i32;
+            slot.ringer.store(ringer, Ordering::Release);
+            let generation = slot.generation.load(Ordering::Relaxed).wrapping_add(1)
+                & crate::abi::kernel_abi::handle::GEN_MASK;
+            slot.generation.store(generation, Ordering::Release);
+            return crate::abi::kernel_abi::handle::encode(EVENT, generation, i as u32);
         }
     }
-    crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_EVENTS);
+    ledger::deny(POOL_EVENTS);
     errno::ENOSPC
 }
 
-/// The module that owns event `handle` (a slot index), or `None` when the
-/// slot is not allocated. Answers anyone: an event's owner is no secret, and
-/// a provider that signals an event on a subscriber's behalf checks it
-/// before every signal, so a slot freed and taken by another module is
-/// never woken for the first one.
-pub fn event_owner(handle: i32) -> Option<ModuleId> {
-    if handle < 0 || handle as usize >= slots().len() {
-        return None;
-    }
-    let slot = &slots()[handle as usize];
-    if !slot.allocated.load(Ordering::Acquire) {
-        return None;
-    }
-    Some(slot.owner.load(Ordering::Acquire))
+// ============================================================================
+// Core event operations
+// ============================================================================
+
+/// Create a new event owned by the currently executing module: its handle,
+/// or a negative errno.
+pub fn event_create() -> i32 {
+    claim(
+        crate::kernel::exec::scheduler::current_module_id(),
+        NO_MODULE,
+    )
 }
 
 /// Allocated slots — resource-ledger sample for `POOL_EVENTS`.
@@ -261,47 +300,27 @@ pub fn in_use_count() -> usize {
         .count()
 }
 
-/// Signal an event. Safe to call from any context (module step, poll, ISR).
+/// Signal an event the calling module owns.
 ///
 /// Sets the signaled flag, marks the owning module for wake, and pokes
 /// the scheduler signal so it can break out of its timer sleep.
 pub fn event_signal(handle: i32) -> i32 {
-    if handle < 0 || handle as usize >= slots().len() {
-        return errno::EINVAL;
+    match check_event_access(handle) {
+        Ok(slot) => {
+            raise(slot);
+            0
+        }
+        Err(e) => e,
     }
-    let slot = &slots()[handle as usize];
-    if !slot.allocated.load(Ordering::Acquire) {
-        return errno::EINVAL;
-    }
-    slot.signaled.store(true, Ordering::Release);
-    let owner = slot.owner.load(Ordering::Relaxed);
-    if (owner as usize) < crate::kernel::exec::scheduler::module_slots()
-        && !latch_module_wake(owner as usize)
-    {
-        // Owner paused: wake deferred, doorbell suppressed.
-        return 0;
-    }
-    hal::wake_scheduler();
-    0
 }
 
-/// Minimal ISR-safe signal path. No validation beyond bounds check.
-/// Called at most once per ISR entry (coalesced), not per-pin.
+/// Set `slot` signaled and wake its owner.
 ///
-/// # Safety
-/// Caller must ensure handle is a valid, allocated event slot.
-///
-/// Never inlined: it is a root of the `irq-neon-free` gate's walk.
+/// Never inlined: interrupt context reaches it (`event_signal_from_isr`, a
+/// platform's doorbell ring), and the `irq-neon-free` gate names its HAL
+/// call as the IRQ path's indirect branch.
 #[inline(never)]
-pub fn event_signal_from_isr(handle: i32) {
-    // The committed slots, never `slots()`: interrupt context does not size
-    // a table, and an unsized table has no event to signal.
-    let Some(slot) = usize::try_from(handle)
-        .ok()
-        .and_then(|i| EVENT_SLOTS.committed().get(i))
-    else {
-        return;
-    };
+fn raise(slot: &EventSlot) {
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
     if (owner as usize) < crate::kernel::exec::scheduler::committed_module_slots()
@@ -311,6 +330,18 @@ pub fn event_signal_from_isr(handle: i32) {
         return;
     }
     hal::wake_scheduler();
+}
+
+/// Signal the event `handle` names from interrupt context (an IRQ bound with
+/// `BIND_IRQ`, the fault monitor): no owner check, and a handle whose event
+/// was destroyed signals nothing. Reads only the committed table.
+///
+/// Never inlined: it is a root of the `irq-neon-free` gate's walk.
+#[inline(never)]
+pub fn event_signal_from_isr(handle: i32) {
+    if let Some(slot) = committed_slot(handle) {
+        raise(slot);
+    }
 }
 
 /// Poll an event (non-blocking). Clears the signaled flag atomically.
@@ -328,32 +359,84 @@ pub fn event_poll(handle: i32) -> i32 {
     }
 }
 
-/// Non-destructive peek: check if an event is signaled without clearing it.
-/// Used by `fd_poll` for unified readiness checks.
-pub fn event_is_signaled(handle: i32) -> bool {
-    if handle < 0 || handle as usize >= slots().len() {
-        return false;
+/// Non-destructive readiness of an event the calling module owns: the
+/// event contract's `HANDLE_POLL`.
+pub fn event_poll_ready(handle: i32, events: u32) -> i32 {
+    match check_event_access(handle) {
+        Ok(slot) => {
+            if events & crate::abi::kernel_abi::poll::IN != 0
+                && slot.signaled.load(Ordering::Acquire)
+            {
+                crate::abi::kernel_abi::poll::IN as i32
+            } else {
+                0
+            }
+        }
+        Err(e) => e,
     }
-    let slot = &slots()[handle as usize];
-    if !slot.allocated.load(Ordering::Acquire) {
-        return false;
-    }
-    slot.signaled.load(Ordering::Acquire)
 }
 
 /// Destroy an event and free its slot.
 /// Only the owning module may destroy its events.
-/// Note: Device-specific cleanup (e.g. GPIO edge unbinding) is the
-/// responsibility of the device provider, not the event subsystem.
 pub fn event_destroy(handle: i32) -> i32 {
     let slot = match check_event_access(handle) {
         Ok(s) => s,
         Err(e) => return e,
     };
-    slot.signaled.store(false, Ordering::Release);
-    slot.owner.store(NO_MODULE, Ordering::Release);
-    slot.allocated.store(false, Ordering::Release);
+    slot.free();
     0
+}
+
+// ============================================================================
+// Doorbells
+// ============================================================================
+
+/// Claim a doorbell for `minter`, rung by `ringer` (a module provider) or by
+/// the platform (`NO_MODULE`). Its word, or `ENOSPC` when the event pool is
+/// spent.
+pub fn doorbell_claim(minter: ModuleId, ringer: ModuleId) -> i32 {
+    claim(minter, ringer)
+}
+
+/// Ring `doorbell` from the platform, in any context including an
+/// interrupt handler: its minter's handle polls ready and the minter is
+/// woken. A doorbell whose handle closed rings nothing. `false` when it
+/// named no live doorbell.
+#[inline(never)]
+pub fn doorbell_ring(doorbell: i32) -> bool {
+    match committed_slot(doorbell) {
+        Some(slot) => {
+            raise(slot);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `DOORBELL_RING` from module `ringer`: 0, also for a doorbell whose handle
+/// closed; `EACCES` when the doorbell was handed to another provider.
+pub fn doorbell_ring_by(doorbell: i32, ringer: ModuleId) -> i32 {
+    match committed_slot(doorbell) {
+        Some(slot) if slot.ringer.load(Ordering::Acquire) == ringer => {
+            raise(slot);
+            0
+        }
+        Some(_) => errno::EACCES,
+        None => 0,
+    }
+}
+
+/// Whether `doorbell` rang since the last take, clearing it: a signalling
+/// handle's `HANDLE_POLL`.
+pub fn doorbell_take(doorbell: i32) -> bool {
+    committed_slot(doorbell).is_some_and(|s| s.signaled.swap(false, Ordering::AcqRel))
+}
+
+/// Free `doorbell`; one already freed is left alone.
+pub fn doorbell_release(doorbell: i32) {
+    if let Some(slot) = committed_slot(doorbell) {
+        slot.free();
+    }
 }
 
 // ============================================================================
@@ -477,9 +560,7 @@ pub fn release_owned_by(module_idx: ModuleId) {
         if slot.owner.load(Ordering::Acquire) != module_idx {
             continue;
         }
-        slot.signaled.store(false, Ordering::Release);
-        slot.owner.store(NO_MODULE, Ordering::Release);
-        slot.allocated.store(false, Ordering::Release);
+        slot.free();
     }
 }
 
@@ -502,9 +583,7 @@ pub fn reset_pause_masking() {
 pub fn reset_all() {
     for slot in slots().iter() {
         if slot.allocated.load(Ordering::Acquire) {
-            slot.signaled.store(false, Ordering::Release);
-            slot.owner.store(NO_MODULE, Ordering::Release);
-            slot.allocated.store(false, Ordering::Release);
+            slot.free();
         }
     }
     for w in EVENT_WAKE_PENDING.iter() {

@@ -301,9 +301,9 @@ The table contains exactly:
 
 | Group | Functions |
 |-------|----------|
-| Channel I/O | `channel_read`, `channel_write`, `channel_poll` |
+| Channel I/O | `channel_read`, `channel_write`, `channel_poll`, `channel_peek`, `channel_discard` |
 | Heap | `heap_alloc`, `heap_free`, `heap_realloc` |
-| Provider dispatch | `provider_open`, `provider_call`, `provider_call_sel`, `provider_query`, `provider_close` |
+| Provider dispatch | `provider_open`, `provider_call`, `provider_query`, `provider_close` |
 
 Channel I/O and heap are hot-path typed syscalls. Everything else
 routes through the `provider_*` entries:
@@ -315,14 +315,15 @@ routes through the `provider_*` entries:
   contract's vtable. For handle=-1 global operations and untracked
   handles, the opcode's high byte carries the contract id and
   dispatch routes directly through the class chain.
-- `provider_call_sel(sel, sel_len, op_handle, op, arg, len)` calls the
-  provider a short selector string names: an instance-keyed layer (for
-  example a volume name on the storage surface), or, for the reserved
-  name `platform`, the platform's own provider beneath every module
-  layer. The contract is the opcode's class byte. `op_handle` is `-1`
-  for open-style ops; a handle one mints is returned routed, so later
-  ops on it — here or through `provider_call` — reach the provider that
-  minted it, and a handle minted elsewhere is refused (`EBADF`).
+- `provider_open(contract, kernel::BIND, arg)` binds one provider of a
+  contract: `[NAME][len][name]` an instance-keyed layer (for example a
+  volume name on the storage surface), or, for the reserved name
+  `platform`, the platform's own provider beneath every module layer;
+  `[PORT][port_type][index]` the module at the other end of one of the
+  caller's ports, for an edge contract. Every op through the bound
+  handle reaches that provider, and a handle one mints is returned
+  routed, so later ops on it reach the provider that minted it; a handle
+  minted elsewhere is refused (`EBADF`).
 - `provider_query(handle, key, out, len)` reads introspection state.
 - `provider_close(handle)` invokes the contract's default close
   opcode (if any) and releases the tracking entry.

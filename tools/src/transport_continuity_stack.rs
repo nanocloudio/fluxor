@@ -497,6 +497,24 @@ mod tests {
         assert_ne!(f, tc_flow_id_v6(&cli6, &vip6, PORT, CPORT));
     }
 
+    /// FXTC's send section is `ip`'s copy of what a connection sent; a flow
+    /// this bridge moves is `tls`'s, which keeps its own, so the section is
+    /// written empty and a record carrying bytes there is refused rather than
+    /// folded into a canonical send buffer that holds TLS records.
+    #[test]
+    fn a_tcp_half_carries_no_send_bytes_of_its_own() {
+        let tcp = tcp_half(5000, 5000);
+        let mut b = vec![0u8; FXTC_MAX + 32];
+        let n = fxtc_encode(&tcp, &mut b).expect("fxtc");
+        assert_eq!(&b[n - 4..n], &[0, 0, 0, 0], "an empty send section");
+        let mut back = tcp;
+        fxtc_decode(&b[..n], &mut back).expect("decodes");
+        let mut carried = b[..n - 4].to_vec();
+        carried.extend_from_slice(&3u32.to_le_bytes());
+        carried.extend_from_slice(b"abc");
+        assert_eq!(fxtc_decode(&carried, &mut back), Err(CkptError::Bounds));
+    }
+
     /// Each record has its layout bytes and no others: FXTC 1 (IPv4) and
     /// 2 (IPv6), CT_TLS 1.
     #[test]
@@ -656,7 +674,7 @@ mod tests {
     }
 
     /// The connection's output horizon (the consumer's clear bytes through
-    /// the last record, `net_proto::MSG_HORIZON`) is part of the record:
+    /// the last record, `stream_cursor::MSG_CURSOR_HORIZON`) is part of the record:
     /// `tls`'s half carries it in, the record carries it back out to the
     /// standby's `tls`, and a record out moves it only forward.
     #[test]
@@ -673,7 +691,7 @@ mod tests {
         let n = ct_tls_encode(&st, &w, &mut back).expect("encodes");
         let again = ct_tls_decode(&back[..n]).expect("decodes");
         assert_eq!(again.out_bytes, 77);
-        // So is the consumer's cursor (`net_proto::CMD_DELIVERED`), opaque.
+        // So is the consumer's cursor (`stream_cursor::CMD_CURSOR_DELIVERED`), opaque.
         assert_eq!((th.consumer_cursor, st.consumer_cursor), (0x5150, 0x5150));
         assert_eq!(again.consumer_cursor, 0x5150);
         // With its clear byte, and where the unconsumed deliveries start.

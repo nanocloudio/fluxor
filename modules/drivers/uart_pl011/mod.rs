@@ -2,7 +2,8 @@
 //!
 //! Manages UART peripheral access using kernel register bridge.
 //! Registers as the HAL_UART provider (contract id 0x0D).
-//! FIFO-based polling for TX/RX.
+//! FIFO-based polling for TX/RX through a transmit and a receive ring per
+//! bus; every op copies between a ring and the caller's `data`.
 
 #![no_std]
 #![allow(
@@ -37,7 +38,11 @@ const UARTDMACR: u8 = 0x48;
 // UARTFR bits
 const FR_TXFF: u32 = 1 << 5; // TX FIFO full
 const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
-const FR_BUSY: u32 = 1 << 3;
+
+/// Bytes each ring of a bus holds.
+const RING: usize = 256;
+/// Bytes moved each way per bus per step.
+const BURST: usize = 32;
 
 #[repr(C)]
 struct UartHandle {
@@ -47,16 +52,15 @@ struct UartHandle {
     _pad: u8,
 }
 
+/// A bus's transmit and receive rings, shared by every handle open on it.
 #[repr(C)]
-struct UartTransfer {
-    buf_ptr: u32,
-    buf_len: u16,
-    pos: u16,
-    pending: u8,
-    active: u8,
-    is_read: u8,
-    _pad: u8,
-    result: i32,
+struct BusRings {
+    tx: [u8; RING],
+    rx: [u8; RING],
+    tx_head: u16,
+    tx_len: u16,
+    rx_head: u16,
+    rx_len: u16,
 }
 
 #[repr(C)]
@@ -66,7 +70,7 @@ struct UartState {
     out_chan: i32,
     ctrl_chan: i32,
     handles: [UartHandle; MAX_HANDLES],
-    transfers: [UartTransfer; MAX_HANDLES],
+    buses: [BusRings; MAX_BUSES],
     step_count: u32,
     next_handle: u8,
     ready_reported: u8,
@@ -89,6 +93,8 @@ unsafe fn uart_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
         UART_REG_WRITE,
         bp,
         5,
+        core::ptr::null_mut(),
+        0,
     );
 }
 
@@ -101,6 +107,8 @@ unsafe fn uart_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
         UART_REG_READ,
         bp,
         5,
+        core::ptr::null_mut(),
+        0,
     );
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
@@ -141,47 +149,67 @@ unsafe fn configure_uart(sys: &SyscallTable, bus: u8, baud: u32) {
     uart_reg_write(sys, bus, UARTCR, 0x301); // UARTEN + TXE + RXE
 }
 
-unsafe fn poll_uart_transfer(s: &mut UartState, idx: usize) {
+/// Whether any open handle names `bus`.
+fn bus_open(s: &UartState, bus: u8) -> bool {
+    s.handles.iter().any(|h| h.in_use != 0 && h.bus_id == bus)
+}
+
+/// Move up to [`BURST`] bytes each way between `bus`'s rings and its FIFOs.
+unsafe fn pump_bus(s: &mut UartState, bus: u8) {
     let sys = &*s.syscalls;
-    let tp = s.transfers.as_mut_ptr().add(idx);
-    if (*tp).active == 0 {
-        return;
+    let r = &mut s.buses[bus as usize];
+    let mut n = 0usize;
+    while n < BURST && r.tx_len > 0 {
+        if uart_reg_read(sys, bus, UARTFR) & FR_TXFF != 0 {
+            break;
+        }
+        uart_reg_write(sys, bus, UARTDR, r.tx[r.tx_head as usize] as u32);
+        r.tx_head = ((r.tx_head as usize + 1) % RING) as u16;
+        r.tx_len -= 1;
+        n += 1;
     }
-
-    let bus = (*s.handles.as_ptr().add(idx)).bus_id;
-    let fr = uart_reg_read(sys, bus, UARTFR);
-    let pos = (*tp).pos as usize;
-    let len = (*tp).buf_len as usize;
-
-    if (*tp).is_read != 0 {
-        // RX: read available bytes
-        if (fr & FR_RXFE) == 0 && pos < len {
-            let byte = uart_reg_read(sys, bus, UARTDR) as u8;
-            if (*tp).buf_ptr != 0 {
-                *(((*tp).buf_ptr as usize + pos) as *mut u8) = byte;
-            }
-            (*tp).pos = (pos + 1) as u16;
+    n = 0;
+    while n < BURST && (r.rx_len as usize) < RING {
+        if uart_reg_read(sys, bus, UARTFR) & FR_RXFE != 0 {
+            break;
         }
-        if (*tp).pos as usize >= len {
-            (*tp).result = len as i32;
-            (*tp).active = 0;
-        }
+        let byte = uart_reg_read(sys, bus, UARTDR) as u8;
+        let at = (r.rx_head as usize + r.rx_len as usize) % RING;
+        r.rx[at] = byte;
+        r.rx_len += 1;
+        n += 1;
+    }
+}
+
+/// Queue `src` on the transmit ring; the bytes it took.
+fn ring_put(r: &mut BusRings, src: &[u8]) -> usize {
+    let room = RING - r.tx_len as usize;
+    let n = if src.len() < room { src.len() } else { room };
+    let mut i = 0usize;
+    while i < n {
+        let at = (r.tx_head as usize + r.tx_len as usize + i) % RING;
+        r.tx[at] = src[i];
+        i += 1;
+    }
+    r.tx_len += n as u16;
+    n
+}
+
+/// Take received bytes into `dst`; the bytes taken.
+fn ring_take(r: &mut BusRings, dst: &mut [u8]) -> usize {
+    let n = if dst.len() < r.rx_len as usize {
+        dst.len()
     } else {
-        // TX: write available space
-        if (fr & FR_TXFF) == 0 && pos < len {
-            let byte = if (*tp).buf_ptr != 0 {
-                *(((*tp).buf_ptr as usize + pos) as *const u8)
-            } else {
-                0
-            };
-            uart_reg_write(sys, bus, UARTDR, byte as u32);
-            (*tp).pos = (pos + 1) as u16;
-        }
-        if (*tp).pos as usize >= len && (fr & FR_BUSY) == 0 {
-            (*tp).result = len as i32;
-            (*tp).active = 0;
-        }
+        r.rx_len as usize
+    };
+    let mut i = 0usize;
+    while i < n {
+        dst[i] = r.rx[(r.rx_head as usize + i) % RING];
+        i += 1;
     }
+    r.rx_head = ((r.rx_head as usize + n) % RING) as u16;
+    r.rx_len -= n as u16;
+    n
 }
 
 const UART_OPEN: u32 = abi::registry::uart::OPEN;
@@ -193,8 +221,9 @@ const UART_CONFIGURE: u32 = abi::registry::uart::CONFIGURE;
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
-/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
-/// (may be null when `arg_len` is 0) valid for the call.
+/// module's `module_new` initialised, `arg` points to `arg_len` bytes and
+/// `data` to `data_len` bytes (either may be null when its length is 0),
+/// both valid for the call.
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn uart_dispatch(
@@ -203,89 +232,78 @@ pub unsafe extern "C" fn uart_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     let s = &mut *(state as *mut UartState);
+    let arg: &[u8] = if arg.is_null() {
+        &[]
+    } else {
+        core::slice::from_raw_parts(arg, arg_len)
+    };
+
+    if opcode == UART_OPEN {
+        let Some(&bus) = arg.first() else {
+            return E_INVAL;
+        };
+        if bus as usize >= MAX_BUSES {
+            return E_INVAL;
+        }
+        let mut i = 0usize;
+        while i < MAX_HANDLES {
+            let idx = (s.next_handle as usize + i) % MAX_HANDLES;
+            let hp = &mut s.handles[idx];
+            if hp.in_use == 0 {
+                hp.in_use = 1;
+                hp.bus_id = bus;
+                s.next_handle = ((idx + 1) % MAX_HANDLES) as u8;
+                return idx as i32;
+            }
+            i += 1;
+        }
+        return E_BUSY;
+    }
+
+    if handle < 0 {
+        return E_INVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_HANDLES || s.handles[idx].in_use == 0 {
+        return E_INVAL;
+    }
+    let bus = s.handles[idx].bus_id;
 
     match opcode {
-        UART_OPEN => {
-            if arg.is_null() || arg_len < 1 {
-                return -22;
-            }
-            let bus = *arg;
-            if bus as usize >= MAX_BUSES {
-                return -22;
-            }
-            let mut i = 0usize;
-            while i < MAX_HANDLES {
-                let idx = (s.next_handle as usize + i) % MAX_HANDLES;
-                let hp = s.handles.as_mut_ptr().add(idx);
-                if (*hp).in_use == 0 {
-                    (*hp).in_use = 1;
-                    (*hp).bus_id = bus;
-                    s.next_handle = ((idx + 1) % MAX_HANDLES) as u8;
-                    return idx as i32;
-                }
-                i += 1;
-            }
-            -16
-        }
         UART_CLOSE => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
-            (*s.handles.as_mut_ptr().add(idx)).in_use = 0;
+            s.handles[idx].in_use = 0;
             0
         }
-        UART_WRITE | UART_READ => {
-            // arg=[buf_ptr:u32, len:u16] (6 bytes)
-            if arg.is_null() || arg_len < 6 {
-                return -22;
-            }
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
-            let tp = s.transfers.as_mut_ptr().add(idx);
-            if (*tp).active != 0 {
-                return -16;
-            }
-            (*tp).buf_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            (*tp).buf_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            (*tp).pos = 0;
-            (*tp).is_read = if opcode == UART_READ { 1 } else { 0 };
-            (*tp).result = 0;
-            (*tp).pending = 0;
-            (*tp).active = 1;
-            0
-        }
-        UART_POLL => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
-            let tp = s.transfers.as_ptr().add(idx);
-            if (*tp).active != 0 {
+        UART_WRITE => {
+            if data.is_null() || data_len == 0 {
                 return 0;
             }
-            (*tp).result
+            let src = core::slice::from_raw_parts(data, data_len);
+            ring_put(&mut s.buses[bus as usize], src) as i32
         }
+        UART_READ => {
+            if data.is_null() || data_len == 0 {
+                return 0;
+            }
+            let dst = core::slice::from_raw_parts_mut(data, data_len);
+            ring_take(&mut s.buses[bus as usize], dst) as i32
+        }
+        UART_POLL => s.buses[bus as usize].tx_len as i32,
         UART_CONFIGURE => {
             // arg=[baud:u32 LE] (4 bytes)
-            if arg.is_null() || arg_len < 4 {
-                return -22;
-            }
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES {
-                return -22;
-            }
-            let bus = (*s.handles.as_ptr().add(idx)).bus_id;
-            let baud = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let Some(b) = arg.get(..4) else {
+                return E_INVAL;
+            };
+            let baud = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             let sys = &*s.syscalls;
             configure_uart(sys, bus, baud);
             0
         }
-        _ => -38,
+        _ => E_NOSYS,
     }
 }
 
@@ -343,13 +361,12 @@ pub unsafe extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut UartState);
-    let mut i = 0usize;
-    while i < MAX_HANDLES {
-        let tp = s.transfers.as_ptr().add(i);
-        if (*tp).active != 0 {
-            poll_uart_transfer(s, i);
+    let mut bus = 0u8;
+    while (bus as usize) < MAX_BUSES {
+        if bus_open(s, bus) {
+            pump_bus(s, bus);
         }
-        i += 1;
+        bus += 1;
     }
     // Ready on the first step: nothing is brought up before a consumer's
     // first open, and the scheduler holds this provider's consumers until

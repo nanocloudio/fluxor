@@ -57,6 +57,10 @@ name = "frames_tx"
 direction = "output"
 content_type = "EthernetFrame"
 required = true
+# A fence asks the NIC driver here whether the wire is quiet; a driver that
+# serves no drain query leaves the fence at the ring hand-off.
+contract = "net_tx_drain"
+contract_optional = true
 buffer_size = { default = 4096, aarch64 = 32768 }
 
 [[ports]]
@@ -65,12 +69,27 @@ direction = "output"
 content_type = "NetProto"
 # net rings match http's per-call stage: 16 KiB on aarch64, 2 KiB else.
 buffer_size = { default = 2048, aarch64 = 16384 }
+# A datagram of one link MTU, `[ep_id][af][addr 4][port]` + 1472 B, the
+# longest record written here (`NET_OUT_MAX_RECORD`).
+max_record = 1483
+# What this port's connections send is kept here for every consumer that does
+# not keep it itself (`retains_send`) and may open a stream (not
+# `datagram_only`), in blocks of `tcp_send_buf` from a pool of
+# `tcp_send_pool` bytes. Either at 0 keeps nothing, and may be set only when
+# no consumer leaves retention here. The composer derives the pool from the
+# graph: 0 where no consumer leaves retention here and no workload lane
+# (`lanes`) is served, else the default pool's blocks of `tcp_send_buf`.
+send_buffer_param = "tcp_send_buf"
+send_pool_param = "tcp_send_pool"
+send_pool_lanes_param = "lanes"
 
 [[ports]]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
 buffer_size = { default = 2048, aarch64 = 16384 }
+# One command up to the send stash (`NET_IN_ACCEPTS_RECORD`).
+accepts_record = { default = 1603, aarch64 = 8195 }
 
 # Address-control port (in[2]). Single writer: the platform workload backend.
 # Carries IP_ADDR_ADD / IP_ADDR_DEL as net-proto-framed control messages.
@@ -82,6 +101,7 @@ direction = "input"
 index = 2
 content_type = "NetProto"
 buffer_size = { default = 512, aarch64 = 512 }
+accepts_record = 197
 
 # Emission events back to the address-control writer (out[5]): the token
 # minted at each install (`MSG_ADDR_ADDED`), arm and fence outcomes, and
@@ -97,6 +117,7 @@ direction = "output"
 index = 5
 content_type = "NetProto"
 buffer_size = { default = 512, aarch64 = 1024 }
+max_record = 51
 
 # Pre-transport decision seam (in[3] / out[3] / out[4]), on only when
 # `packet_decision = pre_transport`: every validated inbound IPv4 packet, and
@@ -114,6 +135,7 @@ direction = "input"
 index = 3
 content_type = "NetProto"
 buffer_size = { default = 512, aarch64 = 2048 }
+accepts_record = 27
 
 [[ports]]
 name = "packet_out"
@@ -121,6 +143,7 @@ direction = "output"
 index = 3
 content_type = "NetProto"
 buffer_size = { default = 512, aarch64 = 2048 }
+max_record = 61
 
 [[ports]]
 name = "packet_fwd"
@@ -128,6 +151,7 @@ direction = "output"
 index = 4
 content_type = "NetProto"
 buffer_size = { default = 4096, aarch64 = 32768 }
+max_record = 1600
 
 # Transport continuity (in[4] / out[6]), the `session_ctrl` §Transport
 # continuity surface for the TCP connections this module owns: a
@@ -175,6 +199,18 @@ buffer_size = 1024
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
 # cumulative counters; no-op when unwired.
+[capacities]
+# The send pool (`tcp_send_pool`) comes from the heap on an MCU-class target,
+# so the heap grows by it, byte for byte; on aarch64 its blocks are granted
+# from the elastic region and the heap does not. `base` is `module_facts!`'s
+# arena (`HEAP_DEFAULT_BYTES`), `default` the param's schema default
+# (`send_pool::POOL_DEFAULT`). The decision seam's holds (`packet_holds`) are
+# heap too, `HOLD_BYTES` each, declared only by a graph that turns the seam on.
+heap_per_param = { base = { default = 5152, aarch64 = 16777216 }, params = [
+    { tag = 34, default = { default = 2920, thumbv8m = 5840, aarch64 = 8388608 }, bytes_each = { default = 1, aarch64 = 0 } },
+    { tag = 32, default = 0, bytes_each = { default = 1628, aarch64 = 0 } },
+] }
+
 [observability]
 metrics = ["bytes_in", "bytes_out"]
 # Span 0: one `tcp.connection` span per accepted connection (accept -> close),

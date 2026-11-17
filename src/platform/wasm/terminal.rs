@@ -57,7 +57,10 @@ unsafe fn alloc_state() -> *mut TerminalState {
     raw
 }
 
-fn terminal_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn terminal_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
     // type allocated by the new_fn and operate within that allocation.
@@ -71,7 +74,14 @@ fn terminal_step(state: *mut u8) -> i32 {
         // Drain in a single tight loop so multi-line bursts land in
         // one step. The provider returns 0 on empty; we stop then.
         loop {
-            let n = (table.provider_call)(-1, LOG_RING_DRAIN, st.buf.as_mut_ptr(), st.buf.len());
+            let n = (table.provider_call)(
+                -1,
+                LOG_RING_DRAIN,
+                core::ptr::null_mut(),
+                0,
+                st.buf.as_mut_ptr(),
+                st.buf.len(),
+            );
             if n <= 0 {
                 break;
             }

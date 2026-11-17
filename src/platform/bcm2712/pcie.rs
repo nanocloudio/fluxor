@@ -127,6 +127,10 @@ impl PcieDevice {
             _ => PcieNicType::Unknown,
         };
     }
+    /// Bus/device/function as one word: the key a BAR map is kept by.
+    fn bdf(&self) -> u16 {
+        (u16::from(self.bus) << 8) | (u16::from(self.dev) << 3) | u16::from(self.func)
+    }
 }
 
 // ============================================================================
@@ -137,8 +141,6 @@ impl PcieDevice {
 struct BarMap {
     bdf: u16,
     bar_idx: u8,
-    virt_addr: usize,
-    size: usize,
     active: bool,
 }
 
@@ -147,8 +149,6 @@ impl BarMap {
         Self {
             bdf: 0,
             bar_idx: 0,
-            virt_addr: 0,
-            size: 0,
             active: false,
         }
     }
@@ -1021,43 +1021,30 @@ pub fn device_cfg_write32(_dev_idx: usize, _offset: u16, _val: u32) -> i32 {
 
 /// Syscall handler for `PCIE_CFG_READ32`. Arg layout:
 ///   in:  `[dev_idx: u8][_pad: u8][offset: u16 LE]` (4 bytes)
-///   out: `[value: u32 LE]` appended at offset 4 (caller must pass >= 8 B).
+///   out: `[value: u32 LE]` at offset 4 (`arg` holds >= 8 B).
 /// Returns 0 on success, -22 on malformed arg.
-///
-/// # Safety
-/// `arg` must point to a writable buffer of at least `arg_len` bytes that
-/// outlives the call; the kernel's syscall trampoline guarantees this when
-/// invoking handlers, but direct callers must uphold the same invariant.
-pub unsafe fn syscall_cfg_read32(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
+pub fn syscall_cfg_read32(arg: &mut [u8]) -> i32 {
+    if arg.len() < 8 {
         return -22;
     }
-    let dev_idx = *arg as usize;
-    let offset = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
+    let dev_idx = arg[0] as usize;
+    let offset = u16::from_le_bytes([arg[2], arg[3]]);
     let val = device_cfg_read32(dev_idx, offset);
-    let vb = val.to_le_bytes();
-    *arg.add(4) = vb[0];
-    *arg.add(5) = vb[1];
-    *arg.add(6) = vb[2];
-    *arg.add(7) = vb[3];
+    arg[4..8].copy_from_slice(&val.to_le_bytes());
     0
 }
 
 /// Syscall handler for `PCIE_CFG_WRITE32`. Arg layout:
 ///   in:  `[dev_idx: u8][_pad: u8][offset: u16 LE][value: u32 LE]` (8 bytes).
-/// Returns 0 on success, -22 on malformed arg.
-///
-/// # Safety
-/// `arg` must point to a readable buffer of at least `arg_len` bytes that
-/// outlives the call. Writing to PCIe config space can affect device state
-/// and BAR placement; caller must hold the right contract permission.
-pub unsafe fn syscall_cfg_write32(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
+/// Returns 0 on success, -22 on malformed arg. Writing config space can
+/// affect device state and BAR placement; the caller holds the grant.
+pub fn syscall_cfg_write32(arg: &mut [u8]) -> i32 {
+    if arg.len() < 8 {
         return -22;
     }
-    let dev_idx = *arg as usize;
-    let offset = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
-    let val = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+    let dev_idx = arg[0] as usize;
+    let offset = u16::from_le_bytes([arg[2], arg[3]]);
+    let val = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]);
     device_cfg_write32(dev_idx, offset, val)
 }
 
@@ -1065,7 +1052,10 @@ pub unsafe fn syscall_cfg_write32(arg: *mut u8, arg_len: usize) -> i32 {
 // BAR mapping
 // ============================================================================
 
-pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
+/// Map BAR `bar_idx` of device `dev_idx`: where it lies and its size.
+/// `None` for a device or BAR out of range, one with nothing assigned, or a
+/// full map table.
+pub fn bar_map(dev_idx: usize, bar_idx: usize) -> Option<(u64, u64)> {
     let _cfg = lock_cfg();
     // SAFETY: DEVICES is written only by `enumerate` and BAR_MAPS only here
     // and in `bar_unmap`, all under CFG_LOCK.
@@ -1077,106 +1067,95 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
             log::warn!(
                 "[pcie] bar_map: dev_idx={dev_idx} count={count} bar_idx={bar_idx} out of range"
             );
-            return 0;
+            return None;
         }
         let dev = &DEVICES[dev_idx];
         let phys = dev.bars[bar_idx];
         let size = dev.bar_sizes[bar_idx];
         if phys == 0 || size == 0 {
             log::warn!("[pcie] bar_map: dev{dev_idx} bar{bar_idx} phys={phys:#x} size={size:#x}");
-            return 0;
+            return None;
         }
-
-        let virt = phys as usize;
-        let bdf = ((dev.bus as u16) << 8) | ((dev.dev as u16) << 3) | (dev.func as u16);
+        let bdf = dev.bdf();
 
         // Re-use an existing slot for the same BDF+bar_idx — callers can
         // and do invoke this repeatedly (e.g. nvme retry-on-fault) and
         // allocating a fresh slot each time would exhaust MAX_BAR_MAPS.
         let bar_maps_p = &raw const BAR_MAPS;
-        for m in (*bar_maps_p).iter() {
-            if m.active && m.bdf == bdf && m.bar_idx == bar_idx as u8 {
-                return virt;
-            }
+        let mapped = (*bar_maps_p)
+            .iter()
+            .any(|m| m.active && m.bdf == bdf && m.bar_idx == bar_idx as u8);
+        if !mapped {
+            let slot = (*bar_maps_p).iter().position(|m| !m.active)?;
+            BAR_MAPS[slot] = BarMap {
+                bdf,
+                bar_idx: bar_idx as u8,
+                active: true,
+            };
         }
-
-        let slot = match (*bar_maps_p).iter().position(|m| !m.active) {
-            Some(s) => s,
-            None => return 0,
-        };
-
-        BAR_MAPS[slot] = BarMap {
-            bdf,
-            bar_idx: bar_idx as u8,
-            virt_addr: virt,
-            size: size as usize,
-            active: true,
-        };
-        virt
+        Some((phys, size))
     }
 }
 
-pub fn bar_unmap(virt_addr: usize) -> i32 {
+/// Release the mapping of BAR `bar_idx` of device `dev_idx`; `EINVAL` when
+/// it is not mapped.
+pub fn bar_unmap(dev_idx: usize, bar_idx: usize) -> i32 {
     let _cfg = lock_cfg();
-    // SAFETY: BAR_MAPS is written only here and in `bar_map`, under CFG_LOCK.
+    // SAFETY: DEVICES is written only by `enumerate` and BAR_MAPS only here
+    // and in `bar_map`, all under CFG_LOCK.
     unsafe {
-        let bar_maps_p = &raw mut BAR_MAPS;
-        for m in (*bar_maps_p).iter_mut() {
-            if m.active && m.virt_addr == virt_addr {
-                m.active = false;
-                return 0;
-            }
+        if dev_idx >= *core::ptr::addr_of!(DEVICE_COUNT) {
+            return crate::kernel::sys::errno::EINVAL;
         }
-        crate::kernel::sys::errno::EINVAL
+        let bdf = DEVICES[dev_idx].bdf();
+        let bar_maps_p = &raw mut BAR_MAPS;
+        match (*bar_maps_p)
+            .iter_mut()
+            .find(|m| m.active && m.bdf == bdf && usize::from(m.bar_idx) == bar_idx)
+        {
+            Some(m) => {
+                m.active = false;
+                0
+            }
+            None => crate::kernel::sys::errno::EINVAL,
+        }
     }
+}
+
+/// Write a BAR map's address answer `[addr u64][len u32]` at the head of
+/// `arg`. `ENOMEM` for no mapping, `ERANGE` for a BAR whose size the answer
+/// cannot state.
+fn answer_bar(arg: &mut [u8], mapped: Option<(u64, u64)>) -> i32 {
+    let Some((addr, size)) = mapped else {
+        return crate::kernel::sys::errno::ENOMEM;
+    };
+    let Ok(len) = u32::try_from(size) else {
+        return crate::kernel::sys::errno::ERANGE;
+    };
+    arg[0..8].copy_from_slice(&addr.to_le_bytes());
+    arg[8..12].copy_from_slice(&len.to_le_bytes());
+    0
 }
 
 // ============================================================================
 // Syscall handlers
 // ============================================================================
 
-/// Syscall handler for `PCIE_BAR_MAP`. Arg in: `[dev_idx][bar_idx]`,
-/// out: 8-byte LE virt address at offset 2 when `arg_len >= 10`.
-///
-/// # Safety
-/// `arg` must point to a writable buffer of at least `arg_len` bytes
-/// for the duration of the call. The kernel syscall trampoline upholds
-/// this when invoking the handler.
-pub unsafe fn syscall_bar_map(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
+/// `NIC_BAR_MAP`: in `[dev_idx u8][bar_idx u8]`, out `[addr u64][len u32]`.
+pub fn syscall_bar_map(arg: &mut [u8]) -> i32 {
+    if arg.len() < 12 {
         return crate::kernel::sys::errno::EINVAL;
     }
-    let dev_idx = *arg as usize;
-    let bar_idx = *arg.add(1) as usize;
-    let virt = bar_map(dev_idx, bar_idx);
-    if virt == 0 {
-        return crate::kernel::sys::errno::ENOMEM;
-    }
-    if arg_len >= 10 {
-        let addr_bytes = (virt as u64).to_le_bytes();
-        core::ptr::copy_nonoverlapping(addr_bytes.as_ptr(), arg.add(2), 8);
-    }
-    // Return a small positive success code rather than the low 32 bits
-    // of the virt address. A 64-bit BAR like `0x1B_8002_0000` on Pi 5
-    // PCIe1 truncates to a *negative* i32 otherwise, tricking callers
-    // that check `rc < 0` into thinking the map failed. The real
-    // address is in arg[2..10].
-    1
+    let (dev_idx, bar_idx) = (usize::from(arg[0]), usize::from(arg[1]));
+    answer_bar(arg, bar_map(dev_idx, bar_idx))
 }
 
-/// Syscall handler for `PCIE_BAR_UNMAP`. Arg: 8-byte LE virt address.
-///
-/// # Safety
-/// `arg` must point to a readable buffer of at least 8 bytes for the
-/// duration of the call.
-pub unsafe fn syscall_bar_unmap(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
-        return crate::kernel::sys::errno::EINVAL;
+/// `NIC_BAR_UNMAP`: `[dev_idx u8][bar_idx u8]`, the mapping as it was made.
+pub fn syscall_bar_unmap(arg: &[u8]) -> i32 {
+    match *arg {
+        [dev_idx, bar_idx, ..] => bar_unmap(usize::from(dev_idx), usize::from(bar_idx)),
+        _ => crate::kernel::sys::errno::EINVAL,
     }
-    let mut addr_buf = [0u8; 8];
-    core::ptr::copy_nonoverlapping(arg, addr_buf.as_mut_ptr(), 8);
-    let virt = u64::from_le_bytes(addr_buf) as usize;
-    bar_unmap(virt)
 }
 
 // ============================================================================
@@ -1337,25 +1316,25 @@ unsafe fn finalize_bind(
     let n = core::cmp::min(bytes.len(), slot.alias.len() - 1);
     slot.alias[..n].copy_from_slice(&bytes[..n]);
     slot.alias_len = n as u8;
-    crate::kernel::ipc::fd::tag_fd(crate::kernel::ipc::fd::FD_TAG_PCIE_DEVICE, dev_idx as i32)
+    dev_idx as i32
 }
 
-/// Decode a PCIE_DEVICE handle to its device index. Accepts both the
-/// FD_TAG_PCIE_DEVICE-tagged form (from `BIND`) and a raw slot.
+/// Handles a node may hold on bound devices and their MSI vectors at once.
+pub const MAX_BOUND_HANDLES: usize = MAX_SCAN_DEVS + 32;
+
+/// The index an MSI vector answers (`MSI_ALLOC`): [`VECTOR_BASE`] plus the
+/// vector, a band no device index shares.
+pub const VECTOR_BASE: i32 = 0x1000;
+
+/// The device index a PCIE_DEVICE handle's index names, if it is one.
 #[cfg(feature = "board-pi5")]
 fn decode_handle(handle: i32) -> Option<usize> {
-    if handle < 0 {
-        return None;
-    }
-    let (tag, slot) = crate::kernel::ipc::fd::untag_fd(handle);
-    if tag != 0 && tag != crate::kernel::ipc::fd::FD_TAG_PCIE_DEVICE {
-        return None;
-    }
-    let idx = slot as usize;
-    if idx >= MAX_SCAN_DEVS {
-        return None;
-    }
-    Some(idx)
+    usize::try_from(handle).ok().filter(|&i| i < MAX_SCAN_DEVS)
+}
+
+/// The MSI vector an index names, if it is one.
+pub fn vector_of(handle: i32) -> Option<u8> {
+    u8::try_from(handle.checked_sub(VECTOR_BASE)?).ok()
 }
 
 #[cfg(not(feature = "board-pi5"))]
@@ -1373,15 +1352,18 @@ pub unsafe fn bind_selector(_sel: &[u8]) -> i32 {
 }
 
 /// PCIE_DEVICE `CLOSE`: release per-handle bookkeeping. BAR maps
-/// created via `BAR_MAP` are ref-counted by BDF+bar_idx in
-/// `bar_map` and persist until explicit `NIC_BAR_UNMAP` or reboot.
+/// created via `BAR_MAP` are kept by BDF+bar_idx in `bar_map` and persist
+/// until `NIC_BAR_UNMAP` names them or reboot.
 ///
 /// # Safety
 /// `handle` must be a value previously returned from `bind_selector` or
-/// the untagged slot index. Touches global `BOUND_DEVICES`; caller must
-/// not run concurrently with another close on the same handle.
+/// `MSI_ALLOC`. Touches global `BOUND_DEVICES`; caller must not run
+/// concurrently with another close on the same handle.
 #[cfg(feature = "board-pi5")]
 pub unsafe fn syscall_device_close(handle: i32) -> i32 {
+    if let Some(vec) = vector_of(handle) {
+        return pcie1_msi_free(vec);
+    }
     let idx = match decode_handle(handle) {
         Some(i) => i,
         None => return crate::kernel::sys::errno::EINVAL,
@@ -1403,75 +1385,48 @@ pub unsafe fn syscall_device_close(_handle: i32) -> i32 {
 }
 
 /// PCIE_DEVICE `CFG_READ32`. arg = [offset:u16 LE] at bytes 0..2;
-/// writes value:u32 LE to arg[4..8]. Caller must pass >= 8 bytes.
-///
-/// # Safety
-/// `arg` must point to a writable buffer of at least `arg_len` bytes for
-/// the duration of the call. `handle` must be one previously bound for
-/// this contract.
-pub unsafe fn syscall_device_cfg_read32(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
+/// writes value:u32 LE to arg[4..8]. `arg` holds >= 8 bytes.
+pub fn syscall_device_cfg_read32(handle: i32, arg: &mut [u8]) -> i32 {
+    if arg.len() < 8 {
         return crate::kernel::sys::errno::EINVAL;
     }
     let idx = match decode_handle(handle) {
         Some(i) => i,
         None => return crate::kernel::sys::errno::EINVAL,
     };
-    let offset = u16::from_le_bytes([*arg, *arg.add(1)]);
+    let offset = u16::from_le_bytes([arg[0], arg[1]]);
     let val = device_cfg_read32(idx, offset);
-    let b = val.to_le_bytes();
-    for (i, byte) in b.iter().enumerate() {
-        *arg.add(4 + i) = *byte;
-    }
+    arg[4..8].copy_from_slice(&val.to_le_bytes());
     0
 }
 
 /// PCIE_DEVICE `CFG_WRITE32`. arg = [offset:u16 LE, _pad:u16,
-/// value:u32 LE] (8 bytes).
-///
-/// # Safety
-/// `arg` must point to a readable buffer of at least 8 bytes for the
-/// duration of the call. Writing config space mutates device state, so
-/// `handle` must hold the right contract permission.
-pub unsafe fn syscall_device_cfg_write32(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 {
+/// value:u32 LE] (8 bytes). Writing config space mutates device state;
+/// the handle's holder has the contract's grant.
+pub fn syscall_device_cfg_write32(handle: i32, arg: &[u8]) -> i32 {
+    if arg.len() < 8 {
         return crate::kernel::sys::errno::EINVAL;
     }
     let idx = match decode_handle(handle) {
         Some(i) => i,
         None => return crate::kernel::sys::errno::EINVAL,
     };
-    let offset = u16::from_le_bytes([*arg, *arg.add(1)]);
-    let val = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+    let offset = u16::from_le_bytes([arg[0], arg[1]]);
+    let val = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]);
     device_cfg_write32(idx, offset, val)
 }
 
-/// PCIE_DEVICE `BAR_MAP`. arg = [bar_idx:u8] at byte 0; writes
-/// virt_addr:u64 LE to arg[2..10]. Caller must pass >= 10 bytes.
-/// Returns 0 on success, -errno on failure — success is signalled
-/// by the written address, not the return value.
-///
-/// # Safety
-/// `arg` must point to a writable buffer of at least 10 bytes for the
-/// duration of the call. `handle` must be a bound PCIE_DEVICE handle.
-pub unsafe fn syscall_device_bar_map(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 10 {
+/// PCIE_DEVICE `BAR_MAP`: in `[bar_idx u8]`, out `[addr u64][len u32]`.
+pub fn syscall_device_bar_map(handle: i32, arg: &mut [u8]) -> i32 {
+    if arg.len() < 12 {
         return crate::kernel::sys::errno::EINVAL;
     }
     let idx = match decode_handle(handle) {
         Some(i) => i,
         None => return crate::kernel::sys::errno::EINVAL,
     };
-    let bar_idx = *arg as usize;
-    let virt = bar_map(idx, bar_idx);
-    if virt == 0 {
-        return crate::kernel::sys::errno::ENOMEM;
-    }
-    let ab = (virt as u64).to_le_bytes();
-    for (i, byte) in ab.iter().enumerate() {
-        *arg.add(2 + i) = *byte;
-    }
-    0
+    let bar_idx = usize::from(arg[0]);
+    answer_bar(arg, bar_map(idx, bar_idx))
 }
 
 /// Look up which root complex a bound PCIE_DEVICE handle sits on.
@@ -1503,55 +1458,43 @@ pub unsafe fn bound_device_root(_handle: i32) -> Option<crate::platform::pcie_al
     None
 }
 
-/// PCIE_DEVICE `INFO`. arg is a 32-byte output buffer. Writes:
+/// PCIE_DEVICE `INFO`. arg is a 32-byte output record. Writes:
 ///   [ vendor_id:u16, device_id:u16, class:u32,
 ///     bus:u8, dev:u8, func:u8, _pad:u8,
 ///     alias:[u8; 20] null-terminated ]
 /// Returns 32 on success or -errno.
-///
-/// # Safety
-/// `arg` must point to a writable 32-byte buffer for the duration of
-/// the call. `handle` must be a bound PCIE_DEVICE handle.
-pub unsafe fn syscall_device_info(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 32 {
+pub fn syscall_device_info(handle: i32, arg: &mut [u8]) -> i32 {
+    let Some(out) = arg.get_mut(..32) else {
         return crate::kernel::sys::errno::EINVAL;
-    }
+    };
     let idx = match decode_handle(handle) {
         Some(i) => i,
         None => return crate::kernel::sys::errno::EINVAL,
     };
-    let count = *core::ptr::addr_of!(DEVICE_COUNT);
-    if idx >= count {
-        return crate::kernel::sys::errno::ENODEV;
-    }
-    let dev = &DEVICES[idx];
-    let vid = dev.vendor_id.to_le_bytes();
-    let did = dev.device_id.to_le_bytes();
-    let cls = dev.class.to_le_bytes();
-    *arg = vid[0];
-    *arg.add(1) = vid[1];
-    *arg.add(2) = did[0];
-    *arg.add(3) = did[1];
-    for (i, byte) in cls.iter().enumerate() {
-        *arg.add(4 + i) = *byte;
-    }
-    *arg.add(8) = dev.bus;
-    *arg.add(9) = dev.dev;
-    *arg.add(10) = dev.func;
-    *arg.add(11) = 0;
+    // SAFETY: DEVICES/DEVICE_COUNT are written only by `enumerate`, which
+    // finishes before any module binds a device.
+    let dev = unsafe {
+        if idx >= *core::ptr::addr_of!(DEVICE_COUNT) {
+            return crate::kernel::sys::errno::ENODEV;
+        }
+        &(*core::ptr::addr_of!(DEVICES))[idx]
+    };
+    out[0..2].copy_from_slice(&dev.vendor_id.to_le_bytes());
+    out[2..4].copy_from_slice(&dev.device_id.to_le_bytes());
+    out[4..8].copy_from_slice(&dev.class.to_le_bytes());
+    out[8] = dev.bus;
+    out[9] = dev.dev;
+    out[10] = dev.func;
+    out[11] = 0;
     #[cfg(feature = "board-pi5")]
     {
-        let slot = &*core::ptr::addr_of!(BOUND_DEVICES[idx]);
-        for i in 0..20 {
-            *arg.add(12 + i) = slot.alias[i];
-        }
+        // SAFETY: BOUND_DEVICES is touched only on the scheduler thread,
+        // which runs every provider call.
+        let slot = unsafe { &*core::ptr::addr_of!(BOUND_DEVICES[idx]) };
+        out[12..32].copy_from_slice(&slot.alias[..20]);
     }
     #[cfg(not(feature = "board-pi5"))]
-    {
-        for i in 0..20 {
-            *arg.add(12 + i) = 0;
-        }
-    }
+    out[12..32].fill(0);
     32
 }
 
@@ -1586,7 +1529,8 @@ pub const PCIE1_MSI_VECTORS: usize = 32;
 #[cfg(feature = "board-pi5")]
 #[derive(Clone, Copy)]
 struct MsiVector {
-    event_handle: i32,
+    /// The doorbell the vector rings, once the kernel bound it; -1 before.
+    doorbell: i32,
     active: bool,
 }
 
@@ -1594,7 +1538,7 @@ struct MsiVector {
 impl MsiVector {
     const fn empty() -> Self {
         Self {
-            event_handle: -1,
+            doorbell: -1,
             active: false,
         }
     }
@@ -1670,18 +1614,16 @@ pub unsafe fn pcie1_msi_init() -> bool {
     true
 }
 
-/// Allocate a free MSI vector for `event_handle` and return
-/// `(vector_index, target_addr, data_value)`. The caller writes
-/// `address = target_addr`, `data = data_value` into the peripheral's
-/// MSI-X table entry.
+/// Allocate a free MSI vector and return `(vector_index, target_addr,
+/// data_value)`. The caller writes `address = target_addr`, `data =
+/// data_value` into the peripheral's MSI-X table entry. The vector rings
+/// nothing until its doorbell is bound ([`pcie1_msi_bind_doorbell`]).
 ///
 /// # Safety
-/// `event_handle` must reference a kernel event handle that outlives
-/// the allocated MSI vector (released only on reboot — there is no
-/// per-vector free path). Mutates `PCIE1_MSI_VECTORS_TAB`;
-/// caller must serialize with other allocators on the same root.
+/// Mutates `PCIE1_MSI_VECTORS_TAB`; caller must serialize with other
+/// allocators on the same root.
 #[cfg(feature = "board-pi5")]
-pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)> {
+pub unsafe fn pcie1_msi_alloc_vector() -> Option<(u8, u64, u32)> {
     if !PCIE1_MSI_INITIALISED && !pcie1_msi_init() {
         return None;
     }
@@ -1689,7 +1631,7 @@ pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)
     for (i, slot) in (*tab).iter_mut().take(PCIE1_MSI_VECTORS).enumerate() {
         if !slot.active {
             slot.active = true;
-            slot.event_handle = event_handle;
+            slot.doorbell = -1;
             let data = (brcm::MSI_DATA_CONFIG_VAL_32 & 0xFFFF) | (i as u32);
             return Some((i as u8, brcm::MSI_TARGET_ADDR, data));
         }
@@ -1729,12 +1671,48 @@ pub unsafe fn pcie1_msi_dispatch() -> u32 {
             continue;
         }
         let slot = &*core::ptr::addr_of!(PCIE1_MSI_VECTORS_TAB[v]);
-        if slot.active && slot.event_handle >= 0 {
-            crate::kernel::ipc::event::event_signal_from_isr(slot.event_handle);
+        if slot.active
+            && slot.doorbell >= 0
+            && crate::kernel::ipc::event::doorbell_ring(slot.doorbell)
+        {
             signalled += 1;
         }
     }
     signalled
+}
+
+/// Hand vector `vec` the doorbell it rings: `EBADF` for a vector not
+/// allocated or already bound.
+///
+/// # Safety
+/// Scheduler thread; serialised with the allocator. The interrupt handler
+/// reads the slot.
+#[cfg(feature = "board-pi5")]
+pub unsafe fn pcie1_msi_bind_doorbell(vec: u8, doorbell: i32) -> i32 {
+    let tab = &raw mut PCIE1_MSI_VECTORS_TAB;
+    match (*tab).get_mut(usize::from(vec)) {
+        Some(slot) if slot.active && slot.doorbell < 0 => {
+            slot.doorbell = doorbell;
+            0
+        }
+        _ => crate::kernel::sys::errno::EBADF,
+    }
+}
+
+/// Free vector `vec`: it rings nothing after.
+///
+/// # Safety
+/// As [`pcie1_msi_bind_doorbell`].
+#[cfg(feature = "board-pi5")]
+pub unsafe fn pcie1_msi_free(vec: u8) -> i32 {
+    let tab = &raw mut PCIE1_MSI_VECTORS_TAB;
+    match (*tab).get_mut(usize::from(vec)) {
+        Some(slot) if slot.active => {
+            *slot = MsiVector::empty();
+            0
+        }
+        _ => crate::kernel::sys::errno::EBADF,
+    }
 }
 
 /// QEMU stub — no PCIe RC, MSI init always reports unsupported.
@@ -1750,8 +1728,16 @@ pub unsafe fn pcie1_msi_init() -> bool {
 /// # Safety
 /// No invariants; this stub does not touch hardware or globals.
 #[cfg(not(feature = "board-pi5"))]
-pub unsafe fn pcie1_msi_alloc_vector(_e: i32) -> Option<(u8, u64, u32)> {
+pub unsafe fn pcie1_msi_alloc_vector() -> Option<(u8, u64, u32)> {
     None
+}
+/// QEMU stub — no vectors to bind.
+///
+/// # Safety
+/// No invariants; this stub does not touch hardware or globals.
+#[cfg(not(feature = "board-pi5"))]
+pub unsafe fn pcie1_msi_bind_doorbell(_vec: u8, _doorbell: i32) -> i32 {
+    crate::kernel::sys::errno::EBADF
 }
 /// QEMU stub — no PCIe MSI mux, dispatch always reports zero events.
 ///

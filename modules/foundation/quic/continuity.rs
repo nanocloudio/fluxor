@@ -211,6 +211,11 @@ pub struct ContinuityState {
     signer: i32,
     signer_pub: [u8; sc::custody::PUB_LEN],
     signer_open: bool,
+    /// The ATTEST being signed, and an ATTEST that arrived meanwhile, held
+    /// whole (`attest_held_len` bytes, 0 for none) until it is answered.
+    attest: CustodyAttest,
+    attest_held: [u8; CUSTODY_ATTEST_CMD_LEN],
+    attest_held_len: u8,
 }
 
 /// Initialise the continuity state in-place over the module's zeroed
@@ -243,6 +248,8 @@ unsafe fn continuity_init(s: &mut QuicState) {
     s.continuity.master = -1;
     s.continuity.signer = -1;
     s.continuity.signer_open = false;
+    s.continuity.attest = NO_CUSTODY_ATTEST;
+    s.continuity.attest_held_len = 0;
 }
 
 // ─── Bounded writer / reader ───────────────────────────────────────────
@@ -364,75 +371,6 @@ fn cont_aad(flow_id: &[u8; CONT_FLOW_ID_BYTES], epoch: u32) -> [u8; CONT_FLOW_ID
     aad
 }
 
-/// `AEAD_SEAL` a continuity secret blob under `handle`; bytes written to
-/// `out`, or 0. Distinct from `vault_seal` only in its wider argument
-/// buffer (the secret set is larger than a ticket).
-unsafe fn cont_seal(
-    sys: &SyscallTable,
-    handle: i32,
-    aad: &[u8],
-    pt: &[u8],
-    out: &mut [u8],
-) -> usize {
-    let mut arg = [0u8; 2 + 32 + 2 + CONT_SECRET_PT_MAX + 12];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + aad.len()].copy_from_slice(aad);
-    p += aad.len();
-    arg[p..p + 2].copy_from_slice(&(pt.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + pt.len()].copy_from_slice(pt);
-    p += pt.len();
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(
-        handle,
-        abi::registry::key_vault::AEAD_SEAL,
-        arg.as_mut_ptr(),
-        p + 12,
-    );
-    if rc < 0 {
-        return 0;
-    }
-    u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize
-}
-
-/// `AEAD_OPEN` a sealed continuity blob under `handle` with `aad`.
-unsafe fn cont_open(
-    sys: &SyscallTable,
-    handle: i32,
-    aad: &[u8],
-    blob: &[u8],
-    out: &mut [u8],
-) -> usize {
-    let mut arg = [0u8; 2 + 32 + 2 + CONT_SECRET_PT_MAX + CONT_SEAL_OVERHEAD + 12];
-    if aad.len() > 32 || blob.len() > CONT_SECRET_PT_MAX + CONT_SEAL_OVERHEAD {
-        return 0;
-    }
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + aad.len()].copy_from_slice(aad);
-    p += aad.len();
-    arg[p..p + 2].copy_from_slice(&(blob.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + blob.len()].copy_from_slice(blob);
-    p += blob.len();
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(
-        handle,
-        abi::registry::key_vault::AEAD_OPEN,
-        arg.as_mut_ptr(),
-        p + 12,
-    );
-    if rc < 0 {
-        return 0;
-    }
-    u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize
-}
-
 // ─── SHA-256 helper ────────────────────────────────────────────────────
 
 fn record_sha256(data: &[u8]) -> [u8; 32] {
@@ -531,7 +469,7 @@ unsafe fn serialize_checkpoint(
     }
     let aad = cont_aad(flow_id, epoch);
     let mut sealed = [0u8; CONT_SECRET_PT_MAX + 32];
-    let sealed_len = cont_seal(sys, handle, &aad, &pt[..pp], &mut sealed);
+    let sealed_len = vault_seal(sys, handle, &aad, &pt[..pp], &mut sealed);
     // Zeroize the plaintext secret staging.
     let mut z = 0;
     while z < pp {
@@ -1167,7 +1105,9 @@ unsafe fn import_checkpoint(
     };
     let aad = cont_aad(flow_id, epoch);
     let mut pt = [0u8; CONT_SECRET_PT_MAX];
-    let n = cont_open(sys, handle, &aad, sealed, &mut pt);
+    let n = open_sealed::<{ CONT_SECRET_PT_MAX + CONT_SEAL_OVERHEAD }>(
+        sys, handle, &aad, sealed, &mut pt,
+    );
     if n == 0 {
         return sc::STATUS_CORRUPT;
     }
@@ -2742,12 +2682,15 @@ unsafe fn cont_apply_abort(s: &mut QuicState, payload: &[u8]) {
 unsafe fn cont_pump(s: &mut QuicState) {
     cont_keys_sweep(s);
     cont_service(s);
+    custody_attest_step(s);
     if s.cont_in < 0 {
         return;
     }
     let sys = &*s.syscalls;
     let mut budget = 0;
-    while budget < 8 {
+    // An ATTEST held behind the one being signed stops the drain: the
+    // commands after it stay unread, in order, until it is handled.
+    while budget < 8 && s.continuity.attest_held_len == 0 {
         let poll = (sys.channel_poll)(s.cont_in, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;

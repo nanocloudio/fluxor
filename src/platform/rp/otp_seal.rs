@@ -153,7 +153,7 @@ mod hw {
             return;
         };
         let mut key = [0u8; KEY_BYTES];
-        if crate::kernel::sys::hal::csprng_fill(key.as_mut_ptr(), KEY_BYTES) != 0 {
+        if crate::kernel::sys::hal::csprng_fill(&mut key) != 0 {
             return;
         }
         blob[..4].copy_from_slice(&SEAL_KEY_MAGIC);

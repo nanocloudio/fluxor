@@ -1,9 +1,11 @@
 version = "1.0.0"
 type = "Source"
 hardware_targets = ["rp2350", "bcm2712", "linux"]
+# `stream` serves `stream_select`: the consumer restarts the emit.
+provider_contracts = ["stream_select"]
 
-# Synthetic byte source: emits `size` bytes on every IOCTL_NOTIFY
-# received on its output channel, then signals IOCTL_SET_HUP. Used
+# Synthetic byte source: emits `size` bytes on every `stream_select`
+# `SELECT` its consumer makes, then ends the stream (SET_HUP). Used
 # to decouple HTTP/IP throughput tests from disk content; consumers
 # (curl, range probes) only ever length-check, so the payload itself
 # is the pre-zeroed scratch buffer — see `mod.rs` for the cost trade
@@ -18,12 +20,13 @@ name = "stream"
 direction = "output"
 content_type = "OctetStream"
 required = true
+serves = "stream_select"
 # out[0]: stream — sized comfortably above one full MAX_CHUNK_SIZE
 # chunk so a fresh emit can land without back-pressure even when the
 # consumer is one tick behind. The downstream (http) typically requests
 # 65536; the kernel takes max(producer, consumer) hints, so this value
 # matters only when the downstream isn't http.
-buffer_size = { default = 4096, aarch64 = 65536 }
+buffer_size = { default = 8192, aarch64 = 65536 }
 # MAX_CHUNK_SIZE — largest single chunk emit.
 max_record = { default = 4096, aarch64 = 32768 }
 

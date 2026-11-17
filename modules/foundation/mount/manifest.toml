@@ -11,9 +11,9 @@ timer_class = "wall_clock"
 provides = ["file.data"]
 provider_contracts = ["fs"]
 
-# Every op it routes goes to a volume through `provider_call_sel`, under
-# this module's own `fs` grant: the kernel checks the module that makes the
-# selector call, which is this one (a provider's dispatch runs as the
+# Every op it routes goes to a volume through the handle it bound to that
+# volume by name, under this module's own `fs` grant: the kernel checks the
+# module that makes the call, which is this one (a provider's dispatch runs as the
 # provider), not the consumer whose op it forwards. The volume is the one
 # its `mounts:` table names for the path, so the composer checks that every
 # volume the table names is provided; one the hotplug channel adds as it

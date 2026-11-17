@@ -31,7 +31,12 @@ extern "C" {
 
 /// HAL_PIO dispatch: answer `STREAM_TIME` (handle=-1 → the single wasm audio
 /// stream) with the audio sink's clock. Shape mirrors `linux_stream_time_dispatch`.
-unsafe fn wasm_stream_time_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+fn wasm_stream_time_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    _data: crate::kernel::module::user_span::UserSpan<'_>,
+) -> i32 {
     if opcode != STREAM_CLOCK_QUERY {
         return errno::ENOSYS;
     }
@@ -39,12 +44,13 @@ unsafe fn wasm_stream_time_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
         // Only the "first active stream" (handle=-1) form is meaningful on wasm.
         return errno::EINVAL;
     }
-    if arg.is_null() || arg_len < 24 {
+    let Some(out) = arg.get_mut(..24) else {
         return errno::EINVAL;
-    }
+    };
     // The host writes the full 24-byte StreamTime; a 0 return just means the
     // audio clock has not started yet (snapshot is zeros → the guest cold-starts).
-    let _started = host_stream_time(arg);
+    // SAFETY: the host import writes exactly 24 bytes at `out`, which holds them.
+    let _started = unsafe { host_stream_time(out.as_mut_ptr()) };
     0
 }
 

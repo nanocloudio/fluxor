@@ -34,7 +34,8 @@ const ROUND_MS: u64 = 2_000;
 /// Read granularity of the clocks the anchor is built from.
 const TICK_ERR_US: u64 = 1_000;
 const HB_MS: u64 = 30_000;
-const SCRATCH: usize = 256;
+/// One record `net_in` accepts; also the frame scratch for the requests.
+const SCRATCH: usize = NET_IN_ACCEPTS_RECORD;
 /// Shortest interval between requests to one server: RFC 4330 §10 forbids
 /// polling more often than every 15 s under any conditions.
 pub const MIN_POLL_S: u32 = 15;
@@ -147,7 +148,13 @@ mod params_def {
     }
 }
 
-fluxor_rt::module_facts! { state: State }
+fluxor_rt::module_facts! {
+    state: State,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + DG_V4_PREFIX + NTP_LEN,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -403,6 +410,8 @@ unsafe fn nonce(sys: &SyscallTable, out: &mut [u8; 8]) {
     let rc = (sys.provider_call)(
         -1,
         abi::kernel_abi::RANDOM_FILL,
+        core::ptr::null_mut(),
+        0,
         out.as_mut_ptr(),
         out.len(),
     );
@@ -477,7 +486,14 @@ unsafe fn finish_round(sys: &SyscallTable, s: &mut State, now_ms: u64) {
             arg[..8].copy_from_slice(&b.unix_us.to_le_bytes());
             arg[8..16].copy_from_slice(&b.mono_us.to_le_bytes());
             arg[16..].copy_from_slice(&(err as u32).to_le_bytes());
-            let rc = (sys.provider_call)(-1, timer::DISCIPLINE, arg.as_mut_ptr(), arg.len());
+            let rc = (sys.provider_call)(
+                -1,
+                timer::DISCIPLINE,
+                arg.as_mut_ptr(),
+                arg.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             s.last_rc = rc;
             s.last_err_us = err as u32;
             if rc == 0 {
@@ -564,7 +580,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             s.last_hb_ms = now_ms;
             // The kernel's own verdict on the clock, beside this client's.
             let mut rec = [0u8; tt::LEN];
-            let _ = (sys.provider_call)(-1, timer::TRUSTED_UNIX, rec.as_mut_ptr(), rec.len());
+            let _ = (sys.provider_call)(
+                -1,
+                timer::TRUSTED_UNIX,
+                rec.as_mut_ptr(),
+                rec.len(),
+                core::ptr::null_mut(),
+                0,
+            );
             let mut secs = [0u8; 8];
             secs.copy_from_slice(&rec[tt::OFF_UNIX_SECONDS..tt::OFF_UNIX_SECONDS + 8]);
             let mut unc = [0u8; 4];

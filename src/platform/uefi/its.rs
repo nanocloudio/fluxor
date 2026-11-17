@@ -172,8 +172,10 @@ impl Its {
         Ok(())
     }
 
-    /// One MSI for `device_id`, delivered as a new LPI bound to `event`.
-    fn allocate(&mut self, device_id: u32, event: i32) -> Result<(u64, u32), &'static str> {
+    /// One MSI for `device_id`, delivered as a new LPI: the doorbell address,
+    /// the event ID the device writes, and the LPI, which signals nothing
+    /// until the caller binds it (`gic::bind_lpi`).
+    fn allocate(&mut self, device_id: u32) -> Result<(u64, u32, u32), &'static str> {
         self.device(device_id)?;
         let slot = self.devices[..self.device_count]
             .iter()
@@ -191,9 +193,6 @@ impl Its {
         // SAFETY: inside the property table this module carved.
         unsafe { core::ptr::write_volatile(property as *mut u8, LPI_PRIORITY_ENABLED) };
         clean(property, 1);
-        if gic::bind_lpi(lpi, event) != 0 {
-            return Err("its_binding_table_full");
-        }
         self.command([
             0x0A | (u64::from(device_id) << 32),
             u64::from(event_id) | (u64::from(lpi) << 32),
@@ -209,7 +208,7 @@ impl Its {
         self.sync()?;
         self.next_lpi += 1;
         self.devices[slot].1 += 1;
-        Ok((self.base as u64 + GITS_TRANSLATER, event_id))
+        Ok((self.base as u64 + GITS_TRANSLATER, event_id, lpi))
     }
 }
 
@@ -342,10 +341,10 @@ pub unsafe fn init(machine: &acpi::Machine, redistributor: usize) -> Result<(), 
 }
 
 /// An MSI for the device with ITS device ID `device_id` (its requester ID
-/// through the IORT), signalling `event`: the address and data its MSI-X table
-/// entry takes. `None` with no ITS.
-pub fn allocate(device_id: u32, event: i32) -> Option<Result<(u64, u32), &'static str>> {
+/// through the IORT): the address and data its MSI-X table entry takes, and
+/// the LPI it raises. `None` with no ITS.
+pub fn allocate(device_id: u32) -> Option<Result<(u64, u32, u32), &'static str>> {
     // SAFETY: this runtime steps on one core; set once at boot.
     let its = unsafe { (*core::ptr::addr_of_mut!(ITS)).as_mut()? };
-    Some(its.allocate(device_id, event))
+    Some(its.allocate(device_id))
 }

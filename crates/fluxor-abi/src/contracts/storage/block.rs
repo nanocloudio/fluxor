@@ -8,15 +8,19 @@
 //
 // ## Addressing
 //
-// A block source is not provider-dispatched. It is the channel wired to a
-// consumer's `blocks` input, and every request below is a channel ioctl on
-// that channel. The graph edge is the binding: there is no default source,
-// so inserting a transform (a source on one side, a consumer on the other)
-// never changes which device another consumer reaches.
+// `storage.block` is an edge contract: it is served by the module at the
+// other end of a consumer's `blocks` port, and reached only through that
+// edge. The consumer binds it once (`kernel::BIND` with `bind::PORT` naming
+// its own port) and keeps the bound handle; every op below is a
+// `provider_call` on that handle. The source is handed its own port
+// reference on the edge (`bind::port_ref`) as the op's handle. The graph
+// edge is the binding: there is no default source, so inserting a transform
+// (a source on one side, a consumer on the other) never changes which device
+// another consumer reaches.
 //
 // ## Units
 //
-// Every count and address is in **logical blocks** of the size `CAPS`
+// Every count and address is in **logical blocks** of the size `DESCRIBE`
 // reports. A consumer that has not asked has no licence to assume 512.
 // Addresses are 64-bit; a source whose hardware addresses less refuses an
 // out-of-range request rather than truncating it.
@@ -42,7 +46,7 @@
 // that reports `F_ASYNC` and refuses one that does not; every source that
 // can sit under one does report it.
 //
-// A source that cannot queue reports no [`caps::F_ASYNC`] and answers
+// A source that cannot queue reports no [`describe::F_ASYNC`] and answers
 // `SUBMIT` with `ENOSYS`.
 //
 // `tag` is the consumer's request identity. The source echoes it in the
@@ -63,12 +67,28 @@
 //
 // ## Buffers
 //
-// `buf_ptr` / `buf_len` name the caller's memory. `buf_len` must equal
+// A queued request's memory is a lend. The consumer lends its buffer or
+// block cache once, on the bound handle (`lend::OPEN`, direction in/out as
+// it reads and writes), under a cookie it chooses, and every `SUBMIT` names
+// `[lend][offset][buf_len]` inside it. `buf_len` must equal
 // `nblocks * logical_block_size` for `READ` and `WRITE` and be zero for
-// every other op. A read buffer is lent to the source until the request's
-// completion is reaped (or `EXEC` returns). A write buffer is lent for the
-// same span, unless the source reports [`caps::F_WRITE_COPIES`], in which
-// case it is released when `SUBMIT` returns.
+// every other op, which names no lend.
+//
+// The source resolves the cookie under the port reference it was handed
+// (`lend::RESOLVE`), refuses a range outside the lend or a direction the
+// lend does not allow, moves the bytes, and returns the borrow
+// (`lend::RETURN`) before the request's completion becomes reapable. A read
+// buffer is therefore the source's until its completion is reaped. A write
+// buffer is lent for the same span, unless the source reports
+// [`describe::F_WRITE_COPIES`]: it copies the bytes and returns the borrow before
+// `SUBMIT` returns.
+//
+// `EXEC` names no lend: its buffer is the call's `data` span
+// (`data_len == buf_len` for `READ` and `WRITE`, zero for every other op),
+// and its `lend` and `offset` fields are zero.
+//
+// `READ_STREAM` names no buffer either: its blocks arrive on the edge's
+// channel.
 //
 // ## Fences
 //
@@ -82,7 +102,7 @@
 // - a read or a failure: no fence (`fence_len = 0`).
 //
 // A source whose device has no volatile write cache reports no
-// [`caps::F_FLUSH`], and every completed write is `LocalDurable`.
+// [`describe::F_FLUSH`], and every completed write is `LocalDurable`.
 //
 // ## Retries
 //
@@ -90,31 +110,29 @@
 // byte-identical data at the same address. A source may execute a block
 // write more than once; it never merges or reorders the bytes of one.
 
-/// Channel ioctl commands on a block source's `blocks` channel.
-pub mod ioctl {
-    /// Stream `nblocks` blocks back on the channel itself instead of into a
-    /// buffer. Argument: one [`super::req`] record with `op = READ`;
-    /// `buf_ptr`/`buf_len` are ignored. For a consumer that participates in
-    /// the channel state machine rather than one that needs bytes inside its
-    /// own dispatch. Returns 0 when queued.
-    pub const READ_STREAM: u32 = 0x4E56_0002;
-    /// Describe the source. Argument: one [`super::caps`] record, written by
-    /// the source. Returns `caps::LEN`, or `EAGAIN` while the device has
-    /// not attached.
-    pub const CAPS: u32 = 0x4E56_0009;
-    /// Queue one request. Argument: one [`super::req`] record. Returns 0 when
-    /// queued, `EAGAIN` when the queue is full, or a negative errno when the
-    /// request is refused before it is queued.
-    pub const SUBMIT: u32 = 0x4E56_000A;
-    /// Hand back one finished completion. Argument: one [`super::cpl`]
-    /// record, written by the source. Returns 1 when a completion was
-    /// written and 0 when none is ready.
-    pub const REAP: u32 = 0x4E56_000B;
-    /// Run one request to completion. Argument: one [`super::req`] record
-    /// followed by one [`super::cpl`] record, which the source writes.
-    /// Returns the completion's status.
-    pub const EXEC: u32 = 0x4E56_000C;
-}
+// ## Ops
+//
+// Op numbers are `registry::storage_block`:
+//
+// - `DESCRIBE`: `arg` out one [`describe`] record. Returns 0, or `EAGAIN`
+//   while the device has not attached. The record's `F_*` flags are this
+//   contract's capability bits: they qualify the geometry beside them (the
+//   queue depth is meaningful with `F_ASYNC`, the device id with
+//   `F_FLUSH`) and exist only once the device has attached, so they travel
+//   in the one record a consumer reads after binding, and the contract has
+//   no separate `CAPS`.
+// - `SUBMIT`: `arg` in one [`req`] record. Returns 0 when queued, `EAGAIN`
+//   when the queue is full, or a negative errno when the request is refused
+//   before it is queued.
+// - `REAP`: `arg` out one [`cpl`] record. Returns 1 when a completion was
+//   written and 0 when none is ready.
+// - `EXEC`: `arg` inout one [`req`] record followed by one [`cpl`] record,
+//   which the source writes ([`exec`]); `data` the buffer. Returns the
+//   completion's status.
+// - `READ_STREAM`: `arg` in one [`req`] record with `op = READ`, naming no
+//   buffer; the blocks are streamed onto the edge's channel. For a consumer
+//   that participates in the channel state machine rather than one that
+//   needs bytes inside its own dispatch. Returns 0 when queued.
 
 /// Request operations.
 pub mod op {
@@ -132,7 +150,9 @@ pub const F_PREFLUSH: u8 = 0x02;
 /// Every flag this contract defines.
 pub const F_ALL: u8 = F_FUA | F_PREFLUSH;
 
-/// Request record.
+/// Request record:
+/// `[op u8][flags u8][0 u16][nblocks u32][lba u64][lend u32][offset u32]
+/// [buf_len u32][0 u32][tag u64]`.
 pub mod req {
     /// Total length, in bytes.
     pub const LEN: usize = 40;
@@ -144,8 +164,10 @@ pub mod req {
     pub const NBLOCKS: usize = 4;
     /// `u64` LE — first logical block.
     pub const LBA: usize = 8;
-    /// `u64` LE — caller's buffer.
-    pub const BUF_PTR: usize = 16;
+    /// `u32` LE — the cookie of the consumer's lend the buffer lies in.
+    pub const LEND: usize = 16;
+    /// `u32` LE — the buffer's offset inside that lend.
+    pub const OFFSET: usize = 20;
     /// `u32` LE — buffer length in bytes.
     pub const BUF_LEN: usize = 24;
     /// `u64` LE — consumer's request identity, echoed in the completion.
@@ -168,8 +190,16 @@ pub mod cpl {
     pub const FENCE_CAP: usize = LEN - FENCE;
 }
 
-/// Capability record.
-pub mod caps {
+/// `EXEC` argument: one [`req`] record, then one [`cpl`] record.
+pub mod exec {
+    /// The completion's offset in the argument.
+    pub const CPL: usize = super::req::LEN;
+    /// Total length, in bytes.
+    pub const ARG_LEN: usize = super::req::LEN + super::cpl::LEN;
+}
+
+/// The device description record `DESCRIBE` answers.
+pub mod describe {
     /// Total length, in bytes.
     pub const LEN: usize = 40;
     /// `u32` LE — logical block size in bytes.
@@ -213,7 +243,11 @@ pub struct Req {
     pub flags: u8,
     pub nblocks: u32,
     pub lba: u64,
-    pub buf_ptr: u64,
+    /// Cookie of the lend the buffer lies in (`SUBMIT`); 0 for `EXEC` and
+    /// for an op without a buffer.
+    pub lend: u32,
+    /// Offset of the buffer inside that lend.
+    pub offset: u32,
     pub buf_len: u32,
     pub tag: u64,
 }
@@ -230,16 +264,43 @@ impl Req {
         o[req::FLAGS] = self.flags;
         o[req::NBLOCKS..req::NBLOCKS + 4].copy_from_slice(&self.nblocks.to_le_bytes());
         o[req::LBA..req::LBA + 8].copy_from_slice(&self.lba.to_le_bytes());
-        o[req::BUF_PTR..req::BUF_PTR + 8].copy_from_slice(&self.buf_ptr.to_le_bytes());
+        o[req::LEND..req::LEND + 4].copy_from_slice(&self.lend.to_le_bytes());
+        o[req::OFFSET..req::OFFSET + 4].copy_from_slice(&self.offset.to_le_bytes());
         o[req::BUF_LEN..req::BUF_LEN + 4].copy_from_slice(&self.buf_len.to_le_bytes());
         o[req::TAG..req::TAG + 8].copy_from_slice(&self.tag.to_le_bytes());
         true
     }
 
+    /// Read a `READ_STREAM` request from `buf[..req::LEN]`: a `READ` of at
+    /// least one block that names no buffer (no lend, offset or length) and
+    /// carries no flag, since its blocks arrive on the edge's channel.
+    pub fn decode_stream(buf: &[u8]) -> Option<Req> {
+        if buf.len() < req::LEN {
+            return None;
+        }
+        let r = Req {
+            op: buf[req::OP],
+            flags: buf[req::FLAGS],
+            nblocks: u32::from_le_bytes(buf[req::NBLOCKS..req::NBLOCKS + 4].try_into().ok()?),
+            lba: u64::from_le_bytes(buf[req::LBA..req::LBA + 8].try_into().ok()?),
+            lend: u32::from_le_bytes(buf[req::LEND..req::LEND + 4].try_into().ok()?),
+            offset: u32::from_le_bytes(buf[req::OFFSET..req::OFFSET + 4].try_into().ok()?),
+            buf_len: u32::from_le_bytes(buf[req::BUF_LEN..req::BUF_LEN + 4].try_into().ok()?),
+            tag: u64::from_le_bytes(buf[req::TAG..req::TAG + 8].try_into().ok()?),
+        };
+        let ok = r.op == op::READ
+            && r.flags == 0
+            && r.nblocks != 0
+            && r.buf_len == 0
+            && r.lend == 0
+            && r.offset == 0;
+        ok.then_some(r)
+    }
+
     /// Read a request from `buf[..req::LEN]`, refusing any record this
     /// contract does not define: an unknown op or flag, `F_FUA` off a write,
-    /// a data op without blocks or buffer, a non-data op with a buffer, or a
-    /// `FLUSH` that names blocks.
+    /// a data op without blocks or buffer, a non-data op with a buffer or a
+    /// lend, or a `FLUSH` that names blocks.
     ///
     /// Whether `buf_len` matches `nblocks` is the source's check: only it
     /// knows its block size.
@@ -252,7 +313,8 @@ impl Req {
             flags: buf[req::FLAGS],
             nblocks: u32::from_le_bytes(buf[req::NBLOCKS..req::NBLOCKS + 4].try_into().ok()?),
             lba: u64::from_le_bytes(buf[req::LBA..req::LBA + 8].try_into().ok()?),
-            buf_ptr: u64::from_le_bytes(buf[req::BUF_PTR..req::BUF_PTR + 8].try_into().ok()?),
+            lend: u32::from_le_bytes(buf[req::LEND..req::LEND + 4].try_into().ok()?),
+            offset: u32::from_le_bytes(buf[req::OFFSET..req::OFFSET + 4].try_into().ok()?),
             buf_len: u32::from_le_bytes(buf[req::BUF_LEN..req::BUF_LEN + 4].try_into().ok()?),
             tag: u64::from_le_bytes(buf[req::TAG..req::TAG + 8].try_into().ok()?),
         };
@@ -263,9 +325,11 @@ impl Req {
             return None;
         }
         let ok = match r.op {
-            op::READ | op::WRITE => r.nblocks != 0 && r.buf_len != 0 && r.buf_ptr != 0,
-            op::DISCARD => r.nblocks != 0 && r.buf_len == 0,
-            op::FLUSH => r.nblocks == 0 && r.lba == 0 && r.buf_len == 0,
+            op::READ | op::WRITE => r.nblocks != 0 && r.buf_len != 0,
+            op::DISCARD => r.nblocks != 0 && r.buf_len == 0 && r.lend == 0 && r.offset == 0,
+            op::FLUSH => {
+                r.nblocks == 0 && r.lba == 0 && r.buf_len == 0 && r.lend == 0 && r.offset == 0
+            }
             _ => false,
         };
         if ok {
@@ -278,6 +342,19 @@ impl Req {
     /// Whether the source writes into the caller's buffer.
     pub fn writes_buffer(&self) -> bool {
         self.op == op::READ
+    }
+
+    /// Whether the op moves bytes through a buffer.
+    pub fn has_buffer(&self) -> bool {
+        matches!(self.op, op::READ | op::WRITE)
+    }
+
+    /// The buffer's byte range inside a lend of `lend_len` bytes, or `None`
+    /// when it does not lie wholly inside it.
+    pub fn range_in(&self, lend_len: usize) -> Option<core::ops::Range<usize>> {
+        let start = self.offset as usize;
+        let end = start.checked_add(self.buf_len as usize)?;
+        (end <= lend_len).then_some(start..end)
     }
 }
 
@@ -342,9 +419,9 @@ impl Cpl {
     }
 }
 
-/// A decoded capability record.
+/// A decoded [`describe`] record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Caps {
+pub struct Description {
     pub logical_block_size: u32,
     pub block_count: u64,
     pub max_blocks: u32,
@@ -354,64 +431,68 @@ pub struct Caps {
     pub device_id: u64,
 }
 
-impl Caps {
-    /// Write this record at `out[..caps::LEN]`.
+impl Description {
+    /// Write this record at `out[..describe::LEN]`.
     pub fn encode(&self, out: &mut [u8]) -> bool {
-        if out.len() < caps::LEN {
+        if out.len() < describe::LEN {
             return false;
         }
-        let o = &mut out[..caps::LEN];
+        let o = &mut out[..describe::LEN];
         o.fill(0);
-        o[caps::LOGICAL_BLOCK_SIZE..caps::LOGICAL_BLOCK_SIZE + 4]
+        o[describe::LOGICAL_BLOCK_SIZE..describe::LOGICAL_BLOCK_SIZE + 4]
             .copy_from_slice(&self.logical_block_size.to_le_bytes());
-        o[caps::BLOCK_COUNT..caps::BLOCK_COUNT + 8]
+        o[describe::BLOCK_COUNT..describe::BLOCK_COUNT + 8]
             .copy_from_slice(&self.block_count.to_le_bytes());
-        o[caps::MAX_BLOCKS..caps::MAX_BLOCKS + 4].copy_from_slice(&self.max_blocks.to_le_bytes());
-        o[caps::ATOMIC_BLOCKS..caps::ATOMIC_BLOCKS + 4]
+        o[describe::MAX_BLOCKS..describe::MAX_BLOCKS + 4]
+            .copy_from_slice(&self.max_blocks.to_le_bytes());
+        o[describe::ATOMIC_BLOCKS..describe::ATOMIC_BLOCKS + 4]
             .copy_from_slice(&self.atomic_blocks.to_le_bytes());
-        o[caps::QUEUE_DEPTH..caps::QUEUE_DEPTH + 2]
+        o[describe::QUEUE_DEPTH..describe::QUEUE_DEPTH + 2]
             .copy_from_slice(&self.queue_depth.to_le_bytes());
-        o[caps::FLAGS..caps::FLAGS + 4].copy_from_slice(&self.flags.to_le_bytes());
-        o[caps::DEVICE_ID..caps::DEVICE_ID + 8].copy_from_slice(&self.device_id.to_le_bytes());
+        o[describe::FLAGS..describe::FLAGS + 4].copy_from_slice(&self.flags.to_le_bytes());
+        o[describe::DEVICE_ID..describe::DEVICE_ID + 8]
+            .copy_from_slice(&self.device_id.to_le_bytes());
         true
     }
 
-    /// Read a capability record, refusing one no source may report: a block
+    /// Read a [`describe`] record, refusing one no source may report: a block
     /// size that is not a power of two of at least 512, or a zero
     /// per-request, atomic or queue limit.
-    pub fn decode(buf: &[u8]) -> Option<Caps> {
-        if buf.len() < caps::LEN {
+    pub fn decode(buf: &[u8]) -> Option<Description> {
+        if buf.len() < describe::LEN {
             return None;
         }
-        let c = Caps {
+        let c = Description {
             logical_block_size: u32::from_le_bytes(
-                buf[caps::LOGICAL_BLOCK_SIZE..caps::LOGICAL_BLOCK_SIZE + 4]
+                buf[describe::LOGICAL_BLOCK_SIZE..describe::LOGICAL_BLOCK_SIZE + 4]
                     .try_into()
                     .ok()?,
             ),
             block_count: u64::from_le_bytes(
-                buf[caps::BLOCK_COUNT..caps::BLOCK_COUNT + 8]
+                buf[describe::BLOCK_COUNT..describe::BLOCK_COUNT + 8]
                     .try_into()
                     .ok()?,
             ),
             max_blocks: u32::from_le_bytes(
-                buf[caps::MAX_BLOCKS..caps::MAX_BLOCKS + 4]
+                buf[describe::MAX_BLOCKS..describe::MAX_BLOCKS + 4]
                     .try_into()
                     .ok()?,
             ),
             atomic_blocks: u32::from_le_bytes(
-                buf[caps::ATOMIC_BLOCKS..caps::ATOMIC_BLOCKS + 4]
+                buf[describe::ATOMIC_BLOCKS..describe::ATOMIC_BLOCKS + 4]
                     .try_into()
                     .ok()?,
             ),
             queue_depth: u16::from_le_bytes(
-                buf[caps::QUEUE_DEPTH..caps::QUEUE_DEPTH + 2]
+                buf[describe::QUEUE_DEPTH..describe::QUEUE_DEPTH + 2]
                     .try_into()
                     .ok()?,
             ),
-            flags: u32::from_le_bytes(buf[caps::FLAGS..caps::FLAGS + 4].try_into().ok()?),
+            flags: u32::from_le_bytes(buf[describe::FLAGS..describe::FLAGS + 4].try_into().ok()?),
             device_id: u64::from_le_bytes(
-                buf[caps::DEVICE_ID..caps::DEVICE_ID + 8].try_into().ok()?,
+                buf[describe::DEVICE_ID..describe::DEVICE_ID + 8]
+                    .try_into()
+                    .ok()?,
             ),
         };
         let lbs = c.logical_block_size;
@@ -432,12 +513,12 @@ impl Caps {
         match r.op {
             op::READ => {}
             op::WRITE => {
-                if !has(caps::F_WRITE) {
+                if !has(describe::F_WRITE) {
                     return false;
                 }
             }
             op::DISCARD => {
-                if !has(caps::F_DISCARD) {
+                if !has(describe::F_DISCARD) {
                     return false;
                 }
             }

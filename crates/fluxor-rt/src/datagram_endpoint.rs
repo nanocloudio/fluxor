@@ -2,8 +2,8 @@
 //
 // Layer: cores (reusable SDK implementation, `include!`d at a consumer module's
 // top level so it shares the module's `sdk/runtime` scope — `net_write_frame`,
-// `net_read_frame`, `parse_dg_rx_from_v4`, `dev_dg_send_to_v4_owned`,
-// `dev_owner_tag`, `dev_micros`, the
+// `net_read_frame`, `parse_dg_rx_from_v4`, `dev_dg_send_to_v4`,
+// `dev_micros`, the
 // `DG_*` opcodes). NOT a wire contract: it drives the EXISTING `datagram`
 // contract (CMD_DG_BIND / MSG_DG_BOUND / CMD_DG_SEND_TO / MSG_DG_RX_FROM), it
 // does not define a new one.
@@ -20,14 +20,10 @@
 // `dtls` 4-tuple), or ignoring it (send-only). Burying the channel read inside a
 // per-endpoint `recv` would drop another endpoint's frames on a shared channel.
 //
-// ENDPOINT AUTHORITY. An `ep_id` is a provider-side index, and the provider's
-// command channel merges every producer into one stream with no producer
-// identity attached, so the index alone cannot say who sent a command. The bind
-// therefore stamps the module's own owner slot (`dev_owner_tag`) on the
-// endpoint and every send presents it; the provider refuses a mismatch with
-// `EPERM`. The tag names an owner, not a module: two modules of the same owner
-// sharing a channel are not separated by it, and a base-graph module is owner
-// slot 0 (the host wildcard, emitted as the untagged shape).
+// ENDPOINT AUTHORITY. An `ep_id` is a provider-side index. The provider
+// records against each endpoint the owner the kernel attests for the channel
+// its bind arrived on, and refuses (`EPERM`) a send or close on it from a
+// channel of another owner. Nothing in the records names an owner.
 //
 // Two usage modes:
 //   send-only / single endpoint:
@@ -126,10 +122,6 @@ pub struct DatagramEndpoint {
     pub phase: BindPhase,
     /// endpoint id from MSG_DG_BOUND (`0xFF` = unallocated).
     pub ep_id: u8,
-    /// The owner tag this endpoint was bound with — the module's own owner slot
-    /// (`dev_owner_tag`), latched at the first bind attempt and presented on
-    /// every send. `0` is the host wildcard and emits the untagged shape.
-    pub owner_tag: u16,
     pub bind_attempts: u16,
     pub backoff_until_micros: u64,
 }
@@ -149,7 +141,6 @@ impl DatagramEndpoint {
         DatagramEndpoint {
             phase: BindPhase::Unbound,
             ep_id: 0xFF,
-            owner_tag: 0,
             bind_attempts: 0,
             backoff_until_micros: 0,
         }
@@ -208,29 +199,8 @@ impl DatagramEndpoint {
                 self.phase = BindPhase::Binding;
                 return;
             }
-            // CMD_DG_BIND payload: [port: u16 LE][flags: u8 = 0][owner_tag: u16 LE]?
-            //
-            // The tag is the module's own owner slot, read from the kernel — a
-            // module can only read its own. It stamps the endpoint's holder, so
-            // a later send or close from another consumer on this shared command
-            // channel is refused rather than sourced from a socket it does not
-            // hold. Owner slot 0 (a base-graph, host-owned module) is the host
-            // wildcard: the tag field is omitted and the frame is the untagged
-            // shape, byte for byte.
-            self.owner_tag = dev_owner_tag(sys);
-            let mut payload = [0u8; 5];
-            let p = bind_port.to_le_bytes();
-            payload[0] = p[0];
-            payload[1] = p[1];
-            payload[2] = 0;
-            let payload_len = if self.owner_tag == 0 {
-                3
-            } else {
-                let t = self.owner_tag.to_le_bytes();
-                payload[3] = t[0];
-                payload[4] = t[1];
-                5
-            };
+            let payload = abi::contracts::net::datagram::bind(bind_port, 0);
+            let payload_len = payload.len();
             let wrote = net_write_frame(
                 sys,
                 net_out,
@@ -365,11 +335,10 @@ impl DatagramEndpoint {
         if self.phase != BindPhase::Bound || net_out < 0 || self.ep_id == 0xFF {
             return 0;
         }
-        let n = dev_dg_send_to_v4_owned(
+        let n = dev_dg_send_to_v4(
             sys,
             net_out,
             self.ep_id,
-            self.owner_tag,
             dst_ip,
             dst_port,
             data,
@@ -406,11 +375,10 @@ impl DatagramEndpoint {
         if self.phase != BindPhase::Bound || net_out < 0 || self.ep_id == 0xFF {
             return 0;
         }
-        let n = dev_dg_send_to_v6_owned(
+        let n = dev_dg_send_to_v6(
             sys,
             net_out,
             self.ep_id,
-            self.owner_tag,
             dst,
             dst_port,
             data,
@@ -449,11 +417,10 @@ impl DatagramEndpoint {
         if self.phase != BindPhase::Bound || net_out < 0 || self.ep_id == 0xFF {
             return 0;
         }
-        let n = dev_dg_send_to_name_owned(
+        let n = dev_dg_send_to_name(
             sys,
             net_out,
             self.ep_id,
-            self.owner_tag,
             name,
             dst_port,
             data,
@@ -508,16 +475,9 @@ pub unsafe fn dg_recv(
         return None;
     }
     let (msg_type, payload_len, full_len) = net_read_frame_sized(sys, net_in, scratch, scratch_max);
-    if msg_type == DG_MSG_BOUND && payload_len >= 1 {
-        // MSG_DG_BOUND payload: [ep_id:1][local_port:2 LE]. The local port is
-        // informational (the endpoint routes by ep_id); tolerate its absence.
-        let ep_id = *scratch.add(NET_FRAME_HDR);
-        let local_port = if payload_len >= 3 {
-            (*scratch.add(NET_FRAME_HDR + 1) as u16)
-                | ((*scratch.add(NET_FRAME_HDR + 2) as u16) << 8)
-        } else {
-            0
-        };
+    let payload = core::slice::from_raw_parts(scratch.add(NET_FRAME_HDR), payload_len);
+    if msg_type == DG_MSG_BOUND {
+        let (ep_id, local_port) = abi::contracts::net::datagram::dg_bound_parts(payload)?;
         Some(DgEvent::Bound { ep_id, local_port })
     } else if msg_type == DG_MSG_RX_FROM {
         parse_dg_rx_from_v4(scratch, payload_len).map(|(ep_id, src_ip, src_port, data, len)| {
@@ -530,11 +490,11 @@ pub unsafe fn dg_recv(
                 full_len: full_len - DG_V4_PREFIX,
             }
         })
-    } else if msg_type == DG_MSG_ERROR && payload_len >= 2 {
+    } else if msg_type == DG_MSG_ERROR && payload_len == abi::contracts::net::datagram::ERROR_LEN {
         let ep_id = *scratch.add(NET_FRAME_HDR);
         let errno = *scratch.add(NET_FRAME_HDR + 1) as i8;
         Some(DgEvent::Err { ep_id, errno })
-    } else if msg_type == DG_MSG_CLOSED && payload_len >= 1 {
+    } else if msg_type == DG_MSG_CLOSED && payload_len == 1 {
         Some(DgEvent::Closed {
             ep_id: *scratch.add(NET_FRAME_HDR),
         })

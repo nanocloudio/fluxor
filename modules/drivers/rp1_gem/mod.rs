@@ -109,7 +109,6 @@ const DMACFG_ADDR64: u32 = 1 << 30; // 64-bit address bus
 
 // NIC syscall opcodes
 const NIC_RING_CREATE: u32 = abi::registry::platform_nic_ring::NIC_RING_CREATE;
-const NIC_RING_INFO: u32 = abi::registry::platform_nic_ring::NIC_RING_INFO;
 
 // ============================================================================
 // GEM RX descriptor (Cadence native, 64-bit addressing)
@@ -455,10 +454,9 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     }
 
     // Create NIC DMA ring. PLATFORM_NIC_RING is a first-class contract
-    // for ring management; the kernel binds the returned handle and
-    // routes subsequent calls (NIC_RING_INFO/DESTROY) via that
-    // contract. Access is gated by the module's `platform_raw`
-    // permission.
+    // for ring management; the returned handle names the ring, and
+    // NIC_RING_INFO / NIC_RING_DESTROY are ops on it. Access is gated
+    // by the module's `platform_raw` permission.
     let mut ring_arg = [0u8; 8];
     let p = ring_arg.as_mut_ptr();
     write_volatile(p as *mut u16, RX_DESC_COUNT.to_le());
@@ -473,48 +471,23 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     }
     s.ring_handle = ring_handle;
 
-    // Get ring info
-    let mut info = [0u8; 32];
-    let info_rc = (sys.provider_call)(ring_handle, NIC_RING_INFO, info.as_mut_ptr(), 32);
-    if info_rc < 0 {
+    // Where the ring's three parts lie.
+    use abi::platform::bcm2712::nic_ring::info;
+    let (Some(rx), Some(tx), Some(bufs)) = (
+        dev_nic_ring_info(sys, ring_handle, info::RX_DESC),
+        dev_nic_ring_info(sys, ring_handle, info::TX_DESC),
+        dev_nic_ring_info(sys, ring_handle, info::BUFFERS),
+    ) else {
         log_msg(sys, b"[rp1_gem] RING_INFO failed");
         return false;
-    }
-    let ip = info.as_ptr();
-    s.rx_desc_addr = u64::from_le_bytes([
-        read_volatile(ip),
-        read_volatile(ip.add(1)),
-        read_volatile(ip.add(2)),
-        read_volatile(ip.add(3)),
-        read_volatile(ip.add(4)),
-        read_volatile(ip.add(5)),
-        read_volatile(ip.add(6)),
-        read_volatile(ip.add(7)),
-    ]);
-    s.rx_desc_count = u16::from_le_bytes([read_volatile(ip.add(8)), read_volatile(ip.add(9))]);
-    s.tx_desc_addr = u64::from_le_bytes([
-        read_volatile(ip.add(10)),
-        read_volatile(ip.add(11)),
-        read_volatile(ip.add(12)),
-        read_volatile(ip.add(13)),
-        read_volatile(ip.add(14)),
-        read_volatile(ip.add(15)),
-        read_volatile(ip.add(16)),
-        read_volatile(ip.add(17)),
-    ]);
-    s.tx_desc_count = u16::from_le_bytes([read_volatile(ip.add(18)), read_volatile(ip.add(19))]);
-    s.buf_pool_addr = u64::from_le_bytes([
-        read_volatile(ip.add(20)),
-        read_volatile(ip.add(21)),
-        read_volatile(ip.add(22)),
-        read_volatile(ip.add(23)),
-        read_volatile(ip.add(24)),
-        read_volatile(ip.add(25)),
-        read_volatile(ip.add(26)),
-        read_volatile(ip.add(27)),
-    ]);
-    s.buf_size = u16::from_le_bytes([read_volatile(ip.add(28)), read_volatile(ip.add(29))]);
-    s.buf_count = u16::from_le_bytes([read_volatile(ip.add(30)), read_volatile(ip.add(31))]);
+    };
+    s.rx_desc_addr = rx.0;
+    s.rx_desc_count = rx.2;
+    s.tx_desc_addr = tx.0;
+    s.tx_desc_count = tx.2;
+    s.buf_pool_addr = bufs.0;
+    s.buf_count = bufs.2;
+    s.buf_size = bufs.3;
 
     // Reformat descriptors in Cadence GEM native layout
     init_rx_descriptors(s);
@@ -565,7 +538,15 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     // administered address — if the kernel has nothing for us.
     const SYS_GET_HW_ETHERNET_MAC: u32 = abi::registry::kernel::GET_HW_ETHERNET_MAC;
     let mut probed = [0u8; 6];
-    s.mac = if (sys.provider_call)(-1, SYS_GET_HW_ETHERNET_MAC, probed.as_mut_ptr(), 6) == 6 {
+    s.mac = if (sys.provider_call)(
+        -1,
+        SYS_GET_HW_ETHERNET_MAC,
+        probed.as_mut_ptr(),
+        6,
+        core::ptr::null_mut(),
+        0,
+    ) == 6
+    {
         probed
     } else {
         DEFAULT_MAC
@@ -1048,24 +1029,6 @@ pub unsafe extern "C" fn module_new(
     s.tx_packets = 0;
     s.tx_completed = 0;
     s.link_poll_counter = 0;
-    // The frame channel's reader answers the transmit-drain query, so a
-    // fence upstream can learn when the wire is quiet.
-    if in_chan >= 0 {
-        let mut reg = [0u8; 16];
-        reg[..8].copy_from_slice(&(state as u64).to_le_bytes());
-        reg[8..16].copy_from_slice(&(gem_tx_drain_ioctl as usize as u64).to_le_bytes());
-        // SAFETY: `syscalls` is the kernel table handed to `module_new`;
-        // the registration payload is the 16-byte layout `REGISTER_IOCTL`
-        // documents.
-        let _ = unsafe {
-            ((*syscalls).provider_call)(
-                in_chan,
-                abi::registry::channel::REGISTER_IOCTL,
-                reg.as_mut_ptr(),
-                16,
-            )
-        };
-    }
     s.link_poll_counter = 0;
     s.rx_resource_total = 0;
     s.rx_overrun_total = 0;
@@ -1077,19 +1040,38 @@ pub unsafe extern "C" fn module_new(
     0
 }
 
-/// `net::identity::tx_drain::IOCTL` on the frame channel: `0` with the
-/// completed count once no frame is unread on the channel and every
-/// submitted descriptor has been used by the GEM; `EAGAIN` until then.
-unsafe extern "C" fn gem_tx_drain_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
-    const IOCTL_TX_DRAIN: u32 = 0x0010;
+/// Serves the edge contract `net_tx_drain` on the frames input (the edge
+/// `ip` writes): `DRAINED` answers `0` with the completed transmit count in
+/// `arg` once no frame is unread on the edge and every submitted descriptor
+/// has been used by the GEM, and `EAGAIN` until then. A fence upstream
+/// learns from it when the wire is quiet.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised; `arg[..arg_len]` is valid for the
+/// call.
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_provider_dispatch"]
+pub unsafe extern "C" fn module_provider_dispatch(
+    state: *mut u8,
+    _handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    _data: *mut u8,
+    _data_len: usize,
+) -> i32 {
     const E_NOSYS: i32 = -38;
     const E_AGAIN: i32 = -11;
     const E_INVAL: i32 = -22;
     if state.is_null() {
         return E_INVAL;
     }
-    if cmd != IOCTL_TX_DRAIN {
+    if op != abi::registry::net_tx_drain::DRAINED {
         return E_NOSYS;
+    }
+    if arg.is_null() || arg_len < abi::contracts::net::identity::tx_drain::ARG_LEN {
+        return E_INVAL;
     }
     let s = &mut *(state as *mut GemState);
     let sys = &*s.syscalls;
@@ -1104,9 +1086,7 @@ unsafe extern "C" fn gem_tx_drain_ioctl(state: *mut c_void, cmd: u32, arg: *mut 
         s.tx_tail = ring::next(s.tx_tail, s.tx_desc_count);
         s.tx_completed = s.tx_completed.wrapping_add(1);
     }
-    if !arg.is_null() {
-        core::ptr::copy_nonoverlapping(s.tx_completed.to_le_bytes().as_ptr(), arg, 4);
-    }
+    core::slice::from_raw_parts_mut(arg, 4).copy_from_slice(&s.tx_completed.to_le_bytes());
     let unread = (sys.channel_poll)(s.in_chan, POLL_IN);
     if (unread > 0 && (unread as u32 & POLL_IN) != 0) || s.tx_tail != s.tx_head {
         return E_AGAIN;

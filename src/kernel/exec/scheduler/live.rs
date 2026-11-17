@@ -303,7 +303,7 @@ pub struct AddEdge {
     /// the same rules as `prepare_graph`'s wiring pass (same-domain
     /// direct edges only). NOT expressible through the FLXA wire codec:
     /// the per-edge record has no reserved space, so
-    /// `apply_add_encoded` always decodes it as `false`; only direct
+    /// `apply_add_borrowed` always decodes it as `false`; only direct
     /// [`apply_add`] callers can set it.
     pub wake_on_write: bool,
 }
@@ -991,13 +991,13 @@ fn begin_staged(
                 }
                 let candidate = scan;
                 scan += 1;
-                // A torn-down module's memory is kept while a source may still
-                // write into a buffer lent from it; the slot is not free yet.
+                // A torn-down module's memory is kept while a provider may still
+                // write into a span lent from it; the slot is not free yet.
                 // Nor is an empty slot stamped with a live owner: another add,
                 // staged and still instantiating, holds it.
                 let stamp = super::module_owner(candidate);
                 if matches!(s.modules[candidate], ModuleSlot::Empty)
-                    && !crate::kernel::module::block_lend::slot_quarantined(candidate)
+                    && !crate::kernel::ipc::lend::slot_quarantined(candidate)
                     && (stamp.is_system() || s.owners.lookup(stamp).is_none())
                 {
                     break candidate;
@@ -1539,7 +1539,7 @@ fn rollback_add(
     let s = sched();
     for &slot in &slots[..instantiated.min(slots.len())] {
         // What a module that instantiated registered or opened (provider
-        // layer, ioctl handler, events, timers) goes before its state does.
+        // layer, events, timers, mailbox lends) goes before its state does.
         crate::kernel::module::syscalls::release_module_handles(slot as ModuleId);
         // The module never stepped, so it lent nothing and its memory goes
         // back at once, with its protection domain and slot bookkeeping.
@@ -2013,14 +2013,6 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
         s.exec_order_count = w;
     }
 
-    // A module with buffers lent to a block source is being torn down: from
-    // here the kernel reaps its completions itself (see `block_lend`).
-    for (i, &is_owned) in owned.iter().enumerate() {
-        if is_owned {
-            crate::kernel::module::block_lend::mark_dying(i);
-        }
-    }
-
     // 3. Close the owner's edges and compact the edges array. Nothing
     //    references edges by array index, and channel handles are unchanged by
     //    the shift, so surviving owners are untouched. `channel_close` resets
@@ -2042,7 +2034,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
                 // stream (the observer completes by EOF) and keep the edge —
                 // and its channel, which the observer still reads — until the
                 // observer's own owner is freed.
-                crate::kernel::ipc::channel::channel_mark_hup(edge.channel);
+                crate::kernel::ipc::channel::channel_producer_gone(edge.channel, false);
                 let mut kept = edge;
                 kept.tap_source = -1;
                 s.edges[w] = kept;
@@ -2054,15 +2046,14 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
                 // removed with the owner but its channel is NEVER closed — the
                 // boot merge caches it. Dropping the edge alone frees the lane
                 // (`channel_producer_owner` reverts to system on the next scan).
-                //
-                // A channel carrying a buffer lent from a torn-down module stays
-                // open: the source can only be asked to return it there. The
-                // ledger closes it once the lends are back.
-                if edge.channel >= 0
-                    && !edge.shared_channel
-                    && !crate::kernel::module::block_lend::adopt_channel(edge.channel)
-                {
+                if edge.channel >= 0 && !edge.shared_channel {
                     crate::kernel::module::syscalls::channel_close(edge.channel);
+                } else if edge.shared_channel && from_owned {
+                    // The lane outlives its producer, and takes the next.
+                    crate::kernel::ipc::channel::channel_set_producer(
+                        edge.channel,
+                        crate::kernel::exec::scheduler::NO_MODULE,
+                    );
                 }
                 continue;
             }
@@ -2085,7 +2076,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
                 continue;
             }
             // A live-added module may hold events, timers and platform handles,
-            // a channel ioctl handler, and a contract-provider layer (e.g. a
+            // mailbox lends, and a contract-provider layer (e.g. a
             // mounted volume backend). Release them before its state is freed,
             // or a later dispatch would call into freed code. Boot modules
             // reach this through the finish path; the live-splice teardown
@@ -2481,10 +2472,12 @@ pub fn module_grants(blob: &[u8]) -> Option<[u64; 2]> {
     Some(grants)
 }
 
-/// Decode a bounded binary `AddSubgraph` and apply it. On success writes the
-/// 6-byte `OwnerHandle` (`slot:u16 LE, generation:u32 LE`) into `arg[0..6]` and
-/// returns 0; otherwise a negative error (`-EINVAL` for a malformed blob, or
-/// the negative [`AddError::code`]).
+/// Decode a bounded binary `AddSubgraph` and apply it for the module
+/// syscall: `creator` is the calling module's global index, which an add
+/// flagged [`ADD_FLAG_CREATOR_AUTHORITY`] acts on behalf of
+/// ([`AddAuthority::Creator`]); an unflagged add is the same as
+/// [`apply_add_borrowed`]. `Err` is `-EINVAL` for a malformed blob, or the
+/// negative [`AddError::code`].
 ///
 /// A [`SPARE_LANE_SENTINEL`] `to` endpoint is **not** rewritten here: it decodes
 /// to `Existing(0xFFFF)`, which resolves to no live module and fails
@@ -2493,33 +2486,18 @@ pub fn module_grants(blob: &[u8]) -> Option<[u64; 2]> {
 /// instead.
 ///
 /// # Safety
-/// `arg` must be a writable buffer of at least `arg_len` bytes, valid for the
-/// duration of the call (module params are borrowed from it in place).
-pub unsafe fn apply_add_encoded(arg: *mut u8, arg_len: usize) -> i32 {
-    // SAFETY: forwarded contract; `None` = no spare-lane rewrite (the sentinel,
-    // if present, falls through to `BadEndpoint`), and no creator.
-    unsafe { apply_add_encoded_inner(arg, arg_len, None, None) }
+/// As [`apply_add_borrowed`].
+pub unsafe fn apply_add_encoded_by(bytes: &[u8], creator: usize) -> Result<OwnerHandle, i32> {
+    // SAFETY: forwarded contract; the add completes within this call.
+    unsafe { decode_add(bytes, None, Some(creator)) }.and_then(apply_decoded)
 }
 
-/// [`apply_add_encoded`] for the module syscall: `creator` is the calling
-/// module's global index, which an add flagged
-/// [`ADD_FLAG_CREATOR_AUTHORITY`] acts on behalf of
-/// ([`AddAuthority::Creator`]). An unflagged add is the same as through
-/// [`apply_add_encoded`].
-///
-/// # Safety
-/// As [`apply_add_encoded`].
-pub unsafe fn apply_add_encoded_by(arg: *mut u8, arg_len: usize, creator: usize) -> i32 {
-    // SAFETY: forwarded contract.
-    unsafe { apply_add_encoded_inner(arg, arg_len, None, Some(creator)) }
-}
-
-/// The metal `net=own` variant of [`apply_add_encoded`] — the
-/// decode→inject→apply seam. Identical to
-/// `apply_add_encoded`, except a net-facing [`SPARE_LANE_SENTINEL`] `to`
-/// endpoint is rewritten to `Endpoint::ExistingChannel(spare_lane)` before
-/// apply, wiring the workload's producer into the boot merge's pre-cached spare
-/// lane so its egress reaches the node's shared `ip`.
+/// The metal `net=own` variant of [`apply_add_borrowed`] — the
+/// decode→inject→apply seam. Identical to it, except a net-facing
+/// [`SPARE_LANE_SENTINEL`] `to` endpoint is rewritten to
+/// `Endpoint::ExistingChannel(spare_lane)` before apply, wiring the
+/// workload's producer into the boot merge's pre-cached spare lane so its
+/// egress reaches the node's shared `ip`.
 ///
 /// `spare_lane` is the caller-resolved free lane channel
 /// (`merge_next_free_lane(find_spare_lane_merge_for_channel(ingress))`, resolved from the registered net-identity provider):
@@ -2528,48 +2506,22 @@ pub unsafe fn apply_add_encoded_by(arg: *mut u8, arg_len: usize, creator: usize)
 ///     apply is refused `ENOMEM` (spare-lane exhaustion / no boot merge) with
 ///     nothing allocated — a clean fail-closed rollback.
 ///
-/// A blob with **no** sentinel edge ignores `spare_lane` and is byte-identical
-/// to `apply_add_encoded` (the host-shared path).
+/// A blob with **no** sentinel edge ignores `spare_lane` and is the same as
+/// [`apply_add_borrowed`] (the host-shared path).
 ///
 /// # Safety
-/// As [`apply_add_encoded`].
-pub unsafe fn apply_add_encoded_spare_lane(arg: *mut u8, arg_len: usize, spare_lane: i32) -> i32 {
-    // SAFETY: forwarded contract.
-    unsafe { apply_add_encoded_inner(arg, arg_len, Some(spare_lane), None) }
+/// As [`apply_add_borrowed`].
+pub unsafe fn apply_add_encoded_spare_lane(
+    bytes: &[u8],
+    spare_lane: i32,
+) -> Result<OwnerHandle, i32> {
+    // SAFETY: forwarded contract; the add completes within this call.
+    unsafe { decode_add(bytes, Some(spare_lane), None) }.and_then(apply_decoded)
 }
 
-/// Shared decode+apply body for [`apply_add_encoded`],
-/// [`apply_add_encoded_by`] and [`apply_add_encoded_spare_lane`]: the whole
-/// add in this call.
-///
-/// # Safety
-/// As [`apply_add_encoded`].
-unsafe fn apply_add_encoded_inner(
-    arg: *mut u8,
-    arg_len: usize,
-    spare_lane: Option<i32>,
-    creator: Option<usize>,
-) -> i32 {
-    if arg.is_null() {
-        return crate::kernel::sys::errno::EINVAL;
-    }
-    // SAFETY: caller guarantees `arg`/`arg_len` describe a valid buffer.
-    let bytes = unsafe { core::slice::from_raw_parts(arg, arg_len) };
-    // SAFETY: the modules' params are borrowed from `bytes`, which outlives
-    // the add: it completes within this call.
-    match unsafe { decode_add(bytes, spare_lane, creator) }.and_then(apply_decoded) {
-        Ok(handle) => {
-            // SAFETY: a decoded blob is longer than the handle's 6 bytes.
-            unsafe { write_handle(core::slice::from_raw_parts_mut(arg, 6), handle) };
-            0
-        }
-        Err(e) => e,
-    }
-}
-
-/// [`apply_add_encoded`] over a blob it reads in place and does not write:
-/// the owner's handle is returned rather than written back, so the blob may
-/// lie in read-only memory (a resident workload in the config image).
+/// Decode a bounded binary `AddSubgraph` and apply it within this call,
+/// reading the blob in place and never writing it, so the blob may lie in
+/// read-only memory (a resident workload in the config image).
 /// `Err` is `-EINVAL` for a malformed blob, or the negative
 /// [`AddError::code`].
 ///
@@ -2774,63 +2726,45 @@ unsafe fn decode_add(
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and free that owner.
-///
-/// # Safety
-/// `arg` must point to at least `arg_len` readable bytes.
-pub unsafe fn free_owner_encoded(arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 6 {
-        return -22;
-    }
-    // SAFETY: caller guarantees >= 6 readable bytes.
-    let bytes = unsafe { core::slice::from_raw_parts(arg, 6) };
-    let slot = u16::from_le_bytes([bytes[0], bytes[1]]);
-    let generation = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-    match free_owner(OwnerHandle { slot, generation }) {
-        Ok(()) => 0,
-        Err(e) => e.code(),
+pub fn free_owner_encoded(arg: &[u8]) -> i32 {
+    match decode_owner_handle(arg) {
+        Some(h) => match free_owner(h) {
+            Ok(()) => 0,
+            Err(e) => e.code(),
+        },
+        None => crate::kernel::sys::errno::EINVAL,
     }
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and pause that owner
 /// (`reconfigure::OWNER_PAUSE`). Same handle record as `FREE_OWNER`.
-///
-/// # Safety
-/// `arg` must point to at least `arg_len` readable bytes.
-pub unsafe fn owner_pause_encoded(arg: *const u8, arg_len: usize) -> i32 {
-    match decode_owner_handle(arg, arg_len) {
+pub fn owner_pause_encoded(arg: &[u8]) -> i32 {
+    match decode_owner_handle(arg) {
         Some(h) => match owner_pause(h) {
             Ok(()) => 0,
             Err(e) => e.code(),
         },
-        None => -22,
+        None => crate::kernel::sys::errno::EINVAL,
     }
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and resume that owner
 /// (`reconfigure::OWNER_RESUME`).
-///
-/// # Safety
-/// `arg` must point to at least `arg_len` readable bytes.
-pub unsafe fn owner_resume_encoded(arg: *const u8, arg_len: usize) -> i32 {
-    match decode_owner_handle(arg, arg_len) {
+pub fn owner_resume_encoded(arg: &[u8]) -> i32 {
+    match decode_owner_handle(arg) {
         Some(h) => match owner_resume(h) {
             Ok(()) => 0,
             Err(e) => e.code(),
         },
-        None => -22,
+        None => crate::kernel::sys::errno::EINVAL,
     }
 }
 
 /// Shared `[slot:u16 LE, generation:u32 LE]` handle decode.
-fn decode_owner_handle(arg: *const u8, arg_len: usize) -> Option<OwnerHandle> {
-    if arg.is_null() || arg_len < 6 {
-        return None;
-    }
-    // SAFETY: non-null with >= 6 readable bytes, checked above; callers
-    // guarantee validity for the call duration.
-    let bytes = unsafe { core::slice::from_raw_parts(arg, 6) };
+fn decode_owner_handle(arg: &[u8]) -> Option<OwnerHandle> {
+    let b = arg.get(..6)?;
     Some(OwnerHandle {
-        slot: u16::from_le_bytes([bytes[0], bytes[1]]),
-        generation: u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+        slot: u16::from_le_bytes([b[0], b[1]]),
+        generation: u32::from_le_bytes([b[2], b[3], b[4], b[5]]),
     })
 }

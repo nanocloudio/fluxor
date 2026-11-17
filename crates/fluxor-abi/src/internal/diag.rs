@@ -14,8 +14,3 @@
 /// the overflow-dropped byte count since the last drain (saturating at
 /// 0x7FFF). The top bit is always 0.
 pub use super::super::registry::diag::LOG_RING_DRAIN;
-
-/// Snapshot fan-out / fan-in pump counters as ASCII into a caller buffer.
-/// Returns bytes written. Read-only — no permission required.
-/// handle=-1, arg=output buffer, arg_len=capacity.
-pub use super::super::registry::diag::FAN_DIAG_SNAPSHOT;

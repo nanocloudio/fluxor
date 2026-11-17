@@ -293,7 +293,10 @@ fn log_msg(msg: &[u8]) {
     }
 }
 
-fn gpu_step(state: *mut u8) -> i32 {
+/// # Safety
+/// `state` is this module's own 64-byte state buffer, exclusively the
+/// step's for its duration.
+unsafe fn gpu_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer written by build(),
     // holding a valid `*mut GpuState`.
     unsafe {

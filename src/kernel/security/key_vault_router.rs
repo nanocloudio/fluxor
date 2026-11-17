@@ -18,25 +18,27 @@
 //! Every step runs inside the one dispatch, so "is it there?" and "make it"
 //! stay one operation. A destroy by label goes to both.
 //!
-//! Operations that span keys — opening share envelopes, attesting a key —
-//! reach each key through the contract's own opcodes on whichever backend
-//! holds it. A hardware recipient key agrees an envelope's secret inside its
-//! token; that secret crosses only bounded kernel scratch, zeroed on every
-//! path, into the software session key the reconstruction makes. The key
-//! made is reported as the software tier it is.
+//! Operations that reach a key the call does not name by its handle —
+//! opening share envelopes, attesting a key — reach it through the
+//! contract's own opcodes on whichever backend holds it. A hardware
+//! recipient key agrees an envelope's secret inside its token; that secret
+//! crosses only bounded kernel scratch, zeroed on every path, into the
+//! software session key the reconstruction makes. The key made is reported
+//! as the software tier it is.
 
 use crate::abi::contracts::key_vault as kv;
-use crate::abi::errno::{EACCES, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE, ERROR};
-use crate::kernel::ipc::fd;
+use crate::abi::errno::{EACCES, EINPROGRESS, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE};
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::security::crypto::sha256::Sha256;
 use crate::kernel::security::key_share;
 use crate::kernel::security::key_vault::{self as software, zeroize};
 
 /// A backend's contract dispatch.
-pub type Dispatch = unsafe fn(i32, u32, *mut u8, usize) -> i32;
+pub type Dispatch = crate::kernel::module::provider::VTableCallFn;
 
-/// Handle-field bit set on every handle the hardware backend mints.
-pub const HARDWARE_FIELD_BIT: i32 = 1 << crate::abi::registry::fd::SLOT_FIELD_BITS;
+/// Bit set on every index the hardware backend answers: the router's own
+/// split of the vault's index space, the software backend's below it.
+pub const HARDWARE_FIELD_BIT: i32 = 1 << 24;
 
 static mut HARDWARE: Option<Dispatch> = None;
 
@@ -59,25 +61,25 @@ pub fn is_hardware(handle: i32) -> bool {
     if handle < 0 {
         return false;
     }
-    let (tag, field) = fd::untag_fd(handle);
-    tag == fd::FD_TAG_KEY_VAULT && field & HARDWARE_FIELD_BIT != 0
+    handle & HARDWARE_FIELD_BIT != 0
 }
 
-/// Whether the hardware backend serves `suite`.
-unsafe fn hardware_serves(hw: Dispatch, suite: u16) -> bool {
-    hardware_usage(hw, suite).is_some()
+/// The hardware backend's record for `suite`, if it serves it.
+fn hardware_record(hw: Dispatch, suite: u16) -> Option<kv::describe_suite::Record> {
+    let mut q = kv::describe_suite::encode_cursor(suite);
+    if hw(-1, kv::DESCRIBE_SUITE, &mut q, UserSpan::empty()) < 0 {
+        return None;
+    }
+    kv::describe_suite::parse(&q).filter(|r| r.suite == suite)
 }
 
 /// The uses the hardware backend permits for `suite`, if it serves it.
-unsafe fn hardware_usage(hw: Dispatch, suite: u16) -> Option<u32> {
-    let mut q = [0u8; 14];
-    q[..2].copy_from_slice(&suite.to_le_bytes());
-    (hw(-1, kv::SUITE_QUERY, q.as_mut_ptr(), q.len()) >= 0)
-        .then(|| u32::from_le_bytes([q[4], q[5], q[6], q[7]]))
+fn hardware_usage(hw: Dispatch, suite: u16) -> Option<u32> {
+    hardware_record(hw, suite).map(|r| r.usage)
 }
 
 /// The backend `handle` names.
-unsafe fn backend_of(handle: i32) -> Result<Dispatch, i32> {
+fn backend_of(handle: i32) -> Result<Dispatch, i32> {
     if is_hardware(handle) {
         hardware().ok_or(EINVAL)
     } else {
@@ -86,38 +88,48 @@ unsafe fn backend_of(handle: i32) -> Result<Dispatch, i32> {
 }
 
 /// KEY_VAULT provider dispatch.
+pub fn dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    // SAFETY: kernel context on the scheduler thread, one provider call at
+    // a time: the held shares are touched by this call alone.
+    unsafe { route(handle, opcode, arg, data) }
+}
+
+/// [`dispatch`]'s routing.
 ///
 /// # Safety
-/// `arg` valid for `arg_len` bytes, as each opcode's layout requires.
-pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// Kernel context, exclusive access to the held shares.
+unsafe fn route(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     match opcode {
         // The store the software vault persists to, kept by `vault_store`.
         op if crate::abi::internal::vault_store::is_store_op(op) => {
-            crate::kernel::security::vault_store::dispatch(op, arg, arg_len)
+            crate::kernel::security::vault_store::dispatch(op, arg, data)
         }
-        kv::SHARE_REWRAP => share_rewrap(handle, arg, arg_len),
-        kv::SHARE_COMBINE => share_combine(arg, arg_len),
-        kv::ATTEST_KEY => attest_key(handle, arg, arg_len),
-        kv::ATTEST_COMPOSITION if is_hardware(handle) => attest_composition(handle, arg, arg_len),
+        kv::SHARE_REWRAP => share_rewrap(handle, arg, data.as_mut()),
+        kv::SHARE_COMBINE => share_combine(handle, arg, data.as_slice()),
+        kv::ATTEST_KEY => attest_key(handle, arg, data.as_mut()),
+        kv::ATTEST_COMPOSITION if is_hardware(handle) => {
+            attest_composition(handle, arg, data.as_mut())
+        }
         // A key held where its bytes cannot be read cannot be split.
         kv::SHARE_SPLIT if is_hardware(handle) => ENOSYS,
-        kv::GENERATE | kv::SUITE_QUERY if handle < 0 && arg_len >= 2 && !arg.is_null() => {
-            let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
+        kv::GENERATE if handle < 0 && arg.len() >= 2 => {
+            let suite = u16::from_le_bytes([arg[0], arg[1]]);
             match hardware() {
-                Some(hw) if hardware_serves(hw, suite) => hw(handle, opcode, arg, arg_len),
-                _ => software::provider_dispatch(handle, opcode, arg, arg_len),
+                Some(hw) if hardware_record(hw, suite).is_some() => hw(handle, opcode, arg, data),
+                _ => software::provider_dispatch(handle, opcode, arg, data),
             }
         }
-        kv::OPEN | kv::OPEN_OR_GENERATE if handle < 0 && arg_len >= 8 && !arg.is_null() => {
-            open_by_label(handle, opcode, arg, arg_len)
+        kv::DESCRIBE_SUITE if handle < 0 => describe_suite(arg),
+        kv::OPEN | kv::OPEN_OR_GENERATE if handle < 0 && arg.len() >= kv::open::HEADER => {
+            open_by_label(handle, opcode, arg, data)
         }
         kv::DESTROY_BY_LABEL if handle < 0 => {
-            let sw = software::provider_dispatch(handle, opcode, arg, arg_len);
+            let sw = software::provider_dispatch(handle, opcode, arg, data.reborrow());
             // A workload's labels are its realm's, which only software keeps.
             let Some(hw) = hardware().filter(|_| !software::caller_in_workload()) else {
                 return sw;
             };
-            let hw = hw(handle, opcode, arg, arg_len);
+            let hw = hw(handle, opcode, arg, data);
             // A refusal from either is the answer, so a key one backend
             // could not remove is never reported gone.
             if sw < 0 && sw != ENOENT {
@@ -133,98 +145,114 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
         // The tier of the backend that holds the identity keys a node
         // attests with; each key's own custody is its `DESCRIBE`.
         kv::TIER => match hardware() {
-            Some(hw) => hw(handle, opcode, arg, arg_len),
-            None => software::provider_dispatch(handle, opcode, arg, arg_len),
+            Some(hw) => hw(handle, opcode, arg, data),
+            None => software::provider_dispatch(handle, opcode, arg, data),
         },
         _ => match backend_of(handle) {
-            Ok(b) => b(handle, opcode, arg, arg_len),
+            Ok(b) => b(handle, opcode, arg, data),
             Err(e) => e,
         },
     }
 }
 
+/// `DESCRIBE_SUITE` across both backends: from the cursor, the lower of the
+/// two backends' next suites, the hardware's record where both serve one
+/// (it is the backend `GENERATE` sends that suite to).
+fn describe_suite(arg: &mut [u8]) -> i32 {
+    use kv::describe_suite as ds;
+    let Some(cursor) = ds::parse_cursor(arg) else {
+        return EINVAL;
+    };
+    if arg.len() < ds::LEN {
+        return EINVAL;
+    }
+    let sw = software::suite_record(cursor);
+    let hw = hardware().and_then(|hw| {
+        let mut q = ds::encode_cursor(cursor);
+        (hw(-1, kv::DESCRIBE_SUITE, &mut q, UserSpan::empty()) >= 0)
+            .then(|| ds::parse(&q))
+            .flatten()
+    });
+    let pick = match (sw, hw) {
+        (Some(s), Some(h)) if h.suite <= s.suite => Some(h),
+        (Some(s), _) => Some(s),
+        (None, h) => h,
+    };
+    match pick {
+        Some(mut r) => {
+            r.next = r.suite + 1;
+            arg[..ds::LEN].copy_from_slice(&ds::encode(&r));
+            ds::LEN as i32
+        }
+        None => ENOENT,
+    }
+}
+
 /// `OPEN` / `OPEN_OR_GENERATE` across both backends (a workload's: software
-/// alone): software first, then
-/// the token, then — for `OPEN_OR_GENERATE` with neither holding the key —
-/// made in the token if it is asked to persist with uses the token permits,
-/// in software otherwise. Any answer other than `ENOENT` (the key
-/// itself, or `EBUSY`, `EACCES`, `EAGAIN`, `ERANGE`, ...) is final: a key
-/// that exists somewhere is never made again somewhere else.
-///
-/// # Safety
-/// `arg` valid for `arg_len` bytes (at least 8).
-unsafe fn open_by_label(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// alone): software first, then the token, then — for `OPEN_OR_GENERATE`
+/// with neither holding the key — made in the token if it is asked to
+/// persist with uses the token permits, in software otherwise. Any answer
+/// other than `ENOENT` (the key itself, or `EBUSY`, `EACCES`, `EAGAIN`,
+/// `ERANGE`, ...) is final: a key that exists somewhere is never made again
+/// somewhere else. `arg` holds at least the open header.
+fn open_by_label(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     // A workload's labels live in its realm (its owner uid), which only
     // the software backend keeps: a token names a label by module type and
     // nothing narrower, so a workload reaching it would reach the node's
     // keys of its type, and every other workload's.
     if software::caller_in_workload() {
-        return software::provider_dispatch(handle, opcode, arg, arg_len);
+        return software::provider_dispatch(handle, opcode, arg, data);
     }
-    let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
-    let usage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-    let (hw, hw_usage) = match hardware() {
-        Some(hw) => match hardware_usage(hw, suite) {
-            Some(u) => (hw, u),
-            None => return software::provider_dispatch(handle, opcode, arg, arg_len),
-        },
-        None => return software::provider_dispatch(handle, opcode, arg, arg_len),
+    let suite = u16::from_le_bytes([arg[0], arg[1]]);
+    let usage = u32::from_le_bytes([arg[2], arg[3], arg[4], arg[5]]);
+    let Some((hw, hw_usage)) = hardware().and_then(|hw| hardware_usage(hw, suite).map(|u| (hw, u)))
+    else {
+        return software::provider_dispatch(handle, opcode, arg, data);
     };
-    let rc = software::provider_dispatch(handle, kv::OPEN, arg, arg_len);
+    let rc = software::provider_dispatch(handle, kv::OPEN, arg, data.reborrow());
     if rc != ENOENT {
         return rc;
     }
-    let rc = hw(handle, kv::OPEN, arg, arg_len);
+    let rc = hw(handle, kv::OPEN, arg, data.reborrow());
     if rc != ENOENT || opcode == kv::OPEN {
         return rc;
     }
     // A use the token cannot give (WRAP: its key's bytes are nowhere to
     // wrap) keeps the key in software rather than refusing it.
     if usage & kv::usage::PERSIST != 0 && usage & !hw_usage == 0 {
-        hw(handle, opcode, arg, arg_len)
+        hw(handle, opcode, arg, data)
     } else {
-        software::provider_dispatch(handle, opcode, arg, arg_len)
+        software::provider_dispatch(handle, opcode, arg, data)
     }
 }
 
-/// Call `op` on `handle` through the router.
-unsafe fn call(handle: i32, op: u32, arg: &mut [u8]) -> i32 {
-    dispatch(handle, op, arg.as_mut_ptr(), arg.len())
+/// Call `op` on `handle` through the router, with `data` as the call's span.
+///
+/// # Safety
+/// As [`route`].
+unsafe fn call(handle: i32, op: u32, arg: &mut [u8], data: &mut [u8]) -> i32 {
+    route(handle, op, arg, UserSpan::of(data))
 }
 
 /// What `DESCRIBE` says of a key.
-struct Described {
-    suite: u16,
-    usage: u32,
-    tier: u8,
-    persisted: bool,
-}
-
-unsafe fn describe(handle: i32) -> Result<Described, i32> {
-    let mut d = [0u8; 8];
-    let rc = call(handle, kv::DESCRIBE, &mut d);
+unsafe fn describe(handle: i32) -> Result<kv::describe::Described, i32> {
+    let mut d = [0u8; kv::describe::ARG_LEN];
+    let rc = call(handle, kv::DESCRIBE, &mut d, &mut []);
     if rc < 0 {
         return Err(rc);
     }
-    Ok(Described {
-        suite: u16::from_le_bytes([d[0], d[1]]),
-        usage: u32::from_le_bytes([d[2], d[3], d[4], d[5]]),
-        tier: d[6],
-        persisted: d[7] != 0,
-    })
+    kv::describe::parse(&d).ok_or(EINVAL)
 }
 
 /// A P-256 key's public half.
 unsafe fn p256_public(handle: i32) -> Result<[u8; 65], i32> {
     let mut out = [0u8; 65];
-    let mut arg = [0u8; 12];
-    arg[..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[8..10].copy_from_slice(&65u16.to_le_bytes());
-    let rc = call(handle, kv::PUBLIC, &mut arg);
+    let mut arg = [0u8; kv::public::ARG_LEN];
+    let rc = call(handle, kv::PUBLIC, &mut arg, &mut out);
     if rc < 0 {
         return Err(rc);
     }
-    if u16::from_le_bytes([arg[10], arg[11]]) != 65 {
+    if rc != 65 {
         return Err(EINVAL);
     }
     Ok(out)
@@ -235,20 +263,21 @@ unsafe fn p256_public(handle: i32) -> Result<[u8; 65], i32> {
 /// The shared secret lands in `shared` and nowhere else.
 unsafe fn agree(opener: i32, peer: &[u8], shared: &mut [u8; 32]) -> Result<[u8; 65], i32> {
     let public = p256_public(opener)?;
-    let mut arg = [0u8; 4 + key_share::PEER_MAX + 12];
     if peer.len() > key_share::PEER_MAX {
         return Err(EINVAL);
     }
-    arg[..4].copy_from_slice(&(peer.len() as u32).to_le_bytes());
-    arg[4..4 + peer.len()].copy_from_slice(peer);
-    let tail = 4 + peer.len();
-    arg[tail..tail + 8].copy_from_slice(&(shared.as_mut_ptr() as u64).to_le_bytes());
-    arg[tail + 8..tail + 10].copy_from_slice(&32u16.to_le_bytes());
-    let rc = dispatch(opener, kv::ECDH, arg.as_mut_ptr(), tail + 12);
-    if rc < 0 || u16::from_le_bytes([arg[tail + 10], arg[tail + 11]]) != 32 {
+    let mut buf = [0u8; key_share::PEER_MAX];
+    buf[..peer.len()].copy_from_slice(peer);
+    let mut arg = kv::ecdh::encode(peer.len() as u32);
+    let n = peer.len().max(32);
+    let rc = call(opener, kv::ECDH, &mut arg, &mut buf[..n]);
+    if rc != 32 {
+        zeroize(&mut buf);
         zeroize(shared);
         return Err(if rc < 0 { rc } else { EINVAL });
     }
+    shared.copy_from_slice(&buf[..32]);
+    zeroize(&mut buf);
     Ok(public)
 }
 
@@ -268,42 +297,19 @@ unsafe fn open_share(opener: i32, envelope: &[u8], y: &mut [u8; 32]) -> Result<u
 }
 
 /// # Safety
-/// `arg` valid for `arg_len` bytes.
-unsafe fn share_rewrap(opener: i32, arg: *mut u8, arg_len: usize) -> i32 {
+/// As [`route`].
+unsafe fn share_rewrap(opener: i32, args: &[u8], data: &mut [u8]) -> i32 {
     use kv::share::{self as sh, rewrap as a};
-    if arg.is_null() || arg_len < a::ENV {
-        return EINVAL;
-    }
-    let args = core::slice::from_raw_parts_mut(arg, arg_len);
-    let env_len = u16::from_le_bytes([args[a::ENV_LEN], args[a::ENV_LEN + 1]]) as usize;
-    if a::ENV + env_len > arg_len {
+    if args.len() < a::ARG_LEN || data.len() < sh::P256_LEN {
         return EINVAL;
     }
     let grant = key_share::Grant::read(&args[..sh::grant::LEN]);
     if !grant.valid() {
         return EINVAL;
     }
-    let out_ptr = u64::from_le_bytes(
-        args[a::OUT_PTR..a::OUT_PTR + 8]
-            .try_into()
-            .unwrap_or([0; 8]),
-    ) as *mut u8;
-    let out_cap = u32::from_le_bytes(
-        args[a::OUT_CAP..a::OUT_CAP + 4]
-            .try_into()
-            .unwrap_or([0; 4]),
-    ) as usize;
-    if out_cap < sh::P256_LEN || out_ptr.is_null() {
-        args[a::OUT_LEN..a::OUT_LEN + 4].copy_from_slice(&(sh::P256_LEN as u32).to_le_bytes());
-        return ERANGE;
-    }
     let mut envelope = [0u8; sh::P256_LEN];
-    if env_len != sh::P256_LEN {
-        return EINVAL;
-    }
-    envelope.copy_from_slice(&args[a::ENV..a::ENV + env_len]);
-    let mut recipient = [0u8; sh::P256_PUB_LEN];
-    recipient.copy_from_slice(&args[a::RECIPIENT..a::RECIPIENT + sh::P256_PUB_LEN]);
+    envelope.copy_from_slice(&data[..sh::P256_LEN]);
+    let recipient = &args[a::RECIPIENT..a::RECIPIENT + sh::P256_PUB_LEN];
     let mut y = [0u8; 32];
     let index = match open_share(opener, &envelope, &mut y) {
         Ok(ix) => ix,
@@ -317,22 +323,21 @@ unsafe fn share_rewrap(opener: i32, arg: *mut u8, arg_len: usize) -> i32 {
     let carried = grant.carrying(&envelope);
     let mut out = [0u8; sh::P256_LEN];
     let sealed = match anti_replay_id() {
-        Some(id) => key_share::seal(&mut out, &carried.binding(), index, &y, &recipient, &id),
+        Some(id) => key_share::seal(&mut out, &carried.binding(), index, &y, recipient, &id),
         None => false,
     };
     zeroize(&mut y);
     if !sealed {
         return EINVAL;
     }
-    core::ptr::copy_nonoverlapping(out.as_ptr(), out_ptr, sh::P256_LEN);
-    args[a::OUT_LEN..a::OUT_LEN + 4].copy_from_slice(&(sh::P256_LEN as u32).to_le_bytes());
-    0
+    data[..sh::P256_LEN].copy_from_slice(&out);
+    sh::P256_LEN as i32
 }
 
 /// A fresh anti-replay id.
 fn anti_replay_id() -> Option<[u8; 16]> {
     let mut id = [0u8; 16];
-    (crate::kernel::sys::hal::csprng_fill(id.as_mut_ptr(), 16) == 0).then_some(id)
+    (crate::kernel::sys::hal::csprng_fill(&mut id) == 0).then_some(id)
 }
 
 /// `Ok` when an envelope has no expiry or has not reached it. An expiry
@@ -359,14 +364,97 @@ fn unexpired(envelope: &[u8]) -> Result<(), i32> {
     }
 }
 
+// ── Reconstruction, one envelope per call ───────────────────────────────
+//
+// `SHARE_COMBINE` opens one envelope per call. The first share is held here
+// for its caller — inside the vault, never written out — until the second
+// arrives, a refusal drops it, or its caller's occupancy ends.
+
+/// Callers that may hold a first share at once.
+const MAX_HELD: usize = 4;
+
+struct HeldShare {
+    /// The caller, `(scheduler slot, occupancy)`; `None` for a free entry.
+    owner: Option<(crate::kernel::exec::scheduler::ModuleId, u32)>,
+    /// The envelope's header fields a second share must match: set id,
+    /// resource, epoch, AEAD.
+    set_id: [u8; 16],
+    resource: [u8; 16],
+    epoch: [u8; 4],
+    aead: [u8; 2],
+    /// The call's target, which the second call must repeat.
+    suite: u16,
+    usage: u32,
+    anti_replay: [u8; 16],
+    index: u8,
+    y: [u8; 32],
+}
+
+impl HeldShare {
+    const fn empty() -> Self {
+        Self {
+            owner: None,
+            set_id: [0; 16],
+            resource: [0; 16],
+            epoch: [0; 4],
+            aead: [0; 2],
+            suite: 0,
+            usage: 0,
+            anti_replay: [0; 16],
+            index: 0,
+            y: [0; 32],
+        }
+    }
+
+    fn clear(&mut self) {
+        zeroize(&mut self.y);
+        *self = Self::empty();
+    }
+}
+
+static mut HELD: [HeldShare; MAX_HELD] = [const { HeldShare::empty() }; MAX_HELD];
+
 /// # Safety
-/// `arg` valid for `arg_len` bytes.
-unsafe fn share_combine(arg: *mut u8, arg_len: usize) -> i32 {
+/// As [`route`].
+unsafe fn share_combine(opener: i32, args: &[u8], env: &[u8]) -> i32 {
+    let held = &mut *core::ptr::addr_of_mut!(HELD);
+    let who = software::caller_owner();
+    // Shares held for occupancies that have ended are nobody's.
+    for h in held.iter_mut() {
+        if let Some((slot, generation)) = h.owner {
+            if !software::owner_is_live(slot, generation) {
+                h.clear();
+            }
+        }
+    }
+    let mine = held.iter().position(|h| h.owner == Some(who));
+    let rc = combine_step(opener, args, env, who, mine);
+    // A refusal drops the share held; a reconstruction spends it.
+    if rc != EINPROGRESS {
+        if let Some(m) = mine {
+            held[m].clear();
+        }
+    }
+    rc
+}
+
+/// One `SHARE_COMBINE` call: hold the first share (`EINPROGRESS`), or
+/// reconstruct from the share held and this one.
+///
+/// # Safety
+/// As [`route`].
+unsafe fn combine_step(
+    opener: i32,
+    args: &[u8],
+    env: &[u8],
+    who: (crate::kernel::exec::scheduler::ModuleId, u32),
+    mine: Option<usize>,
+) -> i32 {
     use kv::share::{self as sh, combine as a};
-    if arg.is_null() || arg_len < a::ENVS {
+    let held = &mut *core::ptr::addr_of_mut!(HELD);
+    if args.len() < a::ARG_LEN {
         return EINVAL;
     }
-    let args = core::slice::from_raw_parts(arg, arg_len);
     let suite = u16::from_le_bytes([args[a::TARGET_SUITE], args[a::TARGET_SUITE + 1]]);
     let usage = u32::from_le_bytes([
         args[a::TARGET_USAGE],
@@ -377,64 +465,75 @@ unsafe fn share_combine(arg: *mut u8, arg_len: usize) -> i32 {
     if !software::session_key_admissible(suite, usage) {
         return EINVAL;
     }
-    let len_a = u16::from_le_bytes([args[a::ENV_A_LEN], args[a::ENV_A_LEN + 1]]) as usize;
-    let len_b = u16::from_le_bytes([args[a::ENV_B_LEN], args[a::ENV_B_LEN + 1]]) as usize;
-    if a::ENVS + len_a + len_b > arg_len {
+    if !key_share::well_formed(env) {
         return EINVAL;
     }
-    let env_a = &args[a::ENVS..a::ENVS + len_a];
-    let env_b = &args[a::ENVS + len_a..a::ENVS + len_a + len_b];
-    if !key_share::well_formed(env_a) || !key_share::well_formed(env_b) {
-        return EINVAL;
-    }
-    // The pair must be two shares of one key: same set, resource, epoch and
-    // AEAD, distinct indices. Checked on the headers before anything opens;
-    // the headers are authenticated by the opens that follow.
-    let same = |off: usize, len: usize| env_a[off..off + len] == env_b[off..off + len];
-    if !same(sh::SET_ID, 16) || !same(sh::RESOURCE, 16) || !same(sh::EPOCH, 4) || !same(sh::AEAD, 2)
-    {
-        return EINVAL;
-    }
-    if env_a[sh::INDEX] == env_b[sh::INDEX] {
-        return EINVAL;
-    }
-    if env_a[sh::RESOURCE..sh::RESOURCE + 16] != args[a::RESOURCE..a::RESOURCE + 16]
-        || env_a[sh::EPOCH..sh::EPOCH + 4] != args[a::EPOCH..a::EPOCH + 4]
+    if env[sh::RESOURCE..sh::RESOURCE + 16] != args[a::RESOURCE..a::RESOURCE + 16]
+        || env[sh::EPOCH..sh::EPOCH + 4] != args[a::EPOCH..a::EPOCH + 4]
     {
         return EACCES;
     }
-    for e in [env_a, env_b] {
-        if let Err(err) = unexpired(e) {
-            return err;
-        }
-        if key_share::consumed(&e[sh::ANTI_REPLAY..sh::ANTI_REPLAY + 16]) {
-            return EACCES;
-        }
+    if let Err(e) = unexpired(env) {
+        return e;
     }
-    let read_i32 =
-        |off: usize| i32::from_le_bytes([args[off], args[off + 1], args[off + 2], args[off + 3]]);
-    let mut ys = [[0u8; 32]; 2];
-    let mut xs = [0u8; 2];
-    for (n, (opener, e)) in [
-        (read_i32(a::OPENER_A), env_a),
-        (read_i32(a::OPENER_B), env_b),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        match open_share(opener, e, &mut ys[n]) {
-            Ok(x) => xs[n] = x,
-            Err(err) => {
-                zeroize(&mut ys[0]);
-                zeroize(&mut ys[1]);
-                return err;
+    if key_share::consumed(&env[sh::ANTI_REPLAY..sh::ANTI_REPLAY + 16]) {
+        return EACCES;
+    }
+    // The second share must be another share of the key the first is of:
+    // same set, resource, epoch and AEAD, and the same target. Checked on
+    // the header before anything opens; the open authenticates the header.
+    let pairs = mine.map(|m| {
+        let h = &held[m];
+        h.set_id[..] == env[sh::SET_ID..sh::SET_ID + 16]
+            && h.resource[..] == env[sh::RESOURCE..sh::RESOURCE + 16]
+            && h.epoch[..] == env[sh::EPOCH..sh::EPOCH + 4]
+            && h.aead[..] == env[sh::AEAD..sh::AEAD + 2]
+            && h.suite == suite
+            && h.usage == usage
+    });
+    if pairs == Some(true) && held[mine.unwrap_or(0)].index == env[sh::INDEX] {
+        return EINVAL;
+    }
+    let mut y = [0u8; 32];
+    let index = match open_share(opener, env, &mut y) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let Some(m) = mine.filter(|_| pairs == Some(true)) else {
+        // A first share, or one of another set than the share held: held,
+        // replacing whatever this caller held.
+        let slot = match mine.or_else(|| held.iter().position(|h| h.owner.is_none())) {
+            Some(s) => s,
+            None => {
+                zeroize(&mut y);
+                return ENOMEM;
             }
-        }
+        };
+        let h = &mut held[slot];
+        h.clear();
+        h.owner = Some(who);
+        h.set_id.copy_from_slice(&env[sh::SET_ID..sh::SET_ID + 16]);
+        h.resource
+            .copy_from_slice(&env[sh::RESOURCE..sh::RESOURCE + 16]);
+        h.epoch.copy_from_slice(&env[sh::EPOCH..sh::EPOCH + 4]);
+        h.aead.copy_from_slice(&env[sh::AEAD..sh::AEAD + 2]);
+        h.suite = suite;
+        h.usage = usage;
+        h.anti_replay
+            .copy_from_slice(&env[sh::ANTI_REPLAY..sh::ANTI_REPLAY + 16]);
+        h.index = index;
+        h.y = y;
+        zeroize(&mut y);
+        return EINPROGRESS;
+    };
+    let first = &held[m];
+    if key_share::consumed(&first.anti_replay) {
+        zeroize(&mut y);
+        return EACCES;
     }
     let mut key = [0u8; 32];
-    let combined = key_share::combine(xs[0], &ys[0], xs[1], &ys[1], &mut key);
-    zeroize(&mut ys[0]);
-    zeroize(&mut ys[1]);
+    let combined = key_share::combine(first.index, &first.y, index, &y, &mut key);
+    zeroize(&mut y);
     if combined.is_none() {
         zeroize(&mut key);
         return EINVAL;
@@ -442,112 +541,31 @@ unsafe fn share_combine(arg: *mut u8, arg_len: usize) -> i32 {
     let handle = software::import_session_key(suite, usage, &key);
     zeroize(&mut key);
     if handle >= 0 {
-        key_share::consume(&env_a[sh::ANTI_REPLAY..sh::ANTI_REPLAY + 16]);
-        key_share::consume(&env_b[sh::ANTI_REPLAY..sh::ANTI_REPLAY + 16]);
+        key_share::consume(&first.anti_replay);
+        key_share::consume(&env[sh::ANTI_REPLAY..sh::ANTI_REPLAY + 16]);
     }
     handle
 }
 
-/// The sign mode `suite` signs a record in, or `None` for a suite whose
-/// signature is no evidence to a third party (a MAC) or that signs only
-/// resumably (RSA).
-fn record_sign_mode(suite: u16) -> Option<u8> {
-    match suite {
-        kv::suite::P256 => Some(kv::sign_mode::DIGEST),
-        kv::suite::ED25519 | kv::suite::ML_DSA_44 | kv::suite::ML_DSA_65 | kv::suite::ML_DSA_87 => {
-            Some(kv::sign_mode::RAW)
-        }
-        _ => None,
-    }
-}
-
-/// Sign `record` with `signer` into `out`, in the signer's suite
-/// convention: ECDSA over the record's SHA-256, the whole record otherwise.
-/// Returns the signature length.
-unsafe fn sign_record(signer: i32, record: &[u8], out: *mut u8, cap: usize) -> Result<usize, i32> {
-    let d = describe(signer)?;
-    let Some(mode) = record_sign_mode(d.suite) else {
-        return Err(ENOSYS);
-    };
-    let digest;
-    let input: &[u8] = if mode == kv::sign_mode::DIGEST {
-        let mut h = Sha256::new();
-        h.update(record);
-        digest = h.finalize();
-        &digest
-    } else {
-        record
-    };
-    if input.len() > MAX_SIGNED_INPUT {
-        return Err(EINVAL);
-    }
-    let mut arg = [0u8; 6 + MAX_SIGNED_INPUT + 12];
-    arg[0] = mode;
-    arg[2..6].copy_from_slice(&(input.len() as u32).to_le_bytes());
-    arg[6..6 + input.len()].copy_from_slice(input);
-    let t = 6 + input.len();
-    arg[t..t + 8].copy_from_slice(&(out as u64).to_le_bytes());
-    arg[t + 8..t + 10].copy_from_slice(&(cap.min(u16::MAX as usize) as u16).to_le_bytes());
-    let rc = dispatch(signer, kv::SIGN, arg.as_mut_ptr(), t + 12);
-    if rc < 0 {
-        return Err(rc);
-    }
-    Ok(u16::from_le_bytes([arg[t + 10], arg[t + 11]]) as usize)
-}
-
-/// Longest input a record signature takes: the key-attestation record.
-const MAX_SIGNED_INPUT: usize = kv::attest_key::RECORD_LEN;
-
 /// # Safety
-/// `arg` valid for `arg_len` bytes.
-unsafe fn attest_key(subject: i32, arg: *mut u8, arg_len: usize) -> i32 {
+/// As [`route`].
+unsafe fn attest_key(subject: i32, args: &[u8], out: &mut [u8]) -> i32 {
     use kv::attest_key as a;
-    if arg.is_null() || arg_len < a::ARG_LEN {
+    if args.len() < a::ARG_LEN {
         return EINVAL;
     }
-    let args = core::slice::from_raw_parts_mut(arg, arg_len);
-    let signer = i32::from_le_bytes([
-        args[a::SIGNER],
-        args[a::SIGNER + 1],
-        args[a::SIGNER + 2],
-        args[a::SIGNER + 3],
-    ]);
-    let out_ptr = u64::from_le_bytes(
-        args[a::OUT_PTR..a::OUT_PTR + 8]
-            .try_into()
-            .unwrap_or([0; 8]),
-    ) as *mut u8;
-    let out_cap = u32::from_le_bytes(
-        args[a::OUT_CAP..a::OUT_CAP + 4]
-            .try_into()
-            .unwrap_or([0; 4]),
-    ) as usize;
     let d = match describe(subject) {
         Ok(d) => d,
         Err(e) => return e,
     };
-    let signer_d = match describe(signer) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    if signer_d.usage & kv::usage::SIGN == 0 {
-        return EACCES;
-    }
-    if record_sign_mode(signer_d.suite).is_none() {
-        return ENOSYS;
-    }
-    let sig_len = software::signature_len(signer_d.suite);
-    let need = a::RECORD_LEN + sig_len;
-    if out_cap < need || out_ptr.is_null() {
-        args[a::OUT_LEN..a::OUT_LEN + 4].copy_from_slice(&(need as u32).to_le_bytes());
+    if out.len() < a::RECORD_LEN {
         return ERANGE;
     }
     let mut record = [0u8; a::RECORD_LEN];
     record[..4].copy_from_slice(&a::MAGIC);
-    record[a::R_CHALLENGE..a::R_CHALLENGE + 32]
-        .copy_from_slice(&args[a::CHALLENGE..a::CHALLENGE + 32]);
+    record[a::R_CHALLENGE..a::R_CHALLENGE + 32].copy_from_slice(&args[..32]);
     record[a::R_TIER] = d.tier;
-    record[a::R_PERSISTED] = u8::from(d.persisted);
+    record[a::R_PERSISTED] = u8::from(d.persisted != kv::persisted::NO);
     record[a::R_SUITE..a::R_SUITE + 2].copy_from_slice(&d.suite.to_le_bytes());
     record[a::R_USAGE..a::R_USAGE + 4].copy_from_slice(&d.usage.to_le_bytes());
     if is_hardware(subject) {
@@ -579,32 +597,20 @@ unsafe fn attest_key(subject: i32, arg: *mut u8, arg_len: usize) -> i32 {
         return ENOMEM;
     };
     record[a::R_COMPOSITION..a::R_COMPOSITION + 32].copy_from_slice(&composition);
-    let written = match sign_record(
-        signer,
-        &record,
-        out_ptr.add(a::RECORD_LEN),
-        out_cap - a::RECORD_LEN,
-    ) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
-    core::ptr::copy_nonoverlapping(record.as_ptr(), out_ptr, a::RECORD_LEN);
-    args[a::OUT_LEN..a::OUT_LEN + 4]
-        .copy_from_slice(&((a::RECORD_LEN + written) as u32).to_le_bytes());
-    0
+    out[..a::RECORD_LEN].copy_from_slice(&record);
+    a::RECORD_LEN as i32
 }
 
 /// `ATTEST_COMPOSITION` with a hardware signer: the kernel's composition
-/// record, ending in the hardware tier, signed inside the token.
+/// record, ending in the hardware tier, its SHA-256 signed inside the token.
 ///
 /// # Safety
-/// `arg` valid for `arg_len` bytes.
-unsafe fn attest_composition(signer: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    // arg: [challenge:32][out_ptr:u64][out_cap:u16][out_len_out:u16]
-    if arg.is_null() || arg_len < 32 + 12 {
+/// As [`route`].
+unsafe fn attest_composition(signer: i32, args: &mut [u8], out: &mut [u8]) -> i32 {
+    use kv::attest_composition as a;
+    if args.len() < a::ARG_LEN {
         return EINVAL;
     }
-    let args = core::slice::from_raw_parts_mut(arg, arg_len);
     let d = match describe(signer) {
         Ok(d) => d,
         Err(e) => return e,
@@ -612,41 +618,33 @@ unsafe fn attest_composition(signer: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if d.usage & kv::usage::SIGN == 0 {
         return EACCES;
     }
-    let sig_len = software::signature_len(d.suite);
-    if record_sign_mode(d.suite).is_none() || sig_len == 0 {
+    // The composition record is longer than any signer takes whole, so a
+    // hardware signer signs its digest; a token signs P-256 only.
+    if d.suite != kv::suite::P256 {
         return ENOSYS;
     }
-    let mut challenge = [0u8; 32];
-    challenge.copy_from_slice(&args[..32]);
-    let out_ptr = u64::from_le_bytes(args[32..40].try_into().unwrap_or([0; 8])) as *mut u8;
-    let out_cap = u16::from_le_bytes([args[40], args[41]]) as usize;
+    let sig_len = software::signature_len(d.suite);
+    let Some(challenge) = a::parse(args) else {
+        return EINVAL;
+    };
     let Some(record) = software::composition_record(&challenge, d.tier) else {
         return ENOMEM;
     };
     let need = record.len() + sig_len;
-    if out_cap < need || out_ptr.is_null() {
-        args[42..44].copy_from_slice(&(need.min(u16::MAX as usize) as u16).to_le_bytes());
+    if out.len() < need {
+        a::set_len(args, need);
         return ERANGE;
     }
-    // The composition record is longer than any signer takes whole, so a
-    // hardware signer signs its digest; a token signs P-256 only.
-    if record_sign_mode(d.suite) != Some(kv::sign_mode::DIGEST) {
-        return ENOSYS;
+    let mut h = Sha256::new();
+    h.update(record);
+    let digest = h.finalize();
+    let sig = &mut out[record.len()..need];
+    sig[..32].copy_from_slice(&digest);
+    let mut sa = kv::sign::encode(kv::sign_mode::DIGEST, 32);
+    let rc = call(signer, kv::SIGN, &mut sa, sig);
+    if rc < 0 {
+        return rc;
     }
-    let written = match sign_record(
-        signer,
-        record,
-        out_ptr.add(record.len()),
-        out_cap - record.len(),
-    ) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
-    core::ptr::copy_nonoverlapping(record.as_ptr(), out_ptr, record.len());
-    let n = record.len() + written;
-    if n > u16::MAX as usize {
-        return ERROR;
-    }
-    args[42..44].copy_from_slice(&(n as u16).to_le_bytes());
-    0
+    out[..record.len()].copy_from_slice(record);
+    (record.len() + rc as usize) as i32
 }

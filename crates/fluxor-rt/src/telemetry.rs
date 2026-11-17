@@ -16,31 +16,9 @@ pub unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
         abi::registry::kernel::SELF_INDEX,
         core::ptr::null_mut(),
         0,
-    )
-}
-
-/// Query the calling module's owner slot (`owner_tag`). See
-/// `kernel_abi::OWNER_TAG` (`kernel::OWNER_TAG`). Returns the module's owner slot as a
-/// `u16`: slot 0 (`OWNER_SYSTEM`) for a base-graph / host-owned module — the
-/// legitimate host / wildcard tag — or the workload's owner slot (>= 1) for a
-/// module `apply_add` staged for a `net=own` workload. A negative errno
-/// (called outside step, unsupported) maps to 0 (host), so an unstamped/host
-/// path binds host-wildcard. Used by a
-/// bind-emitting module (http, a DG binder) to append the trailing `owner_tag`
-/// on its `NET_CMD_BIND` / `DG_CMD_BIND`.
-#[inline(always)]
-pub unsafe fn dev_owner_tag(sys: &SyscallTable) -> u16 {
-    let rc = (sys.provider_call)(
-        -1,
-        abi::registry::kernel::OWNER_TAG,
         core::ptr::null_mut(),
         0,
-    );
-    if rc < 0 {
-        0
-    } else {
-        (rc as u32).min(u16::MAX as u32) as u16
-    }
+    )
 }
 
 /// Stream-surface requester tag for this module: `module index + 1`, so the
@@ -95,7 +73,14 @@ pub unsafe fn dev_telemetry_metric(
     if let Some(n) = abi::contracts::telemetry::write_metric_scalar(
         &mut buf, module_idx, t_micros, kind, id, value,
     ) {
-        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
+        let _ = (sys.provider_call)(
+            -1,
+            abi::contracts::telemetry::TLM_EMIT,
+            buf.as_mut_ptr(),
+            n,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -125,7 +110,14 @@ pub unsafe fn dev_telemetry_metric_dim(
     if let Some(n) = abi::contracts::telemetry::write_metric_scalar_dim(
         &mut buf, module_idx, t_micros, kind, id, dim, value,
     ) {
-        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
+        let _ = (sys.provider_call)(
+            -1,
+            abi::contracts::telemetry::TLM_EMIT,
+            buf.as_mut_ptr(),
+            n,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -147,7 +139,14 @@ pub unsafe fn dev_telemetry_histogram(
     if let Some(n) = abi::contracts::telemetry::write_metric_histogram(
         &mut buf, module_idx, t_micros, id, buckets,
     ) {
-        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
+        let _ = (sys.provider_call)(
+            -1,
+            abi::contracts::telemetry::TLM_EMIT,
+            buf.as_mut_ptr(),
+            n,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -172,7 +171,14 @@ pub unsafe fn dev_telemetry_histogram16(
     if let Some(n) = abi::contracts::telemetry::write_metric_histogram16(
         &mut buf, module_idx, t_micros, id, dim, buckets,
     ) {
-        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
+        let _ = (sys.provider_call)(
+            -1,
+            abi::contracts::telemetry::TLM_EMIT,
+            buf.as_mut_ptr(),
+            n,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -212,7 +218,14 @@ pub unsafe fn dev_telemetry_span(
         start_micros,
         end_micros,
     ) {
-        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
+        let _ = (sys.provider_call)(
+            -1,
+            abi::contracts::telemetry::TLM_EMIT,
+            buf.as_mut_ptr(),
+            n,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 

@@ -97,10 +97,10 @@ pub struct AgentState {
     fence_cmd: [u8; CMD_MAX],
     restore_cmd: [u8; CMD_MAX],
     /// Frames read from `addr_ctl`.
-    buf: [u8; 64],
+    buf: [u8; FRAME_MAX],
     /// Frames written to `addr_evt`, kept apart from `buf` so emitting
     /// never overwrites the frame being served.
-    out: [u8; 64],
+    out: [u8; FRAME_MAX],
     /// Actuator output, read and discarded: its exit code is the signal.
     drain: [u8; 256],
 }
@@ -223,7 +223,7 @@ unsafe fn emit(s: &mut AgentState, msg: u8, payload: &[u8]) {
         payload.as_ptr(),
         payload.len(),
         s.out.as_mut_ptr(),
-        64,
+        FRAME_MAX,
     );
 }
 
@@ -309,7 +309,7 @@ unsafe fn actuate(s: &mut AgentState, op: u8, addr: &[u8; 16], token: &[u8; 16])
         b"[fence_agent] restoring "
     };
     log_addr(s, verb, addr, &[]);
-    let rc = (sys.provider_call)(-1, PROC_SPAWN, cmd, len);
+    let rc = (sys.provider_call)(-1, PROC_SPAWN, core::ptr::null_mut(), 0, cmd, len);
     if rc < 0 {
         // No executor on this node, or a command it will not run: the
         // host was not touched and the caller is told so.
@@ -367,14 +367,28 @@ unsafe fn poll_actuator(s: &mut AgentState) {
     // executor reports a command done only once its output has been read.
     let mut n = 0;
     while n < 8 {
-        let r = (sys.provider_call)(s.proc_slot, PROC_READ, s.drain.as_mut_ptr(), 256);
+        let r = (sys.provider_call)(
+            s.proc_slot,
+            PROC_READ,
+            s.drain.as_mut_ptr(),
+            256,
+            core::ptr::null_mut(),
+            0,
+        );
         if r <= 0 {
             break;
         }
         n += 1;
     }
     let mut st = [0u8; 4];
-    let status = (sys.provider_call)(s.proc_slot, PROC_STATUS, st.as_mut_ptr(), 4);
+    let status = (sys.provider_call)(
+        s.proc_slot,
+        PROC_STATUS,
+        st.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
     if status > 0 {
         return;
     }
@@ -386,7 +400,14 @@ unsafe fn poll_actuator(s: &mut AgentState) {
     } else {
         status
     };
-    let _ = (sys.provider_call)(s.proc_slot, PROC_CLOSE, core::ptr::null_mut(), 0);
+    let _ = (sys.provider_call)(
+        s.proc_slot,
+        PROC_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.proc_slot = -1;
     let addr = s.pending.addr;
     let op = s.pending.op;
@@ -439,7 +460,7 @@ unsafe fn service_ctl(s: &mut AgentState) {
         // Frame-aligned: a payload too large for `buf` is dropped whole
         // rather than left to desync the control channel for good.
         let (msg, copied, payload_len) =
-            net_read_frame_sized(sys, s.addr_ctl, s.buf.as_mut_ptr(), 64);
+            net_read_frame_sized(sys, s.addr_ctl, s.buf.as_mut_ptr(), FRAME_MAX);
         if msg == 0 {
             break;
         }
@@ -471,7 +492,13 @@ unsafe fn service_ctl(s: &mut AgentState) {
     }
 }
 
-fluxor_rt::module_facts! { state: AgentState }
+/// The largest address-control frame read or written, header included.
+const FRAME_MAX: usize = 64;
+
+fluxor_rt::module_facts! {
+    state: AgentState,
+    records: [in 0 ADDR_CTL_IN_ACCEPTS_RECORD = FRAME_MAX, out 0 ADDR_EVT_OUT_MAX_RECORD = FRAME_MAX],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

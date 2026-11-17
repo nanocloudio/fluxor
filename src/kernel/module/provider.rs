@@ -5,20 +5,26 @@
 //! A contract is the portable surface a module asks for (HAL GPIO, HAL
 //! SPI, channel, timer, FS, …). Each contract has a `ProviderVTable`
 //! with `call`, optional `query`, and a `default_close_op`. Consumers
-//! call `provider_open(contract, open_op, config, len)` to get a
-//! handle; the kernel records which contract the handle belongs to in
-//! `HANDLE_BINDINGS`, and subsequent `provider_call` / `provider_query`
-//! / `provider_close` route through that contract's vtable.
+//! call `provider_open(contract, open_op, arg)` to get a handle; the kernel
+//! records which contract the handle belongs to, and later `provider_call` /
+//! `provider_query` / `provider_close` route through that contract's vtable.
 //!
-//! Handle resolution order (see `lookup_contract`):
-//!   1. Tagged fds (event / timer / DMA-fd) self-identify via their
-//!      high-bit tag — no tracking entry required.
-//!   2. Handles returned by `provider_open` are looked up in
-//!      `HANDLE_BINDINGS`.
-//!   3. Anything else — `handle = -1` globals and scheduler-assigned
-//!      channel fds — falls through to class-byte routing, where the
-//!      opcode's high byte identifies the contract and
-//!      `dispatch(contract, …)` invokes the registered provider chain.
+//! Every call carries one handle slot, one flat `arg` record (a slice) and
+//! one bulk `data` span ([`UserSpan`]), and nothing else: no provider follows
+//! an address it was handed in bytes, and the kernel rewrites no argument.
+//!
+//! Every handle a module holds is a word the kernel minted
+//! (`abi::kernel_abi::handle`): `(contract, generation, index)`. A native
+//! handle (channel, event, timer, lend) names its slot in the kernel's own
+//! table, and the native op resolves it. Any other handle names a route
+//! ([`Route`]): which provider serves it and what that provider called it
+//! (its own index, `inner`). A provider — kernel, platform or module — answers
+//! an op that mints (the registry's handle use `mints`, `scoped_mints`,
+//! `minted_mints`) with its own index, and the kernel wraps it in a route. A
+//! handle whose generation is not its slot's names nothing (`EBADF`).
+//!
+//! A `handle = -1` op goes by its opcode's class byte to the contract's
+//! default provider: the top-most unkeyed module layer, else the platform's.
 //!
 //! ## Registration
 //!
@@ -33,21 +39,31 @@
 //! Each layer carries an **instance selector**: `0` for the default
 //! provider, or the hash of a short name (a volume, say) for a keyed one.
 //! Class-byte dispatch (`handle == -1`) reaches the top-most *unkeyed*
-//! layer; keyed layers are reachable only by name via `provider_call_sel`.
-//! That is what lets several providers of one contract coexist — two
-//! `fat32` volumes behind a `mount` router — without any of them shadowing
-//! another. Selectors are unique per contract: a duplicate is refused at
-//! registration, because a shadowed provider is silently unreachable.
+//! layer; a keyed layer is reached through a handle bound to it by name
+//! (`kernel::BIND`). That is what lets several providers of one contract
+//! coexist — two `fat32` volumes behind a `mount` router — without any of
+//! them shadowing another. Selectors are unique per contract: a duplicate is
+//! refused at registration, because a shadowed provider is silently
+//! unreachable.
 //!
-//! The name `platform` is reserved: `provider_call_sel("platform", …)`
-//! reaches the platform's own (kernel-registered) provider of the contract
-//! beneath any module layers — the host filesystem under a graph-local
-//! `fat32`, say. A handle minted through any selector is returned as a
-//! routed handle that names its minting provider, so its handle-bound ops
-//! reach that provider however the default layer changes (see `Route`).
+//! The name `platform` is reserved: a bind to it reaches the platform's own
+//! (kernel-registered) provider of the contract beneath any module layers —
+//! the host filesystem under a graph-local `fat32`, say.
+//!
+//! An **edge contract** (`storage.block`, `net_tx_drain`) has no default and
+//! no chain: it is served by the module at the other end of one of the
+//! caller's ports, through a handle bound to that port. The provider is
+//! handed its own port on the edge as the handle of every such op.
+//!
+//! A bound handle, and every handle an op through it mints, is a routed
+//! handle that names its provider (see `Route`), so its ops reach that
+//! provider however the default layer changes.
 
+use crate::abi::kernel_abi::handle;
+use crate::abi::registry::gate::HandleUse;
 use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
-use crate::kernel::ipc::fd;
+use crate::kernel::mem::handles::{HandleTable, Slot};
+use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 
 /// Stable contract identifier. The vtable registry is indexed by this id;
@@ -73,7 +89,6 @@ pub mod contract {
     pub const HAL_PWM: u16 = crate::abi::registry::pwm::ID;
     pub const CHANNEL: u16 = crate::abi::registry::channel::ID;
     pub const TIMER: u16 = crate::abi::registry::timer::ID;
-    pub const BUFFER: u16 = crate::abi::registry::buffer::ID;
     pub const EVENT: u16 = crate::abi::registry::event::ID;
     pub const FS: u16 = crate::abi::registry::fs::ID;
     pub const STORAGE_NAMESPACE: u16 = crate::abi::registry::storage_namespace::ID;
@@ -105,17 +120,20 @@ pub mod contract {
 ///
 /// `call` handles every operation on a handle or global (handle=-1)
 /// op — including open-style ops that return a handle (CLAIM,
-/// SET_INPUT, OPEN, CREATE, …). The caller picks the open-style
-/// opcode; `provider_open` tracks the returned handle against the
-/// contract.
+/// SET_INPUT, OPEN, CREATE, …). `arg` is the op's flat record: read in
+/// place, and written in place where the op answers into it. `data` is the
+/// op's bulk span, valid for this call.
 ///
-/// `query` reads introspection state. `default_close_op` is the opcode
-/// `provider_close` invokes to release a handle (e.g. `gpio::RELEASE`,
-/// `channel::CLOSE`). Contracts whose handles don't need a close hook
-/// (BUFFER, some net paths) leave it as 0, in which case
-/// `provider_close` just releases the tracking entry.
-pub type VTableCallFn = unsafe fn(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32;
-pub type VTableQueryFn = unsafe fn(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32;
+/// `query` reads introspection state into `out`. `default_close_op` is the
+/// opcode `provider_close` invokes to release a handle (e.g. `gpio::RELEASE`,
+/// `channel::CLOSE`). Contracts whose handles don't need a close hook leave
+/// it as 0, in which case `provider_close` just releases the route.
+pub type VTableCallFn = fn(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32;
+pub type VTableQueryFn = fn(handle: i32, key: u32, out: &mut [u8]) -> i32;
+/// Readiness of one of a contract's handles (`HANDLE_POLL`): the ready bits of
+/// `events`, or a negative errno. `inner` is the provider's own index; for a
+/// native contract, the handle itself.
+pub type VTablePollFn = fn(inner: i32, events: u32) -> i32;
 
 /// A contract's dispatch vtable. Registered once at kernel init via
 /// `register_vtable`.
@@ -125,6 +143,9 @@ pub struct ProviderVTable {
     pub query: Option<VTableQueryFn>,
     /// Opcode used by `provider_close` to release a handle. 0 = none.
     pub default_close_op: u32,
+    /// `HANDLE_POLL` on the contract's handles; `None`: they do not poll
+    /// (`EINVAL`). A signalling handle polls its doorbell instead.
+    pub poll: Option<VTablePollFn>,
 }
 
 /// Maximum number of contracts. A contract id is simultaneously the
@@ -162,256 +183,78 @@ fn vtable_for(contract: ContractId) -> Option<&'static ProviderVTable> {
     unsafe { VTABLES[idx] }
 }
 
-// ── Handle → contract tracking ───────────────────────────────────────
-//
-// Untagged handles returned by `provider_open` (GPIO pin numbers, DMA
-// channel numbers, HAL handles) are recorded here so `provider_call` /
-// `provider_query` / `provider_close` can route by the bound contract
-// instead of inferring from the opcode's class byte. Tagged fds
-// (event / timer / DMA-fd) identify their contract via tag bits and
-// don't consume a slot.
+// ── Handles ──────────────────────────────────────────────────────────
 
-/// Untagged handles tracked at once: the profile's static table, or where the
-/// plan sizes it (Linux, bcm2712, RP) the plan's `tracked_handles` pool, its
-/// envelope entry or default.
-const MAX_TRACKED: usize =
-    crate::kernel::config::static_slots(crate::abi::contracts::resource::POOL_TRACKED_HANDLES);
-
-struct HandleBinding {
-    handle: i32,
-    contract: ContractId,
-    /// Owner that opened the handle.
-    owner: crate::kernel::workload::owner::OwnerHandle,
+/// Whether `contract`'s handles are native: slots in a kernel table the
+/// contract's own ops resolve (`ipc::handle::resolve_owned`, the channel's
+/// resolver), never routes.
+pub fn is_native(contract: ContractId) -> bool {
+    matches!(
+        contract,
+        contract::CHANNEL | contract::TIMER | contract::EVENT
+    ) || contract == crate::abi::registry::lend::ID
 }
 
-static mut HANDLE_BINDINGS: crate::kernel::mem::table::Table<HandleBinding, MAX_TRACKED> = crate::boot_table!(
-    MAX_TRACKED,
-    HandleBinding {
-        handle: -1,
-        contract: 0,
-        owner: crate::kernel::workload::owner::OWNER_SYSTEM,
-    },
-    crate::abi::contracts::resource::POOL_TRACKED_HANDLES
-);
-
-/// Size the tracking table to `n` slots, all live.
-///
-/// # Safety
-/// Graph-preparation context: no reference into the table is live.
-pub unsafe fn size_tracked(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
-    let t = &*core::ptr::addr_of!(HANDLE_BINDINGS);
-    t.reserve(n)?;
-    t.grow(n)
+/// The contract a handle names: `None` for a negative value (an errno, or
+/// `-1`) and for a contract field past [`MAX_CONTRACTS`].
+pub fn contract_of(h: i32) -> Option<ContractId> {
+    handle::contract_of(h).filter(|&c| (c as usize) < MAX_CONTRACTS)
 }
 
-/// Tracked handles held now — resource-ledger sample for
-/// `POOL_TRACKED_HANDLES`.
-pub fn tracked_in_use() -> usize {
-    // SAFETY: read-only walk on the scheduler thread.
-    unsafe {
-        (*core::ptr::addr_of!(HANDLE_BINDINGS))
-            .iter()
-            .filter(|b| b.handle != -1)
-            .count()
-    }
+/// The rule the registry declares for `op` (`gate::op_rule`).
+fn rule_of(op: u32) -> Option<crate::abi::registry::gate::OpRule> {
+    crate::abi::registry::gate::op_rule(op & !CHAIN_NEXT)
 }
 
-/// Result of `track_handle`. `Ok(())` = a tracking slot was claimed (or none
-/// was needed because the handle is self-identifying via FD tag).
-/// `Err(())` = the tracking table was full; the caller must release the
-/// underlying handle and propagate an error to the module.
-fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
-    if handle < 0 {
-        return Ok(());
-    }
-    // Tagged fds (event / timer / dma) are self-identifying — the FD
-    // tag carries the contract id, so `lookup_contract` resolves them
-    // without a tracking table entry. Skip tracking to keep the table
-    // available for untagged handles (GPIO pins, DMA channel numbers,
-    // HAL handles) that genuinely need an entry. A tagged handle's
-    // provider keeps its own slots, and answers each to its opener.
-    if fd_tag_contract(handle).is_some() {
-        return Ok(());
-    }
-    // SAFETY: HANDLE_BINDINGS is scheduler-thread-owned; track_handle
-    // is called from provider_open which serialises on the kernel side.
-    unsafe {
-        let p = &raw mut HANDLE_BINDINGS;
-        (*p).size_unplanned(|| {
-            crate::kernel::sys::resource_ledger::ceiling(
-                crate::abi::contracts::resource::POOL_TRACKED_HANDLES,
-            ) as usize
-        });
-        for slot in (*p).iter_mut() {
-            if slot.handle == -1 {
-                slot.handle = handle;
-                slot.contract = contract;
-                // Stamp the opening module's owner so later use is owner-scoped.
-                slot.owner = crate::kernel::exec::scheduler::caller_owner();
-                return Ok(());
-            }
-        }
-        log::error!(
-            "[provider] pool 'tracked_handles' at its ceiling of {} slots; refusing to leak \
-             untracked handle {handle} for contract {contract:#x}",
-            (&(*p)).len()
-        );
-        crate::kernel::sys::resource_ledger::deny(
-            crate::abi::contracts::resource::POOL_TRACKED_HANDLES,
-        );
-        Err(())
-    }
+/// Whether `op` answers a handle the kernel wraps in a route: its rule mints
+/// and its contract's handles are not native.
+fn op_mints(op: u32) -> bool {
+    let class = ((op >> 8) & 0xFF) as ContractId;
+    !is_native(class)
+        && class != contract::INTERNAL_DISPATCH_BUCKET
+        && rule_of(op).is_some_and(|r| {
+            matches!(
+                r.handle,
+                HandleUse::Mints | HandleUse::ScopedMints | HandleUse::MintedMints
+            )
+        })
 }
 
-/// Owner-scoping guard for tracked provider handles. Returns `true` — deny —
-/// when the calling module's owner may not use `handle` because it was opened
-/// by a different, non-system owner. Self-identifying FDs (event/timer/dma)
-/// are skipped: they carry no tracking entry and the event/timer subsystems
-/// enforce their own per-module ownership.
-fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
+/// Whether the handle `op` mints signals its minter.
+fn op_signals(op: u32) -> bool {
+    rule_of(op).is_some_and(|r| r.signals)
+}
+
+/// Whether the calling module's owner may use route `r`: a routed handle is
+/// its minting module's, so its owner's alone. Logs a refusal.
+fn route_owner_ok(r: &Route, h: i32, syscall: &str) -> bool {
     // An owner table of the system slot alone stamps every handle and every
     // caller `OWNER_SYSTEM`: nothing can be another owner's. This is every
     // call on a node whose plan seats no workload, so it costs one load.
-    if handle < 0 || crate::kernel::exec::scheduler::owners().slot_count() <= 1 {
-        return false;
+    if crate::kernel::exec::scheduler::owners().slot_count() <= 1 || r.minter == NO_MODULE {
+        return true;
     }
     let caller = crate::kernel::exec::scheduler::caller_owner();
-    // A routed handle is its minting module's, so its owner's alone.
-    if let RouteLookup::Live(idx) = route_lookup(handle) {
-        let r = route_at(idx);
-        if r.minter != crate::kernel::exec::scheduler::NO_MODULE {
-            let minted_by = crate::kernel::exec::scheduler::module_owner(r.minter as usize);
-            if caller != minted_by {
-                log::warn!(
-                    "[provider] {syscall}: owner slot {} denied routed handle {handle:#x} \
-                     (minted by owner slot {})",
-                    caller.slot,
-                    minted_by.slot,
-                );
-                return true;
-            }
-        }
-        return false;
+    let minted_by = crate::kernel::exec::scheduler::module_owner(r.minter as usize);
+    if caller == minted_by {
+        return true;
     }
-    // SAFETY: HANDLE_BINDINGS is scheduler-thread-owned (see `track_handle`).
-    let bound_owner = unsafe {
-        let p = &raw const HANDLE_BINDINGS;
-        (*p).iter().find(|s| s.handle == handle).map(|s| s.owner)
-    };
-    // Untracked handle → no entry to scope (raw HAL handle, etc.); allow.
-    let Some(bound_owner) = bound_owner else {
-        return false;
-    };
-    if crate::kernel::workload::owner::same_or_system(caller, bound_owner) {
-        false
-    } else {
-        log::warn!(
-            "[provider] {syscall}: owner slot {} denied cross-owner handle {handle} \
-             (opened by owner slot {})",
-            caller.slot,
-            bound_owner.slot,
-        );
-        true
-    }
-}
-
-/// Public lookup — returns the contract bound to `handle`. Resolution
-/// order: tagged FD (self-identifying via high-bit tag) → tracked
-/// binding from `provider_open` → None.
-pub fn contract_of(handle: i32) -> Option<ContractId> {
-    lookup_contract(handle)
-}
-
-/// Derive a contract from an FD tag, if the handle carries one. This
-/// is the fast path for scheduler-assigned fds (channel / event /
-/// timer) and for tagged-fd opens (DMA fd). Returns `None` for raw
-/// integer handles (GPIO pin numbers, DMA channel numbers, etc.) —
-/// those rely on the `HANDLE_BINDINGS` tracking table populated by
-/// `provider_open`.
-fn fd_tag_contract(handle: i32) -> Option<ContractId> {
-    if handle < 0 {
-        return None;
-    }
-    use crate::kernel::ipc::fd;
-    // Tag 0 (FD_TAG_CHANNEL) produces handles indistinguishable from
-    // raw integers because tag 0 doesn't set any high bits. Resolving
-    // channels via tag would clash with e.g. DMA channel numbers
-    // (0..15) that share the same bit pattern. Keep channel handles
-    // on the opcode-class-byte dispatch path — CHANNEL ops all carry
-    // 0x05 in the opcode's high byte so routing is unambiguous. Every
-    // other tag sets high bits, so none collides with a small integer.
-    // A minting contract tags its handles with its own id.
-    let (tag, _slot) = fd::untag_fd(handle);
-    let id = u16::try_from(tag).ok()?;
-    (tag != crate::abi::registry::fd::UNTAGGED && crate::abi::registry::contract_mints(id))
-        .then_some(id)
-}
-
-fn lookup_contract(handle: i32) -> Option<ContractId> {
-    if handle < 0 {
-        return None;
-    }
-    if let Some(c) = fd_tag_contract(handle) {
-        return Some(c);
-    }
-    // SAFETY: HANDLE_BINDINGS read-only path; the producer side is
-    // serialised on the scheduler thread.
-    unsafe {
-        let p = &raw const HANDLE_BINDINGS;
-        for slot in (*p).iter() {
-            if slot.handle == handle {
-                return Some(slot.contract);
-            }
-        }
-    }
-    None
-}
-
-fn release_handle(handle: i32) {
-    if handle < 0 {
-        return;
-    }
-    // SAFETY: scheduler-thread-only mutation.
-    unsafe {
-        let p = &raw mut HANDLE_BINDINGS;
-        for slot in (*p).iter_mut() {
-            if slot.handle == handle {
-                slot.handle = -1;
-                slot.contract = 0;
-                return;
-            }
-        }
-    }
-}
-
-// ── Handle-scoped dispatch ───────────────────────────────────────────
-
-/// Contract → FD-tag mapping. Every contract that returns a handle
-/// to a module appears here so `provider_open` can apply the tag
-/// that matches `fd_tag_contract`'s inverse lookup. Contracts
-/// returning `None` don't use tagged fds (CHANNEL is the only one).
-fn contract_to_tag(contract: ContractId) -> Option<i32> {
-    crate::abi::registry::contract_mints(contract).then_some(i32::from(contract))
+    log::warn!(
+        "[provider] {syscall}: owner slot {} denied handle {h:#x} (minted by owner slot {})",
+        caller.slot,
+        minted_by.slot,
+    );
+    false
 }
 
 /// Open a handle on the named contract. The caller chooses the
-/// open-style opcode (e.g. `gpio::CLAIM`, `gpio::SET_INPUT`,
-/// `spi::OPEN`, `timer::CREATE`) — `config` / `config_len` are the
-/// operation's arg payload. Returns a handle (>= 0) on success,
-/// negative errno on failure.
+/// open-style opcode (e.g. `gpio::CLAIM`, `spi::OPEN`, `timer::CREATE`) —
+/// `arg` is the operation's record, which the kernel holds its own copy of for
+/// the call. Returns a handle (>= 0) on success, negative errno on failure.
 ///
-/// The returned handle carries the contract's FD tag per
-/// `contract_to_tag`. Handlers that self-tag (event, timer, DMA-fd,
-/// key_vault, PCIE_DEVICE) pass through if the tag matches; handlers
-/// that return a raw slot get tagged here. Handlers that return a
-/// mismatched tag are refused with ENOSYS — better to fail loudly
-/// than silently misroute.
-pub fn provider_open(
-    contract: ContractId,
-    open_op: u32,
-    config: *const u8,
-    config_len: usize,
-) -> i32 {
+/// `kernel::BIND` is answered here: it opens a handle bound to one provider
+/// of `contract` (see [`bind`]).
+pub fn provider_open(contract: ContractId, open_op: u32, config: &[u8]) -> i32 {
     // ISR-tier modules must not touch the provider table.
     // Bridge channels are the only legal cross-tier conduit.
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_open") {
@@ -432,210 +275,258 @@ pub fn provider_open(
         );
         return errno::EACCES;
     }
-    let handle = match vtable_for(contract) {
-        // SAFETY: vt.call is the contract's registered fn-pointer; passing
-        // -1 (no handle yet) with the open opcode and caller's config buf.
-        Some(vt) => unsafe { (vt.call)(-1, open_op, config as *mut u8, config_len) },
-        None => {
-            // No vtable — fall back to the contract's registered
-            // chain dispatcher directly.
-            // SAFETY: as above; `dispatch` enforces its own bounds checks.
-            unsafe { dispatch(contract, -1, open_op, config as *mut u8, config_len) }
-        }
+    if open_op == crate::abi::registry::kernel::BIND {
+        return bind(contract, config);
+    }
+    if ((open_op >> 8) & 0xFF) as ContractId != contract {
+        return errno::EINVAL;
+    }
+    // The provider writes into an open's record as into any other: it is
+    // the kernel's copy, so a caller's read-only config stays untouched.
+    let mut copy = [0u8; crate::abi::registry::gate::ARG_MAX];
+    let Some(arg) = copy.get_mut(..config.len()) else {
+        return errno::EINVAL;
     };
-    if handle < 0 {
-        return handle;
-    }
-    match contract_to_tag(contract) {
-        Some(expected) => {
-            let (actual, slot) = fd::untag_fd(handle);
-            if actual == expected {
-                handle
-            } else if actual == 0 {
-                fd::tag_fd(expected, slot)
-            } else {
-                log::error!(
-                    "[provider] contract {contract:#x} open returned handle with tag={actual} (expected {expected}); refusing",
-                );
-                errno::ENOSYS
-            }
-        }
-        None => {
-            // Untagged contract (CHANNEL): class-byte dispatch looks
-            // the handle up via HANDLE_BINDINGS. If tracking fails
-            // (table full), close the resource we just opened and
-            // refuse the open — fail-closed; never return an
-            // untracked handle.
-            match track_handle(handle, contract) {
-                Ok(()) => handle,
-                Err(()) => {
-                    // Release the underlying resource. Use the same
-                    // dispatch path provider_close uses so contracts
-                    // without a vtable still get the default-close op
-                    // delivered.
-                    if let Some(vt) = vtable_for(contract) {
-                        if vt.default_close_op != 0 {
-                            // SAFETY: vt.call is the registered fn-pointer;
-                            // null arg, zero len is the close convention.
-                            unsafe {
-                                (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0);
-                            }
-                        }
-                    }
-                    // Use ENOMEM: tracking table is a finite kernel
-                    // resource and the caller exhausted it. Same class
-                    // as STATE_ARENA exhaustion in the loader.
-                    errno::ENOMEM
-                }
-            }
-        }
-    }
+    arg.copy_from_slice(config);
+    call_by_class(-1, open_op, arg, UserSpan::empty())
 }
 
-/// Invoke an operation on an open handle.
+/// Invoke an operation on a handle (or `handle == -1`).
 ///
-/// Routing resolution order:
-///   0. Kernel primitives (opcode class `INTERNAL_DISPATCH_BUCKET`): a
-///      question about a handle rather than a request to its provider, so
-///      the opcode decides ahead of the handle.
-///   1. `handle >= 0` with an FD tag: the tag self-identifies the
-///      contract via `fd_tag_contract`.
-///   2. Channel fds (tag 0) + `handle == -1` globals: HANDLE_BINDINGS
-///      lookup, then class-byte dispatch on the opcode's high byte.
-///
-/// Tagged handles pass through unchanged. Handlers strip with
-/// `slot_of(handle)` at entry when they need the raw slot, or inspect
-/// the tag when they need to reject a wrong-family handle (e.g. a
-/// channel-op handler rejecting a DMA-fd tag).
-pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+/// Routing:
+///   0. A class-routed opcode (the kernel's own class, and every contract the
+///      registry routes by class) goes to the kernel ahead of the handle; a
+///      handle of the op's own contract is first resolved to its route's
+///      inner index.
+///   1. A native contract's op goes to its vtable with the handle as is.
+///   2. A handle: its route's provider, with the provider's own index.
+///   3. `handle == -1`: the contract's default provider.
+pub fn provider_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
     // Defense in depth: ISR-tier (Tier 1b/2) modules must not reach
     // `provider_call` — the contract is "bridge-only I/O, no syscalls".
-    // The build-time validator already gates admission; this catches
-    // hand-rolled binaries that bypass the tools pipeline. EXCEPTION: the
-    // bridge ops and `SELF_BRIDGES` enumeration ARE the sanctioned
-    // ISR-tier I/O path (lock-free, allocation-free rings), so they are
-    // exempt from the deny here too — matching the exemption in
-    // `syscall_provider_call`.
+    // EXCEPTION: the bridge ops and `SELF_BRIDGE` are the sanctioned ISR-tier
+    // I/O path (lock-free, allocation-free rings), so they are exempt here
+    // too — matching the exemption in `syscall_provider_call`.
     if !crate::abi::internal::bridge::is_isr_safe(op)
         && crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_call")
     {
         return errno::EACCES;
     }
-    if deny_cross_owner_handle(handle, "provider_call") {
+    // The doorbell a provider is handed is the kernel's to hand: a module
+    // naming one would bind its own provider to another module's wake.
+    if op & !CHAIN_NEXT == crate::abi::kernel_abi::doorbell::BIND_DOORBELL {
         return errno::EACCES;
     }
-    let class = ((op >> 8) & 0xFF) as u16;
-    // A kernel primitive (the kernel's class, and every class-routed contract — HANDLE_POLL above all) is a
-    // question about a handle, not a request to its provider: `fd_poll` on a
-    // timer or event fd asks the KERNEL whether the fd is ready, and the
-    // handle's own provider has no opinion to offer. So the primitive is
-    // routed by its opcode class ahead of the handle's contract; a contract's
-    // vtable sees only the opcodes it defines.
-    if crate::abi::registry::op_routes_to_kernel(op) {
-        // SAFETY: dispatch routes to the kernel-internal bucket handler.
-        return unsafe { dispatch(contract::INTERNAL_DISPATCH_BUCKET, handle, op, arg, arg_len) };
+    if handle >= 0 && rule_of(op).is_none_or(|r| r.handle != HandleUse::Value) {
+        call_by_handle(handle, op, arg, data)
+    } else {
+        call_by_class(handle, op, arg, data)
     }
-    // A handle minted through a selector belongs to the provider that minted
-    // it, not to whichever layer is the default now.
-    match route_lookup(handle) {
-        // SAFETY: caller owns `arg`/`arg_len` for the call.
-        RouteLookup::Live(idx) => return unsafe { call_route(idx, op, arg, arg_len) },
-        RouteLookup::Stale => return EBADF,
-        RouteLookup::NotRouted => {}
-    }
-    if let Some(contract) = lookup_contract(handle) {
-        if let Some(vt) = vtable_for(contract) {
-            // SAFETY: vt.call is the contract's registered ABI entry;
-            // caller owns `arg`/`arg_len` for the call.
-            return unsafe { (vt.call)(handle, op, arg, arg_len) };
-        }
-        // SAFETY: dispatch routes to the chain-registered handler.
-        return unsafe { dispatch(contract, handle, op, arg, arg_len) };
-    }
-    // Every provider of `fs`, `storage.object` and `storage.namespace` hands
-    // out handles carrying its contract's fd tag, which resolve above. A
-    // non-negative handle here is not one of theirs: a descriptor field never
-    // opened, a raw slot number that would reach whatever object holds that
-    // slot now (another module's), or a handle minted at a tag this kernel
-    // does not know. It names nothing.
-    if handle >= 0
-        && matches!(
-            class,
-            contract::FS | contract::STORAGE_OBJECT | contract::STORAGE_NAMESPACE
-        )
-    {
-        return EBADF;
-    }
-    // SAFETY: as above; class-byte dispatch fallback.
-    unsafe { dispatch(class, handle, op, arg, arg_len) }
 }
 
-/// Query handle state by key.
-pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32 {
+/// An op through `h`, a handle.
+fn call_by_handle(h: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    let class = ((op >> 8) & 0xFF) as ContractId;
+    let Some(c) = contract_of(h) else {
+        return EBADF;
+    };
+    if crate::abi::registry::op_routes_to_kernel(op) {
+        // The kernel's own ops and the native contracts' resolve the handle
+        // themselves (a lend is opened on any session), and so does an op
+        // naming a native handle of another contract (the event a monitor
+        // subscription signals). Any other handle is translated to what its
+        // provider calls it, and must be of the op's own contract.
+        if is_native(class)
+            || class == contract::INTERNAL_DISPATCH_BUCKET
+            || (c != class && is_native(c))
+        {
+            return call_by_class(h, op, arg, data);
+        }
+        if c != class {
+            return EBADF;
+        }
+        let (idx, generation, r) = match route_of(h) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if !route_owner_ok(&r, h, "provider_call") {
+            return errno::EACCES;
+        }
+        return call_route(idx, generation, r, op, arg, data);
+    }
+    if is_native(class) {
+        return match vtable_for(class) {
+            Some(vt) => (vt.call)(h, op, arg, data),
+            None => errno::ENOSYS,
+        };
+    }
+    // A handle names one contract: an op of another through it names
+    // nothing, before any provider sees it. The fence query is every
+    // storage contract's own (`fence::QUERY_OP`), forwarded by the kernel.
+    if c != class && op != crate::abi::fence::QUERY_OP {
+        log::warn!("[provider] op {op:#06x} through a handle of contract {c:#06x}; refusing");
+        return EBADF;
+    }
+    let (idx, generation, r) = match route_of(h) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !route_owner_ok(&r, h, "provider_call") {
+        return errno::EACCES;
+    }
+    call_route(idx, generation, r, op, arg, data)
+}
+
+/// An op by its opcode's class: `handle` is `-1`, a value the op takes in
+/// the handle slot, or a handle of another contract the kernel op resolves.
+fn call_by_class(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    let class = ((op >> 8) & 0xFF) as ContractId;
+    if crate::abi::registry::op_routes_to_kernel(op) {
+        let rc = dispatch(contract::INTERNAL_DISPATCH_BUCKET, handle, op, arg, data);
+        if rc >= 0 && op_mints(op) {
+            return mint(Mint {
+                contract: class,
+                selector: 0,
+                target: Target::Platform,
+                inner: rc,
+                bound: false,
+                class_routed: true,
+                signals: op_signals(op),
+            });
+        }
+        return rc;
+    }
+    if is_native(class) {
+        return match vtable_for(class) {
+            Some(vt) => (vt.call)(handle, op, arg, data),
+            None => dispatch(class, handle, op, arg, data),
+        };
+    }
+    // An edge contract is reached through a bound handle alone: a
+    // `handle == -1` op has no edge to travel.
+    if crate::abi::registry::contract_is_edge(class) {
+        return EBADF;
+    }
+    let Some(target) = default_target(class) else {
+        return dispatch(class, handle, op, arg, data);
+    };
+    let rc = call_target(class, target, handle, op, arg, data);
+    if rc >= 0 && op_mints(op) {
+        let selector = match target {
+            Target::Platform => PLATFORM_SELECTOR,
+            Target::Module(_) => 0,
+        };
+        return mint(Mint {
+            contract: class,
+            selector,
+            target,
+            inner: rc,
+            bound: false,
+            class_routed: false,
+            signals: op_signals(op),
+        });
+    }
+    rc
+}
+
+/// Query handle state by key into `out`.
+pub fn provider_query(handle: i32, key: u32, out: &mut [u8]) -> i32 {
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_query") {
         return errno::EACCES;
     }
-    if deny_cross_owner_handle(handle, "provider_query") {
-        return errno::EACCES;
-    }
-    if let Some(contract) = lookup_contract(handle) {
-        if let Some(vt) = vtable_for(contract) {
-            return match vt.query {
-                // SAFETY: vt.query is the registered fn-pointer.
-                Some(f) => unsafe { f(handle, key, out, out_len) },
-                None => errno::ENOSYS,
-            };
+    let Some(c) = contract_of(handle) else {
+        return errno::ENOSYS;
+    };
+    let (vt_contract, inner) = if is_native(c) {
+        (c, handle)
+    } else {
+        match route_of(handle) {
+            Ok((_, _, r)) => {
+                if !route_owner_ok(&r, handle, "provider_query") {
+                    return errno::EACCES;
+                }
+                (r.contract, r.inner)
+            }
+            Err(_) => return errno::ENOSYS,
         }
+    };
+    match vtable_for(vt_contract).and_then(|v| v.query) {
+        Some(f) => f(inner, key, out),
+        None => errno::ENOSYS,
     }
-    errno::ENOSYS
 }
 
-/// Close an open handle using the contract's default close opcode.
-/// For contracts whose vtable declares `default_close_op = 0`,
-/// `provider_close` only releases the tracking entry and returns 0.
+/// `HANDLE_POLL`: the ready bits of `events` on `h`, or a negative errno.
+/// A native handle polls through its contract's vtable; a routed one polls
+/// its doorbell when it signals (taking the ring, so it reads ready once per
+/// ring), else its contract's vtable with the provider's own index.
+pub fn poll(h: i32, events: u32) -> i32 {
+    if h < 0 {
+        return errno::EINVAL;
+    }
+    let Some(c) = contract_of(h) else {
+        return EBADF;
+    };
+    if is_native(c) {
+        return match vtable_for(c).and_then(|v| v.poll) {
+            Some(f) => f(h, events),
+            None => errno::EINVAL,
+        };
+    }
+    let (_, _, r) = match route_of(h) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !route_owner_ok(&r, h, "handle_poll") {
+        return errno::EACCES;
+    }
+    if r.event >= 0 {
+        let rang = events & crate::abi::kernel_abi::poll::IN != 0
+            && crate::kernel::ipc::event::doorbell_take(r.event);
+        return if rang {
+            crate::abi::kernel_abi::poll::IN as i32
+        } else {
+            0
+        };
+    }
+    match vtable_for(r.contract).and_then(|v| v.poll) {
+        Some(f) => f(r.inner, events),
+        None => errno::EINVAL,
+    }
+}
+
+/// Close a handle: a native one through its contract's close op, a routed
+/// one by asking its provider to close its index (the contract's default
+/// close op) and dropping the route.
 ///
-/// The handle is released whatever the provider answers: a close never
-/// waits and always releases (the `fs` contract's `CLOSE`), and a provider
-/// with write-back left to do finishes it in its own step. The answer is
-/// passed through for the caller to see, never as a reason to keep the
-/// handle.
+/// The route is dropped whatever the provider answers: a close never waits
+/// and always releases (the `fs` contract's `CLOSE`), and a provider with
+/// write-back left to do finishes it in its own step. The answer is passed
+/// through for the caller to see, never as a reason to keep the handle.
 pub fn provider_close(handle: i32) -> i32 {
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_close") {
         return errno::EACCES;
     }
-    if deny_cross_owner_handle(handle, "provider_close") {
+    let Some(c) = contract_of(handle) else {
+        return EBADF;
+    };
+    if is_native(c) {
+        return match vtable_for(c) {
+            Some(vt) if vt.default_close_op != 0 => {
+                (vt.call)(handle, vt.default_close_op, &mut [], UserSpan::empty())
+            }
+            Some(_) => 0,
+            None => errno::ENOSYS,
+        };
+    }
+    let (idx, generation, r) = match route_of(handle) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !route_owner_ok(&r, handle, "provider_close") {
         return errno::EACCES;
     }
-    match route_lookup(handle) {
-        RouteLookup::Live(idx) => {
-            let r = route_at(idx);
-            let close = vtable_for(r.contract).map_or(0, |v| v.default_close_op);
-            if close == 0 {
-                retire_route(idx, r.generation);
-                return 0;
-            }
-            // SAFETY: close convention: null arg, zero length.
-            return unsafe { call_route(idx, close, core::ptr::null_mut(), 0) };
-        }
-        RouteLookup::Stale => return EBADF,
-        RouteLookup::NotRouted => {}
-    }
-    let result = if let Some(contract) = lookup_contract(handle) {
-        if let Some(vt) = vtable_for(contract) {
-            if vt.default_close_op != 0 {
-                // SAFETY: vt.call is the registered fn-pointer.
-                unsafe { (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0) }
-            } else {
-                0
-            }
-        } else {
-            errno::ENOSYS
-        }
-    } else {
-        errno::ENOSYS
-    };
-    release_handle(handle);
-    result
+    close_route(idx, generation, &r)
 }
 
 /// What the platform does when an owner is released: close what the owner
@@ -650,64 +541,71 @@ pub fn register_owner_release_hook(hook: fn(crate::kernel::workload::owner::Owne
     unsafe { *core::ptr::addr_of_mut!(OWNER_RELEASE_HOOK) = Some(hook) };
 }
 
-/// Clear all handle tracking. Called on `scheduler::reset` so new
-/// graphs don't inherit stale handle→contract bindings.
+/// Drop every route. Called on `scheduler::reset` so a new graph inherits no
+/// handle of the old one; the generations stay, so none of them names a
+/// route of the new graph.
 pub fn reset_handle_tracking() {
     // SAFETY: called from scheduler::reset between graph rebuilds; no
-    // module observes HANDLE_BINDINGS at this point.
-    unsafe {
-        let p = &raw mut HANDLE_BINDINGS;
-        for slot in (*p).iter_mut() {
-            slot.handle = -1;
-            slot.contract = 0;
-        }
-        let p = &raw mut ROUTES;
-        let routes = &mut *p;
-        for r in routes.iter_mut() {
-            r.in_use = false;
-            r.inner = -1;
-        }
-    }
+    // module observes ROUTES at this point.
+    unsafe { (*core::ptr::addr_of_mut!(ROUTES)).clear() };
 }
 
-/// Snapshot of provider tracking-table usage. Used by diagnostics and
-/// harness tests that need to assert tracking-table state without
-/// reading the private `HANDLE_BINDINGS` static directly.
+/// Snapshot of the route table. Used by diagnostics and harness tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandleTrackingStats {
-    /// Slots currently bound to an open handle.
+    /// Routes live now.
     pub in_use: usize,
-    /// Total slots in the tracking table.
+    /// Routes the table holds (the `handles` pool's ceiling).
     pub capacity: usize,
 }
 
-/// Return current usage of the provider handle tracking table.
-/// Cheap: walks the live entries once with relaxed ordering.
+/// Return the route table's usage.
 pub fn handle_tracking_stats() -> HandleTrackingStats {
-    // SAFETY: a length read of HANDLE_BINDINGS on the scheduler thread.
-    let capacity = unsafe { (&(*core::ptr::addr_of!(HANDLE_BINDINGS))).len() };
+    let routes = routes();
     HandleTrackingStats {
-        in_use: tracked_in_use(),
-        capacity,
+        in_use: routes.in_use(),
+        capacity: routes.capacity(),
     }
 }
 
-/// Function signature for a kernel-internal contract provider.
-/// Arguments: handle, opcode, arg pointer, arg length.
-/// Returns: result code (0 = success, >0 = bytes/count, <0 = errno).
-pub type ProviderDispatch =
-    unsafe fn(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
+/// Function signature for a kernel-internal contract provider: the vtable
+/// call's shape.
+pub type ProviderDispatch = VTableCallFn;
 
-/// Function signature for a PIC module contract provider. Shape matches
-/// `ProviderDispatch` with the module's state pointer prepended. Called
-/// synchronously from kernel context — must not block or perform async I/O.
+/// Function signature for a PIC module contract provider: the six call words
+/// with the module's state pointer prepended. Called synchronously from
+/// kernel context, in the caller's frame — must not block or perform async
+/// I/O.
 pub type ModuleProviderDispatchFn = unsafe extern "C" fn(
     state: *mut u8,
     handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32;
+
+/// Call a module's provider dispatch with one call's words.
+fn call_module(
+    dispatch: ModuleProviderDispatchFn,
+    state: *mut u8,
+    handle: i32,
+    opcode: u32,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
+) -> i32 {
+    let (dp, dl) = data.as_raw();
+    let ap = if arg.is_empty() {
+        core::ptr::null_mut()
+    } else {
+        arg.as_mut_ptr()
+    };
+    // SAFETY: `dispatch` and `state` are the pair the module registered
+    // (its entry point inside its own code, its own state); `arg` and `data`
+    // are live, disjoint spans for the call, as its C ABI expects.
+    unsafe { dispatch(state, handle, opcode, ap, arg.len(), dp, dl) }
+}
 
 /// Maximum registered contracts (indexed by `ContractId`). The provider
 /// chain table and the vtable registry index the same id space, so this is
@@ -749,7 +647,7 @@ struct ProviderLayer {
     /// shared with modules via `abi::provider_selector::hash`). `0` =
     /// unkeyed / default provider — the target of the class-byte
     /// (`handle == -1`) dispatch path. A non-zero selector is reachable only
-    /// via `provider_call_sel`, letting multiple volumes of one contract (two
+    /// through a handle bound to it by name, letting multiple volumes of one contract (two
     /// `fat32`, NVMe + SD) coexist without shadowing.
     selector: u32,
 }
@@ -807,9 +705,140 @@ fn is_module_providable(contract: ContractId) -> bool {
     crate::abi::registry::module_providable(contract)
 }
 
+/// Whether `dispatch` lies inside `module_idx`'s code region (and, on a
+/// Cortex-M, is a Thumb address): a corrupted module may not register a
+/// pointer into kernel memory or another module's code.
+fn dispatch_in_code(module_idx: ModuleId, dispatch: ModuleProviderDispatchFn) -> bool {
+    let fn_addr = dispatch as usize;
+    let (code_base, code_size) =
+        crate::kernel::exec::scheduler::module_code_region(module_idx as usize);
+    if code_base == 0 || code_size == 0 {
+        return true;
+    }
+    let code_end = code_base + code_size as usize;
+    if fn_addr < code_base || fn_addr >= code_end {
+        log::error!(
+            "[provider] module {module_idx} fn_ptr 0x{fn_addr:08x} outside code region 0x{code_base:08x}..0x{code_end:08x}"
+        );
+        return false;
+    }
+    #[cfg(target_arch = "arm")]
+    if fn_addr & 1 == 0 {
+        log::error!("[provider] module {module_idx} fn_ptr 0x{fn_addr:08x} missing Thumb bit");
+        return false;
+    }
+    true
+}
+
+// ── Edge servers ─────────────────────────────────────────────────────────────
+//
+// A module serving an edge contract is reached by module index through a
+// handle bound to one of the caller's ports (`bind`), never by class byte.
+
+/// Modules serving edge contracts at once. Sized per target like the chain.
+#[cfg(feature = "chip-rp2040")]
+const MAX_EDGE_SERVERS: usize = 8;
+#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
+const MAX_EDGE_SERVERS: usize = 16;
+#[cfg(not(feature = "rp"))]
+const MAX_EDGE_SERVERS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct EdgeServer {
+    module_idx: ModuleId,
+    dispatch: ModuleProviderDispatchFn,
+    state: *mut u8,
+    /// Edge contracts it serves, one bit per contract id.
+    contracts: u64,
+}
+
+static mut EDGE_SERVERS: [Option<EdgeServer>; MAX_EDGE_SERVERS] = [None; MAX_EDGE_SERVERS];
+
+fn register_edge_server(
+    contract: ContractId,
+    module_idx: ModuleId,
+    dispatch: ModuleProviderDispatchFn,
+    state: *mut u8,
+) -> i32 {
+    // SAFETY: registration runs on the scheduler thread.
+    let servers = unsafe { &mut *core::ptr::addr_of_mut!(EDGE_SERVERS) };
+    let bit = 1u64 << contract;
+    if let Some(e) = servers
+        .iter_mut()
+        .flatten()
+        .find(|e| e.module_idx == module_idx)
+    {
+        if e.contracts & bit != 0 {
+            return errno::EBUSY;
+        }
+        e.contracts |= bit;
+        return 0;
+    }
+    match servers.iter_mut().find(|e| e.is_none()) {
+        Some(slot) => {
+            *slot = Some(EdgeServer {
+                module_idx,
+                dispatch,
+                state,
+                contracts: bit,
+            });
+            log::info!("[provider] module {module_idx} serves edge contract 0x{contract:04x}");
+            0
+        }
+        None => {
+            log::error!(
+                "[provider] module {module_idx}: {MAX_EDGE_SERVERS} modules already serve edge \
+                 contracts (the per-target `MAX_EDGE_SERVERS`)"
+            );
+            errno::EBUSY
+        }
+    }
+}
+
+/// Record a module the platform runs built in as `contract`'s server on its
+/// edges: an edge contract only, its dispatch the platform's own code and
+/// `state` the module's instance state. `EINVAL` for a contract that is not
+/// an edge contract; otherwise as a PIC module's registration.
+pub fn register_builtin_edge_server(
+    contract: ContractId,
+    module_idx: ModuleId,
+    dispatch: ModuleProviderDispatchFn,
+    state: *mut u8,
+) -> i32 {
+    if contract as usize >= MAX_PROVIDERS || !crate::abi::registry::contract_is_edge(contract) {
+        return errno::EINVAL;
+    }
+    register_edge_server(contract, module_idx, dispatch, state)
+}
+
+/// `module_idx`'s dispatch, if it serves edge contract `contract`.
+fn edge_server(
+    module_idx: ModuleId,
+    contract: ContractId,
+) -> Option<(ModuleProviderDispatchFn, *mut u8)> {
+    // SAFETY: scheduler-thread read; the copy ends the borrow.
+    let servers = unsafe { &*core::ptr::addr_of!(EDGE_SERVERS) };
+    servers
+        .iter()
+        .flatten()
+        .find(|e| e.module_idx == module_idx && e.contracts & (1u64 << contract) != 0)
+        .map(|e| (e.dispatch, e.state))
+}
+
+fn release_edge_server(module_idx: ModuleId) {
+    // SAFETY: scheduler-thread mutation.
+    let servers = unsafe { &mut *core::ptr::addr_of_mut!(EDGE_SERVERS) };
+    for e in servers.iter_mut() {
+        if e.is_some_and(|e| e.module_idx == module_idx) {
+            *e = None;
+        }
+    }
+}
+
 /// Register a PIC module as provider for a contract.
 ///
-/// Pushes the module onto the top of the chain. Returns 0 on success;
+/// Pushes the module onto the top of the chain, or for an edge contract
+/// records it as that contract's server on its edges. Returns 0 on success;
 /// EINVAL if `contract` is out of range or the dispatch pointer is outside
 /// the module's code region; EACCES if `contract` is not module-providable or
 /// `selector` is the reserved `platform` name; EBUSY if the module already
@@ -832,8 +861,16 @@ pub fn register_module_provider(
         );
         return errno::EACCES;
     }
+    if !dispatch_in_code(module_idx, dispatch) {
+        return errno::EINVAL;
+    }
+    // An edge contract is served per edge, addressed by module: it has no
+    // chain, no default and no selector.
+    if crate::abi::registry::contract_is_edge(contract) {
+        return register_edge_server(contract, module_idx, dispatch, state);
+    }
     // The platform's name is not a module's to take: a layer carrying it
-    // would make `provider_call_sel("platform", …)` reach the module, and the
+    // would make a bind to `platform` reach the module, and the
     // one path that names the platform beneath a graph would stop doing so.
     if selector == PLATFORM_SELECTOR {
         log::error!(
@@ -841,28 +878,6 @@ pub fn register_module_provider(
              contract 0x{contract:04x}; that name reaches the platform's own provider"
         );
         return errno::EACCES;
-    }
-
-    // Validate dispatch function pointer is within the registering module's
-    // code region. Prevents a corrupted module from registering a pointer
-    // into kernel memory or another module's code.
-    let fn_addr = dispatch as usize;
-    let (code_base, code_size) =
-        crate::kernel::exec::scheduler::module_code_region(module_idx as usize);
-    if code_base != 0 && code_size != 0 {
-        let code_end = code_base + code_size as usize;
-        if fn_addr < code_base || fn_addr >= code_end {
-            log::error!(
-                "[provider] module {module_idx} fn_ptr 0x{fn_addr:08x} outside code region 0x{code_base:08x}..0x{code_end:08x}"
-            );
-            return errno::EINVAL;
-        }
-        // On Cortex-M (Thumb mode): verify LSB is set
-        #[cfg(target_arch = "arm")]
-        if fn_addr & 1 == 0 {
-            log::error!("[provider] module {module_idx} fn_ptr 0x{fn_addr:08x} missing Thumb bit");
-            return errno::EINVAL;
-        }
     }
 
     // SAFETY: `idx < MAX_PROVIDERS` (bounds-checked above); registration
@@ -890,8 +905,8 @@ pub fn register_module_provider(
         // Reject a duplicate selector, keyed or not — either shadows silently.
         // A second unkeyed (selector 0) provider is unreachable because
         // `default_layer_index` takes the top-most selector-0 layer; a
-        // duplicate keyed one is unreachable because `provider_call_sel`
-        // returns the first match. Selectors are a hash of a short name, so
+        // duplicate keyed one is unreachable because a bind by name
+        // takes the first match. Selectors are a hash of a short name, so
         // this also catches a genuine hash collision between two distinct
         // volume names, which no amount of config validation could see. The
         // config validator (`validate_single_provider`) blocks the graph
@@ -953,6 +968,7 @@ pub fn reset_module_layers() {
             }
             entry.depth = 0;
         }
+        *core::ptr::addr_of_mut!(EDGE_SERVERS) = [None; MAX_EDGE_SERVERS];
         let o = &raw mut OWNER_RELEASE_OBSERVERS;
         *o = crate::kernel::workload::bitmask::ModuleMask::new();
         let s = &raw mut POOL_SAMPLERS;
@@ -974,6 +990,7 @@ pub fn release_module_providers(module_idx: ModuleId) {
     // Before the chain is compacted, so the departing module's own routed
     // handles are closed at owners that are still registered.
     release_routes_of(module_idx);
+    release_edge_server(module_idx);
     // A departing net.policy enforcer stops vouching for its tables.
     crate::kernel::net_policy::release_enforcer(module_idx);
     // SAFETY: called from scheduler module-finish path; scheduler thread.
@@ -1181,17 +1198,14 @@ pub fn sample_module_pool(pool: u16) -> Option<u64> {
     }
     let mut arg = pool.to_le_bytes();
     let rc = in_provider_frame(midx, || {
-        // SAFETY: `dispatch` and `state` are the pair the module registered;
-        // `arg` is a live 2-byte buffer owned by this frame.
-        unsafe {
-            dispatch(
-                state,
-                -1,
-                crate::abi::contracts::resource::POOL_SAMPLE,
-                arg.as_mut_ptr(),
-                crate::abi::contracts::resource::POOL_SAMPLE_ARG_LEN,
-            )
-        }
+        call_module(
+            dispatch,
+            state,
+            -1,
+            crate::abi::contracts::resource::POOL_SAMPLE,
+            &mut arg[..crate::abi::contracts::resource::POOL_SAMPLE_ARG_LEN],
+            UserSpan::empty(),
+        )
     });
     (rc >= 0).then_some(rc as u64)
 }
@@ -1289,17 +1303,14 @@ fn notify_module_observers(owner: crate::kernel::workload::owner::OwnerHandle) {
         // must not change what the next one is told.
         let mut record = encode_owner_record(owner);
         in_provider_frame(midx, || {
-            // SAFETY: `dispatch` and `state` are the pair the module
-            // registered; `record` is a live 8-byte buffer owned by this frame.
-            unsafe {
-                dispatch(
-                    state,
-                    -1,
-                    crate::abi::internal::reconfigure::OWNER_RELEASED,
-                    record.as_mut_ptr(),
-                    crate::abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN,
-                )
-            }
+            call_module(
+                dispatch,
+                state,
+                -1,
+                crate::abi::internal::reconfigure::OWNER_RELEASED,
+                &mut record[..crate::abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN],
+                UserSpan::empty(),
+            )
         });
     }
 }
@@ -1308,6 +1319,17 @@ fn notify_module_observers(owner: crate::kernel::workload::owner::OwnerHandle) {
 /// when it holds no provider layer. The borrow of `PROVIDERS` ends with the
 /// call, so the caller may safely run module code with the result.
 fn module_dispatch_entry(module_idx: ModuleId) -> Option<(ModuleProviderDispatchFn, *mut u8)> {
+    // SAFETY: scheduler-thread read; nothing here calls into module code.
+    let edge = unsafe {
+        (*core::ptr::addr_of!(EDGE_SERVERS))
+            .iter()
+            .flatten()
+            .find(|e| e.module_idx == module_idx)
+            .map(|e| (e.dispatch, e.state))
+    };
+    if edge.is_some() {
+        return edge;
+    }
     // SAFETY: scheduler-thread read; nothing here calls into module code.
     unsafe {
         let p = &raw const PROVIDERS;
@@ -1351,67 +1373,58 @@ pub(crate) fn in_provider_frame<R>(module_idx: usize, f: impl FnOnce() -> R) -> 
 /// The top-most unkeyed module layer takes priority; the kernel provider
 /// answers when none is registered. Returns ENOSYS if no provider is
 /// registered for this contract.
-///
-/// # Safety
-/// `arg` must satisfy the aliasing and validity requirements expected by the
-/// registered dispatch handler for the given `contract` and `opcode`.
-pub unsafe fn dispatch(
+pub fn dispatch(
     contract: ContractId,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
 ) -> i32 {
     let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
         return errno::ENOSYS;
     }
-    // SAFETY: `idx < MAX_PROVIDERS` bounded; the registered dispatch chain
-    // is set up on the scheduler thread before any module observes it.
-    unsafe {
-        let entry = &PROVIDERS[idx];
-
-        // Dispatch to the default (unkeyed) module provider if one is
-        // registered: the top-most selector-0 layer — identical to
-        // `chain[depth-1]` when every provider is unkeyed, and the `mount`
-        // policy module when keyed volume backends coexist with it. Keyed
-        // backends are reached only via `dispatch_to`.
-        if let Some(top) = default_layer_index(entry) {
-            if let Some(ref layer) = entry.chain[top] {
-                let result = in_provider_frame(layer.module_idx as usize, || {
-                    (layer.dispatch)(layer.state, handle, opcode, arg, arg_len)
-                });
-                return result;
-            }
+    // Dispatch to the default (unkeyed) module provider if one is
+    // registered: the top-most selector-0 layer — identical to
+    // `chain[depth-1]` when every provider is unkeyed, and the `mount`
+    // policy module when keyed volume backends coexist with it. Keyed
+    // backends are reached only through a handle bound to them.
+    let target = {
+        // SAFETY: `idx < MAX_PROVIDERS`; the chain is set up on the scheduler
+        // thread before any module observes it, and the borrow ends here,
+        // before any module code runs.
+        let entry = unsafe { &(*core::ptr::addr_of!(PROVIDERS))[idx] };
+        match default_layer_index(entry).and_then(|top| entry.chain[top].as_ref()) {
+            Some(layer) => Ok((layer.module_idx, layer.dispatch, layer.state)),
+            None => Err((entry.depth, entry.kernel_dispatch)),
         }
-
+    };
+    match target {
+        Ok((midx, f, state)) => in_provider_frame(midx as usize, || {
+            call_module(f, state, handle, opcode, arg, data)
+        }),
         // Keyed backends exist but nothing serves the class-byte path. Name the
         // shape explicitly: the generic "no provider" line below would send the
         // reader looking for a missing module when the real fault is a missing
         // router.
-        if entry.depth > 0 && entry.kernel_dispatch.is_none() {
+        Err((depth, None)) if depth > 0 => {
             log::error!(
-                "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: {} instance-keyed provider(s) registered but no default (unkeyed) one — a `handle == -1` op has no router. Add a policy module (e.g. `mount`) that registers unkeyed and routes to the keyed backends.",
-                entry.depth
+                "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: {depth} instance-keyed provider(s) registered but no default (unkeyed) one — a `handle == -1` op has no router. Add a policy module (e.g. `mount`) that registers unkeyed and routes to the keyed backends.",
             );
-            return errno::ENOSYS;
+            errno::ENOSYS
         }
-
-        // Fall back to kernel provider
-        match entry.kernel_dispatch {
-            Some(handler) => {
-                let rc = handler(handle, opcode, arg, arg_len);
-                if rc == errno::ENOSYS {
-                    log::debug!(
-                        "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: kernel handler returned ENOSYS"
-                    );
-                }
-                rc
+        Err((_, Some(handler))) => {
+            let rc = handler(handle, opcode, arg, data);
+            if rc == errno::ENOSYS {
+                log::debug!(
+                    "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: kernel handler returned ENOSYS"
+                );
             }
-            None => {
-                log::warn!("[provider] contract 0x{contract:04x} op 0x{opcode:04x}: no provider");
-                errno::ENOSYS
-            }
+            rc
+        }
+        Err((_, None)) => {
+            log::warn!("[provider] contract 0x{contract:04x} op 0x{opcode:04x}: no provider");
+            errno::ENOSYS
         }
     }
 }
@@ -1421,74 +1434,44 @@ pub unsafe fn dispatch(
 /// Called when a module sets the CHAIN_NEXT flag on an opcode.
 /// Finds the caller's position in the chain and dispatches to the layer below.
 /// If the caller is at the bottom (position 0), dispatches to the kernel provider.
-///
-/// # Safety
-/// Same requirements as `dispatch`.
-pub unsafe fn dispatch_next(
+pub fn dispatch_next(
     caller_module: ModuleId,
     contract: ContractId,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
 ) -> i32 {
     let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
         return errno::ENOSYS;
     }
-    // SAFETY: `idx < MAX_PROVIDERS` bounded; PROVIDERS chain is mutated
-    // only on the scheduler thread, callers run cooperatively.
-    unsafe {
-        let entry = &PROVIDERS[idx];
-
-        // Find caller's position in the chain (search top-down)
-        let mut caller_pos: Option<usize> = None;
-        for i in (0..entry.depth as usize).rev() {
-            if let Some(ref layer) = entry.chain[i] {
-                if layer.module_idx == caller_module {
-                    caller_pos = Some(i);
-                    break;
-                }
-            }
+    // The layer below the caller it may reach, else the kernel provider.
+    let target = {
+        // SAFETY: `idx < MAX_PROVIDERS`; the chain is mutated only on the
+        // scheduler thread, and the borrow ends before module code runs.
+        let entry = unsafe { &(*core::ptr::addr_of!(PROVIDERS))[idx] };
+        let caller_pos = (0..entry.depth as usize).rev().find(|&i| {
+            entry.chain[i]
+                .as_ref()
+                .is_some_and(|l| l.module_idx == caller_module)
+        });
+        let below = caller_pos.and_then(|pos| {
+            (0..pos)
+                .rev()
+                .find_map(|b| entry.chain[b].as_ref().filter(|l| layer_visible(l)))
+        });
+        match below {
+            Some(layer) => Ok((layer.module_idx, layer.dispatch, layer.state)),
+            None => Err(entry.kernel_dispatch),
         }
-
-        let pos = match caller_pos {
-            Some(p) => p,
-            None => {
-                // Caller not in chain — fall back to kernel provider
-                return match entry.kernel_dispatch {
-                    Some(handler) => handler(handle, opcode, arg, arg_len),
-                    None => errno::ENOSYS,
-                };
-            }
-        };
-
-        // If caller is at bottom (position 0), dispatch to kernel provider
-        if pos == 0 {
-            return match entry.kernel_dispatch {
-                Some(handler) => handler(handle, opcode, arg, arg_len),
-                None => errno::ENOSYS,
-            };
-        }
-
-        // Dispatch to the nearest layer below the caller may reach.
-        for below in (0..pos).rev() {
-            if let Some(ref layer) = entry.chain[below] {
-                if !layer_visible(layer) {
-                    continue;
-                }
-                let result = in_provider_frame(layer.module_idx as usize, || {
-                    (layer.dispatch)(layer.state, handle, opcode, arg, arg_len)
-                });
-                return result;
-            }
-        }
-
-        // Nothing below the caller it may reach: the kernel provider.
-        match entry.kernel_dispatch {
-            Some(handler) => handler(handle, opcode, arg, arg_len),
-            None => errno::ENOSYS,
-        }
+    };
+    match target {
+        Ok((midx, f, state)) => in_provider_frame(midx as usize, || {
+            call_module(f, state, handle, opcode, arg, data)
+        }),
+        Err(Some(handler)) => handler(handle, opcode, arg, data),
+        Err(None) => errno::ENOSYS,
     }
 }
 
@@ -1554,15 +1537,12 @@ fn node_default_layer(entry: &ProviderEntry) -> Option<&ProviderLayer> {
 /// would hand a workload the node's whole namespace.
 /// `tests/harness/tests/node_default_reach_lint.rs` holds every caller to
 /// the platform rooting layers.
-///
-/// # Safety
-/// `arg` must satisfy the provider's requirements for `opcode`.
-pub unsafe fn dispatch_node_default(
+pub fn dispatch_node_default(
     contract: ContractId,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
 ) -> i32 {
     let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
@@ -1575,9 +1555,8 @@ pub unsafe fn dispatch_node_default(
         node_default_layer(entry).map(|l| (l.module_idx, l.dispatch, l.state))
     };
     match target {
-        Some((midx, dispatch, state)) => in_provider_frame(midx as usize, || {
-            // SAFETY: the pair the module registered; caller's `arg` contract.
-            unsafe { dispatch(state, handle, opcode, arg, arg_len) }
+        Some((midx, f, state)) => in_provider_frame(midx as usize, || {
+            call_module(f, state, handle, opcode, arg, data)
         }),
         None => errno::ENOSYS,
     }
@@ -1610,269 +1589,104 @@ pub fn default_module_provider(contract: usize) -> Option<usize> {
     }
 }
 
-/// Call the provider of the opcode's contract selected by `sel`: an
-/// instance-keyed module layer (a volume name), or — for the reserved name
-/// [`PLATFORM_SELECTOR_NAME`] — the platform's own provider of that contract
-/// (the host filesystem on Linux), whatever module layers sit above it. The
-/// contract is the opcode's class byte, the same rule the `handle == -1` path
-/// uses.
+/// `kernel::BIND`: a handle bound to one provider of `contract`.
 ///
-/// `op_handle` is `-1` for an open-style op. A handle such an op mints is
-/// returned as a *routed* handle (see [`Route`]): it names the provider that
-/// minted it, so every later op on it — through this call or through plain
-/// `provider_call` — reaches that provider with the provider's own slot, no
-/// matter which layer is the default. A non-negative `op_handle` must be such
-/// a routed handle minted through the same selector for the opcode's own
-/// contract; anything else is
-/// `EBADF`, because a handle another provider minted means nothing here.
+/// `[NAME][len u8][name]` binds the instance-keyed layer registered under
+/// `name`, or for [`PLATFORM_SELECTOR_NAME`] the platform's own provider
+/// beneath every module layer. `[PORT][port_type u8][index u8]` binds the
+/// module at the other end of one of the caller's ports, which must serve
+/// `contract` there (an edge contract); it is handed its own port on the edge
+/// as the handle of every op that reaches it.
 ///
-/// Resolving by selector (rather than by a cached module-index token) is what
-/// keeps this sound under live graph mutation: a freed-then-reused module
-/// index cannot alias a stale binding. Returns `EINVAL` on bad args, `ENODEV`
-/// if nothing carries `sel`.
-///
-/// # Safety
-/// `sel` must point to `sel_len` readable bytes; `arg` must satisfy the
-/// registered dispatch handler's requirements for `opcode`.
-pub unsafe fn provider_call_sel(
-    sel: *const u8,
-    sel_len: usize,
-    op_handle: i32,
-    opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
-    if sel.is_null() || sel_len == 0 {
+/// Every op on the bound handle reaches that provider; a handle such an op
+/// mints comes back routed to the same one. Returns the bound handle, or
+/// `EINVAL` (a malformed bind), `ENODEV` (nothing carries the name, or no
+/// module is at the other end of the port), `ENOSYS` (the provider there
+/// does not serve `contract`).
+pub fn bind(contract: ContractId, arg: &[u8]) -> i32 {
+    use crate::abi::kernel_abi::bind as b;
+    // Only a contract a module may serve has providers to choose between.
+    if contract as usize >= MAX_PROVIDERS || !is_module_providable(contract) {
         return errno::EINVAL;
     }
-    let contract = ((opcode >> 8) & 0xFF) as u16;
-    if contract as usize >= MAX_PROVIDERS {
-        return errno::EINVAL;
-    }
-    // SAFETY: caller guarantees `sel[..sel_len]` is readable.
-    let bytes = unsafe { core::slice::from_raw_parts(sel, sel_len) };
-    // Never 0: `hash` nudges a zero result to 1 precisely so a real name can
-    // never alias the "unkeyed default" sentinel.
-    let want = crate::abi::kernel_abi::provider_selector::hash(bytes);
-
-    if op_handle >= 0 {
-        return match route_lookup(op_handle) {
-            RouteLookup::Live(idx) => {
-                let r = route_at(idx);
-                if r.selector != want || r.contract != contract {
-                    log::warn!(
-                        "[provider] call_sel: handle {op_handle:#x} belongs to contract \
-                         0x{:04x} selector 0x{:08x}, not contract 0x{contract:04x} selector \
-                         0x{want:08x}",
-                        r.contract,
-                        r.selector
-                    );
-                    return EBADF;
-                }
-                // SAFETY: forwarded caller contract.
-                unsafe { call_route(idx, opcode, arg, arg_len) }
+    match arg.first() {
+        Some(&b::NAME) => {
+            let Some(&len) = arg.get(1) else {
+                return errno::EINVAL;
+            };
+            let len = usize::from(len);
+            let Some(name) = arg.get(2..2 + len) else {
+                return errno::EINVAL;
+            };
+            if name.is_empty() || name.len() > b::NAME_MAX || arg.len() != 2 + len {
+                return errno::EINVAL;
             }
-            RouteLookup::Stale => EBADF,
-            RouteLookup::NotRouted if is_module_providable(contract) => EBADF,
-            // Kernel-only contracts are never routed: no module can stand in
-            // front of them, so their handles already belong to the platform.
-            RouteLookup::NotRouted => match target_of(contract, want) {
-                // SAFETY: forwarded caller contract.
-                Some(t) => unsafe { call_target(contract, t, op_handle, opcode, arg, arg_len) },
+            if crate::abi::registry::contract_is_edge(contract) {
+                return errno::EINVAL;
+            }
+            // Never 0: `hash` nudges a zero result to 1 precisely so a real
+            // name can never alias the "unkeyed default" sentinel.
+            let selector = crate::abi::kernel_abi::provider_selector::hash(name);
+            match target_of(contract, selector) {
+                Some(target) => mint_binding(contract, selector, target, -1),
                 None => errno::ENODEV,
-            },
-        };
-    }
-
-    let Some(target) = target_of(contract, want) else {
-        return errno::ENODEV;
-    };
-    // A subscription handle carried in a `CHANGES` request is the caller's
-    // routed one: the provider is handed its own for the call.
-    // SAFETY: the caller's `arg[..arg_len]`, as every op here.
-    let restore = match unsafe { unroute_changes_sub(contract, want, target, opcode, arg, arg_len) }
-    {
-        Ok(r) => r,
-        Err(rc) => return rc,
-    };
-    // SAFETY: forwarded caller contract.
-    let rc = unsafe { call_target(contract, target, -1, opcode, arg, arg_len) };
-    if let Some((at, routed)) = restore {
-        // SAFETY: `at + 4 <= arg_len`, checked when it was rewritten.
-        unsafe { put_i32(arg, at, routed) };
-    }
-    // SAFETY: the answer the provider just wrote, in the caller's buffer.
-    unsafe { route_take_answer(contract, want, target, opcode, arg, arg_len, rc) };
-    mint_route(contract, want, target, rc)
-}
-
-// ── Subscription handles inside a namespace op ───────────────────────────────
-//
-// A `storage.namespace` subscription opened through a selector is routed like
-// any other handle (`mint_route`), so its CLOSE reaches the provider that
-// opened it. Two of the contract's ops carry subscription handles in their
-// argument bytes rather than as `op_handle`, where the routing above never
-// looks: `CHANGES` names the subscription a read serves
-// (`[prefix_len u16][prefix][sub i32]…`), and `TAKE_RUNG` answers with the
-// handles that rang (`[more u8][count u16]` then `count × [handle i32]`).
-// Each is translated at this boundary — the provider sees and names its own
-// handles, the caller its routed ones — so a subscription to a keyed store, or
-// to the platform's own beneath a graph-local default, rings and is read as
-// one to the default store is. A handle the provider names that no route of
-// this caller's selector holds is passed through: one the caller opened on
-// the default path is already its own.
-
-/// The `CHANGES` request's `sub` field offset, when the request holds one.
-fn changes_sub_at(arg: &[u8]) -> Option<usize> {
-    let plen = usize::from(u16::from_le_bytes([*arg.first()?, *arg.get(1)?]));
-    let at = 2 + plen;
-    (arg.len() >= at + 4).then_some(at)
-}
-
-/// Write `v` at `arg[at..at + 4]`.
-///
-/// # Safety
-/// `arg` must be writable for `at + 4` bytes.
-unsafe fn put_i32(arg: *mut u8, at: usize, v: i32) {
-    // SAFETY: caller's bound.
-    let dst = unsafe { core::slice::from_raw_parts_mut(arg.add(at), 4) };
-    dst.copy_from_slice(&v.to_le_bytes());
-}
-
-/// The routed handle naming route `idx` at `generation`.
-fn routed_handle(tag: i32, idx: usize, generation: u16) -> i32 {
-    fd::tag_fd(
-        tag,
-        ROUTED_SLOT_BIT | (i32::from(generation) << ROUTE_IDX_BITS) | idx as i32,
-    )
-}
-
-/// For a `CHANGES` sent through `selector`: replace a routed `sub` in the
-/// caller's request with the handle the provider minted, returning where it
-/// was and what to put back once the provider has answered. `Ok(None)`: no
-/// rewrite (another op, no subscription named, or a handle the caller holds
-/// unrouted). `Err(EBADF)`: a routed handle this selector's provider did not
-/// mint — closed, or another provider's.
-///
-/// # Safety
-/// `arg` must be readable and writable for `arg_len` bytes.
-unsafe fn unroute_changes_sub(
-    contract: ContractId,
-    selector: u32,
-    target: Target,
-    opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> Result<Option<(usize, i32)>, i32> {
-    if contract != contract::STORAGE_NAMESPACE
-        || opcode != crate::abi::contracts::storage::namespace::CHANGES
-        || arg.is_null()
-    {
-        return Ok(None);
-    }
-    // SAFETY: caller's bound.
-    let bytes = unsafe { core::slice::from_raw_parts(arg, arg_len) };
-    let Some(at) = changes_sub_at(bytes) else {
-        return Ok(None);
-    };
-    let sub = i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-    if sub < 0 {
-        return Ok(None);
-    }
-    match route_lookup(sub) {
-        RouteLookup::NotRouted => Ok(None),
-        RouteLookup::Stale => Err(EBADF),
-        RouteLookup::Live(idx) => {
-            let r = route_at(idx);
-            if r.selector != selector || r.contract != contract || r.target() != target {
-                return Err(EBADF);
             }
-            // SAFETY: `at + 4 <= arg_len` (`changes_sub_at`).
-            unsafe { put_i32(arg, at, r.inner) };
-            Ok(Some((at, sub)))
         }
+        Some(&b::PORT) => {
+            let (Some(&port_type), Some(&index), 3) = (arg.get(1), arg.get(2), arg.len()) else {
+                return errno::EINVAL;
+            };
+            if !crate::abi::registry::contract_is_edge(contract) {
+                return errno::EINVAL;
+            }
+            let me = crate::kernel::exec::scheduler::current_module_index();
+            let Some((peer, peer_type, peer_index)) =
+                crate::kernel::exec::scheduler::edge_peer(me, port_type, index)
+            else {
+                return errno::ENODEV;
+            };
+            if edge_server(peer as ModuleId, contract).is_none() {
+                return errno::ENOSYS;
+            }
+            mint_binding(
+                contract,
+                0,
+                Target::Module(peer as ModuleId),
+                b::port_ref(peer_type, peer_index),
+            )
+        }
+        _ => errno::EINVAL,
     }
 }
 
-/// For a `TAKE_RUNG` sent through `selector` that answered `rc` bytes: name
-/// each subscription in the answer by the caller's routed handle for it.
-///
-/// # Safety
-/// `arg` must be readable for `arg_len` bytes; the answer buffer it names
-/// must be writable for `rc` bytes (the provider just wrote them).
-unsafe fn route_take_answer(
-    contract: ContractId,
-    selector: u32,
-    target: Target,
-    opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
-    rc: i32,
-) {
-    use crate::abi::contracts::storage::namespace::{take, TAKE_RUNG};
-    if contract != contract::STORAGE_NAMESPACE || opcode != TAKE_RUNG || rc <= 0 || arg.is_null() {
-        return;
+/// The provider serving the session `handle` names, and that provider's own
+/// index for it: the borrower a span lent on the session is bound to
+/// (`ipc::lend`). A routed handle's provider module ([`NO_MODULE`] for the
+/// platform) and inner index; a native handle is the kernel's own, under the
+/// handle itself. `None` when `handle` names nothing.
+pub fn session_server(handle: i32) -> Option<(ModuleId, i32)> {
+    let c = contract_of(handle)?;
+    if is_native(c) {
+        return Some((NO_MODULE, handle));
     }
-    let Some(tag) = contract_to_tag(contract) else {
-        return;
-    };
-    // SAFETY: caller's bound.
-    let req = unsafe { core::slice::from_raw_parts(arg, arg_len) };
-    let Some(req) = take::parse(req) else {
-        return;
-    };
-    let len = (rc as usize).min(req.out_cap as usize);
-    // SAFETY: the provider wrote `rc` bytes of answer at `out_ptr`.
-    let ans = unsafe { core::slice::from_raw_parts_mut(req.out_ptr as usize as *mut u8, len) };
-    let (Some(&lo), Some(&hi)) = (ans.get(1), ans.get(2)) else {
-        return;
-    };
-    let count = usize::from(u16::from_le_bytes([lo, hi]));
-    for i in 0..count {
-        let at = take::HEAD_LEN + i * 4;
-        let Some(field) = ans.get_mut(at..at + 4) else {
-            return;
-        };
-        let h = i32::from_le_bytes([field[0], field[1], field[2], field[3]]);
-        // SAFETY: scheduler-thread read.
-        let found = unsafe {
-            let p = &raw const ROUTES;
-            (*p).iter()
-                .enumerate()
-                .find(|(_, r)| {
-                    r.in_use
-                        && r.contract == contract
-                        && r.selector == selector
-                        && r.target() == target
-                        && r.inner == h
-                })
-                .map(|(idx, r)| (idx, r.generation))
-        };
-        if let Some((idx, generation)) = found {
-            field.copy_from_slice(&routed_handle(tag, idx, generation).to_le_bytes());
-        }
-    }
+    let (_, _, r) = route_of(handle).ok()?;
+    Some((r.module_idx, r.inner))
 }
 
 // ── Routed handles ───────────────────────────────────────────────────────────
 //
-// A handle a provider mints is a slot in THAT provider's table. Two providers
-// of one contract hand out colliding slots (every fs provider starts at slot 0),
-// and handle-bound ops carry no contract beyond the handle's tag, so a
-// provider-local handle names its owner only as long as that owner is the one
-// layer the tag resolves to — the default. A handle minted through a selector
-// (a keyed volume, or the platform beneath a graph-local default) does not
-// satisfy that, so the kernel mints a routed handle in its place: same contract
-// tag, a slot in this table, and the table records which provider owns it and
-// what the provider called it. Every later op on the routed handle, through
-// either `provider_call` or `provider_call_sel`, is delivered to that owner
-// with its own slot. `mount` needs exactly this for its backends and uses the
-// same mechanism, so there is one owner rule for every non-default handle.
+// A handle a provider mints is an index in THAT provider's table: two
+// providers of one contract hand out colliding indices (every fs provider
+// starts at 0), and the default layer can change under a handle. So the
+// kernel keeps a route per handle — which provider serves it and what that
+// provider called it — and the handle names the route: `(contract, route
+// generation, route index)`. Every later op on it is delivered to that
+// provider with its own index. A bound handle (`BIND`) is a route that names a
+// provider and no resource of it.
 
-/// `EBADF`: a handle this call cannot use — minted by another provider, or
-/// closed. Module-local here as in `mount`: the stable errno table has no
-/// entry for it.
-const EBADF: i32 = -9;
+/// `EBADF`: a handle this call cannot use — of another contract, closed, or
+/// never minted.
+const EBADF: i32 = errno::EBADF;
 
 /// Selector name reserved for the platform's own provider of a contract. A
 /// module may not register it (refused in `register_module_provider`, and by
@@ -1882,29 +1696,7 @@ pub const PLATFORM_SELECTOR_NAME: &[u8] = b"platform";
 pub const PLATFORM_SELECTOR: u32 =
     crate::abi::kernel_abi::provider_selector::hash(PLATFORM_SELECTOR_NAME);
 
-/// Slot bit marking a routed handle. Providers mint small slots (their table
-/// indices, below `SLOT_FIELD_BITS`); the kernel owns the slot field's top
-/// bit.
-const ROUTED_SLOT_BIT: i32 = 1 << crate::abi::registry::fd::SLOT_FIELD_BITS;
-/// Slot bits carrying the route index; the bits above it (below
-/// [`ROUTED_SLOT_BIT`]) carry the entry's generation, so a handle kept past
-/// its close does not resolve onto whatever reused the entry.
-const ROUTE_IDX_BITS: u32 = 8;
-const ROUTE_IDX_MASK: i32 = (1 << ROUTE_IDX_BITS) - 1;
-const ROUTE_GEN_MASK: u16 = 0xFFFF;
-
-/// Routed handles live at once. Sized per target like the chain depth: one
-/// per file a sel-minted consumer holds open (`mount` holds one per open
-/// file on a keyed volume).
-#[cfg(feature = "chip-rp2040")]
-const MAX_ROUTES: usize = 16;
-#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-const MAX_ROUTES: usize = 32;
-#[cfg(not(feature = "rp"))]
-const MAX_ROUTES: usize = 128;
-const _: () = assert!(MAX_ROUTES <= 1 << ROUTE_IDX_BITS);
-
-/// `module_idx` of a route whose owner is the platform provider.
+/// `module_idx` of a route whose provider is the platform.
 const ROUTE_PLATFORM: ModuleId = NO_MODULE;
 
 /// Which provider serves a selector.
@@ -1917,30 +1709,38 @@ enum Target {
 /// One routed handle.
 #[derive(Clone, Copy)]
 struct Route {
-    in_use: bool,
     contract: ContractId,
     /// Selector the handle was minted through ([`PLATFORM_SELECTOR`] for the
     /// platform).
     selector: u32,
-    /// Owning layer's module index, or [`ROUTE_PLATFORM`].
+    /// Serving provider's module index, or [`ROUTE_PLATFORM`].
     module_idx: ModuleId,
-    /// Module that was running when the handle was minted: its handles are
-    /// closed when it is released.
+    /// Module that was running when the handle was minted: its owner is the
+    /// handle's, and its handles are closed when it is released.
     minter: ModuleId,
-    generation: u16,
-    /// The handle as the owning provider minted it.
+    /// What the provider calls the handle: its own index; for a bound
+    /// handle, what the provider is handed as the handle of an op through it
+    /// (`-1`, or its own port on the edge).
     inner: i32,
+    /// A `BIND` handle: it names the provider, not a resource of it, so a
+    /// handle an op through it mints is routed to the same provider.
+    bound: bool,
+    /// The contract is routed by class: its ops reach the kernel bucket.
+    class_routed: bool,
+    /// For a signalling handle, the doorbell its provider rings; `-1`.
+    event: i32,
 }
 
 impl Route {
     const EMPTY: Self = Self {
-        in_use: false,
         contract: 0,
         selector: 0,
         module_idx: 0,
         minter: 0,
-        generation: 0,
         inner: -1,
+        bound: false,
+        class_routed: false,
+        event: -1,
     };
 
     fn target(&self) -> Target {
@@ -1952,53 +1752,72 @@ impl Route {
     }
 }
 
-static mut ROUTES: [Route; MAX_ROUTES] = [Route::EMPTY; MAX_ROUTES];
+/// The route table's compiled size on a static profile; elsewhere it is
+/// sized from the `handles` pool.
+const MAX_ROUTES: usize =
+    crate::kernel::config::static_slots(crate::abi::contracts::resource::POOL_HANDLES);
 
-/// A copy of route `idx`, so no borrow of the table spans a call into a
-/// provider.
-fn route_at(idx: usize) -> Route {
-    // SAFETY: scheduler-thread read; `idx < MAX_ROUTES` at every caller.
-    unsafe {
-        let p = &raw const ROUTES;
-        (*p)[idx]
-    }
+static mut ROUTES: HandleTable<Route, MAX_ROUTES> = HandleTable::new(crate::boot_table!(
+    MAX_ROUTES,
+    Slot::free(Route::EMPTY),
+    crate::abi::contracts::resource::POOL_HANDLES
+));
+
+/// The route table, sized from the plan's defaults when no plan has sized it.
+fn routes() -> &'static HandleTable<Route, MAX_ROUTES> {
+    // SAFETY: scheduler-thread access; a shared borrow that ends before any
+    // provider code runs at every caller.
+    let t = unsafe { &*core::ptr::addr_of!(ROUTES) };
+    t.size_unplanned(|| {
+        crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_HANDLES)
+            as usize
+    });
+    t
 }
 
-enum RouteLookup {
-    /// Not a routed handle.
-    NotRouted,
-    /// Carries the routed bit but names no live route: closed, or its owner
-    /// is gone.
-    Stale,
-    Live(usize),
+/// The route table, for a mutation.
+fn routes_mut() -> &'static mut HandleTable<Route, MAX_ROUTES> {
+    let _ = routes();
+    // SAFETY: scheduler-thread mutation; no borrow of the table spans a call
+    // into a provider.
+    unsafe { &mut *core::ptr::addr_of_mut!(ROUTES) }
 }
 
-fn route_lookup(handle: i32) -> RouteLookup {
-    // Only handles of contracts a module can provide are ever routed; every
-    // other tag keeps its own slot space.
-    let Some(contract) = fd_tag_contract(handle) else {
-        return RouteLookup::NotRouted;
+/// Size the route table to the `handles` pool's ceiling.
+///
+/// # Safety
+/// Graph-preparation context: no reference into the table is live.
+pub unsafe fn size_routes(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    // SAFETY: the caller's contract.
+    unsafe { (*core::ptr::addr_of!(ROUTES)).size(n) }
+}
+
+/// How many handles the platform's own provider tables can hand out at once:
+/// the part of the `handles` pool the boot plan derives before the reserve.
+static mut PLATFORM_HANDLE_SLOTS: Option<fn() -> usize> = None;
+
+/// Register the platform's count of provider-table slots (its file table,
+/// object and namespace tables, DMA descriptors, claimable pins, ...). One
+/// counter; the last wins.
+pub fn register_platform_handle_slots(f: fn() -> usize) {
+    // SAFETY: platform init, before any graph is planned.
+    unsafe { *core::ptr::addr_of_mut!(PLATFORM_HANDLE_SLOTS) = Some(f) };
+}
+
+/// The platform's provider-table slots, 0 when it registered no count.
+pub fn platform_handle_slots() -> usize {
+    // SAFETY: written once at platform init; a word-sized copy.
+    unsafe { *core::ptr::addr_of!(PLATFORM_HANDLE_SLOTS) }.map_or(0, |f| f())
+}
+
+/// The live route `h` names: `(index, generation, route)`, or `EBADF`.
+fn route_of(h: i32) -> Result<(u32, u16, Route), i32> {
+    let Some((c, generation, idx)) = handle::decode(h) else {
+        return Err(EBADF);
     };
-    if !is_module_providable(contract) {
-        return RouteLookup::NotRouted;
-    }
-    let slot = fd::slot_of(handle);
-    if slot & ROUTED_SLOT_BIT == 0 {
-        return RouteLookup::NotRouted;
-    }
-    let idx = (slot & ROUTE_IDX_MASK) as usize;
-    let field = (slot & !ROUTED_SLOT_BIT) >> ROUTE_IDX_BITS;
-    // Bits above the generation are never minted: a handle carrying them
-    // names no route, not the route its low bits would alias.
-    if idx >= MAX_ROUTES || field > i32::from(ROUTE_GEN_MASK) {
-        return RouteLookup::Stale;
-    }
-    let generation = field as u16;
-    let r = route_at(idx);
-    if r.in_use && r.generation == generation && r.contract == contract {
-        RouteLookup::Live(idx)
-    } else {
-        RouteLookup::Stale
+    match routes().get(idx, generation) {
+        Some(r) if r.contract == c => Ok((idx, generation, *r)),
+        _ => Err(EBADF),
     }
 }
 
@@ -2023,215 +1842,256 @@ fn target_of(contract: ContractId, selector: u32) -> Option<Target> {
     None
 }
 
+/// The provider a `handle == -1` op of `contract` reaches: the top-most
+/// unkeyed module layer the caller may see, else the platform's own. `None`
+/// when neither serves it.
+fn default_target(contract: ContractId) -> Option<Target> {
+    let idx = contract as usize;
+    if idx >= MAX_PROVIDERS {
+        return None;
+    }
+    // SAFETY: scheduler-thread read; the borrow ends before any module code
+    // runs.
+    let entry = unsafe { &(*core::ptr::addr_of!(PROVIDERS))[idx] };
+    match default_layer_index(entry).and_then(|top| entry.chain[top].as_ref()) {
+        Some(layer) => Some(Target::Module(layer.module_idx)),
+        None => entry.kernel_dispatch.map(|_| Target::Platform),
+    }
+}
+
 /// Deliver one op to `target`. `ENODEV` when the target has gone.
-///
-/// # Safety
-/// `arg` must satisfy the target's requirements for `opcode`.
-unsafe fn call_target(
+fn call_target(
     contract: ContractId,
     target: Target,
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
 ) -> i32 {
-    // SAFETY: as `target_of`.
-    let entry = unsafe {
-        let p = &raw const PROVIDERS;
-        &(*p)[contract as usize]
-    };
-    match target {
-        Target::Platform => match entry.kernel_dispatch {
-            // SAFETY: the registered kernel handler; caller's `arg` contract.
-            Some(handler) => unsafe { handler(handle, opcode, arg, arg_len) },
-            None => errno::ENODEV,
-        },
-        Target::Module(midx) => {
-            for i in 0..entry.depth as usize {
-                if let Some(ref layer) = entry.chain[i] {
-                    if layer.module_idx == midx {
-                        return in_provider_frame(midx as usize, || {
-                            // SAFETY: the pair the module registered.
-                            unsafe { (layer.dispatch)(layer.state, handle, opcode, arg, arg_len) }
-                        });
-                    }
-                }
-            }
-            errno::ENODEV
+    let found = match target {
+        Target::Platform => {
+            // SAFETY: scheduler-thread read; the copy ends the borrow.
+            let k = unsafe { (*core::ptr::addr_of!(PROVIDERS))[contract as usize].kernel_dispatch };
+            return match k {
+                Some(handler) => handler(handle, opcode, arg, data),
+                None => errno::ENODEV,
+            };
         }
+        Target::Module(midx) if crate::abi::registry::contract_is_edge(contract) => {
+            edge_server(midx, contract).map(|(f, st)| (midx, f, st))
+        }
+        Target::Module(midx) => {
+            // SAFETY: scheduler-thread read; the pair is copied out before
+            // module code runs.
+            let entry = unsafe { &(*core::ptr::addr_of!(PROVIDERS))[contract as usize] };
+            entry.chain[..entry.depth as usize]
+                .iter()
+                .flatten()
+                .find(|l| l.module_idx == midx)
+                .map(|l| (midx, l.dispatch, l.state))
+        }
+    };
+    match found {
+        Some((midx, f, state)) => in_provider_frame(midx as usize, || {
+            call_module(f, state, handle, opcode, arg, data)
+        }),
+        None => errno::ENODEV,
     }
 }
 
-/// Turn the result of an open-style op sent through a selector into what the
-/// caller gets back: a routed handle when `rc` is a handle of `contract`,
-/// `rc` unchanged otherwise.
-///
-/// A result is a handle when it carries the contract's own fd tag — the
-/// convention every provider follows for the handles its open-style ops
-/// return (`provider_open` additionally tags a bare slot, and refuses another
-/// contract's tag). Byte counts and capability words from a `handle == -1` op
-/// never reach the tag bits.
-fn mint_route(contract: ContractId, selector: u32, target: Target, rc: i32) -> i32 {
-    if rc < 0 || !is_module_providable(contract) {
-        return rc;
+/// Deliver `op` to route `r`'s provider with `handle` (its inner index, or
+/// a binding's word).
+fn deliver(r: &Route, handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
+    if r.class_routed {
+        dispatch(contract::INTERNAL_DISPATCH_BUCKET, handle, op, arg, data)
+    } else {
+        call_target(r.contract, r.target(), handle, op, arg, data)
     }
-    let Some(tag) = contract_to_tag(contract) else {
-        return rc;
-    };
-    let (rc_tag, rc_slot) = fd::untag_fd(rc);
-    if rc_tag != tag || tag == 0 {
-        return rc;
-    }
-    // A provider handing back a routed handle it holds (it opened through a
-    // selector itself) passes an owner that is already recorded.
-    if rc_slot & ROUTED_SLOT_BIT != 0 {
-        return rc;
-    }
+}
+
+/// What a new route is.
+struct Mint {
+    contract: ContractId,
+    selector: u32,
+    target: Target,
+    inner: i32,
+    bound: bool,
+    class_routed: bool,
+    signals: bool,
+}
+
+/// Wrap a provider's index in a route and return the handle naming it. A
+/// signalling handle gets a doorbell, handed to its provider
+/// (`BIND_DOORBELL`). On any refusal the index is closed at its provider and
+/// the error returned: `ENOSPC` when the route table (the `handles` pool) or,
+/// for a doorbell, the event pool is spent.
+fn mint(m: Mint) -> i32 {
+    use crate::abi::contracts::resource::POOL_HANDLES;
     // A handle minted in kernel context has no module minter: the
     // platform's sentinel, which nothing releases.
     let minter = crate::kernel::exec::scheduler::current_module_id();
-    // SAFETY: scheduler-thread mutation; no module code runs in this block.
-    let claimed = unsafe {
-        let p = &raw mut ROUTES;
-        let routes = &mut *p;
-        let mut claimed = None;
-        for (i, r) in routes.iter_mut().enumerate() {
-            if !r.in_use {
-                r.in_use = true;
-                r.contract = contract;
-                r.selector = selector;
-                r.module_idx = match target {
-                    Target::Platform => ROUTE_PLATFORM,
-                    Target::Module(m) => m,
-                };
-                r.minter = minter;
-                r.generation = r.generation.wrapping_add(1) & ROUTE_GEN_MASK;
-                r.inner = rc;
-                claimed = Some((i, r.generation));
-                break;
-            }
-        }
-        claimed
+    let mut route = Route {
+        contract: m.contract,
+        selector: m.selector,
+        module_idx: match m.target {
+            Target::Platform => ROUTE_PLATFORM,
+            Target::Module(midx) => midx,
+        },
+        minter,
+        inner: m.inner,
+        bound: m.bound,
+        class_routed: m.class_routed,
+        event: -1,
     };
-    match claimed {
-        Some((idx, generation)) => routed_handle(tag, idx, generation),
-        None => {
-            log::error!(
-                "[provider] routed-handle table exhausted (MAX_ROUTES={MAX_ROUTES}); closing \
-                 handle {rc:#x} of contract {contract:#x} rather than returning one no op \
-                 could reach"
-            );
-            if let Some(close) = vtable_for(contract).map(|v| v.default_close_op) {
-                if close != 0 {
-                    // SAFETY: close convention: null arg, zero length.
-                    unsafe {
-                        call_target(
-                            contract,
-                            target,
-                            fd::slot_of(rc),
-                            close,
-                            core::ptr::null_mut(),
-                            0,
-                        );
-                    }
-                }
-            }
-            errno::ENOMEM
+    if m.signals {
+        let ringer = match m.target {
+            Target::Platform => NO_MODULE,
+            Target::Module(midx) => midx,
+        };
+        let doorbell = crate::kernel::ipc::event::doorbell_claim(minter, ringer);
+        if doorbell < 0 {
+            close_inner(&route);
+            return doorbell;
         }
+        route.event = doorbell;
+    }
+    let Some((idx, generation)) = routes_mut().claim(route) else {
+        log::error!(
+            "[provider] pool 'handles' at its ceiling of {} routes; handle of contract \
+             {:#x} refused",
+            routes().capacity(),
+            m.contract
+        );
+        crate::kernel::sys::resource_ledger::deny(POOL_HANDLES);
+        if route.event >= 0 {
+            crate::kernel::ipc::event::doorbell_release(route.event);
+        }
+        if !m.bound {
+            close_inner(&route);
+        }
+        return errno::ENOSPC;
+    };
+    if route.event >= 0 {
+        let mut arg =
+            crate::abi::kernel_abi::doorbell::bind_arg(route.event as u32, route.contract);
+        let rc = deliver(
+            &route,
+            route.inner,
+            crate::abi::kernel_abi::doorbell::BIND_DOORBELL,
+            &mut arg,
+            UserSpan::empty(),
+        );
+        if rc < 0 {
+            close_route(idx, generation, &route);
+            return rc;
+        }
+    }
+    handle::encode(route.contract, generation, idx)
+}
+
+/// Ask route `r`'s provider to close its index (the contract's default close
+/// op), when it has one and the route names a resource.
+fn close_inner(r: &Route) -> i32 {
+    if r.bound {
+        return 0;
+    }
+    match vtable_for(r.contract).map_or(0, |v| v.default_close_op) {
+        0 => 0,
+        close => deliver(r, r.inner, close, &mut [], UserSpan::empty()),
     }
 }
 
-/// Deliver `opcode` on live route `idx` to its owner with the owner's own
-/// slot, and retire the route when the op is the contract's close.
-///
-/// The slot is passed untagged, as the class-byte vtables pass every handle
-/// inward: providers index their tables with it.
-///
-/// # Safety
-/// `arg` must satisfy the owner's requirements for `opcode`.
-unsafe fn call_route(idx: usize, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    let r = route_at(idx);
-    let close = vtable_for(r.contract).map_or(0, |v| v.default_close_op);
-    // SAFETY: forwarded caller contract.
-    let rc = unsafe {
-        call_target(
-            r.contract,
-            r.target(),
-            fd::slot_of(r.inner),
-            opcode,
-            arg,
-            arg_len,
-        )
-    };
-    if close != 0 && opcode == close {
-        retire_route(idx, r.generation);
+/// Close route `idx` at its provider and drop it.
+fn close_route(idx: u32, generation: u16, r: &Route) -> i32 {
+    let rc = close_inner(r);
+    retire_route(idx, generation);
+    rc
+}
+
+/// The handle a `BIND` returns: a route to `target` that names no resource.
+fn mint_binding(contract: ContractId, selector: u32, target: Target, inner: i32) -> i32 {
+    mint(Mint {
+        contract,
+        selector,
+        target,
+        inner,
+        bound: true,
+        class_routed: false,
+        signals: false,
+    })
+}
+
+/// Deliver `op` on live route `idx` to its provider with the provider's own
+/// index (a binding's word for a bound handle), wrap a handle the op mints in
+/// a route to the same provider, and drop the route when the op closes it.
+fn call_route(
+    idx: u32,
+    generation: u16,
+    r: Route,
+    op: u32,
+    arg: &mut [u8],
+    data: UserSpan<'_>,
+) -> i32 {
+    let rc = deliver(&r, r.inner, op, arg, data);
+    if rc >= 0 && op_mints(op) {
+        return mint(Mint {
+            contract: r.contract,
+            selector: r.selector,
+            target: r.target(),
+            inner: rc,
+            bound: false,
+            class_routed: r.class_routed,
+            signals: op_signals(op),
+        });
+    }
+    if !r.bound && rule_of(op).is_some_and(|rule| rule.closes) {
+        retire_route(idx, generation);
     }
     rc
 }
 
-/// Free route `idx` if it still holds `generation` (the op may have run
-/// module code that already retired it).
-fn retire_route(idx: usize, generation: u16) {
-    // SAFETY: scheduler-thread mutation.
-    unsafe {
-        let p = &raw mut ROUTES;
-        let r = &mut (*p)[idx];
-        if r.in_use && r.generation == generation {
-            r.in_use = false;
-            r.inner = -1;
+/// Drop route `idx` if it still holds `generation` (the op may have run
+/// module code that already dropped it), freeing its doorbell.
+fn retire_route(idx: u32, generation: u16) {
+    if let Some(r) = routes_mut().release(idx, generation) {
+        if r.event >= 0 {
+            crate::kernel::ipc::event::doorbell_release(r.event);
         }
     }
 }
 
-/// Retire every route owned by, or minted by, `module_idx`. A route whose
-/// owner is gone names nothing and is dropped. A route the departing module
+/// Retire every route served by, or minted by, `module_idx`. A route whose
+/// provider is gone names nothing and is dropped. A route the departing module
 /// minted on a provider that stays is closed there, so the provider does not
-/// hold the file open for a consumer that no longer exists.
+/// hold the resource for a consumer that no longer exists.
 fn release_routes_of(module_idx: ModuleId) {
     // The platform's sentinel is not a module: nothing releases it.
     if module_idx == ROUTE_PLATFORM {
         return;
     }
-    let mut to_close = [(0usize, 0u16); MAX_ROUTES];
-    let mut n = 0usize;
-    // SAFETY: scheduler-thread mutation; no module code runs in this block.
-    unsafe {
-        let p = &raw mut ROUTES;
-        let routes = &mut *p;
-        for (i, r) in routes.iter_mut().enumerate() {
-            if !r.in_use {
-                continue;
-            }
-            if r.module_idx == module_idx {
-                r.in_use = false;
-                r.inner = -1;
-            } else if r.minter == module_idx {
-                to_close[n] = (i, r.generation);
-                n += 1;
-            }
+    let mut i = 0usize;
+    loop {
+        // One route at a time, by index, with no borrow of the table held
+        // across a close: the close runs provider code.
+        let next = routes()
+            .live()
+            .find(|(idx, _, r)| {
+                *idx as usize >= i && (r.module_idx == module_idx || r.minter == module_idx)
+            })
+            .map(|(idx, generation, r)| (idx, generation, *r));
+        let Some((idx, generation, r)) = next else {
+            break;
+        };
+        if r.module_idx == module_idx {
+            retire_route(idx, generation);
+        } else {
+            close_route(idx, generation, &r);
         }
-    }
-    for &(idx, generation) in &to_close[..n] {
-        let r = route_at(idx);
-        if !r.in_use || r.generation != generation {
-            continue;
-        }
-        let close = vtable_for(r.contract).map_or(0, |v| v.default_close_op);
-        if close != 0 {
-            // SAFETY: close convention: null arg, zero length.
-            unsafe {
-                call_route(idx, close, core::ptr::null_mut(), 0);
-            }
-        }
-        retire_route(idx, generation);
+        i = idx as usize + 1;
     }
 }
 
 /// Routed handles currently live. Diagnostics and tests.
 pub fn routed_handles_in_use() -> usize {
-    // SAFETY: scheduler-thread read.
-    unsafe {
-        let p = &raw const ROUTES;
-        (*p).iter().filter(|r| r.in_use).count()
-    }
+    routes().in_use()
 }

@@ -305,6 +305,9 @@ struct NvmeState {
     /// allocated on first use; separate-per-queue so concurrent
     /// writes on different queues can't alias each other's DMA.
     write_bufs: [[u64; MAX_INFLIGHT]; MAX_IO_QUEUES],
+    /// The `metal_device` handle of each `write_bufs` page, which cache
+    /// maintenance names it by.
+    write_buf_handles: [[i32; MAX_INFLIGHT]; MAX_IO_QUEUES],
 
     // Admin queue indices (QID=0).
     sq_tail: u32,
@@ -322,31 +325,29 @@ struct NvmeState {
     // being served. `blk_phase` (0=Idle, 1=Reading, 2=Writing) drives
     // the read-stream pipeline. `write_offset` tracks bytes of the
     // 512 B block already pushed to the output channel.
-    // `discard_cqe` is set when a seek arrives while a read is still
-    // in flight — the CQE still has to be harvested to free the I/O
-    // queue slot, but we must not write its data to the channel.
+    // `discard_cqe` is set when a new `READ_STREAM` arrives while a read
+    // is still in flight — the CQE still has to be harvested to free the
+    // I/O queue slot, but we must not write its data to the channel.
     current_block: u64,
     write_offset: u16,
     blk_phase: u8,
     discard_cqe: u8,
 
-    /// Pending batch read queued by a `storage.block` `READ_STREAM` call
-    /// on `blk_out`. The next `BLK_PHASE_IDLE` tick consumes it,
-    /// submits a single multi-block Read with `nlb` LBAs, and
-    /// streams `nlb * 512` bytes back-to-back to the consumer.
-    /// `pending_batch_valid == 0` means no batch is queued; the IDLE
-    /// tick falls back to the per-sector path driven by
-    /// `IOCTL_NOTIFY` / `current_block`.
+    /// The read a `storage.block` `READ_STREAM` call on `blk_out` queued.
+    /// The next `BLK_PHASE_IDLE` tick consumes it, submits a single Read
+    /// of `nlb` LBAs, and streams `nlb * 512` bytes to the consumer as one
+    /// write. `pending_batch_valid == 0` means none is queued, and the IDLE
+    /// tick submits nothing: a free-running sequential read loop would keep
+    /// reading after its consumer stopped draining the channel, and on the
+    /// pi5 board (bcm2712 silicon) the controller eventually misses a CQE
+    /// (fault code 24).
     pending_batch_lba: u64,
     pending_batch_nlb: u16,
     pending_batch_valid: u8,
-    /// Set to 1 by `apply_pending_seek` when an IOCTL_NOTIFY-driven
-    /// seek lands. Cleared by the next BLK_PHASE_IDLE submission. Used
-    /// to scope the per-sector async-stream path to "consumer just
-    /// asked for an LBA" — without this gate the IDLE branch loops
-    /// sequentially through the disk forever, which on the pi5 board (bcm2712 silicon)
-    /// eventually misses a CQE (fault code 24).
-    stream_armed: u8,
+    /// Set by a `READ_STREAM` that arrives; the next step abandons whatever
+    /// block was in flight for the old request, so the next bytes on the
+    /// channel are the new request's.
+    stream_restart: u8,
 
     // Incoming write-request pipeline. Producers push a REQ_HDR_SIZE
     // header `{ op:u32, lba:u64, nlb:u32, nsid:u32 }` followed by
@@ -477,9 +478,9 @@ struct NvmeState {
     msix_cap_offset: u16,
     msix_vector: u8,
     _pad5: [u8; 5],
-    /// Event handle the kernel signals when the allocated MSI vector
-    /// fires. Created lazily on the first `irq_mode=1` pass.
-    msix_event: i32,
+    /// The allocated MSI vector's handle: it polls ready once per
+    /// interrupt. Allocated on the first `irq_mode=1` pass.
+    msix_vec_fd: i32,
     _pad6: [u8; 4],
 
     /// Hot-path counters emitted as `[nvme] tlm dt=… rx=… tx=… idle=… bp=…`
@@ -491,9 +492,9 @@ struct NvmeState {
     tlm: TlmCounters,
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
     /// Who holds the I/O queue: 0 nobody, 1 this module's step, 2 a
-    /// `storage.block` ioctl from a consumer. The two run on whichever cores
-    /// call them, and both drive one SQ/CQ pair; an ioctl arriving while the
-    /// step holds it answers `E_AGAIN`, and a step arriving while an ioctl
+    /// `storage.block` call from a consumer. The two run on whichever cores
+    /// call them, and both drive one SQ/CQ pair; a call arriving while the
+    /// step holds it answers `E_AGAIN`, and a step arriving while a call
     /// holds it yields. Accessed as an `AtomicU8`.
     io_owner: u8,
 }
@@ -924,7 +925,7 @@ unsafe fn emit_identify_info(s: &NvmeState) {
 /// Emit the `[nvme] ns=N size=0xHHHHHHHHHHHHHHHH lbads=DDD` line — one
 /// per controller at IdentifyNamespace completion, and repeatedly from
 /// the heartbeat so it survives early-boot log-drain gaps. Consumers
-/// reach the same values through `storage.block` `CAPS`.
+/// reach the same values through `storage.block` `DESCRIBE`.
 unsafe fn emit_ns_info(s: &NvmeState) {
     let mut buf = [0u8; 64];
     let p = buf.as_mut_ptr();
@@ -989,7 +990,14 @@ unsafe fn step_bind(s: &mut NvmeState) -> StepReturn {
     let now = now_ms(s);
     if now.wrapping_sub(s.last_rescan_ms) >= RESCAN_INTERVAL_MS {
         s.last_rescan_ms = now;
-        let _ = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
+        let _ = (sys.provider_call)(
+            -1,
+            PCIE_RESCAN,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     StepReturn::Continue
 }
@@ -997,10 +1005,9 @@ unsafe fn step_bind(s: &mut NvmeState) -> StepReturn {
 unsafe fn step_map_bars(s: &mut NvmeState) -> StepReturn {
     log_once(s, b"[nvme] MapBars\0");
     let sys = &*s.syscalls;
-    let bar0 = dev_pcie_device_bar_map(sys, s.pcie_handle, 0);
-    if bar0 == 0 {
+    let Some((bar0, _)) = dev_pcie_device_bar_map(sys, s.pcie_handle, 0) else {
         return fault(s, 1, b"[nvme] BAR map failed\0");
-    }
+    };
     s.bar0_virt = bar0;
     s.state = S_RESET;
     s.substate = 0;
@@ -1055,7 +1062,7 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> StepReturn {
     match s.substate {
         0 => {
             log_once(s, b"[nvme] ConfigQueues\0");
-            let p = dev_dma_alloc(sys, PAGE, PAGE);
+            let p = dev_dma_alloc(sys, PAGE, PAGE).map_or(0, |r| r.addr);
             if p == 0 {
                 return fault(s, 5, b"[nvme] SQ alloc fail\0");
             }
@@ -1065,7 +1072,7 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> StepReturn {
             StepReturn::Continue
         }
         1 => {
-            let p = dev_dma_alloc(sys, PAGE, PAGE);
+            let p = dev_dma_alloc(sys, PAGE, PAGE).map_or(0, |r| r.addr);
             if p == 0 {
                 return fault(s, 6, b"[nvme] CQ alloc fail\0");
             }
@@ -1075,7 +1082,7 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> StepReturn {
             StepReturn::Continue
         }
         2 => {
-            let p = dev_dma_alloc(sys, PAGE, PAGE);
+            let p = dev_dma_alloc(sys, PAGE, PAGE).map_or(0, |r| r.addr);
             if p == 0 {
                 return fault(s, 7, b"[nvme] identify alloc fail\0");
             }
@@ -1219,7 +1226,7 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> StepReturn {
             log_once(s, b"[nvme] IdentifyNamespace\0");
             let sys = &*s.syscalls;
             if s.identify_ns_buf == 0 {
-                let p = dev_dma_alloc(sys, PAGE, PAGE);
+                let p = dev_dma_alloc(sys, PAGE, PAGE).map_or(0, |r| r.addr);
                 if p == 0 {
                     return fault(s, 12, b"[nvme] id-ns alloc fail\0");
                 }
@@ -1296,7 +1303,7 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> StepReturn {
             let sys = &*s.syscalls;
             let slot = *s.io_cq.as_ptr().add(q);
             if slot == 0 {
-                let p = dev_dma_alloc(sys, PAGE, PAGE);
+                let p = dev_dma_alloc(sys, PAGE, PAGE).map_or(0, |r| r.addr);
                 if p == 0 {
                     return fault(s, 15, b"[nvme] io cq alloc fail\0");
                 }
@@ -1357,7 +1364,7 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> StepReturn {
             let sys = &*s.syscalls;
             let slot = *s.io_sq.as_ptr().add(q);
             if slot == 0 {
-                let p = dev_dma_alloc(sys, PAGE, PAGE);
+                let p = dev_dma_alloc(sys, PAGE, PAGE).map_or(0, |r| r.addr);
                 if p == 0 {
                     return fault(s, 18, b"[nvme] io sq alloc fail\0");
                 }
@@ -1529,7 +1536,7 @@ pub mod limits {
     pub use super::{is_v1_slot_cid, CID_V1_FLUSH_BASE, V1_FLUSH_SLOTS};
     pub use super::{CDW12_FUA, CID_V1_BASE, ONCS_DSM, V1_SLOTS};
     /// This driver's own mount of the block capability record and fence.
-    pub type DriverCaps = super::Caps;
+    pub type DriverCaps = super::Description;
     pub type DriverFence = super::Fence;
     pub use super::{
         CID_IO_WRITE_BASE, CID_NONE, CID_SLOT_BITS, CID_SLOT_MASK, IO_Q_ENTRIES, MAX_INFLIGHT,
@@ -1592,7 +1599,7 @@ pub mod sim {
         s.ns_lbads = lbads;
         s.needs_flush = needs_flush;
         s.inflight_cap = MAX_INFLIGHT as u8;
-        s.msix_event = -1;
+        s.msix_vec_fd = -1;
         // The controller model decodes PRPs against the Pi 5's window, the
         // parameter's default.
         s.dma_offset = DMA_WINDOW;
@@ -1612,7 +1619,7 @@ pub mod sim {
     pub unsafe fn start_stream_read(state: *mut u8, lba: u64) -> bool {
         let s = &mut *(state as *mut NvmeState);
         if s.read_buf == 0 {
-            s.read_buf = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
+            s.read_buf = dev_dma_alloc(&*s.syscalls, PAGE, PAGE).map_or(0, |r| r.addr);
             if s.read_buf == 0 {
                 return false;
             }
@@ -1647,10 +1654,21 @@ pub mod sim {
         (*(state as *mut NvmeState)).stale_cqes
     }
 
+    /// One `storage.block` op, as the kernel delivers it.
+    ///
     /// # Safety
-    /// `state` was initialised by [`init`]; `arg` is a `block` ioctl argument.
-    pub unsafe fn ioctl(state: *mut u8, cmd: u32, arg: *mut u8) -> i32 {
-        nvme_blocks_ioctl_handler(state as *mut c_void, cmd, arg)
+    /// `state` was initialised by [`init`]; `arg[..arg_len]` and
+    /// `data[..data_len]` are valid for the call.
+    pub unsafe fn provider(
+        state: *mut u8,
+        handle: i32,
+        op: u32,
+        arg: *mut u8,
+        arg_len: usize,
+        data: *mut u8,
+        data_len: usize,
+    ) -> i32 {
+        module_provider_dispatch(state, handle, op, arg, arg_len, data, data_len)
     }
 }
 
@@ -1663,7 +1681,7 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> StepReturn {
             log_once(s, b"[nvme] ReadLba0\0");
             let sys = &*s.syscalls;
             if s.read_buf == 0 {
-                let p = dev_dma_alloc(sys, PAGE, PAGE);
+                let p = dev_dma_alloc(sys, PAGE, PAGE).map_or(0, |r| r.addr);
                 if p == 0 {
                     return fault(s, 21, b"[nvme] read buf alloc fail\0");
                 }
@@ -1688,11 +1706,8 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> StepReturn {
             CqeResult::Failed => fault(s, 23, b"[nvme] ReadLba0 failed\0"),
             CqeResult::Ok => {
                 emit_lba0_info(s);
-                // Hand control to the block-streaming loop starting at
-                // LBA 0. A FAT32 consumer's first IOCTL_NOTIFY targets
-                // LBA 0 anyway (the boot sector); starting there avoids
-                // a race where fat32's seek arrives after we've
-                // already streamed an unrelated LBA into its buffer.
+                // Hand control to the block-streaming loop, idle until a
+                // consumer's `READ_STREAM` names what to read.
                 s.current_block = 0;
                 s.write_offset = 0;
                 s.blk_phase = BLK_PHASE_IDLE;
@@ -2001,34 +2016,6 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
     }
 }
 
-/// Check the block-output channel for a consumer-originated seek
-/// (IOCTL_POLL_NOTIFY); apply it to `current_block` if present.
-/// Returns true if a seek was applied.
-unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
-    if s.blk_out < 0 {
-        return false;
-    }
-    let mut seek: u32 = 0;
-    let res = dev_channel_ioctl(
-        &*s.syscalls,
-        s.blk_out,
-        IOCTL_POLL_NOTIFY,
-        &mut seek as *mut u32 as *mut u8,
-        4,
-    );
-    if res == 0 {
-        s.current_block = u64::from(seek);
-        s.write_offset = 0;
-        // A per-sector seek supersedes any not-yet-submitted batch
-        // — fat32 alternates batch reads with single-sector FAT
-        // walks, so the FAT seek must override a stale batch.
-        s.pending_batch_valid = 0;
-        true
-    } else {
-        false
-    }
-}
-
 /// Harvest every ready write-pipeline CQE. Thin wrapper around
 /// [`poll_io_cqe(s, CID_NONE)`] that converts its result into the
 /// integer status the pump expects (0 on drain, -1 on fault).
@@ -2064,12 +2051,13 @@ unsafe fn ensure_write_buf(s: &mut NvmeState, q: usize, slot: usize) -> bool {
     if cur != 0 {
         return true;
     }
-    let p = dev_dma_alloc_streaming(sys, PAGE, PAGE);
-    if p == 0 {
+    let Some(r) = dev_dma_alloc_streaming(sys, PAGE, PAGE) else {
         return false;
-    }
+    };
     let row_mut = (*s.write_bufs.as_mut_ptr().add(q)).as_mut_ptr();
-    *row_mut.add(slot) = p;
+    *row_mut.add(slot) = r.addr;
+    let handles = (*s.write_buf_handles.as_mut_ptr().add(q)).as_mut_ptr();
+    *handles.add(slot) = r.handle;
     true
 }
 
@@ -2220,9 +2208,10 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 let tail = *s.inflight_tail.as_ptr().add(q) as usize;
                 let row = (*s.write_bufs.as_ptr().add(q)).as_ptr();
                 let buf = *row.add(tail);
+                let handle = *(*s.write_buf_handles.as_ptr().add(q)).as_ptr().add(tail);
                 let cid = CID_IO_WRITE_BASE | ((q as u16) << CID_SLOT_BITS) | (tail as u16);
                 let payload_bytes = (s.req_nlb as u32) * BLOCK_SIZE;
-                dev_dma_flush(sys, buf, payload_bytes);
+                dev_dma_flush(sys, handle, 0, payload_bytes);
                 submit_io_write(s, q, s.req_lba, s.req_nlb, cid, s.req_nsid, buf);
                 let cid_row = (*s.inflight_cid.as_mut_ptr().add(q)).as_mut_ptr();
                 *cid_row.add(tail) = cid;
@@ -2403,12 +2392,11 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
 /// is emitted; `step_create_io_cq` falls back to polled CQE delivery.
 ///
 /// Sequence:
-/// 1. Create an event fd.
-/// 2. Allocate a vector through the PCIE_DEVICE contract, receiving
-///    `(vec, target_addr, data)`; the platform brings up its MSI
+/// 1. Allocate a vector through the PCIE_DEVICE contract, receiving its
+///    handle and `(vec, target_addr, data)`; the platform brings up its MSI
 ///    controller on the first call.
-/// 3. Write those into MSI-X table entry 0 with `ctrl=0` (unmasked).
-/// 4. Flip bit 15 (MSI-X Enable) in the cap's Message Control.
+/// 2. Write those into MSI-X table entry 0 with `ctrl=0` (unmasked).
+/// 3. Flip bit 15 (MSI-X Enable) in the cap's Message Control.
 unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     if s.msix_enabled != 0 {
         return true;
@@ -2419,25 +2407,10 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
 
     let sys = &*s.syscalls;
 
-    // Create the event we'll subscribe to the MSI vector.
-    if s.msix_event < 0 {
-        let ev = dev_event_create(sys);
-        if ev < 0 {
-            dev_log(
-                sys,
-                2,
-                c"[nvme] msix: event_create failed".as_ptr().cast(),
-                32,
-            );
-            return false;
-        }
-        s.msix_event = ev;
-    }
-
     // Vector allocation — the PCIE_DEVICE contract brings up the
     // root-complex MSI mux on first call and returns the target
     // address + data value we program into the MSI-X table entry.
-    let (vec, addr, data) = match dev_pcie_device_msi_alloc(sys, s.pcie_handle, s.msix_event) {
+    let (vfd, vec, addr, data) = match dev_pcie_device_msi_alloc(sys, s.pcie_handle) {
         Some(t) => t,
         None => {
             dev_log(
@@ -2449,6 +2422,7 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
             return false;
         }
     };
+    s.msix_vec_fd = vfd;
     s.msix_vector = vec;
 
     // MSI-X Table Offset + BIR live in the dword at cap+4: low 3 bits
@@ -2511,7 +2485,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
     log_once(s, b"[nvme] Ready\0");
 
     // Give every `storage.block` slot its DMA page here, in this module's
-    // own step: requests arrive in a consumer's ioctl, whose permission
+    // own step: requests arrive in a consumer's call, whose permission
     // scope would be denied the allocation. `Ready` waits until every page
     // is in hand; the allocation retries next tick and is idempotent.
     if !v1_ensure_pages(s) {
@@ -2529,11 +2503,11 @@ unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
         s.msix_walked = 1;
         walk_pcie_caps(s);
     }
-    // Drain any MSI-X event the brcmstb mux raised so the event
-    // ring doesn't back up. The CQ is still polled below; the event
-    // is a "CQE may be ready" hint for future event-driven paths.
-    if s.msix_enabled != 0 && s.msix_event >= 0 {
-        let _ = dev_event_poll(&*s.syscalls, s.msix_event);
+    // Take any MSI-X ring the brcmstb mux raised. The CQ is still polled
+    // below; the ring is a "CQE may be ready" hint for future event-driven
+    // paths.
+    if s.msix_enabled != 0 && s.msix_vec_fd >= 0 {
+        let _ = dev_fd_poll(&*s.syscalls, s.msix_vec_fd, POLL_IN);
     }
     // Service incoming write requests on every tick. poll_io_cqe is
     // CID-aware (reads ask for CID_READ_LBA0, writes use the
@@ -2544,15 +2518,13 @@ unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
         return StepReturn::Continue;
     }
 
-    // Check for consumer seek on every tick. fat32 (and the
-    // `sd → fat32` contract in general) calls `flush_input` + `seek`
-    // before reading a specific LBA; a seek that lands while we are
-    // mid-read or mid-write must abort the in-flight block so the
-    // next bytes the consumer reads are from the seeked LBA, not
-    // from whatever happened to be in flight.
-    let seek_now = apply_pending_seek(s);
-    if seek_now {
-        s.stream_armed = 1;
+    // A consumer (fat32) flushes its input and then asks for a specific
+    // LBA with `READ_STREAM`; one that lands while we are mid-read or
+    // mid-write must abort the in-flight block so the next bytes the
+    // consumer reads are from the LBA it asked for, not from whatever
+    // happened to be in flight.
+    if s.stream_restart != 0 {
+        s.stream_restart = 0;
         match s.blk_phase {
             BLK_PHASE_READING => {
                 // CQE still outstanding; we must harvest it to free
@@ -2578,42 +2550,20 @@ unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
                 s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
                 return StepReturn::Continue;
             }
-            // Gate auto-streaming: only submit a Read SQE when there is
-            // explicit consumer demand (a queued batch or a seek that
-            // just landed). Otherwise idle silently. A free-running
-            // sequential `current_block + 1` read loop would otherwise
-            // keep reading after a consumer moves to synchronous ioctls
-            // and stops draining the streaming channel; reads then queue
-            // up faster than anything drains them and the controller
-            // eventually misses a CQE (`block read CQE timeout`, fault
-            // code 24).
-            if s.pending_batch_valid == 0 && s.stream_armed == 0 {
+            // Submit only on explicit consumer demand (a queued
+            // `READ_STREAM`); otherwise idle (see `pending_batch_valid`).
+            // One Read SQE covers the request's `nlb` contiguous LBAs: a
+            // one-block request is a per-sector read (boot sector, FAT
+            // walk), a longer one collapses a cluster's round trips into
+            // a single device command.
+            if s.pending_batch_valid == 0 {
                 s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
                 return StepReturn::Continue;
             }
-            s.stream_armed = 0;
-            // Two paths into IDLE:
-            //  1. Per-sector seek via `IOCTL_NOTIFY(lba)` —
-            //     `current_block` was set by `apply_pending_seek`;
-            //     `blk_nlb = 1`. One Read SQE per IOCTL.
-            //  2. Multi-sector batch via `storage.block` `READ_STREAM` —
-            //     `pending_batch_*` populated by the module ioctl
-            //     handler; `blk_nlb = nlb`. One Read SQE for `nlb`
-            //     contiguous LBAs, response streamed back-to-back.
-            //
-            // The batch path is what fat32 uses for cluster-scale
-            // reads; it collapses `sectors_per_cluster` round-trips
-            // into a single device command. Per-sector reads (FAT
-            // walks, dir parses, boot sector) take the first path.
-            let (lba, nlb) = if s.pending_batch_valid != 0 {
-                let n = s.pending_batch_nlb;
-                let l = s.pending_batch_lba;
-                s.pending_batch_valid = 0;
-                s.current_block = l;
-                (l, n)
-            } else {
-                (s.current_block, 1u16)
-            };
+            let nlb = s.pending_batch_nlb;
+            let lba = s.pending_batch_lba;
+            s.pending_batch_valid = 0;
+            s.current_block = lba;
             s.blk_nlb = nlb;
             submit_io_read(s, lba, nlb, CID_READ_LBA0);
             s.blk_phase = BLK_PHASE_READING;
@@ -2625,9 +2575,9 @@ unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
             CqeResult::Failed => fault(s, 25, b"[nvme] block read failed\0"),
             CqeResult::Ok => {
                 if s.discard_cqe != 0 {
-                    // A seek arrived while this read was in flight —
-                    // drop the result and let the IDLE branch pick the
-                    // seeked LBA on the next tick.
+                    // A new request arrived while this read was in
+                    // flight — drop the result and let the IDLE branch
+                    // submit the new one on the next tick.
                     s.discard_cqe = 0;
                     s.blk_phase = BLK_PHASE_IDLE;
                     StepReturn::Continue
@@ -2641,8 +2591,8 @@ unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
             }
         },
         _ => {
-            // BLK_PHASE_WRITING: push the whole batch byte-by-byte to the
-            // output channel, handling partial writes + backpressure.
+            // BLK_PHASE_WRITING: push the whole batch to the output
+            // channel as one record, retrying under back-pressure.
             let sys = &*s.syscalls;
             let batch_bytes = (s.blk_nlb as u32) * BLOCK_SIZE;
             let remaining = batch_bytes - (s.write_offset as u32);
@@ -2661,10 +2611,9 @@ unsafe fn step_ready(s: &mut NvmeState) -> StepReturn {
                 s.current_block = s.current_block.wrapping_add(u64::from(s.blk_nlb));
                 s.write_offset = 0;
                 s.blk_phase = BLK_PHASE_IDLE;
-                // Burst: kick straight into IDLE so a queued NOTIFY (or
-                // already-bumped `current_block` for a sequential
-                // consumer) submits the next read this tick instead of
-                // waiting one tick per block.
+                // Burst: kick straight into IDLE so a queued
+                // `READ_STREAM` submits its read this tick instead of
+                // waiting one tick.
                 StepReturn::Burst
             } else {
                 // Partial write — channel filled. Yield until the next
@@ -2686,10 +2635,17 @@ unsafe fn step_fault(s: &mut NvmeState) -> StepReturn {
     if s.fault_code == 1 && now.wrapping_sub(s.last_rescan_ms) >= RESCAN_INTERVAL_MS {
         s.last_rescan_ms = now;
         let sys = &*s.syscalls;
-        let rescan = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
+        let rescan = (sys.provider_call)(
+            -1,
+            PCIE_RESCAN,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         // Re-attempt BAR map through the bound handle.
         let bar0 = if s.pcie_handle >= 0 {
-            dev_pcie_device_bar_map(sys, s.pcie_handle, 0)
+            dev_pcie_device_bar_map(sys, s.pcie_handle, 0).map_or(0, |(addr, _)| addr)
         } else {
             0
         };
@@ -2712,62 +2668,93 @@ unsafe fn step_fault(s: &mut NvmeState) -> StepReturn {
 }
 
 // ============================================================================
-// Block channel ioctl handler (registered on `blk_out` at module_new)
+// storage.block provider (the edge contract on `blk_out`)
 // ============================================================================
 
-/// Serves `storage.block` v1 on `blk_out`: `CAPS`, `SUBMIT`, `REAP`,
-/// `EXEC` and `READ_STREAM`.
-unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
-    if state.is_null() {
+/// Serves `storage.block` to the consumer wired to `blk_out`: `DESCRIBE`,
+/// `SUBMIT`, `REAP`, `EXEC` and `READ_STREAM`. `handle` is this module's own
+/// port reference on that edge, the session its consumer's lend is bound to.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised; `arg[..arg_len]` and
+/// `data[..data_len]` are the caller's spans, valid for the call.
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_provider_dispatch"]
+pub unsafe extern "C" fn module_provider_dispatch(
+    state: *mut u8,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    if state.is_null() || arg.is_null() {
         return E_INVAL;
     }
     let s = &mut *(state as *mut NvmeState);
-    if arg.is_null() {
-        return E_INVAL;
+    let arg = core::slice::from_raw_parts_mut(arg, arg_len);
+    // Every op but DESCRIBE drives the I/O queue, from the consumer's core: it
+    // holds the queue against this module's step (see `io_owner`).
+    if op == SB::DESCRIBE {
+        return blocks_op(s, handle, op, arg, data, data_len);
     }
-    // Every command but CAPS drives the I/O queue, from the consumer's
-    // core: it holds the queue against this module's step (see `io_owner`).
-    if cmd == blk::ioctl::CAPS {
-        return blocks_ioctl_body(s, cmd, arg);
-    }
-    if !io_claim(s, IO_IOCTL) {
+    if !io_claim(s, IO_PROVIDER) {
         return E_AGAIN;
     }
-    let rc = blocks_ioctl_body(&mut *(state as *mut NvmeState), cmd, arg);
+    let rc = blocks_op(
+        &mut *(state as *mut NvmeState),
+        handle,
+        op,
+        arg,
+        data,
+        data_len,
+    );
     io_release(&mut *(state as *mut NvmeState));
     rc
 }
 
-unsafe fn blocks_ioctl_body(s: &mut NvmeState, cmd: u32, arg: *mut u8) -> i32 {
-    match cmd {
-        blk::ioctl::CAPS => {
+use abi::registry::storage_block as SB;
+
+unsafe fn blocks_op(
+    s: &mut NvmeState,
+    handle: i32,
+    op: u32,
+    arg: &mut [u8],
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    match op {
+        SB::DESCRIBE => {
             let Some(c) = v1_caps_of(s) else {
                 return E_AGAIN;
             };
-            c.encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
-            blk::caps::LEN as i32
-        }
-        blk::ioctl::SUBMIT => {
-            let Some(r) = Req::decode(core::slice::from_raw_parts(arg, blk::req::LEN)) else {
-                return E_INVAL;
-            };
-            match v1_start(s, &r) {
-                Ok(_) => 0,
-                Err(rc) => rc,
+            if c.encode(arg) {
+                0
+            } else {
+                E_INVAL
             }
         }
-        blk::ioctl::REAP => v1_reap(s, arg),
-        blk::ioctl::EXEC => v1_exec(s, arg),
-        blk::ioctl::READ_STREAM => {
-            let Some(r) = Req::decode(core::slice::from_raw_parts(arg, blk::req::LEN)) else {
+        SB::SUBMIT => {
+            let Some(r) = Req::decode(arg) else {
                 return E_INVAL;
             };
-            if r.op != blk::op::READ || (1u32 << s.ns_lbads) != BLOCK_SIZE {
+            v1_submit(s, handle, &r)
+        }
+        SB::REAP => v1_reap(s, handle, arg),
+        SB::EXEC => v1_exec(s, arg, data, data_len),
+        SB::READ_STREAM => {
+            let Some(r) = Req::decode_stream(arg) else {
+                return E_INVAL;
+            };
+            if (1u32 << s.ns_lbads) != BLOCK_SIZE {
                 return E_INVAL;
             }
             s.pending_batch_lba = r.lba;
             s.pending_batch_nlb = clamp_nlb(r.nblocks.min(u32::from(MAX_NLB)) as u16);
             s.pending_batch_valid = 1;
+            s.stream_restart = 1;
             0
         }
         _ => E_NOSYS,
@@ -2784,7 +2771,7 @@ unsafe fn blocks_ioctl_body(s: &mut NvmeState, cmd: u32, arg: *mut u8) -> i32 {
 // retires a v1 CID wherever it surfaces (`retire_v1_cqe`), so no path is
 // held up behind another's completion.
 
-use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use abi::contracts::storage::block::{self as blk, Cpl, Description, Req};
 use abi::fence::Fence;
 
 /// Requests the v1 surface holds in flight.
@@ -2840,8 +2827,10 @@ const PF_ABANDONED: u8 = 4;
 #[repr(C)]
 struct V1Slot {
     tag: u64,
-    /// Caller's buffer, for a read's copy-out at reap.
-    buf: u64,
+    /// The read's buffer in its consumer's lend (cookie, offset), for the
+    /// copy-out at reap; `EXEC` copies out itself.
+    lend: u32,
+    offset: u32,
     /// This slot's DMA page, allocated on first use.
     dma: u64,
     /// First block, kept so a parked request can be issued later.
@@ -2873,7 +2862,7 @@ pub fn device_id_of(serial: &[u8; 20], nsid: u32) -> u64 {
     h
 }
 
-/// The capability record this namespace answers `CAPS` with.
+/// The capability record this namespace answers `DESCRIBE` with.
 ///
 /// One request is at most one DMA page. `F_FLUSH` follows the volatile
 /// write cache; discard needs Dataset Management. Dataset Management only
@@ -2888,23 +2877,23 @@ pub fn v1_caps(
     needs_flush: bool,
     oncs: u16,
     device_id: u64,
-) -> Option<Caps> {
+) -> Option<Description> {
     if !(9..=12).contains(&lbads) {
         return None;
     }
     let lbs = 1u32 << lbads;
-    let mut flags = blk::caps::F_WRITE | blk::caps::F_FUA | blk::caps::F_ASYNC;
-    flags |= blk::caps::F_WRITE_COPIES;
+    let mut flags = blk::describe::F_WRITE | blk::describe::F_FUA | blk::describe::F_ASYNC;
+    flags |= blk::describe::F_WRITE_COPIES;
     if needs_flush {
-        flags |= blk::caps::F_FLUSH;
+        flags |= blk::describe::F_FLUSH;
     }
     if oncs & ONCS_DSM != 0 {
-        flags |= blk::caps::F_DISCARD;
+        flags |= blk::describe::F_DISCARD;
     }
     if lbs == BLOCK_SIZE {
-        flags |= blk::caps::F_READ_STREAM;
+        flags |= blk::describe::F_READ_STREAM;
     }
-    Some(Caps {
+    Some(Description {
         logical_block_size: lbs,
         block_count,
         max_blocks: PAGE / lbs,
@@ -3033,7 +3022,7 @@ unsafe fn harvest_writes(s: &mut NvmeState) {
     }
 }
 
-fn v1_caps_of(s: &NvmeState) -> Option<Caps> {
+fn v1_caps_of(s: &NvmeState) -> Option<Description> {
     if s.state != S_READY || s.ns_size == 0 {
         return None;
     }
@@ -3052,7 +3041,7 @@ fn v1_caps_of(s: &NvmeState) -> Option<Caps> {
 unsafe fn v1_ensure_pages(s: &mut NvmeState) -> bool {
     for i in 0..V1_SLOTS {
         if s.v1[i].dma == 0 {
-            let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
+            let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE).map_or(0, |r| r.addr);
             if p == 0 {
                 return false;
             }
@@ -3098,10 +3087,33 @@ unsafe fn v1_submit_sqe(s: &mut NvmeState, cdw: [u32; 16]) {
     reg_w32(s, sq_doorbell(s, IO_QID as u32), new_tail);
 }
 
-/// Queue `r` into a free slot. Returns the slot, or a negative errno:
-/// `EAGAIN` when every slot is busy, `EINVAL` for a request this source
-/// cannot serve.
-unsafe fn v1_start(s: &mut NvmeState, r: &Req) -> Result<usize, i32> {
+/// `SUBMIT`: queue `r`, its buffer in the lend its consumer opened on
+/// `handle`. A write's bytes are copied into the slot's DMA page here and
+/// the borrow given back before this returns (`F_WRITE_COPIES`); a read's
+/// range is checked here and borrowed again only for the copy-out at reap.
+unsafe fn v1_submit(s: &mut NvmeState, handle: i32, r: &Req) -> i32 {
+    if !r.has_buffer() {
+        return match v1_start(s, r, core::ptr::null()) {
+            Ok(_) => 0,
+            Err(rc) => rc,
+        };
+    }
+    let buf = match blk_borrow(&*s.syscalls, handle, r) {
+        Ok(p) => p,
+        Err(rc) => return rc,
+    };
+    let rc = match v1_start(s, r, buf) {
+        Ok(_) => 0,
+        Err(rc) => rc,
+    };
+    blk_give_back(&*s.syscalls, handle, r);
+    rc
+}
+
+/// Queue `r` into a free slot, a write's bytes taken from `wbuf`. Returns
+/// the slot, or a negative errno: `EAGAIN` when every slot is busy,
+/// `EINVAL` for a request this source cannot serve.
+unsafe fn v1_start(s: &mut NvmeState, r: &Req, wbuf: *const u8) -> Result<usize, i32> {
     let Some(caps) = v1_caps_of(s) else {
         return Err(E_AGAIN);
     };
@@ -3147,10 +3159,7 @@ unsafe fn v1_start(s: &mut NvmeState, r: &Req) -> Result<usize, i32> {
     if r.op == blk::op::WRITE {
         let mut i = 0usize;
         while i < bytes {
-            write_volatile(
-                (dma as *mut u8).add(i),
-                read_volatile((r.buf_ptr as *const u8).add(i)),
-            );
+            write_volatile((dma as *mut u8).add(i), read_volatile(wbuf.add(i)));
             i += 1;
         }
     }
@@ -3164,7 +3173,8 @@ unsafe fn v1_start(s: &mut NvmeState, r: &Req) -> Result<usize, i32> {
     }
     let slot = &mut s.v1[idx];
     slot.tag = r.tag;
-    slot.buf = r.buf_ptr;
+    slot.lend = r.lend;
+    slot.offset = r.offset;
     slot.lba = r.lba;
     slot.status = 0;
     slot.nblocks = r.nblocks;
@@ -3240,8 +3250,8 @@ unsafe fn v1_issue(s: &mut NvmeState, idx: usize) {
 }
 
 /// Hand back slot `idx`'s completion and free it. A read's data is copied
-/// to the caller's buffer here, while the caller's call is running.
-unsafe fn v1_finish(s: &mut NvmeState, idx: usize) -> Cpl {
+/// to `rbuf` here, while the caller's call is running.
+unsafe fn v1_finish(s: &mut NvmeState, idx: usize, rbuf: *mut u8) -> Cpl {
     let slot = s.v1[idx];
     let mut c = Cpl::bare(slot.tag, slot.status);
     if slot.status == 0 {
@@ -3249,10 +3259,7 @@ unsafe fn v1_finish(s: &mut NvmeState, idx: usize) -> Cpl {
             let bytes = slot.nblocks as usize * (1usize << s.ns_lbads);
             let mut i = 0usize;
             while i < bytes {
-                write_volatile(
-                    (slot.buf as *mut u8).add(i),
-                    read_volatile((slot.dma as *const u8).add(i)),
-                );
+                write_volatile(rbuf.add(i), read_volatile((slot.dma as *const u8).add(i)));
                 i += 1;
             }
         }
@@ -3267,26 +3274,67 @@ unsafe fn v1_finish(s: &mut NvmeState, idx: usize) -> Cpl {
 }
 
 /// `REAP`: write one finished completion into `arg`. Returns 1, or 0 when
-/// none is ready.
-unsafe fn v1_reap(s: &mut NvmeState, arg: *mut u8) -> i32 {
+/// none is ready. A successful read is copied into its consumer's lend
+/// under one borrow, given back before the completion is written.
+unsafe fn v1_reap(s: &mut NvmeState, handle: i32, arg: &mut [u8]) -> i32 {
+    if arg.len() < blk::cpl::LEN {
+        return E_INVAL;
+    }
     v1_harvest(s);
     for i in 0..V1_SLOTS {
-        if s.v1[i].state == V1_DONE {
-            let c = v1_finish(s, i);
-            c.encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
-            return 1;
+        if s.v1[i].state != V1_DONE {
+            continue;
         }
+        let slot = s.v1[i];
+        let c = if slot.op == blk::op::READ && slot.status == 0 {
+            let r = Req {
+                op: slot.op,
+                flags: 0,
+                nblocks: slot.nblocks,
+                lba: slot.lba,
+                lend: slot.lend,
+                offset: slot.offset,
+                buf_len: slot.nblocks << s.ns_lbads,
+                tag: slot.tag,
+            };
+            match blk_borrow(&*s.syscalls, handle, &r) {
+                Ok(p) => {
+                    let c = v1_finish(s, i, p);
+                    blk_give_back(&*s.syscalls, handle, &r);
+                    c
+                }
+                Err(rc) => {
+                    s.v1[i].state = V1_FREE;
+                    Cpl::bare(slot.tag, rc)
+                }
+            }
+        } else {
+            v1_finish(s, i, core::ptr::null_mut())
+        };
+        c.encode(arg);
+        return 1;
     }
     0
 }
 
-/// `EXEC`: run the request in `arg` to completion and write its completion
-/// after it. Returns the completion's status.
-unsafe fn v1_exec(s: &mut NvmeState, arg: *mut u8) -> i32 {
-    let Some(r) = Req::decode(core::slice::from_raw_parts(arg, blk::req::LEN)) else {
+/// `EXEC`: run the request in `arg` to completion over `data` and write its
+/// completion after it. Returns the completion's status.
+unsafe fn v1_exec(s: &mut NvmeState, arg: &mut [u8], data: *mut u8, data_len: usize) -> i32 {
+    if arg.len() < blk::exec::ARG_LEN {
+        return E_INVAL;
+    }
+    let Some(r) = Req::decode(arg) else {
         return E_INVAL;
     };
-    let idx = match v1_start(s, &r) {
+    let want = if r.has_buffer() {
+        r.buf_len as usize
+    } else {
+        0
+    };
+    if data_len != want || (want != 0 && data.is_null()) {
+        return E_INVAL;
+    }
+    let idx = match v1_start(s, &r, data) {
         Ok(i) => i,
         Err(rc) => return rc,
     };
@@ -3311,11 +3359,8 @@ unsafe fn v1_exec(s: &mut NvmeState, arg: *mut u8) -> i32 {
             return E_AGAIN;
         }
     }
-    let c = v1_finish(s, idx);
-    c.encode(core::slice::from_raw_parts_mut(
-        arg.add(blk::req::LEN),
-        blk::cpl::LEN,
-    ));
+    let c = v1_finish(s, idx, data);
+    c.encode(&mut arg[blk::exec::CPL..]);
     c.status
 }
 
@@ -3373,16 +3418,6 @@ pub unsafe extern "C" fn module_new(
         s.state = S_BIND;
         s.logged_state = 0xFE;
 
-        // `storage.block` v1 is served on blk_out.
-        if s.blk_out >= 0 {
-            dev_channel_register_ioctl(
-                &*s.syscalls,
-                s.blk_out,
-                state as *mut c_void,
-                Some(nvme_blocks_ioctl_handler),
-            );
-        }
-
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
@@ -3417,8 +3452,8 @@ pub unsafe extern "C" fn module_new(
         if s.io_q_count == 0 || s.io_q_count as usize > MAX_IO_QUEUES {
             s.io_q_count = 1;
         }
-        // `-1` = no event yet; `enable_msix` creates on first need.
-        s.msix_event = -1;
+        // `-1` = no vector yet; `enable_msix` allocates on first need.
+        s.msix_vec_fd = -1;
 
         let now = dev_millis(&*s.syscalls);
         s.last_rescan_ms = now;
@@ -3438,7 +3473,7 @@ pub unsafe extern "C" fn module_new(
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     let s = &mut *(state as *mut NvmeState);
     if !io_claim(s, IO_STEP) {
-        return StepReturn::Continue; // an ioctl holds the queue; next step
+        return StepReturn::Continue; // a request holds the queue; next step
     }
     let rc = step_body(state);
     io_release(&mut *(state as *mut NvmeState));
@@ -3446,7 +3481,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
 }
 
 const IO_STEP: u8 = 1;
-const IO_IOCTL: u8 = 2;
+const IO_PROVIDER: u8 = 2;
 
 unsafe fn io_owner(s: &mut NvmeState) -> &core::sync::atomic::AtomicU8 {
     // SAFETY: AtomicU8 has u8's size and alignment; the field is only ever

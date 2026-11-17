@@ -48,6 +48,8 @@ content_type = "ExchangeRequest"
 buffer_size = 16384
 max_record = 8192
 required = true
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_out"

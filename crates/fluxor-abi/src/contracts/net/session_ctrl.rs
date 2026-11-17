@@ -470,11 +470,12 @@ pub const DELTA_TLS_RETX_ACK: u8 = 11;
 pub const DELTA_TLS_RECV_BYTES: u8 = 12;
 /// TLS, strict profile: what the clear-side consumer has consumed, a
 /// cumulative count of records handed up — those whose plaintext ends at or
-/// before the clear byte the consumer acknowledged (`net_proto` 0x19 under
-/// `tls`'s `delivery_ack`), or counted as handed up — and the cursor and
-/// clear byte its last acknowledgement carried (0 for none), kept with the
-/// count so a takeover redelivers from that byte and hands both to the next
-/// consumer (`net_proto::MSG_RESUMED`).
+/// before the clear byte the consumer acknowledged (`stream_cursor`
+/// `CMD_CURSOR_DELIVERED`, on a connection granted `CURSORS`), or counted as
+/// handed up — and the cursor and clear byte its last acknowledgement
+/// carried (0 for none), kept with the count so a takeover redelivers from
+/// that byte and hands both to the next consumer
+/// (`stream_cursor::MSG_CURSOR_RESUMED`).
 ///   [consumed: 8 LE][consumer_cursor: 8 LE][cursor_at: 8 LE]
 pub const DELTA_TLS_DELIVERED: u8 = 15;
 /// TCP: the connection ended by a reset — the peer's, accepted

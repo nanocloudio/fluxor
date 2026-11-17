@@ -116,6 +116,51 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     Value::Object(edge)
 }
 
+/// The module entries of an FXWR config blob, in slot order: each one's
+/// `name_hash` (FNV-1a of its type) and its params TLV.
+pub fn module_entries(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
+    let header = fxwr_slice(data, 0, FXWR_HEADER_SIZE, "the header")?;
+    if le_u32(&header[0..4]) != MAGIC_FXWR {
+        return Err(Error::Config("not an FXWR config".into()));
+    }
+    let msec = fxwr_slice(
+        data,
+        FXWR_HEADER_SIZE,
+        FXWR_MODULE_SECTION_HEADER,
+        "the module section header",
+    )?;
+    let module_count = u16::from_le_bytes([msec[0], msec[1]]) as usize;
+    let section_size = le_u32(&msec[2..6]) as usize;
+    let entries = fxwr_slice(
+        data,
+        FXWR_HEADER_SIZE + FXWR_MODULE_SECTION_HEADER,
+        section_size,
+        "the module section",
+    )?;
+    let mut out = Vec::with_capacity(module_count);
+    let mut off = 0usize;
+    for i in 0..module_count {
+        let head = fxwr_slice(
+            entries,
+            off,
+            MODULE_ENTRY_HEADER_SIZE,
+            "a module entry header",
+        )?;
+        let entry_len = le_u32(&head[0..4]) as usize;
+        if entry_len < MODULE_ENTRY_HEADER_SIZE || entry_len > entries.len() - off {
+            return Err(Error::Config(format!(
+                "FXWR module entry {i}: length {entry_len} does not fit its section"
+            )));
+        }
+        out.push((
+            le_u32(&head[4..8]),
+            &entries[off + MODULE_ENTRY_HEADER_SIZE..off + entry_len],
+        ));
+        off += entry_len;
+    }
+    Ok(out)
+}
+
 /// Decode an FXWR config blob: the header, each module entry (identity and
 /// parameter size), the graph's edges and per-domain metadata, and the
 /// hardware section's counts. Every read is bounds-checked; a blob cut short

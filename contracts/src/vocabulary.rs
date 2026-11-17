@@ -107,7 +107,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "replication.state_machine",
     // The ordered-ack terms of the exchange contract
     // (`crates/fluxor-abi/src/contracts/exchange.rs`): publish requests in order, each
-    // answered 200 once durably accepted, and — for a provider that answers
+    // answered with outcome OK once durably accepted, and — for a provider that answers
     // with data — a response body on the same exchange.
     //
     // Three names — one parent and two roles — because the roles are not
@@ -119,6 +119,10 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "stream.ordered_ack",
     "stream.ordered_ack.sink",
     "stream.ordered_ack.exchange",
+    // The surface an `ExchangeRequest` port carries, port-scoped: its
+    // `binding` fact names the bindings whose verbs cross the port
+    // (`crates/fluxor-abi/src/contracts/exchange.rs`).
+    "exchange.request",
     // ── Effect surfaces ────────────────────────────────────────────────
     // Substitutable application-effect providers: what a graph binds when a
     // stage publishes, subscribes, or calls out, as opposed to the transport
@@ -229,6 +233,16 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
             ("broadcast", &["fanout", "degenerate", "unsupported"]),
             ("max_payload", FACT_NUMERIC),
         ],
+    ),
+    (
+        // The bindings whose verbs an exchange request port carries, declared
+        // on the PORT (`[ports.facts]`): a requester's `request_out` names
+        // the bindings it sends verbs of, a provider's `request_in` the ones
+        // it speaks. Undeclared is none (`UNDECLARED_IS_NONE`), so a
+        // requester sending HTTP verbs is refused at build against a
+        // provider that speaks no binding.
+        "exchange.request",
+        &[("binding", &["http"])],
     ),
     (
         "stream.publish",
@@ -589,7 +603,13 @@ pub fn packing_byte(packing: &str) -> Option<u8> {
 /// Capabilities whose facts describe the stream on ONE PORT rather than a
 /// service the module provides. Their facts are declared in `[ports.facts]`
 /// on the port and refused in the module-level `[capability_facts]` table.
-pub const PORT_SCOPED_CAPABILITIES: &[&str] = &["audio.encoded", "video.encoded"];
+pub const PORT_SCOPED_CAPABILITIES: &[&str] =
+    &["audio.encoded", "video.encoded", "exchange.request"];
+
+/// Set-valued port facts a consumer that declares nothing takes NONE of,
+/// rather than being unconstrained: what a port does not say it speaks, it
+/// does not speak. Compared by the subset rule against the empty set.
+pub const UNDECLARED_IS_NONE: &[(&str, &str)] = &[("exchange.request", "binding")];
 
 /// The service-level capability that mirrors a content type — the surface a
 /// port of that type carries. `None` for a content type with no surface
@@ -603,6 +623,7 @@ pub fn surface_capability(content_type: &str) -> Option<&'static str> {
         ("VideoRaster", "video.raster"),
         ("VideoScanout", "video.scanout"),
         ("MediaMuxed", "media.muxed"),
+        ("ExchangeRequest", "exchange.request"),
     ];
     SURFACES
         .iter()

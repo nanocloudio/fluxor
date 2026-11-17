@@ -319,10 +319,11 @@ fn check_decoded(
                 max_record,
                 granted,
             } => format!(
-                "{}: its producer writes records of up to {max_record} B but the ring is \
-                 {granted} B, so a record that size could never be written; raise the edge's \
-                 buffer_bytes or the port's buffer_size",
-                namer.edge(&ends)
+                "{}: its producer writes records of up to {max_record} B ({} B of ring with \
+                 their length prefix) but the ring is {granted} B, so a record that size could \
+                 never be written; raise the edge's buffer_bytes or the port's buffer_size",
+                namer.edge(&ends),
+                rings::record_bytes(max_record)
             ),
             RingError::GroupsExhausted => format!(
                 "the graph's record fans need more mailbox groups than {}'s kernel has",
@@ -466,8 +467,17 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            contract: None,
+            serves: None,
+            contract_optional: false,
             facts: Default::default(),
             gates_readiness: true,
+            accepts_record: 0,
+            retains_send: false,
+            datagram_only: false,
+            send_buffer_param: None,
+            send_pool_param: None,
+            send_pool_lanes_param: None,
         }
     }
 

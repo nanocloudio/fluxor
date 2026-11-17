@@ -21,16 +21,16 @@
 //!   software backend — consumers verify, they don't byte-compare.
 //! - `ECDH` → `C_DeriveKey` with `CKM_ECDH1_DERIVE` (CKD_NULL KDF): the
 //!   32-byte X coordinate lands in a throwaway extractable session
-//!   secret, is copied to the caller per the contract, and the object
-//!   is destroyed. The P-256 usage mask covers both SIGN and AGREE, so a
+//!   secret, is written over the caller's `data` per the contract, and the
+//!   object is destroyed. The P-256 usage mask covers both SIGN and AGREE, so a
 //!   backend reporting it must implement both.
 //! - `PUBLIC` → read `CKA_EC_POINT` (DER OCTET STRING unwrapped to the
 //!   65-byte SEC1 point).
 //! - `VERIFY` → delegated to the kernel software implementation: it takes
 //!   a caller-supplied public key and touches no custodial material.
 //! - `STORE` → `ENOSYS`. A non-extractable token cannot import an
-//!   external private key; `SUITE_QUERY` reports a private length of 0,
-//!   so consumers know to use `GENERATE`.
+//!   external private key; `DESCRIBE_SUITE` reports a private length of 0
+//!   and no `IMPORT`, so consumers know to use `GENERATE`.
 //! - `TIER` → `PROCESS_HW`: a host process talking to a token isolates
 //!   the key from host-memory compromise to the extent the token does.
 //! - `OPEN_OR_GENERATE` / `OPEN` → `C_FindObjects` on the key's token
@@ -42,9 +42,9 @@
 //! - `DESCRIBE` → P-256, the key's sealed uses, `PROCESS_HW`, and
 //!   persisted exactly when the key is a token object.
 //!
-//! This backend is P-256-scoped. `SUITE_QUERY` answers `ENOSYS` for every
-//! other suite and `SUITE_ENUM` lists only P-256, so a consumer that needs
-//! EdDSA learns it before it commits and falls back per its own policy.
+//! This backend is P-256-scoped: `DESCRIBE_SUITE` describes P-256 alone, so
+//! a consumer that needs EdDSA learns it before it commits. It signs whole:
+//! its `SIGN` never answers `EAGAIN`.
 //!
 //! An unlabelled key (`GENERATE`) is a *session* object (`CKA_TOKEN=false`)
 //! whatever its mask says: it has no name to be reopened by, so a token
@@ -122,8 +122,8 @@ use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
 
 use crate::abi::contracts::key_vault as dev_key_vault;
-use crate::abi::errno::{EACCES, EBUSY, EINVAL, ENOENT, ENOMEM, ENOSYS, ERROR};
-use crate::kernel::ipc::fd;
+use crate::abi::errno::{EACCES, EBUSY, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE, ERROR};
+use crate::kernel::module::user_span::UserSpan;
 
 /// DER encoding of the `secp256r1` (NIST P-256, a.k.a. `prime256v1`)
 /// named-curve OID `1.2.840.10045.3.1.7`, as required for `CKA_EC_PARAMS`.
@@ -165,25 +165,21 @@ fn normalise_low_s(sig: &mut [u8; 64]) {
 
 /// Slots this backend holds: the vault contract exposes a small fixed handle
 /// space, not the token's whole object store.
-const MAX_SLOTS: usize = 8;
+pub const MAX_SLOTS: usize = 8;
 
 /// What this backend permits for the one suite it supports.
 ///
 /// `PERSIST` is a permission, as the contract has it, and a labelled key
 /// holding it is born a token object; an unlabelled one stays a session
 /// object, since nothing could reopen it. There is no `WRAP`: a token key's
-/// bytes are nowhere to wrap. Nor is there a `STORE_IMPORT` equivalent —
-/// import is refused per-suite through `SUITE_QUERY` rather than as one
-/// global bit, because tokens differ by algorithm and a single bit could not
-/// say which.
+/// bytes are nowhere to wrap. Import is refused per suite through
+/// `DESCRIBE_SUITE` rather than as one global bit, because tokens differ by
+/// algorithm and a single bit could not say which.
 const HSM_P256_USAGE: u32 = dev_key_vault::usage::SIGN
     | dev_key_vault::usage::VERIFY
     | dev_key_vault::usage::AGREE
     | dev_key_vault::usage::EXPORT_PUBLIC
     | dev_key_vault::usage::PERSIST;
-
-/// Longest label, mirroring the contract's `MAX_LABEL`.
-const MAX_LABEL: usize = dev_key_vault::MAX_LABEL;
 
 /// Magic opening a token key's `CKA_ID` record.
 const RECORD_MAGIC: [u8; 4] = *b"FXVK";
@@ -223,18 +219,6 @@ fn parse_record(namespace: u32, r: &[u8]) -> Option<(u16, u32)> {
     ))
 }
 
-/// Read a little-endian `u64` from `p`.
-///
-/// # Safety
-/// `p` must be readable for 8 bytes.
-unsafe fn read_u64(p: *const u8) -> u64 {
-    let mut b = [0u8; 8];
-    for (i, v) in b.iter_mut().enumerate() {
-        *v = *p.add(i);
-    }
-    u64::from_le_bytes(b)
-}
-
 /// One generated keypair living inside the token.
 struct HsmSlot {
     private: ObjectHandle,
@@ -260,9 +244,6 @@ struct HsmVault {
     /// Keeps the loaded PKCS#11 library alive as long as the session.
     _ctx: Pkcs11,
     slots: Mutex<[Option<HsmSlot>; MAX_SLOTS]>,
-    /// Per-slot generation, bumped when a key is destroyed and carried in
-    /// every handle, so a handle to a destroyed key never reaches the next.
-    generations: Mutex<[u32; MAX_SLOTS]>,
 }
 
 static VAULT: OnceLock<HsmVault> = OnceLock::new();
@@ -359,7 +340,6 @@ fn open_vault(module: &str, token: &TokenSelector, pin: &str) -> Result<HsmVault
         session: Mutex::new(session),
         _ctx: ctx,
         slots: Mutex::new([const { None }; MAX_SLOTS]),
-        generations: Mutex::new([0; MAX_SLOTS]),
     })
 }
 
@@ -423,38 +403,26 @@ fn read_public_point(session: &Session, public_key: ObjectHandle) -> Result<[u8;
     Ok(out)
 }
 
-/// Handle bits naming the slot; the generation sits above them.
-const SLOT_BITS: u32 = 6;
-const GENERATION_MASK: u32 = (1 << 19) - 1;
-/// Set on every handle this backend mints, so the router sends it here.
+/// Set on every index this backend answers, so the router sends it here.
 const BACKEND_BIT: i32 = crate::kernel::security::key_vault_router::HARDWARE_FIELD_BIT;
-const _: () = assert!(MAX_SLOTS <= 1 << SLOT_BITS);
+const _: () = assert!(MAX_SLOTS < BACKEND_BIT as usize);
 
-/// The slot a handle names, if the caller may use it — the same rule as
-/// the software backend: `EINVAL` for something that is not a vault handle,
-/// `ENOENT` for a key that no longer exists, `EACCES` for another module's.
+/// The slot an index names, if the caller may use it — the same rule as
+/// the software backend: `EINVAL` for something that is not this backend's
+/// index, `ENOENT` for a key that no longer exists, `EACCES` for another
+/// module's.
 fn resolve(vault: &HsmVault, handle: i32) -> Result<usize, i32> {
-    if handle < 0 {
+    if handle < 0 || handle & BACKEND_BIT == 0 {
         return Err(EINVAL);
     }
-    let (tag, field) = fd::untag_fd(handle);
-    if tag != fd::FD_TAG_KEY_VAULT || field & BACKEND_BIT == 0 {
-        return Err(EINVAL);
-    }
-    let field = field & !BACKEND_BIT;
-    let idx = (field & ((1 << SLOT_BITS) - 1)) as usize;
-    let g = (field >> SLOT_BITS) as u32;
+    let idx = (handle & !BACKEND_BIT) as usize;
     if idx >= MAX_SLOTS {
         return Err(EINVAL);
     }
     let slots = vault.slots.lock().map_err(|_| ERROR)?;
-    let generations = vault.generations.lock().map_err(|_| ERROR)?;
     let Some(slot) = &slots[idx] else {
         return Err(ENOENT);
     };
-    if generations[idx] & GENERATION_MASK != g {
-        return Err(ENOENT);
-    }
     // A key whose owner is gone no longer exists, for anyone; its slot is
     // freed when the next GENERATE needs one.
     if !crate::kernel::security::key_vault::owner_is_live(slot.owner.0, slot.owner.1) {
@@ -466,29 +434,17 @@ fn resolve(vault: &HsmVault, handle: i32) -> Result<usize, i32> {
     Ok(idx)
 }
 
-/// The handle naming slot `idx` at its current generation.
-fn handle_of(vault: &HsmVault, idx: usize) -> i32 {
-    let g = vault
-        .generations
-        .lock()
-        .map(|g| (g[idx] & GENERATION_MASK) as i32)
-        .unwrap_or(0);
-    fd::tag_fd(
-        fd::FD_TAG_KEY_VAULT,
-        BACKEND_BIT | (g << SLOT_BITS) | idx as i32,
-    )
+/// What this backend calls slot `idx`: its index, with the backend bit.
+fn handle_of(_vault: &HsmVault, idx: usize) -> i32 {
+    BACKEND_BIT | idx as i32
 }
 
-/// Retire a slot's handles — the generation moves on, so a handle to the
-/// key stops resolving — and destroy its session objects. A token key's
-/// objects stay on the token: `DESTROY_BY_LABEL` is what removes them.
-fn release_slot(vault: &HsmVault, session: &Session, idx: usize, slot: HsmSlot) {
+/// Destroy a slot's session objects. A token key's objects stay on the
+/// token: `DESTROY_BY_LABEL` is what removes them.
+fn release_slot(_vault: &HsmVault, session: &Session, _idx: usize, slot: HsmSlot) {
     if !slot.persisted {
         let _ = session.destroy_object(slot.private);
         let _ = session.destroy_object(slot.public);
-    }
-    if let Ok(mut g) = vault.generations.lock() {
-        g[idx] = g[idx].wrapping_add(1) & GENERATION_MASK;
     }
 }
 
@@ -634,34 +590,20 @@ fn find_token_key(
 /// for another suite or a wider mask than the key was born with, `ENOENT`
 /// for `OPEN` of an absent key, `ENOMEM` with no slot free, `ERANGE`
 /// (checked before anything is opened or made) for a short public buffer.
-///
-/// # Safety
-/// As [`hsm_key_vault_dispatch`].
-unsafe fn open_labelled(vault: &HsmVault, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    // arg: [suite:u16][usage_mask:u32][flags:u8][label_len:u8]
-    //      [label[label_len]]
-    //      [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
-    if arg.is_null() || arg_len < 8 {
+fn open_labelled(vault: &HsmVault, opcode: u32, arg: &mut [u8], out: &mut [u8]) -> i32 {
+    let Some(req) = dev_key_vault::open::parse(arg) else {
         return EINVAL;
-    }
-    let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
-    let usage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-    let label_len = *arg.add(7) as usize;
-    if label_len == 0 || label_len > MAX_LABEL || 8 + label_len + 12 > arg_len {
-        return EINVAL;
-    }
-    let label = core::slice::from_raw_parts(arg.add(8), label_len).to_vec();
-    let tail = arg.add(8 + label_len);
-    let pub_out = read_u64(tail) as *mut u8;
-    let pub_cap = u16::from_le_bytes([*tail.add(8), *tail.add(9)]) as usize;
+    };
+    let (suite, usage) = (req.suite, req.usage);
+    let label = &req.label.to_vec();
     if suite != dev_key_vault::suite::P256 {
         return ENOSYS;
     }
     // Sized before anything is opened or made: a refusal after a key was
     // minted would leave a slot nobody holds a handle to.
-    if pub_cap < 65 {
-        core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), tail.add(10), 2);
-        return crate::abi::errno::ERANGE;
+    if out.len() < 65 {
+        dev_key_vault::open::set_len(arg, 65);
+        return ERANGE;
     }
     let mut slots = match vault.slots.lock() {
         Ok(s) => s,
@@ -693,7 +635,7 @@ unsafe fn open_labelled(vault: &HsmVault, opcode: u32, arg: *mut u8, arg_len: us
         }
         i
     } else {
-        let found = match find_token_key(&session, namespace, &label) {
+        let found = match find_token_key(&session, namespace, label) {
             Ok(f) => f,
             Err(e) => return e,
         };
@@ -718,12 +660,12 @@ unsafe fn open_labelled(vault: &HsmVault, opcode: u32, arg: *mut u8, arg_len: us
                 owner,
                 usage: k.usage,
                 namespace,
-                label: Some(label),
+                label: Some(label.clone()),
                 persisted: true,
             },
             None => {
                 let persist = usage & dev_key_vault::usage::PERSIST != 0;
-                let name = token_name(namespace, &label);
+                let name = token_name(namespace, label);
                 let record = token_record(namespace, suite, usage);
                 if persist {
                     // A public half left behind by a pair whose private half
@@ -750,7 +692,7 @@ unsafe fn open_labelled(vault: &HsmVault, opcode: u32, arg: *mut u8, arg_len: us
                     owner,
                     usage,
                     namespace,
-                    label: Some(label),
+                    label: Some(label.clone()),
                     persisted: persist,
                 }
             }
@@ -776,10 +718,8 @@ unsafe fn open_labelled(vault: &HsmVault, opcode: u32, arg: *mut u8, arg_len: us
             return ERROR;
         }
     };
-    if !pub_out.is_null() {
-        core::ptr::copy_nonoverlapping(point.as_ptr(), pub_out, 65);
-    }
-    core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), tail.add(10), 2);
+    out[..65].copy_from_slice(&point);
+    dev_key_vault::open::set_len(arg, 65);
     drop(session);
     drop(slots);
     handle_of(vault, idx)
@@ -789,18 +729,10 @@ unsafe fn open_labelled(vault: &HsmVault, opcode: u32, arg: *mut u8, arg_len: us
 /// token objects. `0`, `ENOENT` when nothing has the label, `ERROR` when a
 /// token object could not be removed (it would come back).
 ///
-/// # Safety
-/// As [`hsm_key_vault_dispatch`].
-unsafe fn destroy_labelled(vault: &HsmVault, arg: *mut u8, arg_len: usize) -> i32 {
-    // arg: [label_len:u8][label[label_len]]
-    if arg.is_null() || arg_len < 2 {
+fn destroy_labelled(vault: &HsmVault, arg: &[u8]) -> i32 {
+    let Some(label) = dev_key_vault::destroy_by_label::parse(arg) else {
         return EINVAL;
-    }
-    let label_len = *arg as usize;
-    if label_len == 0 || label_len > MAX_LABEL || 1 + label_len > arg_len {
-        return EINVAL;
-    }
-    let label = core::slice::from_raw_parts(arg.add(1), label_len);
+    };
     let mut slots = match vault.slots.lock() {
         Ok(s) => s,
         Err(_) => return ERROR,
@@ -858,16 +790,11 @@ fn permits(vault: &HsmVault, idx: usize, want: u32) -> Result<(), i32> {
 }
 
 /// KEY_VAULT provider dispatch backed by the PKCS#11 token.
-///
-/// # Safety
-/// `arg` must be valid for `arg_len` bytes for reads (input fields per
-/// the opcode's layout) and writes (`*_out` regions). Caller must not
-/// retain `arg` after return.
-pub unsafe fn hsm_key_vault_dispatch(
+pub fn hsm_key_vault_dispatch(
     handle: i32,
     opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
+    arg: &mut [u8],
+    mut data: UserSpan<'_>,
 ) -> i32 {
     let Some(vault) = VAULT.get() else {
         // Registration only happens after VAULT.set succeeds; reaching
@@ -875,70 +802,49 @@ pub unsafe fn hsm_key_vault_dispatch(
         return ENOSYS;
     };
     match opcode {
-        dev_key_vault::PROBE => 1,
-        dev_key_vault::SUITE_QUERY => {
-            // arg: [suite:u16][_pad:u16][usage_out:u32]
-            //      [priv_len_out:u16][pub_len_out:u16][sig_len_out:u16]
-            if arg.is_null() || arg_len < 14 {
+        dev_key_vault::DESCRIBE_SUITE => {
+            use dev_key_vault::describe_suite as ds;
+            let Some(cursor) = ds::parse_cursor(arg) else {
+                return EINVAL;
+            };
+            if arg.len() < ds::LEN {
                 return EINVAL;
             }
-            let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
-            if suite != dev_key_vault::suite::P256 {
-                return crate::abi::errno::ENOSYS;
+            if cursor > dev_key_vault::suite::P256 {
+                return ENOENT;
             }
-            let usage = HSM_P256_USAGE.to_le_bytes();
-            core::ptr::copy_nonoverlapping(usage.as_ptr(), arg.add(4), 4);
             // The private length is 0 and that is the answer, not a gap:
             // this backend never hands out a private key and never takes
             // one, so there is no private length a caller could allocate
             // for. `STORE` refuses accordingly.
-            core::ptr::copy_nonoverlapping(0u16.to_le_bytes().as_ptr(), arg.add(8), 2);
-            core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), arg.add(10), 2);
-            core::ptr::copy_nonoverlapping(64u16.to_le_bytes().as_ptr(), arg.add(12), 2);
-            14
-        }
-        dev_key_vault::SUITE_ENUM => {
-            // One suite, so the enumeration is short and always complete.
-            if arg.is_null() || arg_len < 16 {
-                return EINVAL;
-            }
-            let cursor = u16::from_le_bytes([*arg, *arg.add(1)]);
-            let out_ptr = {
-                let mut b = [0u8; 8];
-                for (i, v) in b.iter_mut().enumerate() {
-                    *v = *arg.add(4 + i);
-                }
-                u64::from_le_bytes(b) as *mut u8
+            let r = ds::Record {
+                suite: dev_key_vault::suite::P256,
+                next: dev_key_vault::suite::P256 + 1,
+                usage: HSM_P256_USAGE,
+                priv_len: 0,
+                pub_len: 65,
+                sig_len: 64,
+                secret_len: 32,
+                flags: ds::flags::GENERATE,
             };
-            let out_cap = u16::from_le_bytes([*arg.add(12), *arg.add(13)]) as usize;
-            let mut written = 0u16;
-            if cursor <= dev_key_vault::suite::P256 && out_cap >= 2 && !out_ptr.is_null() {
-                core::ptr::copy_nonoverlapping(
-                    dev_key_vault::suite::P256.to_le_bytes().as_ptr(),
-                    out_ptr,
-                    2,
-                );
-                written = 1;
-            }
-            core::ptr::copy_nonoverlapping(written.to_le_bytes().as_ptr(), arg.add(14), 2);
-            0
+            arg[..ds::LEN].copy_from_slice(&ds::encode(&r));
+            ds::LEN as i32
         }
         dev_key_vault::TIER => {
-            if arg.is_null() || arg_len < 1 {
+            let Some(t) = arg.first_mut() else {
                 return EINVAL;
-            }
-            *arg = dev_key_vault::tier::PROCESS_HW;
+            };
+            *t = dev_key_vault::tier::PROCESS_HW;
             1
         }
         // Import is unavailable against a non-extractable token, which
-        // SUITE_QUERY already reported as a private length of 0.
+        // DESCRIBE_SUITE already reported as a private length of 0.
         dev_key_vault::STORE => ENOSYS,
         dev_key_vault::ECDH => {
-            // arg: [peer_len:u32][peer[peer_len]]
-            //      [out_ptr:u64][out_cap:u16][out_len_out:u16]
-            if arg.is_null() || arg_len < 4 {
+            let Some(peer_len) = dev_key_vault::ecdh::parse(arg) else {
                 return EINVAL;
-            }
+            };
+            let buf = data.as_mut();
             let idx = match resolve(vault, handle) {
                 Ok(i) => i,
                 Err(e) => return e,
@@ -946,19 +852,14 @@ pub unsafe fn hsm_key_vault_dispatch(
             if let Err(e) = permits(vault, idx, dev_key_vault::usage::AGREE) {
                 return e;
             }
-            let peer_len =
-                u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
-            if peer_len == 0 || peer_len > 65 || 4 + peer_len + 12 > arg_len {
+            if peer_len == 0 || peer_len > 65 || peer_len > buf.len() {
                 return EINVAL;
             }
-            let ecdh_tail = arg.add(4 + peer_len);
-            let ecdh_out = read_u64(ecdh_tail) as *mut u8;
-            let ecdh_cap = u16::from_le_bytes([*ecdh_tail.add(8), *ecdh_tail.add(9)]) as usize;
-            if ecdh_cap < 32 {
-                core::ptr::copy_nonoverlapping(32u16.to_le_bytes().as_ptr(), ecdh_tail.add(10), 2);
-                return crate::abi::errno::ERANGE;
+            if buf.len() < 32 {
+                dev_key_vault::ecdh::set_len(arg, 32);
+                return ERANGE;
             }
-            let peer = core::slice::from_raw_parts(arg.add(4), peer_len);
+            let peer = &buf[..peer_len];
             // CKM_ECDH1_DERIVE takes the peer point as the raw ANSI
             // X9.62 octet string (`04 ‖ X ‖ Y`); also accept the bare
             // 64-byte `X ‖ Y` form, mirroring the software backend's
@@ -966,7 +867,10 @@ pub unsafe fn hsm_key_vault_dispatch(
             // point is on the curve.
             let mut prefixed = [0u8; 65];
             let public_data: &[u8] = match (peer_len, peer.first()) {
-                (65, Some(0x04)) => peer,
+                (65, Some(0x04)) => {
+                    prefixed.copy_from_slice(peer);
+                    &prefixed
+                }
                 (64, _) => {
                     prefixed[0] = 0x04;
                     prefixed[1..].copy_from_slice(peer);
@@ -1024,11 +928,8 @@ pub unsafe fn hsm_key_vault_dispatch(
                 }
             };
             let rc = if secret.len() == 32 {
-                if !ecdh_out.is_null() {
-                    core::ptr::copy_nonoverlapping(secret.as_ptr(), ecdh_out, 32);
-                }
-                core::ptr::copy_nonoverlapping(32u16.to_le_bytes().as_ptr(), ecdh_tail.add(10), 2);
-                0
+                buf[..32].copy_from_slice(&secret);
+                32
             } else {
                 log::warn!(
                     "hsm_key_vault: expected a 32-byte ECDH secret, got {} bytes",
@@ -1038,39 +939,31 @@ pub unsafe fn hsm_key_vault_dispatch(
             };
             // The shared secret transited host memory; wipe our copy
             // (volatile, matching the software backend's discipline).
-            for byte in secret.iter_mut() {
-                core::ptr::write_volatile(byte as *mut u8, 0);
-            }
+            crate::kernel::security::key_vault::zeroize(&mut secret);
             rc
         }
         // VERIFY takes a caller-supplied public key and touches no
         // custodial material — reuse the kernel software implementation
         // rather than a token round-trip.
         dev_key_vault::VERIFY => {
-            crate::kernel::security::key_vault::provider_dispatch(handle, opcode, arg, arg_len)
+            crate::kernel::security::key_vault::provider_dispatch(handle, opcode, arg, data)
         }
         dev_key_vault::GENERATE => {
-            // arg: [suite:u16][usage_mask:u32][flags:u8][_pad:u8]
-            //      [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
-            if arg.is_null() || arg_len < 20 {
+            let Some((suite, usage, _flags)) = dev_key_vault::generate::parse(arg) else {
                 return EINVAL;
-            }
-            let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
+            };
             if suite != dev_key_vault::suite::P256 {
-                // ES256-scoped backend: `SUITE_QUERY` answers ENOSYS for
-                // everything else, and so does this.
+                // ES256-scoped backend: `DESCRIBE_SUITE` describes nothing
+                // else, and this makes nothing else.
                 return ENOSYS;
             }
-            let usage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
             if usage == 0 || usage & !HSM_P256_USAGE != 0 {
                 return EINVAL;
             }
-            let gen_tail = arg.add(8);
-            let gen_out = read_u64(gen_tail) as *mut u8;
-            let gen_cap = u16::from_le_bytes([*gen_tail.add(8), *gen_tail.add(9)]) as usize;
-            if gen_cap < 65 {
-                core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), gen_tail.add(10), 2);
-                return crate::abi::errno::ERANGE;
+            let out = data.as_mut();
+            if out.len() < 65 {
+                dev_key_vault::generate::set_len(arg, 65);
+                return ERANGE;
             }
             let mut slots = match vault.slots.lock() {
                 Ok(s) => s,
@@ -1104,10 +997,8 @@ pub unsafe fn hsm_key_vault_dispatch(
                     return ERROR;
                 }
             };
-            if !gen_out.is_null() {
-                core::ptr::copy_nonoverlapping(point.as_ptr(), gen_out, 65);
-            }
-            core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), gen_tail.add(10), 2);
+            out[..65].copy_from_slice(&point);
+            dev_key_vault::generate::set_len(arg, 65);
             slots[idx] = Some(HsmSlot {
                 private,
                 public,
@@ -1121,10 +1012,6 @@ pub unsafe fn hsm_key_vault_dispatch(
             handle_of(vault, idx)
         }
         dev_key_vault::PUBLIC => {
-            // arg: [out_ptr:u64][out_cap:u16][out_len_out:u16]
-            if arg.is_null() || arg_len < 12 {
-                return EINVAL;
-            }
             let idx = match resolve(vault, handle) {
                 Ok(i) => i,
                 Err(e) => return e,
@@ -1132,11 +1019,10 @@ pub unsafe fn hsm_key_vault_dispatch(
             if let Err(e) = permits(vault, idx, dev_key_vault::usage::EXPORT_PUBLIC) {
                 return e;
             }
-            let pub_out = read_u64(arg) as *mut u8;
-            let pub_cap = u16::from_le_bytes([*arg.add(8), *arg.add(9)]) as usize;
-            if pub_cap < 65 {
-                core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), arg.add(10), 2);
-                return crate::abi::errno::ERANGE;
+            let out = data.as_mut();
+            if out.len() < 65 {
+                dev_key_vault::public::set_len(arg, 65);
+                return ERANGE;
             }
             let slots = match vault.slots.lock() {
                 Ok(s) => s,
@@ -1151,11 +1037,8 @@ pub unsafe fn hsm_key_vault_dispatch(
             };
             match read_public_point(&session, slot.public) {
                 Ok(point) => {
-                    if !pub_out.is_null() {
-                        core::ptr::copy_nonoverlapping(point.as_ptr(), pub_out, 65);
-                    }
-                    core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), arg.add(10), 2);
-                    0
+                    out[..65].copy_from_slice(&point);
+                    65
                 }
                 Err(e) => {
                     log::warn!("hsm_key_vault: {e}");
@@ -1164,11 +1047,10 @@ pub unsafe fn hsm_key_vault_dispatch(
             }
         }
         dev_key_vault::SIGN => {
-            // arg: [sign_mode:u8][_pad:u8][input_len:u32][input[input_len]]
-            //      [sig_out_ptr:u64][sig_out_cap:u16][sig_len_out:u16]
-            if arg.is_null() || arg_len < 6 {
+            let Some((mode, hash_len)) = dev_key_vault::sign::parse(arg) else {
                 return EINVAL;
-            }
+            };
+            let buf = data.as_mut();
             let idx = match resolve(vault, handle) {
                 Ok(i) => i,
                 Err(e) => return e,
@@ -1179,20 +1061,15 @@ pub unsafe fn hsm_key_vault_dispatch(
             // P-256 signs a DIGEST. Explicit rather than inferred: a caller
             // that handed this a message would otherwise get a valid
             // signature over the wrong thing.
-            if *arg != dev_key_vault::sign_mode::DIGEST {
+            if mode != dev_key_vault::sign_mode::DIGEST {
                 return EINVAL;
             }
-            let hash_len =
-                u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]) as usize;
-            if hash_len == 0 || hash_len > 64 || 6 + hash_len + 12 > arg_len {
+            if hash_len == 0 || hash_len > dev_key_vault::sign::DIGEST_MAX || hash_len > buf.len() {
                 return EINVAL;
             }
-            let sig_tail = arg.add(6 + hash_len);
-            let sig_out = read_u64(sig_tail) as *mut u8;
-            let sig_cap = u16::from_le_bytes([*sig_tail.add(8), *sig_tail.add(9)]) as usize;
-            if sig_cap < 64 {
-                core::ptr::copy_nonoverlapping(64u16.to_le_bytes().as_ptr(), sig_tail.add(10), 2);
-                return crate::abi::errno::ERANGE;
+            if buf.len() < 64 {
+                dev_key_vault::sign::set_len(arg, 64);
+                return ERANGE;
             }
             let slots = match vault.slots.lock() {
                 Ok(s) => s,
@@ -1201,7 +1078,7 @@ pub unsafe fn hsm_key_vault_dispatch(
             let Some(slot) = &slots[idx] else {
                 return EINVAL;
             };
-            let digest = core::slice::from_raw_parts(arg.add(6), hash_len);
+            let digest = &buf[..hash_len];
             let session = match vault.session.lock() {
                 Ok(s) => s,
                 Err(_) => return ERROR,
@@ -1223,11 +1100,8 @@ pub unsafe fn hsm_key_vault_dispatch(
             // Contract SIGN output is low-s; the token's raw CKM_ECDSA
             // result is not guaranteed to be.
             normalise_low_s(&mut sig);
-            if !sig_out.is_null() {
-                core::ptr::copy_nonoverlapping(sig.as_ptr(), sig_out, 64);
-            }
-            core::ptr::copy_nonoverlapping(64u16.to_le_bytes().as_ptr(), sig_tail.add(10), 2);
-            0
+            buf[..64].copy_from_slice(&sig);
+            64
         }
         dev_key_vault::DESTROY => {
             let idx = match resolve(vault, handle) {
@@ -1249,10 +1123,6 @@ pub unsafe fn hsm_key_vault_dispatch(
             0
         }
         dev_key_vault::DESCRIBE => {
-            // arg: [suite_out:u16][usage_out:u32][tier_out:u8][persisted_out:u8]
-            if arg.is_null() || arg_len < 8 {
-                return EINVAL;
-            }
             let idx = match resolve(vault, handle) {
                 Ok(i) => i,
                 Err(e) => return e,
@@ -1263,23 +1133,25 @@ pub unsafe fn hsm_key_vault_dispatch(
                     .map_or((0, false), |slot| (slot.usage, slot.persisted)),
                 Err(_) => return ERROR,
             };
-            core::ptr::copy_nonoverlapping(
-                dev_key_vault::suite::P256.to_le_bytes().as_ptr(),
-                arg,
-                2,
-            );
-            core::ptr::copy_nonoverlapping(usage.to_le_bytes().as_ptr(), arg.add(2), 4);
-            *arg.add(6) = dev_key_vault::tier::PROCESS_HW;
             // Reported beside the tier and meaning something else: a token
             // object comes back in the next process; a session object does
             // not.
-            *arg.add(7) = u8::from(persisted);
-            8
+            let d = dev_key_vault::describe::Described {
+                suite: dev_key_vault::suite::P256,
+                usage,
+                tier: dev_key_vault::tier::PROCESS_HW,
+                persisted: u8::from(persisted),
+            };
+            let Some(out) = arg.get_mut(..dev_key_vault::describe::ARG_LEN) else {
+                return EINVAL;
+            };
+            out.copy_from_slice(&dev_key_vault::describe::encode(&d));
+            dev_key_vault::describe::ARG_LEN as i32
         }
         dev_key_vault::OPEN_OR_GENERATE | dev_key_vault::OPEN => {
-            open_labelled(vault, opcode, arg, arg_len)
+            open_labelled(vault, opcode, arg, data.as_mut())
         }
-        dev_key_vault::DESTROY_BY_LABEL => destroy_labelled(vault, arg, arg_len),
+        dev_key_vault::DESTROY_BY_LABEL => destroy_labelled(vault, arg),
         _ => ENOSYS,
     }
 }

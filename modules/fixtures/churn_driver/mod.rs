@@ -269,8 +269,6 @@ fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
     // Pack mode: the churn workload brings its modules — the pack reference
     // and its pin come first in the source section, the FLXA after them.
     let pack = fault_mode.is_none() && s.pack_len > 0 && s.pin_set != 0;
-    let pack_ptr = s.pack.as_ptr() as u64;
-    let pack_len = s.pack_len;
     let pin = s.pin;
     if pack {
         s.arg[17] = wl::SOURCE_FMOD_PACK;
@@ -281,12 +279,8 @@ fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
         ok: true,
     };
     if pack {
-        for b in pack_ptr.to_le_bytes() {
-            o.u8(b);
-        }
-        for b in pack_len.to_le_bytes() {
-            o.u8(b);
-        }
+        // The pack's bytes travel as the call's `data`; the reference
+        // carries its pins.
         o.u8(1); // pin_count
         o.u8(0);
         o.u8(0);
@@ -420,16 +414,28 @@ unsafe fn admit(sys: &SyscallTable, s: &mut State, len: usize) -> i32 {
     let t0 = dev_micros(sys);
     // A large subgraph is staged a batch of modules per call; ask again with
     // the same spec until the handle comes back.
-    let mut h = (sys.provider_call)(-1, wl::CREATE, s.arg.as_mut_ptr(), len);
+    let (data, data_len) = if s.arg[17] == wl::SOURCE_FMOD_PACK {
+        (s.pack.as_mut_ptr(), s.pack_len as usize)
+    } else {
+        (core::ptr::null_mut(), 0)
+    };
+    let mut h = (sys.provider_call)(-1, wl::CREATE, s.arg.as_mut_ptr(), len, data, data_len);
     while h == abi::kernel_abi::errno::EINPROGRESS {
-        h = (sys.provider_call)(-1, wl::CREATE, s.arg.as_mut_ptr(), len);
+        h = (sys.provider_call)(-1, wl::CREATE, s.arg.as_mut_ptr(), len, data, data_len);
     }
     let dt = dev_micros(sys).saturating_sub(t0).min(u32::MAX as u64) as u32;
     if h < 0 {
         return h;
     }
     s.cmax_us = s.cmax_us.max(dt);
-    let rc = (sys.provider_call)(h, wl::START, core::ptr::null_mut(), 0);
+    let rc = (sys.provider_call)(
+        h,
+        wl::START,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         reap(sys, s, h);
         return rc;
@@ -439,25 +445,34 @@ unsafe fn admit(sys: &SyscallTable, s: &mut State, len: usize) -> i32 {
 
 unsafe fn reap(sys: &SyscallTable, s: &mut State, h: i32) {
     let t0 = dev_micros(sys);
-    let _ = (sys.provider_call)(h, wl::DESTROY, core::ptr::null_mut(), 0);
+    let _ = (sys.provider_call)(
+        h,
+        wl::DESTROY,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     let dt = dev_micros(sys).saturating_sub(t0).min(u32::MAX as u64) as u32;
     s.dmax_us = s.dmax_us.max(dt);
 }
 
 /// The channel the workload writes this module's lane 0 on, or -1.
 unsafe fn lane0(sys: &SyscallTable, h: i32) -> i32 {
-    let mut out = [0u8; 1 + wl::MAX_CALLER_LANES * 9];
-    let n = (sys.provider_call)(h, wl::LANES, out.as_mut_ptr(), out.len());
-    if n < 10 || out[0] == 0 {
-        return -1;
+    let mut arg = [0u8, wl::lane::TO_CALLER];
+    let ch = (sys.provider_call)(
+        h,
+        wl::LANE,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if ch < 0 {
+        -1
+    } else {
+        ch
     }
-    for i in 0..(out[0] as usize).min(wl::MAX_CALLER_LANES) {
-        let o = 1 + i * 9;
-        if out[o] == 0 {
-            return i32::from_le_bytes([out[o + 1], out[o + 2], out[o + 3], out[o + 4]]);
-        }
-    }
-    -1
 }
 
 #[no_mangle]
@@ -601,7 +616,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     return StepReturn::Continue;
                 }
                 let mut out = [0u8; 5];
-                let _ = (sys.provider_call)(s.handle, wl::WAIT, out.as_mut_ptr(), out.len());
+                let _ = (sys.provider_call)(
+                    s.handle,
+                    wl::WAIT,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 let st = out[0];
                 let code = i32::from_le_bytes([out[1], out[2], out[3], out[4]]);
                 let el = now.saturating_sub(s.since_ms);
