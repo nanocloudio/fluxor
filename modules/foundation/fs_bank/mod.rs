@@ -177,10 +177,10 @@ unsafe fn backend_scan(s: &mut BankState) -> bool {
         let n = (s.sys().provider_call)(
             dir_fd,
             FS_READDIR,
-            s.buf.as_mut_ptr(),
-            BUF_SIZE,
             core::ptr::null_mut(),
             0,
+            s.buf.as_mut_ptr(),
+            BUF_SIZE,
         );
         if n == E_AGAIN {
             return false;
@@ -262,10 +262,10 @@ unsafe fn backend_stream(s: &mut BankState) -> ReadOutcome {
         n = (s.sys().provider_call)(
             s.fs_fd,
             FS_READ,
-            s.buf.as_mut_ptr(),
-            BUF_SIZE,
             core::ptr::null_mut(),
             0,
+            s.buf.as_mut_ptr(),
+            BUF_SIZE,
         );
         if n > 0 {
             let written = (s.sys().channel_write)(s.out_chans[0], s.buf.as_ptr(), n as usize);

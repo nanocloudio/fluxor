@@ -298,6 +298,15 @@ fn node_call(handle: i32, opcode: u32, arg: &mut [u8]) -> i32 {
     rc
 }
 
+/// As [`node_call`], for an op whose bytes travel in `data` with no `arg`.
+fn node_call_data(handle: i32, opcode: u32, data: &mut [u8]) -> i32 {
+    let saved = scheduler::current_module_index();
+    scheduler::set_current_module(u32::MAX as usize);
+    let rc = owner_call(handle, opcode, &mut [], UserSpan::of(data));
+    scheduler::set_current_module(saved);
+    rc
+}
+
 fn retry(rc: i32) -> bool {
     rc == errno::EAGAIN || rc == errno::EINPROGRESS
 }
@@ -517,13 +526,16 @@ unsafe fn ready_root(owner: OwnerHandle) -> Result<usize, i32> {
 // ── Jobs ───────────────────────────────────────────────────────────────────
 
 /// One request a job has outstanding, kept whole so a re-ask is
-/// byte-identical.
+/// byte-identical. `buf` is the op's `arg` record, or its `data` span for a
+/// `READDIR`.
 #[derive(Clone, Copy)]
 struct Req {
     live: bool,
     opcode: u32,
     handle: i32,
     len: usize,
+    /// `buf` travels as the call's `data` span rather than its `arg`.
+    data: bool,
     arg: [u8; REQ_MAX],
 }
 
@@ -533,6 +545,7 @@ impl Req {
         opcode: 0,
         handle: -1,
         len: 0,
+        data: false,
         arg: [0; REQ_MAX],
     };
 
@@ -556,9 +569,25 @@ impl Req {
             ..Self::IDLE
         }
     }
+    /// The next `READDIR` batch of `handle`, filled into `arg` as `data`.
+    fn read_dir(handle: i32) -> Self {
+        Self {
+            live: true,
+            opcode: op::READDIR,
+            handle,
+            len: REQ_MAX,
+            data: true,
+            ..Self::IDLE
+        }
+    }
     /// Ask (again). `None` while the answer is "ask again".
     unsafe fn ask(&mut self) -> Option<i32> {
-        let rc = node_call(self.handle, self.opcode, &mut self.arg[..self.len]);
+        let buf = &mut self.arg[..self.len];
+        let rc = if self.data {
+            node_call_data(self.handle, self.opcode, buf)
+        } else {
+            node_call(self.handle, self.opcode, buf)
+        };
         if retry(rc) || rc == errno::EBUSY {
             return None;
         }
@@ -786,7 +815,7 @@ unsafe fn pump_scan() {
                     )
                 }
                 ScanStage::Walk | ScanStage::OpenSub => Req::path(op::OPENDIR, &s.path),
-                ScanStage::ReadDir => Req::on(op::READDIR, s.dirs[s.depth - 1], REQ_MAX),
+                ScanStage::ReadDir => Req::read_dir(s.dirs[s.depth - 1]),
                 ScanStage::Entry => {
                     let Some((n, is_dir)) = s.batch[s.depth - 1].next() else {
                         s.stage = ScanStage::ReadDir;
@@ -959,7 +988,7 @@ unsafe fn pump_remove() {
         if !m.req.live {
             m.req = match m.stage {
                 RmStage::SweepOpen => Req::path(op::OPENDIR, &Path::of(OWNERS)),
-                RmStage::SweepRead => Req::on(op::READDIR, m.held, REQ_MAX),
+                RmStage::SweepRead => Req::read_dir(m.held),
                 RmStage::SweepEntry => {
                     let Some((n, is_dir)) = m.batch.next() else {
                         m.stage = RmStage::SweepRead;
@@ -987,7 +1016,7 @@ unsafe fn pump_remove() {
                     Req::path(op::FSYNC_NAME, &name.sub(TOMBSTONE))
                 }
                 RmStage::WalkOpen => Req::path(op::OPENDIR, &m.path),
-                RmStage::WalkRead => Req::on(op::READDIR, m.held, REQ_MAX),
+                RmStage::WalkRead => Req::read_dir(m.held),
                 RmStage::Unmark => Req::path(op::UNLINK, &name.sub(TOMBSTONE)),
                 RmStage::RmRoot => Req::path(op::RMDIR, &name.dir()),
                 RmStage::Unlink | RmStage::Rmdir | RmStage::SweepCheck | RmStage::Idle => return,
@@ -1358,7 +1387,7 @@ unsafe fn handle_op(
             if let Err(e) = know_size(s) {
                 return e;
             }
-            let grow = (s.pos + arg.len() as u64).saturating_sub(s.size);
+            let grow = (s.pos + data.len() as u64).saturating_sub(s.size);
             if !reserve(owner, grow) {
                 return errno::ENOSPC;
             }

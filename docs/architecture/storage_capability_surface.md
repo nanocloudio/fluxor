@@ -84,6 +84,12 @@ served by platform dispatchers inside the runtime (§5) rather than by
 modules with manifests, so they register directly and never advertise a
 surface.
 
+The `fs` contract's bulk ops carry their bytes in the call's `data` span
+and take no `arg`: `READ` and `READDIR` fill it and answer the count
+written, `WRITE` and `WRITE_ASYNC` take from it and answer the count taken.
+Every other `fs` op carries one bounded `arg` record (a path, an offset, a
+`STAT` record) and no `data`.
+
 Consumers by contract (substitutable): `foundation/fs_bank` and
 `foundation/fs_tap` name `requires_contract = "fs"`;
 `foundation/object_bank` names `requires_contract = "storage.namespace"`
@@ -151,7 +157,7 @@ keeps the routed handle it
 gets back, and hands the consumer a handle of its own, so later
 handle-bound ops (`FS_READ` / `FS_CLOSE` / …) come back to it (which is
 what lets an unmount revoke them) and are forwarded to the owning
-volume. A mount may name `platform` as its volume. Path policy stays in
+volume with the caller's `data` span. A mount may name `platform` as its volume. Path policy stays in
 the module; the kernel never parses paths. `validate_single_provider` therefore allows several
 providers of one surface as long as each `volume:` selector is distinct;
 two providers with one `volume:`, or two unkeyed providers, are refused.

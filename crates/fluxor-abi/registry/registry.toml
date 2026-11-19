@@ -126,8 +126,7 @@ doc = "Keep the key vault's durable image: the holder sees every persisted recor
 [[grant]]
 name = "lend.borrow"
 bit = 17
-reach = "kernel"
-doc = "Resolve and return a span another module lent to one of this module's edges (`RESOLVE`, `RETURN`): a privileged driver doing DMA into it."
+doc = "Resolve and return a span another module lent to one of this module's edges (`RESOLVE`, `RETURN`): the borrower reads or writes the span in place. It reaches only memory its lender opened to it; DMA into the span is `platform_dma`'s privilege, not this one."
 
 [[errno]]
 name = "OK"
@@ -656,7 +655,6 @@ manifest = true
 
 [[contract]]
 name = "key_vault"
-reach = "kernel"
 id = 0x05
 manifest = true
 module_provided = true
@@ -1194,7 +1192,7 @@ manifest = true
   [[contract.op]]
   name = "READ"
   op = 0x01
-  gate = { handle = "minted", arg = "out", max = 1024 }
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "SEEK"
@@ -1220,7 +1218,7 @@ manifest = true
   [[contract.op]]
   name = "WRITE"
   op = 0x06
-  gate = { handle = "minted", arg = "in", max = 1024 }
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "OPENDIR"
@@ -1231,7 +1229,7 @@ manifest = true
   [[contract.op]]
   name = "READDIR"
   op = 0x08
-  gate = { handle = "minted", arg = "out", max = 1024 }
+  gate = { handle = "minted", arg = "none", max = 0, data = "out", data_max = "any" }
 
   [[contract.op]]
   name = "OPEN_CREATE"
@@ -1262,7 +1260,7 @@ manifest = true
   [[contract.op]]
   name = "WRITE_ASYNC"
   op = 0x0F
-  gate = { handle = "minted", arg = "in", max = 1024 }
+  gate = { handle = "minted", arg = "none", max = 0, data = "in", data_max = "any" }
 
   [[contract.op]]
   name = "FSYNC_SUBMIT"

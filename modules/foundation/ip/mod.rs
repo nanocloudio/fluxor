@@ -4673,11 +4673,10 @@ fluxor_rt::module_facts! {
     state: IpState,
     arena: HEAP_DEFAULT_BYTES,
     records: [
-        // The largest record on `net_out`: a datagram of one link MTU
-        // (`[ep_id][af][addr 4][port]` + 1472 B, IPv4), longer than a
-        // stream's MSS of data (`[conn_id]` + 1460 B) and a v6 datagram
-        // (`[ep_id][af][addr 16][port]` + 1452 B).
-        out 1 NET_OUT_MAX_RECORD = NET_FRAME_HDR + 1 + 1 + 4 + 2 + 1472,
+        // The largest record on `net_out`: a datagram of one link MTU from
+        // an IPv4 peer, longer than a stream's MSS of data (`[conn_id]` +
+        // 1460 B) and a v6 datagram (`[ep_id][af][addr 16][port]` + 1452 B).
+        out 1 NET_OUT_MAX_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
         // A command up to the stash (`PENDING_CMD_BUF_SIZE`).
         in 1 NET_IN_ACCEPTS_RECORD = NET_FRAME_HDR + PENDING_CMD_BUF_SIZE,
         // An address-control command, its authority token included.
@@ -4689,7 +4688,7 @@ fluxor_rt::module_facts! {
         // A held frame forwarded whole, behind its id and disposition.
         out 4 PACKET_FWD_MAX_RECORD = 1600,
         // An emission event.
-        out 5 ADDR_EVT_MAX_RECORD = NET_FRAME_HDR + 48,
+        out 5 ADDR_EVT_MAX_RECORD = netid::EVENT_RECORD_MAX,
     ],
 }
 

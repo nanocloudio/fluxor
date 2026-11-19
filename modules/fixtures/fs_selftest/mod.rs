@@ -439,10 +439,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             let rc = (sys.provider_call)(
                 s.fd,
                 FS_WRITE,
-                chunk.as_mut_ptr(),
-                n,
                 core::ptr::null_mut(),
                 0,
+                chunk.as_mut_ptr(),
+                n,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
@@ -696,10 +696,10 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> StepReturn {
     let rc = (sys.provider_call)(
         s.fd,
         FS_READ,
-        s.buf.as_mut_ptr(),
-        want,
         core::ptr::null_mut(),
         0,
+        s.buf.as_mut_ptr(),
+        want,
     );
     if rc == E_AGAIN || rc == E_INPROGRESS {
         return StepReturn::Continue;

@@ -132,8 +132,9 @@ pub const fn decode_entry(pool: u16, n: u32) -> u64 {
 
 /// Request a chunk from the kernel elastic region. handle = -1.
 /// arg in: `[bytes u32 LE]`; the kernel rounds the grant up to the
-/// elastic quantum. arg out (same buffer, ≥ 8 bytes): `[ptr u64 LE]`.
-/// Returns the granted byte count (> 0), or `errno::ENOSPC` — an
+/// elastic quantum. arg out (same buffer, 12 bytes):
+/// `[addr u64 LE][len u32 LE]`, `len` the granted byte count.
+/// Returns 0, or `errno::ENOSPC` — an
 /// accounted denial against `POOL_ELASTIC_REGION` (region exhausted,
 /// chunk table full, or a zero-sized region on targets without one).
 ///

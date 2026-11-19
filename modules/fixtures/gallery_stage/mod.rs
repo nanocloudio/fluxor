@@ -65,7 +65,7 @@ fn file(idx: usize) -> (&'static [u8], &'static [u8]) {
     }
 }
 
-/// Bytes copied into the state buffer and handed to FS_WRITE per step.
+/// Bytes copied into the state buffer and handed to `fs::WRITE` per step.
 /// Small enough that a step stays well inside the pi5 domain budget;
 /// Burst (return 2) lets the scheduler drain the whole payload in a
 /// handful of ticks anyway.
@@ -259,7 +259,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 let remaining = payload.len() - s.off;
                 let n = if remaining > CHUNK { CHUNK } else { remaining };
                 s.chunk[..n].copy_from_slice(&payload[s.off..s.off + n]);
-                let rc = call(sys, s.fd, fs::WRITE, s.chunk.as_mut_ptr(), n);
+                let rc = (sys.provider_call)(
+                    s.fd,
+                    fs::WRITE,
+                    core::ptr::null_mut(),
+                    0,
+                    s.chunk.as_mut_ptr(),
+                    n,
+                );
                 if rc == E_AGAIN || rc == E_INPROGRESS {
                     return StepReturn::Continue; // block-ring backpressure — retry next tick
                 }

@@ -330,6 +330,14 @@ impl Fs {
         unsafe { (self.table().provider_call)(handle, op, arg, len, core::ptr::null_mut(), 0) }
     }
 
+    /// Call a bulk op (`READ`, `WRITE`, `READDIR`), whose bytes travel in
+    /// `data` and whose `arg` is empty.
+    fn bulk(self, handle: i32, op: u32, data: *mut u8, len: usize) -> i32 {
+        // SAFETY: `data` names `len` bytes the caller owns for the call (or
+        // is null with `len` 0).
+        unsafe { (self.table().provider_call)(handle, op, core::ptr::null_mut(), 0, data, len) }
+    }
+
     /// Call `op` on a path; the path buffer is the callee's to read.
     fn path(self, op: u32, path: &mut [u8]) -> i32 {
         self.call(-1, op, path.as_mut_ptr(), path.len())
@@ -371,7 +379,7 @@ impl Fs {
         let mut got = 0usize;
         while got < len {
             // SAFETY: `out` is writable for `len` bytes.
-            let rc = self.call(fd, fs::READ, unsafe { out.add(got) }, len - got);
+            let rc = self.bulk(fd, fs::READ, unsafe { out.add(got) }, len - got);
             if rc < 0 {
                 return rc;
             }
@@ -393,7 +401,7 @@ impl Fs {
         let mut got = 0usize;
         while got < len {
             // SAFETY: `out` is writable for `len` bytes.
-            let rc = self.call(fd, fs::READ, unsafe { out.add(got) }, len - got);
+            let rc = self.bulk(fd, fs::READ, unsafe { out.add(got) }, len - got);
             if rc == ERR_AGAIN && got > 0 {
                 break;
             }
@@ -875,7 +883,7 @@ fn put_step(s: &mut State, key: &[u8], ct: &[u8], body: &[u8], pre: u8) -> i32 {
                 // The header is rebuilt each ask, the same bytes every time,
                 // and written from where the last ask stopped.
                 build_header(s, key, ct);
-                io.call(
+                io.bulk(
                     s.write.fd,
                     fs::WRITE,
                     s.hdr[at..].as_mut_ptr(),
@@ -884,7 +892,7 @@ fn put_step(s: &mut State, key: &[u8], ct: &[u8], body: &[u8], pre: u8) -> i32 {
             } else {
                 let at = at - hdr_len;
                 let n = core::cmp::min(WRITE_CHUNK, body.len() - at);
-                io.call(s.write.fd, fs::WRITE, body[at..].as_ptr() as *mut u8, n)
+                io.bulk(s.write.fd, fs::WRITE, body[at..].as_ptr() as *mut u8, n)
             };
             if rc < 0 {
                 return rc;
@@ -1225,7 +1233,7 @@ fn scan(s: &mut State, ask: [u8; 32], prefix: &[u8], cursor: &[u8], max: usize) 
     s.scan.opens = 0;
     while s.scan.dir >= 0 {
         if s.scan.batch_left == 0 {
-            let rc = io.call(
+            let rc = io.bulk(
                 s.scan.dir,
                 fs::READDIR,
                 s.scan.batch.as_mut_ptr(),

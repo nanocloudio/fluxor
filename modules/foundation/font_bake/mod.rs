@@ -235,10 +235,10 @@ fn step_read(s: &mut State) {
         (sys.provider_call)(
             s.fd,
             fs::READ,
-            s.font.add(s.font_len),
-            READ_CHUNK,
             core::ptr::null_mut(),
             0,
+            s.font.add(s.font_len),
+            READ_CHUNK,
         )
     };
     if r > 0 {

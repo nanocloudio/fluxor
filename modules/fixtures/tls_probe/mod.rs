@@ -348,7 +348,7 @@ unsafe fn service_net(s: &mut ProbeState, now: u32) {
 fluxor_rt::module_facts! {
     state: ProbeState,
     records: [
-        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        in 0 NET_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
         out 0 NET_OUT_MAX_RECORD = net_proto::FRAME_HDR + CONNECT_TO_MAX,
     ],
 }

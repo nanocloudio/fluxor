@@ -45,7 +45,7 @@ direction = "input"
 content_type = "NetProto"
 required = true
 buffer_size = 512
-accepts_record = 64
+accepts_record = 39
 
 [[resources]]
 requires_contract = "channel"

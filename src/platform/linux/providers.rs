@@ -745,10 +745,10 @@ unsafe fn fsync_parent_dir(path: &[u8]) -> i32 {
 ///
 /// `OPEN` and `OPENDIR` answer the slot's index, which the kernel wraps in
 /// a handle; every op on that handle arrives here with the index.
-pub fn linux_fs_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSpan<'_>) -> i32 {
+pub fn linux_fs_dispatch(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     // SAFETY: provider dispatch runs on the scheduler thread, the only
     // thread touching the file-slot table.
-    unsafe { fs_dispatch_on_thread(handle, opcode, arg) }
+    unsafe { fs_dispatch_on_thread(handle, opcode, arg, data.as_mut()) }
 }
 
 /// [`linux_fs_dispatch`]'s body.
@@ -756,7 +756,7 @@ pub fn linux_fs_dispatch(handle: i32, opcode: u32, arg: &mut [u8], _data: UserSp
 /// # Safety
 /// Scheduler thread only: touches `static mut` provider state without
 /// synchronization.
-unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32 {
+unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8], data: &mut [u8]) -> i32 {
     use crate::abi::contracts::storage::fs as dev_fs;
     use crate::abi::fence as dev_fence;
     use crate::kernel::sys::errno;
@@ -1156,13 +1156,13 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
-            if arg_len == 0 {
+            if data.is_empty() {
                 return errno::EINVAL;
             }
             let n = libc::read(
                 files[slot_idx].fd,
-                arg.as_mut_ptr() as *mut libc::c_void,
-                arg_len,
+                data.as_mut_ptr() as *mut libc::c_void,
+                data.len(),
             );
             if n < 0 {
                 errno::ERROR
@@ -1180,7 +1180,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
-            if arg_len == 0 {
+            if data.is_empty() {
                 return errno::EINVAL;
             }
             let fd = files[slot_idx].fd;
@@ -1195,7 +1195,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
                     return errno::ERROR;
                 };
                 let pos = libc::lseek(fd, 0, libc::SEEK_CUR).max(0) as u64;
-                let end = (st.st_size as u64).max(pos.saturating_add(arg_len as u64));
+                let end = (st.st_size as u64).max(pos.saturating_add(data.len() as u64));
                 if !root::charge_inode(
                     slot_owner,
                     st.st_ino,
@@ -1206,7 +1206,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
                 }
                 ino = Some(st.st_ino);
             }
-            let n = libc::write(fd, arg.as_ptr() as *const libc::c_void, arg_len);
+            let n = libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
             if let Some(ino) = ino {
                 settle_inode(slot_owner, fd, ino);
             }
@@ -1332,7 +1332,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
             {
                 return errno::EINVAL;
             }
-            if arg_len < 2 {
+            if data.len() < 2 {
                 return errno::EINVAL;
             }
             let dir = files[slot_idx].dir_ptr as *mut libc::DIR;
@@ -1369,7 +1369,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
                 }
                 let is_dir = ent.d_type == libc::DT_DIR;
                 let need = 2 + nlen;
-                if out_pos + need > arg_len {
+                if out_pos + need > data.len() {
                     // Buffer full: put the entry back rather than drop it, so
                     // it opens the next batch. Unconditionally — `E2BIG` tells
                     // the caller to retry with a larger buffer, and an entry
@@ -1380,9 +1380,9 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
                     }
                     break;
                 }
-                arg[out_pos] = nlen as u8;
-                arg[out_pos + 1] = if is_dir { 1 } else { 0 };
-                arg[out_pos + 2..out_pos + 2 + nlen].copy_from_slice(&name[..nlen]);
+                data[out_pos] = nlen as u8;
+                data[out_pos + 1] = if is_dir { 1 } else { 0 };
+                data[out_pos + 2..out_pos + 2 + nlen].copy_from_slice(&name[..nlen]);
                 out_pos += need;
                 count += 1;
             }
@@ -1393,7 +1393,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
                 record_slot_fence(slot_idx, Fence::Volatile);
                 0
             } else {
-                arg[..2].copy_from_slice(&count.to_le_bytes());
+                data[..2].copy_from_slice(&count.to_le_bytes());
                 record_slot_fence(slot_idx, Fence::Volatile);
                 out_pos as i32
             }
@@ -1730,13 +1730,23 @@ const DG_AF_NAME: u8 = dgc::AF_NAME;
 /// a datagram is delivered only while its `MSG_DG_RX_FROM` frame fits this
 /// bound — 1472 bytes of IPv4 payload, one Ethernet MTU. A larger host
 /// datagram is dropped and counted (`dg_rx_dropped`), never cut.
-pub const LINUX_NET_OUT_MAX_RECORD: usize = 1483;
+pub const LINUX_NET_OUT_MAX_RECORD: usize = dgc::TRANSPORT_RECORD_MAX;
 /// The largest record `net_in` accepts, header included (the manifest's
 /// `accepts_record`): the command scratch.
 pub const LINUX_NET_IN_ACCEPTS_RECORD: usize = 3 + LINUX_NET_CMD_MAX;
 /// Data bytes one `MSG_DATA` frame carries.
 const STREAM_CHUNK: usize = 1460;
 const _: () = assert!(3 + np::DATA_HEAD + STREAM_CHUNK <= LINUX_NET_OUT_MAX_RECORD);
+/// Ring bytes one `MSG_DATA` frame takes beyond its data: the frame header,
+/// the connection id, and the ring's record prefix.
+const STREAM_FRAME_OVERHEAD: usize = 3 + np::DATA_HEAD + crate::kernel::ipc::ringbuf::RECORD_PREFIX;
+
+/// The stream bytes `room` writable bytes of a lane carry as `MSG_DATA`
+/// frames of at most `STREAM_CHUNK` each, every frame a record of its own.
+const fn stream_data_fits(room: usize) -> usize {
+    let per = STREAM_FRAME_OVERHEAD + STREAM_CHUNK;
+    (room / per) * STREAM_CHUNK + (room % per).saturating_sub(STREAM_FRAME_OVERHEAD)
+}
 
 const CONN_TYPE_UDP_BOUND: u8 = 2;
 
@@ -4522,19 +4532,20 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
         // the socket only as many bytes as the consumer channel can accept right
         // now — leaving the rest in the socket so TCP windows the peer down.
         // Reading more and dropping the overflow would silently corrupt the
-        // stream. Bound the recv to the writable space minus chunk-framing
-        // overhead (≤5 B per ≤MSS fragment). The space is the connection's own
+        // stream. Bound the recv to the data the writable space carries as
+        // frames (`stream_data_fits`). The space is the connection's own
         // lane's, so a full attached lane windows down only its own sockets.
+        // Queued control frames go first, since they take the same room.
         let lane = st.conns[i].lane as usize;
         let events = lane_events(st, lane);
-        let room = if events >= 0 {
+        let room = if events >= 0 && st.flush_lane(lane) {
             channel::channel_writable_bytes(events)
         } else {
             0
         };
-        // Each fragment adds 5 B (hdr + u16 conn_id); 64 B covers the worst
-        // case for a full recv_buf (≤12 fragments → ≤60 B).
-        let cap = st.recv_buf.len().min(room.saturating_sub(64));
+        // Sized so the frames always land whole: a tail left over would be
+        // held in `recv_buf`, and while it is held no connection is read.
+        let cap = st.recv_buf.len().min(stream_data_fits(room));
         if cap == 0 {
             // Channel full — don't read; let TCP backpressure the peer. But
             // this is work pending, not work finished: the socket is readable

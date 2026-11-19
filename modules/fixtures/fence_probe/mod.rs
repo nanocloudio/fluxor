@@ -208,7 +208,7 @@ const FRAME_MAX: usize = 64;
 
 fluxor_rt::module_facts! {
     state: ProbeState,
-    records: [out 0 ADDR_CTL_OUT_MAX_RECORD = FRAME_MAX, in 0 ADDR_EVT_IN_ACCEPTS_RECORD = FRAME_MAX],
+    records: [out 0 ADDR_CTL_OUT_MAX_RECORD = FRAME_MAX, in 0 ADDR_EVT_IN_ACCEPTS_RECORD = abi::contracts::net::identity::EVENT_RECORD_MAX],
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]

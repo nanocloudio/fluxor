@@ -526,8 +526,10 @@ Fronts `fetch()` behind the FS contract (`FS_OPEN` / `FS_READ` /
 bare metal. `FS_OPEN` returns a slot immediately with the fetch in
 flight; `FS_READ` maps the shim's four-state return to bytes / EAGAIN
 / EOF / error; `FS_STAT` maps `host_fetch_size` per the §3 table.
-`FS_SEEK`, `FS_WRITE`, and `FS_FSYNC` return `ENOSYS`; the streaming
-fetch model has no equivalent.
+`FS_WRITE` stages its `data` against the handle and publishes the bytes
+as one file at `FS_CLOSE`, in the persistent tier `storage.object` reads.
+`FS_SEEK` and `FS_FSYNC` return `ENOSYS`; the streaming fetch model has no
+equivalent.
 
 ### `storage.object` provider — `src/platform/wasm/object.rs`
 

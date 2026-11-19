@@ -396,10 +396,10 @@ impl CredFile {
             let r = (sys.provider_call)(
                 self.fd,
                 fs::READ,
-                chunk.as_mut_ptr(),
-                CRED_CHUNK,
                 core::ptr::null_mut(),
                 0,
+                chunk.as_mut_ptr(),
+                CRED_CHUNK,
             );
             if r == abi::errno::EAGAIN {
                 return CF_PENDING;

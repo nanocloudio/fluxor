@@ -51,11 +51,11 @@ pub mod grant {
     pub const METAL_DEVICE_DMA: u8 = 15;
     /// Keep the key vault's durable image: the holder sees every persisted record and decides what reaches the medium.
     pub const SEAL_KEY: u8 = 16;
-    /// Resolve and return a span another module lent to one of this module's edges (`RESOLVE`, `RETURN`): a privileged driver doing DMA into it.
+    /// Resolve and return a span another module lent to one of this module's edges (`RESOLVE`, `RETURN`): the borrower reads or writes the span in place. It reaches only memory its lender opened to it; DMA into the span is `platform_dma`'s privilege, not this one.
     pub const LEND_BORROW: u8 = 17;
 
     /// The op-level grants a gated module may not hold.
-    pub const REACH_KERNEL: u64 = 0x3ffff;
+    pub const REACH_KERNEL: u64 = 0x1ffff;
 
     /// The bit an op-level grant's name stands for.
     pub fn of_name(name: &str) -> Option<u8> {
@@ -109,7 +109,7 @@ pub mod grant {
 }
 
 /// The contracts whose own grant a gated module may not hold.
-pub const CONTRACT_REACH_KERNEL: u64 = 0xfff9000020;
+pub const CONTRACT_REACH_KERNEL: u64 = 0xfff9000000;
 
 /// The functions the kernel calls in a module, by the FNV-1a hash of
 /// their names: a module exports these and nothing else.
@@ -3231,10 +3231,10 @@ pub mod gate {
             }),
             0x0d01 => Some(OpRule {
                 handle: HandleUse::Minted,
-                arg: Dir::Out,
-                arg_max: 1024,
-                data: Dir::None,
-                data_max: Bound::Bytes(0),
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
                 closes: false,
                 addr_answer: false,
                 signals: false,
@@ -3281,10 +3281,10 @@ pub mod gate {
             }),
             0x0d06 => Some(OpRule {
                 handle: HandleUse::Minted,
-                arg: Dir::In,
-                arg_max: 1024,
-                data: Dir::None,
-                data_max: Bound::Bytes(0),
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
                 closes: false,
                 addr_answer: false,
                 signals: false,
@@ -3301,10 +3301,10 @@ pub mod gate {
             }),
             0x0d08 => Some(OpRule {
                 handle: HandleUse::Minted,
-                arg: Dir::Out,
-                arg_max: 1024,
-                data: Dir::None,
-                data_max: Bound::Bytes(0),
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::Out,
+                data_max: Bound::Any,
                 closes: false,
                 addr_answer: false,
                 signals: false,
@@ -3371,10 +3371,10 @@ pub mod gate {
             }),
             0x0d0f => Some(OpRule {
                 handle: HandleUse::Minted,
-                arg: Dir::In,
-                arg_max: 1024,
-                data: Dir::None,
-                data_max: Bound::Bytes(0),
+                arg: Dir::None,
+                arg_max: 0,
+                data: Dir::In,
+                data_max: Bound::Any,
                 closes: false,
                 addr_answer: false,
                 signals: false,

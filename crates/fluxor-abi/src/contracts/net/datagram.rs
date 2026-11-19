@@ -156,3 +156,13 @@ pub const V4_ADDR_PREFIX: usize = 1 + 1 + 4 + 2;
 /// port prefix, for IPv6 (`af = AF_INET6`). Layout for SEND_TO / RX_FROM:
 /// `[ep_id:1][af:1][addr:16][port:2] = 20 bytes`.
 pub const V6_ADDR_PREFIX: usize = 1 + 1 + 16 + 2;
+
+/// The largest datagram payload a transport delivers: one Ethernet MTU of
+/// IPv4 payload. A larger datagram is dropped and counted, never cut.
+pub const PAYLOAD_MAX: usize = 1472;
+/// The largest record a stream transport writes toward its consumers, header
+/// included: a `MSG_DG_RX_FROM` carrying [`PAYLOAD_MAX`] bytes from an IPv4
+/// peer. It bounds the transport's `MSG_DATA` too, so it is the
+/// `max_record` of the ip module's and the host adapter's `net_out` and of
+/// tls's clear side, and what a consumer of any of them accepts.
+pub const TRANSPORT_RECORD_MAX: usize = super::net_proto::FRAME_HDR + V4_ADDR_PREFIX + PAYLOAD_MAX;

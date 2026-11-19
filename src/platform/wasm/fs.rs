@@ -127,16 +127,17 @@ fn wasm_fs_dispatch(
     handle: i32,
     opcode: u32,
     arg: &mut [u8],
-    _data: crate::kernel::module::user_span::UserSpan<'_>,
+    mut data: crate::kernel::module::user_span::UserSpan<'_>,
 ) -> i32 {
     // SAFETY: provider dispatch runs on the scheduler thread, the only one
-    // touching FETCH_FILES; the host imports take spans of `arg` it holds.
-    unsafe { fs_dispatch_on_thread(handle, opcode, arg) }
+    // touching FETCH_FILES; the host imports take spans of `arg` and `data`
+    // it holds.
+    unsafe { fs_dispatch_on_thread(handle, opcode, arg, data.as_mut()) }
 }
 
 /// # Safety
 /// Scheduler thread only (FETCH_FILES).
-unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32 {
+unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8], data: &mut [u8]) -> i32 {
     // `fs_open` answers the FETCH_FILES slot's index, and every per-FD op
     // (QUERY/READ/STAT/CLOSE) below is handed it back.
     // The wasm fetch model has no fsync path and no replication, so
@@ -179,10 +180,10 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8]) -> i32
     }
     match opcode {
         dev_fs::OPEN => fs_open(arg),
-        dev_fs::READ => fs_read(handle, arg),
+        dev_fs::READ => fs_read(handle, data),
         dev_fs::CLOSE => fs_close(handle),
         dev_fs::STAT => fs_stat(handle, arg),
-        dev_fs::WRITE => fs_write(handle, arg),
+        dev_fs::WRITE => fs_write(handle, data),
         _ => errno::ENOSYS,
     }
 }
@@ -260,13 +261,13 @@ unsafe fn fs_stat(handle: i32, arg: &mut [u8]) -> i32 {
     .answer(arg)
 }
 
-/// `WRITE` — append `arg` to the open handle.
+/// `WRITE` — append `data` to the open handle.
 ///
 /// Returns bytes written. The bytes are staged against the handle and
 /// published as one file at `CLOSE`, which is what makes several writes
 /// one file instead of a sequence a reader can catch halfway.
-unsafe fn fs_write(handle: i32, arg: &[u8]) -> i32 {
-    if arg.is_empty() {
+unsafe fn fs_write(handle: i32, data: &[u8]) -> i32 {
+    if data.is_empty() {
         return 0;
     }
     let slot_idx = handle as usize;
@@ -274,7 +275,7 @@ unsafe fn fs_write(handle: i32, arg: &[u8]) -> i32 {
     if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
         return errno::EINVAL;
     }
-    let n = host_fetch_write(files[slot_idx].host_handle, arg.as_ptr(), arg.len());
+    let n = host_fetch_write(files[slot_idx].host_handle, data.as_ptr(), data.len());
     if n < 0 {
         return errno::ENODEV;
     }

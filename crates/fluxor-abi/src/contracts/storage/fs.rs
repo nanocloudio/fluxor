@@ -145,8 +145,8 @@ pub use super::super::super::registry::fs::CLOSE;
 /// tagged FD, a negative errno, or `EAGAIN` while what the walk needs is
 /// still being fetched.
 pub use super::super::super::registry::fs::OPEN;
-/// Read from the FD's offset. `handle=file`, `arg` is the output buffer.
-/// Returns the bytes read — possibly short — 0 at end of file, or `EAGAIN`
+/// Read from the FD's offset. `handle=file`; `arg` is empty and the bytes
+/// land in `data`, as many as it holds. Returns the bytes read — possibly short — 0 at end of file, or `EAGAIN`
 /// when no byte could be read yet (the data is being fetched). Once a byte
 /// has moved the answer is the short count, never `EAGAIN`; the offset
 /// advances by exactly what was answered.
@@ -207,8 +207,8 @@ pub use super::super::super::registry::fs::FSYNC;
 ///     the last one goes. A provider without hard links reports 1, which is
 ///     true.
 pub use super::super::super::registry::fs::STAT;
-/// Write data. handle=file, arg=data, arg_len=data_len. Returns the bytes
-/// taken, which may be short; `EAGAIN` only when none were. The caller
+/// Write data. `handle=file`; `arg` is empty and `data` holds the bytes.
+/// Returns the bytes taken, which may be short; `EAGAIN` only when none were. The caller
 /// advances by the answer. Taken bytes belong to the provider, which writes
 /// them back in the background; they are volatile until a fence.
 pub use super::super::super::registry::fs::WRITE;
@@ -227,14 +227,13 @@ pub use super::super::super::registry::fs::OPENDIR;
 
 /// Read the next batch of directory entries from a `OPENDIR` handle.
 ///
-/// `handle` is the dir FD; `arg` is `*mut u8` output buffer,
-/// `arg_len` its capacity. The provider fills as many whole entries
-/// as fit, advances its internal cursor, and returns the number of
+/// `handle` is the dir FD; `arg` is empty and `data` is the output
+/// buffer. The provider fills as many whole entries as fit, advances its internal cursor, and returns the number of
 /// bytes written (positive) or `0` once the directory is fully
 /// drained. The caller iterates by calling `READDIR` until it gets
 /// `0`, then calls `CLOSE`.
 ///
-/// Output buffer layout (all little-endian):
+/// `data` layout (all little-endian):
 ///
 /// ```text
 ///   [count: u16 LE]                        — entries in this batch
@@ -249,9 +248,9 @@ pub use super::super::super::registry::fs::OPENDIR;
 /// are skipped at the provider layer; `.` and `..` are skipped too —
 /// callers don't see them.
 ///
-/// If the buffer is too small to hold even one entry, the provider
+/// If `data` is too small to hold even one entry, the provider
 /// returns `-7 E2BIG` without advancing the cursor so the caller can
-/// retry with a larger buffer.
+/// retry with a larger one.
 pub use super::super::super::registry::fs::READDIR;
 
 /// Open a file with create-on-missing semantics. Same arg layout as
@@ -343,8 +342,8 @@ pub use super::super::super::registry::fs::TRUNCATE;
 /// ring (multiple in flight) and returns. Like plain [`WRITE`], the
 /// bytes are submitted but volatile; the caller establishes durability
 /// with [`FSYNC_SUBMIT`] / [`FSYNC_POLL`] instead of the blocking
-/// [`FSYNC`]. Same arg shape as [`WRITE`] (`handle=file`, `arg=data`,
-/// `arg_len=len`). Lets a durable append log (the WAL) pipeline its
+/// [`FSYNC`]. Same shape as [`WRITE`] (`handle=file`, empty `arg`, the
+/// bytes in `data`). Lets a durable append log (the WAL) pipeline its
 /// writes instead of spin-polling each, the single biggest write-
 /// throughput lever. Providers without the async tier return `ENOSYS`
 /// and leave [`caps::FSYNC_ASYNC`] clear; callers fall back to `WRITE`.

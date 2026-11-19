@@ -333,10 +333,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             let rc = (sys.provider_call)(
                 s.fd,
                 FS_WRITE,
-                chunk.as_mut_ptr(),
-                n,
                 core::ptr::null_mut(),
                 0,
+                chunk.as_mut_ptr(),
+                n,
             );
             if rc == -11 || rc == -36 {
                 return StepReturn::Continue;

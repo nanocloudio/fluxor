@@ -233,7 +233,7 @@ unsafe fn service(s: &mut IntakeState) {
 fluxor_rt::module_facts! {
     state: IntakeState,
     records: [
-        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        in 0 NET_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
         out 0 NET_OUT_MAX_RECORD = np::FRAME_HDR + np::BIND_LEN,
     ],
 }

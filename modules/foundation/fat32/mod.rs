@@ -4251,8 +4251,8 @@ unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 
 /// its cluster and the next one is not resolved yet: resolving it needs the
 /// FAT, which may not be cached, so it happens on the next read rather than
 /// as the last act of this one.
-unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len == 0 {
+unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, data: *mut u8, data_len: usize) -> i32 {
+    if data.is_null() || data_len == 0 {
         return E_INVAL;
     }
     if s.init_phase != Fat32InitPhase::Done {
@@ -4281,7 +4281,7 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
     let sequential = start == 0 || s.open_files[slot].ra_next == start.wrapping_add(1);
     let mut written: usize = 0;
     let mut waiting = false;
-    while written < arg_len {
+    while written < data_len {
         let (offset, size) = (s.open_files[slot].offset, s.open_files[slot].size);
         let remaining = size.saturating_sub(offset);
         if remaining == 0 {
@@ -4326,12 +4326,12 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
             let idx = (sector - of.scratch_lba) as usize;
             let take = (bps - in_sec)
                 .min(remaining)
-                .min((arg_len - written) as u32) as usize;
+                .min((data_len - written) as u32) as usize;
             let src = s.open_files[slot]
                 .scratch_block
                 .as_ptr()
                 .add(idx * BLOCK_SIZE + in_sec as usize);
-            core::ptr::copy_nonoverlapping(src, arg.add(written), take);
+            core::ptr::copy_nonoverlapping(src, data.add(written), take);
             written += take;
             let of = &mut s.open_files[slot];
             of.offset = of.offset.wrapping_add(take as u32);
@@ -4361,9 +4361,9 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
             Ok(i) => {
                 let take = (bps - in_sec)
                     .min(remaining)
-                    .min((arg_len - written) as u32) as usize;
+                    .min((data_len - written) as u32) as usize;
                 let src = s.cache_data[i].as_ptr().add(in_sec as usize);
-                core::ptr::copy_nonoverlapping(src, arg.add(written), take);
+                core::ptr::copy_nonoverlapping(src, data.add(written), take);
                 written += take;
                 s.rd_sectors = s.rd_sectors.wrapping_add(1);
                 let of = &mut s.open_files[slot];
@@ -4854,8 +4854,8 @@ unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i
 ///
 /// On end-of-directory the function returns 0 and latches `dir_eof`
 /// so subsequent calls keep returning 0 without re-walking the chain.
-unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
+unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, data: *mut u8, data_len: usize) -> i32 {
+    if data.is_null() || data_len < 2 {
         return E_INVAL;
     }
     if s.init_phase != Fat32InitPhase::Done {
@@ -4947,8 +4947,8 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
                 // End-of-directory marker.
                 s.open_files[slot_idx].dir_eof = 1;
                 let cnt_le = count.to_le_bytes();
-                *arg = cnt_le[0];
-                *arg.add(1) = cnt_le[1];
+                *data = cnt_le[0];
+                *data.add(1) = cnt_le[1];
                 return out_pos as i32;
             }
             if first == 0xE5 {
@@ -4991,7 +4991,7 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
             let total = nlen + if elen > 0 { 1 + elen } else { 0 };
             // Per-entry overhead: name_len(1) + type(1) + bytes.
             let need = 2 + total;
-            if out_pos + need > arg_len {
+            if out_pos + need > data_len {
                 // Buffer full: stop here, don't advance cursor past
                 // this entry. Next READDIR call will resume from `e`.
                 if count == 0 {
@@ -5001,30 +5001,30 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
                 }
                 s.open_files[slot_idx].offset = e as u32;
                 let cnt_le = count.to_le_bytes();
-                *arg = cnt_le[0];
-                *arg.add(1) = cnt_le[1];
+                *data = cnt_le[0];
+                *data.add(1) = cnt_le[1];
                 return out_pos as i32;
             }
-            *arg.add(out_pos) = total as u8;
-            *arg.add(out_pos + 1) = if (attr & ATTR_DIRECTORY) != 0 { 1 } else { 0 };
+            *data.add(out_pos) = total as u8;
+            *data.add(out_pos + 1) = if (attr & ATTR_DIRECTORY) != 0 { 1 } else { 0 };
             let mut wp = out_pos + 2;
             // Copy name (lower-cased for cleaner display).
             let mut i = 0usize;
             while i < nlen {
                 let c = raw[i];
                 let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
-                *arg.add(wp) = lc;
+                *data.add(wp) = lc;
                 wp += 1;
                 i += 1;
             }
             if elen > 0 {
-                *arg.add(wp) = b'.';
+                *data.add(wp) = b'.';
                 wp += 1;
                 let mut k = 0usize;
                 while k < elen {
                     let c = raw[8 + k];
                     let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
-                    *arg.add(wp) = lc;
+                    *data.add(wp) = lc;
                     wp += 1;
                     k += 1;
                 }
@@ -5040,8 +5040,8 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
     }
 
     let cnt_le = count.to_le_bytes();
-    *arg = cnt_le[0];
-    *arg.add(1) = cnt_le[1];
+    *data = cnt_le[0];
+    *data.add(1) = cnt_le[1];
     out_pos as i32
 }
 
@@ -8225,7 +8225,7 @@ unsafe fn fs_prealloc_advance(s: &mut Fat32State, i: usize) {
     s.ops[i].state = OPS_WAIT;
 }
 
-/// FS_WRITE / FS_WRITE_ASYNC: write `arg_len` bytes at the writable FD's
+/// FS_WRITE / FS_WRITE_ASYNC: write the `data_len` bytes of `data` at the writable FD's
 /// current offset, allocating and linking clusters when a normal append
 /// grows the file. Answers the bytes taken, which may be short; `EAGAIN`
 /// only when none were.
@@ -8238,11 +8238,11 @@ unsafe fn fs_prealloc_advance(s: &mut Fat32State, i: usize) {
 /// the scratch does not hold starts that sector's read and ends the call
 /// short; the next call finds it. The directory-entry size is written at
 /// `FSYNC` / the async fence / after close.
-unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() {
+unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, data: *const u8, data_len: usize) -> i32 {
+    if data.is_null() {
         return E_INVAL;
     }
-    if arg_len == 0 {
+    if data_len == 0 {
         return 0;
     }
     let slot = handle as usize;
@@ -8268,7 +8268,7 @@ unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: 
     }
     let cpb = bps * spc; // bytes per cluster
 
-    let total = arg_len;
+    let total = data_len;
     let mut done = 0usize;
     // What stopped the loop short: 0 for nothing, else the errno a call
     // that moved no bytes answers.
@@ -8390,7 +8390,7 @@ unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: 
         let (idx, _mirrored) = scratch_place(&mut s.open_files[slot], cur, sector);
         let sec_off = idx * BLOCK_SIZE;
         core::ptr::copy_nonoverlapping(
-            arg.add(done),
+            data.add(done),
             s.open_files[slot]
                 .scratch_block
                 .as_mut_ptr()
@@ -9379,8 +9379,9 @@ unsafe fn fs_op_fsync_poll(s: &mut Fat32State, handle: i32, arg: *const u8, arg_
 
 /// # Safety
 /// Kernel provider-dispatch entry point: `state` is the instance block this
-/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
-/// (may be null when `arg_len` is 0) valid for the call.
+/// module's `module_new` initialised, `arg` points to `arg_len` bytes and
+/// `data` to `data_len` bytes (either may be null when its length is 0),
+/// each valid for the call.
 #[cfg_attr(
     not(feature = "host-test"),
     link_section = ".text.module_provider_dispatch"
@@ -9392,8 +9393,8 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
-    _data: *mut u8,
-    _data_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return E_INVAL;
@@ -9494,7 +9495,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     // Collect what the device finished since the last call, so this one
     // sees it; and after the call, start what it made ready.
     fs_pump(s);
-    let rc = fs_dispatch_op(s, handle, opcode, arg, arg_len);
+    let rc = fs_dispatch_op(s, handle, opcode, arg, arg_len, data, data_len);
     fs_pump(s);
     // Closed handles finish as soon as what they wait for has landed, not
     // only on the next step: a caller that closes and reopens a file finds
@@ -9687,6 +9688,8 @@ unsafe fn fs_dispatch_op(
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     // Settle the mount before the first operation of any kind. A reader
     // that resolves a name across an un-replayed rename would adopt a
@@ -9776,16 +9779,16 @@ unsafe fn fs_dispatch_op(
     let a = arg as *const u8;
     match opcode {
         FS_OPEN => fs_op_open(s, a, arg_len),
-        FS_READ => fs_op_read(s, handle, arg, arg_len),
+        FS_READ => fs_op_read(s, handle, data, data_len),
         FS_SEEK => fs_op_seek(s, handle, a, arg_len),
         FS_STAT => fs_op_stat(s, handle, arg, arg_len),
         FS_OPENDIR => fs_op_opendir(s, a, arg_len),
-        FS_READDIR => fs_op_readdir(s, handle, arg, arg_len),
+        FS_READDIR => fs_op_readdir(s, handle, data, data_len),
         FS_OPEN_CREATE => fs_mutate(s, |s| fs_op_create(s, a, arg_len)),
         FS_UNLINK => fs_mutate(s, |s| fs_op_unlink(s, a, arg_len)),
         FS_MKDIR => fs_mutate(s, |s| fs_op_mkdir(s, a, arg_len)),
         FS_RMDIR => fs_mutate(s, |s| fs_op_rmdir(s, a, arg_len)),
-        FS_WRITE | FS_WRITE_ASYNC => fs_op_write(s, handle, a, arg_len),
+        FS_WRITE | FS_WRITE_ASYNC => fs_op_write(s, handle, data, data_len),
         FS_FSYNC => fs_op_fsync(s, handle),
         FS_FSYNC_SUBMIT => fs_op_fsync_submit(s, handle, arg, arg_len),
         FS_FSYNC_POLL => fs_op_fsync_poll(s, handle, a, arg_len),

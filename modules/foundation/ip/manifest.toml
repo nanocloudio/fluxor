@@ -117,7 +117,7 @@ direction = "output"
 index = 5
 content_type = "NetProto"
 buffer_size = { default = 512, aarch64 = 1024 }
-max_record = 51
+max_record = 39
 
 # Pre-transport decision seam (in[3] / out[3] / out[4]), on only when
 # `packet_decision = pre_transport`: every validated inbound IPv4 packet, and

@@ -64,7 +64,7 @@ const LOG_PERIOD: u32 = 5000;
 const OPEN_WORDS: usize = 65536 / 32;
 /// One inbound frame, header included: whatever a transport's `net_out`
 /// may carry (`NET_IN_ACCEPTS_RECORD`).
-const BUF: usize = 1483;
+const BUF: usize = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX;
 /// Frames read per step.
 const FRAMES_PER_STEP: usize = 64;
 /// The longest `CMD_SEND` this writes: an `echo_after` hold, whole

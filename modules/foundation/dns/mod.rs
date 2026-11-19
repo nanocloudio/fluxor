@@ -5142,6 +5142,10 @@ unsafe fn zone_commit_advance(s: &mut DnsState) {
         let pc = move |h: i32, op: u32, a: *mut u8, l: usize| {
             call(h, op, a, l, core::ptr::null_mut(), 0)
         };
+        // `READ` / `WRITE`: the bytes travel in `data`.
+        let bulk = move |h: i32, op: u32, d: *mut u8, l: usize| {
+            call(h, op, core::ptr::null_mut(), 0, d, l)
+        };
         match s.zio_phase {
             ZIO_COM_UNLINK => {
                 // A previous interrupted commit may have left the temporary
@@ -5178,7 +5182,7 @@ unsafe fn zone_commit_advance(s: &mut DnsState) {
                     continue;
                 }
                 let done = s.zio_done as usize;
-                let n = pc(
+                let n = bulk(
                     s.zio_fd,
                     fs::WRITE,
                     s.zone_file.as_mut_ptr().add(done),
@@ -5315,6 +5319,10 @@ unsafe fn zone_recover_drive(s: &mut DnsState) -> bool {
         let pc = move |h: i32, op: u32, a: *mut u8, l: usize| {
             call(h, op, a, l, core::ptr::null_mut(), 0)
         };
+        // `READ` / `WRITE`: the bytes travel in `data`.
+        let bulk = move |h: i32, op: u32, d: *mut u8, l: usize| {
+            call(h, op, core::ptr::null_mut(), 0, d, l)
+        };
         match s.zio_phase {
             ZIO_REC_OPEN => {
                 let mut path = [0u8; MAX_ZONE_PATH];
@@ -5349,7 +5357,7 @@ unsafe fn zone_recover_drive(s: &mut DnsState) -> bool {
                     s.zio_phase = ZIO_REC_PROBE;
                     continue;
                 }
-                let r = pc(
+                let r = bulk(
                     s.zio_fd,
                     fs::READ,
                     s.zone_file.as_mut_ptr().add(got),
@@ -5371,7 +5379,7 @@ unsafe fn zone_recover_drive(s: &mut DnsState) -> bool {
             }
             ZIO_REC_PROBE => {
                 let mut probe = [0u8; 1];
-                let r = pc(s.zio_fd, fs::READ, probe.as_mut_ptr(), 1);
+                let r = bulk(s.zio_fd, fs::READ, probe.as_mut_ptr(), 1);
                 if r == abi::errno::EAGAIN {
                     return false;
                 }
@@ -5749,9 +5757,9 @@ unsafe fn evaluate_update(
 fluxor_rt::module_facts! {
     state: DnsState,
     records: [
-        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        in 0 NET_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
         out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + DG_V4_PREFIX + DNS_MAX_PACKET,
-        in 1 TLS_IN_ACCEPTS_RECORD = 1483,
+        in 1 TLS_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
         out 1 TLS_OUT_MAX_RECORD = 600,
     ],
 }

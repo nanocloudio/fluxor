@@ -158,7 +158,7 @@ const ANCHOR_ID: [u8; ANCHOR_ID_BYTES] = *b"DEMO-A01";
 
 /// Largest net_proto frame read or written, header included: whatever a
 /// transport's `net_out` may carry.
-const NET_BUF_SIZE: usize = 1483;
+const NET_BUF_SIZE: usize = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX;
 /// No accepted client.
 const NO_CONN: u16 = 0xFFFF;
 

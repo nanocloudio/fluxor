@@ -243,7 +243,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         return StepReturn::Continue;
     }
     let dst = s.line_buf.as_mut_ptr().add(s.fill as usize);
-    let n = (sys.provider_call)(s.fs_fd, FS_READ, dst, space, core::ptr::null_mut(), 0);
+    let n = (sys.provider_call)(s.fs_fd, FS_READ, core::ptr::null_mut(), 0, dst, space);
     // EAGAIN: provider has no bytes but the stream isn't finished
     // (async FS provider). Hold the fd and retry next tick.
     if n == -11 {

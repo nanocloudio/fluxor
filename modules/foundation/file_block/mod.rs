@@ -303,7 +303,7 @@ unsafe fn transfer_once(
         return rc;
     }
     let op = if write { fs::WRITE } else { fs::READ };
-    let n = s.fs(s.fd, op, buf, len);
+    let n = (s.sys().provider_call)(s.fd, op, core::ptr::null_mut(), 0, buf, len);
     if n == E_AGAIN {
         return n;
     }

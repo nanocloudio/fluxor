@@ -336,10 +336,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             let rc = (sys.provider_call)(
                 s.dir,
                 FS_READDIR,
-                s.buf.as_mut_ptr(),
-                s.buf.len(),
                 core::ptr::null_mut(),
                 0,
+                s.buf.as_mut_ptr(),
+                s.buf.len(),
             );
             if rc == EAGAIN {
                 return StepReturn::Continue;

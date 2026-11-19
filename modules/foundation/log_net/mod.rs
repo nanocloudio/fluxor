@@ -282,7 +282,7 @@ unsafe fn discard_net_in(s: &mut LogNetState) {
 fluxor_rt::module_facts! {
     state: LogNetState,
     records: [
-        in 0 NET_IN_ACCEPTS_RECORD = 1483,
+        in 0 NET_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
         out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + DG_V4_PREFIX + CHUNK_SIZE,
     ],
 }

@@ -497,7 +497,7 @@ const FRAME_MAX: usize = 64;
 
 fluxor_rt::module_facts! {
     state: AgentState,
-    records: [in 0 ADDR_CTL_IN_ACCEPTS_RECORD = FRAME_MAX, out 0 ADDR_EVT_OUT_MAX_RECORD = FRAME_MAX],
+    records: [in 0 ADDR_CTL_IN_ACCEPTS_RECORD = FRAME_MAX, out 0 ADDR_EVT_OUT_MAX_RECORD = netid::EVENT_RECORD_MAX],
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]

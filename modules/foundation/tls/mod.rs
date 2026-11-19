@@ -1794,7 +1794,7 @@ fluxor_rt::module_facts! {
         in 0 CIPHER_IN_ACCEPTS_RECORD = 1600,
         in 1 CLEAR_IN_ACCEPTS_RECORD = net_proto::FRAME_HDR + net_proto::DATA_HEAD + 8192,
         out 0 CIPHER_OUT_MAX_RECORD = NET_SCRATCH_SIZE,
-        out 1 CLEAR_OUT_MAX_RECORD = 1483,
+        out 1 CLEAR_OUT_MAX_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
     ],
 }
 

@@ -381,10 +381,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             let rc = (sys.provider_call)(
                 s.fd,
                 FS_WRITE,
-                chunk.as_mut_ptr(),
-                n,
                 core::ptr::null_mut(),
                 0,
+                chunk.as_mut_ptr(),
+                n,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;
@@ -521,10 +521,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
             let rc = (sys.provider_call)(
                 s.fd,
                 FS_READ,
-                chunk.as_mut_ptr(),
-                n,
                 core::ptr::null_mut(),
                 0,
+                chunk.as_mut_ptr(),
+                n,
             );
             if rc == E_AGAIN || rc == E_INPROGRESS {
                 return StepReturn::Continue;

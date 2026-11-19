@@ -175,6 +175,13 @@ pub use super::super::super::registry::msg::identity::MSG_ADDR_ARMED;
 /// a provider with no ring to stage into.
 pub use super::super::super::registry::msg::identity::MSG_ADDR_FENCED;
 
+/// The longest event payload: `MSG_ADDR_ADDED`'s address, token and
+/// generation.
+pub const EVENT_PAYLOAD_MAX: usize = 16 + 16 + 4;
+/// The largest record on `addr_evt`, header included: what every provider of
+/// the events declares as its `max_record` and every consumer accepts.
+pub const EVENT_RECORD_MAX: usize = FRAME_HDR + EVENT_PAYLOAD_MAX;
+
 /// An install, arm or fence was refused.
 /// Payload: `[addr: 16][op: u8][reason: u8]` — `op` the refused opcode,
 /// `reason` per `refusal`.

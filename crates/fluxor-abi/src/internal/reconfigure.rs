@@ -60,11 +60,12 @@ pub use super::super::registry::reconfigure::TRIGGER_REBUILD;
 // They need the `reconfigure.owner` grant.
 
 /// Add a new owner's subgraph to the running graph.
-/// handle=-1, arg = bounded binary `AddSubgraph` (magic `FLXA`, version,
+/// handle=-1, `data` = bounded binary `AddSubgraph` (magic `FLXA`, version,
 /// flags, body; validated for structure and bounds — the channel, not the
-/// blob, is authenticated). On success the kernel writes the 6-byte
-/// `OwnerHandle` (`slot:u16 LE, generation:u32 LE`) into the first 6 bytes of
-/// `arg`. Returns 0 on success, a negative errno otherwise. The on-wire form
+/// blob, is authenticated), read in place for the call; `arg` (6 bytes) is
+/// the answer: on success the kernel writes the `OwnerHandle`
+/// (`slot:u16 LE, generation:u32 LE`) there. Returns 0 on success, a
+/// negative errno otherwise. The on-wire form
 /// carries PIC modules (by `name_hash` + params), each loaded within the
 /// call: a module whose load cannot complete synchronously refuses the add
 /// `EAGAIN`. In-process callers use `scheduler::apply_add` directly (built-in
