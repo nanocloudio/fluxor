@@ -41,7 +41,7 @@ SECTIONS {
 SECTIONS {
     /*
      * Firmware end marker — equivalent to RP2350's end_block.
-     * Placed after .uninit so the combine tool can find the trailer.
+     * Placed after .uninit: the graph image header follows it.
      */
     .fluxor_end : ALIGN(4)
     {

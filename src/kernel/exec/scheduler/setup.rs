@@ -1038,7 +1038,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
         // the export, and this is the runtime backstop. `BuiltInModule`
         // fixtures (whose Rust step function is trivially ISR-safe) take
         // the trampoline arm below.
-        if exec_mode == exec_mode::TIER_2 {
+        if exec_mode == exec_mode::IRQ {
             let irq = match module_irq(module_idx) {
                 Some(n) => n,
                 None => {
@@ -1098,7 +1098,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
             // controller (e.g. the host harness); production platforms
             // wire the IRQ-controller register here.
             // Deliver the IRQ to the core that runs this Tier-2 domain's
-            // `exec_mode==4` park loop (domain id == core id on the multi-core
+            // `irq` park loop (domain id == core id on the multi-core
             // platform), not core 0 — otherwise the GIC dispatches
             // `module_isr_entry` on the wrong core. Single-core / no-IRQ
             // platforms ignore the target.
@@ -1118,7 +1118,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
             continue;
         }
 
-        if exec_mode != exec_mode::TIER_1B {
+        if exec_mode != exec_mode::TIMER {
             continue;
         }
         // Find the period for this domain (fall back to graph-level

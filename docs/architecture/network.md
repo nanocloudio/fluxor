@@ -250,8 +250,8 @@ sixty seconds.
 
 A consumer that already keeps what it sends — `tls`, whose retransmission
 window holds the encrypted records — declares `retains_send` on its input
-port. The composer marks every edge into such a port (graph edge byte 9
-bit 1), the kernel carries the mark through a fan only when every fanned
+port. The composer marks every edge into such a port (the edge record's
+`retains_send` flag), the kernel carries the mark through a fan only when every fanned
 edge has it, and `ip` reads it for its own channel with `channel::FACTS`.
 On such a channel `ip` keeps no copy: it grants `RETX`, reports each
 movement of `SND.UNA` (`MSG_RETX_ACK`, whose `isn` places the consumer's

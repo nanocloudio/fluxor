@@ -323,7 +323,7 @@ pub mod store {
     // ============================================================================
 
     /// Merge runtime overrides for `module_id` into `param_buf`
-    /// (`kernel::sys::params_tlv::merge_overrides`): each override entry is
+    /// (`fluxor_contracts::params_tlv::merge_overrides`): each override entry is
     /// inserted before the basic section's terminator, so `parse_tlv()`'s
     /// last-writer-wins gives it precedence, and the terminator and every
     /// extended entry after it (certificates, keys, trust bundles) move up
@@ -363,7 +363,7 @@ pub mod store {
             return param_len;
         }
         let buf = core::slice::from_raw_parts_mut(param_buf, max_len);
-        crate::kernel::sys::params_tlv::merge_overrides(buf, param_len, mine).len
+        fluxor_contracts::params_tlv::merge_overrides(buf, param_len, mine).len
     }
 
     // ============================================================================

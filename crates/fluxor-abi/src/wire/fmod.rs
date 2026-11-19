@@ -237,9 +237,9 @@ pub const FLAG_PORT_CAPACITY: u8 = 0x20;
 /// kernel decides admission with it — a workload supplying its own
 /// conditions would be declaring its own privileges.
 ///
-/// 0x40: bits 0x04 and 0x08 are the head's `isr_safe` and `pre_tick_drain`,
-/// which this list did not name — they are set in the flags byte all the
-/// same, so a block flagged 0x04 would be claimed by every ISR-safe module.
+/// 0x40: bits 0x04 and 0x08 are the head's `interrupt_safe` and `pre_pass`
+/// flags, so a conditional block cannot use them: a block flagged 0x04 would
+/// be claimed by every interrupt-safe module.
 pub const FLAG_COND_GRANTS: u8 = 0x40;
 
 /// Size of the integrity hash and of the attestation.

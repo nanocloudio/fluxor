@@ -21,6 +21,7 @@
 //! of the reconcile) layer on top of this module, which owns the
 //! allocation/determinism and reservation invariants.
 
+use fluxor_contracts::owner_plan;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -263,7 +264,7 @@ pub struct CompositionPlan {
     /// Assignments in ascending slot order.
     pub assignments: Vec<OwnerAssignment>,
     /// Owners departing under a drain window, in ascending slot order. Usually
-    /// empty; the revocation section is omitted from the encoding when empty.
+    /// empty.
     pub revocations: Vec<PlanRevocation>,
     /// Granted endpoint leases, ordered by
     /// (slot, protocol, port), empty when the workload declares no exports. The
@@ -286,8 +287,8 @@ pub struct PlanLease {
 }
 
 /// Protocol byte values for [`PlanLease::protocol`].
-pub const LEASE_PROTO_TCP: u8 = 1;
-pub const LEASE_PROTO_UDP: u8 = 2;
+pub const LEASE_PROTO_TCP: u8 = owner_plan::PROTOCOL_TCP;
+pub const LEASE_PROTO_UDP: u8 = owner_plan::PROTOCOL_UDP;
 
 /// Map an export's protocol string to a lease protocol byte; `None` for
 /// protocols the lease system does not cover (reported but not granted/gated).
@@ -603,92 +604,6 @@ pub fn compose(
     })
 }
 
-/// Per-assignment fixed record width in the canonical plan body:
-/// workload_uid(16) + slot(2) + generation(4) + module_base(2) + module_count(2)
-/// + edge_base(2) + edge_count(2).
-const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
-
-/// Per-revocation fixed record width: an assignment record verbatim plus
-/// grace_secs(2) + deadline_unix(8).
-const REVOKE_REC_LEN: usize = ASSIGN_REC_LEN + 2 + 8;
-/// Per-lease fixed record width: slot(2) + generation(4) + protocol(1) + port(2).
-const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
-/// Opens the lease section: an IMPOSSIBLE
-/// revocation count (counts are capped at MAX_PLAN_ASSIGNMENTS), so the first
-/// u32 of the tail deterministically discriminates the sections — no length
-/// arithmetic is trusted for discrimination (48-byte revocation and 9-byte
-/// lease records collide at e.g. 148 tail bytes). Lives inside the digested
-/// body, unlike header bits, so it is integrity-protected.
-const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
-/// Decoder ceiling for the lease section (bounded-binary rule): the format's
-/// own domain. Composition grants each `(protocol, port)` at most once
-/// (a second claim is a conflict), and only tcp and udp nonzero ports are
-/// leased, so no valid plan carries more. The wire count is a `u32`.
-pub const MAX_PLAN_LEASES: usize = 2 * u16::MAX as usize;
-
-fn push_assignment(buf: &mut Vec<u8>, a: &OwnerAssignment) {
-    buf.extend_from_slice(&a.workload_uid);
-    buf.extend_from_slice(&a.slot.to_be_bytes());
-    buf.extend_from_slice(&a.generation.to_be_bytes());
-    buf.extend_from_slice(&a.module_base.to_be_bytes());
-    buf.extend_from_slice(&a.module_count.to_be_bytes());
-    buf.extend_from_slice(&a.edge_base.to_be_bytes());
-    buf.extend_from_slice(&a.edge_count.to_be_bytes());
-    buf.extend_from_slice(&a.state_cap.to_be_bytes());
-    buf.extend_from_slice(&a.buffer_cap.to_be_bytes());
-}
-
-/// Canonical, fixed-width big-endian serialization of a plan's payload
-/// (generation + count + assignments [+ revocation section]). Stable across
-/// platforms, so the digest over it — and the encoded plan — are reproducible.
-/// Shared by `digest_plan` and `encode_plan`.
-///
-/// The revocation section (`rev_count(4)` + records) is appended only when
-/// non-empty — a plan with no revocations, the overwhelmingly common case,
-/// omits it entirely.
-fn plan_body(
-    generation: u64,
-    assignments: &[OwnerAssignment],
-    revocations: &[PlanRevocation],
-    leases: &[PlanLease],
-) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::with_capacity(
-        12 + assignments.len() * ASSIGN_REC_LEN
-            + if revocations.is_empty() {
-                0
-            } else {
-                4 + revocations.len() * REVOKE_REC_LEN
-            },
-    );
-    buf.extend_from_slice(&generation.to_be_bytes());
-    buf.extend_from_slice(&(assignments.len() as u32).to_be_bytes());
-    for a in assignments {
-        push_assignment(&mut buf, a);
-    }
-    if !revocations.is_empty() {
-        buf.extend_from_slice(&(revocations.len() as u32).to_be_bytes());
-        for r in revocations {
-            push_assignment(&mut buf, &r.assignment);
-            buf.extend_from_slice(&r.grace_secs.to_be_bytes());
-            buf.extend_from_slice(&r.deadline_unix.to_be_bytes());
-        }
-    }
-    // Lease section: marker + count + records,
-    // fixed order revocations-before-leases. The section is always emitted, even
-    // with zero grants: its presence is the integrity-protected signal that the
-    // plan is lease-aware, and the kernel bind gate enforces it mandatorily (an
-    // owner may bind only a nonzero port it was granted).
-    buf.extend_from_slice(&LEASE_SECTION_MARKER.to_be_bytes());
-    buf.extend_from_slice(&(leases.len() as u32).to_be_bytes());
-    for l in leases {
-        buf.extend_from_slice(&l.slot.to_be_bytes());
-        buf.extend_from_slice(&l.generation.to_be_bytes());
-        buf.push(l.protocol);
-        buf.extend_from_slice(&l.port.to_be_bytes());
-    }
-    buf
-}
-
 fn sha256_of(bytes: &[u8]) -> Digest32 {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -698,214 +613,159 @@ fn sha256_of(bytes: &[u8]) -> Digest32 {
     digest
 }
 
-/// Canonical content digest over a plan. Fixed-width big-endian encoding so the
-/// bytes — and therefore the digest — are stable across platforms. Covers the
-/// revocation section too: a tampered deadline fails the digest.
+// ============================================================================
+// Binary plan codec. The kernel consumes a validated, bounded binary plan
+// (`fluxor_contracts::owner_plan`); it parses no orchestrator objects, OCI
+// manifests or YAML.
+// ============================================================================
+
+/// The most assignments, and the most revocations, a plan carries: the
+/// kernel's owner table (`MAX_OWNERS`, one constant on every kernel), the
+/// bound the kernel decodes with. Composition places fewer
+/// (`NodeCapacity::max_owners - 1` workloads, `capacity_for_profile`).
+pub fn max_plan_assignments() -> usize {
+    usize::try_from(crate::capacity::kernel_max_owners("")).unwrap_or(usize::MAX)
+}
+
+fn wire_assignment(a: &OwnerAssignment) -> owner_plan::Assignment {
+    owner_plan::Assignment {
+        owner_uid: a.workload_uid,
+        slot: a.slot,
+        generation: a.generation,
+        module_base: a.module_base,
+        module_count: a.module_count,
+        edge_base: a.edge_base,
+        edge_count: a.edge_count,
+        state_cap: a.state_cap,
+        buffer_cap: a.buffer_cap,
+    }
+}
+
+fn owned_assignment(a: owner_plan::Assignment) -> OwnerAssignment {
+    OwnerAssignment {
+        workload_uid: a.owner_uid,
+        slot: a.slot,
+        generation: a.generation,
+        module_base: a.module_base,
+        module_count: a.module_count,
+        edge_base: a.edge_base,
+        edge_count: a.edge_count,
+        state_cap: a.state_cap,
+        buffer_cap: a.buffer_cap,
+    }
+}
+
+/// The plan's bytes: header, `ASGN`, `RVOK`, `LEAS` (each always present,
+/// empty or not), then the SHA-256 over all of it.
+fn plan_bytes(
+    generation: u64,
+    assignments: &[OwnerAssignment],
+    revocations: &[PlanRevocation],
+    leases: &[PlanLease],
+    max_assignments: usize,
+) -> Result<Vec<u8>, owner_plan::PlanError> {
+    let assignments: Vec<owner_plan::Assignment> =
+        assignments.iter().map(wire_assignment).collect();
+    let revocations: Vec<owner_plan::Revocation> = revocations
+        .iter()
+        .map(|r| owner_plan::Revocation {
+            assignment: wire_assignment(&r.assignment),
+            grace_secs: r.grace_secs,
+            deadline_unix: r.deadline_unix,
+        })
+        .collect();
+    let leases: Vec<owner_plan::Lease> = leases
+        .iter()
+        .map(|l| owner_plan::Lease {
+            slot: l.slot,
+            generation: l.generation,
+            protocol: l.protocol,
+            port: l.port,
+        })
+        .collect();
+    owner_plan::encode(
+        &owner_plan::PlanSpec {
+            generation,
+            assignments: &assignments,
+            revocations: &revocations,
+            leases: &leases,
+        },
+        max_assignments,
+        sha256_of,
+    )
+}
+
+/// Content digest of a plan: the SHA-256 its encoding carries, so the digest
+/// a composer reports is the one the kernel verifies. Covers every section:
+/// a tampered deadline fails it.
 fn digest_plan(
     generation: u64,
     assignments: &[OwnerAssignment],
     revocations: &[PlanRevocation],
     leases: &[PlanLease],
 ) -> Digest32 {
-    sha256_of(&plan_body(generation, assignments, revocations, leases))
+    // The digest names the content whatever its size; the owner table's
+    // bound is the encoder's and decoder's check, not the digest's.
+    let bytes = plan_bytes(generation, assignments, revocations, leases, usize::MAX)
+        .expect("a plan's sections fit the codec's u32 lengths");
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes[bytes.len() - owner_plan::DIGEST_LEN..]);
+    digest
 }
 
-// ============================================================================
-// Binary plan codec. The kernel consumes a validated, bounded binary plan; it
-// parses no orchestrator objects, OCI manifests or YAML.
-// ============================================================================
-
-/// Magic for an encoded device-graph plan: "FLXP".
-const PLAN_MAGIC: u32 = 0x464C_5850;
-/// On-wire plan format version.
-const PLAN_VERSION: u16 = 1;
-/// Fixed header: magic(4) + version(2) + reserved(2).
-const PLAN_HEADER_LEN: usize = 8;
-/// Decoder ceiling on assignments in one bounded plan: the format's own
-/// domain, one assignment per nonzero `u16` owner slot (the wire count is a
-/// `u32`). What a node holds is profile data: composition places at most
-/// `NodeCapacity::max_owners - 1` workloads (`capacity_for_profile`), and
-/// the kernel refuses a slot past its live owner table.
-const MAX_PLAN_ASSIGNMENTS: usize = u16::MAX as usize;
-
-/// Why decoding a binary plan failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlanDecodeError {
-    BadMagic,
-    BadVersion,
-    Truncated,
-    TooManyAssignments,
-    DigestMismatch,
-    TrailingBytes,
-}
-
-/// Encode a composed plan into the bounded binary form the kernel consumes:
-/// `[header][body][sha256(body)]`. Deterministic — identical plans encode to
-/// identical bytes.
-pub fn encode_plan(plan: &CompositionPlan) -> Vec<u8> {
-    let body = plan_body(
+/// Encode a composed plan into the bounded binary form the kernel consumes.
+/// Deterministic: identical plans encode to identical bytes.
+///
+/// # Errors
+/// A plan holding more assignments or revocations than the kernel's owner
+/// table ([`ComposeError::OwnerSlotsExhausted`]), or more leases than the
+/// codec's bound ([`ComposeError::EndpointsExceeded`]).
+pub fn encode_plan(plan: &CompositionPlan) -> Result<Vec<u8>, ComposeError> {
+    plan_bytes(
         plan.generation,
         &plan.assignments,
         &plan.revocations,
         &plan.leases,
-    );
-    let digest = sha256_of(&body);
-    let mut out = Vec::with_capacity(PLAN_HEADER_LEN + body.len() + 32);
-    out.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
-    out.extend_from_slice(&PLAN_VERSION.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes()); // reserved
-    out.extend_from_slice(&body);
-    out.extend_from_slice(&digest);
-    out
+        max_plan_assignments(),
+    )
+    .map_err(|e| match e {
+        owner_plan::PlanError::TooMany {
+            tag: owner_plan::tag::LEASES,
+            ..
+        } => ComposeError::EndpointsExceeded,
+        _ => ComposeError::OwnerSlotsExhausted,
+    })
 }
 
-/// Decode and verify a binary plan. Validates magic/version, bounds every length
-/// against the input, enforces `MAX_PLAN_ASSIGNMENTS`, and verifies the trailing
-/// sha256 over the body so a tampered or truncated plan fails closed.
-pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
-    if bytes.len() < PLAN_HEADER_LEN + 12 + 32 {
-        return Err(PlanDecodeError::Truncated);
-    }
-    let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-    if magic != PLAN_MAGIC {
-        return Err(PlanDecodeError::BadMagic);
-    }
-    let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
-    if version != PLAN_VERSION {
-        return Err(PlanDecodeError::BadVersion);
-    }
-    let body = &bytes[PLAN_HEADER_LEN..];
-    let generation = u64::from_be_bytes(body[0..8].try_into().unwrap());
-    let count = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
-    if count > MAX_PLAN_ASSIGNMENTS {
-        return Err(PlanDecodeError::TooManyAssignments);
-    }
-    let assign_len = 12 + count * ASSIGN_REC_LEN;
-    let base_total = PLAN_HEADER_LEN + assign_len + 32;
-    if bytes.len() < base_total {
-        return Err(PlanDecodeError::Truncated);
-    }
-    // Optional revocation section: present iff bytes remain between the
-    // assignments and the digest (an empty revocation section is not encoded).
-    // Tail grammar: [rev_section] [lease_section],
-    // fixed order, each omitted when empty. The first u32 of the surplus
-    // discriminates deterministically: LEASE_SECTION_MARKER (an impossible
-    // revocation count) opens a lease section; a valid count (1..=cap) opens
-    // the revocation section. Length equations validate, never discriminate.
-    let mut cursor = assign_len; // offset into `body`
-    let tail_end = bytes.len() - PLAN_HEADER_LEN - 32; // end of body incl. tail
-    let read_u32_at = |off: usize| -> Option<u32> {
-        body.get(off..off + 4)
-            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
-    };
-    let mut rev_count = 0usize;
-    let mut lease_count = 0usize;
-    if cursor < tail_end {
-        let first = read_u32_at(cursor).ok_or(PlanDecodeError::Truncated)?;
-        if first != LEASE_SECTION_MARKER {
-            let rc = first as usize;
-            if rc == 0 || rc > MAX_PLAN_ASSIGNMENTS {
-                // An explicitly-empty section is not a valid encoding; treat
-                // like trailing garbage, not a second spelling of "none".
-                return Err(PlanDecodeError::TrailingBytes);
-            }
-            rev_count = rc;
-            cursor += 4 + rev_count * REVOKE_REC_LEN;
-            if cursor > tail_end {
-                return Err(PlanDecodeError::Truncated);
-            }
-        }
-    }
-    if cursor < tail_end {
-        let marker = read_u32_at(cursor).ok_or(PlanDecodeError::Truncated)?;
-        if marker != LEASE_SECTION_MARKER {
-            return Err(PlanDecodeError::TrailingBytes);
-        }
-        let lc = read_u32_at(cursor + 4).ok_or(PlanDecodeError::Truncated)? as usize;
-        // Count 0 is valid — a plan that grants no endpoints; only an over-cap
-        // count is rejected.
-        if lc > MAX_PLAN_LEASES {
-            return Err(PlanDecodeError::TrailingBytes);
-        }
-        lease_count = lc;
-        cursor += 4 + 4 + lease_count * LEASE_REC_LEN;
-    }
-    let body_len = cursor;
-    let expected_total = PLAN_HEADER_LEN + body_len + 32;
-    if bytes.len() < expected_total {
-        return Err(PlanDecodeError::Truncated);
-    }
-    if bytes.len() > expected_total {
-        return Err(PlanDecodeError::TrailingBytes);
-    }
-    // Verify the digest over the body before trusting any field.
-    let digest = &bytes[PLAN_HEADER_LEN + body_len..];
-    if sha256_of(&body[..body_len]) != digest {
-        return Err(PlanDecodeError::DigestMismatch);
-    }
-    let read_assignment = |r: &[u8]| -> OwnerAssignment {
-        let mut workload_uid = [0u8; 16];
-        workload_uid.copy_from_slice(&r[0..16]);
-        OwnerAssignment {
-            workload_uid,
-            slot: u16::from_be_bytes(r[16..18].try_into().unwrap()),
-            generation: u32::from_be_bytes(r[18..22].try_into().unwrap()),
-            module_base: u16::from_be_bytes(r[22..24].try_into().unwrap()),
-            module_count: u16::from_be_bytes(r[24..26].try_into().unwrap()),
-            edge_base: u16::from_be_bytes(r[26..28].try_into().unwrap()),
-            edge_count: u16::from_be_bytes(r[28..30].try_into().unwrap()),
-            state_cap: u32::from_be_bytes(r[30..34].try_into().unwrap()),
-            buffer_cap: u32::from_be_bytes(r[34..38].try_into().unwrap()),
-        }
-    };
-    let mut assignments = Vec::with_capacity(count);
-    for i in 0..count {
-        assignments.push(read_assignment(
-            &body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN],
-        ));
-    }
-    let mut revocations = Vec::with_capacity(rev_count);
-    for i in 0..rev_count {
-        let base = assign_len + 4 + i * REVOKE_REC_LEN;
-        let r = &body[base..base + REVOKE_REC_LEN];
-        revocations.push(PlanRevocation {
-            assignment: read_assignment(&r[..ASSIGN_REC_LEN]),
-            grace_secs: u16::from_be_bytes(
-                r[ASSIGN_REC_LEN..ASSIGN_REC_LEN + 2].try_into().unwrap(),
-            ),
-            deadline_unix: u64::from_be_bytes(
-                r[ASSIGN_REC_LEN + 2..ASSIGN_REC_LEN + 10]
-                    .try_into()
-                    .unwrap(),
-            ),
-        });
-    }
-    let mut leases = Vec::with_capacity(lease_count);
-    let lease_base = assign_len
-        + if rev_count > 0 {
-            4 + rev_count * REVOKE_REC_LEN
-        } else {
-            0
-        }
-        + 8; // marker + count
-    for i in 0..lease_count {
-        let base = lease_base + i * LEASE_REC_LEN;
-        let r = &body[base..base + LEASE_REC_LEN];
-        leases.push(PlanLease {
-            slot: u16::from_be_bytes(r[0..2].try_into().unwrap()),
-            generation: u32::from_be_bytes(r[2..6].try_into().unwrap()),
-            protocol: r[6],
-            port: u16::from_be_bytes(r[7..9].try_into().unwrap()),
-        });
-    }
-    let mut plan_digest = [0u8; 32];
-    plan_digest.copy_from_slice(digest);
+/// Decode and verify a binary plan: every section once, each within the
+/// kernel's owner-table bound, and the trailing SHA-256 over everything
+/// before it, so a tampered or truncated plan fails closed.
+///
+/// # Errors
+/// The codec's refusal ([`owner_plan::PlanError`]).
+pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, owner_plan::PlanError> {
+    let plan = owner_plan::decode(bytes, max_plan_assignments(), sha256_of)?;
     Ok(CompositionPlan {
-        generation,
-        assignments,
-        revocations,
-        leases,
-        plan_digest,
+        generation: plan.generation,
+        assignments: plan.assignments().map(owned_assignment).collect(),
+        revocations: plan
+            .revocations()
+            .map(|r| PlanRevocation {
+                assignment: owned_assignment(r.assignment),
+                grace_secs: r.grace_secs,
+                deadline_unix: r.deadline_unix,
+            })
+            .collect(),
+        leases: plan
+            .leases()
+            .map(|l| PlanLease {
+                slot: l.slot,
+                generation: l.generation,
+                protocol: l.protocol,
+                port: l.port,
+            })
+            .collect(),
+        plan_digest: plan.digest,
     })
 }
 
@@ -1212,7 +1072,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trips() {
         let plan = sample_plan();
-        let bytes = encode_plan(&plan);
+        let bytes = encode_plan(&plan).expect("encode");
         let decoded = decode_plan(&bytes).expect("decode");
         assert_eq!(decoded, plan);
         // decoded plan_digest matches the freshly composed one
@@ -1223,6 +1083,7 @@ mod tests {
     fn encode_is_deterministic() {
         let plan = sample_plan();
         assert_eq!(encode_plan(&plan), encode_plan(&plan));
+        assert!(encode_plan(&plan).is_ok());
     }
 
     #[test]
@@ -1234,11 +1095,11 @@ mod tests {
             leases: vec![],
             plan_digest: digest_plan(7, &[], &[], &[]),
         };
-        assert_eq!(decode_plan(&encode_plan(&plan)).unwrap(), plan);
+        assert_eq!(decode_plan(&encode_plan(&plan).unwrap()).unwrap(), plan);
     }
 
     #[test]
-    fn lease_section_round_trips_alone_with_revocations_and_never_misparses() {
+    fn lease_and_revocation_sections_round_trip_alone_and_together() {
         let lease = |slot: u16, port: u16| PlanLease {
             slot,
             generation: 1,
@@ -1247,8 +1108,7 @@ mod tests {
         };
         let base = sample_plan();
 
-        // Lease-only plan round-trips (the marker discriminates the section;
-        // pre-marker decoders would have misparsed this as revocations).
+        // Lease-only plan round-trips.
         let mut lease_only = base.clone();
         lease_only.leases = vec![lease(1, 8080), lease(2, 9090)];
         lease_only.plan_digest = digest_plan(
@@ -1257,12 +1117,11 @@ mod tests {
             &[],
             &lease_only.leases,
         );
-        let decoded = decode_plan(&encode_plan(&lease_only)).unwrap();
-        assert_eq!(decoded.leases, lease_only.leases);
-        assert!(decoded.revocations.is_empty());
+        let decoded = decode_plan(&encode_plan(&lease_only).unwrap()).unwrap();
+        assert_eq!(decoded, lease_only);
 
-        // THE COLLISION PAIR: 3 revocations and 16
-        // leases both occupy 148 tail bytes. Each decodes to its own section.
+        // Three revocations and sixteen leases: each lands in its own
+        // section, found by tag.
         let committed = sample_plan();
         let snap = snap_from(&committed, 16);
         let ds = DeviceDesiredState {
@@ -1270,7 +1129,6 @@ mod tests {
             system_revision: 1,
             workloads: vec![],
         };
-        // Build a plan with exactly 3 revocations via three graced removals.
         let mut with_revs = compose(
             &ds,
             &cap(),
@@ -1281,7 +1139,6 @@ mod tests {
             0,
         )
         .unwrap();
-        // Manufacture the third revocation by hand to hit exactly R=3.
         let mut third = with_revs.revocations[0];
         third.assignment.slot = 9;
         with_revs.revocations.push(third);
@@ -1299,24 +1156,14 @@ mod tests {
             &[],
             &sixteen_leases.leases,
         );
-        let rev_bytes = encode_plan(&with_revs);
-        let lease_bytes = encode_plan(&sixteen_leases);
-        // The ambiguity the marker removes: under count-only framing, a
-        // 3-revocation tail and a 16-lease tail would both be 148 bytes —
-        // undecidable by length. The marker adds 4 bytes to the lease section
-        // precisely to make the first u32 discriminate instead.
-        assert_eq!(
-            4 + 3 * REVOKE_REC_LEN,
-            4 + 16 * LEASE_REC_LEN,
-            "the documented 148-byte collision (marker-less framing)"
-        );
-        // …and each decodes to the correct section.
-        let r = decode_plan(&rev_bytes).unwrap();
+        let r = decode_plan(&encode_plan(&with_revs).unwrap()).unwrap();
         assert_eq!((r.revocations.len(), r.leases.len()), (3, 0));
-        let l = decode_plan(&lease_bytes).unwrap();
+        assert_eq!(r, with_revs);
+        let l = decode_plan(&encode_plan(&sixteen_leases).unwrap()).unwrap();
         assert_eq!((l.revocations.len(), l.leases.len()), (0, 16));
+        assert_eq!(l, sixteen_leases);
 
-        // Both sections together round-trip, order rev-then-lease.
+        // Both sections together round-trip.
         let mut both = with_revs.clone();
         both.leases = vec![lease(2, 8080)];
         both.plan_digest = digest_plan(
@@ -1325,12 +1172,12 @@ mod tests {
             &both.revocations,
             &both.leases,
         );
-        let d = decode_plan(&encode_plan(&both)).unwrap();
+        let d = decode_plan(&encode_plan(&both).unwrap()).unwrap();
         assert_eq!(d.revocations.len(), 3);
         assert_eq!(d.leases, both.leases);
 
         // Truncating inside the lease section fails closed.
-        let bytes = encode_plan(&sixteen_leases);
+        let bytes = encode_plan(&sixteen_leases).unwrap();
         assert!(decode_plan(&bytes[..bytes.len() - 1]).is_err());
     }
 
@@ -1411,22 +1258,25 @@ mod tests {
 
     #[test]
     fn tampered_body_fails_digest() {
-        let mut bytes = encode_plan(&sample_plan());
-        // flip a byte inside the first assignment record (after the 12-byte
-        // body prefix, which is after the 8-byte header).
-        let idx = PLAN_HEADER_LEN + 12 + 4;
+        let mut bytes = encode_plan(&sample_plan()).unwrap();
+        // Flip a byte inside the first assignment record: past the plan
+        // header and the assignment section's head.
+        let idx = owner_plan::HEADER_LEN + owner_plan::SECTION_HEAD_LEN + 4;
         bytes[idx] ^= 0xFF;
-        assert_eq!(decode_plan(&bytes), Err(PlanDecodeError::DigestMismatch));
+        assert_eq!(
+            decode_plan(&bytes),
+            Err(owner_plan::PlanError::DigestMismatch)
+        );
     }
 
     #[test]
-    fn bad_magic_and_version_rejected() {
-        let mut bytes = encode_plan(&sample_plan());
-        let mut bad_magic = bytes.clone();
-        bad_magic[0] ^= 0xFF;
-        assert_eq!(decode_plan(&bad_magic), Err(PlanDecodeError::BadMagic));
-        bytes[5] = 0xFF; // version low byte
-        assert_eq!(decode_plan(&bytes), Err(PlanDecodeError::BadVersion));
+    fn bad_magic_rejected() {
+        let mut bytes = encode_plan(&sample_plan()).unwrap();
+        bytes[0] ^= 0xFF;
+        assert!(matches!(
+            decode_plan(&bytes),
+            Err(owner_plan::PlanError::BadMagic { .. })
+        ));
     }
 
     /// A snapshot that carries the given plan as prior state (occupancy +
@@ -1447,30 +1297,40 @@ mod tests {
     }
 
     #[test]
-    fn no_revocation_plan_has_the_canonical_layout_with_an_empty_lease_section() {
-        // Canonical layout, hand-built: header + generation + count + assignment
-        // records + [no revocation section] + lease section (marker + count 0) +
-        // sha256(body). The revocation section is omitted when empty; the lease
-        // section is always emitted, so a no-revocation, no-lease plan carries
-        // the 8-byte empty section and nothing more.
+    fn a_plan_has_the_canonical_layout_with_every_section_present() {
+        // Hand-built: header (magic, generation), the assignment section, an
+        // empty revocation section and an empty lease section, each
+        // `tag | len | count | records`, little-endian, then SHA-256 over all
+        // of it. Every section is emitted, empty or not.
         let plan = sample_plan();
         assert!(plan.revocations.is_empty() && plan.leases.is_empty());
         let mut expected = Vec::new();
-        expected.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
-        expected.extend_from_slice(&PLAN_VERSION.to_be_bytes());
-        expected.extend_from_slice(&0u16.to_be_bytes());
-        let mut body = Vec::new();
-        body.extend_from_slice(&plan.generation.to_be_bytes());
-        body.extend_from_slice(&(plan.assignments.len() as u32).to_be_bytes());
+        expected.extend_from_slice(b"FLXP");
+        expected.extend_from_slice(&plan.generation.to_le_bytes());
+        expected.extend_from_slice(b"ASGN");
+        let asgn_len = 4 + plan.assignments.len() * owner_plan::ASSIGNMENT_LEN;
+        expected.extend_from_slice(&(asgn_len as u32).to_le_bytes());
+        expected.extend_from_slice(&(plan.assignments.len() as u32).to_le_bytes());
         for a in &plan.assignments {
-            push_assignment(&mut body, a);
+            expected.extend_from_slice(&a.workload_uid);
+            expected.extend_from_slice(&a.slot.to_le_bytes());
+            expected.extend_from_slice(&a.generation.to_le_bytes());
+            expected.extend_from_slice(&a.module_base.to_le_bytes());
+            expected.extend_from_slice(&a.module_count.to_le_bytes());
+            expected.extend_from_slice(&a.edge_base.to_le_bytes());
+            expected.extend_from_slice(&a.edge_count.to_le_bytes());
+            expected.extend_from_slice(&a.state_cap.to_le_bytes());
+            expected.extend_from_slice(&a.buffer_cap.to_le_bytes());
         }
-        // Always-present lease section: marker + count(0), no records.
-        body.extend_from_slice(&LEASE_SECTION_MARKER.to_be_bytes());
-        body.extend_from_slice(&0u32.to_be_bytes());
-        expected.extend_from_slice(&body);
-        expected.extend_from_slice(&sha256_of(&body));
-        assert_eq!(encode_plan(&plan), expected);
+        for tag in [b"RVOK", b"LEAS"] {
+            expected.extend_from_slice(tag);
+            expected.extend_from_slice(&4u32.to_le_bytes());
+            expected.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let digest = sha256_of(&expected);
+        expected.extend_from_slice(&digest);
+        assert_eq!(encode_plan(&plan).unwrap(), expected);
+        assert_eq!(plan.plan_digest, digest);
     }
 
     #[test]
@@ -1491,17 +1351,21 @@ mod tests {
         assert_eq!(rev.grace_secs, 30);
         assert_eq!(rev.deadline_unix, 1030);
 
-        let bytes = encode_plan(&plan);
+        let bytes = encode_plan(&plan).unwrap();
         assert_eq!(decode_plan(&bytes).unwrap(), plan);
 
         // Tampering with the stamped deadline fails the digest. deadline_unix is
-        // the last field of the revocation record, which sits before the 8-byte
-        // empty lease section and the 32-byte digest — structurally inert
-        // (framing unchanged) but digest-covered.
+        // the last field of the revocation record, which sits before the empty
+        // lease section's head and the digest — structurally inert (framing
+        // unchanged) but digest-covered.
         let mut tampered = bytes.clone();
-        let deadline_last = tampered.len() - 32 - 8 - 1; // - digest - empty lease section
+        let deadline_last =
+            tampered.len() - owner_plan::DIGEST_LEN - owner_plan::SECTION_HEAD_LEN - 1;
         tampered[deadline_last] ^= 0xFF;
-        assert_eq!(decode_plan(&tampered), Err(PlanDecodeError::DigestMismatch));
+        assert_eq!(
+            decode_plan(&tampered),
+            Err(owner_plan::PlanError::DigestMismatch)
+        );
 
         // Truncating inside the revocation section fails closed.
         assert!(decode_plan(&bytes[..bytes.len() - 1]).is_err());
@@ -1660,14 +1524,16 @@ mod tests {
 
     #[test]
     fn truncated_and_trailing_rejected() {
-        let bytes = encode_plan(&sample_plan());
+        let bytes = encode_plan(&sample_plan()).unwrap();
         assert_eq!(
             decode_plan(&bytes[..bytes.len() - 1]),
-            Err(PlanDecodeError::Truncated)
+            Err(owner_plan::PlanError::Truncated)
         );
+        // A byte past the digest moves where the digest is read from: the
+        // last section ends short of where the digest begins.
         let mut extra = bytes.clone();
         extra.push(0);
-        assert_eq!(decode_plan(&extra), Err(PlanDecodeError::TrailingBytes));
+        assert!(decode_plan(&extra).is_err());
     }
 
     /// A Linux node's plan is bounded by its profile's owner domain, not a
@@ -1706,24 +1572,30 @@ mod tests {
         assert_eq!(plan.assignments.len(), 300);
         assert!(plan.assignments.iter().any(|a| a.slot > 256));
         assert_eq!(plan.leases.len(), 60);
-        let bytes = encode_plan(&plan);
+        let bytes = encode_plan(&plan).expect("encodes");
         assert_eq!(decode_plan(&bytes).expect("decodes"), plan);
     }
 
     #[test]
     fn over_cap_count_rejected() {
-        // Hand-craft a header claiming more assignments than the bound, so the
-        // count check trips before any allocation.
+        // Hand-craft an assignment section claiming more records than the
+        // kernel's owner table, so the count check trips before anything is
+        // read.
+        let over = max_plan_assignments() + 1;
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
-        bytes.extend_from_slice(&PLAN_VERSION.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
-        bytes.extend_from_slice(&7u64.to_be_bytes()); // generation
-        bytes.extend_from_slice(&((MAX_PLAN_ASSIGNMENTS as u32 + 1).to_be_bytes()));
+        bytes.extend_from_slice(b"FLXP");
+        bytes.extend_from_slice(&7u64.to_le_bytes()); // generation
+        bytes.extend_from_slice(b"ASGN");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(over as u32).to_le_bytes());
         bytes.extend_from_slice(&[0u8; 32]); // (bogus) digest area
         assert_eq!(
             decode_plan(&bytes),
-            Err(PlanDecodeError::TooManyAssignments)
+            Err(owner_plan::PlanError::TooMany {
+                tag: owner_plan::tag::ASSIGNMENTS,
+                count: over,
+                max: max_plan_assignments(),
+            })
         );
     }
 
@@ -2000,10 +1872,10 @@ mod tests {
                 cap.buffer_bytes as u64,
                 k(profile, "BUFFER_ARENA_SIZE", target)
             );
-            // Both lay the graph section out for the graph: the format bound.
+            // Both size their edge tables at boot, within the kernel's bound.
             assert_eq!(
                 cap.max_edges as u64,
-                crate::capacity::GRAPH_EDGES_FORMAT_BOUND as u64
+                crate::capacity::BOOT_SIZED_MAX_EDGES as u64
             );
             assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
         }

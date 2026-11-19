@@ -17,10 +17,11 @@ Two delivery paths exist:
 
 ## The Graph Image
 
-Source: `tools/src/cli/commands_a.rs` (writer),
-`crates/fluxor-abi/src/platform/rp/flash_layout.rs` (layout),
-`src/kernel/module/ota_stage.rs`, `src/kernel/boot/config.rs` and
-`modules/foundation/graph_slot/` (readers).
+Source: `crates/fluxor-abi/src/wire/graph_image.rs` (header and codec),
+`tools/src/graph_image.rs` (writer), `src/kernel/boot/graph_image.rs`
+(admission), `src/kernel/boot/config.rs`, `src/kernel/module/ota_stage.rs`,
+`modules/foundation/graph_slot/` and `modules/foundation/ota_ingest/`
+(readers).
 
 `fluxor build <config> --emit=image --output <file>` produces a graph
 image: a 256-byte FXSL header; from the first 4 KiB boundary, the module
@@ -43,10 +44,17 @@ little-endian:
 | 96..168 | signature record, or erased (0xFF) when the image is unsigned |
 | 168..256 | unused (0xFF) |
 
-The header pins kernel and graph to each other: a device refuses an
-image whose ABI-surface digest does not equal the running kernel's.
-The image excludes firmware; it is the only sanctioned module-delivery
-path for OTA devices. An image is emitted as long as its payload, on a
+The same header opens every graph a kernel runs: an RP flash slot, an
+OTA image staged in RAM, the graph a combined firmware image carries
+after the kernel (RP UF2, Pi 5 and uefi raw images: the header on the
+first 256-byte boundary past the kernel's file-backed end), and the
+`graph.img` file `fluxor build` writes for Linux and `fluxor-linux
+--image` runs. Every reader admits it the same way: the header is well
+formed for the bytes holding it, the ABI-surface digest equals the
+running kernel's, the signature verifies under a signing root (below),
+and the payload hashes to the header's digest. The OTA image excludes
+firmware; it is the only sanctioned module-delivery path for OTA
+devices. An image is emitted as long as its payload, on a
 whole 256-byte page: the header says where the payload ends, which is
 where `ota_ingest` stops reading, so nothing is padded across the wire.
 Its ceiling is the board's graph slot on an RP target (below) and 8 MiB
@@ -54,7 +62,7 @@ of RAM staging elsewhere.
 
 ### Graph-image signatures
 
-Source: `src/kernel/security/slot_signature.rs`.
+Source: `src/kernel/security/image_signature.rs`.
 
 The signature record is `[magic "SIG1" (u32 LE 0x3147_4953)][key id: the
 first four bytes of SHA-256 of the public key][Ed25519 signature R ‖ S:
@@ -79,7 +87,8 @@ kernel image with a root:
 
 - boots from a flash slot only when its header carries a record for the
   root that verifies and its payload matches the digest; otherwise it falls
-  back to the other slot, then to the firmware's own graph. Verification is
+  back to the other slot, then to the graph the firmware image carries,
+  which is held to the same check. Verification is
   strict (S below the group order, canonical encodings, no small-order
   points) and is the same in the kernel and in `graph_slot`, so the boot
   selector and ACTIVATE agree on every image;
@@ -90,8 +99,10 @@ kernel image with a root:
 
 A kernel built without a root checks no signature: signed and unsigned
 images are admitted alike, on their structure, ABI pin, digest and epoch.
-The firmware's own graph (the one in the boot image) is never
-signature-checked; it is as trusted as the kernel it ships in.
+`fluxor build` signs the graph a combined firmware image or a Linux
+`graph.img` carries with the workspace signing key, whose public half is
+the root it writes, and refuses a `--root` the workspace holds no key
+for, since that kernel would refuse its own graph.
 
 ## Publish and Distribution
 

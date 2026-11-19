@@ -87,8 +87,9 @@ The file carries a small envelope plus one entry per resident workload:
 }
 ```
 
-`plan_digest` is the sha256 over the body of the plan the runtime decoded and
-applied, all zero before the first. The
+`plan_digest` is the SHA-256 the plan the runtime decoded and applied
+carries (over its header and every section, `fluxor_contracts::owner_plan`),
+all zero before the first. The
 [agent protocol](agent_protocol.md#what-the-activation-digest-proves) holds it to
 the committed plan's before it reports an activation.
 

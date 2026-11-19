@@ -2,28 +2,14 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
     let content = std::fs::read(file)?;
     let memory = parse_uf2(&content)?;
 
-    // Read trailer to find config address
-    let config_addr = read_trailer_config_addr(&memory)?;
-
-    // The contiguous region from the config address; the decoder reads only
-    // as far as the blob's own section sizes say.
-    let config_data = {
-        let mut data = Vec::new();
-        let mut addr = config_addr;
-        while let Some(&byte) = memory.get(&addr) {
-            data.push(byte);
-            match addr.checked_add(1) {
-                Some(next) => addr = next,
-                None => break,
-            }
-        }
-        if data.len() < 64 {
-            return Err(error::Error::Config(
-                "No config found at expected address".into(),
-            ));
-        }
-        data
-    };
+    // The config the graph image after the kernel names.
+    let (at, header) = find_graph_image(&memory)?;
+    let config_data = uf2::extract_region(
+        &memory,
+        at + header.config_offset,
+        header.config_size as usize,
+    )
+    .ok_or_else(|| error::Error::Config("the graph image's config is not in the file".into()))?;
 
     let config = decode_config(&config_data)?;
 
@@ -35,36 +21,36 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find and read trailer from memory map
-/// Scans 256-byte aligned addresses looking for TRAILER_MAGIC
-fn find_trailer(memory: &std::collections::BTreeMap<u32, u8>) -> Result<(u32, u32, u32)> {
-    // Scan 256-byte aligned addresses for trailer magic
+/// The graph image a firmware image carries after the kernel: the first
+/// 256-byte aligned address holding a header the codec reads whose regions
+/// the file holds. Answers its address and header.
+fn find_graph_image(
+    memory: &std::collections::BTreeMap<u32, u8>,
+) -> Result<(u32, fluxor_abi::wire::graph_image::Header)> {
+    use fluxor_abi::wire::graph_image::{Header, HEADER_SIZE, MAGIC};
     let min_addr = *memory
         .keys()
         .min()
         .ok_or_else(|| error::Error::Config("Empty memory".into()))?;
     let max_addr = *memory.keys().max().unwrap();
-
-    let mut addr = (min_addr + 255) & !255; // Start at first 256-byte boundary
+    let mut addr = min_addr.div_ceil(256) * 256;
     while addr <= max_addr {
-        if let Some(data) = uf2::extract_region(memory, addr, 16) {
-            let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            if magic == TRAILER_MAGIC {
-                let modules_addr = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                let config_addr = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-                return Ok((addr, modules_addr, config_addr));
+        if let Some(bytes) = uf2::extract_region(memory, addr, HEADER_SIZE) {
+            let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if magic == MAGIC {
+                if let Ok(h) = Header::decode(&bytes, u64::from(max_addr - addr) + 1) {
+                    let held = |off: u32, len: u32| {
+                        uf2::extract_region(memory, addr + off, len as usize).is_some()
+                    };
+                    if held(h.modules_offset, h.modules_size) && held(h.config_offset, h.config_size) {
+                        return Ok((addr, h));
+                    }
+                }
             }
         }
         addr += 256;
     }
-
-    Err(error::Error::Config("No trailer found".into()))
-}
-
-/// Read config address from trailer
-fn read_trailer_config_addr(memory: &std::collections::BTreeMap<u32, u8>) -> Result<u32> {
-    let (_, _, config_addr) = find_trailer(memory)?;
-    Ok(config_addr)
+    Err(error::Error::Config("No graph image found".into()))
 }
 
 fn cmd_info_fmod(file: &Path) -> Result<()> {
@@ -140,16 +126,27 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
         println!("  [{i}] 0x{start:08x} - 0x{end:08x} ({size} bytes)");
     }
 
-    // Check for trailer
+    // The graph image after the kernel.
     println!();
-    if let Ok((trailer_addr, modules_addr, config_addr)) = find_trailer(&memory) {
-        println!("Trailer: Present at 0x{trailer_addr:08x}");
-        if modules_addr != 0 {
-            println!("  Modules: 0x{modules_addr:08x}");
-        } else {
-            println!("  Modules: None");
-        }
-        println!("  Config:  0x{config_addr:08x}");
+    if let Ok((image_addr, header)) = find_graph_image(&memory) {
+        let modules_addr = image_addr + header.modules_offset;
+        let config_addr = image_addr + header.config_offset;
+        println!(
+            "Graph image: header at 0x{image_addr:08x}, epoch {}, {}",
+            header.epoch,
+            if fluxor_abi::wire::graph_image::signature(
+                &uf2::extract_region(&memory, image_addr, fluxor_abi::wire::graph_image::HEADER_SIZE)
+                    .unwrap_or_default()
+            )
+            .is_some()
+            {
+                "signed"
+            } else {
+                "unsigned"
+            }
+        );
+        println!("  Modules: 0x{modules_addr:08x} ({} bytes)", header.modules_size);
+        println!("  Config:  0x{config_addr:08x} ({} bytes)", header.config_size);
 
         // Check config magic
         if let Some(header_data) = uf2::extract_region(&memory, config_addr, 4) {
@@ -159,95 +156,94 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                 header_data[2],
                 header_data[3],
             ]);
-            // The tools' `MAGIC_FXWR` is the kernel's own `MAGIC_CONFIG`: the
-            // config blob a booting image carries.
+            // The boot config's magic, the codec's own constant.
             match magic {
-                config::MAGIC_FXWR => println!("  Config magic: Valid (0x{magic:08x}, FXWR)"),
+                fluxor_contracts::boot_config::MAGIC => {
+                    println!("  Config magic: Valid (0x{magic:08x}, FXCF)");
+                }
                 _ => println!("  Config magic: Invalid (0x{magic:08x})"),
             }
         }
 
         // Parse and display module table
-        if modules_addr != 0 {
-            if let Some(table_header) =
-                uf2::extract_region(&memory, modules_addr, modules::TABLE_HEADER_SIZE)
-            {
-                let table_magic = u32::from_le_bytes([
-                    table_header[0],
-                    table_header[1],
-                    table_header[2],
-                    table_header[3],
-                ]);
-                if table_magic == modules::MODULE_TABLE_MAGIC {
-                    let module_count = u16::from_le_bytes([table_header[6], table_header[7]]) as usize;
-                    println!("\nModules: {module_count} embedded");
+        if let Some(table_header) =
+            uf2::extract_region(&memory, modules_addr, modules::TABLE_HEADER_SIZE)
+        {
+            let table_magic = u32::from_le_bytes([
+                table_header[0],
+                table_header[1],
+                table_header[2],
+                table_header[3],
+            ]);
+            if table_magic == modules::MODULE_TABLE_MAGIC {
+                let module_count = u16::from_le_bytes([table_header[6], table_header[7]]) as usize;
+                println!("\nModules: {module_count} embedded");
 
-                    // Read entries
-                    let entries_start = modules_addr + modules::TABLE_HEADER_SIZE as u32;
-                    for i in 0..module_count {
-                        let entry_addr = entries_start + (i as u32 * modules::ENTRY_SIZE as u32);
-                        if let Some(entry) =
-                            uf2::extract_region(&memory, entry_addr, modules::ENTRY_SIZE)
+                // Read entries
+                let entries_start = modules_addr + modules::TABLE_HEADER_SIZE as u32;
+                for i in 0..module_count {
+                    let entry_addr = entries_start + (i as u32 * modules::ENTRY_SIZE as u32);
+                    if let Some(entry) =
+                        uf2::extract_region(&memory, entry_addr, modules::ENTRY_SIZE)
+                    {
+                        let name_hash =
+                            u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                        let fmod_offset =
+                            u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+                        let fmod_size =
+                            u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]])
+                                as usize;
+
+                        let fmod_addr = modules_addr + fmod_offset;
+                        if let Some(fmod_header) =
+                            uf2::extract_region(&memory, fmod_addr, modules::MODULE_HEADER_SIZE)
                         {
-                            let name_hash =
-                                u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                            let fmod_offset =
-                                u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-                            let fmod_size =
-                                u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]])
-                                    as usize;
+                            let Some(h) =
+                                fluxor_abi::wire::fmod::header::Header::read(&fmod_header)
+                            else {
+                                continue;
+                            };
+                            let name = String::from_utf8_lossy(h.name_bytes());
+                            let mod_type = h.module_type;
+                            let abi = h.abi_version;
 
-                            let fmod_addr = modules_addr + fmod_offset;
-                            if let Some(fmod_header) =
-                                uf2::extract_region(&memory, fmod_addr, modules::MODULE_HEADER_SIZE)
-                            {
-                                let Some(h) =
-                                    fluxor_abi::wire::fmod::header::Header::read(&fmod_header)
-                                else {
-                                    continue;
-                                };
-                                let name = String::from_utf8_lossy(h.name_bytes());
-                                let mod_type = h.module_type;
-                                let abi = h.abi_version;
+                            let type_str = match mod_type {
+                                1 => "Source",
+                                2 => "Transformer",
+                                3 => "Sink",
+                                4 => "EventHandler",
+                                _ => "Unknown",
+                            };
 
-                                let type_str = match mod_type {
-                                    1 => "Source",
-                                    2 => "Transformer",
-                                    3 => "Sink",
-                                    4 => "EventHandler",
-                                    _ => "Unknown",
-                                };
+                            println!("\n  [{i}] {name} (hash=0x{name_hash:08x})");
+                            println!(
+                                "      type: {type_str} ({mod_type}), abi: v{abi}, size: {fmod_size} bytes"
+                            );
 
-                                println!("\n  [{i}] {name} (hash=0x{name_hash:08x})");
-                                println!(
-                                    "      type: {type_str} ({mod_type}), abi: v{abi}, size: {fmod_size} bytes"
-                                );
+                            // Read the manifest the fmod carries (a header abi of 2 or more)
+                            if abi >= 2 {
+                                let code_size = h.code_size as usize;
+                                let data_size = h.data_size as usize;
+                                let export_count = h.export_count as usize;
+                                let schema_size = h.schema_size as usize;
+                                let manifest_size = h.manifest_size as usize;
 
-                                // Read the manifest the fmod carries (a header abi of 2 or more)
-                                if abi >= 2 {
-                                    let code_size = h.code_size as usize;
-                                    let data_size = h.data_size as usize;
-                                    let export_count = h.export_count as usize;
-                                    let schema_size = h.schema_size as usize;
-                                    let manifest_size = h.manifest_size as usize;
+                                let manifest_offset = modules::MODULE_HEADER_SIZE
+                                    + code_size
+                                    + data_size
+                                    + export_count * 8
+                                    + schema_size;
+                                let manifest_addr = fmod_addr + manifest_offset as u32;
 
-                                    let manifest_offset = modules::MODULE_HEADER_SIZE
-                                        + code_size
-                                        + data_size
-                                        + export_count * 8
-                                        + schema_size;
-                                    let manifest_addr = fmod_addr + manifest_offset as u32;
-
-                                    if manifest_size > 0 {
-                                        if let Some(manifest_data) = uf2::extract_region(
-                                            &memory,
-                                            manifest_addr,
-                                            manifest_size,
-                                        ) {
-                                            match manifest::Manifest::from_bytes(&manifest_data) {
-                                                Ok(m) => println!("{}", m.display()),
-                                                Err(e) => println!("      manifest: error: {e}"),
-                                            }
+                                if manifest_size > 0 {
+                                    if let Some(manifest_data) = uf2::extract_region(
+                                        &memory,
+                                        manifest_addr,
+                                        manifest_size,
+                                    ) {
+                                        match manifest::Manifest::from_bytes(&manifest_data) {
+                                            Ok(m) => println!("{}", m.display()),
+                                            Err(e) => println!("      manifest: error: {e}"),
                                         }
                                     }
                                 }
@@ -258,7 +254,7 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
             }
         }
     } else {
-        println!("Trailer: Not present");
+        println!("Graph image: Not present");
     }
 
     Ok(())
@@ -368,6 +364,44 @@ fn cmd_generate(
     module_root: Option<&std::path::Path>,
     binary: bool,
 ) -> Result<()> {
+    let binary_data = generate_config_bytes(config_path, module_root)?;
+    eprintln!("Config size: {} bytes", binary_data.len());
+    eprintln!("Note: Use 'combine' command to create a complete UF2 with the graph image");
+
+    if let Some(output_path) = output {
+        if binary {
+            std::fs::write(output_path, &binary_data)?;
+            println!("Wrote binary config to {}", output_path.display());
+        } else {
+            return Err(error::Error::Config(
+                "A config UF2 is only produced combined with a firmware image: \
+                 use `--emit=combined --firmware <UF2>`, or `--emit=bin` for the \
+                 raw config binary."
+                    .into(),
+            ));
+        }
+    } else {
+        // Hex dump to stdout (relative offsets)
+        for i in (0..binary_data.len()).step_by(16) {
+            let end = (i + 16).min(binary_data.len());
+            let hex: String = binary_data[i..end]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{i:04x}: {hex}");
+        }
+    }
+
+    Ok(())
+}
+
+/// The boot config a hosted build (Linux, wasm) compiles from the graph at
+/// `config_path`, its rings charged against the target's buffer arena.
+fn generate_config_bytes(
+    config_path: &Path,
+    module_root: Option<&std::path::Path>,
+) -> Result<Vec<u8>> {
     let config: serde_json::Value =
         stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
 
@@ -433,35 +467,7 @@ fn cmd_generate(
         false,
     )?;
 
-    eprintln!("Config size: {} bytes", binary_data.len());
-    eprintln!("Note: Use 'combine' command to create a complete UF2 with trailer");
-
-    if let Some(output_path) = output {
-        if binary {
-            std::fs::write(output_path, &binary_data)?;
-            println!("Wrote binary config to {}", output_path.display());
-        } else {
-            return Err(error::Error::Config(
-                "A config UF2 is only produced combined with a firmware image: \
-                 use `--emit=combined --firmware <UF2>`, or `--emit=bin` for the \
-                 raw config binary."
-                    .into(),
-            ));
-        }
-    } else {
-        // Hex dump to stdout (relative offsets)
-        for i in (0..binary_data.len()).step_by(16) {
-            let end = (i + 16).min(binary_data.len());
-            let hex: String = binary_data[i..end]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!("{i:04x}: {hex}");
-        }
-    }
-
-    Ok(())
+    Ok(binary_data)
 }
 
 /// Refuse a module whose code is over the loader's ceiling for the target.
@@ -518,6 +524,12 @@ fn check_state_budget(
     if modules.is_empty() {
         return Ok(());
     }
+    let Some(state_arena_kb) = target.state_arena_kb else {
+        return Err(Error::Config(format!(
+            "{} has no kernel, so it has no state arena to admit a graph against",
+            target.id
+        )));
+    };
     let by_hash: std::collections::HashMap<u32, &modules::ModuleInfo> =
         modules.iter().map(|m| (m.name_hash, m)).collect();
     let instances = crate::config::module_entries(config_data)?;
@@ -529,7 +541,7 @@ fn check_state_budget(
     // or what the graph's envelope places (`capacity::planned_state_arena`).
     let (arena, envelope) = crate::capacity::planned_state_arena(
         target.runtime(),
-        target.state_arena_kb as u64 * 1024,
+        state_arena_kb as u64 * 1024,
         target.buffer_arena_kb.map(|kb| kb as u64 * 1024),
         config.get("capacity"),
     );
@@ -624,15 +636,21 @@ fn check_state_budget(
         } else {
             ""
         };
+        let remedy = if crate::capacity::kernel_places_arenas(target.runtime()) {
+            format!(
+                "give the state arena more: `capacity: {{ state_arena }}`, or state_arena_kb \
+                 in targets/silicon/{}.toml (either is taken from the kernel's static pool, \
+                 which costs the buffer arena and the stack)",
+                target.id
+            )
+        } else {
+            format!("{}'s kernel fixes the size of its state arena", target.id)
+        };
         return Err(Error::Config(format!(
             "graph needs {total} B of module state but {}'s arena is {arena} B{by} — over by \
-             {} B. Drop a module, select a smaller variant, or give the state arena more: \
-             `capacity: {{ state_arena }}` (on RP, taken from the kernel's static pool) or \
-             state_arena_kb in targets/silicon/{}.toml (which costs the buffer arena and the \
-             stack).",
+             {} B. Drop a module or select a smaller variant; {remedy}.",
             target.id,
             total - arena,
-            target.id,
         )));
     }
     Ok(())
@@ -674,19 +692,40 @@ fn check_ring_demand(
 }
 
 /// The 16 MiB alignment `.bss` starts on in a RAM-loaded aarch64 image
-/// (`linker/memory-bcm2712.x`, `linker/memory-uefi.x`): the image's trailer,
-/// module table and config sit between the end of its file-backed sections
-/// and that boundary, which `_start` zeroes from.
+/// (`linker/memory-bcm2712.x`, `linker/memory-uefi.x`): the graph image's
+/// header, module table and config sit between the end of its file-backed
+/// sections and that boundary, which `_start` zeroes from.
 const AARCH64_BSS_ALIGN: u32 = 0x0100_0000;
 
 /// Where the payload window of a RAM-loaded aarch64 image ends: `__bss_start`,
 /// the first 16 MiB boundary at or past the image's file-backed end. The
-/// kernel bounds its config parse by the same address
-/// (`kernel::boot::config::trailer_config_window`), so a config that ends
-/// past it is refused here, by name, rather than erased by the boot's `.bss`
-/// clear and refused before the logger runs.
+/// kernel bounds the graph image by the same address
+/// (`kernel::boot::config::firmware_image_window`), so an image that reaches
+/// it is refused here, by name, rather than erased in part by the boot's
+/// `.bss` clear and refused before the logger runs.
 fn aarch64_payload_window_end(firmware_end: u32) -> u64 {
     (firmware_end as u64).div_ceil(AARCH64_BSS_ALIGN as u64) * AARCH64_BSS_ALIGN as u64
+}
+
+/// Refuse a graph image whose config, the last of its regions, is placed at
+/// `config_addr` in a RAM-loaded aarch64 image whose file-backed sections end
+/// at `firmware_end`, unless the whole blob, `total_len` bytes as its header
+/// states, ends below `__bss_start`: the header, module table and config then
+/// all lie in the window. A blob that ends at the boundary or past it is
+/// refused: `.bss` starts there.
+fn check_aarch64_payload_window(config_addr: u32, config: &[u8], firmware_end: u32) -> Result<()> {
+    let cfg = fluxor_contracts::boot_config::decode(config)
+        .map_err(|e| error::Error::Config(format!("boot config refused: {e}")))?;
+    let window_end = aarch64_payload_window_end(firmware_end);
+    let config_end = u64::from(config_addr) + cfg.total_len() as u64;
+    if config_end >= window_end {
+        return Err(error::Error::Config(format!(
+            "Combined image payload ends at {config_end:#x}, reaching the payload window's end \
+             at {window_end:#x} where the kernel's .bss begins (the graph image's header, module \
+             table and config must all end below it). Shrink the module set or config."
+        )));
+    }
+    Ok(())
 }
 
 /// Admit each module's stack depth against the stack it will run on.
@@ -1075,80 +1114,69 @@ fn cmd_combine(
     check_gated_admission(&modules, &config, &target_desc)?;
     let programs = crate::modules::collect_programs(&config)?;
 
-    let modules_data = if !modules.is_empty() || !programs.is_empty() {
-        if verbose {
-            eprintln!("Embedding {} module(s):", modules.len());
-            for module in &modules {
-                eprintln!(
-                    "  - {} ({} bytes, type={})",
-                    module.name,
-                    module.data.len(),
-                    module.module_type
-                );
-            }
+    if verbose {
+        eprintln!("Embedding {} module(s):", modules.len());
+        for module in &modules {
+            eprintln!(
+                "  - {} ({} bytes, type={})",
+                module.name,
+                module.data.len(),
+                module.module_type
+            );
         }
-        Some(crate::modules::build_module_table_with_programs(
-            &modules, &programs,
-        )?)
-    } else {
-        None
-    };
+    }
+    let modules_data = crate::modules::build_module_table_with_programs(&modules, &programs)?;
 
-    // Calculate addresses - trailer goes right after firmware, then modules, then config
-    // All sections 256-byte aligned (UF2 block payload size)
-    const UF2_BLOCK_ALIGN: u32 = 256;
-    // aarch64 PIC modules use ADRP which requires code_base to be 4KB aligned.
-    // The combine tool aligns WITHIN the blob so offset+header = 4KB boundary,
-    // but modules_addr itself must also be 4KB aligned for absolute addresses.
-    const MODULES_ALIGN: u32 = 4096;
+    // The graph image goes right after the firmware: its header on the next
+    // 256-byte boundary (a UF2 block's payload), where the kernel looks for
+    // it, and the module table and config where `graph_image::place` puts
+    // them from there.
+    let image_addr = firmware_max_addr.div_ceil(256) * 256;
+    let header = crate::graph_image::header(
+        u64::from(image_addr),
+        &modules_data,
+        &config_data,
+        0,
+    )?;
+    let modules_addr = image_addr + header.modules_offset;
+    let config_addr = image_addr + header.config_offset;
+    let image_end = u64::from(image_addr) + header.end();
 
-    // Trailer immediately after firmware (256-byte aligned)
-    let trailer_addr = (firmware_max_addr + UF2_BLOCK_ALIGN - 1) & !(UF2_BLOCK_ALIGN - 1);
-
-    // Modules after trailer: 4KB aligned for aarch64 ADRP compatibility
-    let modules_addr = if modules_data.is_some() {
-        let raw = trailer_addr + UF2_BLOCK_ALIGN;
-        (raw + MODULES_ALIGN - 1) & !(MODULES_ALIGN - 1)
-    } else {
-        0 // Sentinel for "no modules"
-    };
-
-    // Config after modules (or after trailer if no modules)
-    let config_addr = if let Some(ref mdata) = modules_data {
-        let after_modules = modules_addr + mdata.len() as u32;
-        (after_modules + UF2_BLOCK_ALIGN - 1) & !(UF2_BLOCK_ALIGN - 1)
-    } else {
-        trailer_addr + UF2_BLOCK_ALIGN
-    };
-
-    // A RAM-loaded aarch64 image carries its payload below `.bss`: past that
-    // boundary `_start` zeroes it before the kernel reads it.
+    // A RAM-loaded aarch64 image carries its graph image below `.bss`: past
+    // that boundary `_start` zeroes it before the kernel reads it.
     if is_aarch64 {
-        let window_end = aarch64_payload_window_end(firmware_max_addr);
-        let config_end = config_addr as u64 + config_data.len() as u64;
-        if config_end > window_end {
-            return Err(error::Error::Config(format!(
-                "Combined image payload ends at {config_end:#x}, past the payload window that \
-                 ends at {window_end:#x} where the kernel's .bss begins (the trailer, module \
-                 table and config must all lie below it). Shrink the module set or config."
-            )));
-        }
+        check_aarch64_payload_window(config_addr, &config_data, firmware_max_addr)?;
     }
 
     // Ensure the combined image ends below the regions the board's flash is
-    // partitioned into above it: the two graph slots and the parameter
-    // store, which start at slot A (`flash_layout::graph_flash`, from the
-    // board's flash size). Only applies to flash-based targets.
+    // partitioned into above it: the two graph slots, the data store and the
+    // parameter store, which start at slot A (`flash_layout::graph_flash`,
+    // from the board's flash size). Only applies to flash-based targets.
     if let Some(layout) = target_desc.graph_flash() {
-        let slot_a_addr = XIP_BASE + layout.slot_a;
-        let config_end = config_addr + config_data.len() as u32;
-        if config_end > slot_a_addr {
+        let slot_a_addr = u64::from(XIP_BASE + layout.slot_a);
+        if image_end > slot_a_addr {
             return Err(error::Error::Config(format!(
-                "Combined image end ({config_end:#010x}) overlaps the graph slots and parameter store from {slot_a_addr:#010x} (a {} KiB flash). Reduce firmware/config size.",
+                "Combined image end ({image_end:#010x}) overlaps the graph slots and parameter store from {slot_a_addr:#010x} (a {} KiB flash). Reduce firmware/config size.",
                 layout.flash_size / 1024
             )));
         }
     }
+
+    // A kernel image with a signing root admits only a graph image signed by
+    // it, so the header is signed with the key whose public key the root is.
+    // A root this workspace holds no key for would leave the image unable to
+    // boot its own graph: refused here.
+    let seed = crate::signing::seed(None, &project_root)?;
+    if let Some(r) = root {
+        if seed.map(|s| crate::signing::public_key(&s)) != Some(r) {
+            return Err(error::Error::Config(format!(
+                "the image's signing root {} is not the public key of this workspace's signing \
+                 key, which signs the graph it carries: the kernel would refuse its own graph",
+                crate::signing::root_id(&r)
+            )));
+        }
+    }
+    let header_bytes = crate::graph_image::header_bytes(&header, seed.as_ref());
 
     if verbose {
         let base_str = if is_aarch64 {
@@ -1158,14 +1186,12 @@ fn cmd_combine(
         };
         eprintln!("Layout:");
         eprintln!("  Firmware:  0x{base_str:08x} - 0x{firmware_max_addr:08x}");
-        eprintln!("  Trailer:   0x{trailer_addr:08x} (16 bytes)");
-        if let Some(ref mdata) = modules_data {
-            eprintln!(
-                "  Modules:   0x{:08x} ({} bytes)",
-                modules_addr,
-                mdata.len()
-            );
-        }
+        eprintln!("  Header:    0x{image_addr:08x} (256 bytes)");
+        eprintln!(
+            "  Modules:   0x{:08x} ({} bytes)",
+            modules_addr,
+            modules_data.len()
+        );
         eprintln!(
             "  Config:    0x{:08x} ({} bytes)",
             config_addr,
@@ -1173,52 +1199,24 @@ fn cmd_combine(
         );
     }
 
-    // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
-    let payload_crc: u16 = 0; // reserved
-
-    // Build trailer (16 bytes)
-    let mut trailer = Vec::with_capacity(16);
-    trailer.extend_from_slice(&TRAILER_MAGIC.to_le_bytes());
-    trailer.push(TRAILER_VERSION);
-    trailer.push(0); // flags
-    trailer.extend_from_slice(&payload_crc.to_le_bytes()); // CRC-16 of payload
-    trailer.extend_from_slice(&modules_addr.to_le_bytes());
-    trailer.extend_from_slice(&config_addr.to_le_bytes());
-    assert_eq!(trailer.len(), 16);
-
     // Build the combined image.
-    // aarch64: raw binary (firmware + padding + trailer + modules + config)
+    // aarch64: raw binary (firmware + padding + header + modules + config)
     // RP:      UF2 container with blocks for each section
     let (combined, firmware_size) = if is_aarch64 {
         let base = aarch64_load_base;
         let mut raw = firmware_data; // already raw bytes for aarch64
         let fw_size = raw.len();
-
-        // Pad to trailer address
-        let pad_to = (trailer_addr - base) as usize;
-        if pad_to > raw.len() {
-            raw.resize(pad_to, 0);
-        }
-
-        // Append trailer
-        raw.extend_from_slice(&trailer);
-
-        // Pad to modules address (if modules exist)
-        if let Some(ref mdata) = modules_data {
-            let mod_off = (modules_addr - base) as usize;
-            if mod_off > raw.len() {
-                raw.resize(mod_off, 0);
+        for (addr, bytes) in [
+            (image_addr, &header_bytes[..]),
+            (modules_addr, &modules_data[..]),
+            (config_addr, &config_data[..]),
+        ] {
+            let off = (addr - base) as usize;
+            if off > raw.len() {
+                raw.resize(off, 0);
             }
-            raw.extend_from_slice(mdata);
+            raw.extend_from_slice(bytes);
         }
-
-        // Pad to config address
-        let cfg_off = (config_addr - base) as usize;
-        if cfg_off > raw.len() {
-            raw.resize(cfg_off, 0);
-        }
-        raw.extend_from_slice(&config_data);
-
         (raw, fw_size)
     } else {
         // UF2 path for RP targets
@@ -1235,20 +1233,23 @@ fn cmd_combine(
             }
         };
 
-        let modules_uf2 = modules_data
-            .as_ref()
-            .map(|mdata| create_uf2_blocks(mdata, modules_addr, firmware_family_id));
-        let trailer_uf2 = create_uf2_blocks(&trailer, trailer_addr, firmware_family_id);
-        let config_uf2 = create_uf2_blocks(&config_data, config_addr, firmware_family_id);
-
         let firmware_size = firmware_data.len();
         let mut combined = firmware_data;
-        combined.extend_from_slice(&trailer_uf2);
-        if let Some(muf2) = modules_uf2 {
-            combined.extend_from_slice(&muf2);
-        }
-        combined.extend_from_slice(&config_uf2);
-
+        combined.extend_from_slice(&create_uf2_blocks(
+            &header_bytes,
+            image_addr,
+            firmware_family_id,
+        ));
+        combined.extend_from_slice(&create_uf2_blocks(
+            &modules_data,
+            modules_addr,
+            firmware_family_id,
+        ));
+        combined.extend_from_slice(&create_uf2_blocks(
+            &config_data,
+            config_addr,
+            firmware_family_id,
+        ));
         fix_uf2_block_numbers(&mut combined);
         (combined, firmware_size)
     };
@@ -1263,7 +1264,7 @@ fn cmd_combine(
         );
     } else {
         // Concise output: filename modules config total
-        let modules_size = modules_data.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modules_size = modules_data.len();
         println!(
             "\x1b[1;32mSuccess\x1b[0m {} fw={}K mod={}K cfg={}K total={}K",
             output_path
@@ -1561,9 +1562,9 @@ pub fn cmd_workload_image(
 
 /// Emit a graph image: a 256-byte header, the module table (with the
 /// graph's program section after it) from the first 4 KiB boundary, and the
-/// static config from the next 256-byte boundary. An RP image is padded with
-/// 0xFF to the flash slot size; any other is as long as its payload. The
-/// header layout is `flash_layout::GRAPH_SLOT_*`.
+/// static config from the next 256-byte boundary. An RP image ends on a
+/// whole flash page; any other is as long as its payload. The header is
+/// `wire::graph_image`'s, written by `graph_image::compose`.
 ///
 /// The header records the epoch, the in-image offsets and sizes of the
 /// modules and config regions, a SHA-256 over their concatenation, and the
@@ -1580,16 +1581,8 @@ fn cmd_graph_image(
     module_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> Result<()> {
-    // The graph-image header, as the kernel and `graph_slot` read it
-    // (`crates/fluxor-abi/src/platform/rp/flash_layout.rs`, `GRAPH_SLOT_*`; an RP
-    // flash A/B slot holds exactly this format).
-    use crate::modules::sdk_layout::flash_layout as fl;
-    const HEADER_SIZE: usize = fl::GRAPH_SLOT_HEADER_SIZE;
-    const MODULES_ALIGN: usize = 4096;
-    const SECTION_ALIGN: usize = 256;
     /// RAM-staged image ceiling for targets without a flash aperture
-    /// (Pi 5 OTA staging region; mirrors the kernel's
-    /// `MAX_MODULES_BLOB_SIZE` reasoning).
+    /// (Pi 5 OTA staging region; mirrors the kernel's `STAGE_CAPACITY`).
     const RAM_IMAGE_SIZE: usize = 8 * 1024 * 1024;
 
     // Parse config (reusing the same path as cmd_combine).
@@ -1663,66 +1656,27 @@ fn cmd_graph_image(
         None => RAM_IMAGE_SIZE,
     };
 
-    // Lay out the image: header | pad → 4KB | modules | pad → 256B | config.
-    let modules_offset = HEADER_SIZE.div_ceil(MODULES_ALIGN) * MODULES_ALIGN;
-    let modules_end = modules_offset + modules_data.len();
-    let config_offset = modules_end.div_ceil(SECTION_ALIGN) * SECTION_ALIGN;
-    let config_end = config_offset + config_data.len();
-    if config_end > image_size {
+    // Header, module table, config, laid out and hashed by the one writer;
+    // with a key, signed over the header's signed bytes. Without one the
+    // image is unsigned, which only a device with a rootless kernel image
+    // accepts.
+    let seed = sign_key.map(read_signing_seed).transpose()?;
+    let mut out = crate::graph_image::compose(&modules_data, &config_data, epoch, seed.as_ref())?;
+    let header = crate::graph_image::read(&out, "the graph image")?;
+    let (modules_offset, config_offset) = (header.modules_offset, header.config_offset);
+    if out.len() > image_size {
         return Err(error::Error::Config(format!(
-            "Graph image ({config_end} bytes) exceeds the size ceiling ({image_size} bytes). Reduce modules/config."
+            "Graph image ({} bytes) exceeds the size ceiling ({image_size} bytes). Reduce modules/config.",
+            out.len()
         )));
     }
-
-    // Build the payload bytes that are covered by the SHA-256.
-    let mut payload = Vec::with_capacity(modules_data.len() + config_data.len());
-    payload.extend_from_slice(&modules_data);
-    payload.extend_from_slice(&config_data);
-    let digest = {
-        use sha2::Digest;
-        sha2::Sha256::digest(&payload)
-    };
-
-    // Compose the final image. A flash image ends on a whole page, which is
-    // what `graph_slot` programs.
-    let emit_len = if flash_slot.is_some() {
-        config_end.div_ceil(256) * 256
-    } else {
-        config_end
-    };
-    let mut out = vec![0xFFu8; emit_len];
-    // Header.
-    out[0..4].copy_from_slice(&fl::GRAPH_SLOT_MAGIC.to_le_bytes());
-    out[4] = fl::GRAPH_SLOT_VERSION;
-    out[8..16].copy_from_slice(&epoch.to_le_bytes());
-    out[16..20].copy_from_slice(&(modules_offset as u32).to_le_bytes());
-    out[20..24].copy_from_slice(&(modules_data.len() as u32).to_le_bytes());
-    out[24..28].copy_from_slice(&(config_offset as u32).to_le_bytes());
-    out[28..32].copy_from_slice(&(config_data.len() as u32).to_le_bytes());
-    out[32..64].copy_from_slice(&digest);
-    // ABI-surface pin (header 64..96): the wire-surface digest of the
-    // substrate this image was built against (`hash::abi_surface_digest`).
-    // The RP boot slot selector, `graph_slot` and the OTA staging commit
-    // all enforce it: an image built for an incompatible kernel fails
-    // closed (to the other flash slot, or with -EACCES) instead of loading
-    // modules with stale hardcoded wire values.
-    let pin = fl::GRAPH_SLOT_ABI_SURFACE_OFFSET;
-    out[pin..pin + 32].copy_from_slice(&hash::abi_surface_digest());
-    // Signature record (header 96..168): "SIG1", the key id (the first
-    // four bytes of SHA-256 of the public key), and Ed25519 over the
-    // header's first 96 bytes, which bind the payload through its digest.
-    // Left erased when no key is given: an unsigned image, which only a
-    // device with a rootless kernel image accepts.
-    let signed = match sign_key {
-        Some(key_path) => Some(sign_graph_image_header(
-            &mut out[..HEADER_SIZE],
-            &read_signing_seed(key_path)?,
-        )),
-        None => None,
-    };
-    // Payload.
-    out[modules_offset..modules_offset + modules_data.len()].copy_from_slice(&modules_data);
-    out[config_offset..config_offset + config_data.len()].copy_from_slice(&config_data);
+    // A flash image ends on a whole page, which is what `graph_slot`
+    // programs.
+    if flash_slot.is_some() {
+        out.resize(out.len().div_ceil(256) * 256, 0xFF);
+    }
+    let emit_len = out.len();
+    let signed = seed.map(|s| crate::signing::public_key(&s));
 
     std::fs::write(output_path, &out)?;
     if verbose {
@@ -1748,23 +1702,6 @@ fn cmd_graph_image(
         },
     );
     Ok(())
-}
-
-/// Sign a graph-image header in place: the signature record
-/// (`flash_layout::GRAPH_SLOT_SIGNATURE_*`) over the signed bytes before it.
-/// Answers the signer's public key.
-fn sign_graph_image_header(header: &mut [u8], seed: &[u8; 32]) -> [u8; 32] {
-    use crate::modules::sdk_layout::flash_layout as fl;
-    let (pk, sig) = crate::crypto::sign(seed, &header[..fl::GRAPH_SLOT_SIGNED_LEN]);
-    let key_id = {
-        use sha2::Digest;
-        sha2::Sha256::digest(pk)
-    };
-    let at = fl::GRAPH_SLOT_SIGNATURE_OFFSET;
-    header[at..at + 4].copy_from_slice(&fl::GRAPH_SLOT_SIGNATURE_MAGIC.to_le_bytes());
-    header[at + 4..at + 8].copy_from_slice(&key_id[..4]);
-    header[at + 8..at + fl::GRAPH_SLOT_SIGNATURE_LEN].copy_from_slice(&sig);
-    pk
 }
 
 #[cfg(test)]
@@ -1797,21 +1734,27 @@ mod state_budget_tests {
         }
     }
 
-    /// A built config holding one entry per instance: `(type, params TLV)`.
+    /// A built config holding one module record per instance:
+    /// `(type, params TLV)`.
     fn image(instances: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut entries = Vec::new();
-        for (ty, params) in instances {
-            entries.extend_from_slice(&(10 + params.len() as u32).to_le_bytes());
-            entries.extend_from_slice(&crate::hash::fnv1a_hash(ty.as_bytes()).to_le_bytes());
-            entries.extend_from_slice(&[0, 0]);
-            entries.extend_from_slice(params);
-        }
-        let mut data = vec![0u8; 16];
-        data[0..4].copy_from_slice(&crate::config::MAGIC_FXWR.to_le_bytes());
-        data.extend_from_slice(&(instances.len() as u16).to_le_bytes());
-        data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        data.extend_from_slice(&entries);
-        data
+        use fluxor_contracts::boot_config::{encode, BootConfigSpec, DomainRecord, ModuleRecord};
+        let modules: Vec<ModuleRecord<'_>> = instances
+            .iter()
+            .zip(0u16..)
+            .map(|(&(ty, params), id)| ModuleRecord {
+                name_hash: crate::hash::fnv1a_hash(ty.as_bytes()),
+                id,
+                domain: 0,
+                pre_pass: false,
+                params,
+            })
+            .collect();
+        encode(&BootConfigSpec {
+            modules: &modules,
+            domains: &[DomainRecord::default()],
+            ..BootConfigSpec::default()
+        })
+        .expect("encodes")
     }
 
     fn pico2w() -> crate::target::TargetDescriptor {
@@ -1825,7 +1768,7 @@ mod state_budget_tests {
     #[test]
     fn an_rp_envelope_moves_the_state_arena() {
         let target = pico2w();
-        let default = target.state_arena_kb as u64 * 1024;
+        let default = target.state_arena_kb.expect("an RP arena") as u64 * 1024;
         let buffer = target.buffer_arena_kb.expect("rp buffer arena") as u64 * 1024;
         // Fits the default split with 16 KiB to spare.
         let mods = [module("a", default - 16 * 1024)];
@@ -1856,7 +1799,7 @@ mod state_budget_tests {
     #[test]
     fn each_instance_is_charged() {
         let target = pico2w();
-        let default = target.state_arena_kb as u64 * 1024;
+        let default = target.state_arena_kb.expect("an RP arena") as u64 * 1024;
         let mods = [module("a", default / 2 + 1024)];
         check_state_budget(&mods, &json!({}), &image(&[("a", &[])]), &target)
             .expect("one instance fits");
@@ -1870,7 +1813,7 @@ mod state_budget_tests {
     #[test]
     fn a_committed_heap_is_charged_at_its_cap() {
         let target = pico2w();
-        let default = target.state_arena_kb as u64 * 1024;
+        let default = target.state_arena_kb.expect("an RP arena") as u64 * 1024;
         let state = default - 16 * 1024;
         let mods = [module_with_heap("a", state, 32 * 1024)];
         check_state_budget(&mods, &json!({}), &image(&[("a", &[])]), &target)
@@ -1882,42 +1825,38 @@ mod state_budget_tests {
 }
 
 #[cfg(test)]
-mod graph_image_signature_tests {
-    use super::sign_graph_image_header;
-    use crate::modules::sdk_layout::flash_layout as fl;
+mod payload_window_tests {
+    use super::{aarch64_payload_window_end, check_aarch64_payload_window};
+    use fluxor_contracts::boot_config::{encode, BootConfigSpec, DomainRecord};
 
-    /// The record lands where the kernel reads it, names the key, and
-    /// verifies over exactly the signed bytes: changing the epoch breaks it,
-    /// and the bytes after the record are not covered.
+    /// The window is bounded by the blob's own `total_len`: a config ending
+    /// exactly at `__bss_start` is refused, one ending 8 bytes below it is
+    /// accepted.
     #[test]
-    fn a_signed_header_verifies_over_its_signed_bytes() {
-        let mut h = vec![0xFFu8; fl::GRAPH_SLOT_HEADER_SIZE];
-        h[0..4].copy_from_slice(&fl::GRAPH_SLOT_MAGIC.to_le_bytes());
-        h[8..16].copy_from_slice(&3u64.to_le_bytes());
-        let pk = sign_graph_image_header(&mut h, &[9u8; 32]);
-        let at = fl::GRAPH_SLOT_SIGNATURE_OFFSET;
-        assert_eq!(&h[at..at + 4], b"SIG1");
-        let id = {
-            use sha2::Digest;
-            sha2::Sha256::digest(pk)
-        };
-        assert_eq!(&h[at + 4..at + 8], &id[..4]);
-        let sig: [u8; 64] = h[at + 8..at + 72].try_into().unwrap();
-        assert!(crate::crypto::verify(
-            &pk,
-            &h[..fl::GRAPH_SLOT_SIGNED_LEN],
-            &sig
-        ));
-        let mut raised = h.clone();
-        raised[8] = 4;
-        assert!(!crate::crypto::verify(
-            &pk,
-            &raised[..fl::GRAPH_SLOT_SIGNED_LEN],
-            &sig
-        ));
-        assert!(h[at + fl::GRAPH_SLOT_SIGNATURE_LEN..]
-            .iter()
-            .all(|&b| b == 0xFF));
+    fn a_config_must_end_below_bss_start() {
+        let blob = encode(&BootConfigSpec {
+            domains: &[DomainRecord::default()],
+            ..BootConfigSpec::default()
+        })
+        .expect("encodes");
+        let firmware_end = 0x0023_0000u32;
+        let bss = aarch64_payload_window_end(firmware_end);
+        assert_eq!(bss, 0x0100_0000);
+        let len = blob.len() as u64;
+
+        let at_boundary = u32::try_from(bss - len).unwrap();
+        let err = check_aarch64_payload_window(at_boundary, &blob, firmware_end)
+            .expect_err("ends at __bss_start");
+        assert!(err.to_string().contains(".bss"), "{err}");
+
+        let below = u32::try_from(bss - len - 8).unwrap();
+        check_aarch64_payload_window(below, &blob, firmware_end).expect("ends 8 bytes below");
+
+        // Bytes past `total_len` are not the blob's: a trailing pad does
+        // not move where it ends.
+        let mut padded = blob.clone();
+        padded.extend_from_slice(&[0u8; 64]);
+        check_aarch64_payload_window(below, &padded, firmware_end).expect("same blob");
     }
 }
 

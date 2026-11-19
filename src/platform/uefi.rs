@@ -709,58 +709,6 @@ fn report_stages(con: &Console, reached: &str, clock: &Clock) {
     con.puts("\n");
 }
 
-/// The graph's `boot:` map, from the image's config blob; all defaults if it
-/// has none or the blob does not parse.
-struct BootParams {
-    fault_probe: bool,
-    lockup_probe: bool,
-    summary_every_s: u64,
-    summary_for_s: u64,
-    max_uptime_s: u64,
-}
-
-fn boot_params() -> BootParams {
-    static mut CONFIG: core::mem::MaybeUninit<fluxor::kernel::boot::config::Config> =
-        core::mem::MaybeUninit::uninit();
-    // SAFETY: the boot core, once, before anything else reads the config.
-    let raw = unsafe {
-        let slot = &raw mut CONFIG;
-        let config = (*slot).write(fluxor::kernel::boot::config::Config::empty());
-        if fluxor::kernel::boot::config::read_config_into(config) {
-            config.boot_params
-        } else {
-            [0; fluxor::kernel::boot::config::BOOT_PARAMS_BYTES]
-        }
-    };
-    let word = |at: usize| {
-        u64::from(u32::from_le_bytes([
-            raw[at],
-            raw[at + 1],
-            raw[at + 2],
-            raw[at + 3],
-        ]))
-    };
-    BootParams {
-        fault_probe: raw[1] != 0,
-        lockup_probe: raw[2] != 0,
-        summary_every_s: match word(4) {
-            0 => 10,
-            n => n,
-        },
-        summary_for_s: word(8),
-        max_uptime_s: word(12),
-    }
-}
-
-/// Fault on purpose: a store into the boot stack's unmapped guard page.
-fn fault_probe() -> ! {
-    let guard = core::ptr::addr_of!(__stack_guard) as *mut u64;
-    // SAFETY: not safe, on purpose: `build_map` left this page unmapped, so the
-    // store faults and the exception path reports it.
-    unsafe { core::ptr::write_volatile(guard, 0) };
-    park()
-}
-
 fn stack_guard_probe(addr: u64) -> Option<usize> {
     let guard = core::ptr::addr_of!(__stack_guard) as u64;
     if addr >= guard && addr < guard + 4096 {
@@ -848,12 +796,6 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     // fault stacks are indexed by this field from the first interrupt on.
     cpu::configure_core_id(core_id_shift(&machine));
 
-    let params = boot_params();
-    if params.fault_probe {
-        report_stages(&con, "kernel_entry,mmu,acpi", &clock);
-        fault_probe();
-    }
-
     let mut reached = Reached::new();
     for stage in ["kernel_entry", "mmu", "acpi"] {
         reached.push(stage);
@@ -864,14 +806,14 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     let controller = unsafe { start_interrupts(&machine, info) };
     let Some(controller) = controller else {
         con.puts("[boot] error irq no_controller\n");
-        idle(&con, info, &machine, reached.as_str(), &params, &clock)
+        idle(&con, info, &machine, reached.as_str(), &clock)
     };
     // SAFETY: vectors and controller are ready for the first interrupt.
     unsafe { core::arch::asm!("msr daifclr, #2") };
 
     if !sgi_self_test(&clock) {
         con.puts("[boot] error irq sgi_not_received\n");
-        idle(&con, info, &machine, reached.as_str(), &params, &clock)
+        idle(&con, info, &machine, reached.as_str(), &clock)
     }
     reached.push("irq");
     con.puts("[boot] stage=irq ctrl=");
@@ -884,7 +826,7 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
 
     let Some(took_us) = timer_self_test(&clock) else {
         con.puts("[boot] error timer deadline_missed\n");
-        idle(&con, info, &machine, reached.as_str(), &params, &clock)
+        idle(&con, info, &machine, reached.as_str(), &clock)
     };
     reached.push("timer");
     con.puts("[boot] stage=timer src=");
@@ -907,7 +849,7 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     fluxor::kernel::exec::step_guard::init();
     if !step_guard_self_test(&clock) {
         con.puts("[boot] error step_guard not_caught\n");
-        idle(&con, info, &machine, reached.as_str(), &params, &clock)
+        idle(&con, info, &machine, reached.as_str(), &clock)
     }
     reached.push("step_guard");
     con.puts("[boot] stage=step_guard self_test=ok\n");
@@ -930,7 +872,6 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
             &machine,
             |mpidr| redistributor_of(&machine, mpidr),
             period,
-            params.lockup_probe,
             || clock.elapsed_us(),
         )
     };
@@ -992,9 +933,9 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     devices::configure(&machine);
 
     // A graph with no modules is an image that only proves the boot: nothing is
-    // left to run, so the summary repeats until the uptime limit.
+    // left to run, so the summary repeats.
     if !graph_has_modules() {
-        idle(&con, info, &machine, reached.as_str(), &params, &clock)
+        idle(&con, info, &machine, reached.as_str(), &clock)
     }
     let modules = match start_graph() {
         Ok(modules) => modules,
@@ -1009,7 +950,7 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
             con.puts("[boot] error graph ");
             con.puts(why);
             con.puts("\n");
-            idle(&con, info, &machine, reached.as_str(), &params, &clock)
+            idle(&con, info, &machine, reached.as_str(), &clock)
         }
     };
     reached.push("graph");
@@ -1024,7 +965,7 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     con.puts("\n");
     report_stages(&con, reached.as_str(), &clock);
 
-    run(con, reached, params, clock)
+    run(reached, clock)
 }
 
 /// The stages reached, for the summary line.
@@ -1121,10 +1062,12 @@ fn report_interrupts() {
 /// How often the boot core looks at the other cores' tick counts.
 const WATCH_EVERY_US: u64 = 500_000;
 
+/// How often the boot core repeats its summary, for a console that joins late.
+const SUMMARY_EVERY_S: u64 = 10;
+
 /// What both loops do between passes: move the log to the console, watch the
-/// other cores for a lockup, power the machine off at the uptime limit, and
-/// say when the summary is due. Nothing here waits on an interrupt, so it holds
-/// with interrupts masked.
+/// other cores for a lockup, and say when the summary is due. Nothing here
+/// waits on an interrupt, so it holds with interrupts masked.
 struct Upkeep {
     watch: smp::Watch,
     watch_at_us: u64,
@@ -1132,17 +1075,16 @@ struct Upkeep {
 }
 
 impl Upkeep {
-    fn new(params: &BootParams, clock: &Clock) -> Self {
+    fn new(clock: &Clock) -> Self {
         Upkeep {
             watch: smp::Watch::new(),
             watch_at_us: 0,
-            summary_at_s: clock.elapsed_s() + params.summary_every_s,
+            summary_at_s: clock.elapsed_s() + SUMMARY_EVERY_S,
         }
     }
 
-    /// One round. True when the summary is due, which it is every
-    /// `summary_every_s` for the first `summary_for_s` (always, if 0).
-    fn poll(&mut self, con: &Console, params: &BootParams, clock: &Clock) -> bool {
+    /// One round. True when the summary is due, every `SUMMARY_EVERY_S`.
+    fn poll(&mut self, clock: &Clock) -> bool {
         let now_us = clock.elapsed_us();
         if now_us >= self.watch_at_us {
             self.watch.check(now_us);
@@ -1150,23 +1092,16 @@ impl Upkeep {
         }
         drain_log();
         let now = clock.elapsed_s();
-        if params.max_uptime_s != 0 && now >= params.max_uptime_s {
-            con.puts("[power] max_uptime reached\n");
-            psci::system_off();
-            park();
-        }
-        if now < self.summary_at_s || (params.summary_for_s != 0 && now > params.summary_for_s) {
+        if now < self.summary_at_s {
             return false;
         }
-        self.summary_at_s = now + params.summary_every_s;
+        self.summary_at_s = now + SUMMARY_EVERY_S;
         true
     }
 }
 
 /// What the boot core's loop reports and watches between passes.
 struct Running {
-    con: Console,
-    params: BootParams,
     clock: Clock,
     reached: Reached,
     upkeep: Upkeep,
@@ -1238,10 +1173,7 @@ fn after_pass(domain_id: usize, _core_id: usize, _tier: domains::Tier) {
         return;
     };
     running.cpu.poll(running.clock.elapsed_us());
-    if running
-        .upkeep
-        .poll(&running.con, &running.params, &running.clock)
-    {
+    if running.upkeep.poll(&running.clock) {
         log::info!(
             "[boot] stages={} total_us={}",
             running.reached.as_str(),
@@ -1255,13 +1187,11 @@ fn after_step(_domain_id: usize) {}
 
 /// Release the graph to the other cores and run domain 0 on this one. The
 /// summary keeps repeating, because a cloud console joins late.
-fn run(con: Console, reached: Reached, params: BootParams, clock: Clock) -> ! {
-    let upkeep = Upkeep::new(&params, &clock);
+fn run(reached: Reached, clock: Clock) -> ! {
+    let upkeep = Upkeep::new(&clock);
     // SAFETY: the boot core, once, before the loop that reads it.
     unsafe {
         RUNNING = Some(Running {
-            con,
-            params,
             clock,
             reached,
             upkeep,
@@ -1274,19 +1204,18 @@ fn run(con: Console, reached: Reached, params: BootParams, clock: Clock) -> ! {
 
 /// Where the kernel stops when it has no graph to run, or a stage failed: what
 /// it found and how far it got repeat, because a cloud console may join after
-/// the boot has finished, until the uptime limit powers the machine off.
+/// the boot has finished.
 fn idle(
     con: &Console,
     info: &BootInfo,
     machine: &acpi::Machine,
     reached: &str,
-    params: &BootParams,
     clock: &Clock,
 ) -> ! {
     report_stages(con, reached, clock);
-    let mut upkeep = Upkeep::new(params, clock);
+    let mut upkeep = Upkeep::new(clock);
     loop {
-        if upkeep.poll(con, params, clock) {
+        if upkeep.poll(clock) {
             report_entry(con, info);
             report_acpi(con, machine, clock);
             report_stages(con, reached, clock);

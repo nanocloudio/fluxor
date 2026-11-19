@@ -53,6 +53,8 @@ pub mod fmod;
 pub mod genstore_wire;
 /// The GPU execution records a provider exchanges with its backend.
 pub mod gpu_exec_wire;
+/// The header every graph image opens with, and its codec.
+pub mod graph_image;
 
 /// The signing root item a kernel image carries, which the packager writes.
 pub mod image_root;

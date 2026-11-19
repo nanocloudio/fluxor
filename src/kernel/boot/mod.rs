@@ -3,3 +3,4 @@
 pub mod config;
 #[cfg(feature = "dtb")]
 pub mod dtb;
+pub mod graph_image;

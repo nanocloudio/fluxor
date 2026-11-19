@@ -42,7 +42,7 @@ It does not define:
 |-----------|-----------------------|---------------|---------------|
 | `rp2350`  | thumbv8m PIC ELF      | `.fmod`       | `.uf2`        |
 | `bcm2712` | aarch64 PIC ELF       | `.fmod`       | `.img`        |
-| `linux`   | aarch64 PIC ELF       | `.fmod`       | runtime-linked (`config.bin` + `modules.bin`) |
+| `linux`   | aarch64 PIC ELF       | `.fmod`       | `graph.img`   |
 | `wasm`    | wasm32 module         | `.fmod`       | `.wasm`       |
 
 Three rules carry across:
@@ -151,7 +151,7 @@ by a bound stack ([stacks.md](stacks.md#build-time-assets)).
 At boot the kernel reads its own blob statics from linear memory
 (`used_len` via a volatile read, since the rewrite is invisible to the
 compiler), parses `modules.bin` the same way the Linux runtime parses
-its on-disk `modules.bin`, and instantiates each module via the host
+the module table in its `graph.img`, and instantiates each module via the host
 imports below. Hosts can also locate the blobs through the exported
 accessors `kernel_modules_blob_offset` / `_len` / `_capacity` and
 `kernel_config_blob_offset` / `_len` / `_capacity`.

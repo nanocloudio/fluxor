@@ -29,25 +29,27 @@ use crate::kernel::exec::scheduler::{self, MAX_DOMAINS};
 /// How a domain's loop runs, from the domain's `exec_mode`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// Cooperative, one pass per tick (the default).
+    /// `tick` on the graph's tick: one pass per tick (the default).
     Cooperative,
-    /// High-rate periodic: a pass per tick at the domain's own rate.
+    /// `tick` on the domain's own `tick_us`: a pass per tick at that rate,
+    /// with per-pass step metrics.
     HighRate,
-    /// Polled-timer ISR: the domain's modules belong to the ISR tier.
+    /// `timer`: the domain's modules are stepped at its fixed period.
     PolledIsr,
-    /// IRQ-owned: the domain's modules run from their interrupt.
+    /// `irq`: the domain's modules run from their interrupt.
     IrqOwned,
-    /// Poll mode: passes back to back while any module bursts.
+    /// `poll`: passes back to back while any module bursts.
     Poll,
 }
 
 impl Tier {
     fn of(domain_id: usize) -> Self {
+        use scheduler::exec_mode;
         match scheduler::domain_exec_mode(domain_id) {
-            1 => Tier::HighRate,
-            2 => Tier::PolledIsr,
-            3 => Tier::Poll,
-            4 => Tier::IrqOwned,
+            exec_mode::POLL => Tier::Poll,
+            exec_mode::TIMER => Tier::PolledIsr,
+            exec_mode::IRQ => Tier::IrqOwned,
+            _ if scheduler::domain_declares_tick(domain_id) => Tier::HighRate,
             _ => Tier::Cooperative,
         }
     }

@@ -42,6 +42,7 @@ mod error;
 mod gpu_contract;
 mod gpu_pack;
 mod graph_assets;
+mod graph_image;
 mod hash;
 mod hygiene;
 mod identity_key;
@@ -128,11 +129,7 @@ use crate::modules::{pack_fmod, parse_modules_from_config_multi};
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
 /// Flash layout constants
-const XIP_BASE: u32 = 0x10000000;
-
-/// Trailer format (placed right after firmware, before modules/config)
-const TRAILER_MAGIC: u32 = 0x544C5846; // "FXLT"
-const TRAILER_VERSION: u8 = 1;
+const XIP_BASE: u32 = fluxor_abi::platform::rp::flash_layout::XIP_BASE;
 
 fn main() {
     // Busybox multi-call dispatch: invoked through a symlink whose basename

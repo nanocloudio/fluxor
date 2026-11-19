@@ -25,7 +25,7 @@ pub const ABI_VERSION: u32 = super::wire::ABI_VERSION as u32;
 
 /// Default channel buffer size in bytes.
 /// The ring an edge gets when neither its ports nor its wiring size it
-/// (the kernel's ring rule, `src/kernel/ipc/ring_size.rs`); modules that
+/// (the kernel's ring rule, `fluxor_contracts::ring_size`); modules that
 /// size their own buffers to one ring's worth (the I2S input buffer)
 /// read it too. Sized to hold one ZX Spectrum ZVFF packet (6924 B) plus
 /// framing in a single channel write — byte-stream parsers see message

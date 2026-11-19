@@ -29,7 +29,7 @@
 //!
 //! It also holds the **boot plan**: each pool's ceiling is what the config
 //! derives for it (module and edge counts, resident workloads, declared
-//! demand) plus its live-add reserve (the FXEV envelope entry, else the
+//! demand) plus its live-add reserve (the ENVL envelope entry, else the
 //! profile's default, `kernel::config::DEFAULT_RESERVES`). The tables size
 //! themselves to [`ceiling`]; a static profile's table must already hold it,
 //! and a plan it cannot hold is refused at boot naming the pool
@@ -47,13 +47,14 @@ static DENIALS: [AtomicU32; res::KERNEL_POOL_COUNT] =
     [const { AtomicU32::new(0) }; res::KERNEL_POOL_COUNT];
 static PEAKS: [AtomicU64; res::KERNEL_POOL_COUNT] =
     [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
-/// Per-deployment reserve (or size) from the boot config's FXEV envelope
+/// Per-deployment reserve (or size) from the boot config's ENVL envelope
 /// section, in the pool's own unit; meaningful where `HAS_ENTRY` is set.
 static ENTRY: [AtomicU64; res::KERNEL_POOL_COUNT] =
     [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
 static HAS_ENTRY: [AtomicBool; res::KERNEL_POOL_COUNT] =
     [const { AtomicBool::new(false) }; res::KERNEL_POOL_COUNT];
-/// What the graph's modules declare they will ask of each pool (FXDM).
+/// What the graph's modules declare they will ask of each pool (the boot
+/// config's DMND section).
 static DECLARED: [AtomicU64; res::KERNEL_POOL_COUNT] =
     [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
 /// What the parsed config derives for each pool (module count, edges,
@@ -200,7 +201,7 @@ fn update_peak(i: usize, cur: u64) -> u64 {
 /// (its size, for a pool the config cannot derive), `n` as the entry encodes
 /// it (`resource::decode_entry`: exact bytes for an arena below 2 GiB). Not
 /// clamped: a reserve the platform cannot hold is refused when the plan is
-/// made. Called from the boot-config FXEV section parse.
+/// made. Called from the boot-config parse, for each ENVL entry.
 pub fn set_reserve(pool: u16, n: u32) {
     let Some(i) = idx(pool) else {
         log::warn!("[ledger] envelope names unknown pool {pool}; ignored");
@@ -210,7 +211,7 @@ pub fn set_reserve(pool: u16, n: u32) {
     HAS_ENTRY[i].store(true, Ordering::Relaxed);
 }
 
-/// Install one declared-demand entry (FXDM): what the graph's modules declare
+/// Install one declared-demand entry (DMND): what the graph's modules declare
 /// they will ask of `pool`, added to its derived size (decoded as
 /// [`set_reserve`] decodes).
 pub fn set_declared(pool: u16, n: u32) {
@@ -222,7 +223,8 @@ pub fn set_declared(pool: u16, n: u32) {
 }
 
 /// Clear every envelope entry and declared demand — a config without them must
-/// not inherit the previous deployment's. Called before the post-body parse.
+/// not inherit the previous deployment's. Called by the boot-config parse
+/// before it installs a blob's entries.
 pub fn reset_envelope() {
     for i in 0..res::KERNEL_POOL_COUNT {
         ENTRY[i].store(0, Ordering::Relaxed);
@@ -324,6 +326,11 @@ pub fn ceiling(pool: u16) -> u32 {
 }
 
 /// The pool's ceiling in its own unit, unsaturated: an arena's bytes.
+///
+/// Out of line: the boot sizes every kernel table through it with a
+/// constant pool, and inlined each copy reads four ledger words, which on a
+/// part without 64-bit atomics is four critical sections.
+#[inline(never)]
 pub fn ceiling_bytes(pool: u16) -> u64 {
     let (derived, reserve) = plan_parts_wide(pool);
     derived.saturating_add(reserve)
@@ -533,35 +540,23 @@ fn fan_count(config: &crate::kernel::boot::config::Config) -> usize {
     fans
 }
 
-/// `(workloads, modules, edges)` the config's resident-workload section
-/// (FXPD) will admit at boot: each workload is an owner, its modules take
-/// module slots and its edges channels.
+/// `(workloads, modules, edges)` the config's resident workloads will admit
+/// at boot: each workload is an owner, its modules take module slots and its
+/// edges channels.
 fn resident_demand(config: &crate::kernel::boot::config::Config) -> (usize, usize, usize) {
-    let (ptr, len) = (
-        config.resident_workload_section,
-        config.resident_workload_section_len,
-    );
-    if ptr.is_null() || len < 12 {
+    let Some(workloads) = config.workloads() else {
         return (0, 0, 0);
-    }
-    // SAFETY: the parser validated the section (bounds and CRC) and it stays
-    // mapped with the config blob.
-    let s = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let count = u16::from_le_bytes([s[10], s[11]]) as usize;
+    };
     let (mut modules, mut edges) = (0, 0);
-    let mut off = 12;
-    for _ in 0..count {
-        let Some(b) = s.get(off..off + 4) else { break };
-        let blob_len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
-        // Frame: blob_len u32, flags u8, then the FLXA blob, whose header
-        // carries module_count at byte 32 and edge_count at 33.
-        if let Some(h) = s.get(off + 5..off + 5 + 34) {
-            modules += h[32] as usize;
-            edges += h[33] as usize;
+    for w in workloads.iter() {
+        // The FLXA blob's header carries module_count at byte 32 and
+        // edge_count at 33.
+        if let Some(h) = w.blob.get(..34) {
+            modules += usize::from(h[32]);
+            edges += usize::from(h[33]);
         }
-        off = off.saturating_add(5).saturating_add(blob_len);
     }
-    (count, modules, edges)
+    (usize::from(workloads.count()), modules, edges)
 }
 
 /// Edges of the base graph that cross execution domains: their modules sit in

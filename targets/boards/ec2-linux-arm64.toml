@@ -14,7 +14,7 @@ host = "linux"
 description = "AWS EC2 arm64 instance, hosted linux runtime"
 
 [rig]
-# A small FAT disk image: the runtime binary, its config and modules, and a
+# A small FAT disk image: the runtime binary, its graph image, and a
 # script that runs them. The deploy step turns it into a volume snapshot the
 # instance mounts beside its own image.
 artifact = "hosted_bundle"

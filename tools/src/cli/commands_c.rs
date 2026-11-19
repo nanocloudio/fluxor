@@ -594,16 +594,10 @@ fn spawn_scenario(
                 build.family
             )));
         }
-        let dir = build.output_path.parent().ok_or_else(|| {
-            Error::Config(format!(
-                "component `{comp_name}` build has no output parent"
-            ))
-        })?;
         let port = comp.port;
         actives.push(ActiveComponent {
             display: comp_name.clone(),
-            config_bin: dir.join("config.bin"),
-            modules_bin: dir.join("modules.bin"),
+            image: build.output_path.clone(),
             port,
             url: port.map(|p| format!("http://localhost:{p}/")),
             duration: comp
@@ -627,14 +621,9 @@ fn spawn_scenario(
                 host_build.family
             )));
         }
-        let dir = host_build
-            .output_path
-            .parent()
-            .ok_or_else(|| Error::Config("host build has no output parent".into()))?;
         actives.push(ActiveComponent {
             display: "host".into(),
-            config_bin: dir.join("config.bin"),
-            modules_bin: dir.join("modules.bin"),
+            image: host_build.output_path.clone(),
             port: scenario::synthesised_host_port(scenario),
             url: scenario::synthesised_host_url(scenario),
             duration: None,
@@ -659,13 +648,13 @@ fn spawn_scenario(
 
 /// One active (= spawned-as-a-kernel-process) component in a
 /// scenario. Built ahead of the spawn loop; the spawn loop just
-/// invokes `fluxor-linux` with the config / modules pair.
+/// invokes `fluxor-linux` with the graph image.
 struct ActiveComponent {
     /// Display name — the scenario component name, or `"host"` for
     /// the synthesised host.
     display: String,
-    config_bin: PathBuf,
-    modules_bin: PathBuf,
+    /// The graph image the component's build wrote.
+    image: PathBuf,
     /// The port the component listens on: its scenario `port:`, or the
     /// host's. `None` for a headless component — the readiness probe
     /// degrades to "child still alive after a startup grace period".
@@ -723,11 +712,10 @@ fn run_actives_parallel(
     let mut spawned: Vec<SpawnedActive> = Vec::new();
     for a in actives {
         eprintln!(
-            "[scenario] {}: spawning `{}` (config={}, modules={})",
+            "[scenario] {}: spawning `{}` (image={})",
             name,
             a.display,
-            a.config_bin.display(),
-            a.modules_bin.display()
+            a.image.display()
         );
         let s = spawn_one(linux_bin, &a, scenario_path)?;
         spawned.push(s);
@@ -914,10 +902,8 @@ fn spawn_one(
     _scenario_path: &Path,
 ) -> Result<SpawnedActive> {
     let mut cmd = std::process::Command::new(linux_bin);
-    cmd.arg("--config")
-        .arg(&active.config_bin)
-        .arg("--modules")
-        .arg(&active.modules_bin)
+    cmd.arg("--image")
+        .arg(&active.image)
         .stderr(std::process::Stdio::piped());
     let mut child = tie_to_parent(&mut cmd).spawn().map_err(|e| {
         Error::Config(format!(
@@ -1168,15 +1154,15 @@ fn cmd_run(
     match result.family.as_str() {
         "linux" => {
             let out_dir = result.output_path.parent().unwrap();
-            let mut config_bin = out_dir.join("config.bin");
-            let modules_bin = out_dir.join("modules.bin");
-            // Operator anchors are appended to a copy of the built blob,
-            // named for what it is, so the build product itself carries
-            // exactly what the graph said.
+            let mut image = result.output_path.clone();
+            // Operator anchors go into a copy of the built image, named for
+            // what it is, so the build product itself carries exactly what
+            // the graph said.
             if let Some(pem) = ca {
-                let widened = out_dir.join("config.operator.bin");
-                workload_src::write_widened_config(&config_bin, &widened, pem)?;
-                config_bin = widened;
+                let widened = out_dir.join("graph.operator.img");
+                let seed = crate::signing::seed(None, &crate::project::root_for_config(config_path))?;
+                workload_src::write_widened_image(&image, &widened, pem, seed.as_ref())?;
+                image = widened;
             }
             // Anchor to the resolved project root so `fluxor run <config>` finds
             // the runtime binary regardless of the caller's cwd.
@@ -1191,17 +1177,13 @@ fn cmd_run(
             }
 
             eprintln!(
-                "Running: {} --config {} --modules {}",
+                "Running: {} --image {}",
                 linux_bin.display(),
-                config_bin.display(),
-                modules_bin.display()
+                image.display()
             );
 
             let mut cmd = std::process::Command::new(&linux_bin);
-            cmd.arg("--config")
-                .arg(&config_bin)
-                .arg("--modules")
-                .arg(&modules_bin);
+            cmd.arg("--image").arg(&image);
             // Everything after `--` is the program's, passed on exactly as
             // `fluxor exec` passes an applet's. Without this a graph that
             // takes arguments could only be run once installed, which made

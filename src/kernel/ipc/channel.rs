@@ -450,7 +450,8 @@ fn ring_capacity(config: &[u8]) -> Option<usize> {
         [] => Some(BUFFER_SIZE),
         [a, b, c, d] => {
             let size = u32::from_le_bytes([a, b, c, d]);
-            (super::ring_size::MIN_RING_BYTES..=super::ring_size::MAX_RING_BYTES)
+            (fluxor_contracts::ring_size::MIN_RING_BYTES
+                ..=fluxor_contracts::ring_size::MAX_RING_BYTES)
                 .contains(&size)
                 .then_some(size as usize)
                 .filter(|s| s.is_power_of_two())

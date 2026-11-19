@@ -858,18 +858,11 @@ pub fn serve_stream(
 /// process. It is told nothing of a plan: a transport's graph is the node's
 /// connection to its controllers, and it must not rebuild when a workload
 /// changes.
-pub fn spawn_transport(
-    runtime: &Path,
-    config: &Path,
-    modules: &Path,
-    log: Stdio,
-) -> io::Result<Child> {
+pub fn spawn_transport(runtime: &Path, image: &Path, log: Stdio) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(runtime);
-    cmd.arg("--config")
-        .arg(config)
-        .arg("--modules")
-        .arg(modules)
+    cmd.arg("--image")
+        .arg(image)
         .env_remove("FLUXOR_PLAN")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

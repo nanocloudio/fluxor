@@ -161,7 +161,7 @@ use crate::platform::builtin_param_tags::{
 /// which `build.rs` generates from the `[[params]]` and `[[ports]]` tables of
 /// the wasm built-in manifests.
 fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], f: F) {
-    crate::kernel::sys::params_tlv::walk_declared(blob, f);
+    fluxor_contracts::params_tlv::walk_declared(blob, f);
 }
 
 fn tlv_u32(value: &[u8]) -> u32 {

@@ -70,9 +70,7 @@ mod profile_linux {
     /// tables are sized at boot from the graph (`resource_ledger::plan`), its
     /// module count, fans and resident workloads plus the module-slot
     /// reserve. What this bounds is what a module index may be at all: a
-    /// boot-config module id carries 12 bits (entry byte 8 plus four bits of
-    /// byte 9), and a `ModuleMask` holds one bit per index in a fixed number
-    /// of words. A plan past it is refused at boot naming `module_slots`.
+    /// `ModuleMask` holds one bit per index in a fixed number of words. A plan past it is refused at boot naming `module_slots`.
     /// Modules read the live slot count at runtime through
     /// `internal::reconfigure::SLOT_CAPACITY`.
     pub const MAX_MODULES: usize = 4096;
@@ -112,7 +110,7 @@ mod profile_linux {
     pub const LENDS: usize = 64;
 
     /// Each kernel pool's DEFAULT reserve: what the boot plan adds to the
-    /// pool's derived size when the boot config's capacity envelope (FXEV)
+    /// pool's derived size when the boot config's capacity envelope (ENVL)
     /// carries no entry for it. A pool the graph cannot size (events,
     /// timers, TTY sessions, …) has no derived part, so its default is its
     /// size; the sandbox pool's derived part is the owner table's workload
@@ -222,7 +220,7 @@ mod profile_bcm2712 {
 
     /// Each kernel pool's DEFAULT reserve (see the Linux profile): what the
     /// boot plan adds to a pool's derived size when the boot config's
-    /// capacity envelope (FXEV) carries no entry for it, or its size for a
+    /// capacity envelope (ENVL) carries no entry for it, or its size for a
     /// pool the graph cannot derive. Every table is sized at boot from
     /// derived + reserve and carved; none is a compiled ceiling.
     pub const DEFAULT_RESERVES: &[(u16, usize)] = &[
@@ -474,7 +472,7 @@ mod profile_rp {
 
     /// Each kernel pool's DEFAULT reserve (see the Linux profile): what the
     /// boot plan adds to a pool's derived size when the boot config's
-    /// capacity envelope (FXEV) carries no entry for it, or its size for a
+    /// capacity envelope (ENVL) carries no entry for it, or its size for a
     /// pool the graph cannot derive. The derived pools' reserves are slim —
     /// an MCU graph changes by a rebuild, which plans the pool again — and
     /// cover the channels a module opens for itself and the fan modules the
@@ -613,8 +611,3 @@ pub const fn static_slots(pool: u16) -> usize {
 pub const fn default_reserve(pool: u16) -> usize {
     PROFILE.default_reserve(pool)
 }
-
-const _: () = assert!(
-    MAX_MODULES <= 4096,
-    "a boot-config module id carries 12 bits"
-);

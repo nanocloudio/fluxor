@@ -12,8 +12,9 @@
 //   - RP1 peripheral access via PCIe BAR (GPIO, SPI, I2C register bridges)
 //   - Multi-domain execution with config-driven domain assignment and core wakeup
 //
-// Fully config-driven: the boot image carries trailer, modules.bin, and config.bin
-// after the fixed kernel binary, discovered at runtime via the layout trailer.
+// Fully config-driven: the boot image carries a graph image (header, module
+// table, config) after the fixed kernel binary, admitted at boot
+// (`kernel::boot::graph_image`).
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -205,8 +206,8 @@ global_asm!(
     "    .word 0x4B505846", // PACKAGE_HEADER_MAGIC
     "    .byte 1, 0, 0, 0", // version + reserved
     // runtime_end: end of file-backed sections (must NOT include BSS
-    // or stack). The kernel resolves the trailer via this same symbol
-    // through `config::get_trailer_addr()`. `_start`'s relocator copies
+    // or stack). The kernel finds the graph image after it through this
+    // same symbol (`config::read_layout`). `_start`'s relocator copies
     // `package_size` bytes here only when package_size != 0; RAM-loaded
     // aarch64 images leave it at 0 and skip the copy.
     "    .word __end_data_addr",
@@ -645,8 +646,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // loop steps its domain through the shared `step_one_module` body.
     use fluxor::kernel::boot::config;
 
-    // Parse config + loader into the kernel's static state. Pi 5 scans
-    // flash via the trailer; QEMU side-loads a packed blob at a fixed
+    // Parse config + loader into the kernel's static state. Pi 5 reads
+    // the graph image after the kernel; QEMU side-loads a packed blob at a fixed
     // address. `prepare_graph` reads STATIC_CONFIG / STATIC_LOADER from
     // there.
     loader::reset_state_arena();
@@ -661,7 +662,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
             // SAFETY: as above.
             let modules_blob_magic =
                 unsafe { core::ptr::read_volatile(QEMU_MODULES_BLOB_ADDR as *const u32) };
-            if blob_magic == config::MAGIC_CONFIG
+            if blob_magic == fluxor_contracts::boot_config::MAGIC
                 && modules_blob_magic == loader::MODULE_TABLE_MAGIC
             {
                 // SAFETY: caller upholds `# Safety` invariant — blobs at
@@ -689,8 +690,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         }
         #[cfg(feature = "board-pi5")]
         {
-            // Flash-trailer path: the loader scans the packed image for
-            // the module table; the config sits in the same trailer.
+            // The graph image after the kernel: the loader and the config
+            // read the regions its admitted header states.
             // SAFETY: boot-time single-thread init.
             let loader_ref = unsafe { scheduler::static_loader_mut() };
             // SAFETY: as above.
@@ -839,7 +840,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     fluxor::kernel::exec::scheduler::finalize_instantiation_accounting();
 
-    // Admit resident workloads declared in the config's `[FXPD]` section
+    // Admit resident workloads declared in the config's `WKLD` section
     // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via
     // `apply_add` + finalize. Boot-time, before the run loops start. No-op
     // without a workload section; the multi-graph runner multiplexes the

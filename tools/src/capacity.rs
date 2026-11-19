@@ -20,6 +20,8 @@
 /// kernels it builds for.
 const KERNEL_CONFIG: &str = include_str!("../../src/kernel/config.rs");
 
+use fluxor_contracts::boot_config::WorkloadRecord;
+
 /// The kernel's owner table, embedded for its owner-slot domain
 /// (`MAX_OWNERS`), which it states per platform.
 const KERNEL_OWNER: &str = include_str!("../../src/kernel/workload/owner.rs");
@@ -161,10 +163,11 @@ pub fn kernel_has_pool(target: &str, pool: &str) -> bool {
     })
 }
 
-/// Whether `target`'s config blob lays its graph section out for the graph it
-/// carries (Linux, bcm2712, uefi) rather than for the profile's compiled slot count
-/// (`GRAPH_EDGES`, RP and wasm), which is then also its channel-id domain.
-pub fn graph_section_per_graph(target: &str) -> bool {
+/// Whether `target`'s kernel sizes its edge and channel tables at boot from
+/// the graph (Linux, bcm2712, uefi) rather than compiling them at the
+/// profile's `GRAPH_EDGES` (RP and wasm), which is then also its channel-id
+/// domain.
+pub fn edge_tables_sized_at_boot(target: &str) -> bool {
     matches!(
         kernel_profile(target),
         "profile_linux" | "profile_bcm2712" | "profile_uefi"
@@ -172,38 +175,27 @@ pub fn graph_section_per_graph(target: &str) -> bool {
 }
 
 /// Kernel `MAX_MODULES` for the profile a target compiles: the module-index
-/// domain (config ids carry 12 bits), within which Linux, bcm2712, uefi and RP
-/// size their module tables from the graph; wasm's static module table.
+/// domain, within which Linux, bcm2712, uefi and RP size their module tables
+/// from the graph; wasm's static module table.
 pub fn kernel_max_modules(target: &str) -> usize {
     eval(profile_body(kernel_profile(target)), "MAX_MODULES").unwrap_or(32) as usize
 }
 
-/// Graph-edge slots a target's config blob may carry, and so its channel-id
-/// domain (`MAX_GRAPH_EDGES`, `MAX_CHANNELS`): the static profile's compiled
-/// `GRAPH_EDGES`, or on Linux, bcm2712 and uefi, whose graph section is laid out
-/// for the graph, the format's bound.
+/// Graph edges a target's kernel admits, and so its channel-id domain
+/// (`MAX_GRAPH_EDGES`, `MAX_CHANNELS`): the static profile's compiled
+/// `GRAPH_EDGES`, or on Linux, bcm2712 and uefi, whose tables are sized at
+/// boot, [`BOOT_SIZED_MAX_EDGES`].
 pub fn kernel_max_edges(target: &str) -> usize {
-    if graph_section_per_graph(target) {
-        GRAPH_EDGES_FORMAT_BOUND
+    if edge_tables_sized_at_boot(target) {
+        BOOT_SIZED_MAX_EDGES
     } else {
         eval(profile_body(kernel_profile(target)), "GRAPH_EDGES").unwrap_or(128) as usize
     }
 }
 
-/// The format's bound on a per-graph section's edge slots: slot code 255, a
-/// byte of 128-edge units.
-pub const GRAPH_EDGES_FORMAT_BOUND: usize = 255 * 128;
-
-/// Edge slots the graph section of a `target` blob carrying `edges` edges is
-/// laid out for: the static profile's count, or on Linux, bcm2712 and uefi the
-/// graph's own edges rounded up to whole 128-edge units.
-pub fn graph_slots(target: &str, edges: usize) -> usize {
-    if graph_section_per_graph(target) {
-        edges.max(1).div_ceil(128) * 128
-    } else {
-        kernel_max_edges(target)
-    }
-}
+/// `MAX_GRAPH_EDGES` of a kernel that sizes its edge tables at boot
+/// (`src/kernel/boot/config.rs`).
+pub const BOOT_SIZED_MAX_EDGES: usize = 255 * 128;
 
 /// A kernel pool's size where `target`'s profile fixes one: the static size,
 /// else the default (for an arena, its size).
@@ -360,7 +352,7 @@ pub struct GraphShape {
     pub edges: u64,
     /// Tees and merges graph preparation inserts ([`fan_count`]).
     pub fans: u64,
-    /// Resident workloads (the FXPD section).
+    /// Resident workloads (the `WKLD` section).
     pub workloads: u64,
     /// Their modules, summed.
     pub workload_modules: u64,
@@ -387,8 +379,8 @@ pub fn crossing_count(edges: impl IntoIterator<Item = (Option<u8>, Option<u8>, b
 /// Tees and merges graph preparation inserts for `edges`, as the kernel's
 /// plan counts them (`resource_ledger::fan_count`): one per port carrying two
 /// or more edges in the same direction, an upper bound. Each edge is
-/// `(from_id, to_id, to_port, from_port_index, to_port_index)`, the graph
-/// section's fields.
+/// `(from_id, to_id, to_port, from_port_index, to_port_index)`, from the
+/// graph's edge records.
 pub fn fan_count(edges: &[(u16, u16, u8, u8, u8)]) -> u64 {
     let mut keys: Vec<u32> = Vec::with_capacity(2 * edges.len());
     for &(from_id, to_id, to_port, from_port_index, to_port_index) in edges {
@@ -409,30 +401,19 @@ pub fn fan_count(edges: &[(u16, u16, u8, u8, u8)]) -> u64 {
     fans
 }
 
-/// `(workloads, modules, edges)` of an encoded resident-workload section, read
-/// as the kernel's plan reads it (`resource_ledger::resident_demand`): the
-/// count at bytes 10-11, then per workload `[blob_len u32][flags u8]` and the
-/// FLXA blob, whose header holds its module count at byte 32 and its edge
-/// count at 33.
-pub fn resident_demand(section: &[u8]) -> (u64, u64, u64) {
-    if section.len() < 12 {
-        return (0, 0, 0);
-    }
-    let count = u16::from_le_bytes([section[10], section[11]]) as u64;
+/// `(workloads, modules, edges)` of a config's resident workloads, read as
+/// the kernel's plan reads them (`resource_ledger::resident_demand`): each
+/// workload's FLXA blob holds its module count at byte 32 and its edge count
+/// at 33.
+pub fn resident_demand(workloads: &[WorkloadRecord<'_>]) -> (u64, u64, u64) {
     let (mut modules, mut edges) = (0u64, 0u64);
-    let mut off = 12usize;
-    for _ in 0..count {
-        let Some(b) = section.get(off..off + 4) else {
-            break;
-        };
-        let blob_len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
-        if let Some(h) = section.get(off + 5..off + 5 + 34) {
+    for w in workloads {
+        if let Some(h) = w.blob.get(..34) {
             modules += u64::from(h[32]);
             edges += u64::from(h[33]);
         }
-        off = off.saturating_add(5).saturating_add(blob_len);
     }
-    (count, modules, edges)
+    (workloads.len() as u64, modules, edges)
 }
 
 /// One pool of a boot plan: what the config derives for it (and its modules
@@ -465,7 +446,7 @@ fn figure(list: &PoolFigures, pool: &str) -> Option<u64> {
 /// resident workloads, and where the kernel bridges domains a channel per
 /// cross-domain edge; on Linux the sandboxes from the owner table's workload
 /// slots; the state-arena free list from the module slots), plus `declared`
-/// (FXDM), plus the reserve — the envelope's entry in `entries`, never
+/// (`DMND`), plus the reserve — the envelope's entry in `entries`, never
 /// clamped (one past the pool's domain is refused), else what a static table
 /// leaves, else the profile's default clamped to what the pool's index domain
 /// leaves beside the derived part.
@@ -593,27 +574,6 @@ pub fn check_boot_plan(
     Ok(format!("Boot plan ({target}): {}", summary.join(", ")))
 }
 
-/// Graph-section byte 3 for a section laid out for `slots` edges: the count
-/// in units of 128, with 0 meaning 128 (see
-/// `kernel::boot::config::GRAPH_SLOTS_CODE`).
-pub fn graph_slots_code(slots: usize) -> u8 {
-    if slots == 128 {
-        0
-    } else {
-        (slots / 128) as u8
-    }
-}
-
-/// Edge slots a finished config blob was laid out for, from its graph-section
-/// byte 3 — so a tool re-reading a blob needs no target to find its sections.
-pub fn edges_for_slots_code(code: u8) -> usize {
-    if code == 0 {
-        128
-    } else {
-        code as usize * 128
-    }
-}
-
 /// Kernel resource-pool registry mirror: `(yaml name, pool id)` — the
 /// composer-facing names for `crates/fluxor-abi/src/contracts/resource.rs` ids.
 /// Pinned against the contract source by `capacity_pool_ids_match_contract`
@@ -682,7 +642,7 @@ pub fn encode_entry(id: u16, n: u64) -> Option<u32> {
 
 /// What a module's manifest may declare it will ask of a kernel pool at run
 /// time, `([capacities] key, pool name)`. The composer sums the graph's
-/// declarations per pool into the FXDM section, and the kernel adds them to
+/// declarations per pool into the `DMND` section, and the kernel adds them to
 /// the pool's derived size. A key is a per-type constant; a type's
 /// `[capacities] demand_from_params` rule counts its pool per instance
 /// instead, and a graph's `demand: { <pool>: n }` on a module entry wins over
@@ -707,94 +667,3 @@ pub const DECLARED_DEMAND: &[(&str, &str)] = &[
 /// (`resource::POOL_SAMPLE`) and it counts its refusals there
 /// (`resource::LEDGER_DENY`).
 pub const MODULE_PROVIDED_POOLS: &[(&str, &str)] = &[("store_subs", "storage.namespace")];
-
-/// Envelope section magic "FXEV" — mirror of
-/// `resource::ENVELOPE_SECTION_MAGIC`.
-pub const ENVELOPE_SECTION_MAGIC: u32 = 0x4658_4556;
-/// Declared-demand section magic "FXDM" — mirror of
-/// `resource::DEMAND_SECTION_MAGIC`.
-pub const DEMAND_SECTION_MAGIC: u32 = 0x4658_444D;
-
-/// Boot-parameter section magic "FXBO" — mirror of the kernel's
-/// `boot::config::BOOT_SECTION_MAGIC`.
-pub const BOOT_SECTION_MAGIC: u32 = 0x4658_424F;
-
-/// The graph's `boot:` map as the kernel's platform reads it: how a machine
-/// behaves on a test rig.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BootParams {
-    /// Fault on purpose once the kernel has vectors and a console.
-    pub fault_probe: bool,
-    /// Stop one secondary core's interrupts on purpose, to test the lockup
-    /// detector.
-    pub lockup_probe: bool,
-    /// Repeat the `[boot] stages=` line this often; 0 the platform's default.
-    pub summary_every_s: u32,
-    /// For this long; 0 the platform's default.
-    pub summary_for_s: u32,
-    /// Power off this long after entry; 0 never.
-    pub max_uptime_s: u32,
-}
-
-/// Encode the FXBO post-body section: `[magic][section_len u32][crc16]` then
-/// the 16-byte payload the kernel's `boot::config::BOOT_PARAMS_BYTES` names,
-/// `[0][fault_probe][lockup_probe][0][summary_every_s u32][summary_for_s u32]
-/// [max_uptime_s u32]`; crc over `section[10..]`.
-pub fn encode_boot_section(p: &BootParams) -> Vec<u8> {
-    let section_len = 10 + 16;
-    let mut s = Vec::with_capacity(section_len);
-    s.extend_from_slice(&BOOT_SECTION_MAGIC.to_le_bytes());
-    s.extend_from_slice(&(section_len as u32).to_le_bytes());
-    s.extend_from_slice(&[0, 0]); // crc placeholder
-    s.push(0);
-    s.push(u8::from(p.fault_probe));
-    s.push(u8::from(p.lockup_probe));
-    s.push(0);
-    s.extend_from_slice(&p.summary_every_s.to_le_bytes());
-    s.extend_from_slice(&p.summary_for_s.to_le_bytes());
-    s.extend_from_slice(&p.max_uptime_s.to_le_bytes());
-    let crc = crc16_ccitt(&s[10..]);
-    s[8..10].copy_from_slice(&crc.to_le_bytes());
-    s
-}
-
-/// Encode a pool section (`abi::contracts::resource`): `[magic][section_len
-/// u32][crc16][entry_count u16]` then `[pool u16][n u32]` entries; crc over
-/// `section[10..]`. The FXEV envelope and the FXDM declared demand share it.
-pub fn encode_pool_section(magic: u32, entries: &[(u16, u32)]) -> Vec<u8> {
-    let section_len = 12 + entries.len() * 6;
-    let mut s = Vec::with_capacity(section_len);
-    s.extend_from_slice(&magic.to_le_bytes());
-    s.extend_from_slice(&(section_len as u32).to_le_bytes());
-    s.extend_from_slice(&[0, 0]); // crc placeholder
-    s.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    for (pool, n) in entries {
-        s.extend_from_slice(&pool.to_le_bytes());
-        s.extend_from_slice(&n.to_le_bytes());
-    }
-    let crc = crc16_ccitt(&s[10..]);
-    s[8..10].copy_from_slice(&crc.to_le_bytes());
-    s
-}
-
-/// Encode the FXEV capacity-envelope post-body section: each entry a pool's
-/// live-add reserve (its size, for a pool the config cannot derive).
-pub fn encode_envelope_section(entries: &[(u16, u32)]) -> Vec<u8> {
-    encode_pool_section(ENVELOPE_SECTION_MAGIC, entries)
-}
-
-/// CRC16-CCITT (poly 0x1021, init 0xFFFF) — the config-blob section CRC.
-fn crc16_ccitt(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
-    for &b in data {
-        crc ^= (b as u16) << 8;
-        for _ in 0..8 {
-            crc = if crc & 0x8000 != 0 {
-                (crc << 1) ^ 0x1021
-            } else {
-                crc << 1
-            };
-        }
-    }
-    crc
-}

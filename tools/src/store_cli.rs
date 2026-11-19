@@ -1018,7 +1018,7 @@ pub fn lock_store_resolver(
 ///      unambiguous — every pin for that name shares one digest;
 ///   3. differing digests and no match for a HOST target (`linux`,
 ///      `wasm`) is `NotPinned`. A pin binds the target it names, and a
-///      host graph loads modules built from source into `modules.bin`,
+///      host graph loads modules built from source into its graph image,
 ///      never store bytes — so no pin here binds anything, and the
 ///      on-disk manifest is authoritative;
 ///   4. differing digests and no match for a SILICON is `Failed`:

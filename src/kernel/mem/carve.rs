@@ -407,7 +407,7 @@ pub fn place_arenas(
     buffer: usize,
     state_asked: Option<usize>,
 ) -> Result<Split, super::pool_plan::Refusal> {
-    let align = crate::kernel::ipc::ring_size::RING_ALIGN as usize;
+    let align = fluxor_contracts::ring_size::RING_ALIGN as usize;
     let (lo, split) = {
         let _g = Guard::acquire();
         let lo = ZONE_LO.load(Ordering::Relaxed);

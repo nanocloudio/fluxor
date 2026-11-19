@@ -37,10 +37,10 @@ enum Commands {
     /// Emit forms (flash/deploy encodings — never store artifacts):
     ///   uf2       config UF2 for drag-drop flashing
     ///   bin       raw config binary
-    ///   combined  firmware + config in one UF2. Dev-flash convenience
-    ///             only: the trailer-embedded modules/config are NOT an
-    ///             OTA path — OTA devices update runtime modules
-    ///             exclusively through `--emit=image`.
+    ///   combined  firmware + graph image in one UF2. Dev-flash
+    ///             convenience only: the graph image placed after the
+    ///             firmware is NOT an OTA path — OTA devices update
+    ///             runtime modules exclusively through `--emit=image`.
     ///   image     graph image (modules + config + header): the
     ///             packaged deployable graph — what an RP flash A/B
     ///             graph slot holds and what an OTA device pulls;

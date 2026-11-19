@@ -29,7 +29,7 @@
 //! - `abi::contracts::hal::gpio::CLAIM`
 //! - `abi::platform::rp::pio::CMD_TRANSFER`
 //! - `abi::contracts::net::net_proto::CMD_BIND`
-//! - `abi::platform::rp::flash_layout::GRAPH_SLOT_MAGIC`
+//! - `abi::platform::rp::flash_layout::XIP_BASE`
 //! - `abi::internal::reconfigure::CALL_DRAIN`
 //! - `abi::platform::bcm2712::nic_ring::NIC_BAR_MAP`
 

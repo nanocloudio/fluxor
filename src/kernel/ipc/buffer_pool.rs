@@ -97,7 +97,7 @@ const _: () = assert!(
 /// `CHANNEL_BUFFER_SIZE`, which is the default ring the composer charges an
 /// unsized edge (`ring_size::DEFAULT_RING_BYTES`).
 pub const BUFFER_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
-const _: () = assert!(BUFFER_SIZE == super::ring_size::DEFAULT_RING_BYTES as usize);
+const _: () = assert!(BUFFER_SIZE == fluxor_contracts::ring_size::DEFAULT_RING_BYTES as usize);
 
 /// Buffer arena size: the kernel profile's (`kernel::config`). On the RP parts
 /// the arena is no static: each graph's plan carves it from the kernel's
@@ -115,7 +115,7 @@ const BUFFER_ARENA_SIZE: usize = crate::kernel::config::BUFFER_ARENA_SIZE;
 /// two of at least 64 bytes (`channel_open`), so every buffer starts and ends
 /// on a line boundary: two channels never share a line, and cache maintenance
 /// on one buffer (a DMA-owned edge) never touches its neighbour.
-const BUFFER_ALIGN: usize = super::ring_size::RING_ALIGN as usize;
+const BUFFER_ALIGN: usize = fluxor_contracts::ring_size::RING_ALIGN as usize;
 
 #[cfg(not(feature = "rp"))]
 #[repr(C, align(64))]

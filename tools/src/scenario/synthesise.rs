@@ -663,7 +663,7 @@ pub fn render_merged_component(
 /// working directory. The host graph written there belongs to that
 /// project, so its `@file_server` resolves against that project's
 /// `fluxor.toml` and `fluxor.lock`; scenarios do not trample each other's
-/// host graph, document root or config.bin output.
+/// host graph, document root or graph image.
 pub fn scenario_work_dir(scenario: &Scenario, scenario_path: &Path) -> PathBuf {
     crate::project::root_for_config(scenario_path)
         .join("target/scenarios")

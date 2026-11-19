@@ -8,9 +8,9 @@
 //! [`RingBufState::record_len`].
 
 /// Bytes of ring a record's length prefix takes.
-pub const RECORD_PREFIX: usize = super::ring_size::RECORD_PREFIX_BYTES as usize;
+pub const RECORD_PREFIX: usize = fluxor_contracts::ring_size::RECORD_PREFIX_BYTES as usize;
 /// The longest record one prefix states; a longer write is several records.
-pub const RECORD_MAX: usize = super::ring_size::RECORD_MAX_BYTES as usize;
+pub const RECORD_MAX: usize = fluxor_contracts::ring_size::RECORD_MAX_BYTES as usize;
 const _: () = assert!(RECORD_MAX <= u16::MAX as usize);
 
 /// Ring bytes a write of `n` payload bytes takes: the payload and one prefix

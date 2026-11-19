@@ -610,9 +610,8 @@ fn build_one_asset(
             graph.display()
         ),
     )?;
-    let built = crate::build_one_from(&step_path, Some(&dir.join("config.bin")), None, verbose)
+    let built = crate::build_one_from(&step_path, Some(&dir.join("graph.img")), None, verbose)
         .map_err(|e| Error::Config(format!("{what}: building its build-step graph: {e}")))?;
-    let out_dir = built.output_path.parent().unwrap_or(&dir).to_path_buf();
 
     let runtime = crate::project::linux_runtime(project_root);
     if !runtime.is_file() {
@@ -622,10 +621,8 @@ fn build_one_asset(
         )));
     }
     let output = std::process::Command::new(&runtime)
-        .arg("--config")
-        .arg(out_dir.join("config.bin"))
-        .arg("--modules")
-        .arg(out_dir.join("modules.bin"))
+        .arg("--image")
+        .arg(&built.output_path)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| Error::Config(format!("{what}: running {}: {e}", runtime.display())))?;

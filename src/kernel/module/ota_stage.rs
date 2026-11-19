@@ -2,12 +2,12 @@
 //! RP flash graph-slot A/B path.
 //!
 //! A module (normally `ota_registry`) streams a GRAPH IMAGE (`fluxor
-//! build --emit=image`: FXSL header + modules blob + config blob) into
-//! the inactive one of two RAM staging buffers via `OTA_STAGE_WRITE`,
-//! then commits it with `OTA_STAGE_CTRL`. Commit validates the image —
-//! header shape, SHA-256 over the payload, ABI-surface pin against the
-//! running kernel, on a kernel image with a signing root its signature
-//! (`security::slot_signature`), and an epoch above the live one — flips
+//! build --emit=image`: the `wire::graph_image` header, the module table
+//! and the config) into the inactive one of two RAM staging buffers via
+//! `OTA_STAGE_WRITE`, then commits it with `OTA_STAGE_CTRL`. Commit admits
+//! the image as boot admits one (`boot::graph_image::admit`: header shape,
+//! ABI-surface pin, on a kernel image with a signing root its signature,
+//! SHA-256 over the payload) and requires an epoch above the live one — flips
 //! the region executable (cache maintenance / page permissions via
 //! `hal::ota_stage_protect`), re-points the static loader + config at the
 //! staged blobs (`populate_static_state_with_len`, the same population
@@ -36,16 +36,6 @@ use crate::kernel::sys::hal;
 /// `MAX_MODULES_BLOB_SIZE` reasoning (loader.rs): comfortably above any
 /// realistic graph bundle.
 pub const STAGE_CAPACITY: usize = 8 * 1024 * 1024;
-
-// The graph-image header: the format `fluxor build --emit=image` writes
-// (tools/src/cli/commands_a.rs::cmd_graph_image) and an RP flash slot
-// holds, defined once in `crates/fluxor-abi/src/platform/rp/flash_layout.rs`
-// (`GRAPH_SLOT_*`). The RAM stage holds the same image unpadded.
-use crate::abi::platform::rp::flash_layout as image_layout;
-const IMAGE_MAGIC: u32 = image_layout::GRAPH_SLOT_MAGIC;
-const IMAGE_VERSION: u8 = image_layout::GRAPH_SLOT_VERSION;
-const IMAGE_HEADER_SIZE: usize = image_layout::GRAPH_SLOT_HEADER_SIZE;
-const IMAGE_ABI_SURFACE_OFFSET: usize = image_layout::GRAPH_SLOT_ABI_SURFACE_OFFSET;
 
 /// Page-aligned staging buffer. 64 KiB is the largest page an aarch64 Linux
 /// kernel uses (`mprotect` works on whole pages, and the buffer's capacity
@@ -147,79 +137,29 @@ pub fn stage_ctrl(cmd: u8) -> i32 {
     }
 }
 
-fn read_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
-fn read_u64(b: &[u8], off: usize) -> u64 {
-    let lo = read_u32(b, off) as u64;
-    let hi = read_u32(b, off + 4) as u64;
-    lo | (hi << 32)
-}
-
 fn commit() -> i32 {
     let buf = staging_buf();
     // SAFETY: scheduler-thread statics; validation reads the staged
     // bytes this thread wrote.
     let staged_len = unsafe { STAGED_LEN };
-    if staged_len < IMAGE_HEADER_SIZE {
-        return errno::EINVAL;
-    }
     let image = &buf.bytes[..staged_len];
-
-    // Header shape.
-    if read_u32(image, 0) != IMAGE_MAGIC || image[4] != IMAGE_VERSION {
-        log::error!("[ota] commit: bad image magic/version");
-        return errno::EINVAL;
-    }
-    let epoch = read_u64(image, 8);
-    let modules_offset = read_u32(image, 16) as usize;
-    let modules_size = read_u32(image, 20) as usize;
-    let config_offset = read_u32(image, 24) as usize;
-    let config_size = read_u32(image, 28) as usize;
-    // The smallest real module table is its 16-byte header; region
-    // bounds are checked against what was actually staged.
-    if modules_size < 16
-        || config_size == 0
-        || modules_offset < IMAGE_HEADER_SIZE
-        || modules_offset.saturating_add(modules_size) > staged_len
-        || config_offset < modules_offset + modules_size
-        || config_offset.saturating_add(config_size) > staged_len
-    {
-        log::error!("[ota] commit: image regions out of bounds");
-        return errno::EINVAL;
-    }
-
-    // Payload integrity: SHA-256 over modules ++ config, as the pack
-    // tool computed it.
-    let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
-    h.update(&image[modules_offset..modules_offset + modules_size]);
-    h.update(&image[config_offset..config_offset + config_size]);
-    let digest = h.finalize();
-    if digest[..] != image[32..64] {
-        log::error!("[ota] commit: payload sha256 mismatch");
-        return errno::EINVAL;
-    }
-
-    // ABI-surface pin: strict equality with the running kernel's own
-    // surface digest — an incompatible graph is refused, not loaded.
-    let own = kernel_abi_surface_digest();
-    if image[IMAGE_ABI_SURFACE_OFFSET..IMAGE_ABI_SURFACE_OFFSET + 32] != own[..] {
-        log::error!(
-            "[ota] commit: ABI-surface pin mismatch (rebuild the image against this kernel)"
-        );
-        return errno::EACCES;
-    }
-
-    // Signature: a kernel image with a signing root stages only an image signed
-    // by it. The signature covers the header, and through the digest checked
-    // above, the payload; validation and the load below read the same
-    // buffer, which nothing writes until the next stage begins in the other.
-    let root = crate::kernel::security::root::signing_root();
-    if let Err(why) = crate::kernel::security::slot_signature::admits(image, root.as_ref()) {
-        log::error!("[ota] commit: image refused: {why:?}");
-        return errno::EACCES;
-    }
+    let own = crate::kernel::boot::graph_image::own_abi_pin();
+    let header = match crate::kernel::boot::graph_image::admit(image, &own) {
+        Ok(header) => header,
+        Err(why) => {
+            use crate::kernel::boot::graph_image::Refusal;
+            log::error!("[ota] commit: image refused: {}", why.reason());
+            return match why {
+                Refusal::Pin | Refusal::Signature(_) => errno::EACCES,
+                Refusal::Malformed(_) | Refusal::Digest => errno::EINVAL,
+            };
+        }
+    };
+    let epoch = header.epoch;
+    let modules_offset = header.modules_offset as usize;
+    let modules_size = header.modules_size as usize;
+    let config_offset = header.config_offset as usize;
+    let config_size = header.config_size as usize;
 
     // Epoch monotonicity: a replayed or stale image is refused.
     // SAFETY: scheduler-thread static.
@@ -263,15 +203,4 @@ fn commit() -> i32 {
     }
     log::warn!("[ota] committed image epoch {epoch} ({staged_len} bytes); rebuild requested");
     0
-}
-
-/// The running kernel's own ABI-surface digest — sha256 over the
-/// canonical `abi_surface` stream (the same computation the RP slot
-/// selector uses at boot).
-fn kernel_abi_surface_digest() -> [u8; 32] {
-    let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
-    crate::abi::abi_surface::write_surface(&mut |bytes| h.update(bytes));
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
 }

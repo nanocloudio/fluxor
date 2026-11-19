@@ -1,6 +1,6 @@
 //! Tier-2 (IRQ-owned) validation probe.
 //!
-//! A minimal PIC module placed on a `tier: 2` domain. The kernel binds its
+//! A minimal PIC module placed on an `exec: irq` domain. The kernel binds its
 //! declared `irq:` to `isr_tier2_trampoline`, so the module's `module_isr_entry`
 //! is dispatched straight from interrupt context (never the cooperative
 //! `module_step`). `module_new` takes the module's first input bridge

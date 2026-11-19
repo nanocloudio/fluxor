@@ -82,7 +82,7 @@ pub const EXPECTED_MANIFEST_VERSION: u8 = 1;
 /// Errors that can occur during module loading and instantiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderError {
-    /// No valid layout trailer found
+    /// No graph image was admitted
     NoLayout,
     /// No modules embedded in flash
     NoModules,
@@ -147,7 +147,7 @@ impl LoaderError {
     /// Log the error with appropriate level.
     pub fn log(&self, context: &str) {
         match self {
-            Self::NoLayout => log::warn!("[loader] {context}: no layout trailer"),
+            Self::NoLayout => log::warn!("[loader] {context}: no graph image"),
             Self::NoModules => log::info!("[loader] {context}: no modules"),
             Self::InvalidTableMagic => log::warn!("[loader] {context}: bad table magic"),
             Self::InvalidModuleMagic => log::warn!("[loader] {context}: bad module magic"),
@@ -1474,7 +1474,7 @@ fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> 
         // the DRAM the machine gives the arena, less the kernel tables
         // carved from its top. The envelope capacity is a PACKAGING fact,
         // computed by the composer from the graph that was packed and
-        // installed from the boot config's FXEV section — and it is usually
+        // installed from the boot config's ENVL section — and it is usually
         // the lower of the two, so it is usually the one that refuses. A
         // single message naming the platform figure sends the reader to raise
         // a number that had nothing to do with the refusal, which is worse
@@ -2151,8 +2151,8 @@ pub struct ModuleLoader {
     /// it to `Embedded`. Read-only after init.
     source: LoadSource,
     /// How far past `table_base` the mapped bundle is known to extend: the
-    /// slot's or blob's length, or the hard cap for a trailer that states
-    /// none. Bounds the program section as it bounds the table.
+    /// module region the graph image header states, or the blob's length.
+    /// Bounds the program section as it bounds the table.
     blob_bound: usize,
 }
 
@@ -2180,8 +2180,8 @@ impl ModuleLoader {
             table_base: core::ptr::null(),
             header: None,
             // Default to Flash; `init_from_blob` overrides to Embedded.
-            // Platforms whose primary load path is the flash trailer
-            // (RP, Pi 5) never re-set this; hosted targets calling
+            // Platforms whose primary load path is the graph image in
+            // memory (RP, Pi 5) never re-set this; hosted targets calling
             // `init_from_blob` get the right value automatically.
             source: LoadSource::Flash,
             blob_bound: 0,
@@ -2324,35 +2324,21 @@ impl ModuleLoader {
     pub fn source(&self) -> LoadSource {
         self.source
     }
-    /// Initialize the loader by reading the layout trailer and module table header
+    /// Initialize the loader from the admitted graph image's module table.
     pub fn init(&mut self) -> Result<(), LoaderError> {
         let layout = read_layout().ok_or(LoaderError::NoLayout)?;
-        if layout.modules_addr == 0 {
-            log::info!("[loader] no modules in flash");
-            return Err(LoaderError::NoModules);
-        }
         self.table_base = layout.modules_addr as *const u8;
-        // SAFETY: table_base points to flash memory at modules_addr
+        // SAFETY: the admitted image's module region is mapped and at least
+        // the table's 16-byte header long (`wire::graph_image::MIN_MODULES_SIZE`).
         let header = unsafe { read_table_header(self.table_base) };
         if header.magic != MODULE_TABLE_MAGIC {
             log::warn!("[loader] bad table magic=0x{:08x}", header.magic);
             return Err(LoaderError::InvalidTableMagic);
         }
-        // Run the SAME bounded validator the embedded-blob path uses, so a
-        // corrupted or torn staged flash image can't drive unchecked typed
-        // reads through `module_count` / `entry.offset`. The bound is the
-        // slot's known `modules_size` when the layout source carried one
-        // (flash A/B graph slots); the firmware trailer carries no length
-        // field, so we fall back to the hard cap and lean on the table's own
-        // `total_size`
-        // for the internal-consistency checks. `total_size` is always
-        // written by the pack tool (`tools/src/modules.rs`), so the same
-        // `.fxmt` that loads from an embedded blob validates here too.
-        let bound = if layout.modules_size != 0 {
-            layout.modules_size as usize
-        } else {
-            MAX_MODULES_BLOB_SIZE
-        };
+        // The same bounded validator the embedded-blob path uses, bounded by
+        // the module region the image header states, so a table cannot drive
+        // reads past it through `module_count` or an entry's offset.
+        let bound = layout.modules_size as usize;
         Self::validate_table_layout(self.table_base, bound, &header)?;
         self.blob_bound = bound;
         log::debug!(
@@ -2486,7 +2472,7 @@ impl ModuleLoader {
     }
 
     /// The single bounded table validator shared by every load source
-    /// (embedded blob, flash A/B slot, flash trailer). Given a mapped
+    /// (embedded blob, graph image). Given a mapped
     /// `blob` of at most `blob_len` bytes and its already-magic-checked
     /// `header`, it proves the table version, the declared `total_size`,
     /// and every entry's offset/size/footprint are in bounds BEFORE any

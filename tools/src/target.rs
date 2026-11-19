@@ -433,8 +433,11 @@ pub struct TargetDescriptor {
     /// Platform stack defaults from board TOML (e.g. net → {phy: wifi, driver: cyw43})
     pub platform_defaults:
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-    /// State arena size in KB (from [kernel] section, default 256)
-    pub state_arena_kb: u32,
+    /// The state arena a graph is admitted against, in KiB: `[kernel]
+    /// state_arena_kb` where the kernel takes its size from this file (RP),
+    /// else the kernel profile's `STATE_ARENA_SIZE`. `None` for a target with
+    /// no kernel (validation-only silicon), which admits no graph.
+    pub state_arena_kb: Option<u32>,
     /// Channel buffer arena in KiB (`[kernel] buffer_arena_kb`), where the
     /// silicon states it — the RP parts, whose kernel takes the figure from
     /// this file. The host-class kernels state theirs in
@@ -888,6 +891,18 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         )));
     }
 
+    // The arena a graph is admitted against is the one its kernel allocates:
+    // the silicon TOML's figure where the kernel takes its size from the TOML
+    // (RP), else the kernel profile's own `STATE_ARENA_SIZE`.
+    let state_arena_kb = silicon
+        .kernel
+        .as_ref()
+        .and_then(|k| k.state_arena_kb)
+        .or_else(|| {
+            crate::capacity::kernel_pool_size(&silicon.target.runtime, "state_arena")
+                .and_then(|bytes| u32::try_from(bytes / 1024).ok())
+        });
+
     Ok(TargetDescriptor {
         kind,
         id: silicon.target.id,
@@ -914,11 +929,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         memory,
         hardware_defaults: None,
         platform_defaults: platform_string_defaults(silicon.platform),
-        state_arena_kb: silicon
-            .kernel
-            .as_ref()
-            .and_then(|k| k.state_arena_kb)
-            .unwrap_or(256),
+        state_arena_kb,
         buffer_arena_kb: silicon.kernel.as_ref().and_then(|k| k.buffer_arena_kb),
         module_code_kb: silicon.kernel.as_ref().and_then(|k| k.module_code_kb),
         ram_static_max_kb: silicon.kernel.as_ref().and_then(|k| k.ram_static_max_kb),
@@ -1142,6 +1153,48 @@ mod tests {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.pop();
         p
+    }
+
+    /// A target whose kernel fixes its state arena (every kernel but RP's,
+    /// which places its arenas from the silicon TOML) is admitted against
+    /// that arena and no other figure: a smaller one refuses graphs the
+    /// kernel would run, a larger one admits graphs it cannot hold. A target
+    /// with no kernel has no arena.
+    #[test]
+    fn targets_plan_against_the_arena_their_kernel_allocates() {
+        let root = repo_root();
+        for target in [
+            "linux",
+            "wasm",
+            "pi5",
+            "bcm2712",
+            "qemu-virt",
+            "uefi",
+            "qemu-uefi-arm64",
+            "ec2-arm64",
+        ] {
+            let desc = super::load_target(target, &root).expect("target loads");
+            assert!(
+                !crate::capacity::kernel_places_arenas(desc.runtime()),
+                "{target}"
+            );
+            let kernel = crate::capacity::kernel_pool_size(desc.runtime(), "state_arena")
+                .unwrap_or_else(|| panic!("{target}: kernel profile fixes no state arena"));
+            assert_eq!(
+                desc.state_arena_kb.map(|kb| kb as u64 * 1024),
+                Some(kernel),
+                "{target} is not planned against its kernel's state arena"
+            );
+        }
+        for target in ["rp2350", "pico2w", "rp2040", "pico"] {
+            let desc = super::load_target(target, &root).expect("target loads");
+            assert!(
+                desc.state_arena_kb.is_some(),
+                "{target}: no RP arena figure"
+            );
+        }
+        let esp32 = super::load_target("esp32", &root).expect("esp32 loads");
+        assert_eq!(esp32.state_arena_kb, None, "esp32 has no kernel");
     }
 
     /// Pins every shipped target's runtime and module ABI. A target that

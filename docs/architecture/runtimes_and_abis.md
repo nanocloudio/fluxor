@@ -55,17 +55,9 @@ and cores, enumerates PCI, and runs the graph on the boot core, one pass per
 tick. It reports each stage on the console UART as it reaches it —
 `[boot] stage=kernel_entry`, then `mmu`, `acpi`, `irq`, `timer`,
 `step_guard`, `smp`, `pcie` and `graph` — and repeats a `[boot] stages=`
-summary, because a cloud console can connect after the boot has finished.
-On this runtime a graph's optional `boot:` map sets how a machine behaves on
-a test rig:
-
-| Key | Meaning |
-|---|---|
-| `summary_every_s` | How often to repeat the summary, 10 by default. |
-| `summary_for_s` | For how long; 0, the default, is for as long as it runs. |
-| `max_uptime_s` | Power off after this long, by PSCI and the counter alone. |
-| `fault_probe` | Fault on purpose, to test the fault report. |
-| `lockup_probe` | Stop one secondary core taking interrupts, to test the lockup detector. |
+summary every 10 s for as long as it runs, because a cloud console can
+connect after the boot has finished. A graph carries no machine behaviour:
+the composer refuses a top-level `boot:` key.
 
 ## Module ABIs
 

@@ -70,7 +70,7 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
 
     // Validate ISR module declarations if present
     if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
-        validate_isr_modules(modules, target, &mut result);
+        validate_isr_modules(config, modules, target, &mut result);
     }
 
     // Validate isolation settings if present
@@ -152,8 +152,8 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
 
         // Direction validation: command bridges are thread→ISR only
         if btype == "command" {
-            // from should be Tier 0 (cooperative), to should be Tier 1/2 (ISR)
-            // For now, just validate the declaration exists — tier assignment is Epic 7b/c
+            // from should be cooperative, to should be interrupt-mode;
+            // only the declaration is validated here.
         }
     }
 
@@ -165,77 +165,97 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
     }
 }
 
-/// Validate ISR module declarations.
+/// Validate interrupt-mode module declarations.
 ///
-/// Checks that modules declaring `tier: "1b"` or `tier: "2"` have:
-/// - A valid `trust` level ("platform" required for ISR execution)
-/// - A `max_cycles` budget that fits within the declared `rate_hz` period
-/// - Combined Tier 1b + Tier 2 ISR budget does not exceed configurable limit
+/// A module's execution mode is its domain's `exec:`; a module carries no
+/// `tier:` and no `rate_hz:` of its own (a `timer` domain declares the
+/// cadence). Modules in a `timer` or `irq` domain must have:
+/// - `trust: "platform"` (an ISR runs privileged)
+/// - for `timer`, a declared `max_cycles` that fits the domain's period, and
+///   a combined `timer` budget under half of that period
+/// - for `irq`, an `irq` field
 fn validate_isr_modules(
+    config: &Value,
     modules: &[Value],
     _target: &TargetDescriptor,
     result: &mut ValidationResult,
 ) {
+    use fluxor_contracts::boot_config::ExecMode;
     // Default to 150MHz (RP2350). Config can override via execution.clock_hz.
     let clock_hz: u64 = 150_000_000;
 
-    let mut total_tier1b_budget: u64 = 0;
-    let mut tier1b_period_us: u64 = 0;
+    let domains = match crate::config::parse_domain_execs(config) {
+        Ok(d) => d,
+        Err(e) => {
+            result.add_error(e.to_string());
+            return;
+        }
+    };
+
+    // Combined `max_cycles` per `timer` domain, against that domain's period.
+    let mut timer_budget: Vec<u64> = vec![0; domains.len()];
     let mut isr_module_count: usize = 0;
 
     for (i, module) in modules.iter().enumerate() {
-        let tier = module.get("tier").and_then(|t| t.as_str()).unwrap_or("0");
-        if tier != "1b" && tier != "2" {
-            continue;
-        }
-
-        isr_module_count += 1;
         let prefix = format!("modules[{i}]");
         let name = module
             .get("name")
             .and_then(|n| n.as_str())
             .unwrap_or("unknown");
+        if module.get("tier").is_some() {
+            result.add_error(format!(
+                "{prefix} ({name}): unknown key `tier`; a module runs in its domain's \
+                 execution mode (`exec:` on the domain)"
+            ));
+        }
+        if module.get("rate_hz").is_some() {
+            result.add_error(format!(
+                "{prefix} ({name}): unknown key `rate_hz`; the cadence is the `exec: timer` \
+                 domain's `rate_hz`"
+            ));
+        }
+
+        let domain = module
+            .get("domain")
+            .and_then(|d| d.as_str())
+            .and_then(|d| domains.iter().position(|(label, _)| label == d))
+            .unwrap_or(0);
+        let Some((_, exec)) = domains.get(domain) else {
+            continue;
+        };
+        if !exec.mode.is_interrupt() {
+            continue;
+        }
+        let mode = exec.mode.name();
+        isr_module_count += 1;
 
         // Trust level validation
         let trust = module.get("trust").and_then(|t| t.as_str()).unwrap_or("");
         if trust != "platform" {
             result.add_error(format!(
-                "{prefix} ({name}): ISR tier '{tier}' requires trust: \"platform\" (got '{trust}')"
+                "{prefix} ({name}): an `exec: {mode}` module requires trust: \"platform\" \
+                 (got '{trust}')"
             ));
         }
 
-        // Cycle budget validation
-        let max_cycles = module
-            .get("max_cycles")
-            .and_then(|c| c.as_u64())
-            .unwrap_or(0);
-        if max_cycles == 0 {
-            result.add_error(format!(
-                "{prefix} ({name}): ISR tier '{tier}' requires max_cycles declaration"
-            ));
-            continue;
-        }
-
-        if tier == "1b" {
-            let rate_hz = module.get("rate_hz").and_then(|r| r.as_u64()).unwrap_or(0);
-            if rate_hz > 0 {
-                let period_cycles = clock_hz / rate_hz;
-                if max_cycles > period_cycles {
-                    result.add_error(format!(
-                        "{prefix} ({name}): max_cycles ({max_cycles}) exceeds period ({period_cycles} cycles at {rate_hz} Hz)"
-                    ));
-                }
-                // Track period for combined budget check (all Tier 1b share the same timer)
-                let this_period_us = 1_000_000 / rate_hz;
-                if tier1b_period_us == 0 {
-                    tier1b_period_us = this_period_us;
-                } else if this_period_us != tier1b_period_us {
-                    result.add_warning(format!(
-                        "{prefix} ({name}): Tier 1b rate_hz ({rate_hz}) implies different period than other Tier 1b modules"
-                    ));
-                }
+        if exec.mode == ExecMode::Timer {
+            let period_us = u64::from(exec.timer_period_us);
+            let period_cycles = period_us * clock_hz / 1_000_000;
+            let max_cycles = module
+                .get("max_cycles")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0);
+            if max_cycles == 0 {
+                result.add_error(format!(
+                    "{prefix} ({name}): an `exec: timer` module requires a max_cycles declaration"
+                ));
+            } else if max_cycles > period_cycles {
+                result.add_error(format!(
+                    "{prefix} ({name}): max_cycles ({max_cycles}) exceeds the domain's period \
+                     ({period_cycles} cycles at {period_us} µs)"
+                ));
             }
-            total_tier1b_budget += max_cycles;
+            timer_budget[domain] += max_cycles;
 
             // FPU usage warning
             if module
@@ -244,28 +264,32 @@ fn validate_isr_modules(
                 .unwrap_or(false)
             {
                 result.add_warning(format!(
-                    "{prefix} ({name}): FPU in Tier 1b ISR adds 33 cycle lazy stacking overhead on Cortex-M33"
+                    "{prefix} ({name}): FPU in an `exec: timer` ISR adds 33 cycle lazy stacking overhead on Cortex-M33"
                 ));
             }
         }
 
-        if tier == "2" {
+        if exec.mode == ExecMode::Irq {
             let irq = module.get("irq").and_then(|i| i.as_u64());
             if irq.is_none() {
                 result.add_error(format!(
-                    "{prefix} ({name}): Tier 2 module requires 'irq' field"
+                    "{prefix} ({name}): an `exec: irq` module requires an 'irq' field"
                 ));
             }
         }
     }
 
-    // Combined budget check: Tier 1b budget should be < 50% of period
-    if tier1b_period_us > 0 && total_tier1b_budget > 0 {
-        let period_cycles = (tier1b_period_us * clock_hz) / 1_000_000;
-        let max_budget = period_cycles / 2; // 50% limit
-        if total_tier1b_budget > max_budget {
+    // Combined budget check: a timer domain's budget should be < 50% of its period.
+    for ((label, exec), &budget) in domains.iter().zip(&timer_budget) {
+        if exec.mode != ExecMode::Timer || budget == 0 {
+            continue;
+        }
+        let period_cycles = u64::from(exec.timer_period_us) * clock_hz / 1_000_000;
+        let max_budget = period_cycles / 2;
+        if budget > max_budget {
             result.add_error(format!(
-                "ISR budget: combined Tier 1b budget ({total_tier1b_budget} cycles) exceeds 50% of period ({period_cycles} cycles)"
+                "ISR budget: domain '{label}' combined timer budget ({budget} cycles) exceeds \
+                 50% of its period ({period_cycles} cycles)"
             ));
         }
     }
@@ -273,7 +297,7 @@ fn validate_isr_modules(
     // Slot count check
     if isr_module_count > 8 {
         result.add_error(format!(
-            "ISR modules: too many ({isr_module_count}, max 4 Tier 1b + 4 Tier 2)"
+            "ISR modules: too many ({isr_module_count}, max 4 timer + 4 irq)"
         ));
     }
 }
@@ -603,10 +627,12 @@ fn validate_sink_pins(
 /// default (the module's `trust_tier`, else the graph's `default_trust_tier`).
 /// The level is a floor; a request above every level the target implements is
 /// refused here, naming the levels it has. A gated module (`contained`,
-/// `isolated`) cannot also be an interrupt-tier module: an ISR runs
+/// `isolated`) cannot also be an interrupt-mode module: an ISR runs
 /// privileged, in handler mode, with no gateway between it and the kernel.
 fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut ValidationResult) {
     let levels = &target.isolation.levels;
+    // A malformed domain list is refused by `validate_isr_modules`.
+    let domains = crate::config::parse_domain_execs(config).unwrap_or_default();
     let listed = crate::protection::module_entries(config);
     let model = target.isolation.planner_model();
     let mut windows: Vec<(usize, &str, (u64, u32))> = Vec::new();
@@ -640,13 +666,19 @@ fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut Va
                     Ok(None) => {}
                     Err(e) => result.add_error(format!("modules[{i}] ({ty}): {e}")),
                 }
-                let tier = m.get("tier").and_then(|v| v.as_str());
-                if r.provided.is_gated() && matches!(tier, Some("1b") | Some("2")) {
+                let mode = m
+                    .get("domain")
+                    .and_then(Value::as_str)
+                    .and_then(|d| domains.iter().find(|(label, _)| label == d))
+                    .or_else(|| domains.first())
+                    .map(|(_, exec)| exec.mode)
+                    .filter(|mode| mode.is_interrupt());
+                if let (true, Some(mode)) = (r.provided.is_gated(), mode) {
                     result.add_error(format!(
-                        "modules[{i}] ({ty}): protection {} cannot apply to an interrupt-tier \
-                         (tier {}) module — an ISR runs privileged with no gateway",
+                        "modules[{i}] ({ty}): protection {} cannot apply to an `exec: {}` \
+                         module — an ISR runs privileged with no gateway",
                         r.provided.name(),
-                        tier.unwrap_or(""),
+                        mode.name(),
                     ));
                 }
             }
@@ -710,5 +742,56 @@ mod tests {
             // without it.
             assert_eq!(isolation_errors("linux", config.clone()).len(), 1);
         }
+    }
+
+    fn isr_errors(config: &Value) -> Vec<String> {
+        let mut result = ValidationResult::default();
+        let modules = config["modules"].as_array().cloned().unwrap_or_default();
+        validate_isr_modules(config, &modules, &target("pico2w"), &mut result);
+        result.errors
+    }
+
+    #[test]
+    fn a_module_carries_no_tier_or_rate() {
+        let config = json!({ "modules": [{ "name": "m", "tier": "1b", "rate_hz": 1000 }] });
+        let errors = isr_errors(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("unknown key `tier`")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("unknown key `rate_hz`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn timer_budgets_are_checked_against_the_domain_period() {
+        // 1 kHz at 150 MHz: a 150 000-cycle period, 75 000 for every module.
+        let config = |cycles: [u64; 2]| {
+            json!({
+                "execution": { "domains": [
+                    { "name": "main" },
+                    { "name": "pwm", "exec": "timer", "rate_hz": 1000 }
+                ]},
+                "modules": [
+                    { "name": "a", "domain": "pwm", "trust": "platform", "max_cycles": cycles[0] },
+                    { "name": "b", "domain": "pwm", "trust": "platform", "max_cycles": cycles[1] },
+                    { "name": "c", "domain": "main" }
+                ]
+            })
+        };
+        assert!(isr_errors(&config([30_000, 30_000])).is_empty());
+        let over = isr_errors(&config([50_000, 50_000]));
+        assert!(
+            over.iter().any(|e| e.contains("50% of its period")),
+            "{over:?}"
+        );
+        let past = isr_errors(&config([200_000, 1]));
+        assert!(
+            past.iter()
+                .any(|e| e.contains("exceeds the domain's period")),
+            "{past:?}"
+        );
     }
 }

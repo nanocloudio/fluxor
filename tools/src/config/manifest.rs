@@ -153,7 +153,7 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
 /// the same `type:` name, both readers must agree on which one
 /// wins. Were the order to differ between them, the checks would clear
 /// one source tree while the loader shipped another, admitting an ISR
-/// module whose `isr_safe` and `module_isr_entry` checks were never run
+/// module whose `interrupt_safe` and `module_isr_entry` checks were never run
 /// against the code that actually loads.
 fn resolve_module_root(
     type_name: &str,
@@ -710,7 +710,7 @@ fn edge_framed_type(
 ///
 /// The runtime `open_channels` enforcement over each wiring entry as
 /// written, by the kernel's ring rule (`ring_plan`, which mounts
-/// `src/kernel/ipc/ring_size.rs`) and the manifests' port capacities: for
+/// `fluxor_contracts::ring_size`) and the manifests' port capacities: for
 /// every FIFO edge, take the ring the kernel grants and check
 ///   1. producer `max_record` fits it (wedge exclusion — an
 ///      all-or-nothing write larger than the ring can never succeed);

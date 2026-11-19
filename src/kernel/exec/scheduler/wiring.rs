@@ -86,7 +86,7 @@ pub fn agreed_frame_kind<I: IntoIterator<Item = Option<u8>>>(peers: I) -> u8 {
 
 /// The first `buffer_group` fan insertion may give an edge of its own
 /// (`ring_size::RECORD_FAN_GROUP_FIRST`, which the composer replays fans by).
-const RECORD_FAN_GROUP_FIRST: u8 = crate::kernel::ipc::ring_size::RECORD_FAN_GROUP_FIRST;
+const RECORD_FAN_GROUP_FIRST: u8 = fluxor_contracts::ring_size::RECORD_FAN_GROUP_FIRST;
 
 /// A `buffer_group` no edge uses yet, for one edge around a record fan.
 ///

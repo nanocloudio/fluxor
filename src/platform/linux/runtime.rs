@@ -1,13 +1,3 @@
-// Linker symbol stub
-// ============================================================================
-
-// The config module references __end_block_addr (a linker symbol for flash
-// layout trailers). On Linux we don't use flash layout — we load config from
-// files directly. Provide a dummy symbol so the code links.
-#[no_mangle]
-#[used]
-static __end_block_addr: u8 = 0;
-
 // ============================================================================
 // Monotonic clock (CLOCK_MONOTONIC via std::time)
 // ============================================================================

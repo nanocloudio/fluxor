@@ -1,5 +1,4 @@
-//! Host-side encoder for the on-device `AddSubgraph` wire format and the
-//! resident-workload config section.
+//! Host-side encoder for the on-device `AddSubgraph` wire format.
 //!
 //! A RESIDENT WORKLOAD is a workload-owned subgraph declared in a graph YAML's
 //! `workloads:` section and admitted by the kernel at boot, alongside the base
@@ -11,12 +10,10 @@
 //! The `AddSubgraph` (FLXA) blob produced here is byte-compatible with the
 //! kernel decoder `kernel::exec::scheduler::live::apply_add_encoded`:
 //! big-endian, fixed-width, PIC modules referenced by `name_hash` (FNV-1a of
-//! the type name). The workload **section** wraps one or more FLXA blobs and
-//! is appended to the config blob PAST the checksummed body, after the
-//! adaptive-tick `tick_min/max` tail (`kernel::boot::config::ADAPTIVE_POST_SIZE`),
-//! so the body and its CRC do not cover it. The kernel reads it in
-//! `kernel::boot::config::read_config_from_slice` and admits each workload at
-//! boot via `apply_add_encoded` + `finalize_resident_graphs`.
+//! the type name). A boot config carries each resident workload's blob in its
+//! `WKLD` section (`fluxor_contracts::boot_config::WorkloadRecord`), under the
+//! blob's one checksum; the kernel admits each at boot via
+//! `apply_add_encoded` + `finalize_resident_graphs`.
 //!
 //! Scope: workloads are self-contained subgraphs — intra-workload edges only
 //! (`New → New`), and those edges must stay inside one domain, because a
@@ -145,23 +142,12 @@ impl StepBudget {
         d.saturating_mul(BURST_MULTIPLIER)
     }
 }
-/// Resident-workload config-section magic: "FXPD". Mirrors
-/// `kernel::boot::config::WORKLOAD_SECTION_MAGIC`.
-pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
-
 /// Largest subgraph one `apply_add` admits — mirrors
 /// `kernel::exec::scheduler::live::MAX_ADD_MODULES`.
 pub const MAX_ADD_MODULES: usize = 64;
 /// Largest edge count one `apply_add` admits — mirrors
 /// `kernel::exec::scheduler::live::MAX_ADD_EDGES`.
 pub const MAX_ADD_EDGES: usize = 192;
-/// Largest resident-workload section the kernel will map — mirrors
-/// `kernel::boot::config::MAX_WORKLOAD_SECTION_BYTES`. The encoder rejects
-/// output beyond this so a config that builds always admits ALL its workloads
-/// (the kernel caps the mapped section at this size and would otherwise
-/// silently truncate).
-pub const MAX_WORKLOAD_SECTION_BYTES: usize = 8 * 1024;
-
 /// One PIC module in a workload. `params` is the inline TLV blob (as
 /// `schema::build_params_from_schema` produces it for a base-graph module).
 pub struct WorkloadModule {
@@ -242,16 +228,13 @@ pub struct Workload {
     /// Idle-safe attestation (graph YAML `idle_safe: true` on the workload): the
     /// operator asserts every module in this workload is demand-driven — it makes
     /// progress only when an event or its own periodic schedule wakes it, and
-    /// never relies on being stepped to notice anything. Carried in the FXPD
-    /// per-workload flags byte. The scheduler ANDs the attestation across every
+    /// never relies on being stepped to notice anything. Carried in the
+    /// workload record's flags (`WorkloadRecord::idle_safe`). The scheduler ANDs the attestation across every
     /// module the owner holds and parks the whole graph when idle only if all
     /// of them attest; an UNATTESTED workload is fail-closed — never parked, only
     /// relaxed to a liveness step every `tick_max`.
     pub idle_safe: bool,
 }
-
-/// FXPD per-workload flags bit: workload is idle-safe attested.
-pub const WORKLOAD_FLAG_IDLE_SAFE: u8 = 0x01;
 
 /// Encode one workload as a big-endian `AddSubgraph` (FLXA) blob byte-compatible with
 /// `apply_add_encoded`.
@@ -304,64 +287,6 @@ pub fn encode_add_subgraph(workload: &Workload) -> Result<Vec<u8>, String> {
         b.extend_from_slice(&e.buffer_bytes.to_be_bytes());
     }
     Ok(b)
-}
-
-/// CRC-16-CCITT (0xFFFF init, 0x1021 poly) — byte-identical to the kernel's
-/// `config::crc16_ccitt`, so the kernel can verify the workload section's integrity.
-fn crc16_ccitt(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
-    for &byte in data {
-        crc ^= (byte as u16) << 8;
-        for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
-}
-
-/// Encode the resident-workload config section. Layout (little-endian framing; inner
-/// FLXA blobs are big-endian):
-/// `[FXPD u32][section_len u32][crc16 u16][count u16]` then per workload
-/// `[blob_len u32][flags u8][FLXA blob]`. The workload section rides PAST the config
-/// body's CRC-16, so it carries its OWN length + CRC over the payload (`count` +
-/// workloads); the kernel validates the whole section before admitting ANY workload, so
-/// corruption can't change a workload's domain/wiring/params/attestation or leave a
-/// prefix active. Rejects output exceeding `MAX_WORKLOAD_SECTION_BYTES` (the kernel's
-/// mapped cap), so a config that builds always admits every workload.
-pub fn encode_workload_section(workloads: &[Workload]) -> Result<Vec<u8>, String> {
-    // Payload = count + workloads (the CRC-covered, executable content).
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(workloads.len() as u16).to_le_bytes());
-    for p in workloads {
-        let blob = encode_add_subgraph(p)?;
-        let flags = if p.idle_safe {
-            WORKLOAD_FLAG_IDLE_SAFE
-        } else {
-            0
-        };
-        payload.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-        payload.push(flags);
-        payload.extend_from_slice(&blob);
-    }
-    let crc = crc16_ccitt(&payload);
-    let section_len = 10 + payload.len(); // header magic(4)+len(4)+crc(2) + payload
-    if section_len > MAX_WORKLOAD_SECTION_BYTES {
-        return Err(format!(
-            "resident-workload section is {section_len} bytes, exceeding the kernel's mapped \
-             cap (MAX_WORKLOAD_SECTION_BYTES = {MAX_WORKLOAD_SECTION_BYTES}); the kernel would \
-             truncate it. Reduce workload count or per-workload params."
-        ));
-    }
-    let mut s = Vec::with_capacity(section_len);
-    s.extend_from_slice(&WORKLOAD_SECTION_MAGIC.to_le_bytes());
-    s.extend_from_slice(&(section_len as u32).to_le_bytes());
-    s.extend_from_slice(&crc.to_le_bytes());
-    s.extend_from_slice(&payload);
-    Ok(s)
 }
 
 #[cfg(test)]
@@ -520,9 +445,6 @@ mod tests {
         assert_eq!(&e[0..12], &[3, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // from New(0) port 0 -> to Net(2) port 0, 4096 bytes.
         assert_eq!(&e[12..24], &[0, 0, 0, 0, 3, 0, 2, 0, 0, 0, 0x10, 0]);
-        // The resident section carries the same blob after its frame.
-        let s = encode_workload_section(&[workload]).unwrap();
-        assert_eq!(&s[17..], &b[..]);
     }
 
     #[test]
@@ -557,54 +479,6 @@ mod tests {
             edge(WorkloadEnd::Net(2), WorkloadEnd::Local(1)),
         ];
         assert!(check_net_lanes(&two).is_ok());
-    }
-
-    #[test]
-    fn workload_section_header_has_length_and_crc() {
-        let workload = Workload {
-            workload_uid: [0u8; 16],
-            state_cap: 1,
-            buffer_cap: 2,
-            modules: vec![],
-            edges: vec![],
-            idle_safe: true,
-        };
-        let s = encode_workload_section(&[workload]).unwrap();
-        // Header: magic(4) + section_len(4) + crc16(2) + count(2).
-        assert_eq!(&s[0..4], &WORKLOAD_SECTION_MAGIC.to_le_bytes());
-        let section_len = u32::from_le_bytes([s[4], s[5], s[6], s[7]]) as usize;
-        assert_eq!(section_len, s.len());
-        let crc = u16::from_le_bytes([s[8], s[9]]);
-        // CRC covers the payload (count + workloads) = section[10..].
-        assert_eq!(crc, crc16_ccitt(&s[10..]));
-        assert_eq!(&s[10..12], &1u16.to_le_bytes()); // workload_count
-        let blob_len = u32::from_le_bytes([s[12], s[13], s[14], s[15]]) as usize;
-        // Per-workload frame: blob_len(4) then flags(1) then the FLXA blob.
-        assert_eq!(blob_len, 34); // 0-module blob: header(8)+uid(16)+caps(8)+counts(2)
-        assert_eq!(s[16], WORKLOAD_FLAG_IDLE_SAFE); // flags: idle-safe attested
-        assert_eq!(s.len(), 17 + blob_len);
-        // inner blob is big-endian FLXA (after the 1-byte flags).
-        assert_eq!(&s[17..21], &ADD_MAGIC.to_be_bytes());
-    }
-
-    #[test]
-    fn oversized_workload_section_rejected() {
-        // A workload whose params push the section past the kernel's mapped cap must
-        // be rejected at encode time, not silently truncated at boot.
-        let big = Workload {
-            workload_uid: [0u8; 16],
-            state_cap: 0,
-            buffer_cap: 0,
-            modules: vec![WorkloadModule {
-                name_hash: 1,
-                domain_id: 0,
-                budget: StepBudget::default(),
-                params: vec![0u8; MAX_WORKLOAD_SECTION_BYTES], // > cap on its own
-            }],
-            edges: vec![],
-            idle_safe: false,
-        };
-        assert!(encode_workload_section(&[big]).is_err());
     }
 
     #[test]

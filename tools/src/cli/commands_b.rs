@@ -1296,6 +1296,26 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
 }
 
 fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &Path) -> Result<()> {
+    let (table, modules) = module_table_bytes(config_path, module_root)?;
+    std::fs::write(output, &table)?;
+    println!(
+        "{} modules from {} → {}",
+        modules.len(),
+        config_path.display(),
+        output.display()
+    );
+    for (name, len) in &modules {
+        println!("  {name} ({len} bytes)");
+    }
+    Ok(())
+}
+
+/// A packed module table, with each module's name and size.
+type ModuleTable = (Vec<u8>, Vec<(String, usize)>);
+
+/// The module table a hosted build packs for the graph at `config_path`,
+/// with each module's name and size.
+fn module_table_bytes(config_path: &Path, module_root: Option<&Path>) -> Result<ModuleTable> {
     let mut config: serde_json::Value =
         stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
     let yaml_dir = config_path
@@ -1326,19 +1346,10 @@ fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &P
     // host loader sees module_count=0 and instantiates only built-ins.
     let programs = crate::modules::collect_programs(&config)?;
     let table = crate::modules::build_module_table_with_programs(&modules, &programs)?;
-    std::fs::write(output, &table)?;
-
-    println!(
-        "{} modules from {} → {}",
-        modules.len(),
-        config_path.display(),
-        output.display()
-    );
-    for m in &modules {
-        println!("  {} ({} bytes)", m.name, m.data.len());
-    }
-
-    Ok(())
+    Ok((
+        table,
+        modules.iter().map(|m| (m.name.clone(), m.data.len())).collect(),
+    ))
 }
 
 fn cmd_diff(old_path: &Path, new_path: &Path, target_override: Option<&str>) -> Result<()> {
@@ -1504,8 +1515,7 @@ fn build_one_from(
             }
             "linux" => {
                 let mut p = PathBuf::from(format!("target/linux/{name}"));
-                // Linux produces two files; the "output_path" is the directory
-                p.push("config.bin");
+                p.push("graph.img");
                 p
             }
             "wasm" => {
@@ -1611,14 +1621,6 @@ fn build_one_from(
             }
         }
         "linux" => {
-            let out_dir = output_path
-                .parent()
-                .unwrap_or(std::path::Path::new("target/linux"));
-            std::fs::create_dir_all(out_dir)?;
-
-            let config_bin_path = out_dir.join("config.bin");
-            let modules_bin_path = out_dir.join("modules.bin");
-
             // The host loads its module ABI's shelf. The default root is
             // anchored to the resolved project root (not the
             // caller's cwd) so `fluxor run <path>` finds the same modules from
@@ -1637,16 +1639,22 @@ fn build_one_from(
             // binary can't provide fails here with the matching
             // `cargo build` command in the error message.
             validate_linux_runtime_features(yaml_path)?;
-            // The config first: a graph the builder refuses (an anchor file
-            // that does not load, say) then leaves nothing behind, rather
-            // than a modules table beside a missing config.
-            cmd_generate(
-                yaml_path,
-                Some(config_bin_path.as_path()),
-                Some(modules_dir.as_path()),
-                true,
-            )?;
-            cmd_mktable_config(yaml_path, Some(&modules_dir), &modules_bin_path)?;
+            // One graph image: the config first, so a graph the builder
+            // refuses (an anchor file that does not load, say) leaves nothing
+            // behind. Signed with the workspace key when there is one, which
+            // a runtime whose image carries that key's root requires.
+            let config_data = generate_config_bytes(yaml_path, Some(modules_dir.as_path()))?;
+            let (table, _) = module_table_bytes(yaml_path, Some(&modules_dir))?;
+            let seed = crate::signing::seed(None, &project_root)?;
+            let image = crate::graph_image::compose(&table, &config_data, 0, seed.as_ref())?;
+            std::fs::write(&output_path, &image)?;
+            println!(
+                "graph image {}: modules {} B, config {} B, {}",
+                output_path.display(),
+                table.len(),
+                config_data.len(),
+                if seed.is_some() { "signed" } else { "unsigned" }
+            );
         }
         "wasm" => {
             // wasm produces one self-contained `.wasm` file: the

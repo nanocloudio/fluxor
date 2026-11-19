@@ -272,7 +272,7 @@ each fanned edge beyond it is sized by its other end and its
 `buffer_bytes`. On bcm2712 every edge between two domains, or of class
 `cross_core`, adds a default consumer-side ring.
 
-`src/kernel/ipc/ring_size.rs` states this rule once: the scheduler opens
+`contracts/src/ring_size.rs` states this rule once: the scheduler opens
 rings by it, `channel_open` bounds them by it, and `fluxor build` (and
 `--check`) replays graph preparation by it over the compiled config. It
 prints the largest rings beside the total, the share of the target's

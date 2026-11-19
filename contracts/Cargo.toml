@@ -3,7 +3,7 @@ name              = "fluxor-contracts"
 version.workspace = true
 edition           = "2021"
 license           = "Apache-2.0"
-description       = "Public Fluxor contracts: content types, isolation planner, boot map, owner-log ring"
+description       = "Public Fluxor contracts: content types, isolation planner, boot map, boot configuration and owner plan codecs, ring sizing, params TLV, owner-log ring"
 
 [lib]
 name = "fluxor_contracts"

@@ -1177,7 +1177,7 @@ fn handle_program_op(opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32
     match opcode {
         SLOT_ADMITTED => {
             #[cfg(feature = "rp")]
-            return i32::from(crate::kernel::boot::config::admitted_slots());
+            return i32::from(crate::platform::planner::admitted_slots());
             #[cfg(not(feature = "rp"))]
             return errno::ENOSYS;
         }

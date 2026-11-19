@@ -422,7 +422,7 @@ pub struct SchedulerState {
     /// demand-driven (woken by events / its own periodic schedule) and may be
     /// idle-skipped. DEFAULT false = fail-closed: an unattested workload graph is
     /// never fully parked, only relaxed to the backstop (`tick_max`) cadence.
-    /// Set from the workload's FXPD attestation flag at admission.
+    /// Set from the workload's idle-safe attestation flag at admission.
     pub(crate) module_idle_safe: ModTable<bool>,
     /// Per-module count of consecutive ticks the module was considered
     /// by the scheduler but never reached `m.step()` — readiness gate
@@ -1502,12 +1502,10 @@ pub fn graph_sample_rate() -> u32 {
 /// proposed graph hash matches what's already loaded).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphSnapshot {
-    /// CRC16-CCITT over the binary config body — same value the loader
-    /// validates against `header.checksum`. `0` means the producer
-    /// didn't include a checksum.
-    pub config_checksum: u16,
-    /// Active module count in the compiled graph.
-    pub module_count: u8,
+    /// The config blob's CRC-32, as the parser verified it.
+    pub config_checksum: u32,
+    /// Module count in the compiled graph.
+    pub module_count: u16,
     /// Compiled edge count (past 255 on the host profile).
     pub edge_count: u16,
     /// Tick interval in microseconds (`0` = default `DEFAULT_TICK_US`).
@@ -1535,7 +1533,7 @@ pub fn graph_snapshot() -> GraphSnapshot {
     };
     GraphSnapshot {
         config_checksum: cfg.header.checksum,
-        module_count: cfg.header.module_count,
+        module_count: cfg.module_count,
         edge_count: cfg.edge_count,
         tick_us: cfg.header.tick_us as u32,
         sample_rate: sched.graph_sample_rate,
@@ -1684,6 +1682,13 @@ pub fn domain_tick_us(domain_id: usize) -> u32 {
     tick_us()
 }
 
+/// Whether domain `domain_id` declares its own `tick_us` rather than taking
+/// the graph's.
+pub fn domain_declares_tick(domain_id: usize) -> bool {
+    // SAFETY: scheduler-thread-only read; domain_id bounded.
+    domain_id < MAX_DOMAINS && unsafe { SCHED.domain_tick_us[domain_id] } != 0
+}
+
 /// Return the per-domain worst-recent single-step time in microseconds — the
 /// adaptive-tick floor input (decaying peak-hold, NOT a monotonic max).
 /// The pacer clamps `tick_min_us` up by `worst × margin` so a shortened tick
@@ -1801,7 +1806,7 @@ pub fn set_module_init_state_for_test(slot: usize, initialising: bool) {
 }
 
 /// Test-only: set a module slot's idle-safe attestation (production sets it from
-/// the workload's FXPD flag at admission). Only an all-idle-safe graph may be fully
+/// the workload's `WKLD` idle-safe flag at admission). Only an all-idle-safe graph may be fully
 /// parked; an unattested workload is fail-closed to the `tick_max` backstop.
 pub fn set_module_idle_safe_for_test(slot: usize, idle_safe: bool) {
     if slot < module_slots() {
@@ -1813,7 +1818,7 @@ pub fn set_module_idle_safe_for_test(slot: usize, idle_safe: bool) {
 }
 
 /// Mark every module currently owned by `owner` as idle-safe (or not) — the
-/// admission-time application of a workload's FXPD idle-safe attestation. Bounded
+/// admission-time application of a workload's idle-safe attestation. Bounded
 /// boot-time pass; the resident-graph index's per-graph `idle_safe` is recomputed
 /// by the following `rebuild_resident_graph_index`.
 pub fn set_owner_idle_safe(owner: crate::kernel::workload::owner::OwnerHandle, idle_safe: bool) {

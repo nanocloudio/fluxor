@@ -91,7 +91,7 @@ fn stage_candidate<S: Storage>(
         system_modules,
     )
     .map_err(AgentError::Compose)?;
-    let blob = encode_plan(&plan);
+    let blob = encode_plan(&plan).map_err(AgentError::Compose)?;
     let blob_digest = sha256(&blob);
     store
         .stage(gen_id, blob_digest, &[(blob_digest, blob)])

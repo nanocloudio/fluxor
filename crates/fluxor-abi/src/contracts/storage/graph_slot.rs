@@ -4,14 +4,11 @@
 //
 // The graph slot is the storage-medium-neutral channel protocol spoken
 // between `ota_ingest` / `reconfigure` and the `graph_slot` PIC module.
-// Storage layout (flash offsets, magic bytes, slot sizes) is NOT part
-// of this contract — it lives in `platform/<chip>/flash_layout.rs`
-// because it's platform-specific (RP 4 MB XIP flash vs. ESP32 NVS vs.
-// BCM2712 SD/NVMe).
-//
-// Current RP layout: see `platform::rp::flash_layout::GRAPH_SLOT_*`.
-// On-flash slot header (256 bytes, at the start of each slot) is
-// documented alongside those constants.
+// Storage layout (flash offsets, slot sizes) is NOT part of this
+// contract — it lives in `platform/<chip>/flash_layout.rs` because it's
+// platform-specific (RP 4 MB XIP flash vs. ESP32 NVS vs. BCM2712
+// SD/NVMe). Each slot holds one graph image, whose 256-byte header is
+// `wire::graph_image`.
 //
 // The graph_slot PIC module owns the on-flash format. It is served
 // over channels — consumers write FMP-framed requests and read

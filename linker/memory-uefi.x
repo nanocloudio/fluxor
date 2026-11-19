@@ -32,7 +32,7 @@ SECTIONS {
     } > RAM
 
     /* End of the file-backed sections: the packer pads from here to the
-     * trailer, and the payload follows it in the file. */
+     * graph image header, and the payload follows it in the file. */
     __end_data_addr = .;
 
     /* BSS starts on a 16 MiB boundary. `_start` zeroes BSS, so the payload

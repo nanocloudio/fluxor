@@ -5,7 +5,7 @@ hardware_targets = ["bcm2712"]
 # declaration is treated as unattested and is blocked there.
 timer_class = "agnostic"
 
-# Opt rp1_gem into the Tier 1c pre-pass drain slot: the scheduler runs
+# Opt rp1_gem into its domain's pre-pass: the scheduler runs
 # every module carrying this flag once at the start of each pass, ahead
 # of the exec_order rotation, and charges the time against the combined
 # pre-tick budget. The NIC driver's TX/RX
@@ -15,8 +15,8 @@ timer_class = "agnostic"
 # hop by ~one full pass, attacking the 797 µs fixed per-request
 # overhead measured at [[body_size_scaling]]. Step time is bounded
 # (~1 µs in current builds) so it fits comfortably under the
-# combined `MAX_PRE_TICK_BUDGET_US = 5` ceiling.
-pre_tick_drain = true
+# combined pre-pass budget (`MAX_PRE_TICK_BUDGET_US = 5`).
+pre_pass = true
 
 # `net_tx_drain` is served on `frames_tx` to the stack wired there: a fence
 # learns from it when the wire is quiet.

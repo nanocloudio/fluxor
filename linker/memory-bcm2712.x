@@ -48,10 +48,10 @@ SECTIONS {
         KEEP(*(.layout_header))
     } > RAM
 
-    /* End of loadable (file-backed) sections. Pack-image and combine
-     * pad from this address up to the trailer's 256-byte boundary, so
+    /* End of loadable (file-backed) sections. Combine pads from this
+     * address up to the graph image header's 256-byte boundary, so
      * __end_data_addr must mark the true end of the emitted binary
-     * (no ALIGN here) for the trailer to land at the right offset. */
+     * (no ALIGN here) for the header to land where the kernel reads it. */
     __end_data_addr = .;
 
     /* PAYLOAD WINDOW. A RAM-loaded image (Pi 5: the VPU drops the whole
@@ -62,11 +62,11 @@ SECTIONS {
      * the module table decodes as empty and the board boots a graph with
      * no modules: no network, no telemetry, no console, indistinguishable
      * from a board that never booted. The same holds for the config: a
-     * config whose checksummed body reaches __bss_start loses its last
-     * bytes to the clear, fails its checksum and is refused before the
-     * network is up, so a board without serial is silent. A body that ends
-     * below __bss_start boots, whatever its size inside the window; bytes
-     * after the body (the post-body tail) that cross it read as zero.
+     * config blob that reaches __bss_start loses its last bytes to the
+     * clear, fails its checksum and is refused before the network is up,
+     * so a board without serial is silent. A blob that ends below
+     * __bss_start boots, whatever its size inside the window: the blob's
+     * size is not what refuses it, its placement is.
      *
      * With plain ALIGN(4096) the usable window is only the gap that
      * happens to fall between the firmware's end and the next alignment

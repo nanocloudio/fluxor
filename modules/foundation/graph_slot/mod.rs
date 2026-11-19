@@ -1,11 +1,10 @@
 //! A/B graph slot store (PIC module, channel-served).
 //!
-//! Owns the on-flash format of the two OTA slots
-//! (`abi::platform::rp::flash_layout::GRAPH_SLOT_*`), which lie where the
-//! kernel partitioned this board's flash (`FLASH_LAYOUT`): their size is
-//! the board's, a third each of what the kernel leaves. Each slot holds a
-//! graph image: a 256-byte header, then the module table (with its program
-//! section) and the static config. Of the slots the boot selector admits,
+//! Owns the two OTA slots, which lie where the kernel partitioned this
+//! board's flash (`FLASH_LAYOUT`): their size is the board's, a third each
+//! of what the kernel leaves. Each slot holds a graph image: its 256-byte
+//! header (`abi::wire::graph_image`), then the module table (with its
+//! program section) and the static config. Of the slots the boot selector admits,
 //! the one with the higher epoch is the one the next boot selects.
 //!
 //! ## The running slot is never written
@@ -110,8 +109,6 @@ include!("../tls/ed25519_job.rs");
 // ============================================================================
 
 const XIP_BASE: u32 = abi::platform::rp::flash_layout::XIP_BASE;
-const SLOT_MAGIC: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_MAGIC;
-const SLOT_VERSION: u8 = abi::platform::rp::flash_layout::GRAPH_SLOT_VERSION;
 
 const SECTOR_SIZE: u32 = 4096;
 const PAGE_SIZE: usize = 256;
@@ -198,14 +195,7 @@ struct State {
 // Header decoding
 // ============================================================================
 
-struct HeaderFields {
-    epoch: u64,
-    modules_offset: u32,
-    modules_size: u32,
-    config_offset: u32,
-    config_size: u32,
-    sha256: [u8; 32],
-}
+use abi::wire::graph_image::{self, Header as HeaderFields};
 
 unsafe fn read_u32_le(p: *const u8) -> u32 {
     (core::ptr::read(p) as u32)
@@ -214,50 +204,11 @@ unsafe fn read_u32_le(p: *const u8) -> u32 {
         | ((core::ptr::read(p.add(3)) as u32) << 24)
 }
 
-unsafe fn read_u64_le(p: *const u8) -> u64 {
-    (read_u32_le(p) as u64) | ((read_u32_le(p.add(4)) as u64) << 32)
-}
-
+/// The header at `base_xip`, in a slot of `slot_size` bytes, read as the
+/// kernel's boot selector reads it (`wire::graph_image::Header::decode`).
 unsafe fn decode_header(base_xip: *const u8, slot_size: u32) -> Option<HeaderFields> {
-    if read_u32_le(base_xip) != SLOT_MAGIC {
-        return None;
-    }
-    if core::ptr::read(base_xip.add(4)) != SLOT_VERSION {
-        return None;
-    }
-    let epoch = read_u64_le(base_xip.add(8));
-    let modules_offset = read_u32_le(base_xip.add(16));
-    let modules_size = read_u32_le(base_xip.add(20));
-    let config_offset = read_u32_le(base_xip.add(24));
-    let config_size = read_u32_le(base_xip.add(28));
-
-    // As the boot selector: a module table is at least its 16-byte
-    // header, and both regions lie inside the slot.
-    if modules_size < 16 {
-        return None;
-    }
-    if (modules_offset as u64) + (modules_size as u64) > slot_size as u64 {
-        return None;
-    }
-    if (config_offset as u64) + (config_size as u64) > slot_size as u64 {
-        return None;
-    }
-
-    let mut sha = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        sha[i] = core::ptr::read(base_xip.add(32 + i));
-        i += 1;
-    }
-
-    Some(HeaderFields {
-        epoch,
-        modules_offset,
-        modules_size,
-        config_offset,
-        config_size,
-        sha256: sha,
-    })
+    let bytes = core::slice::from_raw_parts(base_xip, graph_image::HEADER_SIZE);
+    HeaderFields::decode(bytes, u64::from(slot_size)).ok()
 }
 
 /// Whether the boot selector would take `slot` (at `base`): its pin matches,
@@ -531,9 +482,7 @@ unsafe fn slot_pin_admits(base_xip: *const u8, own: &[u8; 32]) -> bool {
     let mut pin = [0u8; 32];
     let mut i = 0;
     while i < 32 {
-        pin[i] = core::ptr::read(
-            base_xip.add(abi::platform::rp::flash_layout::GRAPH_SLOT_ABI_SURFACE_OFFSET + i),
-        );
+        pin[i] = core::ptr::read(base_xip.add(graph_image::ABI_PIN_AT + i));
         i += 1;
     }
     ct_eq32(&pin, own)
@@ -558,11 +507,6 @@ unsafe fn do_activate(s: &mut State, _sys: &SyscallTable) -> i32 {
         Some(h) => h,
         None => return E_IO,
     };
-    // The digest covers what follows the header page, which is all in
-    // flash by now; ranges that reach into the page cannot be checked.
-    if hdr.modules_offset < PAGE_SIZE as u32 || hdr.config_offset < PAGE_SIZE as u32 {
-        return E_INVAL;
-    }
     if epoch_to_beat(s, candidate).is_some_and(|epoch| hdr.epoch <= epoch) {
         return E_AGAIN;
     }
@@ -628,7 +572,7 @@ unsafe fn activate_step(s: &mut State, sys: &SyscallTable) -> bool {
         // signature over the header vouches for the payload only through
         // that digest.
         let out = s.act_hasher.clone().finalize();
-        if !ct_eq32(&out, &hdr.sha256) {
+        if !ct_eq32(&out, &hdr.digest) {
             s.act_phase = ACT_IDLE;
             emit_response(s, sys, REQ_ACTIVATE, E_IO);
             return false;
@@ -674,23 +618,16 @@ const E_ACCES: i32 = -13;
 /// `None` for a header with no record, one for another key, or a
 /// signature whose `S` is not below the group order.
 fn signature_job(s: &State) -> Option<Ed25519VerifyJob> {
-    use abi::platform::rp::flash_layout as fl;
     let h = &s.header;
-    let at = fl::GRAPH_SLOT_SIGNATURE_OFFSET;
-    let magic = u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]]);
-    if magic != fl::GRAPH_SLOT_SIGNATURE_MAGIC {
-        return None;
-    }
+    let record = graph_image::signature(h)?;
     let id = sha256(&s.root);
-    if h[at + 4..at + 8] != id[..4] {
+    if record.key_id != id[..4] {
         return None;
     }
-    let mut sig = [0u8; 64];
-    sig.copy_from_slice(&h[at + 8..at + 72]);
     ed25519_verify_init(
         &s.root,
-        &h[..fl::GRAPH_SLOT_SIGNED_LEN],
-        &sig,
+        &h[..graph_image::SIGNED_LEN],
+        &record.signature,
         SIG_BITS_PER_STEP,
     )
 }

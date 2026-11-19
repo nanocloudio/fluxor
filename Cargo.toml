@@ -234,7 +234,7 @@ adaptive_deferred_rig = []
 
 # Rig-validation opt-in: from core 0, periodically fire SGI 15 at core 1 (the
 # Tier-2 dedicated core) so a Tier-2 IRQ-owned module's `module_isr_entry` is
-# driven on silicon. OFF by default; pairs with a `tier: 2` domain hosting the
+# driven on silicon. OFF by default; pairs with an `exec: irq` domain hosting the
 # `tier2_probe` module. Validates the Tier-2 dispatch path end-to-end on hardware.
 test_tier2_sgi = []
 

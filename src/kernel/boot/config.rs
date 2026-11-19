@@ -1,34 +1,48 @@
-//! Configuration and hardware structures.
+//! The boot configuration: where the platform maps it, and the `Config` the
+//! kernel fills from it.
 //!
-//! This module provides:
-//! - Binary configuration reader for FXWR format config from flash
-//! - Hardware configuration structures for SPI, I2C, and GPIO
-//! - Runtime hardware context tracking
-//! - Hardware manager for initialization
+//! The blob's format and its one codec are `fluxor_contracts::boot_config`
+//! (FXCF): a checksummed header and tagged sections, decoded without
+//! allocating. This module locates the blob in the window the platform maps,
+//! hands it to the codec, bounds what the codec returns by this kernel's
+//! capacity profile, and fills `Config`. A blob the codec refuses, or one
+//! that asks for more than the profile holds, is refused whole: nothing of it
+//! is applied.
 //!
 //! ## Concurrency
 //!
 //! The parsed `Config` is written by `populate_static_state` on core 0 at
 //! boot (and at a rebuild, with every other core parked), then read by every
-//! core. Module params are not copied out of the blob: each `ModuleEntry`
-//! borrows its params in place, so the config blob stays mapped for as long
-//! as the `Config` that points into it (every platform keeps it mapped for
-//! the life of the kernel). See `docs/architecture/concurrency.md`.
+//! core. Module params and resident workloads are not copied out of the blob:
+//! each `ModuleEntry` borrows its params in place, and `Config::workloads`
+//! reads the blob's `WKLD` section where it lies, so the config blob stays
+//! mapped for as long as the `Config` that points into it (every platform
+//! keeps it mapped for the life of the kernel). See
+//! `docs/architecture/concurrency.md`.
 //!
-//! ## Flash Layout
+//! ## Graph image
 //!
-//! The flash layout is dynamic, controlled by a 16-byte trailer placed
-//! immediately after the firmware code (256-byte aligned).
+//! The graph a kernel boots is a graph image (`abi::wire::graph_image`): a
+//! 256-byte header, the module table and the config, admitted by
+//! `boot::graph_image::admit` before anything in it is read. A firmware image
+//! carries one after the kernel, its header on the first 256-byte boundary
+//! past the kernel's file-backed end:
 //!
 //! ```text
-//! 0x10000000: [firmware]
-//!             [trailer - 16 bytes, 256-byte aligned after firmware]
-//!             [modules - optional, any size]
-//!             [config - any size]
+//! [kernel]
+//! [graph image header, 256 bytes]
+//! [module table, 4 KiB aligned]
+//! [config, 256-byte aligned]
 //! ```
+//!
+//! An RP board boots the graph of one of its flash A/B slots when it has an
+//! admissible one (`platform::planner::choose_slot`). A Linux runtime is handed
+//! its image as a file and admits it itself; wasm embeds its blobs.
+
+use fluxor_contracts::boot_config::{self, BootConfig, Workloads};
 
 // ============================================================================
-// Hardware Configuration Structures
+// GPIO pin configuration (the HAL's `init_gpio` input)
 // ============================================================================
 
 /// GPIO direction
@@ -56,47 +70,6 @@ pub enum GpioPull {
     Down = 2,
 }
 
-/// SPI bus configuration
-#[derive(Debug, Clone, Copy)]
-pub struct SpiConfig {
-    /// SPI bus number (0 or 1)
-    pub bus: u8,
-    /// MISO pin number
-    pub miso: u8,
-    /// MOSI pin number
-    pub mosi: u8,
-    /// SCK pin number
-    pub sck: u8,
-    /// Initial frequency in Hz
-    pub freq_hz: u32,
-}
-
-/// I2C bus configuration
-#[derive(Debug, Clone, Copy)]
-pub struct I2cConfig {
-    /// I2C bus number (0 or 1)
-    pub bus: u8,
-    /// SDA pin number
-    pub sda: u8,
-    /// SCL pin number
-    pub scl: u8,
-    /// Frequency in Hz
-    pub freq_hz: u32,
-}
-
-/// UART bus configuration
-#[derive(Debug, Clone, Copy)]
-pub struct UartConfig {
-    /// UART bus number (0 or 1)
-    pub bus: u8,
-    /// TX pin number
-    pub tx_pin: u8,
-    /// RX pin number
-    pub rx_pin: u8,
-    /// Baud rate
-    pub baudrate: u32,
-}
-
 /// GPIO pin configuration
 #[derive(Debug, Clone, Copy)]
 pub struct GpioConfig {
@@ -113,77 +86,10 @@ pub struct GpioConfig {
     pub owner_module_id: ModuleId,
 }
 
-/// PIO instance configuration
-///
-/// Each PIO config describes one PIO instance's pin wiring.
-/// - For cmd mode (bidirectional gSPI): data_pin=DIO, clk_pin=CLK, extra_pin=0xFF
-/// - For stream mode (I2S): data_pin=DOUT, clk_pin=BCLK, extra_pin=LRCLK
-#[derive(Debug, Clone, Copy)]
-pub struct PioConfig {
-    /// PIO block index (0, 1, or 2 on RP2350B)
-    pub pio_idx: u8,
-    /// Primary data pin
-    pub data_pin: u8,
-    /// Clock / sideset-base pin
-    pub clk_pin: u8,
-    /// Extra pin (LRCLK for I2S, 0xFF if unused)
-    pub extra_pin: u8,
-}
-
 /// Maximum number of SPI buses
 pub const MAX_SPI_BUSES: usize = 2;
 /// Maximum number of I2C buses
 pub const MAX_I2C_BUSES: usize = 2;
-/// Maximum number of PIO instances (RP2350B has 3 PIO blocks)
-pub const MAX_PIO_CONFIGS: usize = 3;
-/// Maximum number of UART buses
-pub const MAX_UART_BUSES: usize = 2;
-/// Maximum number of GPIO pins that can be configured
-pub const MAX_GPIO_CONFIGS: usize = 8;
-
-/// Hardware configuration - describes all hardware resources
-#[derive(Debug, Clone)]
-pub struct HardwareConfig {
-    /// SPI bus configurations
-    pub spi: [Option<SpiConfig>; MAX_SPI_BUSES],
-    /// I2C bus configurations
-    pub i2c: [Option<I2cConfig>; MAX_I2C_BUSES],
-    /// UART bus configurations
-    pub uart: [Option<UartConfig>; MAX_UART_BUSES],
-    /// PIO instance configurations (index 0 = cmd, index 1 = stream)
-    pub pio: [Option<PioConfig>; MAX_PIO_CONFIGS],
-    /// GPIO pin configurations
-    pub gpio: [Option<GpioConfig>; MAX_GPIO_CONFIGS],
-    /// Maximum GPIO pin count from target (e.g. 30 for RP2350A, 48 for RP2350B)
-    pub max_gpio: u8,
-}
-
-impl Default for HardwareConfig {
-    fn default() -> Self {
-        Self {
-            spi: [None; MAX_SPI_BUSES],
-            i2c: [None; MAX_I2C_BUSES],
-            uart: [None; MAX_UART_BUSES],
-            pio: [None; MAX_PIO_CONFIGS],
-            gpio: [None; MAX_GPIO_CONFIGS],
-            max_gpio: 30,
-        }
-    }
-}
-
-impl HardwareConfig {
-    /// Create an empty hardware configuration
-    pub const fn new() -> Self {
-        Self {
-            spi: [None; MAX_SPI_BUSES],
-            i2c: [None; MAX_I2C_BUSES],
-            uart: [None; MAX_UART_BUSES],
-            pio: [None; MAX_PIO_CONFIGS],
-            gpio: [None; MAX_GPIO_CONFIGS],
-            max_gpio: 30,
-        }
-    }
-}
 
 // ============================================================================
 // Hardware Context - Runtime State
@@ -242,366 +148,165 @@ impl HardwareContext {
 }
 
 // ============================================================================
-// Flash Layout
+// Graph image layout
 // ============================================================================
 
 extern "C" {
+    #[cfg(feature = "rp")]
     static __end_block_addr: u8;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     static __end_data_addr: u8;
     /// First byte `_start` zeroes on a RAM-loaded aarch64 image: the end of
-    /// the payload window the trailer, module table and config sit in.
+    /// the window the graph image after the kernel lies in.
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     static __bss_start: u8;
 }
 
-/// Trailer magic: "FXLT" (Fluxor Layout Trailer)
-pub const TRAILER_MAGIC: u32 = 0x544C5846;
-
-/// Current trailer version
-pub const TRAILER_VERSION: u8 = 1;
-
-/// Config magic
-pub const MAGIC_CONFIG: u32 = 0x52575846; // "FXWR"
-
-// ============================================================================
-// Flash Layout Trailer
-// ============================================================================
-
-/// Flash layout information read from trailer
+/// Where the admitted graph image's regions lie in memory.
 #[derive(Debug, Clone, Copy)]
 pub struct FlashLayout {
-    /// Address of module table (0 = no modules)
+    /// Address of the module table.
     pub modules_addr: u32,
-    /// Known byte length of the module-table region, or 0 if the layout
-    /// source doesn't carry one. Flash A/B graph slots record it (and
-    /// bound-check it against the slot aperture); the firmware
-    /// trailer has no length field, so it reports 0 and the loader falls
-    /// back to the hard `MAX_MODULES_BLOB_SIZE` cap. Preserved so the
-    /// loader can give the shared table validator a real mapping bound
-    /// instead of trusting the table's self-declared `total_size` alone.
+    /// Bytes of the module table, as the image header states it: the
+    /// loader's bound on the table.
     pub modules_size: u32,
-    /// Address of config
+    /// Address of the config.
     pub config_addr: u32,
-    /// Bytes mapped from `config_addr` on: the window the config blob must
-    /// lie in, and so the parser's only bound. A graph slot records the
-    /// config's own length; the firmware trailer has none, so it reports the
-    /// region the image can hold the config in (`trailer_config_window`).
+    /// Bytes of the config, as the image header states it: the parser's
+    /// only bound.
     pub config_size: u32,
 }
 
-/// Compute trailer address from linker symbol.
-///
-/// On RP (flash/XIP): trailer is after `__end_block_addr` (includes BSS in flash).
-/// On aarch64 (RAM-loaded): trailer is after `__end_data_addr` (end of loadable
-/// sections, before BSS), because the VPU loads the image contiguously and BSS
-/// is zeroed separately in RAM.
-fn get_trailer_addr() -> u32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: `__end_data_addr` is a linker symbol; only its address
-        // is taken, never the value at that address.
-        let end_data = unsafe { &__end_data_addr as *const u8 as u32 };
-        (end_data + 255) & !255
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        // SAFETY: as above; `__end_block_addr` is a linker symbol.
-        let end_block = unsafe { &__end_block_addr as *const u8 as u32 };
-        (end_block + 255) & !255
+impl FlashLayout {
+    /// The regions of an admitted image whose header lies at `base`.
+    pub fn of(base: u32, header: &crate::abi::wire::graph_image::Header) -> FlashLayout {
+        FlashLayout {
+            modules_addr: base + header.modules_offset,
+            modules_size: header.modules_size,
+            config_addr: base + header.config_offset,
+            config_size: header.config_size,
+        }
     }
 }
 
-/// Read flash layout. On targets that expose A/B graph slots, the slot
-/// with a valid header and the higher epoch wins; otherwise the
-/// layout trailer at the end of the firmware is used.
-pub fn read_layout() -> Option<FlashLayout> {
+/// Where the graph image a firmware image carries lies: the first 256-byte
+/// boundary past the kernel's file-backed end. On RP that end is
+/// `__end_block_addr`, past everything the flash holds for the kernel; on a
+/// RAM-loaded aarch64 image it is `__end_data_addr`, before `.bss`, which
+/// `_start` zeroes in RAM.
+#[cfg(any(feature = "rp", all(target_arch = "aarch64", target_os = "none")))]
+fn firmware_image_addr() -> u32 {
     #[cfg(feature = "rp")]
-    if let Some(layout) = read_layout_from_slots() {
-        return Some(layout);
-    }
-    read_layout_from_trailer()
+    // SAFETY: a linker symbol; only its address is taken.
+    let end = unsafe { &__end_block_addr as *const u8 as u32 };
+    #[cfg(not(feature = "rp"))]
+    // SAFETY: a linker symbol; only its address is taken.
+    let end = unsafe { &__end_data_addr as *const u8 as u32 };
+    end.div_ceil(256) * 256
 }
 
-/// The running kernel's own ABI-surface digest — sha256 over the
-/// canonical `abi_surface` stream, computed on demand (a few KB of
-/// hashing, called at most twice per boot from slot selection).
-#[cfg(feature = "rp")]
-pub fn kernel_abi_surface_digest() -> [u8; 32] {
-    use crate::kernel::security::crypto::sha256::Sha256;
-    let mut h = Sha256::new();
-    crate::abi::abi_surface::write_surface(&mut |bytes| h.update(bytes));
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
-}
-
-/// Does a slot's ABI-surface pin admit it under `own` (the running
-/// kernel's digest)? Strict equality: a slot whose pin is erased
-/// (all 0xFF) is as unprovable as a mismatched one, and is refused like
-/// a corrupt header. Rebuild it with `fluxor build --emit=image`.
-#[cfg(feature = "rp")]
-fn slot_pin_admits(pin: &[u8; 32], own: &[u8; 32]) -> bool {
-    pin == own
-}
-
-/// The slot selection, made once per boot and held in `SLOT_CHOICE`: with a
-/// signing root it verifies and hashes up to both slots, and boot asks for the
-/// layout more than once. 0 = not yet chosen, 1 = chosen.
-#[cfg(feature = "rp")]
-static SLOT_CHOSEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-#[cfg(feature = "rp")]
-static mut SLOT_CHOICE: Option<FlashLayout> = None;
-/// The slots the selector admitted, bit 0 = A, bit 1 = B: what
-/// `kernel_abi::SLOT_ADMITTED` answers.
-#[cfg(feature = "rp")]
-static SLOT_ADMITTED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// The slots this boot's selector admitted, choosing first if boot has not.
-#[cfg(feature = "rp")]
-pub fn admitted_slots() -> u8 {
-    let _ = read_layout_from_slots();
-    SLOT_ADMITTED.load(core::sync::atomic::Ordering::Acquire)
-}
-
-#[cfg(feature = "rp")]
-fn read_layout_from_slots() -> Option<FlashLayout> {
-    use core::sync::atomic::Ordering;
-    if SLOT_CHOSEN.load(Ordering::Acquire) == 1 {
-        // SAFETY: written once below before the flag is released, and never
-        // again; the Acquire load orders this read after that write.
-        return unsafe { *core::ptr::addr_of!(SLOT_CHOICE) };
-    }
-    let choice = choose_slot();
-    // SAFETY: the first read of the layout is boot's, on core 0 before any
-    // other core or module runs, so nothing reads or writes this concurrently.
-    unsafe { *core::ptr::addr_of_mut!(SLOT_CHOICE) = choice };
-    SLOT_CHOSEN.store(1, Ordering::Release);
-    choice
-}
-
-#[cfg(feature = "rp")]
-fn choose_slot() -> Option<FlashLayout> {
-    use crate::abi::platform::rp::flash_layout;
-    // This board's slots; a flash with no room for them has none to choose.
-    let layout = crate::platform::chip::GRAPH_FLASH;
-    if layout.slot_size == 0 {
-        return None;
-    }
-    let slot_a = (flash_layout::XIP_BASE + layout.slot_a) as *const u8;
-    let slot_b = (flash_layout::XIP_BASE + layout.slot_b) as *const u8;
-
-    let own_digest = kernel_abi_surface_digest();
-    // SAFETY: slot_a and slot_b are the bases of the two XIP-mapped slot
-    // apertures; `decode_slot_header` reads the 256-byte header and, under
-    // a signing root, regions it has bounded inside the slot.
-    let a = unsafe { decode_slot_header(slot_a, &own_digest) };
-    // SAFETY: as above, for this board's slot B.
-    let b = unsafe { decode_slot_header(slot_b, &own_digest) };
-    SLOT_ADMITTED.store(
-        u8::from(a.is_some()) | (u8::from(b.is_some()) << 1),
-        core::sync::atomic::Ordering::Release,
-    );
-    let (base, hdr) = match (a, b) {
-        (Some(ha), Some(hb)) => {
-            if ha.epoch >= hb.epoch {
-                (slot_a, ha)
-            } else {
-                (slot_b, hb)
-            }
-        }
-        (Some(ha), None) => (slot_a, ha),
-        (None, Some(hb)) => (slot_b, hb),
-        (None, None) => return None,
-    };
-    let slot_base = base as u32;
-    Some(FlashLayout {
-        modules_addr: slot_base + hdr.modules_offset,
-        modules_size: hdr.modules_size,
-        config_addr: slot_base + hdr.config_offset,
-        config_size: hdr.config_size,
-    })
-}
-
-#[cfg(feature = "rp")]
-struct SlotHeader {
-    epoch: u64,
-    modules_offset: u32,
-    modules_size: u32,
-    config_offset: u32,
-    config_size: u32,
-}
-
-#[cfg(feature = "rp")]
-unsafe fn decode_slot_header(base: *const u8, own_digest: &[u8; 32]) -> Option<SlotHeader> {
-    use crate::abi::platform::rp::flash_layout;
-    let magic = read_u32(base);
-    if magic != flash_layout::GRAPH_SLOT_MAGIC {
-        return None;
-    }
-    let version = *base.add(4);
-    if version != flash_layout::GRAPH_SLOT_VERSION {
-        return None;
-    }
-    let epoch = read_u64(base.add(8));
-    let modules_offset = read_u32(base.add(16));
-    let modules_size = read_u32(base.add(20));
-    let config_offset = read_u32(base.add(24));
-    let config_size = read_u32(base.add(28));
-
-    // An A/B slot always carries a real module-table length written by the
-    // packer; the smallest possible table is its 16-byte header. A
-    // `modules_size` below that is a torn/corrupt slot — reject it rather than
-    // letting `init()` treat 0 as the "length unknown" sentinel and fall back
-    // to the MAX_MODULES_BLOB_SIZE bound, which would let a corrupt table
-    // escape the slot aperture. (The firmware trailer carries no length
-    // field, so it keeps 0 = unknown — see read_layout_from_trailer.)
-    if modules_size < 16 {
-        return None;
-    }
-    // Both regions must fit inside the slot.
-    let slot_size = crate::platform::chip::GRAPH_FLASH.slot_size as u64;
-    if (modules_offset as u64) + (modules_size as u64) > slot_size {
-        return None;
-    }
-    if (config_offset as u64) + (config_size as u64) > slot_size {
-        return None;
-    }
-
-    // ABI-surface pin: a slot built for an incompatible substrate is
-    // rejected exactly like a torn header — the other slot (or the
-    // trailer) stays selectable.
-    let mut pin = [0u8; 32];
-    for (i, byte) in pin.iter_mut().enumerate() {
-        *byte = *base.add(flash_layout::GRAPH_SLOT_ABI_SURFACE_OFFSET + i);
-    }
-    if !slot_pin_admits(&pin, own_digest) {
-        return None;
-    }
-
-    // A kernel image with a signing root selects only a slot signed by it whose
-    // payload is what the signature vouches for: the signature covers the
-    // digest, not the payload, so the payload is hashed here too. The
-    // modules then run in place from the bytes hashed. Without a root the
-    // slot is selected on its structure and pin; its payload is checked by
-    // `graph_slot` before it activates the slot.
-    if let Some(root) = crate::kernel::security::root::signing_root() {
-        let header = core::slice::from_raw_parts(base, flash_layout::GRAPH_SLOT_HEADER_SIZE);
-        if let Err(why) = crate::kernel::security::slot_signature::admits(header, Some(&root)) {
-            log::warn!("[boot] slot at {base:p} refused: {why:?}");
-            return None;
-        }
-        let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
-        h.update(core::slice::from_raw_parts(
-            base.add(modules_offset as usize),
-            modules_size as usize,
-        ));
-        h.update(core::slice::from_raw_parts(
-            base.add(config_offset as usize),
-            config_size as usize,
-        ));
-        let digest = h.finalize();
-        if header[32..64] != digest {
-            log::warn!("[boot] slot at {base:p} refused: payload digest");
-            return None;
-        }
-    }
-
-    Some(SlotHeader {
-        epoch,
-        modules_offset,
-        modules_size,
-        config_offset,
-        config_size,
-    })
-}
-
-#[cfg(feature = "rp")]
-unsafe fn read_u64(p: *const u8) -> u64 {
-    let lo = read_u32(p) as u64;
-    let hi = read_u32(p.add(4)) as u64;
-    lo | (hi << 32)
-}
-
-/// Read flash layout from the firmware trailer.
-fn read_layout_from_trailer() -> Option<FlashLayout> {
-    let trailer_addr = get_trailer_addr();
-    let trailer_ptr = trailer_addr as *const u8;
-
-    // SAFETY: `trailer_addr` is the linker-computed address of the
-    // firmware trailer; the magic check below rejects a bad address.
-    unsafe {
-        let magic = read_u32(trailer_ptr);
-
-        if magic != TRAILER_MAGIC {
-            log::error!("[config] bad trailer magic=0x{magic:08x} addr=0x{trailer_addr:08x}");
-            return None;
-        }
-
-        let version = *trailer_ptr.add(4);
-        if version != TRAILER_VERSION {
-            log::error!("[config] unsupported trailer version={version}");
-            return None;
-        }
-
-        let expected_crc = read_u16(trailer_ptr.add(6));
-        let modules_addr = read_u32(trailer_ptr.add(8));
-        let config_addr = read_u32(trailer_ptr.add(12));
-
-        // Trailer CRC (bytes 6-7) reserved for future use.
-        // Config integrity is validated by the config header's own CRC-16 checksum.
-        let _ = expected_crc;
-
-        Some(FlashLayout {
-            modules_addr,
-            // The firmware trailer carries no module-table length; 0 tells
-            // the loader to fall back to the MAX_MODULES_BLOB_SIZE cap and
-            // validate internal consistency against the table's own
-            // total_size.
-            modules_size: 0,
-            config_addr,
-            config_size: trailer_config_window(config_addr),
-        })
-    }
-}
-
-/// Bytes the firmware-trailer layout can hold a config in from `config_addr`:
-/// what lies between it and the next thing the platform owns.
+/// Bytes from `at` the firmware image's graph image may occupy: what lies
+/// between it and the next thing the platform owns.
 ///
-/// - A RAM-loaded aarch64 image (Pi 5, CM5, QEMU virt without side-loaded
-///   blobs, a uefi image) carries its payload between the end of its
-///   file-backed sections and `.bss`, which `_start` zeroes before `main`: the
-///   window ends at `__bss_start` (`linker/memory-bcm2712.x`,
-///   `linker/memory-uefi.x`, the payload window).
-/// - An RP image executes in place from flash, and the config sits below the
-///   graph slots (or, on a flash with no room for slots, below the parameter
-///   store sector).
-///
-/// 0 where `config_addr` is past the window or the target has no trailer
-/// layout; the parser refuses a zero-length blob by name.
-fn trailer_config_window(config_addr: u32) -> u32 {
-    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+/// - A RAM-loaded aarch64 image (Pi 5, CM5, a uefi image) carries it between
+///   the end of its file-backed sections and `.bss`, which `_start` zeroes
+///   before `main`: the window ends at `__bss_start` (`linker/memory-bcm2712.x`,
+///   `linker/memory-uefi.x`).
+/// - An RP image executes in place from flash, and the platform states the
+///   window below its graph slots (`platform::planner::firmware_image_window`).
+#[cfg(any(feature = "rp", all(target_arch = "aarch64", target_os = "none")))]
+fn firmware_image_window(at: u32) -> u32 {
+    #[cfg(feature = "rp")]
+    {
+        crate::platform::planner::firmware_image_window(at)
+    }
+    #[cfg(not(feature = "rp"))]
     {
         // SAFETY: a linker symbol; only its address is taken.
         let end = unsafe { &__bss_start as *const u8 as usize };
-        (end as u32).saturating_sub(config_addr)
+        (end as u32).saturating_sub(at)
     }
-    #[cfg(feature = "rp")]
+}
+
+/// The graph image after the kernel, admitted, or `None` (said why).
+#[cfg(any(feature = "rp", all(target_arch = "aarch64", target_os = "none")))]
+fn firmware_image_layout(own_pin: &[u8; 32]) -> Option<FlashLayout> {
+    let at = firmware_image_addr();
+    let window = firmware_image_window(at);
+    if window == 0 {
+        log::error!("[config] no room for a graph image at 0x{at:08x}");
+        return None;
+    }
+    // SAFETY: `[at, at + window)` is mapped for the life of the kernel: it
+    // is the flash below the graph slots on RP, and the part of a RAM-loaded
+    // image's load before `.bss` on aarch64 (`firmware_image_window`).
+    let image = unsafe { core::slice::from_raw_parts(at as usize as *const u8, window as usize) };
+    match super::graph_image::admit(image, own_pin) {
+        Ok(header) => Some(FlashLayout::of(at, &header)),
+        Err(why) => {
+            log::error!(
+                "[config] graph image at 0x{at:08x} refused: {}",
+                why.reason()
+            );
+            None
+        }
+    }
+}
+
+/// The layout chosen this boot, held so the image is admitted (and its
+/// payload hashed) once: boot asks for it more than once. 0 = not yet
+/// chosen, 1 = chosen.
+static LAYOUT_CHOSEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static mut LAYOUT: Option<FlashLayout> = None;
+
+/// The graph image this kernel boots: on RP the admitted flash slot with the
+/// higher epoch, else (and on a RAM-loaded aarch64 image) the image after the
+/// kernel. `None` where no image is admitted, and on targets whose graph is
+/// handed over another way (Linux, wasm).
+pub fn read_layout() -> Option<FlashLayout> {
+    use core::sync::atomic::Ordering;
+    if LAYOUT_CHOSEN.load(Ordering::Acquire) == 1 {
+        // SAFETY: written once below before the flag is released, and never
+        // again; the Acquire load orders this read after that write.
+        return unsafe { *core::ptr::addr_of!(LAYOUT) };
+    }
+    let layout = choose_layout();
+    // SAFETY: the first read of the layout is boot's, on core 0 before any
+    // other core or module runs, so nothing reads or writes this concurrently.
+    unsafe { *core::ptr::addr_of_mut!(LAYOUT) = layout };
+    LAYOUT_CHOSEN.store(1, Ordering::Release);
+    layout
+}
+
+fn choose_layout() -> Option<FlashLayout> {
+    #[cfg(any(feature = "rp", all(target_arch = "aarch64", target_os = "none")))]
     {
-        use crate::abi::platform::rp::flash_layout;
-        let layout = crate::platform::chip::GRAPH_FLASH;
-        let below = if layout.slot_size != 0 {
-            layout.slot_a
-        } else {
-            layout.param_store
-        };
-        (flash_layout::XIP_BASE + below).saturating_sub(config_addr)
+        let own_pin = super::graph_image::own_abi_pin();
+        #[cfg(feature = "rp")]
+        if let Some(layout) = crate::platform::planner::choose_slot(&own_pin) {
+            return Some(layout);
+        }
+        firmware_image_layout(&own_pin)
     }
-    #[cfg(not(any(all(target_arch = "aarch64", target_os = "none"), feature = "rp")))]
+    #[cfg(not(any(feature = "rp", all(target_arch = "aarch64", target_os = "none"))))]
     {
-        let _ = config_addr;
-        0
+        None
     }
+}
+
+/// The config of the graph image this kernel boots: the bytes
+/// `read_config_into` decodes. `None` with no admitted image.
+pub fn layout_config_window() -> Option<&'static [u8]> {
+    let layout = read_layout()?;
+    // SAFETY: the image was admitted inside memory mapped for the life of
+    // the kernel (a flash slot, or the window after the kernel), and the
+    // header's config region lies inside it.
+    Some(unsafe {
+        core::slice::from_raw_parts(
+            layout.config_addr as usize as *const u8,
+            layout.config_size as usize,
+        )
+    })
 }
 
 /// Maximum counts.
@@ -613,153 +318,55 @@ fn trailer_config_window(config_addr: u32) -> u32 {
 /// (`internal::reconfigure::SLOT_CAPACITY`). Every per-module set — the
 /// event-wake bitmap, owner and upstream masks — is a `ModuleMask` of
 /// `MODULE_MASK_WORDS` u64 words sized from it, so a profile value needs no
-/// bitmap widened by hand; the limits that do bind are the config blob's
-/// 12-bit module id (asserted below) and the `0xFFFF` no-module sentinel.
+/// bitmap widened by hand; the limit that does bind is the `0xFFFF`
+/// no-module sentinel in the config blob's u16 module id.
 pub use crate::kernel::config::MAX_MODULES;
-use crate::kernel::exec::scheduler::ModuleId;
+use crate::kernel::exec::scheduler::{ModuleId, MAX_DOMAINS, NO_MODULE};
 
-// A module id is 12 bits on the wire: the low byte in its own field and four
-// high bits in spare bits beside it (module entry byte 9; edges carry a whole
-// high byte at bytes 10-11, the module-section header the count's high byte at
-// its byte 1). The module-index domain must fit them.
 const _: () = assert!(
-    MAX_MODULES <= 4096,
-    "module ids carry 12 bits in the config blob"
+    MAX_MODULES <= NO_MODULE as usize,
+    "module ids are u16 in the config blob and 0xFFFF names no module"
 );
 
-/// Edge slots a graph section holds. On the static profiles it is the
-/// profile's compiled count (`kernel::config::GRAPH_EDGES`), the slot layout
-/// every blob for that profile is built with. On Linux and aarch64 bare metal
-/// the section is laid out for the graph it carries — byte 3 states the slot
-/// count — and this is only the format's bound: a slot code is a byte of
-/// 128-edge units.
+/// The edge-id domain: the most edges a graph may carry and so the channel-id
+/// domain. On the static profiles it is the profile's compiled count
+/// (`kernel::config::GRAPH_EDGES`); on Linux and aarch64 bare metal the edge
+/// table is sized from the graph and this bounds it.
 #[cfg(any(feature = "host-linux", feature = "aarch64-metal"))]
 pub const MAX_GRAPH_EDGES: usize = 255 * 128;
 #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 pub const MAX_GRAPH_EDGES: usize = crate::kernel::config::GRAPH_EDGES;
-/// The edge slots of the small (static) profiles, named so the tools' capacity
-/// mirror can pin them against this source text.
+/// The edge-id domain of the small (static) profiles, named so the tools'
+/// capacity mirror can pin it against this source text.
 pub const SMALL_GRAPH_EDGES: usize = 128;
 #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 const _: () = assert!(
     MAX_GRAPH_EDGES == SMALL_GRAPH_EDGES,
-    "a static profile lays its graph section out for the named slot count"
+    "a static profile's edge domain is the named small-profile count"
 );
-/// Graph-section byte 3: how many edge SLOTS the blob was laid out for, in
-/// units of 128, with 0 meaning 128 so that a blob stating no code reads as
-/// the small profile. The section is fixed-size for a static profile, so a
-/// blob laid out for another profile would put the domain metadata and
-/// hardware section at the wrong offsets; this byte is how the loader refuses
-/// it by name instead of by a CRC mismatch nobody can read. On Linux and
-/// aarch64 bare metal the section is as large as the code says.
-#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
-pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
-    0
-} else {
-    (MAX_GRAPH_EDGES / 128) as u8
-};
-
-/// Edge slots a slot code (graph-section byte 3) lays out.
-pub const fn slots_for_code(code: u8) -> usize {
-    if code == 0 {
-        128
-    } else {
-        code as usize * 128
-    }
-}
-
-/// Bytes of a graph section laid out for `slots` edges: header, edges,
-/// domain metadata.
-pub const fn graph_section_size(slots: usize) -> usize {
-    4 + slots * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE
-}
 
 // There is no fixed ceiling on the config blob. The parser is handed the
-// blob as a slice whose length is what the platform actually mapped, and
-// that length is the only bound: a section that would run past it is refused
-// by name. The platforms state their windows where they map the blob — the
-// file on Linux, the payload window between the image and `.bss` on a
-// RAM-loaded aarch64 image (`trailer_config_window`), the graph slot or the
-// flash below the slots on RP (`decode_slot_header`, `trailer_config_window`),
-// the gap to the module blob on QEMU virt, the embedded blob's used length on
-// wasm — and the CLI refuses an image whose config would not fit the window
-// it is packed into.
-
-/// Hardware section binary format sizes
-pub const SPI_CONFIG_BIN_SIZE: usize = 8;
-pub const I2C_CONFIG_BIN_SIZE: usize = 8;
-pub const UART_CONFIG_BIN_SIZE: usize = 8;
-pub const GPIO_CONFIG_BIN_SIZE: usize = 5;
-pub const PIO_CONFIG_BIN_SIZE: usize = 4;
-
-/// Graph section binary format sizes.
-///
-/// Edge layout (12 bytes):
-///   byte 0:    from_id, low byte
-///   byte 1:    to_id, low byte
-///   byte 2:    bit 7    = to_port (0 = data, 1 = ctrl)
-///              bits 6:5 = edge_class
-///              bits 4:0 = buffer_group
-///   byte 3:    bits 7:4 = from_port_index
-///              bits 3:0 = to_port_index
-///   bytes 4-7: buffer_bytes (u32 LE) — explicit ring-buffer size.
-///              `0` falls back to the port capacities / `BUFFER_SIZE`.
-///              Otherwise the largest of it and the two port
-///              capacities is the edge's request (`ipc::ring_size`).
-///   byte 8:    rate_class
-///   byte 9:    bit 0 = wake_on_write; bit 1 = retains_send; bits 2-7 reserved
-///   byte 10:   from_id, high byte
-///   byte 11:   to_id, high byte
-pub const GRAPH_EDGE_SIZE: usize = 12;
-/// Per-domain metadata entry, bytes: `tick_us:u16 | exec_mode:u8 |
-/// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags`.
-/// `tick_min_us`/`tick_max_us` are not in this (checksummed) entry: they ride in
-/// the post-body adaptive section past `total_size` (see `ADAPTIVE_POST_SIZE`).
-/// Kernel and tools ship together, so a blob of any other layout is rejected by
-/// the body-size/CRC check.
-pub const DOMAIN_META_ENTRY_SIZE: usize = 4;
-pub const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
-/// Adaptive-tick post-body section: 4 domains × `[tick_min_us:u16, tick_max_us:u16]`.
-/// Stored after the checksummed body (past `total_size`), not covered by the
-/// CRC: values are range-checked and fall back to the domain tick. See the read
-/// site in `read_config_from_slice`.
-pub const ADAPTIVE_POST_SIZE: usize = 16;
-
-/// Resident-workload config-section magic: "FXPD". The section is appended
-/// PAST the checksummed body, right after the adaptive post-body tail (at
-/// `total_size + ADAPTIVE_POST_SIZE`), carrying one or more `AddSubgraph`
-/// (FLXA) blobs the kernel admits at boot via `scheduler::live::apply_add`.
-/// Layout: `[FXPD u32 LE][section_len u32 LE][crc16 u16 LE][workload_count
-/// u16 LE]`, then per workload `[blob_len u32 LE][flags u8][FLXA blob]` (flags
-/// bit 0: the workload is attested idle-safe). Mirrors `tools
-/// add_subgraph::WORKLOAD_SECTION_MAGIC`. Like the adaptive tail it lies
-/// outside the checksummed body. Each blob is copied into a scratch buffer
-/// and admitted from there (`multigraph::admit_resident_workloads_from_config`),
-/// so the read-only config image is never written; its modules read their
-/// params from that copy as they instantiate.
-pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
-/// Largest resident-workload section the kernel will map, in bytes (bounds a torn or
-/// hostile tail). Sized for a handful of workloads with small param blobs.
-pub const MAX_WORKLOAD_SECTION_BYTES: usize = 8 * 1024;
-/// Valid per-domain tick range (µs); mirrors the tools `validate_adaptive_tick`
-/// range gate. A post-body value outside this falls back to the domain tick.
-const TICK_BOUND_MIN: u16 = 100;
-const TICK_BOUND_MAX: u16 = 50_000;
+// blob as a slice whose length is what the platform mapped, and that length
+// is the only bound: a blob whose `total_len` runs past it is refused by the
+// codec. Wherever a graph image carries the blob, that length is the config
+// region its admitted header states; QEMU virt passes the gap to the module
+// blob it side-loads, and wasm the embedded blob's used length. The CLI
+// refuses an image whose payload would not fit the window it is packed into.
 
 // ============================================================================
-// Graph Config (Version 1: Variable-Length Module Entries)
+// Graph Config
 // ============================================================================
 
 /// Bytes of module params the parsed config borrows from its blob, and the
-/// blob's mapped length: `(params_bytes, blob_len)`. Written by the parser,
-/// read by `finalize_instantiation_accounting` and the resource ledger
+/// blob's length: `(params_bytes, blob_len)`. Written by the parser, read by
+/// `finalize_instantiation_accounting` and the resource ledger
 /// (`POOL_CONFIG_ARENA`). Params are not copied anywhere, so the pair is an
 /// observation of the graph, not a pool that can run out.
 static CONFIG_PARAMS_BYTES: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
 static CONFIG_BLOB_LEN: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
 
 /// `(params_bytes, blob_len)` of the config last parsed: the module params
-/// borrowed in place from the blob, against the blob's mapped length.
+/// borrowed in place from the blob, against the blob's length.
 pub fn config_params_usage() -> (usize, usize) {
     use portable_atomic::Ordering;
     (
@@ -768,20 +375,8 @@ pub fn config_params_usage() -> (usize, usize) {
     )
 }
 
-/// Parsed module entry with variable-length params
-///
-/// Binary format (variable length, 10-byte header):
-/// - Bytes 0-3: entry_length (u32) - total entry size including the header;
-///   u32 so one module's params may exceed 64 KiB
-/// - Bytes 4-7: name_hash (fnv1a32)
-/// - Byte 8: id, low byte
-/// - Byte 9: bit-packed metadata —
-///   bits 0-2 = domain_id (0..7, 0 = default domain),
-///   bit  4   = pre_tick_drain (Tier 1c opt-in),
-///   bits 5-6 = id bits 8-9,
-///   bit  7   = id bit 10,
-///   bit  3   = id bit 11.
-/// - Bytes 10+: params (entry_length - 10 bytes)
+/// One module of the graph, filled from the blob's module record
+/// (`boot_config::ModuleRecord`), its params borrowed in place.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEntry {
     pub name_hash: u32,
@@ -818,8 +413,8 @@ impl ModuleEntry {
             &[]
         } else {
             // SAFETY: `params_ptr` is non-null + non-zero len; the parser
-            // pointed it into the config blob after bounding the entry
-            // inside it, and the blob stays mapped for the life of the
+            // pointed it into the config blob after the codec bounded the
+            // record inside it, and the blob stays mapped for the life of the
             // config (see the module header).
             unsafe { core::slice::from_raw_parts(self.params_ptr, self.params_len) }
         }
@@ -847,19 +442,9 @@ impl ModuleEntry {
     }
 }
 
-/// Edge class for channels — metadata for future multi-core scheduling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum EdgeClass {
-    /// Local: same domain, default
-    Local = 0,
-    /// DMA-owned: buffer managed by DMA controller
-    DmaOwned = 1,
-    /// Cross-core: connects modules in different execution domains
-    CrossCore = 2,
-    /// NIC ring: zero-copy packet buffer via NicRing DMA descriptors
-    NicRing = 3,
-}
+/// What an edge's ring is, for placement: same domain, DMA-owned, cross-core
+/// or a NIC descriptor ring.
+pub use fluxor_contracts::boot_config::EdgeClass;
 
 /// Graph edge connecting two modules
 #[derive(Debug, Clone, Copy)]
@@ -868,32 +453,26 @@ pub struct GraphEdge {
     pub to_id: ModuleId,
     /// Destination port type: 0 = in (data), 1 = ctrl (control)
     pub to_port: u8,
-    /// Source port index (high nibble of byte 3). 0 = primary output.
+    /// Source port index, 0..=15. 0 = primary output.
     pub from_port_index: u8,
-    /// Destination port index (low nibble of byte 3). 0 = primary input/ctrl.
+    /// Destination port index, 0..=15. 0 = primary input/ctrl.
     pub to_port_index: u8,
     /// Buffer group ID for aliasing. 0 = no aliasing (each edge gets its own buffer).
     /// Any edge with a non-zero group ID enables mailbox (zero-copy) mode on its
     /// channel. When multiple edges share the same group, they alias to the same
     /// channel buffer. Aliasing requires the downstream module to have `mailbox_safe`
     /// (header flags bit 0) set. Incompatible with tee/merge — `insert_fan` clears
-    /// `buffer_group` on fan edges.
-    ///
-    /// Binary encoding: 5 bits (0..31) in byte 2 bits [4:0] of the graph edge.
-    /// See `parse_graph_edge`.
+    /// `buffer_group` on fan edges. 0..=31.
     pub buffer_group: u8,
-    /// Edge class metadata (Local, DmaOwned, CrossCore, NicRing).
-    /// Encoded in bits [6:5] of byte 2 of the on-wire edge record (see
-    /// `parse_graph_edge` for the full byte layout). Pure metadata on
-    /// single-core; no runtime cost.
+    /// Edge class metadata (Local, DmaOwned, CrossCore, NicRing). Pure
+    /// metadata on single-core; no runtime cost.
     pub edge_class: EdgeClass,
     /// Per-edge ring-buffer size in bytes. `0` defers to the
     /// producer/consumer manifest port capacities and the default ring
     /// (`BUFFER_SIZE`). Non-zero requests at least this many bytes: the
     /// scheduler takes the largest of it and the two port capacities,
     /// rounds that up to a power of two of at least 64 bytes, and refuses
-    /// the graph when it is over the 4 MiB ceiling (`ipc::ring_size`).
-    /// Encoded as a u32 LE in bytes 4-7 of the edge record.
+    /// the graph when it is over the 4 MiB ceiling (`fluxor_contracts::ring_size`).
     pub buffer_bytes: u32,
     /// Rate class of this edge: 0=control, 1=audio, 2=video,
     /// 3=bulk, 4=transaction (contracts `RateClass`). Feeds
@@ -902,31 +481,44 @@ pub struct GraphEdge {
     /// `wake: true` on the wiring entry: a successful
     /// `channel_write` on this edge latches the consumer's
     /// event-wake bit and rings the scheduler doorbell so an idle
-    /// sleep is cut short. Byte 9 bit 0 of the edge record.
+    /// sleep is cut short.
     pub wake_on_write: bool,
     /// The consumer port declares `retains_send`: it keeps its own copy of
-    /// what it sends until the provider reports it acknowledged. Byte 9 bit
-    /// 1 of the edge record, set by the composer; read back through
-    /// `channel::FACTS`.
+    /// what it sends until the provider reports it acknowledged. Set by the
+    /// composer; read back through `channel::FACTS`.
     pub retains_send: bool,
 }
 
+impl From<boot_config::EdgeRecord> for GraphEdge {
+    fn from(e: boot_config::EdgeRecord) -> Self {
+        Self {
+            from_id: e.from,
+            to_id: e.to,
+            to_port: u8::from(e.to_ctrl),
+            from_port_index: e.from_port,
+            to_port_index: e.to_port,
+            buffer_group: e.buffer_group,
+            edge_class: e.class,
+            buffer_bytes: e.buffer_bytes,
+            rate_class: e.rate_class,
+            wake_on_write: e.wake_on_write,
+            retains_send: e.retains_send,
+        }
+    }
+}
+
 // ============================================================================
-// Config Header and Reader
+// Config and its reader
 // ============================================================================
 
-/// Config header
+/// The blob-level facts of a parsed config.
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigHeader {
-    pub magic: u32,
-    pub version: u16,
-    pub checksum: u16,
-    pub module_count: u8,
-    pub edge_count: u8,
-    /// Tick period in microseconds (bytes 10-11). 0 = default 1000us.
-    /// Valid range: 100-50000.
+    /// The blob's CRC-32, as the codec verified it.
+    pub checksum: u32,
+    /// Tick period in microseconds. 0 = default 1000us.
     pub tick_us: u16,
-    /// Graph-level sample rate (bytes 12-15). 0 = not set.
+    /// Graph-level sample rate. 0 = not set.
     pub graph_sample_rate: u32,
 }
 
@@ -943,50 +535,33 @@ pub struct Config {
     pub modules: ModuleList,
     /// Graph edges in blob order.
     pub graph_edges: crate::kernel::mem::table::ParseTable<Option<GraphEdge>, MAX_GRAPH_EDGES>,
-    /// Low byte from the header, high byte from the module section's byte 1.
     pub module_count: u16,
-    /// Low byte from the header, high byte from the graph section — see
-    /// `MAX_GRAPH_EDGES`.
     pub edge_count: u16,
-    pub hardware: HardwareConfig,
-    /// Per-domain tick_us (from graph section domain metadata). 0 = use global.
-    pub domain_tick_us: [u16; 4],
-    /// Per-domain execution mode: 0=cooperative, 1=high_rate/Tier1a, 3=poll/Tier3.
-    pub domain_exec_mode: [u8; 4],
-    /// Per-domain adaptive-tick enable flags, in byte 3 of
-    /// the per-domain metadata entry. `0` = adaptive off.
+    /// Per-domain tick_us. 0 = use global.
+    pub domain_tick_us: [u16; MAX_DOMAINS],
+    /// Per-domain execution mode, the `ExecMode` byte (`scheduler::exec_mode`).
+    pub domain_exec_mode: [u8; MAX_DOMAINS],
+    /// Per-domain adaptive-tick enable flags. `0` = adaptive off.
     ///   bit 0: enable mechanism (a) demand-driven idle.
     ///   bit 1: enable mechanism (b) adaptive cadence.
-    /// bits 2-7: reserved (must be 0).
-    pub domain_adaptive_flags: [u8; 4],
+    pub domain_adaptive_flags: [u8; MAX_DOMAINS],
     /// Per-domain adaptive-tick latency floor target, µs (mechanism (b)). The
     /// pacer never drives the tick below `max(tick_min_us, worst_step×margin)`.
-    /// 0 ⇒ default-filled to that domain's `tick_us` at parse time (so an
-    /// unconfigured domain has no adaptive headroom — a no-op).
-    pub domain_tick_min_us: [u16; 4],
+    /// A blob value of 0, and every domain the blob declares no record for,
+    /// takes that domain's effective tick (so an unconfigured domain has no
+    /// adaptive headroom — a no-op).
+    pub domain_tick_min_us: [u16; MAX_DOMAINS],
     /// Per-domain adaptive-tick relaxed/idle backstop cadence, µs. The idle
-    /// sleep (a) and the cooldown ceiling (b) relax toward this. 0 ⇒
-    /// default-filled to that domain's `tick_us` at parse time (no-op).
-    pub domain_tick_max_us: [u16; 4],
-    /// Graph-level flags byte (graph section header byte 1).
-    ///   bit 0: ACCEPT_CYCLES — author has explicitly attested that
-    ///          any cycles in the graph are bidirectional feedback
-    ///          pairs (e.g. `http <-> linux_net`) and safe to step
-    ///          in best-effort declaration order. Without this bit,
-    ///          `prepare_graph` rejects cycles (v1 strict invariant).
-    /// bits 1-7: reserved (must be 0).
+    /// sleep (a) and the cooldown ceiling (b) relax toward this. 0 takes the
+    /// domain's effective tick, as for `domain_tick_min_us`.
+    pub domain_tick_max_us: [u16; MAX_DOMAINS],
+    /// Graph-level flags (`GRAPH_FLAG_*`).
     pub graph_flags: u8,
-    /// Resident-workload section: pointer into the config
-    /// blob at the `[FXPD][count]…` post-body section, or null if absent. The
-    /// boot path (`scheduler::admit_resident_workloads_from_config`) walks it and
-    /// admits each workload via `apply_add`. Points into the persistent config image
-    /// (same lifetime contract as `ModuleEntry::params_ptr`). Null/0 on a
-    /// single-graph config ⇒ byte-identical boot.
-    pub resident_workload_section: *const u8,
-    /// Length in bytes of the resident-workload section (0 if absent).
-    pub resident_workload_section_len: usize,
-    /// The graph's `boot:` map; all zero if it has none.
-    pub boot_params: [u8; BOOT_PARAMS_BYTES],
+    /// The blob's resident workloads (`WKLD`), read where they lie in the
+    /// config image. `scheduler::admit_resident_workloads_from_config` admits
+    /// each at boot; the resource ledger plans for them. `None` on a config
+    /// with no workloads.
+    workloads: Option<Workloads<'static>>,
 }
 
 /// `graph_flags` bit 0: accept cycles in the dataflow graph. The
@@ -994,18 +569,14 @@ pub struct Config {
 /// pairs in linux http examples. The flag is graph-wide: an edge carries
 /// no feedback marking, so every cycle's members are stepped after the
 /// ordered modules, in declaration order (`compute_exec_order`).
-pub const GRAPH_FLAG_ACCEPT_CYCLES: u8 = 0x01;
+pub const GRAPH_FLAG_ACCEPT_CYCLES: u8 = boot_config::GRAPH_FLAG_ACCEPT_CYCLES;
 
 impl Config {
     /// Create an empty config
     pub const fn empty() -> Self {
         Self {
             header: ConfigHeader {
-                magic: 0,
-                version: 0,
                 checksum: 0,
-                module_count: 0,
-                edge_count: 0,
                 tick_us: 0,
                 graph_sample_rate: 0,
             },
@@ -1013,84 +584,39 @@ impl Config {
             graph_edges: crate::kernel::mem::table::ParseTable::new(None),
             module_count: 0,
             edge_count: 0,
-            hardware: HardwareConfig::new(),
-            domain_tick_us: [0; 4],
-            domain_exec_mode: [0; 4],
-            domain_adaptive_flags: [0; 4],
-            domain_tick_min_us: [0; 4],
-            domain_tick_max_us: [0; 4],
+            domain_tick_us: [0; MAX_DOMAINS],
+            domain_exec_mode: [0; MAX_DOMAINS],
+            domain_adaptive_flags: [0; MAX_DOMAINS],
+            domain_tick_min_us: [0; MAX_DOMAINS],
+            domain_tick_max_us: [0; MAX_DOMAINS],
             graph_flags: 0,
-            resident_workload_section: core::ptr::null(),
-            resident_workload_section_len: 0,
-            boot_params: [0; BOOT_PARAMS_BYTES],
+            workloads: None,
         }
+    }
+
+    /// The resident workloads the blob declares, `None` if it declares none.
+    pub fn workloads(&self) -> Option<Workloads<'_>> {
+        self.workloads
     }
 }
 
-/// Read config from flash
-///
-/// Returns None if config is invalid or not present
-pub fn read_config() -> Option<Config> {
-    let layout = read_layout()?;
-    let mut config = Config::empty();
-    read_layout_config_into(&layout, &mut config).then_some(config)
-}
-
-/// Read config from flash directly into provided destination
+/// Read the config the flash layout points at directly into `dest`, bounded
+/// by the window the layout says is mapped there.
 ///
 /// Returns true if config was read successfully, false otherwise.
 /// This avoids allocating a large Config struct on the stack.
 pub fn read_config_into(dest: &mut Config) -> bool {
-    let layout = match read_layout() {
-        Some(l) => l,
-        None => return false,
-    };
-    read_layout_config_into(&layout, dest)
-}
-
-/// Parse the config a flash layout points at, bounded by the window the
-/// layout says is mapped there.
-fn read_layout_config_into(layout: &FlashLayout, dest: &mut Config) -> bool {
-    // SAFETY: the layout source guarantees `[config_addr, config_addr +
-    // config_size)` is mapped: a slot header was bounded against its slot by
-    // `decode_slot_header`, and the trailer window ends where the platform's
-    // own memory begins (`trailer_config_window`).
-    unsafe {
-        read_config_from_ptr_with_len(
-            layout.config_addr as usize as *const u8,
-            layout.config_size as usize,
-            dest,
-        )
+    match layout_config_window() {
+        Some(blob) => read_config_from_slice(blob, dest),
+        None => {
+            log::error!("[config] no config window in the flash layout");
+            false
+        }
     }
-}
-
-/// Read the config at `config_addr` in the firmware-trailer layout, bounded
-/// by the window that layout leaves it (`trailer_config_window`).
-///
-/// Returns None if config is invalid or not present
-pub fn read_config_at(config_addr: u32) -> Option<Config> {
-    let mut config = Config::empty();
-    if read_config_at_into(config_addr, &mut config) {
-        Some(config)
-    } else {
-        None
-    }
-}
-
-/// [`read_config_at`] into a caller-provided destination, which avoids a
-/// large `Config` on the stack.
-pub fn read_config_at_into(config_addr: u32, config: &mut Config) -> bool {
-    let layout = FlashLayout {
-        modules_addr: 0,
-        modules_size: 0,
-        config_addr,
-        config_size: trailer_config_window(config_addr),
-    };
-    read_layout_config_into(&layout, config)
 }
 
 /// Read config from a raw pointer plus caller-supplied length. The
-/// caller (platform boot path / flash trailer reader) must pass the
+/// caller (a platform boot path) must pass the
 /// mapped region size; the slice is constructed with
 /// `from_raw_parts(ptr, len)`, and that length is the parser's only bound.
 /// `len = 0` is rejected.
@@ -1098,7 +624,7 @@ pub fn read_config_at_into(config_addr: u32, config: &mut Config) -> bool {
 /// # Safety
 /// `flash_ptr..flash_ptr.add(len)` must be a valid, contiguous, readable
 /// memory region that stays mapped and unchanged for as long as the parsed
-/// `config` is in use: its module entries borrow their params from it.
+/// `config` is in use: its module entries and workloads borrow from it.
 pub unsafe fn read_config_from_ptr_with_len(
     flash_ptr: *const u8,
     len: usize,
@@ -1115,826 +641,233 @@ pub unsafe fn read_config_from_ptr_with_len(
     read_config_from_slice(blob, config)
 }
 
+/// Why a decoded blob does not fit this kernel: the count and the limit it
+/// passes, named in the boot log.
+enum Refusal {
+    Codec(boot_config::DecodeError),
+    Over {
+        what: &'static str,
+        count: usize,
+        limit: &'static str,
+        max: usize,
+    },
+    RepeatedModule(ModuleId),
+    Hardware(&'static str),
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Codec(e) => {
+                let (a, b) = e.detail();
+                write!(f, "{} ({a:#010x}, {b})", e.kind())
+            }
+            Self::Over {
+                what,
+                count,
+                limit,
+                max,
+            } => write!(f, "{what}={count} exceeds {limit}={max}"),
+            Self::RepeatedModule(id) => write!(f, "module id {id} repeated"),
+            Self::Hardware(why) => write!(f, "hardware section: {why}"),
+        }
+    }
+}
+
+fn bounded(
+    what: &'static str,
+    count: usize,
+    limit: &'static str,
+    max: usize,
+) -> Result<(), Refusal> {
+    if count > max {
+        Err(Refusal::Over {
+            what,
+            count,
+            limit,
+            max,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Read config from a caller-provided byte slice into `config`. The slice's
-/// length is the hard upper bound: any section that would extend past
-/// `blob.len()` causes a deterministic rejection with a logged error, no
-/// silent truncation. Module / edge counts exceeding `MAX_MODULES` /
-/// `MAX_GRAPH_EDGES` are rejected, not clamped.
+/// length is the hard upper bound: a blob whose `total_len` runs past it is
+/// refused. The codec refuses an unknown, repeated or truncated section and a
+/// checksum mismatch; counts past this kernel's profile (`MAX_MODULES`,
+/// `MAX_GRAPH_EDGES`, `MAX_DOMAINS`, `MAX_OWNERS`) are refused naming the
+/// limit, never clamped. A refused blob leaves `config` empty and applies
+/// nothing (the capacity envelope included).
 ///
-/// The parsed module entries BORROW their params from `blob` (nothing is
+/// The parsed module entries and workloads BORROW from `blob` (nothing is
 /// copied), so the caller keeps `blob` mapped and unchanged for as long as
 /// `config` is used — every platform passes its resident config blob, which
 /// lives as long as the kernel does.
 pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
-    let flash_ptr = blob.as_ptr();
-    let blob_len = blob.len();
-
-    // Header must fit before we even consider parsing.
-    const HEADER_SIZE: usize = 16;
-    if blob_len < HEADER_SIZE {
-        log::error!("[config] blob too short: {blob_len} < {HEADER_SIZE}");
-        return false;
-    }
-    // Read header (16 bytes)
-    // SAFETY: `blob_len >= HEADER_SIZE` (= 16) checked above, so reads at
-    // offsets 0..16 stay inside `blob`.
-    let header = unsafe {
-        let magic = read_u32(flash_ptr);
-        if magic != MAGIC_CONFIG {
-            log::warn!("[config] bad magic=0x{magic:08x}");
-            return false;
-        }
-
-        let version = read_u16(flash_ptr.add(4));
-        let checksum = read_u16(flash_ptr.add(6));
-        let module_count = *flash_ptr.add(8);
-        let edge_count = *flash_ptr.add(9);
-        let tick_us = read_u16(flash_ptr.add(10));
-        let graph_sample_rate = read_u32(flash_ptr.add(12));
-
-        ConfigHeader {
-            magic,
-            version,
-            checksum,
-            module_count,
-            edge_count,
-            tick_us,
-            graph_sample_rate,
-        }
-    };
-
-    // Reset config to empty state.
     *config = Config::empty();
-    config.header = header;
     CONFIG_PARAMS_BYTES.store(0, portable_atomic::Ordering::Relaxed);
-    CONFIG_BLOB_LEN.store(blob_len, portable_atomic::Ordering::Relaxed);
-
-    // Kernel and tools always ship together, so any mismatch is an
-    // upgrade-skipped or toolchain-mismatch bug rather than a
-    // graceful path. The version is intentionally NOT bumped for the
-    // adaptive-tick per-domain-metadata widening (4→8 bytes): the format
-    // is latest-only, so a stale blob is rejected by the body-size / CRC
-    // checks below, not by a version number. (See standing rule: never
-    // bump format versions — it breaks every sibling consumer.)
-    if header.version != 1 {
-        log::error!("[config] unsupported version={}", header.version);
-        return false;
+    CONFIG_BLOB_LEN.store(0, portable_atomic::Ordering::Relaxed);
+    // SAFETY: the caller keeps `blob` mapped and unchanged for as long as
+    // `config` is used (this function's contract, as for every module's
+    // borrowed params); the views `config` keeps into it live no longer.
+    let blob: &'static [u8] = unsafe { core::slice::from_raw_parts(blob.as_ptr(), blob.len()) };
+    match fill(blob, config) {
+        Ok(()) => true,
+        Err(why) => {
+            log::error!("[config] refused: {why}");
+            *config = Config::empty();
+            false
+        }
     }
+}
 
-    // Reject oversized counts deterministically instead of clamping. A
-    // header that promises more modules/edges than the kernel can hold is
-    // either a tool-version mismatch or a malformed blob — either way the
-    // right answer is to refuse the load with a clear log line.
-    // The LOW byte. The high byte lives in the graph section header and is
-    // folded in (and the total bounded) once that section is located below.
-    config.edge_count = u16::from(header.edge_count);
-
-    // Parse modules - variable-length entries
-    // SAFETY: `blob_len >= HEADER_SIZE + 6` checked below; `flash_ptr.add(16)`
-    // points past the header inside the blob.
-    let modules_base = unsafe { flash_ptr.add(16) };
-
-    // Module section header: module_count low byte (u8), module_count high
-    // byte (u8), section_size (u32). u32 lets multi-component scenarios (split
-    // deployments where producer + viewer/player both embed the
-    // canonical wasm shell as http body routes) clear 64 KiB without
-    // overflowing the section size; embedded targets (rp/bcm) still
-    // fit in the low 16 bits in practice.
-    if blob_len < HEADER_SIZE + 6 {
-        log::error!(
-            "[config] blob too short for module section header: {} < {}",
-            blob_len,
-            HEADER_SIZE + 6
-        );
-        return false;
+fn fill(blob: &'static [u8], config: &mut Config) -> Result<(), Refusal> {
+    use crate::kernel::sys::resource_ledger;
+    let bc = boot_config::decode(blob).map_err(Refusal::Codec)?;
+    let graph = bc.graph();
+    bounded(
+        "module_count",
+        usize::from(graph.module_count()),
+        "MAX_MODULES",
+        MAX_MODULES,
+    )?;
+    bounded(
+        "edge_count",
+        usize::from(graph.edge_count()),
+        "MAX_GRAPH_EDGES",
+        MAX_GRAPH_EDGES,
+    )?;
+    bounded(
+        "domain_count",
+        usize::from(graph.domain_count()),
+        "MAX_DOMAINS",
+        MAX_DOMAINS,
+    )?;
+    if let Some(w) = bc.workloads() {
+        // Slot 0 is the system owner; each workload takes one of the rest.
+        bounded(
+            "workload_count",
+            usize::from(w.count()),
+            "MAX_OWNERS - 1",
+            crate::kernel::workload::owner::MAX_OWNERS - 1,
+        )?;
     }
-    // SAFETY: `blob_len >= HEADER_SIZE + 6` (checked above); section_size
-    // u32 lives at offset 16+2 inside `blob`.
-    let section_size = unsafe { read_u32(modules_base.add(2)) } as usize;
-    // The module section must lie inside the blob before any size is derived
-    // from it: a u32 section size added to the fixed sections could wrap a
-    // 32-bit `usize`, and a wrapped total would pass every later bound.
-    if section_size > blob_len - (HEADER_SIZE + 6) {
-        log::error!("[config] module section size={section_size} exceeds blob_len={blob_len}");
-        return false;
-    }
+    check_hardware(&bc)?;
 
-    // The module count's high byte rides the module section header. A
-    // header that promises more modules than the kernel can hold is either
-    // a tool-version mismatch or a malformed blob: refuse, never clamp.
-    // SAFETY: byte 1 of the 6-byte section header, in bounds as above.
-    let count_hi = unsafe { *modules_base.add(1) };
-    config.module_count = u16::from(header.module_count) | (u16::from(count_hi) << 8);
-    if config.module_count as usize > MAX_MODULES {
-        log::error!(
-            "[config] module_count={} exceeds MAX_MODULES={}",
-            config.module_count,
-            MAX_MODULES
-        );
-        return false;
-    }
-
-    // The graph section's slot code (its byte 3) fixes the section's size, so
-    // it is read before any later offset is derived. A static profile holds
-    // exactly one layout and refuses another by name; Linux and aarch64 take
-    // the layout the blob states.
-    let graph_off = HEADER_SIZE + 6 + section_size;
-    if blob_len < graph_off + 4 {
-        log::error!("[config] blob too short for the graph section header");
-        return false;
-    }
-    // SAFETY: `graph_off + 4 <= blob_len` checked above.
-    let slots_code = unsafe { *flash_ptr.add(graph_off + 3) };
-    #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
-    if slots_code != GRAPH_SLOTS_CODE {
-        log::error!(
-            "[config] graph section laid out for slot code {slots_code}, this kernel expects {GRAPH_SLOTS_CODE} (MAX_GRAPH_EDGES={MAX_GRAPH_EDGES}) — rebuild the config for this target"
-        );
-        return false;
-    }
-    let graph_slots = slots_for_code(slots_code);
-    let graph_section = graph_section_size(graph_slots);
-
-    // Validate CRC16-CCITT checksum over body (bytes 8 onwards).
-    // Body = header tail (8) + module section (6+section_size) + graph + hw (variable).
-    // We read hw counts to compute total size.
-    let body_before_hw = 8 + (6 + section_size) + graph_section;
-
-    // Hardware section header (6 bytes: spi/i2c/gpio/pio/_/uart) must fit
-    // inside the blob too. `body_before_hw` is measured from `flash_ptr+8`,
-    // so the absolute offset of the hw header is `8 + body_before_hw`.
-    let hw_header_offset = 8 + body_before_hw;
-    if blob_len < hw_header_offset + 6 {
-        log::error!(
-            "[config] section_size={} pushes hw header past blob_len={} (need {})",
-            section_size,
-            blob_len,
-            hw_header_offset + 6
-        );
-        return false;
-    }
-    // SAFETY: `blob_len >= hw_header_offset + 6` checked above; the hw
-    // header lies at `modules_base + 6 + section_size + graph_section`.
-    let hw_header_ptr = unsafe { modules_base.add(6 + section_size + graph_section) };
-    // SAFETY: 6 bytes at hw_header_ptr verified by the bounds check above.
-    let (spi_n, i2c_n, gpio_n, pio_n, uart_n) = unsafe {
-        (
-            (*hw_header_ptr) as usize,
-            (*hw_header_ptr.add(1)) as usize,
-            (*hw_header_ptr.add(2)) as usize,
-            (*hw_header_ptr.add(3)) as usize,
-            (*hw_header_ptr.add(5)) as usize,
-        )
+    config.header = ConfigHeader {
+        checksum: bc.checksum(),
+        tick_us: graph.tick_us,
+        graph_sample_rate: graph.graph_sample_rate,
     };
-    let hw_size = 6
-        + spi_n * SPI_CONFIG_BIN_SIZE
-        + i2c_n * I2C_CONFIG_BIN_SIZE
-        + uart_n * UART_CONFIG_BIN_SIZE
-        + gpio_n * GPIO_CONFIG_BIN_SIZE
-        + pio_n * PIO_CONFIG_BIN_SIZE;
-    let body_size = body_before_hw + hw_size;
+    config.graph_flags = graph.graph_flags;
+    config.module_count = graph.module_count();
+    config.edge_count = graph.edge_count();
 
-    // The caller-provided slice length is the only bound: exceeding it
-    // would read past the mapped blob.
-    let total_size = 8 + body_size;
-    if total_size > blob_len {
-        log::error!("[config] body size={total_size} exceeds caller blob length={blob_len}");
-        return false;
+    for m in graph.modules() {
+        bounded(
+            "module id",
+            usize::from(m.id),
+            "MAX_MODULES - 1",
+            MAX_MODULES - 1,
+        )?;
+        bounded(
+            "module domain",
+            usize::from(m.domain),
+            "MAX_DOMAINS - 1",
+            MAX_DOMAINS - 1,
+        )?;
+        let slot = &mut config.modules[usize::from(m.id)];
+        if slot.is_some() {
+            return Err(Refusal::RepeatedModule(m.id));
+        }
+        *slot = Some(ModuleEntry {
+            name_hash: m.name_hash,
+            id: m.id,
+            domain_id: m.domain,
+            pre_tick_drain: m.pre_pass,
+            frame_kind: 0,
+            params_ptr: if m.params.is_empty() {
+                core::ptr::null()
+            } else {
+                m.params.as_ptr()
+            },
+            params_len: m.params.len(),
+        });
     }
 
-    if header.checksum != 0 {
-        // SAFETY: `total_size = 8 + body_size <= blob_len` checked above.
-        let body = unsafe { core::slice::from_raw_parts(flash_ptr.add(8), body_size) };
-        let computed = crc16_ccitt(body);
-        if computed != header.checksum {
-            log::warn!(
-                "[config] checksum mismatch stored=0x{:04x} computed=0x{:04x}",
-                header.checksum,
-                computed
-            );
-            return false;
-        }
-    }
-    // Parse variable-length entries. A malformed module section
-    // (truncation, undersized entry length, out-of-bounds extent,
-    // out-of-range id) rejects the whole config
-    // — partial graphs are never accepted.
-    let mut offset = 6usize; // Skip 6-byte section header (count, reserved, section_size u32)
-    for i in 0..config.module_count as usize {
-        // Every entry's 32-bit length prefix must fit inside the
-        // declared section.
-        if offset + 4 > section_size + 6 {
-            log::error!(
-                "[config] module entry {i} length prefix past section end (offset={offset}, section_size={section_size})"
-            );
-            return false;
-        }
-
-        // SAFETY: `offset + 4 <= section_size + 6 <= blob_len` per the
-        // checks above and the section-size bounds-check on read.
-        let entry_ptr = unsafe { modules_base.add(offset) };
-        // SAFETY: 4-byte read at entry_ptr is in-bounds (same proof).
-        let entry_len = unsafe { read_u32(entry_ptr) } as usize;
-
-        if entry_len < 10 {
-            log::error!("[config] module entry {i} bad length={entry_len}");
-            return false;
-        }
-
-        // The whole entry payload must also fit inside the section.
-        if offset + entry_len > section_size + 6 {
-            log::error!(
-                "[config] module entry {i} extends past section end (offset={offset}, entry_len={entry_len}, section_size={section_size})"
-            );
-            return false;
-        }
-
-        let entry = parse_module_entry(entry_ptr, entry_len);
-        CONFIG_PARAMS_BYTES.fetch_add(entry.params_len, portable_atomic::Ordering::Relaxed);
-        if (entry.id as usize) >= MAX_MODULES {
-            log::error!(
-                "[config] module entry {} id={} out of range (MAX_MODULES={})",
-                i,
-                entry.id,
-                MAX_MODULES
-            );
-            return false;
-        }
-        config.modules[entry.id as usize] = Some(entry);
-
-        offset += entry_len;
+    config
+        .graph_edges
+        .reserve_entries(usize::from(graph.edge_count()));
+    for (i, e) in graph.edges().enumerate() {
+        config.graph_edges[i] = Some(GraphEdge::from(e));
     }
 
-    // Section base is after module section (6-byte header + entries)
-    // SAFETY: `modules_base + 6 + section_size` lies inside the blob
-    // (`6 + section_size + graph_section` already validated above).
-    let section_base = unsafe { modules_base.add(6 + section_size) };
-
-    // Graph section header layout (4 bytes, see tools/src/config.rs):
-    //   byte 0: edge_count low byte (redundant with the counts block)
-    //   byte 1: graph_flags — see `GRAPH_FLAG_*` constants
-    //   byte 2: edge_count HIGH byte (0 in every blob of <= 255 edges, which
-    //           is what every blob written before it existed also says)
-    //   byte 3: edge-slot code — see `GRAPH_SLOTS_CODE` (read above)
-    // SAFETY: graph section is `graph_section` bytes from section_base;
-    // 4-byte header fits.
-    config.graph_flags = unsafe { *section_base.add(1) };
-    // SAFETY: byte 2 of the same 4-byte graph header.
-    let edge_hi = unsafe { *section_base.add(2) };
-    config.edge_count |= u16::from(edge_hi) << 8;
-    // A header that promises more edges than its section has slots for is
-    // either a tool-version mismatch or a malformed blob: refuse the load,
-    // never clamp.
-    if config.edge_count as usize > graph_slots.min(MAX_GRAPH_EDGES) {
-        log::error!(
-            "[config] edge_count={} exceeds the graph section's {} edge slots",
-            config.edge_count,
-            graph_slots
-        );
-        return false;
-    }
-    let edge_count = config.edge_count as usize;
-    config.graph_edges.reserve_entries(edge_count);
-
-    // Edges start at offset 4 within graph section
-    // SAFETY: `section_base + 4` is the start of the edge array.
-    let edges_base = unsafe { section_base.add(4) };
-    for i in 0..edge_count {
-        // SAFETY: `edge_count <= graph_slots` (checked above); each
-        // entry is `GRAPH_EDGE_SIZE` bytes, all within the graph section.
-        let entry_ptr = unsafe { edges_base.add(i * GRAPH_EDGE_SIZE) };
-        config.graph_edges[i] = Some(parse_graph_edge(entry_ptr));
-    }
-
-    // Parse domain metadata (DOMAIN_META_SIZE bytes after edge entries).
-    // Each entry is DOMAIN_META_ENTRY_SIZE (4) bytes:
-    //   [0..2] tick_us:u16  [2] exec_mode:u8  [3] adaptive_flags:u8
-    // tick_min_us/tick_max_us are NOT in this entry — they're read below from
-    // the post-body adaptive section past total_size (see ADAPTIVE_POST_SIZE).
-    // SAFETY: section_base + 4 + graph_slots * GRAPH_EDGE_SIZE points
-    // at the domain meta section within the graph section.
-    let domain_meta_base = unsafe { section_base.add(4 + graph_slots * GRAPH_EDGE_SIZE) };
-    let global_tick = if config.header.tick_us > 0 {
-        config.header.tick_us
+    let global_tick = if graph.tick_us > 0 {
+        graph.tick_us
     } else {
         1000
     };
-    for d in 0..4usize {
-        // SAFETY: `d < 4`; DOMAIN_META_SIZE = 4 × DOMAIN_META_ENTRY_SIZE bytes.
-        unsafe {
-            let base = domain_meta_base.add(d * DOMAIN_META_ENTRY_SIZE);
-            let dtick = read_u16(base);
-            config.domain_tick_us[d] = dtick;
-            config.domain_exec_mode[d] = *base.add(2);
-            // adaptive_flags is byte 3 of the domain meta entry.
-            config.domain_adaptive_flags[d] = *base.add(3);
-            // Default tick_min/tick_max to the domain's effective tick; the
-            // post-body adaptive section (read below, after the hw section)
-            // overrides these when present.
-            let eff = if dtick > 0 { dtick } else { global_tick };
-            config.domain_tick_min_us[d] = eff;
-            config.domain_tick_max_us[d] = eff;
-        }
-    }
-
-    // Hardware section starts after graph section (80 bytes). Any
-    // oversized hardware count (spi/i2c/gpio/pio/uart) causes the
-    // whole config to be rejected rather than silently truncating.
-    // SAFETY: hw section follows the graph section; `hw_size` already
-    // validated against `body_size <= blob_len`.
-    let hw_base = unsafe { section_base.add(graph_section) };
-    config.hardware = match parse_hardware_section(hw_base) {
-        Some(hw) => hw,
-        None => {
-            log::error!("[config] hardware section rejected (oversized counts)");
-            return false;
-        }
-    };
-
-    // Adaptive-tick post-body section: 4 domains × [tick_min_us:u16 LE,
-    // tick_max_us:u16 LE] = 16 bytes, placed AFTER the checksummed body (at
-    // `total_size`), not inside `body_size`, so the body, checksum and parse
-    // stay byte-identical to a config without adaptive data, and these values
-    // ride along in the gap before the next 256B image boundary. On bcm2712 the
-    // whole config, body and tail, must end below `__bss_start`: `_start`
-    // clears from there, so a body that reaches it fails its checksum
-    // (`linker/memory-bcm2712.x`). Not checksum-covered → range-validated + 0/garbage ⇒ domain
-    // tick, and adaptive is default-off (flags=0) so a torn tail is inert.
-    let post_off = total_size; // = 8 + body_size, first byte past the CRC'd body
-    if post_off + ADAPTIVE_POST_SIZE <= blob_len {
-        for d in 0..4usize {
-            // SAFETY: `post_off + ADAPTIVE_POST_SIZE <= blob_len` checked above;
-            // each domain reads 4 bytes within that 16-byte window.
-            unsafe {
-                let ab = flash_ptr.add(post_off + d * 4);
-                let raw_min = read_u16(ab);
-                let raw_max = read_u16(ab.add(2));
-                let eff = if config.domain_tick_us[d] > 0 {
-                    config.domain_tick_us[d]
-                } else {
-                    global_tick
-                };
-                // Validate as a PAIR. The post-body tail is deliberately OUTSIDE
-                // the checksum, so a torn/stale tail could pass independent range
-                // checks yet still be an impossible min>max (e.g. half-written).
-                // Require BOTH fields in range AND raw_min <= raw_max; otherwise
-                // fall back to the domain tick for both (min==max==eff ⇒ adaptive
-                // has no range to move in ⇒ inert), so an unprotected post-body
-                // can never inject a dangerous or inverted cadence.
-                let in_range = |v: u16| (TICK_BOUND_MIN..=TICK_BOUND_MAX).contains(&v);
-                if in_range(raw_min) && in_range(raw_max) && raw_min <= raw_max {
-                    config.domain_tick_min_us[d] = raw_min;
-                    config.domain_tick_max_us[d] = raw_max;
-                } else {
-                    config.domain_tick_min_us[d] = eff;
-                    config.domain_tick_max_us[d] = eff;
-                }
-            }
-        }
-    }
-
-    // Post-body section chain, right after the 16-byte adaptive post-body and
-    // past the checksummed body. Every section is self-describing with the same header:
-    // `[magic u32][section_len u32][crc16 u16][payload]`, `crc16` over
-    // `section[10..section_len]` — so the walk skips sections by length and an
-    // unknown magic ends the chain. Known sections:
-    //   FXPD — resident workloads: payload =
-    //          `[count u16]` then per workload
-    //          `[blob_len u32][flags u8][FLXA blob]`.
-    //   FXEV — capacity envelope: payload =
-    //          `[entry_count u16]` then `[pool u16][n u32]` entries, each the
-    //          pool's live-add reserve (or size, for a pool the graph cannot
-    //          derive), as `resource::decode_entry` reads it (exact bytes
-    //          for an arena below 2 GiB, KiB past it).
-    //   FXDM — declared demand: the same entries, what the graph's modules
-    //          declare they will ask of each pool, added to its derived size.
-    //   FXBO — boot parameters, the graph's `boot:` map: how a machine
-    //          behaves on a test rig, read by the platform.
-    // Each is validated whole (bounds AND CRC) before use: workloads are
-    // executable configuration and the envelope gates admission, so a corrupt
-    // or truncated section must contribute NOTHING, never a garbled prefix.
-    // Absent sections ⇒ a single-graph boot whose pools are their derived
-    // sizes plus the profile's default reserves.
-    crate::kernel::sys::resource_ledger::reset_envelope();
-    let mut section_off = post_off + ADAPTIVE_POST_SIZE;
-    while section_off + 12 <= blob_len {
-        // SAFETY: `section_off + 12 <= blob_len` checked; reads 4+4+2 bytes in range.
-        let magic = unsafe { read_u32(flash_ptr.add(section_off)) };
-        let cap = match magic {
-            WORKLOAD_SECTION_MAGIC => MAX_WORKLOAD_SECTION_BYTES,
-            ENVELOPE_SECTION_MAGIC | DEMAND_SECTION_MAGIC => {
-                crate::abi::contracts::resource::MAX_ENVELOPE_SECTION_BYTES
-            }
-            BOOT_SECTION_MAGIC => 10 + BOOT_PARAMS_BYTES,
-            _ => break,
+    let mut domains = graph.domains();
+    for d in 0..MAX_DOMAINS {
+        let rec = domains.next().unwrap_or_default();
+        let eff = if rec.tick_us > 0 {
+            rec.tick_us
+        } else {
+            global_tick
         };
-        // SAFETY: header fields within the 12 bytes checked above.
-        let section_len = unsafe { read_u32(flash_ptr.add(section_off + 4)) } as usize;
-        // SAFETY: crc at offset 8, within the 12 header bytes checked above.
-        let stored_crc = unsafe { read_u16(flash_ptr.add(section_off + 8)) };
-        if section_len < 12 || section_len > cap || section_off + section_len > blob_len {
-            log::error!(
-                "[config] post-body section {magic:#010X} length {section_len} out of range \
-                 (cap {cap}, blob_len {blob_len}); section chain ends here"
-            );
-            break;
-        }
-        // SAFETY: `section_off + section_len <= blob_len`; `section_len >= 12 > 10`.
-        let payload = unsafe {
-            core::slice::from_raw_parts(flash_ptr.add(section_off + 10), section_len - 10)
+        config.domain_tick_us[d] = rec.tick_us;
+        config.domain_exec_mode[d] = rec.exec_mode as u8;
+        config.domain_adaptive_flags[d] = rec.adaptive_flags;
+        config.domain_tick_min_us[d] = if rec.tick_min_us > 0 {
+            rec.tick_min_us
+        } else {
+            eff
         };
-        if crc16_ccitt(payload) != stored_crc {
-            log::error!("[config] post-body section {magic:#010X} CRC mismatch; section ignored");
-            section_off += section_len;
-            continue;
-        }
-        match magic {
-            WORKLOAD_SECTION_MAGIC => {
-                // SAFETY: `section_off < blob_len`; pointer into the mapped blob.
-                config.resident_workload_section = unsafe { flash_ptr.add(section_off) };
-                config.resident_workload_section_len = section_len;
-            }
-            ENVELOPE_SECTION_MAGIC => {
-                parse_pool_entries(payload, crate::kernel::sys::resource_ledger::set_reserve);
-            }
-            DEMAND_SECTION_MAGIC => {
-                parse_pool_entries(payload, crate::kernel::sys::resource_ledger::set_declared);
-            }
-            BOOT_SECTION_MAGIC => {
-                if let Ok(params) = <[u8; BOOT_PARAMS_BYTES]>::try_from(payload) {
-                    config.boot_params = params;
-                }
-            }
-            _ => unreachable!(),
-        }
-        section_off += section_len;
-    }
-
-    true
-}
-
-/// Boot-parameter section magic ("FXBO") — mirror of the tools'
-/// `capacity::BOOT_SECTION_MAGIC`.
-const BOOT_SECTION_MAGIC: u32 = 0x4658_424F;
-/// The boot section's payload, little-endian: `[reserved u8][fault_probe u8]
-/// [lockup_probe u8][reserved u8][summary_every_s u32][summary_for_s u32]
-/// [max_uptime_s u32]`. A payload of any other length is ignored.
-pub const BOOT_PARAMS_BYTES: usize = 16;
-
-/// Capacity-envelope section magic ("FXEV") — mirror of
-/// `abi::contracts::resource::ENVELOPE_SECTION_MAGIC`.
-const ENVELOPE_SECTION_MAGIC: u32 = crate::abi::contracts::resource::ENVELOPE_SECTION_MAGIC;
-
-/// Declared-demand section magic ("FXDM") — mirror of
-/// `abi::contracts::resource::DEMAND_SECTION_MAGIC`.
-const DEMAND_SECTION_MAGIC: u32 = crate::abi::contracts::resource::DEMAND_SECTION_MAGIC;
-
-/// Hand each `[pool u16][n u32]` entry of a CRC-validated envelope or demand
-/// payload (`[entry_count u16]` then the entries) to `install`. A count that
-/// disagrees with the payload length installs nothing.
-fn parse_pool_entries(payload: &[u8], install: fn(u16, u32)) {
-    use crate::abi::contracts::resource::ENVELOPE_ENTRY_SIZE;
-    if payload.len() < 2 {
-        return;
-    }
-    let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-    if 2 + count * ENVELOPE_ENTRY_SIZE != payload.len() {
-        log::error!(
-            "[config] pool section count {count} disagrees with section length {}; ignored",
-            payload.len()
-        );
-        return;
-    }
-    for e in 0..count {
-        let off = 2 + e * ENVELOPE_ENTRY_SIZE;
-        let pool = u16::from_le_bytes([payload[off], payload[off + 1]]);
-        let n = u32::from_le_bytes([
-            payload[off + 2],
-            payload[off + 3],
-            payload[off + 4],
-            payload[off + 5],
-        ]);
-        install(pool, n);
-    }
-}
-
-// ============================================================================
-// Entry Parsers
-// ============================================================================
-
-/// Parse variable-length module entry
-///
-/// The layout is [`ModuleEntry`]'s. `entry_length` is u32 because one
-/// module's params can exceed 64 KiB: the synthesised host's http module
-/// carries both halves of a split scenario's wasm shells as body routes.
-///
-/// The params are borrowed in place: `params_ptr` points into the blob, so an
-/// entry costs nothing beyond its slot in `Config::modules` however large its
-/// params are.
-fn parse_module_entry(ptr: *const u8, entry_len: usize) -> ModuleEntry {
-    // SAFETY: caller validated `entry_len >= 10` and that `ptr..ptr+entry_len`
-    // lies inside the config blob. All inner reads are bounded by `entry_len`.
-    unsafe {
-        let name_hash = read_u32(ptr.add(4));
-        // Byte 9 is multiplexed (see ModuleEntry docs): bits 0-2 carry
-        // domain_id (0..7), bit 4 pre_tick_drain, bits 5-6 the id's bits 8-9,
-        // bit 7 its bit 10 and bit 3 its bit 11.
-        let byte9 = *ptr.add(9);
-        let id = ModuleId::from(*ptr.add(8))
-            | (ModuleId::from((byte9 >> 5) & 0x03) << 8)
-            | (ModuleId::from(byte9 >> 7) << 10)
-            | (ModuleId::from((byte9 >> 3) & 0x01) << 11);
-        let domain_id = byte9 & 0x07;
-        let pre_tick_drain = (byte9 & 0x10) != 0;
-
-        let params_len = entry_len.saturating_sub(10);
-        ModuleEntry {
-            name_hash,
-            id,
-            domain_id,
-            pre_tick_drain,
-            frame_kind: 0,
-            params_ptr: if params_len == 0 {
-                core::ptr::null()
-            } else {
-                ptr.add(10)
-            },
-            params_len,
-        }
-    }
-}
-
-/// Parse graph edge from binary
-///
-/// Format (8 bytes):
-/// - byte 0:    from_id (u8)
-/// - byte 1:    to_id (u8)
-/// - byte 2:    bit 7      = to_port (0=in, 1=ctrl)
-///   bits [6:5] = edge_class (2-bit)
-///   bits [4:0] = buffer_group (5-bit, 0..31)
-/// - byte 3:    bits [7:4] = from_port_index (4-bit, 0..15)
-///   bits [3:0] = to_port_index   (4-bit, 0..15)
-/// - bytes 4-7: buffer_bytes (u32 LE, 0 = no override)
-/// - byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk, 4=transaction),
-///   resolved by the config compiler from the per-edge `rate:`
-///   override / port content-type defaults. Consumed by the
-///   MODULE_FLOW_BUDGET provider query.
-/// - byte 9:    bit 0 = wake_on_write (a
-///   `channel_write` on this edge latches the consumer's event-wake
-///   bit and rings the scheduler doorbell); bit 1 = retains_send (the
-///   consumer port keeps its own copy of what it sends); bits 2-7 reserved
-/// - bytes 10-11: reserved (0)
-///
-/// Both port indices are 4 bits; the runtime caps both at
-/// `MAX_PORTS = 16` (scheduler.rs). `buffer_group` is 5 bits — group 0
-/// means no aliasing, ids 1..31 mark in-place chains. The tool's
-/// `assign_buffer_groups` enforces the 31 ceiling.
-fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
-    // SAFETY: `ptr..ptr+GRAPH_EDGE_SIZE (= 12)` is in-bounds (caller is
-    // the edge-loop which bounds-checked `edge_count * GRAPH_EDGE_SIZE`).
-    unsafe {
-        // Low bytes at 0-1, high bytes at 10-11.
-        let from_id = ModuleId::from(*ptr) | (ModuleId::from(*ptr.add(10)) << 8);
-        let to_id = ModuleId::from(*ptr.add(1)) | (ModuleId::from(*ptr.add(11)) << 8);
-        let byte2 = *ptr.add(2);
-        let to_port = (byte2 >> 7) & 1;
-        let edge_class_raw = (byte2 >> 5) & 0x03;
-        let buffer_group = byte2 & 0x1F;
-        let port_byte = *ptr.add(3);
-        let from_port_index = (port_byte >> 4) & 0x0F;
-        let to_port_index = port_byte & 0x0F;
-        let buffer_bytes = u32::from_le_bytes([*ptr.add(4), *ptr.add(5), *ptr.add(6), *ptr.add(7)]);
-        let rate_class = *ptr.add(8);
-        let wake_on_write = (*ptr.add(9) & 0x01) != 0;
-        let retains_send = (*ptr.add(9) & 0x02) != 0;
-        let edge_class = match edge_class_raw {
-            1 => EdgeClass::DmaOwned,
-            2 => EdgeClass::CrossCore,
-            3 => EdgeClass::NicRing,
-            _ => EdgeClass::Local,
+        config.domain_tick_max_us[d] = if rec.tick_max_us > 0 {
+            rec.tick_max_us
+        } else {
+            eff
         };
-        GraphEdge {
-            from_id,
-            to_id,
-            to_port,
-            from_port_index,
-            to_port_index,
-            buffer_group,
-            edge_class,
-            buffer_bytes,
-            rate_class,
-            wake_on_write,
-            retains_send,
-        }
-    }
-}
-
-/// Parse hardware section from binary config
-///
-/// Binary format:
-/// ```text
-/// Offset 0: spi_count (u8)
-/// Offset 1: i2c_count (u8)
-/// Offset 2: gpio_count (u8)
-/// Offset 3: pio_count (u8)
-/// Offset 4: max_gpio (u8)
-/// Offset 5: uart_count (u8)
-/// Offset 6: spi_configs[spi_count] (8 bytes each)
-///           - bus (u8), miso (u8), mosi (u8), sck (u8), freq_hz (u32)
-/// Then: i2c_configs[i2c_count] (8 bytes each)
-///           - bus (u8), sda (u8), scl (u8), reserved (u8), freq_hz (u32)
-/// Then: uart_configs[uart_count] (8 bytes each)
-///           - bus (u8), tx_pin (u8), rx_pin (u8), reserved (u8), baudrate (u32)
-/// Then: gpio_configs[gpio_count] (5 bytes each)
-///           - pin (u8), flags (u8), initial (u8), owner_module_id (u16 LE)
-///           - flags: bit0 = direction (0=in, 1=out), bit1-2 = pull (0=none, 1=up, 2=down)
-///           - owner_module_id: 0xFFFF = kernel-owned, else the module index to grant to
-/// Then: pio_configs[pio_count] (4 bytes each)
-///           - pio_idx (u8), data_pin (u8), clk_pin (u8), extra_pin (u8)
-///           - extra_pin: 0xFF = unused
-/// ```
-/// Hardware-count fields are rejected, not clamped: any `*_count`
-/// value exceeding the corresponding `MAX_*` constant returns `None`
-/// so the enclosing parser fails the whole graph. Silent truncation
-/// would let a config asking for 10 SPI buses on a 2-bus platform
-/// parse 2 and drop the other 8 without surfacing the mismatch.
-fn parse_hardware_section(ptr: *const u8) -> Option<HardwareConfig> {
-    let mut hw = HardwareConfig::default();
-
-    // SAFETY: caller (`read_config_from_slice`) bounds-checked `hw_size`
-    // against `blob_len`; this body validates counts against MAX_* before
-    // offsetting through the per-section arrays.
-    unsafe {
-        let spi_count_raw = *ptr;
-        let i2c_count_raw = *ptr.add(1);
-        let gpio_count_raw = *ptr.add(2);
-        let pio_count_raw = *ptr.add(3);
-        let max_gpio = *ptr.add(4);
-        let uart_count_raw = *ptr.add(5);
-
-        if spi_count_raw as usize > MAX_SPI_BUSES {
-            log::error!("[config] spi_count={spi_count_raw} exceeds MAX_SPI_BUSES={MAX_SPI_BUSES}");
-            return None;
-        }
-        if i2c_count_raw as usize > MAX_I2C_BUSES {
-            log::error!("[config] i2c_count={i2c_count_raw} exceeds MAX_I2C_BUSES={MAX_I2C_BUSES}");
-            return None;
-        }
-        if gpio_count_raw as usize > MAX_GPIO_CONFIGS {
-            log::error!(
-                "[config] gpio_count={gpio_count_raw} exceeds MAX_GPIO_CONFIGS={MAX_GPIO_CONFIGS}"
-            );
-            return None;
-        }
-        if pio_count_raw as usize > MAX_PIO_CONFIGS {
-            log::error!(
-                "[config] pio_count={pio_count_raw} exceeds MAX_PIO_CONFIGS={MAX_PIO_CONFIGS}"
-            );
-            return None;
-        }
-        if uart_count_raw as usize > MAX_UART_BUSES {
-            log::error!(
-                "[config] uart_count={uart_count_raw} exceeds MAX_UART_BUSES={MAX_UART_BUSES}"
-            );
-            return None;
-        }
-
-        let spi_count = spi_count_raw as usize;
-        let i2c_count = i2c_count_raw as usize;
-        let gpio_count = gpio_count_raw as usize;
-        let pio_count = pio_count_raw as usize;
-        let uart_count = uart_count_raw as usize;
-        if max_gpio > 0 {
-            hw.max_gpio = max_gpio;
-        }
-
-        // Parse SPI configs (starting at offset 6)
-        let mut offset = 6usize;
-        for i in 0..spi_count {
-            let entry = ptr.add(offset);
-            hw.spi[i] = Some(SpiConfig {
-                bus: *entry,
-                miso: *entry.add(1),
-                mosi: *entry.add(2),
-                sck: *entry.add(3),
-                freq_hz: read_u32(entry.add(4)),
-            });
-            offset += SPI_CONFIG_BIN_SIZE;
-        }
-
-        // Parse I2C configs
-        for i in 0..i2c_count {
-            let entry = ptr.add(offset);
-            hw.i2c[i] = Some(I2cConfig {
-                bus: *entry,
-                sda: *entry.add(1),
-                scl: *entry.add(2),
-                // byte 3 is reserved
-                freq_hz: read_u32(entry.add(4)),
-            });
-            offset += I2C_CONFIG_BIN_SIZE;
-        }
-
-        // Parse UART configs (8 bytes each): bus, tx_pin, rx_pin, reserved, baudrate(u32)
-        for i in 0..uart_count {
-            let entry = ptr.add(offset);
-            hw.uart[i] = Some(UartConfig {
-                bus: *entry,
-                tx_pin: *entry.add(1),
-                rx_pin: *entry.add(2),
-                // byte 3 is reserved
-                baudrate: read_u32(entry.add(4)),
-            });
-            offset += UART_CONFIG_BIN_SIZE;
-        }
-
-        // Parse GPIO configs (5 bytes each):
-        // byte 0: pin, byte 1: flags, byte 2: initial, bytes 3-4: owner_module_id
-        for i in 0..gpio_count {
-            let entry = ptr.add(offset);
-            let pin = *entry;
-            let flags = *entry.add(1);
-            let initial = *entry.add(2);
-            let owner_module_id = read_u16(entry.add(3));
-
-            let direction = if flags & 0x01 != 0 {
-                GpioDirection::Output
-            } else {
-                GpioDirection::Input
-            };
-
-            let pull = match (flags >> 1) & 0x03 {
-                1 => GpioPull::Up,
-                2 => GpioPull::Down,
-                _ => GpioPull::None,
-            };
-
-            let level = if initial != 0 {
-                GpioLevel::High
-            } else {
-                GpioLevel::Low
-            };
-
-            hw.gpio[i] = Some(GpioConfig {
-                pin,
-                direction,
-                pull,
-                initial: level,
-                owner_module_id,
-            });
-            offset += GPIO_CONFIG_BIN_SIZE;
-        }
-
-        // Parse PIO configs (4 bytes each): pio_idx, data_pin, clk_pin, extra_pin
-        for i in 0..pio_count {
-            let entry = ptr.add(offset);
-            hw.pio[i] = Some(PioConfig {
-                pio_idx: *entry,
-                data_pin: *entry.add(1),
-                clk_pin: *entry.add(2),
-                extra_pin: *entry.add(3),
-            });
-            offset += PIO_CONFIG_BIN_SIZE;
-        }
     }
 
-    Some(hw)
-}
+    config.workloads = bc.workloads();
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-#[inline]
-unsafe fn read_u16(ptr: *const u8) -> u16 {
-    u16::from_le_bytes([
-        core::ptr::read_volatile(ptr),
-        core::ptr::read_volatile(ptr.add(1)),
-    ])
-}
-
-#[inline]
-unsafe fn read_u32(ptr: *const u8) -> u32 {
-    u32::from_le_bytes([
-        core::ptr::read_volatile(ptr),
-        core::ptr::read_volatile(ptr.add(1)),
-        core::ptr::read_volatile(ptr.add(2)),
-        core::ptr::read_volatile(ptr.add(3)),
-    ])
-}
-
-/// CRC16-CCITT checksum (matches tools/src/config.rs)
-fn crc16_ccitt(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
-    for &byte in data {
-        crc ^= (byte as u16) << 8;
-        for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc <<= 1;
-            }
-        }
+    // Everything is checked: the envelope and the declared demand are the
+    // pools' live-add reserves and declared asks, installed whole. Absent
+    // sections leave a pool at its derived size plus the profile's default
+    // reserve.
+    resource_ledger::reset_envelope();
+    for e in bc.envelope().iter().flat_map(|p| p.iter()) {
+        resource_ledger::set_reserve(e.pool, e.n);
     }
-    crc
+    for e in bc.demand().iter().flat_map(|p| p.iter()) {
+        resource_ledger::set_declared(e.pool, e.n);
+    }
+
+    CONFIG_PARAMS_BYTES.store(graph.params_bytes(), portable_atomic::Ordering::Relaxed);
+    CONFIG_BLOB_LEN.store(bc.total_len(), portable_atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// The platform's hardware section: a platform that declares one (RP) decodes
+/// and checks it, and refuses a blob without it; every other platform refuses
+/// a blob that carries one.
+fn check_hardware(bc: &BootConfig<'_>) -> Result<(), Refusal> {
+    #[cfg(feature = "rp")]
+    {
+        let hw = bc
+            .hardware()
+            .ok_or(Refusal::Hardware("this platform needs one"))?;
+        crate::platform::planner::decode_hardware(hw)
+            .map(|_| ())
+            .map_err(Refusal::Hardware)
+    }
+    #[cfg(not(feature = "rp"))]
+    {
+        if bc.hardware().is_some() {
+            return Err(Refusal::Hardware("this platform has none"));
+        }
+        Ok(())
+    }
 }

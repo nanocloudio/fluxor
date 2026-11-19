@@ -2,225 +2,34 @@
 //! kernel consumes a validated, bounded binary plan; it parses no orchestrator
 //! objects, OCI manifests or YAML.
 //!
-//! This is the kernel half of the host composer's wire format
-//! (`tools/src/compose.rs::encode_plan`). The two MUST stay in lockstep: same
-//! magic, version, and fixed-width record layout. Decoding is `no_std` and
+//! The plan's format and its one codec are `fluxor_contracts::owner_plan`
+//! (FLXP), which the composer encodes with. Decoding is `no_std` and
 //! allocation-free on every target: a decoded plan is a view over the bytes
-//! it verified, its records read from them when asked, so it holds no record
-//! array of any size. It fails closed on bad magic/version, length overrun,
-//! over-cap count, or digest mismatch.
+//! it verified, its records read from them when asked. The codec fails closed
+//! on bad magic, an unknown, repeated or missing section, a length overrun,
+//! an over-cap count, or a digest mismatch; this module adds the checks that
+//! need the running kernel (slot range, duplicate slot, module-range overlap
+//! and bounds, rollback).
 //!
 //! `apply` installs each owner at its plan-assigned slot/generation and stamps
 //! the owner onto its module range, so provider enforcement and per-owner
 //! accounting hold for a composed multi-workload graph. Every module is the system
 //! owner until a plan is applied.
 
-use crate::kernel::security::crypto::sha256::Sha256;
+use fluxor_contracts::owner_plan as codec;
+pub use fluxor_contracts::owner_plan::{Assignment, Lease, Plan, Revocation};
 
 use crate::kernel::workload::owner::MAX_OWNERS;
 
-/// Plan magic: "FLXP". Matches `tools/src/compose.rs::PLAN_MAGIC`.
-/// `#[doc(hidden)] pub` so the golden-format harness tests can hand-build
-/// plan bytes off the same constant the encoder pins to.
-#[doc(hidden)]
-pub const PLAN_MAGIC: u32 = 0x464C_5850;
-/// On-wire plan format version. `#[doc(hidden)] pub` for the golden-format tests.
-#[doc(hidden)]
-pub const PLAN_VERSION: u16 = 1;
-/// Header: magic(4) + version(2) + reserved(2).
-const PLAN_HEADER_LEN: usize = 8;
-/// Per-assignment record: owner_uid(16)+slot(2)+gen(4)+mod_base(2)+mod_count(2)
-/// +edge_base(2)+edge_count(2).
-const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
-/// Per-revocation record: an assignment record verbatim + grace_secs(2) +
-/// deadline_unix(8). The revocation section is present only when
-/// non-empty.
-const REVOKE_REC_LEN: usize = ASSIGN_REC_LEN + 2 + 8;
-/// Per-lease record: slot(2) + generation(4) + protocol(1) + port(2).
-const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
-/// Opens the lease section: an impossible revocation count, so the first u32
-/// of the tail discriminates sections deterministically (48-byte revocation
-/// and 9-byte lease records collide at 148 tail bytes under count-only
-/// framing). Lives inside the digested body — integrity-protected.
-/// `#[doc(hidden)] pub` for the golden-format tests.
-#[doc(hidden)]
-pub const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
-/// Decoder ceiling for the lease section (bounded-binary rule): the format's
-/// own domain, one grant per `(protocol, port)` a node can lease — tcp and
-/// udp, nonzero ports — the same bound as
-/// `tools/src/compose.rs::MAX_PLAN_LEASES`.
-pub const MAX_PLAN_LEASES: usize = 2 * u16::MAX as usize;
-/// At most one assignment per owner slot: the owner-slot domain. The wire
-/// count is a `u32` and the slot a `u16`; a slot past the live owner table
-/// is refused when the plan is validated.
+/// At most one assignment per owner slot: the owner-slot domain. A slot past
+/// the live owner table is refused when the plan is validated.
 pub const MAX_PLAN_ASSIGNMENTS: usize = MAX_OWNERS;
 
-/// One decoded owner placement.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PlanAssignment {
-    pub owner_uid: [u8; 16],
-    pub slot: u16,
-    pub generation: u32,
-    pub module_base: u16,
-    pub module_count: u16,
-    pub edge_base: u16,
-    pub edge_count: u16,
-    pub state_cap: u32,
-    pub buffer_cap: u32,
-}
-
-/// One decoded revocation: a departing owner's last assignment plus its drain
-/// window.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PlanRevocation {
-    pub assignment: PlanAssignment,
-    pub grace_secs: u16,
-    pub deadline_unix: u64,
-}
-
-/// One granted endpoint lease: owner `(slot, generation)` may bind
-/// `(protocol, port)` — 1 = tcp, 2 = udp.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PlanLease {
-    pub slot: u16,
-    pub generation: u32,
-    pub protocol: u8,
-    pub port: u16,
-}
-
-/// A decoded, digest-verified plan: a view over the bytes it was decoded
-/// from, which it reads its records from.
-#[derive(Clone, Copy)]
-pub struct DecodedPlan<'a> {
-    pub generation: u64,
-    /// The sha256 over the plan's body that its trailer carries, verified at
-    /// decode.
-    pub digest: [u8; 32],
-    body: &'a [u8],
-    count: usize,
-    rev_count: usize,
-    lease_count: usize,
-    /// Where the lease records begin in `body`.
-    lease_base: usize,
-}
-
-impl<'a> DecodedPlan<'a> {
-    /// The assignments, in plan order.
-    pub fn assignments(&self) -> Records<'a, PlanAssignment> {
-        Records::new(
-            &self.body[12..],
-            ASSIGN_REC_LEN,
-            self.count,
-            read_assignment,
-        )
-    }
-
-    /// The revocations, in plan order (usually none).
-    pub fn revocations(&self) -> Records<'a, PlanRevocation> {
-        let base = 12 + self.count * ASSIGN_REC_LEN + 4;
-        let bytes = if self.rev_count == 0 {
-            &[][..]
-        } else {
-            &self.body[base..]
-        };
-        Records::new(bytes, REVOKE_REC_LEN, self.rev_count, read_revocation)
-    }
-
-    /// The lease grants, none when the plan grants no endpoints.
-    pub fn leases(&self) -> Records<'a, PlanLease> {
-        let bytes = if self.lease_count == 0 {
-            &[][..]
-        } else {
-            &self.body[self.lease_base..]
-        };
-        Records::new(bytes, LEASE_REC_LEN, self.lease_count, read_lease)
-    }
-}
-
-/// A plan's records of one kind, read from its verified bytes in order.
-#[derive(Clone)]
-pub struct Records<'a, T> {
-    bytes: &'a [u8],
-    stride: usize,
-    next: usize,
-    end: usize,
-    read: fn(&[u8]) -> T,
-}
-
-impl<'a, T> Records<'a, T> {
-    fn new(bytes: &'a [u8], stride: usize, count: usize, read: fn(&[u8]) -> T) -> Self {
-        Self {
-            bytes,
-            stride,
-            next: 0,
-            end: count,
-            read,
-        }
-    }
-}
-
-impl<T> Iterator for Records<'_, T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<T> {
-        if self.next == self.end {
-            return None;
-        }
-        let at = self.next * self.stride;
-        self.next += 1;
-        Some((self.read)(&self.bytes[at..at + self.stride]))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.end - self.next;
-        (n, Some(n))
-    }
-}
-
-impl<T> ExactSizeIterator for Records<'_, T> {}
-
-fn read_assignment(r: &[u8]) -> PlanAssignment {
-    let mut owner_uid = [0u8; 16];
-    owner_uid.copy_from_slice(&r[0..16]);
-    PlanAssignment {
-        owner_uid,
-        slot: be_u16(&r[16..18]),
-        generation: be_u32(&r[18..22]),
-        module_base: be_u16(&r[22..24]),
-        module_count: be_u16(&r[24..26]),
-        edge_base: be_u16(&r[26..28]),
-        edge_count: be_u16(&r[28..30]),
-        state_cap: be_u32(&r[30..34]),
-        buffer_cap: be_u32(&r[34..38]),
-    }
-}
-
-fn read_revocation(r: &[u8]) -> PlanRevocation {
-    PlanRevocation {
-        assignment: read_assignment(&r[..ASSIGN_REC_LEN]),
-        grace_secs: be_u16(&r[ASSIGN_REC_LEN..ASSIGN_REC_LEN + 2]),
-        deadline_unix: be_u64(&r[ASSIGN_REC_LEN + 2..ASSIGN_REC_LEN + 10]),
-    }
-}
-
-fn read_lease(r: &[u8]) -> PlanLease {
-    PlanLease {
-        slot: be_u16(&r[0..2]),
-        generation: be_u32(&r[2..6]),
-        protocol: r[6],
-        port: be_u16(&r[7..9]),
-    }
-}
-
-/// Why decoding a binary plan failed.
+/// Why a staged plan was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanError {
-    BadMagic,
-    BadVersion,
-    Truncated,
-    TooManyAssignments,
-    DigestMismatch,
-    TrailingBytes,
+    /// The codec refused the bytes (framing, limits, digest).
+    Codec(codec::PlanError),
     /// A slot is the system slot (0) or beyond the owner table.
     SlotOutOfRange,
     /// Two assignments claim the same owner slot.
@@ -233,111 +42,35 @@ pub enum PlanError {
     GenerationRollback,
 }
 
-fn be_u16(b: &[u8]) -> u16 {
-    u16::from_be_bytes([b[0], b[1]])
+impl core::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Codec(e) => f.write_str(e.kind()),
+            Self::SlotOutOfRange => write!(f, "slot is the system slot or past the owner table"),
+            Self::DuplicateSlot => write!(f, "two assignments claim one slot"),
+            Self::OverlappingModules => write!(f, "two assignments' module ranges overlap"),
+            Self::ModuleRangeOutOfRange => write!(f, "module range past the module table"),
+            Self::GenerationRollback => write!(f, "generation older than the last applied plan"),
+        }
+    }
 }
-fn be_u32(b: &[u8]) -> u32 {
-    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-}
-fn be_u64(b: &[u8]) -> u64 {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&b[0..8]);
-    u64::from_be_bytes(a)
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use crate::kernel::security::crypto::sha256::Sha256;
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
 }
 
 /// Decode and verify a bounded binary plan. Fails closed on any inconsistency.
-pub fn decode(bytes: &[u8]) -> Result<DecodedPlan<'_>, PlanError> {
-    if bytes.len() < PLAN_HEADER_LEN + 12 + 32 {
-        return Err(PlanError::Truncated);
-    }
-    if be_u32(&bytes[0..4]) != PLAN_MAGIC {
-        return Err(PlanError::BadMagic);
-    }
-    if be_u16(&bytes[4..6]) != PLAN_VERSION {
-        return Err(PlanError::BadVersion);
-    }
-    let body = &bytes[PLAN_HEADER_LEN..];
-    let generation = be_u64(&body[0..8]);
-    let count = be_u32(&body[8..12]) as usize;
-    if count > MAX_PLAN_ASSIGNMENTS {
-        return Err(PlanError::TooManyAssignments);
-    }
-    let assign_len = 12 + count * ASSIGN_REC_LEN;
-    let base_total = PLAN_HEADER_LEN + assign_len + 32;
-    if bytes.len() < base_total {
-        return Err(PlanError::Truncated);
-    }
-    // Tail grammar: [rev_section] [lease_section], fixed order, each omitted
-    // when empty. The first u32 of the surplus discriminates:
-    // LEASE_SECTION_MARKER opens a lease section; a valid count opens the
-    // revocation section. Lengths validate, never discriminate.
-    let mut tail_cursor = assign_len;
-    let tail_end = bytes.len() - PLAN_HEADER_LEN - 32;
-    let mut rev_count = 0usize;
-    let mut lease_count = 0usize;
-    if tail_cursor < tail_end {
-        if tail_cursor + 4 > tail_end {
-            return Err(PlanError::TrailingBytes);
-        }
-        let first = be_u32(&body[tail_cursor..tail_cursor + 4]);
-        if first != LEASE_SECTION_MARKER {
-            let rc = first as usize;
-            if rc == 0 || rc > MAX_PLAN_ASSIGNMENTS {
-                return Err(PlanError::TrailingBytes);
-            }
-            rev_count = rc;
-            tail_cursor += 4 + rev_count * REVOKE_REC_LEN;
-            if tail_cursor > tail_end {
-                return Err(PlanError::Truncated);
-            }
-        }
-    }
-    if tail_cursor < tail_end {
-        if tail_cursor + 8 > tail_end {
-            return Err(PlanError::TrailingBytes);
-        }
-        if be_u32(&body[tail_cursor..tail_cursor + 4]) != LEASE_SECTION_MARKER {
-            return Err(PlanError::TrailingBytes);
-        }
-        // Count 0 is valid — a plan that grants no endpoints; only an over-cap
-        // count is rejected.
-        let lc = be_u32(&body[tail_cursor + 4..tail_cursor + 8]) as usize;
-        if lc > MAX_PLAN_LEASES {
-            return Err(PlanError::TrailingBytes);
-        }
-        lease_count = lc;
-        tail_cursor += 8 + lease_count * LEASE_REC_LEN;
-    }
-    let body_len = tail_cursor;
-    let expected_total = PLAN_HEADER_LEN + body_len + 32;
-    if bytes.len() < expected_total {
-        return Err(PlanError::Truncated);
-    }
-    if bytes.len() > expected_total {
-        return Err(PlanError::TrailingBytes);
-    }
-    // Verify the digest over the body before trusting any field.
-    let mut hasher = Sha256::new();
-    hasher.update(&body[..body_len]);
-    let computed = hasher.finalize();
-    if computed.as_slice() != &bytes[PLAN_HEADER_LEN + body_len..] {
-        return Err(PlanError::DigestMismatch);
-    }
-    let plan = DecodedPlan {
-        generation,
-        digest: [0; 32],
-        body: &body[..body_len],
-        count,
-        rev_count,
-        lease_count,
-        lease_base: assign_len
-            + if rev_count > 0 {
-                4 + rev_count * REVOKE_REC_LEN
-            } else {
-                0
-            }
-            + 8, // marker + count
-    };
+///
+/// # Errors
+/// The codec's refusal, or the first assignment that does not fit the
+/// running owner and module tables.
+pub fn decode(bytes: &[u8]) -> Result<Plan<'_>, PlanError> {
+    let plan = codec::decode(bytes, MAX_PLAN_ASSIGNMENTS, sha256).map_err(PlanError::Codec)?;
     // Semantic validation: framing + digest prove the bytes are intact, not
     // that the plan is coherent. The kernel does not trust the composer's
     // promise of unique slots / non-overlapping ranges — a corrupt or hostile
@@ -346,17 +79,11 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan<'_>, PlanError> {
     // isolation). Validate assignments AND revocations under one rule set: a
     // draining owner still occupies its slot and module range, so revocations
     // participate in the same duplicate/overlap checks.
-    let record = |i: usize| -> PlanAssignment {
-        if i < count {
-            read_assignment(&body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN])
-        } else {
-            let base = assign_len + 4 + (i - count) * REVOKE_REC_LEN;
-            read_assignment(&body[base..base + ASSIGN_REC_LEN])
-        }
+    let records = || {
+        plan.assignments()
+            .chain(plan.revocations().map(|r| r.assignment))
     };
-    let total = count + rev_count;
-    for i in 0..total {
-        let a = record(i);
+    for (i, a) in records().enumerate() {
         // Slot 0 is the system owner (reserved); slot must be a real workload
         // slot within the owner table.
         if a.slot == 0 || a.slot as usize >= crate::kernel::exec::scheduler::owners().slot_count() {
@@ -367,16 +94,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan<'_>, PlanError> {
         if a_end > crate::kernel::exec::scheduler::module_slots() {
             return Err(PlanError::ModuleRangeOutOfRange);
         }
-        for j in 0..i {
-            let a_prev = record(j);
-            if a.slot == a_prev.slot {
+        for prev in records().take(i) {
+            if a.slot == prev.slot {
                 return Err(PlanError::DuplicateSlot);
             }
             // Overlapping module ranges → two owners would claim the same module.
-            let p_base = a_prev.module_base as usize;
-            let p_end = p_base + a_prev.module_count as usize;
+            let p_base = prev.module_base as usize;
+            let p_end = p_base + prev.module_count as usize;
             if a.module_count > 0
-                && a_prev.module_count > 0
+                && prev.module_count > 0
                 && (a.module_base as usize) < p_end
                 && p_base < a_end
             {
@@ -384,15 +110,13 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan<'_>, PlanError> {
             }
         }
     }
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&bytes[PLAN_HEADER_LEN + body_len..]);
-    Ok(DecodedPlan { digest, ..plan })
+    Ok(plan)
 }
 
 /// Apply a decoded plan to the running owner table: install each owner at its
 /// plan-assigned slot/generation and stamp the owner onto its module range.
 /// Returns the number of owners installed.
-pub fn apply(plan: &DecodedPlan<'_>) -> usize {
+pub fn apply(plan: &Plan<'_>) -> usize {
     let table = crate::kernel::exec::scheduler::owners_mut();
     // The plan is authoritative for residency: revoke owners not re-installed
     // below so a removed workload's slot fails closed (generations preserved).
@@ -444,7 +168,7 @@ static mut LAST_APPLIED_DIGEST: [u8; 32] = [0; 32];
 /// `prepare_graph`, resetting every module to the system owner) can RE-apply it
 /// without a fresh staged blob. `None` until the first plan is applied. A view
 /// over the staged bytes, which live for the run ([`set_staged_plan`]).
-static mut RETAINED_PLAN: Option<DecodedPlan<'static>> = None;
+static mut RETAINED_PLAN: Option<Plan<'static>> = None;
 
 /// Generation of the last successfully-applied plan (0 = none yet). Lets the
 /// platform's owner-status writer stamp which plan generation the live state
@@ -506,7 +230,7 @@ fn take_staged_plan() -> Option<(*const u8, usize)> {
 /// owners that were mid-drain when the previous process died — they are
 /// absent from the assignment section, so nothing re-instantiates them; the
 /// record is the only trace.
-pub fn retained_revocations(mut f: impl FnMut(PlanRevocation)) {
+pub fn retained_revocations(mut f: impl FnMut(Revocation)) {
     let retained = &raw const RETAINED_PLAN;
     // SAFETY: scheduler-thread read.
     if let Some(plan) = unsafe { &*retained } {
@@ -665,7 +389,7 @@ pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
 /// never-installed owner is a no-op; `begin_drain` is idempotent for an
 /// already-Draining owner, and the platform re-arms with the record's original
 /// deadline, so a replayed record never resets the clock.
-fn arm_revocations(plan: &DecodedPlan<'_>, mut arm: impl FnMut(DrainArm)) -> usize {
+fn arm_revocations(plan: &Plan<'_>, mut arm: impl FnMut(DrainArm)) -> usize {
     let table = crate::kernel::exec::scheduler::owners_mut();
     let mut armed = 0;
     for rev in plan.revocations() {
@@ -746,7 +470,7 @@ pub fn apply_staged() -> Result<usize, PlanError> {
     // bytes live for the run.
     let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr, len) };
     let plan = decode(bytes).inspect_err(|e| {
-        log::error!("[owner] staged plan invalid: {e:?}");
+        log::error!("[owner] staged plan invalid: {e}");
     })?;
     // Reject a rollback to an older plan generation. Re-applying the SAME
     // generation is allowed (idempotent rebuild); only a strictly-older plan is

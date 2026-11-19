@@ -959,7 +959,7 @@ pub struct PortSpec {
     pub accepts_record: u32,
     /// This input's module keeps its own copy of what it sends back to the
     /// provider until the provider reports it acknowledged (`retains_send`):
-    /// the composer marks the edge (graph edge byte 9 bit 1) and the
+    /// the composer marks the edge (the edge record's `retains_send` flag) and the
     /// provider reads it through `channel::FACTS`. Input ports only.
     pub retains_send: bool,
     /// This input's module opens no stream through the provider on the
@@ -1863,12 +1863,11 @@ pub struct Manifest {
     /// `channel_read`/`channel_write`, bounded execution within the
     /// declared `isr_budget_cycles`. The author owns this claim; the
     /// tool does not statically verify it. The flag is mandatory for
-    /// admission into a Tier 1b (`domain_exec_mode == 2`) or Tier 2
-    /// (`domain_exec_mode == 4`) domain — modules without it are
+    /// admission into a `timer` or `irq` domain — modules without it are
     /// rejected at build time. The runtime backstop is the EACCES check
-    /// the scheduler applies to every syscall an ISR-tier module is
+    /// the scheduler applies to every syscall an interrupt-mode module is
     /// barred from making.
-    pub isr_safe: bool,
+    pub interrupt_safe: bool,
     /// Module attests that it can resume after an arbitrary fault, and is
     /// therefore eligible for `fault_policy: restart`. That policy releases
     /// every provider handle the module owned, flushes every connected
@@ -1889,17 +1888,15 @@ pub struct Manifest {
     /// TOML-only, never serialized to the binary manifest: the policy it
     /// gates is itself a compose-time choice.
     pub resume_after_fault: bool,
-    /// Module opts into the **Tier 1c pre-pass drain slot**. Pre-tick
-    /// modules run cooperatively at the *start* of every scheduler
-    /// pass for their domain, before the regular `domain_exec_order`
-    /// rotation. Use for latency-critical drains that need to run
-    /// every tick regardless of `exec_order` position (canonical
-    /// case: NIC RX/TX). The module retains the full cooperative API
-    /// (heap + `provider_call` + `channel_read`/`write`); the only
-    /// new contract is a shared combined cycle budget across all
-    /// pre-tick modules in a domain (kernel default
-    /// `MAX_PRE_TICK_BUDGET_US = 5`).
-    pub pre_tick_drain: bool,
+    /// Module runs in its domain's **pre-pass**: cooperatively, at the
+    /// *start* of every scheduler pass, before the regular
+    /// `domain_exec_order` rotation. Use for latency-critical drains that
+    /// need to run every tick regardless of `exec_order` position
+    /// (canonical case: NIC RX/TX). The module retains the full
+    /// cooperative API (heap + `provider_call` + `channel_read`/`write`);
+    /// the only new contract is a shared combined cycle budget across all
+    /// pre-pass modules in a domain. Legal only in a `tick` domain.
+    pub pre_pass: bool,
     /// Hardware-feature requirements declared by the module.
     /// Validated against the resolved target's silicon capability
     /// matrix at config time by `check_target_capabilities`. Default
@@ -1980,9 +1977,9 @@ impl Default for Manifest {
             demand_from_params: Vec::new(),
             heap_per_demand: None,
             heap_per_param: None,
-            isr_safe: false,
+            interrupt_safe: false,
             resume_after_fault: false,
-            pre_tick_drain: false,
+            pre_pass: false,
             requires: TomlRequires::default(),
             requires_when: Vec::new(),
             wasm_opt_level: None,
@@ -2226,7 +2223,7 @@ fn validate_instruments(obs: &Observability) -> Result<()> {
 /// — the IRQ-context entry point a Tier 2 (IRQ-owned) module must
 /// provide. Returns `Ok(())` if any `.rs` file under `src_root` defines
 /// the symbol with an exportable signature, `Err` otherwise. Used by the
-/// Tier 2 admission validator so a module placed in an `isr_owned`
+/// Tier 2 admission validator so a module placed in an `exec: irq`
 /// domain that forgot to export `module_isr_entry` fails the graph build
 /// rather than failing registration on the rig.
 ///
@@ -2643,6 +2640,16 @@ impl Manifest {
     pub fn from_toml_str_for_target(content: &str, abi: Option<&str>) -> Result<Self> {
         let toml_val: TomlManifest = toml::from_str(content)
             .map_err(|e| Error::Module(format!("invalid manifest TOML: {e}")))?;
+        if toml_val.isr_safe.is_some() {
+            return Err(Error::Module(
+                "unknown manifest key `isr_safe`; the attestation is `interrupt_safe`".into(),
+            ));
+        }
+        if toml_val.pre_tick_drain.is_some() {
+            return Err(Error::Module(
+                "unknown manifest key `pre_tick_drain`; the attestation is `pre_pass`".into(),
+            ));
+        }
 
         let (major, minor, patch) = parse_semver(&toml_val.version)?;
         let module_version = encode_semver(major, minor, patch);
@@ -3478,9 +3485,9 @@ impl Manifest {
             demand_from_params,
             heap_per_demand,
             heap_per_param,
-            isr_safe: toml_val.isr_safe,
+            interrupt_safe: toml_val.interrupt_safe,
             resume_after_fault: toml_val.resume_after_fault,
-            pre_tick_drain: toml_val.pre_tick_drain,
+            pre_pass: toml_val.pre_pass,
             requires: toml_val.requires,
             requires_when,
             wasm_opt_level,
@@ -3570,18 +3577,18 @@ impl Manifest {
         buf.extend_from_slice(&self.module_version.to_le_bytes());
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
         // byte 12 (`MANIFEST_FLAGS_AT`): bit 0 = has_integrity, bit 1 = has_signature,
-        //          bit 2 = isr_safe (author attestation; the
+        //          bit 2 = interrupt_safe (author attestation; the
         //                  **build-time** `validate_isr_tier_admission`
         //                  in `tools/src/config/builder.rs` is the gate
-        //                  for this flag, for Tier 1b and Tier 2 alike
-        //                  (Tier 2 additionally requires an `irq:` field
+        //                  for this flag, for `timer` and `irq` alike
+        //                  (`irq` additionally requires an `irq:` field
         //                  + a `module_isr_entry` export — see
         //                  `check_module_exports_isr_entry` and the
         //                  loader's `isr_entry_fn`). The kernel does not
         //                  read the bit: its runtime gate is the EACCES
         //                  check on every gated syscall
         //                  (`scheduler::deny_isr_tier_syscall`).
-        //          bit 3 = pre_tick_drain (Tier 1c opt-in). The
+        //          bit 3 = pre_pass (pre-pass opt-in). The
         //                  build carries it into the module's config
         //                  entry, which `prepare_graph` reads to
         //                  populate `domain_pre_tick_order` and exclude
@@ -3590,8 +3597,8 @@ impl Manifest {
         //          bit 5 = port-capacity block present.
         let flags = (if has_integrity { 1 } else { 0 })
             | (if has_signature { 2 } else { 0 })
-            | (if self.isr_safe { 4 } else { 0 })
-            | (if self.pre_tick_drain { 8 } else { 0 })
+            | (if self.interrupt_safe { 4 } else { 0 })
+            | (if self.pre_pass { 8 } else { 0 })
             | (if has_abi_surface { 0x10 } else { 0 })
             | (if has_port_capacity { 0x20 } else { 0 })
             | (if cond_block.is_empty() {
@@ -3729,8 +3736,8 @@ impl Manifest {
             u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
         let has_integrity = (flags & 0x01) != 0;
         let has_signature = (flags & 0x02) != 0;
-        let isr_safe = (flags & 0x04) != 0;
-        let pre_tick_drain = (flags & 0x08) != 0;
+        let interrupt_safe = (flags & 0x04) != 0;
+        let pre_pass = (flags & 0x08) != 0;
         let has_abi_surface = (flags & 0x10) != 0;
         let has_port_capacity = (flags & 0x20) != 0;
 
@@ -3939,11 +3946,11 @@ impl Manifest {
             demand_from_params: Vec::new(),
             heap_per_demand: None,
             heap_per_param: None,
-            isr_safe,
+            interrupt_safe,
             // Author attestation, TOML-only: a binary-loaded manifest makes
             // no claim, so `fault_policy: restart` is refused (fail-closed).
             resume_after_fault: false,
-            pre_tick_drain,
+            pre_pass,
             // `requires` is a TOML-only field — modules carry their
             // binary manifest stripped of the requires block (it's a
             // build-time concern, not a runtime one). Round-tripping
@@ -4176,19 +4183,23 @@ struct TomlManifest {
     /// resolved for the silicon being loaded.
     capability_facts:
         Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, toml::Value>>>,
-    /// Author attests ISR-safety. Required for Tier 1b/2 admission.
-    /// See `Manifest::isr_safe` for the contract.
+    /// Author attests interrupt-safety. Required for `timer`/`irq`
+    /// admission. See `Manifest::interrupt_safe` for the contract.
     #[serde(default)]
-    isr_safe: bool,
+    interrupt_safe: bool,
     /// Author attests the module can resume after an arbitrary fault.
     /// Required for `fault_policy: restart`. See
     /// `Manifest::resume_after_fault` for the contract.
     #[serde(default)]
     resume_after_fault: bool,
-    /// Author opts the module into the Tier 1c pre-pass drain slot.
-    /// See `Manifest::pre_tick_drain` for the contract.
+    /// Author opts the module into its domain's pre-pass.
+    /// See `Manifest::pre_pass` for the contract.
     #[serde(default)]
-    pre_tick_drain: bool,
+    pre_pass: bool,
+    /// Superseded keys, refused by name so a manifest that still spells
+    /// them fails instead of silently dropping the attestation.
+    isr_safe: Option<toml::Value>,
+    pre_tick_drain: Option<toml::Value>,
     /// Hardware-feature requirements. Validated at config time
     /// against the resolved target's capability matrix. A module that
     /// declares `requires.fpu = true` is rejected from a target without

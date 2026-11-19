@@ -58,7 +58,8 @@ use core::ffi::c_void;
 use abi::contracts::storage::graph_slot::channel::{
     FRAME_HDR, REQ_ACTIVATE, REQ_ERASE, REQ_WRITE, RESP_FRAME_LEN, RESP_PAYLOAD, RESP_RESULT,
 };
-use abi::platform::rp::flash_layout::{GraphFlash, GRAPH_FLASH_LEN, GRAPH_SLOT_MAGIC};
+use abi::platform::rp::flash_layout::{GraphFlash, GRAPH_FLASH_LEN};
+use abi::wire::graph_image;
 use abi::SyscallTable;
 use fluxor_abi as abi;
 
@@ -70,7 +71,7 @@ use fluxor_rt::*;
 
 const PAGE_SIZE: usize = 256;
 /// A graph image's first four bytes, "FXSL".
-const MAGIC: [u8; 4] = GRAPH_SLOT_MAGIC.to_le_bytes();
+const MAGIC: [u8; 4] = graph_image::MAGIC.to_le_bytes();
 
 // Extra port indices (primary in/out are index 0).
 const PORT_IN_GS_RESP: u32 = 1; // graph_slot response channel
@@ -133,17 +134,13 @@ struct State {
 // Helpers
 // ============================================================================
 
-/// Where an image ends, from its header page: the further of its two
-/// regions, rounded up to a whole page. `None` for a header that names no
-/// region past itself, or one longer than this board's slot.
+/// Where an image ends, from its header page: its payload's end, rounded up
+/// to a whole page. `None` for a header the codec refuses for a slot of
+/// this board's size (`wire::graph_image::Header::decode`).
 fn declared_end(header: &[u8; PAGE_SIZE], slot_size: u32) -> Option<u32> {
-    let word = |at: usize| {
-        u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]) as u64
-    };
-    let modules_end = word(16) + word(20);
-    let config_end = word(24) + word(28);
-    let end = modules_end.max(config_end).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
-    if end <= PAGE_SIZE as u64 || end > slot_size as u64 {
+    let h = graph_image::Header::decode(header, u64::from(slot_size)).ok()?;
+    let end = h.end().div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+    if end > u64::from(slot_size) {
         return None;
     }
     Some(end as u32)

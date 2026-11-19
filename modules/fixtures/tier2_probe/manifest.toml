@@ -1,15 +1,15 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
 
-# Tier-2 (IRQ-owned) validation probe. `isr_safe` attests the step/ISR body
+# IRQ-owned validation probe. `interrupt_safe` attests the step/ISR body
 # never calls a forbidden syscall from interrupt context — no heap
 # allocation, no provider_call, no channel_read/channel_write, and
-# bounded execution. Required for admission to a `tier: 2` domain; the
+# bounded execution. Required for admission to an `exec: irq` domain; the
 # author owns the claim and the runtime backstops it by returning EACCES
 # on any barred syscall.
 # `module_isr_entry` (exported in mod.rs) is what the IRQ dispatches into; the
 # packer sets the isr_module header bit when it sees that symbol.
-isr_safe = true
+interrupt_safe = true
 
 # Cadence-independent: it does no tick-based timekeeping. Lets it sit on an
 # adaptive (mechanism-(b)) domain too if desired — an absent declaration is
@@ -24,4 +24,4 @@ buffer_size = 16
 
 # Module-scope observability — exempt.
 [observability]
-exempt = "Tier-2 IRQ probe — counts module_isr_entry dispatches, emits no sustained byte stream"
+exempt = "IRQ probe — counts module_isr_entry dispatches, emits no sustained byte stream"

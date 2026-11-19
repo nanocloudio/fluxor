@@ -779,15 +779,15 @@ pub(crate) fn step_one_module(
         return;
     }
 
-    // Skip ISR-tier modules. Tier 1b (`exec_mode == 2`) and Tier 2
-    // (`exec_mode == 4`) modules run from a timer-ISR or hardware IRQ
+    // Skip interrupt-mode modules. `timer` and `irq` domain modules
+    // run from a timer-ISR or hardware IRQ
     // handler — not from the cooperative `step_modules` loop. Stepping
     // them here would double-execute their work (once cooperatively
     // and once from the ISR) and would also break the ISR-only
     // assumption that no `provider_call`/heap-allocation is on the
     // call stack at module entry. The build-time validator in
     // `tools/src/config.rs::validate_isr_tier_admission` already
-    // rejects ISR-tier modules without the `isr_safe` flag; the
+    // rejects interrupt-mode modules without the `interrupt_safe` flag; the
     // runtime skip here is defense in depth for hand-rolled binaries.
     let domain = sched.domain_id[module_idx] as usize;
     if domain < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[domain]) {

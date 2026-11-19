@@ -5,6 +5,5 @@ pub mod channel;
 pub mod event;
 pub mod handle;
 pub mod lend;
-pub mod ring_size;
 pub mod ringbuf;
 pub mod timer;

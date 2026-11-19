@@ -234,33 +234,20 @@ pub fn finalize_resident_graphs() {
     rebuild_resident_graph_index();
 }
 
-/// Boot path: admit every resident workload declared in the config's `[FXPD]`
-/// post-body section (the `combine <two-graph.yaml>` / `workloads:` mechanism)
-/// as a workload owner via `apply_add`, then finalize the domain dispatch
-/// tables. Call ONCE after `prepare_graph` + instantiation and BEFORE the
-/// per-domain run loops start (same constraint as `finalize_resident_graphs`).
-/// No-op when there is no workload section (single-graph config,
-/// byte-identical boot).
+/// Boot path: admit every resident workload the config declares (its `WKLD`
+/// section: the `combine <two-graph.yaml>` / `workloads:` mechanism) as a
+/// workload owner via `apply_add`, then finalize the domain dispatch tables.
+/// Call ONCE after `prepare_graph` + instantiation and BEFORE the per-domain
+/// run loops start (same constraint as `finalize_resident_graphs`). No-op
+/// when the config declares no workloads.
 pub fn admit_resident_workloads_from_config() {
     // SAFETY: boot context — single-threaded, sole reader of STATIC_CONFIG.
     let cfg = unsafe { static_config() };
-    let ptr = cfg.resident_workload_section;
-    let len = cfg.resident_workload_section_len;
-    // Header: magic(4)+section_len(4)+crc16(2)+count(2) = 12 bytes. The whole
-    // section's length+CRC were already validated in `read_config_from_slice`
-    // (it only records the section when bounds AND CRC pass), so by here the
-    // bytes are integral; the per-workload bounds below are belt-and-braces.
-    if ptr.is_null() || len < 12 {
+    // The config parser admitted the blob whole: the section is checksummed
+    // and every record bounded by the codec.
+    let Some(workloads) = cfg.workloads() else {
         return;
-    }
-    // SAFETY: `read_config_from_slice` validated `ptr`/`len` lie within the
-    // mapped config blob, `len <= MAX_WORKLOAD_SECTION_BYTES`, and the CRC matched.
-    let section = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let magic = u32::from_le_bytes([section[0], section[1], section[2], section[3]]);
-    if magic != crate::kernel::boot::config::WORKLOAD_SECTION_MAGIC {
-        return;
-    }
-    let count = u16::from_le_bytes([section[10], section[11]]) as usize;
+    };
     // Each workload's blob is applied where it lies in the config image:
     // the add borrows the blob's params in place, as the base graph's
     // modules borrow theirs, and the image stays mapped for the kernel's
@@ -276,36 +263,16 @@ pub fn admit_resident_workloads_from_config() {
     let mut admitted_slots = [0u64; SLOT_WORDS];
     let mut admitted = 0usize;
     let mut failed = false;
-    let mut off = 12usize;
-    for _ in 0..count {
-        // Per-workload frame: blob_len(4) + flags(1) + blob. flags bit0 = idle-safe
-        // attestation (the operator/tooling asserts the workload is demand-driven).
-        if off + 5 > len {
-            log::error!("[multigraph] workload section truncated mid-frame; rolling back");
+    for workload in workloads.iter() {
+        if workload.blob.is_empty() {
+            log::error!("[multigraph] resident workload with an empty blob; rolling back");
             failed = true;
             break;
         }
-        let blob_len = u32::from_le_bytes([
-            section[off],
-            section[off + 1],
-            section[off + 2],
-            section[off + 3],
-        ]) as usize;
-        off += 4;
-        let workload_flags = section[off];
-        off += 1;
-        let workload_idle_safe = (workload_flags & 0x01) != 0;
-        if blob_len == 0 || off + blob_len > len {
-            log::error!("[multigraph] workload blob len {blob_len} out of range; rolling back");
-            failed = true;
-            break;
-        }
-        let blob = &section[off..off + blob_len];
-        off += blob_len;
-        // SAFETY: `blob` lies in the config image, which stays mapped and
-        // unchanged for the kernel's life; `apply_add_borrowed` validates
-        // the FLXA blob structure and bounds.
-        match unsafe { live::apply_add_borrowed(blob) } {
+        // SAFETY: `workload.blob` lies in the config image, which stays
+        // mapped and unchanged for the kernel's life; `apply_add_borrowed`
+        // validates the FLXA blob structure and bounds.
+        match unsafe { live::apply_add_borrowed(workload.blob) } {
             Ok(handle) => {
                 let slot = handle.slot as usize;
                 admitted_slots[slot / 64] |= 1 << (slot % 64);
@@ -314,7 +281,7 @@ pub fn admit_resident_workloads_from_config() {
                 // modules before finalize, which rebuilds each graph's
                 // `idle_safe` from them. Unattested workloads stay
                 // fail-closed (backstop cadence).
-                set_owner_idle_safe(handle, workload_idle_safe);
+                set_owner_idle_safe(handle, workload.idle_safe);
             }
             Err(rc) => {
                 log::error!("[multigraph] resident workload admit failed rc={rc}; rolling back");
@@ -1089,39 +1056,22 @@ pub fn step_resident_graphs_domain(modules: &mut [ModuleSlot], domain: usize) ->
     (result, pacer_next_deadline_us(domain))
 }
 
-/// Domain execution-mode wire byte values.
-///
-/// These bytes appear in the config blob's domain-metadata section
-/// (`tools/src/config.rs` writes them via `parse_domain_tier_to_exec_mode`)
-/// and are read back by `prepare_graph` into `SCHED.domain_exec_mode`.
-/// **Values are wire-stable** — older `.cfg.bin` blobs read by newer
-/// kernels (and vice versa) must agree on the byte-to-tier mapping.
-/// The mapping is asymmetric (Tier 1b → 2, Tier 2 → 4) because Tier
-/// 1a/3 were allocated first; reshuffling would break already-built
-/// configs.
+/// Domain execution-mode bytes: the boot-config domain record's
+/// `exec_mode` (`fluxor_contracts::boot_config::ExecMode`), read by
+/// `prepare_graph` into `SCHED.domain_exec_mode`.
 pub mod exec_mode {
-    /// Tier 0 — cooperative, main scheduler loop.
-    pub const COOPERATIVE: u8 = 0;
-    /// Tier 1a — high-rate periodic cooperative (sub-ms tick).
-    pub const TIER_1A: u8 = 1;
-    /// Tier 1b — shared timer-ISR. ISR-tier (requires `isr_safe` + bridge).
-    pub const TIER_1B: u8 = 2;
-    /// Tier 3 — poll-mode, continuous stepping with WFE on idle.
-    pub const TIER_3: u8 = 3;
-    /// Tier 2 — IRQ-owned. ISR-tier (requires `isr_safe` + bridge).
-    pub const TIER_2: u8 = 4;
-    /// Tier 1c — pre-pass cooperative drain. Per-module flag, *not* a
-    /// per-domain exec_mode: a Tier 1c module sits inside a Tier 0
-    /// or Tier 1a domain and runs at the start of every scheduler
-    /// pass before any `domain_exec_order` modules. The byte value
-    /// here is reserved for telemetry/logging only — the kernel reads
-    /// the bit per-module from `ModuleEntry::pre_tick_drain`, not from
-    /// the domain's exec_mode.
-    pub const TIER_1C: u8 = 5;
+    use fluxor_contracts::boot_config::ExecMode;
+    /// Cooperative, one pass per tick.
+    pub const TICK: u8 = ExecMode::Tick as u8;
+    /// Cooperative, passes back to back, waiting for an event when idle.
+    pub const POLL: u8 = ExecMode::Poll as u8;
+    /// Stepped at the domain's fixed cadence under the interrupt contract.
+    pub const TIMER: u8 = ExecMode::Timer as u8;
+    /// Each module's entry runs from its own interrupt.
+    pub const IRQ: u8 = ExecMode::Irq as u8;
 }
 
-/// Return the execution mode for a domain. See [`exec_mode`] for the
-/// stable byte→tier mapping.
+/// Return the execution mode byte for a domain (see [`exec_mode`]).
 pub fn domain_exec_mode(domain_id: usize) -> u8 {
     if domain_id < MAX_DOMAINS {
         // SAFETY: scheduler-thread-only read; domain_id bounded.
@@ -1131,14 +1081,12 @@ pub fn domain_exec_mode(domain_id: usize) -> u8 {
     }
 }
 
-/// `true` if `exec_mode` denotes an ISR-tier domain (Tier 1b or
-/// Tier 2). Cooperative tiers (0, 1a, 3) do not require bridge-only
-/// channels or the `isr_safe` attestation. The byte values come from
-/// [`exec_mode`]; checked here against the named constants so a
-/// future reshuffle has to update both sides together.
+/// `true` if `mode` is an interrupt mode (`TIMER` or `IRQ`). The
+/// cooperative modes (`TICK`, `POLL`) do not require bridge-only
+/// channels or the `interrupt_safe` attestation.
 #[inline]
 pub fn is_isr_tier_exec_mode(mode: u8) -> bool {
-    mode == exec_mode::TIER_1B || mode == exec_mode::TIER_2
+    mode == exec_mode::TIMER || mode == exec_mode::IRQ
 }
 
 /// `true` if `module_idx`'s assigned domain is an ISR-tier

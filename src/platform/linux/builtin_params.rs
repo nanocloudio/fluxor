@@ -20,7 +20,7 @@ use crate::kernel::exec::scheduler;
 /// for each entry. No-op on a blob that lacks the magic+version
 /// header (treated as "no params for this module").
 pub fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], f: F) {
-    crate::kernel::sys::params_tlv::walk_declared(blob, f);
+    fluxor_contracts::params_tlv::walk_declared(blob, f);
 }
 
 /// Read a u32 TLV value (zero-extends shorter lengths so an upstream

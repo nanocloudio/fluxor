@@ -439,30 +439,30 @@ mod scheduler_validation_tests {
 
     #[test]
     fn multi_graph_isr_tier_workload_rejected() {
-        // A workload module placed in an ISR-tier domain (tier 1b/2) must be rejected
+        // A workload module placed in an interrupt-mode domain must be rejected
         // at emit time — the FLXA codec carries no ISR metadata and workload admission
         // runs after ISR registration, so it would never execute.
         let tmp = std::env::temp_dir();
-        // Domain 1 is tier 1b (isr_timer, exec_mode 2); domain 0 cooperative.
+        // Domain 1 is `exec: timer`; domain 0 is `exec: tick`.
         let cfg_isr = json!({
             "execution": {"domains": [
                 {"name": "coop", "cores": [0]},
-                {"name": "isrd", "cores": [1], "tier": "1b"}
+                {"name": "isrd", "cores": [1], "exec": "timer", "rate_hz": 1000}
             ]},
             "workloads": [{"modules": [{"name": "p", "type": "workload_pic_mod", "domain": "isrd"}]}]
         });
         let err = build_workload_section(&cfg_isr, test_loc(&tmp), &[])
-            .expect_err("an ISR-tier workload placement must be rejected");
+            .expect_err("an interrupt-mode workload placement must be rejected");
         assert!(
-            format!("{err:?}").contains("ISR-tier"),
-            "expected the ISR-tier workload rejection diagnostic, got: {err:?}"
+            format!("{err:?}").contains("`exec: timer` domain"),
+            "expected the interrupt-mode workload rejection diagnostic, got: {err:?}"
         );
 
         // Same module in the cooperative domain is accepted (reaches schema/emit).
         let cfg_ok = json!({
             "execution": {"domains": [
                 {"name": "coop", "cores": [0]},
-                {"name": "isrd", "cores": [1], "tier": "1b"}
+                {"name": "isrd", "cores": [1], "exec": "timer", "rate_hz": 1000}
             ]},
             "workloads": [{"modules": [{"name": "p", "type": "workload_pic_mod", "domain": "coop"}]}]
         });
@@ -970,7 +970,7 @@ mod scheduler_validation_tests {
             &HeapPlan::default(),
         )
         .expect("emit module entry");
-        let params = &entry[MODULE_ENTRY_HEADER_SIZE..];
+        let params = &entry.params;
         let at = params
             .windows(6)
             .position(|w| w == [0xEF, 4, 0x00, 0x00, 0x01, 0x00])
@@ -995,6 +995,21 @@ mod scheduler_validation_tests {
         }
         validate_heap_subtree(&json!({"heap": {"arena_bytes": 4194304}}), "reader")
             .expect("4 MiB is a cap");
+    }
+
+    /// `variant:` selects a `[[variant]]` build by name. A number selects no
+    /// build and is no param either, so it is refused rather than dropped from
+    /// the image; the error points a param of that name at `params:`.
+    #[test]
+    fn a_variant_that_is_not_a_name_is_refused() {
+        let e = validate_variant_key(&json!({"name": "emit", "variant": 8}), "emit")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("params: { variant: 8 }"), "{e}");
+        validate_variant_key(&json!({"name": "codec", "variant": "audio"}), "codec")
+            .expect("a variant name");
+        validate_variant_key(&json!({"name": "emit", "params": {"variant": 8}}), "emit")
+            .expect("a param called variant");
     }
 
     #[test]
@@ -1326,107 +1341,187 @@ mod scheduler_validation_tests {
         validate_scheduler_budgets(&cfg, &modules, 1000, &[], &[]).unwrap();
     }
 
-    // ---- parse_domain_tier_to_exec_mode ----
+    // ---- parse_domain_exec ----
+
+    fn exec_of(dom: serde_json::Value) -> Result<DomainExec> {
+        parse_domain_exec(&dom, "d")
+    }
 
     #[test]
-    fn tier_friendly_strings_map_to_exec_mode_bytes() {
-        // The byte mapping is wire-stable — adding tiers must preserve
-        // existing values. This test pins the {0,1,2,3,4} table.
-        assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"tier": "cooperative"})),
-            Some(0)
+    fn exec_spellings_map_to_the_dense_modes() {
+        use fluxor_contracts::boot_config::ExecMode;
+        for (s, mode, byte) in [
+            ("tick", ExecMode::Tick, 0u8),
+            ("poll", ExecMode::Poll, 1),
+            ("irq", ExecMode::Irq, 3),
+        ] {
+            let e = exec_of(json!({"exec": s})).unwrap();
+            assert_eq!(e.mode, mode);
+            assert_eq!(e.mode as u8, byte);
+            assert_eq!(e.timer_period_us, 0);
+        }
+        let e = exec_of(json!({"exec": "timer", "rate_hz": 20000})).unwrap();
+        assert_eq!(e.mode, ExecMode::Timer);
+        assert_eq!(e.mode as u8, 2);
+        assert_eq!(e.timer_period_us, 50);
+    }
+
+    #[test]
+    fn exec_defaults_to_tick() {
+        let e = exec_of(json!({"name": "d"})).unwrap();
+        assert_eq!(e.mode, fluxor_contracts::boot_config::ExecMode::Tick);
+    }
+
+    #[test]
+    fn tier_and_exec_mode_are_unknown_keys_naming_exec() {
+        for dom in [
+            json!({"tier": "1a"}),
+            json!({"tier": 0}),
+            json!({"exec_mode": "poll"}),
+            json!({"exec": "tick", "tier": "0"}),
+        ] {
+            let e = format!("{}", exec_of(dom).unwrap_err());
+            assert!(e.contains("unknown key") && e.contains("`exec:`"), "{e}");
+        }
+    }
+
+    #[test]
+    fn exec_refuses_every_other_spelling() {
+        for v in [
+            json!("cooperative"),
+            json!("high_rate"),
+            json!("isr_timer"),
+            json!("isr_owned"),
+            json!("1a"),
+            json!("1b"),
+            json!("Tick"),
+            json!(0),
+        ] {
+            let e = format!("{}", exec_of(json!({"exec": v})).unwrap_err());
+            assert!(e.contains("not an execution mode"), "{e}");
+        }
+    }
+
+    #[test]
+    fn timer_rate_is_required_whole_and_fits_the_record() {
+        let err = |dom| format!("{}", exec_of(dom).unwrap_err());
+        assert!(err(json!({"exec": "timer"})).contains("rate_hz"));
+        assert!(err(json!({"exec": "timer", "rate_hz": 0})).contains("positive"));
+        assert!(err(json!({"exec": "timer", "rate_hz": 3000})).contains("whole number"));
+        // 1 Hz is a 1 s period, past the u16 µs record field.
+        assert!(err(json!({"exec": "timer", "rate_hz": 1})).contains("longer than"));
+        assert!(
+            err(json!({"exec": "timer", "rate_hz": 1000, "tick_us": 1000}))
+                .contains("not `tick_us`")
         );
         assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"tier": "1a"})),
-            Some(1)
+            exec_of(json!({"exec": "timer", "rate_hz": 1_000_000}))
+                .unwrap()
+                .timer_period_us,
+            1
         );
         assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"tier": "1b"})),
-            Some(2),
-            "Tier 1b → exec_mode 2"
-        );
-        assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"tier": "3"})),
-            Some(3)
-        );
-        assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"tier": "2"})),
-            Some(4),
-            "Tier 2 → exec_mode 4 — the byte order deliberately does not \
-             follow the tier names"
+            exec_of(json!({"exec": "timer", "rate_hz": 16}))
+                .unwrap()
+                .timer_period_us,
+            62_500
         );
     }
 
     #[test]
-    fn only_the_tier_key_names_a_domains_tier() {
-        // `exec_mode` is the wire byte's name, not a YAML key: a domain that
-        // spells its tier that way names none, and the builder refuses it.
-        assert!(parse_domain_tier_to_exec_mode(&json!({"exec_mode": "poll"})).is_none());
-        // Each tier has a number and a name, and nothing else.
-        assert!(parse_domain_tier_to_exec_mode(&json!({"tier": "tier1a"})).is_none());
+    fn rate_hz_belongs_to_timer_domains_only() {
+        for mode in ["tick", "poll", "irq"] {
+            let e = format!(
+                "{}",
+                exec_of(json!({"exec": mode, "rate_hz": 1000})).unwrap_err()
+            );
+            assert!(e.contains("`exec: timer`"), "{e}");
+        }
+        let e = format!("{}", exec_of(json!({"rate_hz": 1000})).unwrap_err());
+        assert!(e.contains("`exec: tick`"), "{e}");
     }
 
     #[test]
-    fn unknown_tier_string_returns_none() {
-        // Caller is responsible for hard-failing on a None when the
-        // YAML actually had a `tier` field — silent
-        // fall-through to Tier 0 would mask typos.
-        assert!(parse_domain_tier_to_exec_mode(&json!({"tier": "1c"})).is_none());
-    }
-
-    #[test]
-    fn no_tier_field_returns_none_for_default() {
-        assert!(parse_domain_tier_to_exec_mode(&json!({"name": "d"})).is_none());
-    }
-
-    #[test]
-    fn exec_mode_wire_bytes_are_locked() {
-        // The FULL `(string → byte)` mapping, pinned. These bytes are a
-        // wire contract: a `.cfg.bin` blob carries the byte, and the kernel
-        // reads it back through `scheduler::exec_mode::*`, so a changed
-        // mapping silently mis-routes domains. Failing this test means the
-        // table or one of its spellings moved, which needs a coordinated
-        // kernel + tools + docs change.
-        let pairs: &[(&str, u8)] = &[
-            ("cooperative", 0),
-            ("0", 0),
-            ("1a", 1),
-            ("high_rate", 1),
-            ("1b", 2),
-            ("isr_timer", 2),
-            ("3", 3),
-            ("poll", 3),
-            ("2", 4),
-            ("isr_owned", 4),
-        ];
-        for (s, expected) in pairs {
-            assert_eq!(
-                parse_domain_tier_to_exec_mode(&json!({"tier": s})),
-                Some(*expected),
-                "WIRE-FORMAT BREAK: tier `{s}` must map to byte \
-                 {expected}. These bytes are a locked wire contract and \
-                 can only be changed in lockstep with the kernel-side \
-                 `scheduler::exec_mode::*` constants."
+    fn pre_pass_is_admitted_only_in_tick_domains() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("drainer");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\npre_pass = true\n",
+        )
+        .expect("write manifest");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let modules = vec![json!({"name": "drainer", "type": "drainer", "domain": "d"})];
+        let run = |dom: serde_json::Value| {
+            let cfg = json!({"execution": {"domains": [dom]}});
+            validate_pre_pass_admission(&cfg, &modules, &extras, None, dir.path())
+        };
+        run(json!({"name": "d"})).expect("a tick domain admits a pre-pass module");
+        run(json!({"name": "d", "exec": "tick", "tick_us": 250}))
+            .expect("a tick domain with its own tick admits a pre-pass module");
+        for dom in [
+            json!({"name": "d", "exec": "poll"}),
+            json!({"name": "d", "exec": "timer", "rate_hz": 1000}),
+            json!({"name": "d", "exec": "irq"}),
+        ] {
+            let e = format!("{}", run(dom).unwrap_err());
+            assert!(
+                e.contains("`pre_pass = true`") && e.contains("`exec: tick`"),
+                "{e}"
             );
         }
     }
 
     #[test]
-    fn exec_mode_bare_numeric_only_accepts_zero() {
-        // Numeric form is intentionally narrow (YAML can't
-        // distinguish `tier: 1` from a 1a vs 1b string). Only `0`
-        // resolves; everything else must return None so the operator
-        // sees a hard error instead of a silent fall-through.
-        assert_eq!(parse_domain_tier_to_exec_mode(&json!({"tier": 0})), Some(0));
-        for n in [1u64, 2, 3, 4, 5, 7, 100] {
-            assert_eq!(
-                parse_domain_tier_to_exec_mode(&json!({"tier": n})),
+    fn superseded_manifest_keys_are_refused_by_name() {
+        let head = "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n";
+        for (key, new) in [
+            ("isr_safe", "interrupt_safe"),
+            ("pre_tick_drain", "pre_pass"),
+        ] {
+            let e = crate::manifest::Manifest::from_toml_str_for_target(
+                &format!("{head}{key} = true\n"),
                 None,
-                "bare numeric tier {n} must NOT silently parse — \
-                 only the friendly-string form is allowed for non-zero \
-                 tiers."
-            );
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains(key) && e.contains(new), "{e}");
         }
+    }
+
+    #[test]
+    fn a_timer_domain_writes_its_period_into_the_record() {
+        let config = json!({
+            "tick_us": 1000,
+            "execution": {"domains": [
+                {"name": "main"},
+                {"name": "pwm", "exec": "timer", "rate_hz": 20000},
+                {"name": "net", "exec": "poll", "tick_us": 500}
+            ]},
+            "modules": [],
+            "wiring": []
+        });
+        let root = std::path::Path::new("/nonexistent/modules");
+        let blob = generate_config_ext(
+            &config,
+            &ConfigBuilder::new(),
+            &[],
+            root,
+            &[],
+            0,
+            0,
+            None,
+            root,
+        )
+        .expect("generates");
+        let v = decode_config(&blob).expect("decodes");
+        assert_eq!(v["domains"][0]["exec"], "tick");
+        assert_eq!(v["domains"][0]["tick_us"], 0);
+        assert_eq!(v["domains"][1]["exec"], "timer");
+        assert_eq!(v["domains"][1]["tick_us"], 50);
+        assert_eq!(v["domains"][2]["exec"], "poll");
+        assert_eq!(v["domains"][2]["tick_us"], 500);
     }
 
     // ---- validate_isr_tier_admission ----
@@ -1439,7 +1534,7 @@ mod scheduler_validation_tests {
     fn run_admission(config: serde_json::Value, modules: Vec<serde_json::Value>) -> Result<()> {
         // Use a path that surely doesn't exist so `load_module_
         // manifests_with_extra` finds nothing. The validator handles
-        // the missing-manifest case by skipping the isr_safe check
+        // the missing-manifest case by skipping the interrupt_safe check
         // (the wiring/manifest validator surfaces missing-manifest
         // errors separately), so for the unknown-tier-and-typed-edge
         // tests we don't need a real manifest. The cases that DO
@@ -1453,14 +1548,14 @@ mod scheduler_validation_tests {
     #[test]
     fn admission_passes_when_no_isr_tier_domains_present() {
         let cfg = json!({
-            "execution": {"domains": [{"name": "main", "tier": "1a"}]}
+            "execution": {"domains": [{"name": "main", "exec": "tick", "tick_us": 250}]}
         });
         let modules = vec![json!({"name": "m", "type": "x", "domain": "main"})];
         run_admission(cfg, modules).expect("cooperative graph admits");
     }
 
     #[test]
-    fn admission_rejects_unknown_tier_string() {
+    fn admission_refuses_a_tier_key() {
         let cfg = json!({
             "execution": {"domains": [{"name": "main", "tier": "1c"}]}
         });
@@ -1468,8 +1563,8 @@ mod scheduler_validation_tests {
         let err = run_admission(cfg, modules).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("unknown tier") && msg.contains("1a/high_rate"),
-            "expected unknown-tier diagnostic naming valid values, got: {msg}"
+            msg.contains("unknown key `tier`") && msg.contains("`exec:`"),
+            "expected the unknown-key diagnostic naming `exec:`, got: {msg}"
         );
     }
 
@@ -1479,7 +1574,7 @@ mod scheduler_validation_tests {
         // distributor's enable/priority/target banks out of range on silicon.
         let cfg = json!({
             "target": "pi5",
-            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+            "execution": {"domains": [{"name": "isr", "exec": "irq"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
         let err = run_admission(cfg, modules).unwrap_err();
@@ -1497,7 +1592,7 @@ mod scheduler_validation_tests {
         // etc.) is fine here — just not the range diagnostic.
         let cfg = json!({
             "target": "pi5",
-            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+            "execution": {"domains": [{"name": "isr", "exec": "irq"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 15})];
         if let Err(e) = run_admission(cfg, modules) {
@@ -1517,7 +1612,7 @@ mod scheduler_validation_tests {
         // config.target.)
         let cfg = json!({
             "target": "rp2350",
-            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+            "execution": {"domains": [{"name": "isr", "exec": "irq"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
         let err = run_admission(cfg, modules).unwrap_err();
@@ -1535,7 +1630,7 @@ mod scheduler_validation_tests {
         // not the range.
         let cfg = json!({
             "target": "rp2350",
-            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+            "execution": {"domains": [{"name": "isr", "exec": "irq"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 52})];
         if let Err(e) = run_admission(cfg, modules) {
@@ -1553,7 +1648,7 @@ mod scheduler_validation_tests {
         // range check.
         let cfg = json!({
             "target": "rp2040",
-            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+            "execution": {"domains": [{"name": "isr", "exec": "irq"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 31})];
         if let Err(e) = run_admission(cfg, modules) {
@@ -1566,9 +1661,9 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn admission_rejects_tier_1b_module_without_isr_safe_manifest() {
+    fn admission_rejects_tier_1b_module_without_interrupt_safe_manifest() {
         // Tier 1b is admitted as of 2026-05-26 — but only for modules
-        // that declare `isr_safe = true` in their manifest. A module
+        // that declare `interrupt_safe = true` in their manifest. A module
         // without the attestation must be rejected with a precise
         // diagnostic pointing at the offending manifest path.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1576,12 +1671,12 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&mod_dir).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = false\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\ninterrupt_safe = false\n",
         )
         .expect("write manifest");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+            "execution": {"domains": [{"name": "audio_isr", "exec": "timer", "rate_hz": 1000}]}
         });
         let modules =
             vec![json!({"name": "unflagged", "type": "unflagged", "domain": "audio_isr"})];
@@ -1592,7 +1687,7 @@ mod scheduler_validation_tests {
                 .expect_err("unflagged module in Tier 1b domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("isr_safe = true") && msg.contains("unflagged"),
+            msg.contains("interrupt_safe = true") && msg.contains("unflagged"),
             "diagnostic must name the missing attestation + the module, got: {msg}"
         );
     }
@@ -1606,13 +1701,13 @@ mod scheduler_validation_tests {
         // content types only when **both** endpoints have manifests, so
         // a Tier 1b module with no edges (or bare/default ports) passes
         // it untouched and lands in the graph without ever running
-        // through the `isr_safe` check.
+        // through the `interrupt_safe` check.
         //
         // Hard-error here so the operator gets a single, focused
         // diagnostic naming the unresolved module rather than a
         // silent admission followed by a runtime trap.
         let cfg = json!({
-            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+            "execution": {"domains": [{"name": "audio_isr", "exec": "timer", "rate_hz": 1000}]}
         });
         let modules = vec![json!({
             "name": "ghost_module",
@@ -1640,14 +1735,14 @@ mod scheduler_validation_tests {
         // must both honour that order. Were either to search
         // `standard_module_dirs()` first, a config-declared override
         // colliding with a bundled module of the same `type:` would
-        // have ISR admission read `isr_safe` and check source from the
+        // have ISR admission read `interrupt_safe` and check source from the
         // bundled copy — silently admitting a module the operator had
         // explicitly redirected to a vetted vendor tree.
         //
         // This test plants the *same* type name twice:
         //   - standard tree (`<project>/modules/foundation/coll/`)
-        //     declares `isr_safe = true` and exports `module_isr_entry`.
-        //   - extra dir (`<override>/coll/`) declares `isr_safe = true`
+        //     declares `interrupt_safe = true` and exports `module_isr_entry`.
+        //   - extra dir (`<override>/coll/`) declares `interrupt_safe = true`
         //     but exports no ISR entry.
         //
         // If standard wins, admission passes (wrong). If the
@@ -1661,7 +1756,7 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&std_src).expect("mkdir std");
         std::fs::write(
             std_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write std manifest");
         std::fs::write(
@@ -1675,14 +1770,17 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&ovr_src).expect("mkdir override");
         std::fs::write(
             ovr_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write override manifest");
-        std::fs::write(ovr_src.join("lib.rs"), "fn module_step(_s: *mut u8) -> i32 { 0 }\n")
-            .expect("write override src");
+        std::fs::write(
+            ovr_src.join("lib.rs"),
+            "fn module_step(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write override src");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+            "execution": {"domains": [{"name": "irq_owner", "exec": "irq"}]}
         });
         let modules = vec![json!({
             "name": "coll",
@@ -1704,8 +1802,8 @@ mod scheduler_validation_tests {
 
     #[test]
     fn admission_accepts_tier_2_module_with_isr_entry_export() {
-        // A Tier 2 (`tier: 2` / `isr_owned`) module declaring
-        // `isr_safe = true`, an `irq:`, and a real `module_isr_entry`
+        // An `exec: irq` module declaring
+        // `interrupt_safe = true`, an `irq:`, and a real `module_isr_entry`
         // export is admitted.
         let dir = tempfile::tempdir().expect("tempdir");
         let mod_dir = dir.path().join("irq_driver");
@@ -1713,7 +1811,7 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&src).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write manifest");
         std::fs::write(
@@ -1723,7 +1821,7 @@ mod scheduler_validation_tests {
         .expect("write src");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+            "execution": {"domains": [{"name": "irq_owner", "exec": "irq"}]}
         });
         let modules = vec![json!({
             "name": "irq_driver",
@@ -1739,7 +1837,7 @@ mod scheduler_validation_tests {
 
     #[test]
     fn admission_rejects_tier_2_module_without_isr_entry_export() {
-        // A Tier 2 module that declares `isr_safe = true` + `irq:` but
+        // A Tier 2 module that declares `interrupt_safe = true` + `irq:` but
         // whose source exports no `module_isr_entry` is rejected: the
         // kernel would refuse to dispatch its cooperative `module_step`
         // from IRQ context, so surface the gap loudly at build time.
@@ -1749,7 +1847,7 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&src).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write manifest");
         // Source has no `fn module_isr_entry` definition.
@@ -1760,7 +1858,7 @@ mod scheduler_validation_tests {
         .expect("write src");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+            "execution": {"domains": [{"name": "irq_owner", "exec": "irq"}]}
         });
         let modules = vec![json!({
             "name": "irq_driver",
@@ -1790,7 +1888,7 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&src).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write manifest");
         std::fs::write(
@@ -1800,7 +1898,7 @@ mod scheduler_validation_tests {
         .expect("write src");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+            "execution": {"domains": [{"name": "irq_owner", "exec": "irq"}]}
         });
         let modules = vec![json!({
             "name": "irq_driver",
@@ -1826,7 +1924,7 @@ mod scheduler_validation_tests {
         // lookup searching only `modules_dir + extra_module_dirs` would
         // never run the `module_isr_entry` export check against a module
         // under `modules/drivers/<name>`, which would then pass admission
-        // silently. This test plants an `isr_safe = true` Tier 2 module with
+        // silently. This test plants an `interrupt_safe = true` Tier 2 module with
         // no ISR entry in a fake project root and asserts the check sees it.
         let project = tempfile::tempdir().expect("tempdir");
         // `standard_module_dirs()` reads `$FLUXOR_PROJECT_ROOT`
@@ -1840,7 +1938,7 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&src).expect("mkdir");
         std::fs::write(
             drivers.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write manifest");
         std::fs::write(
@@ -1850,7 +1948,7 @@ mod scheduler_validation_tests {
         .expect("write src");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+            "execution": {"domains": [{"name": "irq_owner", "exec": "irq"}]}
         });
         let modules = vec![json!({
             "name": "entryless_isr_module",
@@ -1862,7 +1960,9 @@ mod scheduler_validation_tests {
         let extras: Vec<&std::path::Path> = Vec::new();
         let err =
             validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-                .expect_err("a standard-tree Tier 2 module without module_isr_entry must be rejected");
+                .expect_err(
+                    "a standard-tree Tier 2 module without module_isr_entry must be rejected",
+                );
         let msg = format!("{err:?}");
         assert!(
             msg.contains("module_isr_entry") && msg.contains("entryless_isr_module"),
@@ -1879,10 +1979,10 @@ mod scheduler_validation_tests {
         // — which searches a hard-coded `SOURCE_DIRS` list relative to
         // the process cwd — would let a manifest living in
         // `extra_module_dirs` (an installed driver, say) pass validation
-        // and still emit a config blob with byte-9 bit 4 clear, silently
+        // and still emit a module record with its pre-pass flag clear, silently
         // demoting the module out of `domain_pre_tick_order`.
         //
-        // This test plants a `pre_tick_drain = true` manifest in a
+        // This test plants a `pre_pass = true` manifest in a
         // tempdir, feeds the dir as an extra, and asserts the bit
         // lands in the emitted module entry.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1891,7 +1991,7 @@ mod scheduler_validation_tests {
         std::fs::write(
             mod_dir.join("manifest.toml"),
             "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\
-             pre_tick_drain = true\n",
+             pre_pass = true\n",
         )
         .expect("write manifest");
 
@@ -1902,10 +2002,8 @@ mod scheduler_validation_tests {
         let extras: Vec<&std::path::Path> = vec![dir.path()];
         let manifests = load_module_manifests_with_extra(&modules_value, &extras, dir.path());
         assert!(
-            manifests
-                .get("ext_drainer")
-                .is_some_and(|m| m.pre_tick_drain),
-            "loader must find the extra-dir manifest with pre_tick_drain = true"
+            manifests.get("ext_drainer").is_some_and(|m| m.pre_pass),
+            "loader must find the extra-dir manifest with pre_pass = true"
         );
 
         let config = json!({});
@@ -1924,21 +2022,14 @@ mod scheduler_validation_tests {
             &HeapPlan::default(),
         )
         .expect("emit module entry");
-        // Entry layout (see `parse_module_entry`): bytes 0-3 =
-        // length, bytes 4-7 = name_hash, byte 8 = id, byte 9 = the
-        // multiplexed domain/pre-tick byte (bits 0-2 = domain_id,
-        // bit 4 = pre_tick_drain).
-        let byte9 = entry[9];
-        assert_eq!(
-            byte9 & 0x10,
-            0x10,
-            "byte-9 bit 4 (pre_tick_drain) must be SET when the resolved \
-             manifest has pre_tick_drain = true (got byte9 = 0x{byte9:02x})"
+        assert!(
+            entry.pre_pass,
+            "the module record's pre-pass flag must be SET when the resolved \
+             manifest has pre_pass = true"
         );
         assert_eq!(
-            byte9 & 0x07,
-            0,
-            "byte-9 bits 0-2 (domain_id) should be 0 (no domain assigned in YAML)"
+            entry.domain, 0,
+            "the domain should be 0 (no domain assigned in YAML)"
         );
     }
 
@@ -1971,21 +2062,21 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn admission_accepts_tier_1b_module_with_isr_safe_manifest() {
+    fn admission_accepts_tier_1b_module_with_interrupt_safe_manifest() {
         // Mirror of the rejection case: when the manifest declares
-        // `isr_safe = true`, the Tier 1b admission path lets the module
+        // `interrupt_safe = true`, the Tier 1b admission path lets the module
         // through. This pins the lift that happened on 2026-05-26.
         let dir = tempfile::tempdir().expect("tempdir");
         let mod_dir = dir.path().join("attested_isr");
         std::fs::create_dir_all(&mod_dir).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write manifest");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+            "execution": {"domains": [{"name": "audio_isr", "exec": "timer", "rate_hz": 1000}]}
         });
         let modules = vec![json!({
             "name": "attested_isr",
@@ -1995,7 +2086,7 @@ mod scheduler_validation_tests {
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
         validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect("isr_safe = true module in Tier 1b domain must be admitted");
+            .expect("interrupt_safe = true module in Tier 1b domain must be admitted");
     }
 
     #[test]
@@ -2012,14 +2103,14 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&mod_dir).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write manifest");
         let producer_dir = dir.path().join("plain_producer");
         std::fs::create_dir_all(&producer_dir).expect("mkdir");
         std::fs::write(
             producer_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = false\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = false\n",
         )
         .expect("write manifest");
 
@@ -2028,8 +2119,8 @@ mod scheduler_validation_tests {
         let cfg = json!({
             "execution": {
                 "domains": [
-                    {"name": "main", "tier": "0"},
-                    {"name": "audio_isr", "tier": "1b"},
+                    {"name": "main", "exec": "tick"},
+                    {"name": "audio_isr", "exec": "timer", "rate_hz": 1000},
                 ]
             },
             "wiring": [
@@ -2055,7 +2146,7 @@ mod scheduler_validation_tests {
                 .expect_err("untagged edge into Tier 1b module must still be rejected");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("ISR-tier endpoint")
+            msg.contains("interrupt-mode endpoint")
                 && msg.contains("module-facing API")
                 && msg.contains("attested_isr"),
             "diagnostic must name the gap + the offending module, got: {msg}"
@@ -2073,21 +2164,21 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&isr_dir).expect("mkdir");
         std::fs::write(
             isr_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = true\n",
         )
         .expect("write manifest");
         let prod_dir = dir.path().join("plain_producer");
         std::fs::create_dir_all(&prod_dir).expect("mkdir");
         std::fs::write(
             prod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = false\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ninterrupt_safe = false\n",
         )
         .expect("write manifest");
 
         let cfg = json!({
             "execution": {"domains": [
-                {"name": "main", "tier": "0"},
-                {"name": "audio_isr", "tier": "1b"},
+                {"name": "main", "exec": "tick"},
+                {"name": "audio_isr", "exec": "timer", "rate_hz": 1000},
             ]},
             "wiring": [{
                 "from": "plain_producer.out",
@@ -2106,9 +2197,9 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn admission_accepts_tier_1a_cooperative_with_isr_safe_field_present() {
+    fn admission_accepts_tier_1a_cooperative_with_interrupt_safe_field_present() {
         // Cooperative tiers (0/1a/3) are unaffected by the
-        // Tier 1b/2 admission gate — the `isr_safe` manifest flag is
+        // Tier 1b/2 admission gate — the `interrupt_safe` manifest flag is
         // simply ignored for non-ISR-tier domains. Catches a
         // regression where the gate goes too broad.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2116,18 +2207,18 @@ mod scheduler_validation_tests {
         std::fs::create_dir_all(&mod_dir).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = false\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\ninterrupt_safe = false\n",
         )
         .expect("write manifest");
 
         let cfg = json!({
-            "execution": {"domains": [{"name": "main", "tier": "1a"}]}
+            "execution": {"domains": [{"name": "main", "exec": "tick", "tick_us": 250}]}
         });
         let modules = vec![json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
         validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect("cooperative tier with isr_safe=false on its modules is fine");
+            .expect("cooperative tier with interrupt_safe=false on its modules is fine");
     }
 
     #[test]
@@ -2173,11 +2264,11 @@ mod module_discovery_tests {
     /// `root/modules/foundation/<name>/manifest.toml`. Used to
     /// synthesise both project and install roots for these tests
     /// without depending on the real source tree.
-    fn plant_manifest(root: &std::path::Path, name: &str, isr_safe: bool) {
+    fn plant_manifest(root: &std::path::Path, name: &str, interrupt_safe: bool) {
         let dir = root.join("modules/foundation").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let body = format!(
-            "name = \"{name}\"\nversion = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = {isr_safe}\n",
+            "name = \"{name}\"\nversion = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\ninterrupt_safe = {interrupt_safe}\n",
         );
         std::fs::write(dir.join("manifest.toml"), body).unwrap();
     }
@@ -2216,13 +2307,13 @@ mod module_discovery_tests {
         let m = manifests
             .get("bundled_mod")
             .expect("install-root manifest must be discoverable");
-        assert!(m.isr_safe, "manifest content round-trips");
+        assert!(m.interrupt_safe, "manifest content round-trips");
     }
 
     #[test]
     fn project_root_module_shadows_install_root_module() {
         // Both roots carry the manifest under the same name. The
-        // project root's version must win — `isr_safe = true` in
+        // project root's version must win — `interrupt_safe = true` in
         // project, `false` in install. After loading, the result
         // must reflect the project version.
         let _g = env_lock();
@@ -2245,8 +2336,8 @@ mod module_discovery_tests {
         }
         let m = manifests.get("shared_mod").expect("must find shared_mod");
         assert!(
-            m.isr_safe,
-            "expected project-root manifest (isr_safe=true) to shadow install-root manifest, got isr_safe=false"
+            m.interrupt_safe,
+            "expected project-root manifest (interrupt_safe=true) to shadow install-root manifest, got interrupt_safe=false"
         );
     }
 
@@ -2504,7 +2595,10 @@ mod continuity_tests {
     #[test]
     fn a_required_contract_must_be_answered_by_kernel_platform_or_module() {
         let fs_user = Manifest {
-            resources: vec![claim(fluxor_abi::registry::fs::ID as u8, false, &[]), claim(fluxor_abi::registry::channel::ID as u8, false, &[])],
+            resources: vec![
+                claim(fluxor_abi::registry::fs::ID as u8, false, &[]),
+                claim(fluxor_abi::registry::channel::ID as u8, false, &[]),
+            ],
             ..Manifest::default()
         };
         let graph = json!({"modules": [{"name": "user"}]});
@@ -2512,7 +2606,10 @@ mod continuity_tests {
         // uefi answers no `fs`; `channel` is the kernel's.
         let r = refusals("uefi", &graph, &alone);
         assert_eq!(r.len(), 1, "{r:?}");
-        assert!(r[0].contains("`user` requires `fs`") && r[0].contains("uefi"), "{r:?}");
+        assert!(
+            r[0].contains("`user` requires `fs`") && r[0].contains("uefi"),
+            "{r:?}"
+        );
         // linux's platform answers `fs`.
         assert!(refusals("linux", &graph, &alone).is_empty());
         // A module in the graph that provides `file.data` answers `fs`.
@@ -2532,7 +2629,10 @@ mod continuity_tests {
         let m: HashMap<String, Manifest> = [(
             "tls".to_string(),
             Manifest {
-                resources: vec![claim(fluxor_abi::registry::trust::ID as u8, true, &[]), claim(fluxor_abi::registry::fs::ID as u8, false, &["cert_file"])],
+                resources: vec![
+                    claim(fluxor_abi::registry::trust::ID as u8, true, &[]),
+                    claim(fluxor_abi::registry::fs::ID as u8, false, &["cert_file"]),
+                ],
                 ..Manifest::default()
             },
         )]
@@ -2562,7 +2662,8 @@ mod continuity_tests {
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains("workload 0: `a` requires `fs`") && e.contains("workload 0: `b` requires `spi`"),
+            e.contains("workload 0: `a` requires `fs`")
+                && e.contains("workload 0: `b` requires `spi`"),
             "{e}"
         );
     }
@@ -2574,7 +2675,11 @@ mod continuity_tests {
         let m: HashMap<String, Manifest> = [(
             "http".to_string(),
             Manifest {
-                resources: vec![claim(fluxor_abi::registry::fs::ID as u8, false, &["fs_root", "route_0_fs_path"])],
+                resources: vec![claim(
+                    fluxor_abi::registry::fs::ID as u8,
+                    false,
+                    &["fs_root", "route_0_fs_path"],
+                )],
                 ..Manifest::default()
             },
         )]
@@ -2595,7 +2700,10 @@ mod continuity_tests {
         // when set so: its default is not.
         let durable = |_: &str, entry: &Value, param: &str, values: &[String]| {
             assert_eq!(param, "update_durability");
-            let v = entry.get(param).and_then(Value::as_str).unwrap_or("default");
+            let v = entry
+                .get(param)
+                .and_then(Value::as_str)
+                .unwrap_or("default");
             Ok(Some(Some(values.iter().any(|w| w == v))))
         };
         let mut disk_only = claim(fluxor_abi::registry::fs::ID as u8, false, &[]);
@@ -2613,9 +2721,27 @@ mod continuity_tests {
                 .resources
                 .len()
         };
-        assert_eq!(kept("disk", json!({"name": "d", "type": "dns", "update_durability": "durable"})), 2);
-        assert_eq!(kept("volatile", json!({"name": "d", "type": "dns", "update_durability": "durable"})), 1);
-        assert_eq!(kept("disk", json!({"name": "d", "type": "dns", "update_durability": "volatile"})), 1);
+        assert_eq!(
+            kept(
+                "disk",
+                json!({"name": "d", "type": "dns", "update_durability": "durable"})
+            ),
+            2
+        );
+        assert_eq!(
+            kept(
+                "volatile",
+                json!({"name": "d", "type": "dns", "update_durability": "durable"})
+            ),
+            1
+        );
+        assert_eq!(
+            kept(
+                "disk",
+                json!({"name": "d", "type": "dns", "update_durability": "volatile"})
+            ),
+            1
+        );
         // Unset: the schema default (not `durable`) stands in.
         assert_eq!(kept("volatile", json!({"name": "d", "type": "dns"})), 0);
     }
@@ -2628,10 +2754,15 @@ mod continuity_tests {
         let ok = format!("{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"disk\"]\nwhen = {{ persist = \"fs\" }}\n");
         let m = Manifest::from_toml_str_for_target(&ok, None).unwrap();
         assert_eq!(m.resources[0].variants, names(&["disk"]));
-        assert_eq!(m.resources[0].when, vec![("persist".to_string(), names(&["fs"]))]);
+        assert_eq!(
+            m.resources[0].when,
+            vec![("persist".to_string(), names(&["fs"]))]
+        );
         assert_eq!(m.selected_variant.as_deref(), Some("disk"));
         let bad = format!("{head}[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\nvariants = [\"dsk\"]\n");
-        let e = Manifest::from_toml_str_for_target(&bad, None).unwrap_err().to_string();
+        let e = Manifest::from_toml_str_for_target(&bad, None)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("`dsk`"), "{e}");
     }
 
@@ -2642,7 +2773,10 @@ mod continuity_tests {
         let m: HashMap<String, Manifest> = [(
             "w".to_string(),
             Manifest {
-                resources: vec![claim(fluxor_abi::registry::fs::ID as u8, false, &[]), claim(fluxor_abi::registry::storage_object::ID as u8, false, &[])],
+                resources: vec![
+                    claim(fluxor_abi::registry::fs::ID as u8, false, &[]),
+                    claim(fluxor_abi::registry::storage_object::ID as u8, false, &[]),
+                ],
                 ..Manifest::default()
             },
         )]
@@ -4377,35 +4511,10 @@ mod capacity_envelope_tests {
     use super::*;
     use serde_json::json;
 
-    /// `boot:` map → the FXBO section, its fields where the kernel reads them.
+    /// `capacity:` map → envelope records carrying the contract pool ids and
+    /// the asked n.
     #[test]
-    fn boot_map_encodes_where_the_kernel_reads_it() {
-        let cfg = json!({"boot": {"fault_probe": true, "lockup_probe": true, "summary_every_s": 7, "summary_for_s": 8, "max_uptime_s": 9}});
-        let p = super::boot_params(&cfg).unwrap().unwrap();
-        let s = crate::capacity::encode_boot_section(&p);
-        assert_eq!(&s[0..4], &0x4658_424Fu32.to_le_bytes());
-        assert_eq!(s.len(), 26);
-        assert_eq!(u32::from_le_bytes(s[4..8].try_into().unwrap()), 26);
-        let payload = &s[10..];
-        assert_eq!(payload[0], 0);
-        assert_eq!(payload[1], 1);
-        assert_eq!(payload[2], 1);
-        assert_eq!(payload[3], 0);
-        assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 7);
-        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 8);
-        assert_eq!(u32::from_le_bytes(payload[12..16].try_into().unwrap()), 9);
-        assert!(super::boot_params(&json!({"boot": {"bogus": 1}})).is_err());
-        assert!(super::boot_params(&json!({"boot": 1})).is_err());
-        assert!(super::boot_params(&json!({"boot": {"fault_probe": 1}})).is_err());
-        assert!(super::boot_params(&json!({"boot": {"max_uptime_s": -1}})).is_err());
-        assert!(super::boot_params(&json!({"boot": {"max_uptime_s": 1u64 << 32}})).is_err());
-        assert!(super::boot_params(&json!({})).unwrap().is_none());
-    }
-
-    /// `capacity:` map → FXEV section appended; entries carry the contract
-    /// pool ids and the asked n.
-    #[test]
-    fn capacity_map_emits_fxev_section() {
+    fn capacity_map_emits_envelope_records() {
         let cfg = json!({"capacity": {"events": 4, "tls_unknown_not_here": null}});
         // Unknown pool must error, not silently skip.
         let err = build_capacity_envelope(&cfg, Some("linux"))
@@ -4414,17 +4523,15 @@ mod capacity_envelope_tests {
 
         let cfg = json!({"capacity": {"events": 4, "timers": 2}});
         let sec = build_capacity_envelope(&cfg, Some("linux")).expect("valid envelope");
-        assert_eq!(&sec[0..4], &0x4658_4556u32.to_le_bytes(), "FXEV magic");
-        let section_len = u32::from_le_bytes(sec[4..8].try_into().unwrap()) as usize;
-        assert_eq!(section_len, sec.len());
-        let count = u16::from_le_bytes(sec[10..12].try_into().unwrap());
-        assert_eq!(count, 2);
-        // Entries are (pool u16, n u32); map order is serde_json's
-        // (insertion-preserving) — events (0x0005) then timers (0x0006).
-        assert_eq!(u16::from_le_bytes(sec[12..14].try_into().unwrap()), 0x0005);
-        assert_eq!(u32::from_le_bytes(sec[14..18].try_into().unwrap()), 4);
-        assert_eq!(u16::from_le_bytes(sec[18..20].try_into().unwrap()), 0x0006);
-        assert_eq!(u32::from_le_bytes(sec[20..24].try_into().unwrap()), 2);
+        // Map order is serde_json's (insertion-preserving) — events (0x0005)
+        // then timers (0x0006).
+        assert_eq!(
+            sec,
+            [
+                boot_config::PoolEntry { pool: 0x0005, n: 4 },
+                boot_config::PoolEntry { pool: 0x0006, n: 2 },
+            ]
+        );
     }
 
     /// An entry is a reserve (a size, for a pool the config cannot derive),
@@ -4490,7 +4597,7 @@ mod capacity_envelope_tests {
         }
     }
 
-    /// No `capacity:` block ⇒ no section ⇒ byte-identical config blobs.
+    /// No `capacity:` block ⇒ no envelope records ⇒ no `ENVL` section.
     #[test]
     fn absent_capacity_block_emits_nothing() {
         let sec = build_capacity_envelope(&json!({}), Some("linux")).expect("ok");
@@ -4498,15 +4605,17 @@ mod capacity_envelope_tests {
     }
 
     /// RP arena asks aren't validated host-side (silicon-TOML-owned); the
-    /// section still encodes them — the kernel refuses an over-ask at boot.
+    /// envelope still carries them — the kernel refuses an over-ask at boot.
     #[test]
     fn rp_arena_ask_passes_through_for_the_kernel_to_check() {
         let cfg = json!({"capacity": {"state_arena": 65536}});
         let sec = build_capacity_envelope(&cfg, Some("rp2350")).expect("encodes");
-        assert_eq!(u16::from_le_bytes(sec[12..14].try_into().unwrap()), 0x0001);
         assert_eq!(
-            u32::from_le_bytes(sec[14..18].try_into().unwrap()),
-            65536,
+            sec,
+            [boot_config::PoolEntry {
+                pool: 0x0001,
+                n: 65536
+            }],
             "an arena's entry below 2 GiB is exact bytes"
         );
     }
@@ -4519,13 +4628,7 @@ mod capacity_envelope_tests {
     fn arena_entries_are_exact_bytes_and_reach_past_4_gib() {
         let cfg = json!({"capacity": {"state_arena": 6u64 << 30, "buffer_arena": 1025}});
         let sec = build_capacity_envelope(&cfg, Some("pi5")).expect("encodes");
-        let entry = |at: usize| {
-            (
-                u16::from_le_bytes(sec[at..at + 2].try_into().unwrap()),
-                u32::from_le_bytes(sec[at + 2..at + 6].try_into().unwrap()),
-            )
-        };
-        let entries = [entry(12), entry(18)];
+        let entries: Vec<(u16, u32)> = sec.iter().map(|e| (e.pool, e.n)).collect();
         let kib = crate::capacity::ENTRY_KIB;
         assert!(entries.contains(&(0x0001, (6 << 20) | kib)), "{entries:?}");
         assert!(
@@ -4534,14 +4637,14 @@ mod capacity_envelope_tests {
         );
         let cfg = json!({"capacity": {"events": 40}});
         let sec = build_capacity_envelope(&cfg, Some("pi5")).expect("encodes");
-        assert_eq!(u32::from_le_bytes(sec[14..18].try_into().unwrap()), 40);
+        assert_eq!(sec[0].n, 40);
     }
 }
 
 /// Graph-sized capacity: module params have no ceiling, the composer reads
 /// the kernel's pool sizes as profile data and runs its boot plan, the Linux
-/// and bcm2712 graph sections are laid out for the graph, and the graph's
-/// declared demand rides the FXDM section.
+/// and bcm2712 edge tables are sized at boot, and the graph's declared demand
+/// rides the `DMND` section.
 #[cfg(test)]
 mod dynamic_capacity_tests {
     use super::*;
@@ -4594,7 +4697,7 @@ mod dynamic_capacity_tests {
             kernel_has_pool, kernel_max_edges, kernel_max_modules, kernel_max_owners,
             kernel_pool_default_reserve, kernel_pool_static_size,
         };
-        assert!(!crate::capacity::graph_section_per_graph("rp2350"));
+        assert!(!crate::capacity::edge_tables_sized_at_boot("rp2350"));
         assert_eq!(kernel_pool_static_size("pi5", "events"), None);
         assert_eq!(kernel_pool_static_size("pi5", "channels"), None);
         assert_eq!(kernel_pool_static_size("rp2350", "events"), None);
@@ -4604,7 +4707,7 @@ mod dynamic_capacity_tests {
         assert_eq!(
             kernel_max_edges("rp2350"),
             128,
-            "RP's channel table is sized from the graph within the 128-slot graph section"
+            "RP's channel table is sized from the graph within its compiled 128 edges"
         );
         assert_eq!(kernel_pool_static_size("linux", "events"), None);
         assert_eq!(kernel_pool_default_reserve("linux", "events"), Some(32));
@@ -4628,7 +4731,7 @@ mod dynamic_capacity_tests {
         // uefi: bare-metal aarch64 like bcm2712, without its control-plane store.
         for t in ["uefi", "qemu-uefi-arm64", "ec2-arm64"] {
             assert_eq!(crate::capacity::kernel_profile(t), "profile_uefi");
-            assert!(crate::capacity::graph_section_per_graph(t));
+            assert!(crate::capacity::edge_tables_sized_at_boot(t));
             assert_eq!(kernel_max_modules(t), 1024);
             assert_eq!(kernel_max_owners(t), 4096);
             assert_eq!(kernel_pool_default_reserve(t, "module_slots"), Some(256));
@@ -4643,20 +4746,15 @@ mod dynamic_capacity_tests {
     }
 
     #[test]
-    fn a_linux_graph_section_is_laid_out_for_its_edges() {
-        use crate::capacity::graph_slots;
-        assert_eq!(graph_slots("linux", 0), 128);
-        assert_eq!(graph_slots("linux", 128), 128);
-        assert_eq!(graph_slots("linux", 1999), 2048);
+    fn edge_tables_sized_at_boot_take_the_kernels_bound() {
+        use crate::capacity::{kernel_max_edges, BOOT_SIZED_MAX_EDGES};
+        for t in ["linux", "pi5", "uefi"] {
+            assert_eq!(kernel_max_edges(t), BOOT_SIZED_MAX_EDGES, "{t}");
+        }
         assert_eq!(
-            graph_slots("pi5", 1999),
-            2048,
-            "bcm2712 lays its section out for the graph, as Linux does"
-        );
-        assert_eq!(
-            graph_slots("rp2350", 3),
+            kernel_max_edges("rp2350"),
             128,
-            "a static profile keeps its layout"
+            "a static profile keeps its count"
         );
     }
 
@@ -4674,9 +4772,9 @@ mod dynamic_capacity_tests {
     }
 
     /// The graph's store consumers declare their subscriptions; the
-    /// composer sums them into one FXDM entry for the kernel.
+    /// composer sums them into one `DMND` entry for the kernel.
     #[test]
-    fn declared_subscriptions_ride_the_fxdm_section() {
+    fn declared_subscriptions_ride_the_demand_section() {
         let mut manifests = HashMap::new();
         for (name, n) in [("watch_a", 7u32), ("watch_b", 5), ("plain", 0)] {
             let mut m = Manifest::default();
@@ -4947,12 +5045,8 @@ mod dynamic_capacity_tests {
             let off = heap_cap_offset(tlv).expect("a heap cap tag");
             u32::from_le_bytes(tlv[off..off + 4].try_into().unwrap())
         };
-        assert_eq!(
-            cap_of(&entry[MODULE_ENTRY_HEADER_SIZE..]),
-            4096,
-            "placeholder"
-        );
-        let len = entry.len();
+        assert_eq!(cap_of(&entry.params), 4096, "placeholder");
+        let len = entry.params.len();
 
         let workload_params = insert_workload_heap_tags(
             Vec::new(),
@@ -4991,18 +5085,17 @@ mod dynamic_capacity_tests {
             counting: false,
         };
         apply_heap_plan(&plan, &heaps, &mut entries, &mut workloads).unwrap();
-        assert_eq!(cap_of(&entries[0][MODULE_ENTRY_HEADER_SIZE..]), 4096 + 6400);
-        assert_eq!(entries[0].len(), len, "written in place");
+        assert_eq!(cap_of(&entries[0].params), 4096 + 6400);
+        assert_eq!(entries[0].params.len(), len, "written in place");
         assert_eq!(cap_of(&workloads[0].modules[0].params), 4096 + 6400);
 
         // A ceiling of nothing keeps the placeholder: the type's own figure.
         let empty = HeapPlan::default();
         let mut entries = vec![entries.remove(0)];
-        let off = heap_cap_offset(&entries[0][MODULE_ENTRY_HEADER_SIZE..]).unwrap();
-        entries[0][MODULE_ENTRY_HEADER_SIZE + off..MODULE_ENTRY_HEADER_SIZE + off + 4]
-            .copy_from_slice(&4096u32.to_le_bytes());
+        let off = heap_cap_offset(&entries[0].params).unwrap();
+        entries[0].params[off..off + 4].copy_from_slice(&4096u32.to_le_bytes());
         apply_heap_plan(&empty, &heaps[..1], &mut entries, &mut []).unwrap();
-        assert_eq!(cap_of(&entries[0][MODULE_ENTRY_HEADER_SIZE..]), 4096);
+        assert_eq!(cap_of(&entries[0].params), 4096);
     }
 
     /// The plan's ceiling for a `heap_per_demand` pool is the graph's whole
@@ -5072,9 +5165,10 @@ mod dynamic_capacity_tests {
         }
     }
 
-    /// A module id carries 12 bits: id 3000 round-trips through byte 9.
+    /// A module id has a full-width field: id 3000 reaches the encoded
+    /// record and decodes back.
     #[test]
-    fn a_module_id_past_ten_bits_is_packed() {
+    fn a_module_id_past_ten_bits_round_trips() {
         let module = json!({"name": "m", "type": "m"});
         let entry = build_module_entry(
             "m",
@@ -5089,13 +5183,20 @@ mod dynamic_capacity_tests {
             &HeapPlan::default(),
         )
         .expect("entry");
-        let b9 = entry[9];
-        let id = u16::from(entry[8])
-            | (u16::from((b9 >> 5) & 3) << 8)
-            | (u16::from(b9 >> 7) << 10)
-            | (u16::from((b9 >> 3) & 1) << 11);
-        assert_eq!(id, 3000);
-        assert_eq!(b9 & 0x07, 0, "the id does not leak into the domain");
+        assert_eq!((entry.id, entry.domain), (3000, 0));
+        let blob = boot_config::encode(&boot_config::BootConfigSpec {
+            modules: &[entry.record()],
+            domains: &[boot_config::DomainRecord::default()],
+            ..boot_config::BootConfigSpec::default()
+        })
+        .expect("encodes");
+        let cfg = boot_config::decode(&blob).expect("decodes");
+        let m = cfg.graph().modules().next().expect("one module");
+        assert_eq!(
+            (m.id, m.domain),
+            (3000, 0),
+            "the id does not leak into the domain"
+        );
     }
 
     /// `heap.raw_arena` (or the type's `[capacities] raw_arena`) is params
@@ -5117,7 +5218,7 @@ mod dynamic_capacity_tests {
         )
         .expect("entry");
         assert!(
-            entry.windows(3).any(|w| w == [0xEE, 1, 1]),
+            entry.params.windows(3).any(|w| w == [0xEE, 1, 1]),
             "tag 0xEE emitted"
         );
         let mut manifests = HashMap::new();
@@ -5139,7 +5240,7 @@ mod dynamic_capacity_tests {
         )
         .expect("entry");
         assert!(
-            entry.windows(3).any(|w| w == [0xEE, 1, 1]),
+            entry.params.windows(3).any(|w| w == [0xEE, 1, 1]),
             "declared by the type"
         );
     }
@@ -5304,10 +5405,7 @@ mod port_capability_tests {
         // Also when the second edge goes to a port with no requirement: it
         // is still a tee on the source's channel.
         m.insert("tap".to_string(), Manifest::default());
-        let g = block_graph(&[
-            ("nvme.blocks", "fat32.blocks"),
-            ("nvme.blocks", "tap.in"),
-        ]);
+        let g = block_graph(&[("nvme.blocks", "fat32.blocks"), ("nvme.blocks", "tap.in")]);
         let msg = format!("{:?}", validate_port_capabilities(&g, &m).unwrap_err());
         assert!(msg.contains("tee"), "got: {msg}");
     }
@@ -5685,7 +5783,10 @@ mod port_fact_tests {
         let speaks = || exchange_port("request_in", "input", "binding = [\"http\"]");
         let (cfg, m) = graph(
             &[
-                ("req", exchange_port("request_out", "output", "binding = \"http\"")),
+                (
+                    "req",
+                    exchange_port("request_out", "output", "binding = \"http\""),
+                ),
                 ("prov", speaks()),
             ],
             edge.clone(),
@@ -5694,7 +5795,10 @@ mod port_fact_tests {
 
         let (cfg, m) = graph(
             &[
-                ("req", exchange_port("request_out", "output", "binding = \"http\"")),
+                (
+                    "req",
+                    exchange_port("request_out", "output", "binding = \"http\""),
+                ),
                 ("prov", exchange_port("request_in", "input", "")),
             ],
             edge.clone(),
@@ -5708,7 +5812,10 @@ mod port_fact_tests {
         // A requester that sends verb 0 binds any provider.
         for prov in [speaks(), exchange_port("request_in", "input", "")] {
             let (cfg, m) = graph(
-                &[("req", exchange_port("request_out", "output", "")), ("prov", prov)],
+                &[
+                    ("req", exchange_port("request_out", "output", "")),
+                    ("prov", prov),
+                ],
                 edge.clone(),
             );
             validate_port_facts(&cfg, &m).unwrap();
@@ -5721,9 +5828,15 @@ mod port_fact_tests {
     fn exchange_requesters_may_fan_into_one_provider() {
         let (cfg, m) = graph(
             &[
-                ("a", exchange_port("request_out", "output", "binding = \"http\"")),
+                (
+                    "a",
+                    exchange_port("request_out", "output", "binding = \"http\""),
+                ),
                 ("b", exchange_port("request_out", "output", "")),
-                ("prov", exchange_port("request_in", "input", "binding = \"http\"")),
+                (
+                    "prov",
+                    exchange_port("request_in", "input", "binding = \"http\""),
+                ),
             ],
             json!([
                 {"from": "a.request_out", "to": "prov.request_in"},
@@ -6070,54 +6183,88 @@ mod framed_edge_tests {
 }
 
 #[cfg(test)]
-mod fxwr_decode_tests {
-    use crate::config::{decode_config, MAGIC_FXWR};
+mod config_decode_tests {
+    use crate::config::decode_config;
+    use fluxor_contracts::boot_config::{
+        encode, BootConfigSpec, DomainRecord, EdgeClass, EdgeRecord, ExecMode, ModuleRecord,
+        PoolEntry, WorkloadRecord, GRAPH_FLAG_ACCEPT_CYCLES,
+    };
 
-    /// A blob laid out as `generate_config_impl` writes one: two modules,
-    /// two edges, a 128-slot graph section, two GPIO entries.
+    /// A blob as `generate_config_impl` writes one: two modules, two edges,
+    /// one domain, an RP hardware payload with two GPIO entries and a UART, a
+    /// resident workload, an envelope and a demand entry.
     fn blob() -> Vec<u8> {
-        let mut d = Vec::new();
-        d.extend_from_slice(&MAGIC_FXWR.to_le_bytes());
-        d.extend_from_slice(&1u16.to_le_bytes()); // version
-        d.extend_from_slice(&0xBEEFu16.to_le_bytes()); // checksum
-        d.push(2); // module_count
-        d.push(2); // edge_count low byte
-        d.extend_from_slice(&1000u16.to_le_bytes()); // tick_us
-        d.extend_from_slice(&48_000u32.to_le_bytes()); // graph_sample_rate
-        let mut entries = Vec::new();
-        for (id, hash, meta, params) in [
-            (0u8, 0x1111_1111u32, 0u8, 3usize),
-            (1, 0x2222_2222, 0x11, 0),
-        ] {
-            entries.extend_from_slice(&((10 + params) as u32).to_le_bytes());
-            entries.extend_from_slice(&hash.to_le_bytes());
-            entries.push(id);
-            entries.push(meta);
-            entries.extend(std::iter::repeat_n(0xAA, params));
-        }
-        d.push(2);
-        d.push(0);
-        d.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        d.extend_from_slice(&entries);
-        // Graph section: count low, flags (accept_cycles), count high, slot code 0.
-        d.extend_from_slice(&[2, 0x01, 0, 0]);
-        let mut edges = vec![0u8; 128 * 12];
-        edges[..12].copy_from_slice(&[0, 1, 0x80 | (1 << 5) | 3, 0x21, 0, 4, 0, 0, 4, 1, 0, 0]);
-        edges[12..24].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        d.extend_from_slice(&edges);
-        // Domain metadata: four entries.
-        d.extend_from_slice(&[0xE8, 0x03, 1, 3]);
-        d.extend_from_slice(&[0u8; 12]);
+        let params = [0xAAu8; 3];
+        let modules = [
+            ModuleRecord {
+                name_hash: 0x1111_1111,
+                id: 0,
+                domain: 0,
+                pre_pass: false,
+                params: &params,
+            },
+            ModuleRecord {
+                name_hash: 0x2222_2222,
+                id: 1,
+                domain: 1,
+                pre_pass: true,
+                params: &[],
+            },
+        ];
+        let edges = [
+            EdgeRecord {
+                from: 0,
+                to: 1,
+                from_port: 2,
+                to_port: 1,
+                to_ctrl: true,
+                class: EdgeClass::DmaOwned,
+                buffer_group: 3,
+                rate_class: 4,
+                wake_on_write: true,
+                retains_send: false,
+                buffer_bytes: 1024,
+            },
+            EdgeRecord {
+                from: 1,
+                to: 0,
+                ..EdgeRecord::default()
+            },
+        ];
+        let domains = [DomainRecord {
+            tick_us: 1000,
+            tick_min_us: 250,
+            tick_max_us: 8000,
+            exec_mode: ExecMode::Tick,
+            adaptive_flags: 3,
+        }];
         // Hardware header: spi, i2c, gpio, pio, reserved, uart.
-        d.extend_from_slice(&[0, 0, 2, 0, 0, 1]);
-        d
+        let mut hw = vec![0, 0, 2, 0, 0, 1];
+        hw.extend_from_slice(&[0u8; 2 * 5 + 8]);
+        encode(&BootConfigSpec {
+            tick_us: 1000,
+            graph_sample_rate: 48_000,
+            graph_flags: GRAPH_FLAG_ACCEPT_CYCLES,
+            modules: &modules,
+            edges: &edges,
+            domains: &domains,
+            hardware: Some(&hw),
+            workloads: Some(&[WorkloadRecord {
+                idle_safe: true,
+                blob: &[1, 2, 3, 4],
+            }]),
+            envelope: Some(&[PoolEntry { pool: 5, n: 40 }]),
+            demand: Some(&[PoolEntry { pool: 10, n: 3 }]),
+        })
+        .expect("encodes")
     }
 
     /// Every field a built blob carries comes back where the encoder put it.
     #[test]
     fn a_built_blob_decodes_field_for_field() {
-        let v = decode_config(&blob()).expect("decodes");
-        assert_eq!(v["version"], 1);
+        let b = blob();
+        let v = decode_config(&b).expect("decodes");
+        assert_eq!(v["total_len"], b.len());
         assert_eq!(v["tick_us"], 1000);
         assert_eq!(v["graph_sample_rate"], 48_000);
         assert_eq!(v["modules"].as_array().unwrap().len(), 2);
@@ -6125,9 +6272,8 @@ mod fxwr_decode_tests {
         assert_eq!(v["modules"][0]["param_bytes"], 3);
         assert_eq!(v["modules"][1]["id"], 1);
         assert_eq!(v["modules"][1]["domain_id"], 1);
-        assert_eq!(v["modules"][1]["pre_tick_drain"], true);
+        assert_eq!(v["modules"][1]["pre_pass"], true);
         assert_eq!(v["accept_cycles"], true);
-        assert_eq!(v["edge_slots"], 128);
         let e = &v["graph"][0];
         assert_eq!(
             (e["from_id"].clone(), e["to_id"].clone()),
@@ -6144,10 +6290,18 @@ mod fxwr_decode_tests {
         assert_eq!(e["rate"], "transaction");
         assert_eq!(e["wake"], true);
         assert_eq!(v["graph"].as_array().unwrap().len(), 2);
+        assert_eq!(v["domains"].as_array().unwrap().len(), 1);
         assert_eq!(v["domains"][0]["tick_us"], 1000);
-        assert_eq!(v["domains"][0]["exec_mode"], 1);
+        assert_eq!(v["domains"][0]["tick_min_us"], 250);
+        assert_eq!(v["domains"][0]["tick_max_us"], 8000);
+        assert_eq!(v["domains"][0]["exec"], "tick");
         assert_eq!(v["hardware"]["gpio"], 2);
         assert_eq!(v["hardware"]["uart"], 1);
+        assert_eq!(v["workloads"][0]["idle_safe"], true);
+        assert_eq!(v["workloads"][0]["blob_bytes"], 4);
+        assert_eq!(v["envelope"][0]["pool"], 5);
+        assert_eq!(v["envelope"][0]["n"], 40);
+        assert_eq!(v["demand"][0]["n"], 3);
     }
 
     /// Every prefix of a blob is refused with an error, never a panic.
@@ -6162,25 +6316,36 @@ mod fxwr_decode_tests {
         }
     }
 
-    /// Only the version the builder writes decodes, and a wrong magic or a
-    /// module entry whose length leaves its section is refused.
+    /// A wrong magic, a flipped byte under the checksum and a module record
+    /// whose length leaves its section are refused, naming what the codec
+    /// found.
     #[test]
-    fn foreign_versions_magics_and_entry_lengths_are_refused() {
-        for v in [0u16, 2, 3] {
-            let mut d = blob();
-            d[4..6].copy_from_slice(&v.to_le_bytes());
-            let err = decode_config(&d).unwrap_err().to_string();
-            assert!(err.contains("not supported"), "{err}");
-        }
+    fn foreign_magics_corruption_and_entry_lengths_are_refused() {
         let mut d = blob();
-        d[..4].copy_from_slice(&0x4643_5846u32.to_le_bytes());
-        assert!(decode_config(&d).is_err());
-        let mut d = blob();
-        d[22..26].copy_from_slice(&u32::MAX.to_le_bytes());
+        d[..4].copy_from_slice(b"FXWR");
         assert!(decode_config(&d)
             .unwrap_err()
             .to_string()
-            .contains("does not fit"));
+            .contains("bad magic"));
+        let mut d = blob();
+        let last = d.len() - 1;
+        d[last] ^= 0x01;
+        assert!(decode_config(&d)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum"));
+        // The first module record's length, after the 16-byte header, the
+        // GRPH section head and the graph header; the checksum re-computed
+        // so the length check is what refuses it.
+        let mut d = blob();
+        let at = 16 + 8 + 12;
+        d[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let crc = fluxor_contracts::boot_config::crc32(&d[12..]);
+        d[8..12].copy_from_slice(&crc.to_le_bytes());
+        assert!(decode_config(&d)
+            .unwrap_err()
+            .to_string()
+            .contains("module record length"));
     }
 }
 
@@ -6393,6 +6558,7 @@ mod boot_plan_tests {
     use crate::capacity::{
         check_boot_plan, fan_count, plan_pool, resident_demand, GraphShape, PoolFigures,
     };
+    use fluxor_contracts::boot_config::WorkloadRecord;
 
     fn shape(modules: u64, edges: u64) -> GraphShape {
         GraphShape {
@@ -6523,7 +6689,7 @@ mod boot_plan_tests {
         );
     }
 
-    /// Declared demand adds to the derived part, as FXDM does in the kernel.
+    /// Declared demand adds to the derived part, as `DMND` does in the kernel.
     #[test]
     fn declared_demand_is_derived() {
         let declared = figures(&[("store_subs", 400)]);
@@ -6558,8 +6724,8 @@ mod boot_plan_tests {
     /// The resident-workload section is read as the kernel reads it: its
     /// workloads, their modules and their edges.
     #[test]
-    fn resident_demand_reads_the_encoded_section() {
-        use crate::add_subgraph::{encode_workload_section, Workload, WorkloadModule};
+    fn resident_demand_reads_the_encoded_workloads() {
+        use crate::add_subgraph::{encode_add_subgraph, Workload, WorkloadModule};
         let module = || WorkloadModule {
             name_hash: 1,
             domain_id: 0,
@@ -6574,11 +6740,15 @@ mod boot_plan_tests {
             edges: vec![],
             idle_safe: false,
         };
-        let section = encode_workload_section(&[workload(2), workload(3)]).expect("section");
-        assert_eq!(resident_demand(&section), (2, 5, 0));
+        let blobs = [workload(2), workload(3)].map(|w| encode_add_subgraph(&w).expect("blob"));
+        let records = blobs.each_ref().map(|blob| WorkloadRecord {
+            idle_safe: false,
+            blob,
+        });
+        assert_eq!(resident_demand(&records), (2, 5, 0));
         assert_eq!(resident_demand(&[]), (0, 0, 0));
         let mut s = shape(4, 0);
-        (s.workloads, s.workload_modules, s.workload_edges) = resident_demand(&section);
+        (s.workloads, s.workload_modules, s.workload_edges) = resident_demand(&records);
         assert_eq!(plan_pool("linux", "owners", &s, NONE, NONE).derived, 3);
         // RP plans its owner table from the same demand. wasm's is a static
         // table holding the system slot alone, so the kernel refuses the
@@ -6978,7 +7148,9 @@ mod record_limit_tests {
     fn a_producer_record_past_a_consumer_bound_is_refused_fans_included() {
         check(None, &[(1483, false)]).unwrap();
         check(None, &[(2048, false), (1500, true)]).unwrap();
-        let e = check(None, &[(2048, false), (1482, true)]).unwrap_err().to_string();
+        let e = check(None, &[(2048, false), (1482, true)])
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("1483") && e.contains("1482"), "{e}");
         // An undeclared bound (a port with no record facts) is not compared.
         check(None, &[(0, false)]).unwrap();
@@ -6992,7 +7164,10 @@ mod record_limit_tests {
         let e = check(Some(0), &[(1483, true), (1483, false)])
             .unwrap_err()
             .to_string();
-        assert!(e.contains("tcp_send_buf: 0") && e.contains("retains_send"), "{e}");
+        assert!(
+            e.contains("tcp_send_buf: 0") && e.contains("retains_send"),
+            "{e}"
+        );
     }
 
     #[test]

@@ -178,6 +178,11 @@ fn debug_drain_poll() {
 fn rp_boot_hardware() -> Option<(Hardware, planner::ResourcePlan)> {
     log::info!("[fluxor] starting");
 
+    // HAL ops, syscall table, providers: before the graph image is read,
+    // since admitting it asks the HAL for the signing root, and before any
+    // bus init so module syscalls reach a populated dispatch table.
+    fluxor::kernel::boot(&RP_HAL_OPS);
+
     // --- Resolve resource plan (max_gpio from config target) ---
     let hw = Hardware::new();
     let max_gpio = hw.raw_config().max_gpio;
@@ -191,10 +196,6 @@ fn rp_boot_hardware() -> Option<(Hardware, planner::ResourcePlan)> {
     };
 
     planner::log_plan(&plan);
-
-    // HAL ops, syscall table, providers — must run before any bus
-    // init so module syscalls reach a populated dispatch table.
-    fluxor::kernel::boot(&RP_HAL_OPS);
 
     // --- SPI: mark available buses (PIC module does actual peripheral init) ---
     for spi_cfg in plan.spi.iter().flatten() {

@@ -23,9 +23,6 @@ const GUARD_BYTES: usize = 4096;
 const STACK_BYTES: usize = 1024 * 1024;
 const SLAB_BYTES: usize = GUARD_BYTES + STACK_BYTES;
 const START_WAIT_US: u64 = 1_000_000;
-/// The lockup probe masks the first secondary's interrupts this long after it
-/// comes up.
-const PROBE_AFTER_US: u64 = 3_000_000;
 /// A core whose tick count has not moved for this long is reported.
 const STALLED_US: u64 = 2_000_000;
 
@@ -51,7 +48,6 @@ static mut STACKS: Slabs = Slabs(
 /// unused): the redistributor it owns on a GICv3, its tick period.
 static mut REDISTRIBUTOR: [usize; MAX_SECONDARIES + 1] = [0; MAX_SECONDARIES + 1];
 static mut PERIOD_TICKS: u32 = 0;
-static mut PROBE: bool = false;
 /// The `CORE_TICKS` slot each secondary counts its ticks in: the core number
 /// the architecture code derives from its MPIDR (`cpu::current_core_id`).
 static mut TICK_SLOT: [usize; MAX_SECONDARIES + 1] = [0; MAX_SECONDARIES + 1];
@@ -88,7 +84,6 @@ pub unsafe fn start(
     machine: &acpi::Machine,
     redistributor_of: impl Fn(u64) -> Option<usize>,
     period_ticks: u32,
-    probe: bool,
     now_us: impl Fn() -> u64,
 ) -> (usize, usize) {
     let boot: u64;
@@ -96,7 +91,6 @@ pub unsafe fn start(
     let affinity = |m: u64| m & 0xFF_00FF_FFFF;
     let number = |m: u64| ((m >> cpu::core_id_shift()) & 0xFF) as usize;
     PERIOD_TICKS = period_ticks;
-    PROBE = probe;
     // The boot core's slot, clamped as the tick handler clamps it.
     let mut taken = 1u64 << number(boot).min(exception::MAX_CORES - 1);
     let mut next = 1usize;
@@ -225,20 +219,9 @@ extern "C" fn secondary_main(number: u64) -> ! {
         core::arch::asm!("msr daifclr, #2");
     }
     ONLINE[n].store(1, Ordering::Release);
-    // SAFETY: set before this core was woken.
-    let probe = unsafe { PROBE } && n == 1;
-    let probe_at = timer::read_timer_count_64() + PROBE_AFTER_US * timer::timer_freq() / 1_000_000;
     loop {
         // SAFETY: parks until the tick.
         unsafe { core::arch::asm!("wfi") };
-        if probe && timer::read_timer_count_64() >= probe_at {
-            // The deliberate lockup: interrupts off, and spin.
-            // SAFETY: masks this core's interrupts only.
-            unsafe { core::arch::asm!("msr daifset, #2") };
-            loop {
-                core::hint::spin_loop();
-            }
-        }
         if domains::released() && domains::is_active(n) {
             log::info!("[smp] core={n} running domain={n}");
             let ticks = domains::seed_core_tick(n);

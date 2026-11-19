@@ -275,7 +275,7 @@ per-unit rule, `heap_per_demand` or `heap_per_param`.
 
 What a module will ask of a kernel pool at run time is declared demand
 (`capacity::DECLARED_DEMAND`: `store_subscriptions` → `store_subs`,
-`store_subscribers` → `events`), summed by the composer into the FXDM section
+`store_subscribers` → `events`), summed by the composer into the boot config's `DMND` section
 and added to the pool's derived size. A per-type constant
 (`store_subscriptions = 2`) overstates or understates a module whose
 instances watch what their params name, so the type can count it instead:

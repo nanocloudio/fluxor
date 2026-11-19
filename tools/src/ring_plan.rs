@@ -5,14 +5,12 @@
 //! fan-out tees and fan-in merges the kernel inserts, its mailbox aliasing,
 //! and the consumer-side ring a multi-domain platform adds for each edge that
 //! crosses domains — sizing each ring by the kernel's own rule
-//! (`src/kernel/ipc/ring_size.rs`, mounted here by path). The composer sums a
+//! (`fluxor_contracts::ring_size`). The composer sums a
 //! graph's rings with it (`ring_demand`); the harness test `ring_demand`
 //! mounts this file too, boots graphs through the real `prepare_graph` and
 //! pins the arena it leaves used against the plan.
 
-#[path = "../../src/kernel/ipc/ring_size.rs"]
-mod ring_size;
-pub use ring_size::*;
+pub use fluxor_contracts::ring_size::*;
 
 pub use self::plan::*;
 

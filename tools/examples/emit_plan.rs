@@ -61,7 +61,7 @@ fn main() {
     // departing occupants, so no revocation records can be minted and
     // the plan stays byte-deterministic for host validation.
     let plan = compose(&ds, &cap, &snap, &[], 0, &[], 0).expect("compose");
-    let bytes = encode_plan(&plan);
+    let bytes = encode_plan(&plan).expect("encode");
     std::fs::write(&out, &bytes).expect("write plan");
     eprintln!(
         "wrote {} ({} bytes): gen={} assignments={} (slot {} owns modules [{}..{}))",

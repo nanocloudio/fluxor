@@ -188,8 +188,8 @@ pub const ARTIFACT_CLASSES: &[&str] = &[
     // A GPT disk image with one FAT ESP: the UEFI loader and the packed
     // kernel image. What a cloud or an emulator boots.
     "uefi_disk",
-    // A small FAT disk image carrying a hosted runtime, its config and
-    // modules, for a machine that already runs an OS.
+    // A small FAT disk image carrying a hosted runtime and its graph
+    // image, for a machine that already runs an OS.
     "hosted_bundle",
 ];
 

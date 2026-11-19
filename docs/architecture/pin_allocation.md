@@ -21,7 +21,7 @@ The pieces:
 - **Config validation** (`tools/src/board.rs`,
   `tools/src/config/validate.rs`) — checks the YAML `hardware:` section
   against the resolved target and packs the binary hardware section.
-- **Runtime bring-up** (`src/kernel/boot/config.rs`) — parses the binary
+- **Runtime bring-up** (`src/platform/rp/config.rs`) — parses the binary
   section into `HardwareConfig` and initialises buses and pins into a
   `HardwareContext` before graph start.
 
@@ -132,10 +132,14 @@ Diagnostics are deterministic and name the offending config path
 ## Binary hardware section
 
 Source: `tools/src/config/validate.rs::build_hardware_section` (encoder),
-`src/kernel/boot/config.rs::parse_hardware_section` (decoder).
+`src/platform/rp/config.rs` (decoder).
 
-The validated section is packed into the binary graph config that the
-kernel reads at boot:
+The validated section rides the boot config as its `HWRP` section
+(`fluxor_contracts::boot_config`), under the config's one checksum. It is
+RP pin policy: the composer emits it for RP targets only (with zero counts
+when the graph has no `hardware:`), refuses a `hardware:` that configures
+anything on another target, and a non-RP kernel refuses a config that
+carries one. Its payload:
 
 ```
 header (6 bytes): spi_count, i2c_count, gpio_count, pio_count, max_gpio, uart_count
@@ -150,16 +154,16 @@ GPIO `flags`: bit 0 direction (0 = input, 1 = output), bits 1–2 pull
 (0 = none, 1 = up, 2 = down). `owner_module_id` is the owning module's
 index, `0xFF` for kernel-owned.
 
-The kernel enforces the same count ceilings when parsing
-(`src/kernel/boot/config.rs`): `MAX_SPI_BUSES = 2`, `MAX_I2C_BUSES = 2`,
+The RP platform enforces the same count ceilings when parsing
+(`src/platform/rp/config.rs`): `MAX_SPI_BUSES = 2`, `MAX_I2C_BUSES = 2`,
 `MAX_UART_BUSES = 2`, `MAX_GPIO_CONFIGS = 8`, `MAX_PIO_CONFIGS = 3`.
 A section whose counts exceed them is rejected at boot.
 
 ## Runtime bring-up
 
-Source: `src/kernel/boot/config.rs`.
+Source: `src/platform/rp/config.rs`.
 
-`parse_hardware_section` decodes the section into `HardwareConfig`
+The RP platform decodes the section into `HardwareConfig`
 (fixed-size `Option` arrays per bus family). Platform bring-up walks it
 to initialise SPI/I2C/UART buses and register GPIO pins into a
 `HardwareContext` before module instantiation, so a module's first

@@ -114,12 +114,10 @@ pub struct TransportArgs {
     /// A fluxor-linux to carry frames over mutual TLS.
     #[arg(long)]
     pub runtime: Option<PathBuf>,
-    /// The runtime's built graph (includes the `agent_listen` or `agent_dial` stack).
+    /// The runtime's graph image, as `fluxor build` writes it (a graph
+    /// that includes the `agent_listen` or `agent_dial` stack).
     #[arg(long, requires = "runtime")]
-    pub config: Option<PathBuf>,
-    /// The runtime's module table. Default: `modules.bin` beside `--config`.
-    #[arg(long, requires = "runtime")]
-    pub modules: Option<PathBuf>,
+    pub image: Option<PathBuf>,
     /// Where the runtime's log goes. Default: `serve` inherits stderr, `call`
     /// discards it.
     #[arg(long, requires = "runtime")]
@@ -311,22 +309,16 @@ fn hex_arg<const N: usize>(flag: &str, text: &str) -> Result<[u8; N]> {
     parse_hex::<N>(text).map_err(|e| Error::Config(format!("--{flag}: {e}")))
 }
 
-/// The runtime's module table: as given, or `modules.bin` beside its config.
-fn transport_files(t: &TransportArgs) -> Result<Option<(&Path, &Path, PathBuf)>> {
+/// The runtime and the graph image it is started with.
+fn transport_files(t: &TransportArgs) -> Result<Option<(&Path, &Path)>> {
     let Some(runtime) = t.runtime.as_deref() else {
         return Ok(None);
     };
-    let config = t
-        .config
+    let image = t
+        .image
         .as_deref()
-        .ok_or_else(|| Error::Config("--runtime needs --config".into()))?;
-    let modules = t.modules.clone().unwrap_or_else(|| {
-        config
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("modules.bin")
-    });
-    Ok(Some((runtime, config, modules)))
+        .ok_or_else(|| Error::Config("--runtime needs --image".into()))?;
+    Ok(Some((runtime, image)))
 }
 
 fn runtime_log(t: &TransportArgs, default: Stdio) -> Result<Stdio> {
@@ -379,10 +371,10 @@ fn serve(s: ServeArgs) -> Result<()> {
         serve_stream(&mut r, &mut w, PeerSource::Stamped, &ctx, &s.store)?;
         return Ok(());
     }
-    let (runtime, config, modules) =
+    let (runtime, image) =
         transport_files(&s.transport)?.ok_or_else(|| Error::Config("no transport".into()))?;
     let log = runtime_log(&s.transport, Stdio::inherit())?;
-    let mut child = spawn_transport(runtime, config, &modules, log)
+    let mut child = spawn_transport(runtime, image, log)
         .map_err(|e| Error::Config(format!("start {}: {e}", runtime.display())))?;
     let mut w = child
         .stdin
@@ -510,10 +502,10 @@ fn call(c: CallArgs) -> Result<()> {
         write_frame(&mut conn, &[0; 32], &record[..len])?;
         (first_frame(frame_reader(conn.try_clone()?), timeout), false)
     } else {
-        let (runtime, config, modules) =
+        let (runtime, image) =
             transport_files(&c.transport)?.ok_or_else(|| Error::Config("no transport".into()))?;
         let log = runtime_log(&c.transport, Stdio::null())?;
-        let mut child = spawn_transport(runtime, config, &modules, log)
+        let mut child = spawn_transport(runtime, image, log)
             .map_err(|e| Error::Config(format!("start {}: {e}", runtime.display())))?;
         let mut w = child
             .stdin

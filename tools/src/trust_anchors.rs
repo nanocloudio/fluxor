@@ -24,11 +24,9 @@
 
 use std::path::Path;
 
-use crate::hash::{crc16_ccitt, fnv1a_hash};
+use fluxor_contracts::boot_config::{self, BootConfigSpec, ModuleRecord};
 
-/// The FXWR config-blob magic (`kernel::config::MAGIC_CONFIG`), the one
-/// definition the writer (`config::MAGIC_FXWR`) and the re-sealer share.
-pub const FXWR_MAGIC: u32 = 0x5257_5846;
+use crate::hash::fnv1a_hash;
 
 /// Most anchors one instance holds — `MAX_ANCHORS` in the tls and quic
 /// modules. A private domain has one; a rotation has two.
@@ -272,32 +270,6 @@ pub fn encode_ext(tag: u8, certs: &[Vec<u8>]) -> Vec<u8> {
 // The operator channel: widening client instances of a built config blob
 // ---------------------------------------------------------------------------
 
-/// Size of the FXWR header (`kernel::config::read_config_from_slice`).
-const HEADER_SIZE: usize = 16;
-/// Size of a 128-slot graph section (slot code 0): a 4-byte header, 128 edges
-/// of 12 bytes, and four 4-byte domain-metadata entries. A blob states its own
-/// slot count in graph-section byte 3 — see [`graph_section_size`]. Only the
-/// test fixtures build a section from scratch, so only they need the size.
-#[cfg(test)]
-const GRAPH_SECTION_SIZE: usize = 4 + 128 * 12 + 4 * 4;
-
-/// The graph section's size as the blob lays it out: its byte 3 is the edge
-/// slot code (`kernel::config::GRAPH_SLOTS_CODE`), so a host-profile blob with
-/// 384 slots is re-sealed at the right offsets without knowing its target.
-fn graph_section_size(blob: &[u8], at: usize) -> usize {
-    let code = blob.get(at + 3).copied().unwrap_or(0);
-    4 + crate::capacity::edges_for_slots_code(code) * 12 + 4 * 4
-}
-/// Per-entry sizes of the hardware section, after its 6-byte header
-/// (spi, i2c, gpio, pio, reserved, uart counts).
-const SPI_CONFIG_BIN_SIZE: usize = 8;
-const I2C_CONFIG_BIN_SIZE: usize = 8;
-const UART_CONFIG_BIN_SIZE: usize = 8;
-const GPIO_CONFIG_BIN_SIZE: usize = 5;
-const PIO_CONFIG_BIN_SIZE: usize = 4;
-/// Module-entry header: entry_length u32, name_hash u32, id u8, meta u8.
-const ENTRY_HEADER: usize = 10;
-
 /// What `--ca` did to a blob.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Widened {
@@ -306,7 +278,7 @@ pub struct Widened {
 }
 
 /// Append `anchors` to every CLIENT-MODE `tls` and `quic` instance in a
-/// built FXWR config blob, under [`TAG_OPERATOR_TRUST`], and return the
+/// built config blob, under [`TAG_OPERATOR_TRUST`], and return the
 /// re-sealed blob.
 ///
 /// A server instance is never touched, whether or not it verifies its
@@ -428,90 +400,49 @@ pub fn append_operator_identity(
 /// params in; the extended entry to append (or `None`) out.
 type Extend<'a> = dyn FnMut(u32, u16, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
 
-/// Rewrite the module entries of a built FXWR config blob and re-seal it.
-/// `extend` sees each entry's module type, id and params, and answers the
-/// bytes to append to that entry's params (an extended TLV entry), or
-/// `None` to leave it as it was.
+/// Rewrite the module records of a built config blob and re-seal it.
+/// `extend` sees each record's module type, id and params, and answers the
+/// bytes to append to that record's params (an extended TLV entry), or
+/// `None` to leave it as it was. The blob is decoded and re-encoded by the
+/// codec the kernel boots with: every other record and section is carried
+/// over as decoded, and the new blob has its own length and checksum.
 fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Widened), String> {
-    if blob.len() < HEADER_SIZE + 6 {
-        return Err("config blob too short".to_string());
-    }
-    if u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) != FXWR_MAGIC {
-        return Err("config blob has no FXWR header".to_string());
-    }
-    // Module section header: count low byte, count high byte, section size.
-    let module_count = u16::from_le_bytes([blob[HEADER_SIZE], blob[HEADER_SIZE + 1]]) as usize;
-    let section_size = u32::from_le_bytes([
-        blob[HEADER_SIZE + 2],
-        blob[HEADER_SIZE + 3],
-        blob[HEADER_SIZE + 4],
-        blob[HEADER_SIZE + 5],
-    ]) as usize;
-    let entries_start = HEADER_SIZE + 6;
-    let entries_end = entries_start + section_size;
-    if entries_end > blob.len() {
-        return Err("module section runs past the blob".to_string());
-    }
-
-    let mut entries: Vec<u8> = Vec::with_capacity(section_size + 4096);
+    let cfg = boot_config::decode(blob).map_err(|e| format!("config blob refused: {e}"))?;
+    let graph = cfg.graph();
     let mut widened = Widened::default();
-    let mut off = entries_start;
-    for _ in 0..module_count {
-        if off + ENTRY_HEADER > entries_end {
-            return Err("module entry header runs past the section".to_string());
+    let mut params: Vec<Vec<u8>> = Vec::with_capacity(usize::from(graph.module_count()));
+    for m in graph.modules() {
+        let mut p = m.params.to_vec();
+        if let Some(ext) = extend(m.name_hash, m.id, m.params)? {
+            p.extend_from_slice(&ext);
+            widened.instances.push(m.id);
         }
-        let entry_len =
-            u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]) as usize;
-        if entry_len < ENTRY_HEADER || off + entry_len > entries_end {
-            return Err("module entry length out of range".to_string());
-        }
-        let entry = &blob[off..off + entry_len];
-        let name_hash = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-        let id = entry_module_id(entry[8], entry[9]);
-        let params = &entry[ENTRY_HEADER..];
-        match extend(name_hash, id, params)? {
-            Some(ext) => {
-                let new_len = entry_len + ext.len();
-                entries.extend_from_slice(&(new_len as u32).to_le_bytes());
-                entries.extend_from_slice(&entry[4..]);
-                entries.extend_from_slice(&ext);
-                widened.instances.push(id);
-            }
-            None => entries.extend_from_slice(entry),
-        }
-        off += entry_len;
+        params.push(p);
     }
-
-    // Re-seal: the body the header's CRC covers is the header tail, the
-    // module section, the graph section and the hardware section; the
-    // adaptive post-body and the section chain after it are copied as
-    // they were.
-    let hw_off = entries_end + graph_section_size(blob, entries_end);
-    if blob.len() < hw_off + 6 {
-        return Err("hardware section header runs past the blob".to_string());
-    }
-    let hw = &blob[hw_off..hw_off + 6];
-    let hw_size = 6
-        + hw[0] as usize * SPI_CONFIG_BIN_SIZE
-        + hw[1] as usize * I2C_CONFIG_BIN_SIZE
-        + hw[2] as usize * GPIO_CONFIG_BIN_SIZE
-        + hw[3] as usize * PIO_CONFIG_BIN_SIZE
-        + hw[5] as usize * UART_CONFIG_BIN_SIZE;
-    let body_end = hw_off + hw_size;
-    if body_end > blob.len() {
-        return Err("hardware section runs past the blob".to_string());
-    }
-
-    let mut out = Vec::with_capacity(blob.len() + entries.len() - section_size);
-    out.extend_from_slice(&blob[..HEADER_SIZE]);
-    out.push(blob[HEADER_SIZE]);
-    out.push(blob[HEADER_SIZE + 1]);
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    out.extend_from_slice(&entries);
-    out.extend_from_slice(&blob[entries_end..body_end]);
-    let checksum = crc16_ccitt(&out[8..]);
-    out[6..8].copy_from_slice(&checksum.to_le_bytes());
-    out.extend_from_slice(&blob[body_end..]);
+    let modules: Vec<ModuleRecord<'_>> = graph
+        .modules()
+        .zip(&params)
+        .map(|(m, p)| ModuleRecord { params: p, ..m })
+        .collect();
+    let edges: Vec<boot_config::EdgeRecord> = graph.edges().collect();
+    let domains: Vec<boot_config::DomainRecord> = graph.domains().collect();
+    let workloads: Option<Vec<boot_config::WorkloadRecord<'_>>> =
+        cfg.workloads().map(|w| w.iter().collect());
+    let envelope: Option<Vec<boot_config::PoolEntry>> = cfg.envelope().map(|e| e.iter().collect());
+    let demand: Option<Vec<boot_config::PoolEntry>> = cfg.demand().map(|d| d.iter().collect());
+    let out = boot_config::encode(&BootConfigSpec {
+        tick_us: graph.tick_us,
+        graph_sample_rate: graph.graph_sample_rate,
+        graph_flags: graph.graph_flags,
+        modules: &modules,
+        edges: &edges,
+        domains: &domains,
+        hardware: cfg.hardware(),
+        workloads: workloads.as_deref(),
+        envelope: envelope.as_deref(),
+        demand: demand.as_deref(),
+    })
+    .map_err(|e| e.to_string())?;
     Ok((out, widened))
 }
 
@@ -570,16 +501,6 @@ fn basic_param(params: &[u8], want: u8) -> Option<&[u8]> {
         pos += 2 + len;
     }
     None
-}
-
-/// A module entry's 12-bit module id: the low byte at entry byte 8; entry
-/// byte 9 carries id bits 8-9 in its bits 5-6, bit 10 in bit 7 and bit 11 in
-/// bit 3, beside the domain (bits 0-2) and the pre-tick-drain flag (bit 4).
-fn entry_module_id(b8: u8, b9: u8) -> u16 {
-    u16::from(b8)
-        | (u16::from((b9 >> 5) & 0x03) << 8)
-        | (u16::from(b9 >> 7) << 10)
-        | (u16::from((b9 >> 3) & 0x01) << 11)
 }
 
 /// Where the basic TLV section ends and the extended entries begin: past its
@@ -643,21 +564,6 @@ mod tests {
         v
     }
 
-    /// The id reads back every bit the graph builder packs into an entry,
-    /// and none of byte 9's domain or pre-tick-drain bits.
-    #[test]
-    fn entry_module_id_reads_all_twelve_bits() {
-        for id in [0u16, 1, 0xFF, 0x100, 0x300, 0x400, 0x800, 0xABC, 0xFFF] {
-            let b8 = (id & 0xFF) as u8;
-            let b9 = 0x07
-                | 0x10
-                | (((id >> 8) as u8 & 0x03) << 5)
-                | (((id >> 10) as u8 & 0x01) << 7)
-                | (((id >> 11) as u8 & 0x01) << 3);
-            assert_eq!(entry_module_id(b8, b9), id, "id {id:#x}");
-        }
-    }
-
     #[test]
     fn file_source_accepts_only_the_spec_form() {
         assert_eq!(file_source("${file:pki/ca.der}"), Some("pki/ca.der"));
@@ -703,35 +609,15 @@ mod tests {
         assert!(parse_bundle(&big).unwrap_err().contains("over the"));
     }
 
-    /// A minimal FXWR blob: header, module section with the given entries,
-    /// an empty graph section, an empty hardware section, the 16-byte
-    /// adaptive post-body and a trailing section-chain payload.
-    fn blob(entries: &[Vec<u8>]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&FXWR_MAGIC.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.push(entries.len() as u8);
-        out.push(0);
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        let section: usize = entries.iter().map(Vec::len).sum();
-        out.push(entries.len() as u8);
-        out.push(0);
-        out.extend_from_slice(&(section as u32).to_le_bytes());
-        for e in entries {
-            out.extend_from_slice(e);
-        }
-        out.extend_from_slice(&[0u8; GRAPH_SECTION_SIZE]);
-        out.extend_from_slice(&[0u8; 6]);
-        let crc = crc16_ccitt(&out[8..]);
-        out[6..8].copy_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&[0u8; 16]);
-        out.extend_from_slice(b"TAIL");
-        out
+    /// A module record of the given type and id: domain 1, pre-pass set, so
+    /// a re-seal that dropped either would show.
+    struct Entry {
+        name_hash: u32,
+        id: u16,
+        params: Vec<u8>,
     }
 
-    fn entry(type_name: &str, id: u8, basic: &[(u8, u8)], ext: &[u8]) -> Vec<u8> {
+    fn entry(type_name: &str, id: u16, basic: &[(u8, u8)], ext: &[u8]) -> Entry {
         let mut body = Vec::new();
         for (tag, v) in basic {
             body.extend_from_slice(&[*tag, 1, *v]);
@@ -741,13 +627,114 @@ mod tests {
         let mut params = vec![0xFE, 0x01, body.len() as u8, (body.len() >> 8) as u8];
         params.extend_from_slice(&body);
         params.extend_from_slice(ext);
-        let mut e = Vec::new();
-        e.extend_from_slice(&((ENTRY_HEADER + params.len()) as u32).to_le_bytes());
-        e.extend_from_slice(&fnv1a_hash(type_name.as_bytes()).to_le_bytes());
-        e.push(id);
-        e.push(0);
-        e.extend_from_slice(&params);
-        e
+        Entry {
+            name_hash: fnv1a_hash(type_name.as_bytes()),
+            id,
+            params,
+        }
+    }
+
+    fn record(e: &Entry) -> ModuleRecord<'_> {
+        ModuleRecord {
+            name_hash: e.name_hash,
+            id: e.id,
+            domain: 1,
+            pre_pass: true,
+            params: &e.params,
+        }
+    }
+
+    const EDGES: [boot_config::EdgeRecord; 1] = [boot_config::EdgeRecord {
+        from: 0,
+        to: 1,
+        from_port: 2,
+        to_port: 3,
+        to_ctrl: true,
+        class: boot_config::EdgeClass::CrossCore,
+        buffer_group: 4,
+        rate_class: 1,
+        wake_on_write: false,
+        retains_send: true,
+        buffer_bytes: 4096,
+    }];
+    const DOMAINS: [boot_config::DomainRecord; 2] = [
+        boot_config::DomainRecord {
+            tick_us: 1000,
+            tick_min_us: 500,
+            tick_max_us: 4000,
+            exec_mode: boot_config::ExecMode::Tick,
+            adaptive_flags: boot_config::ADAPTIVE_CADENCE,
+        },
+        boot_config::DomainRecord {
+            tick_us: 250,
+            tick_min_us: 0,
+            tick_max_us: 0,
+            exec_mode: boot_config::ExecMode::Poll,
+            adaptive_flags: 0,
+        },
+    ];
+    const HARDWARE: [u8; 6] = [0, 0, 0, 0, 0, 0];
+    const FLXA: [u8; 3] = [7, 8, 9];
+    const ENVELOPE: [boot_config::PoolEntry; 1] = [boot_config::PoolEntry { pool: 5, n: 33 }];
+    const DEMAND: [boot_config::PoolEntry; 1] = [boot_config::PoolEntry { pool: 10, n: 2 }];
+
+    /// A built config holding `entries`, with an edge, two domains, a
+    /// hardware payload, a resident workload, an envelope and a demand
+    /// section beside them, so a re-seal that lost any of them would show.
+    fn blob(entries: &[Entry]) -> Vec<u8> {
+        let modules: Vec<ModuleRecord<'_>> = entries.iter().map(record).collect();
+        let workloads = [boot_config::WorkloadRecord {
+            idle_safe: true,
+            blob: &FLXA,
+        }];
+        boot_config::encode(&BootConfigSpec {
+            tick_us: 1000,
+            graph_sample_rate: 48_000,
+            graph_flags: boot_config::GRAPH_FLAG_ACCEPT_CYCLES,
+            modules: &modules,
+            edges: &EDGES,
+            domains: &DOMAINS,
+            hardware: Some(&HARDWARE),
+            workloads: Some(&workloads),
+            envelope: Some(&ENVELOPE),
+            demand: Some(&DEMAND),
+        })
+        .expect("encodes")
+    }
+
+    /// Everything but the module params decodes from `after` as `blob`
+    /// built it; returns each module's `(id, params)`.
+    fn reseal_kept_the_rest(after: &[u8], ids: &[u16]) -> Vec<(u16, Vec<u8>)> {
+        let cfg = boot_config::decode(after).expect("the re-sealed blob decodes");
+        assert_eq!(cfg.total_len(), after.len());
+        let g = cfg.graph();
+        assert_eq!(
+            (g.tick_us, g.graph_sample_rate, g.graph_flags),
+            (1000, 48_000, boot_config::GRAPH_FLAG_ACCEPT_CYCLES)
+        );
+        assert_eq!(g.edges().collect::<Vec<_>>(), EDGES);
+        assert_eq!(g.domains().collect::<Vec<_>>(), DOMAINS);
+        assert_eq!(cfg.hardware(), Some(&HARDWARE[..]));
+        let w: Vec<_> = cfg.workloads().expect("WKLD").iter().collect();
+        assert_eq!(
+            w,
+            [boot_config::WorkloadRecord {
+                idle_safe: true,
+                blob: &FLXA
+            }]
+        );
+        assert_eq!(
+            cfg.envelope().expect("ENVL").iter().collect::<Vec<_>>(),
+            ENVELOPE
+        );
+        assert_eq!(
+            cfg.demand().expect("DMND").iter().collect::<Vec<_>>(),
+            DEMAND
+        );
+        let modules: Vec<_> = g.modules().collect();
+        assert_eq!(modules.iter().map(|m| m.id).collect::<Vec<_>>(), ids);
+        assert!(modules.iter().all(|m| m.domain == 1 && m.pre_pass));
+        modules.iter().map(|m| (m.id, m.params.to_vec())).collect()
     }
 
     #[test]
@@ -758,90 +745,47 @@ mod tests {
         let server = entry("tls", 2, &[(1, 1), (2, 1), (11, 2)], &deployment);
         let quic_client = entry("quic", 3, &[(2, 0), (9, 1)], &deployment);
         let quic_server = entry("quic", 4, &[(9, 1)], &deployment); // mode absent = server
-        let other = entry("ip", 5, &[(1, 0)], &[]);
-        let before = blob(&[
-            client.clone(),
-            server.clone(),
-            quic_client.clone(),
-            quic_server.clone(),
-            other.clone(),
-        ]);
+        let other = entry("ip", 300, &[(1, 0)], &[]);
+        let before_params: Vec<Vec<u8>> = [&client, &server, &quic_client, &quic_server, &other]
+            .iter()
+            .map(|e| e.params.clone())
+            .collect();
+        let before = blob(&[client, server, quic_client, quic_server, other]);
 
         let extra = vec![seq(6, 8)];
         let (after, widened) = append_operator_anchors(&before, &extra).unwrap();
         assert_eq!(widened.instances, vec![1, 3]);
 
-        // Header counts and the tail survive; the section grew by exactly
-        // two operator blobs; the CRC re-seals the new body.
+        // The client records gain exactly the operator blob after their
+        // deployment tag; every other record is byte-identical, and every
+        // other section survives.
         let ext = encode_ext(TAG_OPERATOR_TRUST, &extra);
-        let section = u32::from_le_bytes([after[18], after[19], after[20], after[21]]) as usize;
-        let expected: usize = [&client, &server, &quic_client, &quic_server, &other]
-            .iter()
-            .map(|e| e.len())
-            .sum::<usize>()
-            + 2 * ext.len();
-        assert_eq!(section, expected);
-        assert!(after.ends_with(b"TAIL"));
-        let body_end = after.len() - 16 - 4;
-        let crc = crc16_ccitt(&after[8..body_end]);
-        assert_eq!(u16::from_le_bytes([after[6], after[7]]), crc);
-
-        // The client entries carry the operator tag after their deployment
-        // tag; the server entries are byte-identical.
-        let mut off = HEADER_SIZE + 6;
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            let len =
-                u32::from_le_bytes([after[off], after[off + 1], after[off + 2], after[off + 3]])
-                    as usize;
-            let e = &after[off..off + len];
-            let params = &e[ENTRY_HEADER..];
-            seen.push((
-                e[8],
+        let modules = reseal_kept_the_rest(&after, &[1, 2, 3, 4, 300]);
+        for (i, (id, params)) in modules.iter().enumerate() {
+            let widened = *id == 1 || *id == 3;
+            let mut expected = before_params[i].clone();
+            if widened {
+                expected.extend_from_slice(&ext);
+            }
+            assert_eq!(params, &expected, "module {id}");
+            assert_eq!(
                 ext_blob(params, TAG_OPERATOR_TRUST).map(<[u8]>::to_vec),
-            ));
-            off += len;
+                widened.then(|| extra[0].clone()),
+                "module {id}"
+            );
         }
-        assert_eq!(seen[0], (1, Some(extra[0].clone())));
-        assert_eq!(seen[1], (2, None));
-        assert_eq!(seen[2], (3, Some(extra[0].clone())));
-        assert_eq!(seen[3], (4, None));
-        assert_eq!(seen[4], (5, None));
-        assert_eq!(
-            &after[off..off + 2 * ext.len() - 2 * ext.len()],
-            &[] as &[u8]
-        );
-        let server_after = {
-            let mut o = HEADER_SIZE + 6;
-            let l0 =
-                u32::from_le_bytes([after[o], after[o + 1], after[o + 2], after[o + 3]]) as usize;
-            o += l0;
-            let l1 =
-                u32::from_le_bytes([after[o], after[o + 1], after[o + 2], after[o + 3]]) as usize;
-            after[o..o + l1].to_vec()
-        };
-        assert_eq!(server_after, server);
+        assert_eq!(after.len(), before.len() + 2 * ext.len());
     }
 
-    /// The extended entries of the `n`th module entry: (id, cert, key).
-    fn identity_of(after: &[u8], n: usize) -> (u8, Option<Vec<u8>>, Option<Vec<u8>>) {
-        let mut off = HEADER_SIZE + 6;
-        for i in 0.. {
-            let len =
-                u32::from_le_bytes([after[off], after[off + 1], after[off + 2], after[off + 3]])
-                    as usize;
-            if i == n {
-                let e = &after[off..off + len];
-                let params = &e[ENTRY_HEADER..];
-                return (
-                    e[8],
-                    ext_blob(params, TAG_CERT).map(<[u8]>::to_vec),
-                    ext_blob(params, TAG_KEY).map(<[u8]>::to_vec),
-                );
-            }
-            off += len;
-        }
-        unreachable!()
+    /// The extended entries of the `n`th module record: (id, cert, key).
+    fn identity_of(after: &[u8], n: usize) -> (u16, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let cfg = boot_config::decode(after).expect("decodes");
+        let m = cfg.graph().modules().nth(n).expect("module");
+        (
+            m.id,
+            ext_blob(m.params, TAG_CERT).map(<[u8]>::to_vec),
+            ext_blob(m.params, TAG_KEY).map(<[u8]>::to_vec),
+        )
     }
 
     #[test]
@@ -870,7 +814,7 @@ mod tests {
         let env_client = entry("tls", 8, &[(1, 0), (TAG_ENV_BIND, TAG_KEY_PATH)], &[]);
         let before = blob(&[
             bare_client,
-            server.clone(),
+            server,
             own_client,
             labelled,
             quic_client,
@@ -881,6 +825,7 @@ mod tests {
 
         let (after, given) = append_operator_identity(&before, &cert, &key).unwrap();
         assert_eq!(given.instances, vec![1]);
+        reseal_kept_the_rest(&after, &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             identity_of(&after, 0),
             (1, Some(cert.clone()), Some(key.clone()))
@@ -916,13 +861,18 @@ mod tests {
             (8, None, None),
             "an identity bound to the environment is kept"
         );
-        assert!(after.ends_with(b"TAIL"));
-        let body_end = after.len() - 16 - 4;
-        assert_eq!(
-            u16::from_le_bytes([after[6], after[7]]),
-            crc16_ccitt(&after[8..body_end])
-        );
         assert!(append_operator_identity(&before, &[], &key).is_err());
+    }
+
+    /// A blob the codec refuses is refused here too, naming why, and
+    /// nothing is re-sealed from it.
+    #[test]
+    fn a_corrupt_blob_is_refused_not_resealed() {
+        let mut before = blob(&[entry("tls", 1, &[(1, 0)], &[])]);
+        let last = before.len() - 1;
+        before[last] ^= 0x01;
+        let err = append_operator_anchors(&before, &[seq(2, 9)]).unwrap_err();
+        assert!(err.contains("refused"), "{err}");
     }
 
     #[test]

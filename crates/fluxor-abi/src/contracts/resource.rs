@@ -114,7 +114,10 @@ pub const fn is_arena(pool: u16) -> bool {
 
 /// The figure an envelope (or declared-demand) entry `n` states for `pool`:
 /// bytes for an arena (KiB × 1024 when [`ENTRY_KIB`] is set), slots
-/// otherwise.
+/// otherwise. The boot configuration carries these entries: an envelope
+/// entry is the pool's live-add reserve on top of what the graph derives (or
+/// the pool's whole size, for a pool the graph cannot derive), a demand entry
+/// what the graph's modules declare they will ask of it.
 pub const fn decode_entry(pool: u16, n: u32) -> u64 {
     if is_arena(pool) && n & ENTRY_KIB != 0 {
         ((n & !ENTRY_KIB) as u64) * 1024
@@ -196,53 +199,3 @@ pub const fn module_provided_pool_contract(pool: u16) -> Option<u16> {
         _ => None,
     }
 }
-
-// ── Capacity-envelope config section ───
-//
-// The composer's per-deployment pool envelope, carried as a post-body
-// config section, past the checksummed body.
-// Section layout, mirroring the resident-workload (FXPD) section's
-// self-describing header:
-//
-//   [FXEV u32][section_len u32][crc16 u16][entry_count u16]
-//   [entries: pool_id u16 LE + n u32 LE, ×entry_count]
-//
-// `crc16` covers `section[10..section_len]` (count + entries). The kernel
-// sizes each table from the config it parses — module slots from the module
-// and edge counts, channels from the edges, owners from the resident
-// workloads, store subscriptions from what the graph's store consumers
-// declare (the FXDM section below) — and an envelope entry is the pool's
-// LIVE-ADD RESERVE on top of that: the pool's ceiling is derived + `n`. A
-// pool with no structural source (events, timers, TTY sessions, …) is sized
-// by its entry alone. `n` is decoded by `decode_entry`: exact bytes for an
-// arena below 2 GiB, KiB past it (`ENTRY_KIB`, up to 2 TiB), the pool's own
-// unit otherwise. Absent entry ⇒ the platform's default reserve. An ask the
-// platform cannot hold (past a static table, past a format ceiling, or
-// memory the host refuses) is refused at boot with the pool named; it is
-// never clamped.
-/// Envelope section magic: "FXEV".
-pub const ENVELOPE_SECTION_MAGIC: u32 = 0x4658_4556;
-/// One envelope entry: `pool_id u16 LE + n u32 LE`.
-pub const ENVELOPE_ENTRY_SIZE: usize = 6;
-/// Section header: magic + section_len + crc16 + entry_count.
-pub const ENVELOPE_HEADER_SIZE: usize = 12;
-/// Bounds a torn or hostile tail (more entries than pools can exist).
-pub const MAX_ENVELOPE_ENTRIES: usize = 64;
-/// Largest envelope section the kernel will read.
-pub const MAX_ENVELOPE_SECTION_BYTES: usize =
-    ENVELOPE_HEADER_SIZE + MAX_ENVELOPE_ENTRIES * ENVELOPE_ENTRY_SIZE;
-
-// ── Declared-demand config section ─
-//
-// What the graph's modules declare they will ask of a kernel pool at run
-// time, summed per pool by the composer from each module's manifest
-// (`[capacities] store_subscriptions = n`, …). The kernel adds it to the
-// pool's derived size, so a pool such as the store's subscription table is
-// sized from the graph that boots rather than from a constant. Same shape as
-// the envelope section, after it:
-//
-//   [FXDM u32][section_len u32][crc16 u16][entry_count u16]
-//   [entries: pool_id u16 LE + n u32 LE, ×entry_count]
-
-/// Declared-demand section magic: "FXDM".
-pub const DEMAND_SECTION_MAGIC: u32 = 0x4658_444D;

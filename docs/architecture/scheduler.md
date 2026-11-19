@@ -10,19 +10,20 @@ Source: `src/kernel/exec/scheduler/mod.rs`, `src/kernel/exec/isr_tier.rs`
 
 ## Tier surface
 
-| Tier | Wire byte (`exec_mode`) | Execution context | Cycle budget | Budget enforcement | Allowed syscalls | Use cases |
+| Tier | Domain `exec:` (wire byte) | Execution context | Cycle budget | Budget enforcement | Allowed syscalls | Use cases |
 |------|-------------------------|-------------------|--------------|--------------------|------------------|-----------|
-| **0** Cooperative | 0 | Main scheduler loop, 1 ms tick | per-module `step_deadline_us` | Overrun is detected by the step guard, never pre-empted — see [Deadline enforcement](#deadline-enforcement) | full (heap, `provider_call`, `channel_*`) | most modules |
-| **1a** High-rate cooperative | 1 | Sub-ms timer-driven cooperative tick | per-module `step_deadline_us` | As Tier 0 | full | audio loops, control loops |
-| **1b** Timer ISR | 2 | Polled-timer ISR (BCM2712: soft-polled from the scheduler thread; RP: real timer ISR) | `DEFAULT_ISR_BUDGET_CYCLES` (2000 cycles) | Overruns are counted in the ISR metrics; the handler still runs to completion | ISR-safe bridge ops only — see [ISR-tier I/O contract](#isr-tier-io-contract) | precise-cadence drivers |
-| **1c** Pre-pass drain | (per-module flag on a Tier 0/1a domain) | Cooperative, called at the start of every pass before `domain_exec_order` | combined `MAX_PRE_TICK_BUDGET_US` (5 µs) | The pre-tick loop stops after the overrunning module returns; the rest wait for the next pass | full (cooperative) | NIC RX/TX, ARP-table drains |
-| **2** IRQ-owned | 4 | Per-IRQ ISR (dispatched via `isr_tier2_trampoline` bound through `hal::irq_bind`) | per-module budget | Overruns are counted in the ISR metrics; the handler still runs to completion | ISR-safe bridge ops only, from `module_isr_entry` | precise per-IRQ drivers |
-| **3** Poll | 3 | Continuous spin with WFE on idle | per-pass `domain_budget_us_limit` | The budget is checked between modules, rotating `exec_order_offset` rather than interrupting a step | full | tight polling loops |
+| **0** Cooperative | `tick` (0) | Main scheduler loop, 1 ms tick | per-module `step_deadline_us` | Overrun is detected by the step guard, never pre-empted — see [Deadline enforcement](#deadline-enforcement) | full (heap, `provider_call`, `channel_*`) | most modules |
+| **1a** High-rate cooperative | `tick` with its own `tick_us` (0) | Sub-ms timer-driven cooperative tick | per-module `step_deadline_us` | As Tier 0 | full | audio loops, control loops |
+| **1b** Timer ISR | `timer`, cadence `rate_hz` (2) | Polled-timer ISR (BCM2712: soft-polled from the scheduler thread; RP: real timer ISR) | `DEFAULT_ISR_BUDGET_CYCLES` (2000 cycles) | Overruns are counted in the ISR metrics; the handler still runs to completion | ISR-safe bridge ops only — see [ISR-tier I/O contract](#isr-tier-io-contract) | precise-cadence drivers |
+| **1c** Pre-pass drain | (module `pre_pass` attribute in a `tick` domain) | Cooperative, called at the start of every pass before `domain_exec_order` | combined `MAX_PRE_TICK_BUDGET_US` (5 µs) | The pre-tick loop stops after the overrunning module returns; the rest wait for the next pass | full (cooperative) | NIC RX/TX, ARP-table drains |
+| **2** IRQ-owned | `irq` (3) | Per-IRQ ISR (dispatched via `isr_tier2_trampoline` bound through `hal::irq_bind`) | per-module budget | Overruns are counted in the ISR metrics; the handler still runs to completion | ISR-safe bridge ops only, from `module_isr_entry` | precise per-IRQ drivers |
+| **3** Poll | `poll` (1) | Continuous spin with WFE on idle | per-pass `domain_budget_us_limit` | The budget is checked between modules, rotating `exec_order_offset` rather than interrupting a step | full | tight polling loops |
 
-Wire-byte values are stable: changing the byte mapping would break
-already-built `.cfg.bin` blobs, so a new tier always reserves a fresh
-value rather than renumbering, which is why the tier ordering and the
-byte ordering differ (`1b → 2`, `2 → 4`).
+The wire byte is the boot-config domain record's `exec_mode`, the dense
+`ExecMode` enum (`tick` 0, `poll` 1, `timer` 2, `irq` 3); the decoder
+refuses any other value. A `tick` domain that declares its own `tick_us`
+runs the high-rate loop; one on the graph's tick runs the cooperative
+loop.
 
 ## Deadline enforcement
 
@@ -286,43 +287,55 @@ volume, or in a read-only one, refuses the `CREATE`. The graph backend lists
 the entry in `OPTIONS`; a host process (which reaches no kernel vault) and a
 metal node do not, and answer a required entry `ENOSYS`.
 
-## Where tier is declared
+## Where the execution mode is declared
 
-YAML graphs declare tier on the domain:
+YAML graphs declare the execution mode on the domain, with `exec:`:
 
 ```yaml
 execution:
   domains:
-    - name: main
-      tier: 0          # default
+    - name: main               # exec: tick is the default
       tick_us: 1000
+    - name: audio
+      exec: tick
+      tick_us: 250             # its own tick
+    - name: net
+      exec: poll
+      cores: [2]
     - name: audio_isr
-      tier: 1b
-      tick_us: 23      # ~44.1 kHz timer
+      exec: timer
+      rate_hz: 40000           # 25 µs period
+    - name: gpio
+      exec: irq
+      cores: [1]
 modules:
   - name: sample_driver
     type: my_isr_driver        # author-supplied PIC module with
-                               # `isr_safe = true` in its manifest
+                               # `interrupt_safe = true` in its manifest
     domain: audio_isr
   - name: nic
     type: rp1_gem
     domain: main
-    # `pre_tick_drain = true` is on the module's manifest;
+    # `pre_pass = true` is on the module's manifest;
     # no YAML flag needed.
 ```
 
-Accepted tier spellings are `0`/`cooperative`, `1a`/`high_rate`,
-`1b`/`isr_timer`, `2`/`isr_owned`, and `3`/`poll`; an unknown value is
-a build error rather than a silent fall-through to Tier 0.
+The modes are `tick` (the default when `exec:` is omitted), `poll`,
+`timer` and `irq`; any other value is a build error. `tier:` and
+`exec_mode:` are not keys, and a module declares no mode or rate of its
+own. A `timer` domain's cadence is its `rate_hz`, required and a whole
+number of microseconds per period (`1_000_000 / rate_hz`, written into
+the domain record's `tick_us`); `rate_hz` on any other mode, or
+`tick_us` on a `timer` domain, is refused.
 
 The build-time validators (`validate_isr_tier_admission` and
-`validate_pre_tick_drain_admission` in `tools/src/config/builder.rs`)
-reject misconfigurations: a module without `isr_safe = true` in its
-manifest cannot land in a Tier 1b/2 domain; a module with
-`pre_tick_drain = true` cannot land in a Tier 1b/2/3 domain. A Tier 2
-(`isr_owned`) module additionally must declare an `irq:` field and
+`validate_pre_pass_admission` in `tools/src/config/builder.rs`)
+reject misconfigurations: a module without `interrupt_safe = true` in
+its manifest cannot land in a `timer` or `irq` domain; a module with
+`pre_pass = true` can land only in a `tick` domain. An `irq`
+module additionally must declare an `irq:` field and
 export `module_isr_entry` in its source — the IRQ dispatches into that
-entry point, not the cooperative `module_step`, so a Tier 2 module
+entry point, not the cooperative `module_step`, so an `irq` module
 missing either is rejected at build time. The declared `irq:` is also
 range-checked against the resolved silicon's interrupt controller
 (GIC-400 lines 0..=1019 on BCM2712, NVIC lines 0..=31 on RP2040 and
@@ -340,23 +353,23 @@ runs inside a frame that keeps the interrupted code's FP/SIMD state
 
 ```toml
 # modules/drivers/<your_isr_module>/manifest.toml
-isr_safe = true       # legal admission to a Tier 1b/2 domain
+interrupt_safe = true # legal admission to a timer/irq domain
                       # author attests: no heap, no cooperative
                       # provider_call, no channel_read/write,
                       # bounded execution.
 
 # modules/drivers/rp1_gem/manifest.toml
-pre_tick_drain = true # opt into the Tier 1c pre-pass slot.
+pre_pass = true       # run in the domain's pre-pass (tick only).
                       # cooperative-context constraints apply.
 ```
 
-`isr_safe` is encoded in bit 2 of the manifest binary's flags byte;
-`pre_tick_drain` rides bit 3. Both round-trip through the `.fmod`
+`interrupt_safe` is encoded in bit 2 of the manifest binary's flags
+byte; `pre_pass` rides bit 3. Both round-trip through the `.fmod`
 file format.
 
-`pre_tick_drain` is also mirrored into bit 4 of the config-blob
-module-entry domain byte (alongside the domain id bits) so
-`prepare_graph` can read it without re-parsing the `.fmod` manifest.
+`pre_pass` is also carried in the boot-config module record's flags
+(`MODULE_FLAG_PRE_PASS`) so `prepare_graph` can read it without
+re-parsing the `.fmod` manifest.
 
 ## ISR-tier I/O contract
 
@@ -396,7 +409,7 @@ Source: `src/kernel/module/syscalls.rs`,
 `src/kernel/exec/scheduler/multigraph.rs`
 
 1. **Build-time admission.** `validate_isr_tier_admission` and
-   `validate_pre_tick_drain_admission` reject ill-formed graphs before
+   `validate_pre_pass_admission` reject ill-formed graphs before
    a `.cfg.bin` is emitted.
 2. **Cooperative skip.** `step_one_module` returns early for any
    module whose domain `exec_mode` is Tier 1b/2 (the ISR dispatcher
@@ -433,11 +446,11 @@ Source: `src/kernel/exec/isr_tier.rs`,
 Tier 1b admission and dispatch:
 
 1. **Build time.** `validate_isr_tier_admission` confirms every
-   module in a Tier 1b domain has `isr_safe = true`. The wiring
+   module in a `timer` domain has `interrupt_safe = true`. The wiring
    check rejects any YAML edge with an ISR-tier endpoint (see the
    I/O contract above).
 2. **`prepare_graph`.** Stores per-module domain and
-   `pre_tick_drain` into the scheduler state. The cooperative
+   the pre-pass flag into the scheduler state. The cooperative
    scheduler skips Tier 1b/2 modules from `domain_exec_order` walks
    via the runtime check in `step_one_module`.
 3. **Platform instantiation.** After every module is instantiated,
@@ -454,7 +467,7 @@ Tier 1b admission and dispatch:
    `isr_tier1b_handler` whenever the elapsed counter passes the
    period.
 5. **Run loop.** The domain runtime's (`kernel::exec::domains::run`)
-   Tier 1b arm (`exec_mode == 2`) iterates core parking checks,
+   `timer` arm iterates core parking checks,
    `isr_tier::poll_tier1b()`, the cross-domain pump, and WFE. The
    Tier 0 arm also calls `isr_tier::poll_tier1b()` on every loop
    iteration so configurations sharing a core between cooperative
@@ -489,7 +502,7 @@ Tier 2 (IRQ-owned) admission and dispatch:
   names an FP/SIMD register. Cortex-M33 stacks its FPU in hardware and Cortex-M0+ has
   none, so the frame is aarch64 only.
 - A Tier 2 domain that owns its own core runs the dedicated
-  `domains::run` arm for `exec_mode == 4`: cross-domain pumping
+  `domains::run` arm for `irq`: cross-domain pumping
   plus WFI, with dispatch driven entirely by the hardware IRQ.
 - Tier 2 module state is built through the normal cooperative
   `module_new` at instantiation time (non-ISR context), the same
@@ -497,7 +510,7 @@ Tier 2 (IRQ-owned) admission and dispatch:
 
 Tier 1c pre-pass dispatch:
 
-1. Exec-order computation reads each module's `pre_tick_drain` flag
+1. Exec-order computation reads each module's pre-pass flag
    and routes the module into `domain_pre_tick_order[d]` instead of
    `domain_exec_order[d]`.
 2. `step_domain_modules` and `step_modules` invoke

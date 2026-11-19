@@ -54,9 +54,9 @@ wiring:
 EOF
 ```
 
-`fluxor run` compiles the YAML into a binary config, gathers the
-module artefacts it names, and launches the `fluxor-linux` runtime on
-the pair. Startup logs similar to these mean the graph is live:
+`fluxor run` compiles the YAML into a graph image (the binary config
+and the module artefacts it names) and launches the `fluxor-linux`
+runtime on it. Startup logs similar to these mean the graph is live:
 
 ```text
 [... INFO fluxor_linux] [fluxor] linux platform boot

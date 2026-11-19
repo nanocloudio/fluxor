@@ -121,10 +121,10 @@ this workload digest, and that the owner the plan names is up under it.
 
 It does not prove what code those modules are. A plan assigns an owner its slot,
 module range, caps and leases; it does not carry the workload digest, and on Linux
-the graph a runtime runs is the `--config` it was started with. The workload
+the graph a runtime runs is the `--image` it was started with. The workload
 digest in the formula comes from the agent's committed desired state, joined to
 the runtime's report by workload UID. That the running graph was built from that
-bundle is what deployment of the runtime's config must ensure.
+bundle is what deployment of the runtime's graph image must ensure.
 
 ## Transports
 
@@ -135,15 +135,15 @@ target identity and controllers, and one transport.
 |---|---|---|---|
 | Unix socket | `--socket PATH` | `--socket PATH` | local, whatever the client sends |
 | stdio | `--stdio` | a parent process | the frame's, which the parent vouches for |
-| Runtime | `--runtime R --config C` | `--runtime R --config C` | the channel's verified fingerprint |
+| Runtime | `--runtime R --image I` | `--runtime R --image I` | the channel's verified fingerprint |
 
 ```text
 fluxor agent serve --store D --publish P --bundles B --descriptor F \
     --target-id <64 hex> --controller <64 hex> ... \
-    (--socket PATH | --stdio | --runtime R --config C [--modules M] [--runtime-log L]) \
+    (--socket PATH | --stdio | --runtime R --image I [--runtime-log L]) \
     [--profile linux] [--remove-grace SECONDS]
 
-fluxor agent call (--socket PATH | --runtime R --config C [--modules M] [--runtime-log L]) \
+fluxor agent call (--socket PATH | --runtime R --image I [--runtime-log L]) \
     --op apply|remove|observe [--workload-uid <32 hex>] [--bundle-digest <64 hex>] \
     [--descriptor-revision <64 hex>] [--idempotency-id <32 hex>] \
     [--fence-epoch N] [--fence-seq N] [--target-id <64 hex>] [--timeout-ms N]

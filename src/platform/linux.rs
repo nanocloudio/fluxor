@@ -5,8 +5,7 @@
 // step loop with std::thread::sleep for tick timing.
 //
 // Usage:
-//   fluxor-linux --config config.bin --modules modules.bin
-//   fluxor-linux config.yaml                  # (future: auto-generate bins)
+//   fluxor-linux --image graph.img
 
 #![allow(
     unsafe_code,
@@ -39,8 +38,7 @@ include!("linux/runtime.rs");
 // ============================================================================
 
 struct CliArgs {
-    config_path: String,
-    modules_path: String,
+    image_path: String,
 }
 
 /// `fluxor-linux vault-import --module <type> --label <label> --suite
@@ -281,39 +279,30 @@ fn parse_args() -> CliArgs {
     if args.get(1).map(String::as_str) == Some("reclaim") {
         reclaim(&args[2..]);
     }
-    let mut config_path = String::new();
-    let mut modules_path = String::new();
+    let mut image_path = String::new();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--config" | "-c" => {
+            "--image" | "-i" => {
                 i += 1;
                 if i < args.len() {
-                    config_path = args[i].clone();
+                    image_path = args[i].clone();
                 } else {
-                    eprintln!("error: --config requires a path");
-                    process::exit(1);
-                }
-            }
-            "--modules" | "-m" => {
-                i += 1;
-                if i < args.len() {
-                    modules_path = args[i].clone();
-                } else {
-                    eprintln!("error: --modules requires a path");
+                    eprintln!("error: --image requires a path");
                     process::exit(1);
                 }
             }
             "--help" | "-h" => {
-                eprintln!("Usage: fluxor-linux --config <config.bin> --modules <modules.bin>");
+                eprintln!("Usage: fluxor-linux --image <graph.img>");
                 eprintln!("       fluxor-linux vault-import --module <type> --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex> [--wrap yes]");
                 eprintln!("       fluxor-linux vault-identity --module <type> --label <label>   (print, making if absent, a P-256 identity's public key)");
                 eprintln!("       fluxor-linux reclaim   (collect dead instances' host objects; FLUXOR_INSTANCE names one)");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -c, --config <path>   Path to config.bin");
-                eprintln!("  -m, --modules <path>  Path to modules.bin");
+                eprintln!(
+                    "  -i, --image <path>    The graph image `fluxor build` writes (graph.img)"
+                );
                 eprintln!("      --print-features  Print compiled-in host-* features and exit");
                 eprintln!("  -h, --help            Show this help");
                 process::exit(0);
@@ -349,16 +338,13 @@ fn parse_args() -> CliArgs {
         i += 1;
     }
 
-    if config_path.is_empty() || modules_path.is_empty() {
-        eprintln!("error: --config and --modules are required");
-        eprintln!("Usage: fluxor-linux --config <config.bin> --modules <modules.bin>");
+    if image_path.is_empty() {
+        eprintln!("error: --image is required");
+        eprintln!("Usage: fluxor-linux --image <graph.img>");
         process::exit(1);
     }
 
-    CliArgs {
-        config_path,
-        modules_path,
-    }
+    CliArgs { image_path }
 }
 
 // The platform providers (FS/proc/net registry), the per-owner status writer,
@@ -411,9 +397,7 @@ include!("linux/owner_log_tee.rs");
 /// Runtime parameter overrides, file-backed. Its own module so its parse and
 /// merge can be unit-tested without a graph.
 pub mod param_store {
-    // The merge itself; `tools/tests/param_store.rs` provides the same name by
-    // a path include, so the source below builds in both places.
-    use fluxor::kernel::sys::params_tlv;
+    use fluxor_contracts::params_tlv;
     include!("linux/param_store.rs");
 }
 
@@ -814,76 +798,78 @@ fn main() {
 
     let args = parse_args();
 
-    // Read config from file (regular read — config is data, not code). The
-    // parsed config borrows every module's params from these bytes in place,
-    // so they are leaked: resident for the life of the process, as the
-    // config blob is on every platform. The file's length is the parser's
-    // only bound on it.
-    let config_data: &'static [u8] = Box::leak(
-        fs::read(&args.config_path)
-            .unwrap_or_else(|e| {
-                eprintln!("error: failed to read config {}: {}", args.config_path, e);
-                process::exit(1);
-            })
-            .into_boxed_slice(),
-    );
-
-    // mmap modules with PROT_READ | PROT_EXEC — PIC modules contain executable code.
-    // Using fs::read() would place code in non-executable heap memory, causing SEGV.
-    let modules_file = fs::File::open(&args.modules_path).unwrap_or_else(|e| {
-        eprintln!("error: failed to open modules {}: {}", args.modules_path, e);
+    // The graph image is mapped whole, PROT_READ | PROT_EXEC: the module
+    // table holds PIC code, which a heap copy could not run. The mapping is
+    // never unmapped, so the config the kernel parses borrows its module
+    // params from it in place for the life of the process, as on every
+    // platform. The file's length bounds the image.
+    let image_file = fs::File::open(&args.image_path).unwrap_or_else(|e| {
+        eprintln!("error: failed to open image {}: {}", args.image_path, e);
         process::exit(1);
     });
-    let modules_len = modules_file.metadata().unwrap().len() as usize;
-    // SAFETY: `mmap` with a valid fd, length, and PRIVATE|EXEC flags — the
-    // kernel returns either a valid mapping or MAP_FAILED (checked below).
-    let modules_ptr = unsafe {
+    let image_len = image_file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+    if image_len == 0 {
+        eprintln!("error: image {} is empty", args.image_path);
+        process::exit(1);
+    }
+    // SAFETY: `mmap` with a valid fd, a non-zero length and PRIVATE|EXEC
+    // flags: the kernel returns a valid mapping or MAP_FAILED (checked below).
+    let image_ptr = unsafe {
         libc::mmap(
             core::ptr::null_mut(),
-            modules_len,
+            image_len,
             libc::PROT_READ | libc::PROT_EXEC,
             libc::MAP_PRIVATE,
-            modules_file.as_raw_fd(),
+            image_file.as_raw_fd(),
             0,
         )
     };
-    if modules_ptr == libc::MAP_FAILED {
-        eprintln!("error: failed to mmap modules file");
+    if image_ptr == libc::MAP_FAILED {
+        eprintln!("error: failed to mmap image {}", args.image_path);
         process::exit(1);
     }
-
-    log::info!(
-        "[config] loaded {} bytes from {}",
-        config_data.len(),
-        args.config_path
-    );
-    log::info!(
-        "[modules] mapped {} bytes from {} at {:p}",
-        modules_len,
-        args.modules_path,
-        modules_ptr
-    );
+    // SAFETY: the mapping above covers `image_len` bytes and is never
+    // unmapped.
+    let image: &'static [u8] =
+        unsafe { core::slice::from_raw_parts(image_ptr as *const u8, image_len) };
 
     // HAL ops, syscall table, providers, then the step guard.
     fluxor::kernel::boot(&LINUX_HAL_OPS);
     step_guard::init();
 
-    // Populate the kernel's static config + loader from our mmap'd blobs
-    // and compile the graph. `scheduler::prepare_graph` decodes edges,
-    // inserts `_tee` / `_merge` for fan groups, allocates channels, and
-    // populates port tables.
+    // Admit the image as every target admits its graph (shape, ABI pin,
+    // and, under the runtime's signing root, signature and payload digest), then
+    // populate the kernel's static config + loader from its regions and
+    // compile the graph. `scheduler::prepare_graph` decodes edges, inserts
+    // `_tee` / `_merge` for fan groups, allocates channels, and populates
+    // port tables.
+    let own_pin = fluxor::kernel::boot::graph_image::own_abi_pin();
+    let header = fluxor::kernel::boot::graph_image::admit(image, &own_pin).unwrap_or_else(|why| {
+        eprintln!(
+            "error: graph image {} refused: {}",
+            args.image_path,
+            why.reason()
+        );
+        process::exit(1);
+    });
+    log::info!(
+        "[image] {} bytes from {} at {:p}: modules {} B, config {} B",
+        image_len,
+        args.image_path,
+        image_ptr,
+        header.modules_size,
+        header.config_size
+    );
     loader::reset_state_arena();
-    // Length-aware: pass the file's exact byte count for both blobs
-    // so the parser rejects any section that would extend past the
-    // actual mappings.
-    // SAFETY: `config_data` is the leaked, resident config; `modules_ptr`/`modules_len` come from
-    // the mmap above and cover the full file. `populate_static_state_with_len`
-    // bounds-checks both blobs against the supplied lengths.
+    let modules = header.modules(image);
+    // SAFETY: both regions lie in the image mapping, which stays mapped for
+    // the life of the process; `populate_static_state_with_len` bounds the
+    // config by its slice and the module table by `modules.len()`.
     if let Err(msg) = unsafe {
         scheduler::populate_static_state_with_len(
-            config_data,
-            modules_ptr as *const u8,
-            modules_len,
+            header.config(image),
+            modules.as_ptr(),
+            modules.len(),
         )
     } {
         eprintln!("error: {msg}");
@@ -949,7 +935,7 @@ fn main() {
         }
     }
 
-    // Admit resident workloads declared in the config's `[FXPD]` section
+    // Admit resident workloads declared in the config's `WKLD` section
     // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via
     // `apply_add`, then the multi-graph runner multiplexes them with the base
     // graph. Boot-only (not re-run on live rebuild). No-op without workloads.

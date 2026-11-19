@@ -3,7 +3,7 @@
 //! A thin TOML source manifest — non-derivable fields only — from which
 //! `fluxor build <workload.toml>` emits the bundle format the agent
 //! consumes (`workload.json` + `resources.json` + `graph.yaml`), plus the
-//! per-target `config.bin`/`modules.bin` the run path consumes. Emitting a
+//! per-target graph image (`graph.img`) the run path consumes. Emitting a
 //! bundle calls the same `build_one` a plain `fluxor build <graph>` calls,
 //! so a bundle's blobs are byte-for-byte what building the graph directly
 //! produces.
@@ -26,7 +26,7 @@
 //! target/fluxor/<name>/
 //!   workload.json                    # all implementations
 //!   <target>/{workload.json, graph.yaml, resources.json,   # flat triple —
-//!             config.bin, modules.bin}                     # agent-committable
+//!             graph.img}                                   # agent-committable
 //! ```
 //!
 //! `workload.json` is duplicated into each target dir so that dir is
@@ -350,14 +350,12 @@ pub fn emit_bundle(
         if params.is_empty() {
             crate::build_one_from(
                 &graph_path,
-                Some(&target_dir.join("config.bin")),
+                Some(&target_dir.join("graph.img")),
                 module_root,
                 verbose,
             )?;
         } else {
-            for stale in ["config.bin", "modules.bin"] {
-                let _ = std::fs::remove_file(target_dir.join(stale));
-            }
+            let _ = std::fs::remove_file(target_dir.join("graph.img"));
             let check_dir = project_root.join("target/fluxor/run").join(format!(
                 "{}-emit-{}",
                 src.workload.name,
@@ -372,7 +370,7 @@ pub fn emit_bundle(
             std::fs::write(&check_graph, rendered)?;
             let built = crate::build_one_from(
                 &check_graph,
-                Some(&check_dir.join("config.bin")),
+                Some(&check_dir.join("graph.img")),
                 module_root,
                 verbose,
             );
@@ -681,8 +679,9 @@ fn source_params(path: &Path) -> Result<(String, BTreeMap<String, ParamSpec>)> {
     Ok((src.name, params))
 }
 
-/// Write `config_bin` to `out` with the certificates of `pem` appended to
-/// every client-mode tls/quic instance, and say what was widened. The
+/// Write the graph image `image` to `out` with the certificates of `pem`
+/// appended to every client-mode tls/quic instance of its config, re-signed
+/// with `seed`, and say what was widened. The
 /// operator channel reads PEM only (the build-time `trust` parameter is
 /// the one that also takes raw DER), and a block whose base64 does not
 /// decode is skipped rather than failing the run. A file that yields no
@@ -690,7 +689,12 @@ fn source_params(path: &Path) -> Result<(String, BTreeMap<String, ParamSpec>)> {
 /// the DER ceiling, and an instance whose table would overflow, are each
 /// an error naming what failed; a graph with no client instance is
 /// reported, not an error, since the flag then has nothing to widen.
-pub fn write_widened_config(config_bin: &Path, out: &Path, pem: &Path) -> Result<()> {
+pub fn write_widened_image(
+    image: &Path,
+    out: &Path,
+    pem: &Path,
+    seed: Option<&[u8; 32]>,
+) -> Result<()> {
     let text = std::fs::read_to_string(pem)
         .map_err(|e| Error::Config(format!("--ca: could not read '{}': {e}", pem.display())))?;
     let anchors = crate::trust_anchors::pem_certificates(&text);
@@ -700,10 +704,16 @@ pub fn write_widened_config(config_bin: &Path, out: &Path, pem: &Path) -> Result
             pem.display()
         )));
     }
-    let blob = std::fs::read(config_bin)?;
-    let (widened, report) = crate::trust_anchors::append_operator_anchors(&blob, &anchors)
-        .map_err(|e| Error::Config(format!("--ca: {e}")))?;
-    std::fs::write(out, &widened)?;
+    let img = std::fs::read(image)?;
+    let what = image.display().to_string();
+    let header = crate::graph_image::read(&img, &what)?;
+    let (widened, report) =
+        crate::trust_anchors::append_operator_anchors(header.config(&img), &anchors)
+            .map_err(|e| Error::Config(format!("--ca: {e}")))?;
+    std::fs::write(
+        out,
+        crate::graph_image::with_config(&img, &widened, seed, &what)?,
+    )?;
     if report.instances.is_empty() {
         eprintln!(
             "  --ca: {} anchor(s) in '{}', but the graph has no client-mode tls/quic instance to widen",
@@ -749,13 +759,15 @@ fn operator_identity(name: &str, given: Option<&str>) -> Result<Option<(PathBuf,
     Ok((cert.is_file() && key.is_file()).then_some((cert, key)))
 }
 
-/// Write `config_bin` to `out` with the operator's identity given to every
-/// client-mode tls instance that names none, and say so when asked.
-fn write_identity_config(
-    config_bin: &Path,
+/// Write the graph image `image` to `out` with the operator's identity given
+/// to every client-mode tls instance of its config that names none,
+/// re-signed with `seed`, and say so when asked.
+fn write_identity_image(
+    image: &Path,
     out: &Path,
     cert: &Path,
     key: &Path,
+    seed: Option<&[u8; 32]>,
     verbose: bool,
 ) -> Result<()> {
     let read = |p: &Path| {
@@ -764,11 +776,16 @@ fn write_identity_config(
         })
     };
     let (cert_der, key_der) = (read(cert)?, read(key)?);
-    let blob = std::fs::read(config_bin)?;
+    let img = std::fs::read(image)?;
+    let what = image.display().to_string();
+    let header = crate::graph_image::read(&img, &what)?;
     let (given, report) =
-        crate::trust_anchors::append_operator_identity(&blob, &cert_der, &key_der)
+        crate::trust_anchors::append_operator_identity(header.config(&img), &cert_der, &key_der)
             .map_err(|e| Error::Config(format!("--identity: {e}")))?;
-    write_private(out, &given)?;
+    write_private(
+        out,
+        &crate::graph_image::with_config(&img, &given, seed, &what)?,
+    )?;
     if verbose {
         eprintln!(
             "  --identity: '{}' given to {} client instance(s)",
@@ -993,7 +1010,7 @@ fn launch_bundle(
     }
 
     let project_root = crate::project::root_for_config(&dir);
-    let prebuilt = manifest.params.is_empty() && target_dir.join("config.bin").is_file();
+    let prebuilt = manifest.params.is_empty() && target_dir.join("graph.img").is_file();
     // Scratch holds what this launch writes: a rendered graph and its blobs,
     // a widened config. Parameter values reach all of them, so the directory
     // is private and goes away on every exit path. A config carrying the
@@ -1003,11 +1020,8 @@ fn launch_bundle(
     } else {
         None
     };
-    let (mut config_bin, modules_bin) = match (prebuilt, &scratch) {
-        (true, _) | (_, None) => (
-            target_dir.join("config.bin"),
-            target_dir.join("modules.bin"),
-        ),
+    let mut image = match (prebuilt, &scratch) {
+        (true, _) | (_, None) => target_dir.join("graph.img"),
         (false, Some(scratch)) => {
             let run_dir = &scratch.dir;
             let module_root = if target_dir.join("modules").is_dir() {
@@ -1055,27 +1069,28 @@ fn launch_bundle(
             std::fs::write(&graph, rendered)?;
             crate::build_one_from(
                 &graph,
-                Some(&run_dir.join("config.bin")),
+                Some(&run_dir.join("graph.img")),
                 Some(&module_root),
                 verbose,
             )?;
-            (run_dir.join("config.bin"), run_dir.join("modules.bin"))
+            run_dir.join("graph.img")
         }
     };
-    for f in [&config_bin, &modules_bin] {
-        if !f.is_file() {
-            return Err(Error::Config(format!(
-                "{} missing — rebuild the bundle (`fluxor build <workload.toml>`)",
-                f.display()
-            )));
-        }
+    if !image.is_file() {
+        return Err(Error::Config(format!(
+            "{} missing — rebuild the bundle (`fluxor build <workload.toml>`)",
+            image.display()
+        )));
     }
+    // A changed config is re-signed with this workspace's key, as the build
+    // signed it.
+    let seed = crate::signing::seed(None, &project_root)?;
     // `--ca` widens a copy for this run only; the cached bundle is the
     // publisher's and stays byte-identical.
     if let (Some(pem), Some(scratch)) = (ca, &scratch) {
-        let widened = scratch.dir.join("config.operator.bin");
-        write_widened_config(&config_bin, &widened, pem)?;
-        config_bin = widened;
+        let widened = scratch.dir.join("graph.operator.img");
+        write_widened_image(&image, &widened, pem, seed.as_ref())?;
+        image = widened;
     }
     // The operator's identity is given the same way: to this run's copy,
     // held where a key may be written.
@@ -1084,9 +1099,9 @@ fn launch_bundle(
         None => None,
     };
     if let (Some((cert, key)), Some(secret)) = (identity, &secret) {
-        let given = secret.dir.join("config.identity.bin");
-        write_identity_config(&config_bin, &given, cert, key, verbose)?;
-        config_bin = given;
+        let given = secret.dir.join("graph.identity.img");
+        write_identity_image(&image, &given, cert, key, seed.as_ref(), verbose)?;
+        image = given;
     }
     // A recorded runtime is the one this bundle's modules were packed
     // against. If it has gone, say so and name it: running the bundle
@@ -1116,20 +1131,16 @@ fn launch_bundle(
     // nothing of its own unless asked (`-v`).
     if verbose || applet.is_none() {
         eprintln!(
-            "Running bundle '{}' v{} ({}): {} --config {} --modules {}",
+            "Running bundle '{}' v{} ({}): {} --image {}",
             manifest.name,
             manifest.version,
             imp.target.family,
             linux_bin.display(),
-            config_bin.display(),
-            modules_bin.display()
+            image.display()
         );
     }
     let mut cmd = std::process::Command::new(&linux_bin);
-    cmd.arg("--config")
-        .arg(&config_bin)
-        .arg("--modules")
-        .arg(&modules_bin);
+    cmd.arg("--image").arg(&image);
     if !app_args.is_empty() {
         cmd.arg("--").args(app_args);
     }
@@ -1466,8 +1477,8 @@ pub fn applet_logs(name: &str, tail: usize, all: bool) -> Result<()> {
 /// Materialise the bundle this project pins under `name` as a runnable
 /// bundle dir under the applet cache (`$XDG_DATA_HOME/fluxor/applets/<name>/`):
 /// the same digest-verified flat layout `fluxor sync` writes (documents +
-/// the bundle's own `modules/`), plus the run blobs (`config.bin` /
-/// `modules.bin`) built once from those pinned modules, so `exec` runs
+/// the bundle's own `modules/`), plus the graph image (`graph.img`) built
+/// once from those pinned modules, so `exec` runs
 /// without compiling anything.
 fn materialize_pinned_bundle(name: &str, verbose: bool) -> Result<PathBuf> {
     use fluxor_tools::oci_store::{self, OciStore};
@@ -1507,7 +1518,7 @@ fn materialize_pinned_bundle(name: &str, verbose: bool) -> Result<PathBuf> {
     }
     crate::build_one_from(
         &cache_root.join("graph.yaml"),
-        Some(&cache_root.join("config.bin")),
+        Some(&cache_root.join("graph.img")),
         Some(&cache_root.join("modules")),
         verbose,
     )?;

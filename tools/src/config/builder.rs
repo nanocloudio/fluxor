@@ -2,30 +2,34 @@
 // Graph Config
 // =============================================================================
 
-/// Graph edge size in bytes (12 = 4-byte fixed header + 4-byte
-/// `buffer_bytes` u32 LE override + rate_class u8 + wake flags u8 + 2
-/// reserved).
-/// Mirrors `kernel::config::GRAPH_EDGE_SIZE`; the layout is
-/// documented there.
-const GRAPH_EDGE_SIZE: usize = 12;
-/// Per-domain metadata: 4 domains × DOMAIN_META_ENTRY_SIZE.
-/// Entry = `tick_us:u16 | exec_mode:u8 | adaptive_flags:u8` = 4 bytes. The
-/// adaptive-tick `tick_min_us`/`tick_max_us` bounds are NOT in this entry; they
-/// live in the unchecksummed post-body tail (see ADAPTIVE_POST_SIZE) so the
-/// checksummed `body_size` is unchanged. Mirrors
-/// `kernel::config::{DOMAIN_META_ENTRY_SIZE, DOMAIN_META_SIZE}`.
-const DOMAIN_META_ENTRY_SIZE: usize = 4;
-const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
+/// One module of the graph as the composer builds it: the fields of the
+/// codec's `ModuleRecord` with the params owned. [`ModuleEntry::record`]
+/// lends it to the encoder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ModuleEntry {
+    /// FNV-1a of the module's type name, the `.fmod` it loads.
+    pub name_hash: u32,
+    /// The module's index in the graph.
+    pub id: u16,
+    /// The execution domain it runs in.
+    pub domain: u8,
+    /// It runs in its domain's pre-pass (`pre_pass` in its manifest).
+    pub pre_pass: bool,
+    /// Its params TLV.
+    pub params: Vec<u8>,
+}
 
-/// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + meta:u8,
-/// where id is the module id's low byte and meta carries domain_id in bits 0-2,
-/// pre_tick_drain in bit 4 and the id's bits 8-9 in bits 5-6).
-/// `entry_length` is a u32 so a single module's params can exceed
-/// 64 KiB — needed by synth host's http module when both halves of a
-/// split scenario inline the canonical wasm shell as body routes
-/// (~95 KiB combined). Coordinated with `src/kernel/boot/config.rs`'s
-/// `parse_module_entry`, which reads matching field widths.
-const MODULE_ENTRY_HEADER_SIZE: usize = 10;
+impl ModuleEntry {
+    pub(crate) fn record(&self) -> fluxor_contracts::boot_config::ModuleRecord<'_> {
+        fluxor_contracts::boot_config::ModuleRecord {
+            name_hash: self.name_hash,
+            id: self.id,
+            domain: self.domain,
+            pre_pass: self.pre_pass,
+            params: &self.params,
+        }
+    }
+}
 
 /// What a module entry's params buffer starts at before it grows to fit:
 /// most modules' params are a few hundred bytes, and a module's params are
@@ -78,9 +82,6 @@ pub(crate) fn pack_params_growing(
     }
 }
 
-/// Param base offset within a module entry: the entry header.
-const P: usize = MODULE_ENTRY_HEADER_SIZE;
-
 /// Parse a waveform string into its numeric ID.
 /// Used by synth, monosynth, and other oscillator-based modules.
 /// Parse UUID string (with or without dashes) to 16 bytes. Returns [0; 16] on error.
@@ -132,13 +133,9 @@ const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 
 /// Maximum number of scheduling domains the kernel supports.
 /// Mirrors the scheduler's `MAX_DOMAINS` constant
-/// (`src/kernel/exec/scheduler/mod.rs`). The config writer
-/// serialises exactly 4 domain-metadata entries; the wire format
-/// has no slot for a 5th. Locked at the wire layer by
-/// `tests/harness/tests/abi_wire_surface.rs` (the kernel-side
-/// constant is exercised there); the tools side hardcodes the same
-/// value here with a comment so a future bump touches both
-/// together.
+/// (`src/kernel/exec/scheduler/mod.rs`): the config carries one domain
+/// record per declared domain, and the kernel refuses a config declaring
+/// more than it has.
 const MAX_DOMAINS: usize = 4;
 
 /// Burst-mode deadline multiplier — mirrors
@@ -491,24 +488,19 @@ fn validate_adaptive_tick(
                 // No (or empty) `cores` ⇒ the shared cooperative runner (core 0).
                 _ => core_mask[i] = 1,
             }
-            // Tier-0-vs-Tier-3 warning: adaptive cadence (a Tier-0
-            // latency/efficiency mode) on a domain explicitly declared poll-mode
-            // (Tier 3 = continuous stepping, no relaxation) is contradictory —
-            // Tier 3 is the "use the whole core" mode. Recommend picking one.
-            if flags[i] != 0 {
-                let tier = dom.get("tier").and_then(|v| v.as_str()).unwrap_or("");
-                let exec = dom.get("exec_mode").and_then(|v| v.as_str()).unwrap_or("");
-                if tier == "3" || exec == "poll" {
-                    eprintln!(
-                        "warning: domain '{}' sets adaptive_flags={:#x} but is declared \
-                         Tier 3 / poll-mode. Tier 0 adaptive reduces idle work; Tier 3 \
-                         saturates the core continuously — they are mutually exclusive \
-                         intents. Use Tier 3 for full-CPU/poll workloads and drop \
-                         adaptive_flags, or use Tier 0 adaptive and drop the poll tier.",
-                        dom.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
-                        flags[i]
-                    );
-                }
+            // Adaptive cadence reduces a tick domain's idle work; a poll
+            // domain steps back to back and never relaxes. Declaring both is
+            // contradictory intent.
+            if flags[i] != 0 && dom.get("exec").and_then(Value::as_str) == Some("poll") {
+                eprintln!(
+                    "warning: domain '{}' sets adaptive_flags={:#x} but is `exec: poll`. \
+                     Adaptive cadence reduces a tick domain's idle work; a poll domain \
+                     saturates its core continuously. Use `exec: poll` for full-CPU \
+                     workloads and drop adaptive_flags, or use an adaptive `exec: tick` \
+                     domain.",
+                    dom.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    flags[i]
+                );
             }
         }
     }
@@ -993,24 +985,23 @@ fn validate_adaptive_tick(
     Ok(())
 }
 
-/// Build-time admission gate for Tier 1b/Tier 2 (ISR) domains.
+/// Build-time admission gate for interrupt-mode (`timer`, `irq`) domains.
 ///
 /// Rules enforced:
 ///
-/// 1. **`isr_safe` attestation is mandatory.** Every module assigned
-///    to a domain with `tier: 1b` (`exec_mode == 2`) or `tier: 2`
-///    (`exec_mode == 4`) must declare `isr_safe = true` in its
-///    manifest. Modules without the flag are rejected at build time
+/// 1. **`interrupt_safe` attestation is mandatory.** Every module assigned
+///    to an `exec: timer` or `exec: irq` domain must declare
+///    `interrupt_safe = true` in its manifest. Modules without the flag are rejected at build time
 ///    with a message naming the module, the domain, and the manifest
 ///    path so the author knows exactly where to add the attestation.
 ///    Bridge routing has no fall-back: if the kernel admitted a
 ///    non-ISR-safe module into an ISR domain it would deadlock on
-///    `provider_call` from interrupt context. For Tier 2 modules this
+///    `provider_call` from interrupt context. For `irq` modules this
 ///    rule also requires a `module_isr_entry` export in the source —
 ///    the IRQ dispatches into it, not the cooperative `module_step`.
 ///
-/// 2. **No edges touching ISR-tier endpoints.** ANY YAML edge with at
-///    least one Tier 1b/2 endpoint is rejected, regardless of
+/// 2. **No edges touching interrupt-mode endpoints.** ANY YAML edge with at
+///    least one `timer`/`irq` endpoint is rejected, regardless of
 ///    `edge_class`. The kernel-side bridge wiring
 ///    (`scheduler::wire_isr_bridges` + `pump_isr_bridges`) and the
 ///    module-facing surface (`bridge::SELF_BRIDGE` hands a module a
@@ -1023,10 +1014,10 @@ fn validate_adaptive_tick(
 ///    bridge mechanism via `install_static_config` +
 ///    `set_domain_exec_mode`.
 ///
-/// A module that lands in an ISR-tier domain without a resolvable
+/// A module that lands in an interrupt-mode domain without a resolvable
 /// manifest is a **hard error**. `validate_wiring_types` only
 /// enforces content-type compatibility when both edge endpoints
-/// have manifests, so a Tier 1b module with no wiring (or bare /
+/// have manifests, so a `timer` module with no wiring (or bare /
 /// default ports) would otherwise slip through both this gate and
 /// the wiring check unchecked. The diagnostic names the module +
 /// the directory it should live under.
@@ -1038,65 +1029,21 @@ fn validate_isr_tier_admission(
     resolved_target: Option<&str>,
     project_root: &std::path::Path,
 ) -> Result<()> {
-    // Per-domain exec_mode for the four supported domains.
-    let mut domain_exec_mode: [u8; 4] = [0; 4];
+    use boot_config::ExecMode;
+    // Per-domain execution mode for the four supported domains.
+    let mut domain_exec_mode = [ExecMode::Tick; 4];
     let mut domain_names_local: [Option<String>; 4] = [None, None, None, None];
-    if let Some(domains) = config
-        .get("execution")
-        .and_then(|e| e.get("domains"))
-        .and_then(|d| d.as_array())
-    {
-        for (i, dom) in domains.iter().take(4).enumerate() {
-            if let Some(name) = dom.get("name").and_then(|n| n.as_str()) {
-                domain_names_local[i] = Some(name.to_string());
-            }
-            match parse_domain_tier_to_exec_mode(dom) {
-                Some(m) => domain_exec_mode[i] = m,
-                None => {
-                    // Unknown tier specifier — surface it. Silent
-                    // fall-through to Tier 0 cooperative would let a
-                    // typo (`tier: 1c`) silently downgrade the
-                    // execution discipline.
-                    let label = domain_names_local[i]
-                        .clone()
-                        .unwrap_or_else(|| format!("domains[{i}]"));
-                    if dom.get("exec_mode").is_some() {
-                        return Err(Error::Config(format!(
-                            "execution.domains entry '{label}' sets `exec_mode`, which is not a \
-                             key; name the tier with `tier:` (0/cooperative, 1a/high_rate, \
-                             1b/isr_timer, 3/poll, 2/isr_owned)."
-                        )));
-                    }
-                    if dom.get("tier").is_some() {
-                        return Err(Error::Config(format!(
-                            "execution.domains entry '{label}' has an unknown tier value. \
-                             Valid: 0/cooperative, 1a/high_rate, 1b/isr_timer, 3/poll, \
-                             2/isr_owned."
-                        )));
-                    }
-                }
-            }
-        }
+    for (i, (label, exec)) in parse_domain_execs(config)?.into_iter().take(4).enumerate() {
+        domain_exec_mode[i] = exec.mode;
+        domain_names_local[i] = Some(label);
     }
 
-    // Tier 2 (per-IRQ) admission: a Tier 2 module is dispatched from
-    // its `module_isr_entry` export (resolved by the kernel loader into
+    // `irq` admission: an `irq` module is dispatched from its
+    // `module_isr_entry` export (resolved by the kernel loader into
     // `DynamicModule::isr_entry_fn()` and routed through
-    // `register_tier2_module`). Rules 1/3 below require every Tier 2
-    // module to declare `isr_safe = true`, an `irq:` field, and an
+    // `register_tier2_module`). Rules 1/3 below require every `irq`
+    // module to declare `interrupt_safe = true`, an `irq:` field, and an
     // actual `module_isr_entry` export in its source.
-
-    // Helper: does this exec_mode require ISR-safe modules?
-    let is_isr_tier = |m: u8| -> bool { m == 2 || m == 4 };
-
-    // Helper: friendly tier label for error messages.
-    let tier_label = |m: u8| -> &'static str {
-        match m {
-            2 => "1b (isr_timer)",
-            4 => "2 (isr_owned)",
-            _ => "unknown",
-        }
-    };
 
     // Resolved for the graph's own target, as config generation resolves
     // them: a module pinned per silicon binds that target's pin.
@@ -1107,7 +1054,7 @@ fn validate_isr_tier_admission(
         project_root,
     );
 
-    // ── Rule 0: Tier-2 IRQ range (structural, target-specific) ──────────
+    // ── Rule 0: `irq` line range (structural, target-specific) ──────────
     // Validate the declared `irq:` against the resolved silicon's interrupt
     // controller BEFORE the manifest/export checks, so a bad IRQ value is
     // rejected regardless of manifest state. The bound is the interrupt
@@ -1118,7 +1065,7 @@ fn validate_isr_tier_admission(
     //
     //   - GIC-400 (bcm2712): INTIDs 0..=1019. 1020..=1023 are
     //     reserved/special (e.g. 1023 = spurious). SGIs (0-15), PPIs (16-31) and
-    //     SPIs (32-1019) are all valid Tier-2 owners (the `tier2_probe` example
+    //     SPIs (32-1019) are all valid `irq` owners (the `tier2_probe` example
     //     legitimately owns SGI 15).
     //   - RP2350 (Cortex-M33/Hazard3 NVIC): highest line is SWI_IRQ_5 = 52, so
     //     0..=52 (rp-pac `rp235x::Interrupt`). SWI lines are real NVIC lines and
@@ -1156,14 +1103,17 @@ fn validate_isr_tier_admission(
                     None => continue,
                 };
                 let domain = resolve_domain_id(module, config)?;
-                let exec_mode = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
-                if exec_mode != 4 {
+                let exec_mode = domain_exec_mode
+                    .get(domain as usize)
+                    .copied()
+                    .unwrap_or_default();
+                if exec_mode != ExecMode::Irq {
                     continue;
                 }
                 if let Some(irq) = module.get("irq").and_then(|v| v.as_u64()) {
                     if irq > max_intid {
                         return Err(Error::Config(format!(
-                            "module '{name}' declares Tier 2 `irq: {irq}`, but the {label} on \
+                            "module '{name}' declares `irq: {irq}`, but the {label} on \
                              this target only has interrupt lines 0..={max_intid}. Pick a valid \
                              IRQ number for the silicon (out-of-range values index the interrupt \
                              controller's registers out of bounds)."
@@ -1174,15 +1124,18 @@ fn validate_isr_tier_admission(
         }
     }
 
-    // ── Rule 1: isr_safe attestation ────────────────────────────
+    // ── Rule 1: interrupt_safe attestation ────────────────────────────
     for module in module_list {
         let name = match module.get("name").and_then(|n| n.as_str()) {
             Some(n) => n,
             None => continue,
         };
         let domain = resolve_domain_id(module, config)?;
-        let exec_mode = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
-        if !is_isr_tier(exec_mode) {
+        let exec_mode = domain_exec_mode
+            .get(domain as usize)
+            .copied()
+            .unwrap_or_default();
+        if !exec_mode.is_interrupt() {
             continue;
         }
         let domain_label = domain_names_local
@@ -1190,11 +1143,11 @@ fn validate_isr_tier_admission(
             .and_then(|n| n.clone())
             .unwrap_or_else(|| format!("domain {domain}"));
 
-        // ISR-tier admission requires a manifest — we cannot
-        // certify `isr_safe = true` (or run the NEON-import lint)
+        // Interrupt-mode admission requires a manifest — we cannot
+        // certify `interrupt_safe = true` (or run the NEON-import lint)
         // without one. Don't defer to `validate_wiring_types`: that
         // pass only enforces content-type compatibility when both
-        // endpoints have manifests, so a Tier 1b module with no
+        // endpoints have manifests, so a `timer` module with no
         // edges or bare/default ports would slip through silently.
         let manifest = match manifests.get(name) {
             Some(m) => m,
@@ -1202,65 +1155,64 @@ fn validate_isr_tier_admission(
                 let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
                 return Err(Error::Config(format!(
                     "module '{name}' (type '{module_type}') is assigned to domain \
-                     '{domain_label}' (tier {tier}) but no manifest was found. \
-                     ISR-tier admission requires a manifest declaring `isr_safe = true`; \
+                     '{domain_label}' (exec: {mode}) but no manifest was found. \
+                     Interrupt-mode admission requires a manifest declaring `interrupt_safe = true`; \
                      add `manifest.toml` under the module's source tree (`modules/<area>/<type>/`) \
                      or list a containing directory in the config's top-level \
                      `module_search_paths:`. Run `fluxor inspect` to see the active search list.",
-                    tier = tier_label(exec_mode)
+                    mode = exec_mode.name()
                 )));
             }
         };
-        if !manifest.isr_safe {
+        if !manifest.interrupt_safe {
             let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
             return Err(Error::Config(format!(
                 "module '{name}' (type '{module_type}') is assigned to domain '{domain_label}' \
-                 (tier {tier}) but its manifest does not declare `isr_safe = true`. \
-                 Add `isr_safe = true` to the module's manifest.toml, or move the module \
+                 (exec: {mode}) but its manifest does not declare `interrupt_safe = true`. \
+                 Add `interrupt_safe = true` to the module's manifest.toml, or move the module \
                  to a cooperative domain.",
-                tier = tier_label(exec_mode)
+                mode = exec_mode.name()
             )));
         }
         // The lookup goes through `resolve_module_root` so the search order
         // is identical to the manifest loader's: an explicit YAML
         // `module_search_paths:` entry shadowing a bundled module wins for
-        // both `isr_safe` and the export check, instead of one reader
+        // both `interrupt_safe` and the export check, instead of one reader
         // trusting the bundled copy and the other trusting the override.
         let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
         if let Some(root) = resolve_module_root(module_type, extra_module_dirs) {
-            // Tier 2 (IRQ-owned) modules are dispatched from hardware-IRQ
+            // `irq` modules are dispatched from hardware-IRQ
             // context through their `module_isr_entry` export, NOT the
             // cooperative `module_step`. The authoritative gate is the
             // packer (ELF symtab → `.fmod` isr_module bit) + the loader
             // (`isr_entry_fn = None` → admission fail-closes at runtime).
             // This source-static check is the early, build-time mirror
-            // so a Tier 2 module missing the entry point fails the graph
-            // build instead of getting refused on the rig. (Tier 1b —
-            // `exec_mode == 2` — dispatches the cooperative step from a
-            // polled timer and needs no ISR entry; Tier 2 construction
-            // goes through the normal cooperative `module_new`, same as
-            // Tier 1b.)
-            if exec_mode == 4 {
+            // so an `irq` module missing the entry point fails the graph
+            // build instead of getting refused on the rig. (A `timer`
+            // module's cooperative step is dispatched from the timer and
+            // needs no ISR entry; `irq` construction goes through the
+            // normal cooperative `module_new`, as `timer` does.)
+            if exec_mode == ExecMode::Irq {
                 if let Err(e) = crate::manifest::check_module_exports_isr_entry(&root) {
                     return Err(Error::Config(format!(
                         "module '{name}' (type '{module_type}') is assigned to domain \
-                         '{domain_label}' (tier {tier}) but {e}. A Tier 2 module must \
+                         '{domain_label}' (exec: {mode}) but {e}. An `irq` module must \
                          export `module_isr_entry` (an `extern \"C\" fn(*mut u8) -> i32`) \
                          — the hardware IRQ dispatches into it, not the cooperative \
                          `module_step`.",
-                        tier = tier_label(exec_mode)
+                        mode = exec_mode.name()
                     )));
                 }
             }
-        } else if exec_mode == 4 {
-            // No resolvable source root for a Tier 2 module means we
+        } else if exec_mode == ExecMode::Irq {
+            // No resolvable source root for an `irq` module means we
             // can't certify the ISR entry export exists. The manifest
-            // check (Rule 1, above) already hard-errors a Tier 2 module
+            // check (Rule 1, above) already hard-errors an `irq` module
             // with no manifest, so reaching here implies a manifest with
             // no co-located `src/` tree — still unsafe to admit.
             return Err(Error::Config(format!(
-                "module '{name}' (type '{module_type}') is assigned to a Tier 2 \
-                 (isr_owned) domain but its source tree could not be resolved to \
+                "module '{name}' (type '{module_type}') is assigned to an \
+                 `exec: irq` domain but its source tree could not be resolved to \
                  verify the required `module_isr_entry` export. Place the module's \
                  `src/` tree alongside its manifest, or move it to a cooperative domain."
             )));
@@ -1268,18 +1220,21 @@ fn validate_isr_tier_admission(
     }
 
     // Build module name → exec_mode lookup (used by Rules 2 and 3).
-    let mut module_exec_mode: std::collections::HashMap<String, u8> =
+    let mut module_exec_mode: std::collections::HashMap<String, ExecMode> =
         std::collections::HashMap::new();
     for module in module_list {
         if let Some(name) = module.get("name").and_then(|n| n.as_str()) {
             let domain = resolve_domain_id(module, config)?;
-            let m = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
+            let m = domain_exec_mode
+                .get(domain as usize)
+                .copied()
+                .unwrap_or_default();
             module_exec_mode.insert(name.to_string(), m);
         }
     }
 
     // ── Rule 3 (runs BEFORE Rule 2 so wireless graphs still check):
-    // Tier 2 `irq:` requirement + duplicate check. (The target-specific IRQ
+    // `irq:` requirement + duplicate check for `irq` modules. (The target-specific IRQ
     // range is validated structurally in Rule 0, above, before manifests.)
     let mut seen_irq: Vec<(u16, String)> = Vec::new();
     for module in module_list {
@@ -1287,15 +1242,15 @@ fn validate_isr_tier_admission(
             Some(n) => n,
             None => continue,
         };
-        let m = module_exec_mode.get(name).copied().unwrap_or(0);
-        if m != 4 {
+        let m = module_exec_mode.get(name).copied().unwrap_or_default();
+        if m != ExecMode::Irq {
             continue;
         }
         let irq = match module.get("irq").and_then(|v| v.as_u64()) {
             Some(n) if n < u16::MAX as u64 => n as u16,
             Some(_) | None => {
                 return Err(Error::Config(format!(
-                    "module '{name}' is in a Tier 2 (isr_owned) domain but does not \
+                    "module '{name}' is in an `exec: irq` domain but does not \
                      declare an `irq:` field (or its value is out of u16 range). Add \
                      `irq: N` on the module, where N is the hardware IRQ number the \
                      module owns."
@@ -1304,17 +1259,17 @@ fn validate_isr_tier_admission(
         };
         if let Some((_, prev_name)) = seen_irq.iter().find(|(i, _)| *i == irq) {
             return Err(Error::Config(format!(
-                "Tier 2 IRQ {irq} declared by both module '{prev_name}' and \
+                "IRQ {irq} declared by both module '{prev_name}' and \
                  module '{name}'. Two modules sharing one hardware IRQ produce \
                  undefined dispatch ordering — the kernel's \
                  `isr_tier2_trampoline` is a single-handler-per-IRQ table. Give \
-                 each Tier 2 module a distinct IRQ number."
+                 each `irq` module a distinct IRQ number."
             )));
         }
         seen_irq.push((irq, name.to_string()));
     }
 
-    // ── Rule 2: edges touching ISR-tier modules are rejected ────
+    // ── Rule 2: edges touching interrupt-mode modules are rejected ────
     //
     // The kernel-side bridge wiring works — `wire_isr_bridges`
     // + `pump_isr_bridges` shuttle bytes
@@ -1328,7 +1283,7 @@ fn validate_isr_tier_admission(
     //
     // With no module-facing bridge ABI (see
     // `docs/architecture/scheduler.md` §"ISR-tier I/O contract"), the
-    // build rejects ANY YAML edge with an ISR-tier endpoint. Tests that
+    // build rejects ANY YAML edge with an interrupt-mode endpoint. Tests that
     // bypass YAML (e.g. `tests/harness/tests/scheduler_isr_bridges.rs`)
     // continue to exercise the kernel-side mechanism through
     // `install_static_config` + `set_domain_exec_mode`, but a real
@@ -1352,22 +1307,22 @@ fn validate_isr_tier_admission(
         let from_isr = module_exec_mode
             .get(from_mod)
             .copied()
-            .map(is_isr_tier)
+            .map(ExecMode::is_interrupt)
             .unwrap_or(false);
         let to_isr = module_exec_mode
             .get(to_mod)
             .copied()
-            .map(is_isr_tier)
+            .map(ExecMode::is_interrupt)
             .unwrap_or(false);
         if from_isr || to_isr {
             return Err(Error::Config(format!(
                 "wiring[{i}] (from '{from_mod}' to '{to_mod}'): an edge touching an \
-                 ISR-tier endpoint cannot be wired — PIC modules have no \
+                 interrupt-mode endpoint cannot be wired — PIC modules have no \
                  module-facing API to read/write their bridge slots from inside \
                  `module_step`. The kernel-side bridge mechanism is wired and \
                  tested, but the SDK surface is not. Drop the edge from your YAML \
-                 (Tier 1b modules do private-state work only), or move both \
-                 endpoints to cooperative tiers. See \
+                 (`timer` modules do private-state work only), or move both \
+                 endpoints to cooperative domains. See \
                  `docs/architecture/scheduler.md` §\"ISR-tier I/O contract\"."
             )));
         }
@@ -1377,21 +1332,12 @@ fn validate_isr_tier_admission(
         // existing wiring path handles it.
     }
 
-    // Bonus diagnostic: warn if an ISR-tier domain has no modules
+    // Diagnostic: warn if an interrupt-mode domain has no modules
     // assigned. A misnamed `domain:` field on a module is a common
     // typo (the hard-error `resolve_domain_id` already catches
     // it), but a correctly-named domain with no members is also a
-    // bug. Check by **domain id**, not by exec_mode: two domains
-    // at the same tier would otherwise mask each other (every
-    // module's exec_mode would be 2, satisfying the check for
-    // BOTH Tier 1b domains regardless of which they actually
-    // belong to).
-    //
-    // Tier 1b admission is live (gated on `isr_safe = true` +
-    // NEON-import lint); Tier 2 admission is live too (additionally
-    // gated on an `irq:` field + a `module_isr_entry` export). This
-    // check stays honest for both tiers — an empty ISR-tier domain is
-    // still a bug.
+    // bug. Check by **domain id**, not by mode: two domains in the
+    // same mode would otherwise mask each other.
     let mut per_domain_member_count: [usize; 4] = [0; 4];
     for module in module_list {
         let d = resolve_domain_id(module, config)?;
@@ -1400,7 +1346,7 @@ fn validate_isr_tier_admission(
         }
     }
     for d in 0..4 {
-        if !is_isr_tier(domain_exec_mode[d]) {
+        if !domain_exec_mode[d].is_interrupt() {
             continue;
         }
         if per_domain_member_count[d] > 0 {
@@ -1410,9 +1356,9 @@ fn validate_isr_tier_admission(
             .clone()
             .unwrap_or_else(|| format!("domains[{d}]"));
         eprintln!(
-            "warning: execution.domains entry '{label}' is tier {tier} but has no \
+            "warning: execution.domains entry '{label}' is `exec: {mode}` but has no \
              modules assigned to it. Did you forget a `domain: {label}` on a module?",
-            tier = tier_label(domain_exec_mode[d])
+            mode = domain_exec_mode[d].name()
         );
     }
 
@@ -1420,40 +1366,21 @@ fn validate_isr_tier_admission(
     Ok(())
 }
 
-/// Reject placement of a `pre_tick_drain` module into any domain
-/// whose tier isn't cooperative (Tier 0 or Tier 1a). Pre-tick
-/// modules run in cooperative context with the full kernel API;
-/// admitting one into a Tier 1b/2 (ISR) or Tier 3 (poll) domain
-/// would either run it from interrupt context (where its
-/// `provider_call`/heap usage is undefined) or never run it at all
-/// (Tier 3 has no `domain_exec_order` to inject the pre-tick slot
-/// into). A module declares `pre_tick_drain = true` in its
-/// manifest; this validator is what keeps that declaration and the
-/// domain's tier consistent.
-fn validate_pre_tick_drain_admission(
+/// Reject placement of a `pre_pass` module into any domain that is not
+/// `exec: tick`. Pre-pass modules run in cooperative context with the full
+/// kernel API at the start of each pass; an interrupt-mode (`timer`, `irq`)
+/// domain would run them from interrupt context (where `provider_call` and
+/// heap use are undefined), and a `poll` domain has no pass start to run
+/// them ahead of. A module declares `pre_pass = true` in its manifest; this
+/// validator keeps that declaration and the domain's mode consistent.
+fn validate_pre_pass_admission(
     config: &Value,
     module_list: &[Value],
     extra_module_dirs: &[&std::path::Path],
     resolved_target: Option<&str>,
     project_root: &std::path::Path,
 ) -> Result<()> {
-    // Per-domain exec_mode for the four supported domains.
-    let mut domain_exec_mode: [u8; 4] = [0; 4];
-    let mut domain_names_local: [Option<String>; 4] = [None, None, None, None];
-    if let Some(domains) = config
-        .get("execution")
-        .and_then(|e| e.get("domains"))
-        .and_then(|d| d.as_array())
-    {
-        for (i, dom) in domains.iter().take(4).enumerate() {
-            if let Some(name) = dom.get("name").and_then(|n| n.as_str()) {
-                domain_names_local[i] = Some(name.to_string());
-            }
-            if let Some(m) = parse_domain_tier_to_exec_mode(dom) {
-                domain_exec_mode[i] = m;
-            }
-        }
-    }
+    let domains = parse_domain_execs(config)?;
 
     // Resolved for the graph's own target, as config generation resolves
     // them: a module pinned per silicon binds that target's pin.
@@ -1473,33 +1400,23 @@ fn validate_pre_tick_drain_admission(
             Some(m) => m,
             None => continue,
         };
-        if !manifest.pre_tick_drain {
+        if !manifest.pre_pass {
             continue;
         }
         let domain = resolve_domain_id(module, config)?;
-        let exec_mode = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
-        // Tier 0 (0) and Tier 1a (1) are the only valid hosts for
-        // pre-tick modules. Tier 1b (2) / Tier 2 (4) are ISR; Tier 3
-        // (3) is poll-mode with no exec_order to drain alongside.
-        if exec_mode != 0 && exec_mode != 1 {
-            let domain_label = domain_names_local
-                .get(domain as usize)
-                .and_then(|n| n.clone())
-                .unwrap_or_else(|| format!("domain {domain}"));
+        let (domain_label, mode) = domains.get(domain as usize).map_or_else(
+            || (format!("domain {domain}"), boot_config::ExecMode::Tick),
+            |(label, exec)| (label.clone(), exec.mode),
+        );
+        if mode != boot_config::ExecMode::Tick {
             let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-            let tier_name = match exec_mode {
-                2 => "1b (isr_timer)",
-                3 => "3 (poll)",
-                4 => "2 (isr_owned)",
-                _ => "non-cooperative",
-            };
             return Err(Error::Config(format!(
-                "module '{name}' (type '{module_type}') declares \
-                 `pre_tick_drain = true` but is assigned to domain '{domain_label}' \
-                 (tier {tier_name}). Pre-tick modules run cooperatively at the start \
-                 of every scheduler pass — they must live in a Tier 0 or Tier 1a \
-                 domain. Move the module to a cooperative domain, or drop \
-                 `pre_tick_drain` from its manifest."
+                "module '{name}' (type '{module_type}') declares `pre_pass = true` but is \
+                 assigned to domain '{domain_label}' (exec: {}). The pre-pass runs \
+                 cooperatively at the start of every scheduler pass, so a pre-pass module \
+                 lives in an `exec: tick` domain. Move the module to a tick domain, or drop \
+                 `pre_pass` from its manifest.",
+                mode.name()
             )));
         }
     }
@@ -1507,56 +1424,113 @@ fn validate_pre_tick_drain_admission(
     Ok(())
 }
 
-/// Translate a domain's YAML tier specifier into the kernel's
-/// `domain_exec_mode` wire byte. Accepts the preferred friendly form
-/// (`tier: 1a`) and the `exec_mode:` alias, which spells the same
-/// tiers by their long names. Returns `None` when both fields are
-/// absent so the caller can default to Tier 0 (cooperative) without confusing
-/// "tier omitted" with "tier explicitly set to 0".
-///
-/// Wire encoding (fixed — adding a tier here MUST keep the existing
-/// values intact; this byte is what every `.cfg.bin` blob carries):
-///
-/// | Tier (friendly)       | exec_mode byte |
-/// |-----------------------|----------------|
-/// | `0` / `cooperative`   | 0              |
-/// | `1a` / `high_rate`    | 1              |
-/// | `1b` / `isr_timer`    | 2 (Tier 1b)    |
-/// | `3` / `poll`          | 3              |
-/// | `2` / `isr_owned`     | 4 (Tier 2)     |
-///
-/// The Tier 1b → 2 / Tier 2 → 4 mapping is asymmetric: the wire byte
-/// is an opaque encoding, not the tier's name, and {0, 1, 3} are taken
-/// by Tier 0 / 1a / 3. Reshuffling it would invalidate every built
-/// `.cfg.bin` blob.
-///
-/// **Returned `Err` only on explicit unknown values** — silently
-/// dropping a typo'd tier (e.g. `tier: 1c`) would route the domain
-/// to Tier 0 cooperative without warning: an ISR-tier module would
-/// then run cooperatively with none of the ISR gates applied.
-pub(crate) fn parse_domain_tier_to_exec_mode(domain: &Value) -> Option<u8> {
-    if let Some(raw) = domain.get("tier") {
-        if let Some(s) = raw.as_str() {
-            return match s {
-                "0" | "cooperative" => Some(0),
-                "1a" | "high_rate" => Some(1),
-                "1b" | "isr_timer" => Some(2),
-                "3" | "poll" => Some(3),
-                "2" | "isr_owned" => Some(4),
-                _ => None,
-            };
-        }
-        if let Some(n) = raw.as_u64() {
-            // Bare numeric `tier: 0` only resolves to cooperative;
-            // numeric form is intentionally narrow because it's
-            // ambiguous for Tier 1a/1b/Tier 2.
-            return match n {
-                0 => Some(0),
-                _ => None,
-            };
+/// A domain's execution mode and, for a `timer` domain, its period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DomainExec {
+    pub mode: boot_config::ExecMode,
+    /// A `timer` domain's period in µs (`1_000_000 / rate_hz`); 0 otherwise.
+    pub timer_period_us: u16,
+}
+
+/// The execution mode an `execution.domains[]` entry declares with `exec:`
+/// (`tick` when omitted). A `timer` domain declares its cadence as
+/// `rate_hz`, a whole number of µs per period that fits the domain record's
+/// u16 `tick_us`; no other mode takes `rate_hz`, and a `timer` domain takes
+/// no `tick_us`. `tier:` and `exec_mode:` are not keys.
+pub(crate) fn parse_domain_exec(domain: &Value, label: &str) -> Result<DomainExec> {
+    use boot_config::ExecMode;
+    for key in ["tier", "exec_mode"] {
+        if domain.get(key).is_some() {
+            return Err(Error::Config(format!(
+                "execution.domains entry '{label}': unknown key `{key}`; a domain names its \
+                 execution mode with `exec:` (tick | poll | timer | irq)"
+            )));
         }
     }
-    None
+    let mode = match domain.get("exec") {
+        None => ExecMode::Tick,
+        Some(v) => v.as_str().and_then(ExecMode::from_name).ok_or_else(|| {
+            Error::Config(format!(
+                "execution.domains entry '{label}': `exec: {v}` is not an execution mode \
+                     (tick | poll | timer | irq)"
+            ))
+        })?,
+    };
+    let rate = domain.get("rate_hz");
+    if mode != ExecMode::Timer {
+        if rate.is_some() {
+            return Err(Error::Config(format!(
+                "execution.domains entry '{label}': `rate_hz` is the cadence of an \
+                 `exec: timer` domain; this domain is `exec: {}`",
+                mode.name()
+            )));
+        }
+        return Ok(DomainExec {
+            mode,
+            timer_period_us: 0,
+        });
+    }
+    if domain.get("tick_us").is_some() {
+        return Err(Error::Config(format!(
+            "execution.domains entry '{label}': an `exec: timer` domain's cadence is \
+             `rate_hz`, not `tick_us`"
+        )));
+    }
+    let rate_hz = match rate {
+        None => {
+            return Err(Error::Config(format!(
+                "execution.domains entry '{label}': an `exec: timer` domain declares its \
+                 cadence as `rate_hz`"
+            )))
+        }
+        Some(v) => v.as_u64().filter(|&r| r > 0).ok_or_else(|| {
+            Error::Config(format!(
+                "execution.domains entry '{label}': `rate_hz: {v}` must be a positive integer"
+            ))
+        })?,
+    };
+    if 1_000_000 % rate_hz != 0 {
+        return Err(Error::Config(format!(
+            "execution.domains entry '{label}': `rate_hz: {rate_hz}` is not a whole number \
+             of microseconds per period; pick a rate that divides 1000000"
+        )));
+    }
+    let timer_period_us = u16::try_from(1_000_000 / rate_hz).map_err(|_| {
+        Error::Config(format!(
+            "execution.domains entry '{label}': `rate_hz: {rate_hz}` gives a period of {} µs, \
+             longer than the domain record's {} µs",
+            1_000_000 / rate_hz,
+            u16::MAX
+        ))
+    })?;
+    Ok(DomainExec {
+        mode,
+        timer_period_us,
+    })
+}
+
+/// Every declared domain's [`DomainExec`], in domain-id order, labelled by
+/// name (or `domains[i]`) for diagnostics.
+pub(crate) fn parse_domain_execs(config: &Value) -> Result<Vec<(String, DomainExec)>> {
+    let Some(domains) = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    domains
+        .iter()
+        .enumerate()
+        .map(|(i, dom)| {
+            let label = dom
+                .get("name")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("domains[{i}]"), str::to_string);
+            let exec = parse_domain_exec(dom, &label)?;
+            Ok((label, exec))
+        })
+        .collect()
 }
 
 /// Resolve a module's domain assignment to a numeric domain ID.
@@ -1700,15 +1674,20 @@ const NON_PARAM_KEYS: &[&str] = &[
     "_stack_member",
 ];
 
-/// Reject any YAML key on a module entry that the schema doesn't know
-/// about. Hard-fails for both `.fmod` modules (schema embedded in the
-/// .fmod) and built-ins (schema in `manifest.toml [[params]]`).
-///
-/// The candidate-name check mirrors `build_params_from_schema`'s
-/// flattening: nested objects expand to dotted/underscored variants,
-/// and outer keys ending in a `GROUPING_SUFFIXES` entry can also resolve
-/// to suffix-stripped names. Anything the packer would actually consume
-/// passes; only keys that have no path to any schema param fail here.
+/// A module entry's `variant:` names one of the type's `[[variant]]` builds,
+/// so it is a string. Any other value selects no variant and is not a param
+/// either (`variant` is never one), so it would vanish from the image without
+/// a word; a module param of that name goes under `params:`.
+fn validate_variant_key(module: &Value, module_name: &str) -> Result<()> {
+    match module.get("variant") {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(other) => Err(Error::Config(format!(
+            "module '{module_name}': `variant: {other}` must name a `[[variant]]` build of the \
+             module; a module param called `variant` goes under `params: {{ variant: {other} }}`"
+        ))),
+    }
+}
+
 /// Structural validator for the optional `heap:` subtree. Runs on every
 /// module entry regardless of whether the module has a schema source —
 /// schema-gated validation would otherwise let a `heap.alloc_failure_policy:
@@ -1887,7 +1866,11 @@ fn instance_heap_cap(
     let per_unit: Option<(u64, String, &str)> = plan
         .per_demand(manifest)
         .map(|(extra, pool, ceiling)| {
-            (extra, format!("`{pool}` planned to {ceiling}"), "heap_per_demand")
+            (
+                extra,
+                format!("`{pool}` planned to {ceiling}"),
+                "heap_per_demand",
+            )
         })
         .or_else(|| {
             let r = manifest?.heap_per_param.as_ref()?;
@@ -1935,7 +1918,9 @@ fn instance_heap_cap(
     };
     let cap = to_cap(cap)?;
     match &per_unit {
-        Some((extra, what, _)) => eprintln!("  heap: '{name}' cap {cap} B, {extra} B of it for {what}"),
+        Some((extra, what, _)) => {
+            eprintln!("  heap: '{name}' cap {cap} B, {extra} B of it for {what}")
+        }
         None => eprintln!("  heap: '{name}' cap {cap} B, sized from {bytes} B of declared params"),
     }
     Ok(Some(cap))
@@ -2040,6 +2025,15 @@ fn stack_param_skew(module: &Value, module_name: &str, param: &str) -> Option<St
     ))
 }
 
+/// Reject any YAML key on a module entry that the schema doesn't know
+/// about. Hard-fails for both `.fmod` modules (schema embedded in the
+/// .fmod) and built-ins (schema in `manifest.toml [[params]]`).
+///
+/// The candidate-name check mirrors `build_params_from_schema`'s
+/// flattening: nested objects expand to dotted/underscored variants,
+/// and outer keys ending in a `GROUPING_SUFFIXES` entry can also resolve
+/// to suffix-stripped names. Anything the packer would actually consume
+/// passes; only keys that have no path to any schema param fail here.
 fn validate_yaml_params(
     module: &Value,
     schema: &schema::ParamSchema,
@@ -2725,7 +2719,7 @@ fn build_module_entry(
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
     plan: &HeapPlan,
-) -> Result<Vec<u8>> {
+) -> Result<ModuleEntry> {
     // The params buffer grows to fit the entry: an entry that ran out of room,
     // or left too little to prove nothing was skipped, is rebuilt in a buffer
     // twice the size. There is no params ceiling.
@@ -2747,9 +2741,7 @@ fn build_module_entry(
             plan,
         );
         match built {
-            Ok(entry)
-                if cap - (entry.len() - MODULE_ENTRY_HEADER_SIZE) >= PARAMS_BUFFER_HEADROOM =>
-            {
+            Ok(entry) if cap - entry.params.len() >= PARAMS_BUFFER_HEADROOM => {
                 return Ok(entry);
             }
             Ok(_) => {}
@@ -2790,53 +2782,25 @@ fn build_module_entry_in(
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
     plan: &HeapPlan,
-) -> Result<Vec<u8>> {
+) -> Result<ModuleEntry> {
     // Room for this pass's params; truncated to what the entry used.
-    let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + cap];
-
-    // Leave bytes 0-1 for entry_length (filled at end)
+    let mut entry = vec![0u8; cap];
 
     // Module type: explicit "type" field or falls back to "name"
     let type_name = module["type"].as_str().unwrap_or(name);
 
-    // Name hash (bytes 2-5) — hash the type name so the kernel can find the .fmod.
-    // This allows multiple instances: name: seq_kick, type: sequencer
+    // The type name's hash, so the kernel can find the .fmod. This allows
+    // multiple instances: name: seq_kick, type: sequencer
     let name_hash = fnv1a_hash(type_name.as_bytes());
-    // Header layout (10 bytes total):
-    //   bytes 0-3: entry_length (u32, patched in once the params are sized)
-    //   bytes 4-7: name_hash (u32)
-    //   byte 8:    module id, low byte
-    //   byte 9:    bits 0-2 = domain_id (0..7), bit 4 = pre_tick_drain
-    //              (Tier 1c opt-in), bits 5-6 = module id bits 8-9,
-    //              bit 7 = id bit 10, bit 3 = id bit 11.
-    //              `pre_tick_drain` is mirrored from the manifest and kept
-    //              on the module entry (not the .fmod manifest) so the
-    //              kernel reads it during `prepare_graph` without a second
-    //              loader pass.
-    if id >= 4096 {
-        return Err(Error::Config(format!(
-            "module `{name}` has id {id}; a module id carries 12 bits"
-        )));
-    }
-    entry[4..8].copy_from_slice(&name_hash.to_le_bytes());
-    entry[8] = (id & 0xFF) as u8;
-    let domain_id = resolve_domain_id(module, config)?;
-    if domain_id > 7 {
-        return Err(Error::Config(format!(
-            "module `{name}` resolves to domain_id={domain_id}, exceeds wire-format max of 7"
-        )));
-    }
+    let domain = resolve_domain_id(module, config)?;
     // `manifests` was populated by `load_module_manifests_with_extra`
     // against the same resolver chain that admission validation uses
     // (project root, install root, caller-supplied extras), so a module
     // admission finds — an installed driver among them — carries its
-    // `pre_tick_drain` bit here too.
-    let pre_tick_drain = manifests.get(name).is_some_and(|m| m.pre_tick_drain);
-    entry[9] = domain_id
-        | (if pre_tick_drain { 0x10 } else { 0 })
-        | (((id >> 8) as u8 & 0x03) << 5)
-        | (((id >> 10) as u8 & 0x01) << 7)
-        | (((id >> 11) as u8 & 0x01) << 3);
+    // `pre_pass` flag here too. It rides the module record (not the
+    // .fmod manifest) so the kernel reads it during `prepare_graph` without
+    // a second loader pass.
+    let pre_pass = manifests.get(name).is_some_and(|m| m.pre_pass);
 
     // Track actual params length used
     let params_len: usize;
@@ -2876,6 +2840,7 @@ fn build_module_entry_in(
     // source must still surface a `heap.alloc_failure_policy` typo
     // at build time rather than letting it silently drop at runtime.
     validate_heap_subtree(module, type_name)?;
+    validate_variant_key(module, type_name)?;
 
     if let Some(param_schema) = pic_schema {
         validate_yaml_params(module, &param_schema, type_name)?;
@@ -2883,7 +2848,7 @@ fn build_module_entry_in(
             packed_module,
             &param_schema,
             &mut entry,
-            P,
+            0,
             data_section,
             type_name,
         )
@@ -2901,7 +2866,7 @@ fn build_module_entry_in(
             &module_with_defaults,
             &param_schema,
             &mut entry,
-            P,
+            0,
             data_section,
             type_name,
         )
@@ -2928,18 +2893,12 @@ fn build_module_entry_in(
     // fires, so a module declaring no policy stays at `params_len == 0`.
     let mut extra_len = 0usize;
     let had_end_marker = params_len >= 2
-        && entry
-            .get(MODULE_ENTRY_HEADER_SIZE + params_len - 2)
-            .copied()
-            == Some(0xFF)
-        && entry
-            .get(MODULE_ENTRY_HEADER_SIZE + params_len - 1)
-            .copied()
-            == Some(0x00);
+        && entry.get(params_len - 2).copied() == Some(0xFF)
+        && entry.get(params_len - 1).copied() == Some(0x00);
     let base = if had_end_marker {
-        MODULE_ENTRY_HEADER_SIZE + params_len - 2
+        params_len - 2
     } else {
-        MODULE_ENTRY_HEADER_SIZE + params_len
+        params_len
     };
 
     // The on-device renderers (presentation_resolver, content_controls) process
@@ -3241,7 +3200,7 @@ fn build_module_entry_in(
     // type's declared arena — the graph's `heap.arena_bytes` (validated by
     // `validate_heap_subtree`), else what the type's `[capacities]
     // heap_from_params` and `heap_per_demand` rules derive (`instance_heap_cap`).
-    if let Some(n) = instance_heap_cap(name, module, manifests.get(name), &entry[P..base], plan)? {
+    if let Some(n) = instance_heap_cap(name, module, manifests.get(name), &entry[..base], plan)? {
         if base + extra_len + 6 < entry.len() {
             entry[base + extra_len] = 0xEF;
             entry[base + extra_len + 1] = 4;
@@ -3362,16 +3321,13 @@ fn build_module_entry_in(
         // honest, saturating rather than wrapping past 64 KiB.
         //
         // payload_len is measured from byte 4 (past the TLV header) to
-        // the byte AFTER the end marker. With the schema's original
-        // end marker overwritten, the new end-marker position relative
-        // to byte 4 is `base + extra_len - (MODULE_ENTRY_HEADER_SIZE + 4)`.
-        let header_pos = MODULE_ENTRY_HEADER_SIZE;
-        if entry.len() >= header_pos + 4 && entry[header_pos] == 0xFE {
+        // the byte AFTER the end marker: `base + extra_len - 4`.
+        if entry.len() >= 4 && entry[0] == 0xFE {
             // Saturating past 64 KiB: readers walk to the terminator.
-            let new_payload_len = (base + extra_len) - (header_pos + 4);
+            let new_payload_len = (base + extra_len) - 4;
             let bytes = schema::tlv_payload_len_field(new_payload_len);
-            entry[header_pos + 2] = bytes[0];
-            entry[header_pos + 3] = bytes[1];
+            entry[2] = bytes[0];
+            entry[3] = bytes[1];
         }
     }
 
@@ -3477,18 +3433,16 @@ fn build_module_entry_in(
         );
     }
 
-    // Calculate total entry length and write to header. The
-    // extended cert/key bytes were written past the end marker and
-    // are accounted for in `extra_len`. The 2-byte original schema
-    // end marker, if any, was overwritten and re-emitted by the
-    // inserted-end-marker block above:
+    // The params' length. The extended cert/key bytes were written past
+    // the end marker and are accounted for in `extra_len`. The 2-byte
+    // original schema end marker, if any, was overwritten and re-emitted by
+    // the inserted-end-marker block above:
     //   * had_end_marker == true:  base = orig_params_len - 2; the
     //     original `0xFF 0x00` was overwritten and re-emitted
-    //     (counted in `extra_len`). Total = MODULE_ENTRY_HEADER_SIZE
-    //     + (params_len - 2) + extra_len.
+    //     (counted in `extra_len`). Total = (params_len - 2) + extra_len.
     //   * had_end_marker == false: base = orig_params_len; the end
     //     marker was appended (counted in extra_len). Total =
-    //     MODULE_ENTRY_HEADER_SIZE + params_len + extra_len.
+    //     params_len + extra_len.
     let payload_total = if had_end_marker {
         params_len.saturating_sub(2) + extra_len
     } else {
@@ -3496,13 +3450,15 @@ fn build_module_entry_in(
     };
     crate::protection::params_fit(resolved.provided, payload_total)
         .map_err(|e| Error::Config(format!("module '{name}': {e}")))?;
-    let entry_len = MODULE_ENTRY_HEADER_SIZE + payload_total;
-    entry[0..4].copy_from_slice(&(entry_len as u32).to_le_bytes());
+    entry.truncate(payload_total);
 
-    // Truncate to actual size
-    entry.truncate(entry_len);
-
-    Ok(entry)
+    Ok(ModuleEntry {
+        name_hash,
+        id,
+        domain,
+        pre_pass,
+        params: entry,
+    })
 }
 
 #[expect(
@@ -3518,7 +3474,7 @@ pub(crate) fn parse_modules_map(
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
     plan: &HeapPlan,
-) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
+) -> Result<(Vec<ModuleEntry>, Vec<String>)> {
     let mut entries = Vec::new();
     let mut names = Vec::new();
 

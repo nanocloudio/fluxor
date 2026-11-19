@@ -20,7 +20,7 @@ pub unsafe fn static_loader() -> &'static ModuleLoader {
 }
 
 /// Mutable access to the static loader for platforms that initialize
-/// it themselves (e.g. Pi 5 scans flash via the trailer).
+/// it themselves (e.g. Pi 5 reads the graph image after the kernel).
 ///
 /// # Safety
 /// Returns an exclusive `&mut` to `STATIC_LOADER`. Only sound during
@@ -42,7 +42,7 @@ pub unsafe fn static_config_mut() -> &'static mut Config {
     &mut *p
 }
 
-/// Get a reference to the static config. Returns the parsed FXWR header
+/// Get a reference to the static config. Returns the parsed config header
 /// + module list + edge list that `prepare_graph` consumes.
 ///
 /// # Safety
@@ -73,7 +73,7 @@ pub unsafe fn install_static_config(cfg: Config) {
 
 /// Populate the static config + loader from in-memory blobs.
 ///
-/// `config_ptr` points to an FXWR-format config blob; `modules_ptr` to a
+/// `config_ptr` points to an FXCF boot-config blob; `modules_ptr` to a
 /// module-table blob. The caller must keep both memory ranges mapped for
 /// the life of `STATIC_CONFIG` (module code runs from the table, and every
 /// module's params are borrowed from the config blob in place, including at

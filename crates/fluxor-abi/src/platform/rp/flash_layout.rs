@@ -25,61 +25,22 @@
 //
 // This layout is RP-specific. Other chips (BCM2712, future ESP32)
 // carry their own layout in their own `platform/<chip>` modules. The
-// on-flash data formats (slot header, parameter store entries) are the
+// on-flash data formats (parameter store entries) are the
 // property of this layer too — a second chip that happens to reuse the
 // same format still pays its own constants here rather than reaching
-// into another platform.
+// into another platform. The graph image a slot holds is not: its header is
+// the one every target's images carry (`wire::graph_image`).
 
 /// XIP mapping base on RP2040 / RP2350.
 pub const XIP_BASE: u32 = 0x1000_0000;
 
 // ── Graph slot A/B (OTA reconfigure) ──────────────────────────────────
 //
-// Two equal regions below the parameter store. Each holds one graph image
-// (`fluxor build --emit=image`): this header, the module table with its
-// program section, and the static config. Of the slots the boot selector
-// admits, the one with the higher epoch is live. Consumed by
-// `src/kernel/boot/config.rs` (boot-time selection),
-// `modules/foundation/graph_slot/mod.rs` (writer) and, for the same image
-// staged in RAM, `src/kernel/module/ota_stage.rs`.
-//
-// Header (256 bytes, little-endian):
-//
-//   0..4     magic "FXSL"
-//   4        version
-//   5..8     unused (0xFF)
-//   8..16    epoch (u64)
-//   16..20   modules offset    20..24  modules size
-//   24..28   config offset     28..32  config size
-//   32..64   SHA-256 over the modules region then the config region
-//   64..96   ABI-surface pin
-//   96..168  signature record (below), or erased (0xFF) when unsigned
-//   168..256 unused
-
-pub const GRAPH_SLOT_MAGIC: u32 = 0x4C53_5846; // "FXSL"
-pub const GRAPH_SLOT_VERSION: u8 = 1;
-/// Bytes reserved at the start of each slot for the header laid out above.
-pub const GRAPH_SLOT_HEADER_SIZE: usize = 256;
-/// Header offset of the 32-byte ABI-surface pin (`abi_surface.rs` digest
-/// of the substrate the image was built against). `fluxor build
-/// --emit=image` writes it; every reader accepts an image only when the
-/// pin equals the running kernel's own surface digest.
-pub const GRAPH_SLOT_ABI_SURFACE_OFFSET: usize = 64;
-/// The header bytes a slot signature covers: magic through the ABI pin
-/// (`[0..96]`) -- the epoch, both regions' offsets and sizes, the payload's
-/// SHA-256 and the pin. The payload is bound through its digest, so one
-/// signature over these bytes vouches for every module, the config and the
-/// program section together.
-pub const GRAPH_SLOT_SIGNED_LEN: usize = 96;
-/// Header offset of the signature record: `[magic "SIG1"][key id: 4 bytes =
-/// the first four of SHA-256(public key)][Ed25519 signature R ‖ S: 64
-/// bytes]`, 72 bytes in all. An unsigned image leaves these bytes erased
-/// (0xFF). A kernel image with a signing root accepts
-/// only an image whose record verifies against it; one built without checks
-/// no signature.
-pub const GRAPH_SLOT_SIGNATURE_OFFSET: usize = 96;
-pub const GRAPH_SLOT_SIGNATURE_MAGIC: u32 = 0x3147_4953; // "SIG1"
-pub const GRAPH_SLOT_SIGNATURE_LEN: usize = 72;
+// Two equal regions below the data store ([`graph_flash`]). Each holds one
+// graph image, header first (`wire::graph_image`). Of the slots the boot
+// selector admits, the one with the higher epoch is live. Read by the RP
+// platform's slot selection (`src/platform/rp/config.rs`) and written by
+// `modules/foundation/graph_slot`.
 
 // ── Runtime parameter store ──────────────────────────────────────────
 //

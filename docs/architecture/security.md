@@ -95,10 +95,11 @@ private key is a raw 32-byte seed on disk; `fluxor modules keygen --key
 
 ### Graph-image signatures
 
-Source: `src/kernel/security/slot_signature.rs`.
+Source: `src/kernel/security/image_signature.rs`.
 
-A graph image — what an RP flash slot holds and what the Pi 5 stages in RAM
-— can carry an Ed25519 signature over its header, which names the payload
+A graph image — what an RP flash slot holds, what the Pi 5 stages in RAM,
+what a firmware image carries after the kernel and what a Linux runtime is
+given — can carry an Ed25519 signature over its header, which names the payload
 by its SHA-256. A kernel image with a signing root boots, stages and
 activates only images signed by that key whose payload matches the
 digest. It is the same root that verifies modules: one key vouches for

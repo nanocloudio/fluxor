@@ -1,17 +1,3 @@
-/// Generate binary config in FXWR format (version 1)
-///
-/// Layout:
-/// - Header (8 bytes): magic (u32), version (u16), checksum (u16)
-/// - Counts (8 bytes): module_count low byte, edge_count low byte,
-///   tick_us (u16), graph_sample_rate (u32)
-/// - Module section header (6 bytes): module_count low byte, module_count
-///   high byte, section_size (u32)
-/// - Module entries (variable length each)
-/// - Graph section: edge_count low byte, flags, edge_count high byte, edge-slot
-///   code, then the edge slots the code states (`capacity::graph_slots`) and
-///   the per-domain metadata
-/// - Hardware section: spi/i2c/gpio/pio/uart counts, then their configs
-///
 /// Module capability info for buffer aliasing and manifest validation.
 pub struct ModuleCaps {
     pub name: String,
@@ -78,6 +64,13 @@ fn generate_config_impl(
     let modules = config
         .get("modules")
         .ok_or_else(|| Error::Config("modules section required".into()))?;
+    if config.get("boot").is_some() {
+        return Err(Error::Config(
+            "`boot:` is not a graph key: a machine's rig behaviour (summary cadence, \
+             uptime, fault and lockup probes) is not part of a graph's configuration"
+                .into(),
+        ));
+    }
 
     // The module ABI `modules_dir` holds artefacts for, which tags the pins
     // consulted when a `.fmod` is absent from it. Stated here from the
@@ -133,18 +126,14 @@ fn generate_config_impl(
         )));
     }
 
-    // Parse execution.domains. Hard-reject if the list exceeds
-    // the kernel's `MAX_DOMAINS = 4` ceiling. The config writer
-    // serialises exactly 4 domain-metadata entries
-    // (`domain metadata: 4 entries × …` in the graph section), so
-    // a 5th declared domain would either be silently dropped on
-    // the wire OR (worse) a module assigned to it would resolve
-    // to a domain id the kernel can't address (`domain_count`
-    // clamps to 4 in `prepare_graph`). Reject at source so the
-    // user sees a single clear error rather than odd runtime
-    // behaviour.
+    // Parse execution.domains. Hard-reject if the list exceeds the
+    // kernel's `MAX_DOMAINS` ceiling: the config carries one domain record
+    // per declared domain and the kernel refuses a config declaring more
+    // than it has. Reject at source so the user sees the limit by name at
+    // build rather than a refused boot.
     let mut domain_names: Vec<String> = Vec::new();
     let mut domain_tick_us: Vec<u16> = Vec::new();
+    let mut domain_modes: Vec<boot_config::ExecMode> = Vec::new();
     if let Some(exec) = config.get("execution") {
         if let Some(domains) = exec.get("domains").and_then(|d| d.as_array()) {
             if domains.len() > MAX_DOMAINS {
@@ -156,19 +145,32 @@ fn generate_config_impl(
                     MAX_DOMAINS
                 )));
             }
-            for domain in domains {
+            // A `timer` domain's tick is its period, from `rate_hz`.
+            for (domain, (label, exec)) in domains.iter().zip(parse_domain_execs(config)?) {
                 let name = domain
                     .get("name")
                     .and_then(|n| n.as_str())
                     .unwrap_or("default");
                 domain_names.push(name.to_string());
-                let dtick = domain.get("tick_us").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                let dtick = if exec.mode == boot_config::ExecMode::Timer {
+                    exec.timer_period_us
+                } else {
+                    let t = domain.get("tick_us").and_then(Value::as_u64).unwrap_or(0);
+                    u16::try_from(t).map_err(|_| {
+                        Error::Config(format!(
+                            "execution.domains entry '{label}': tick_us {t} does not fit the \
+                             domain record's u16"
+                        ))
+                    })?
+                };
                 domain_tick_us.push(dtick);
+                domain_modes.push(exec.mode);
             }
         }
     }
-    // Domain count is inferred by the kernel from module domain_id assignments.
-    // domain_names is still used for edge_class validation below.
+    // Every module's domain is an index into `execution.domains`, or 0 when
+    // it names none (`resolve_domain_id`), so the declared list (at least
+    // one) is every domain the graph uses.
 
     // Warn if tick_us < 500 with many modules
     let module_list = modules
@@ -186,7 +188,7 @@ fn generate_config_impl(
     // execution domains and share their domain's runner, budget, and timing/ISR
     // constraints, so they must pass the SAME admission checks as base modules —
     // not a weaker workload-only path. Build an augmented list (base + every workload's
-    // modules) and run the budget / ISR-tier / pre-tick / adaptive-timer-class /
+    // modules) and run the budget / interrupt-mode / pre-pass / adaptive-timer-class /
     // hardware validators over it. The config-EMIT path is unchanged: base
     // entries from `modules`, workloads from `build_workload_section`. With no `workloads:` the
     // augmented list is the base list (byte-identical validation).
@@ -194,7 +196,7 @@ fn generate_config_impl(
     // the base graph) may legitimately reuse a name. The manifest map
     // (`load_module_manifests_with_extra`) is keyed by `name` ALONE and silently
     // overwrites on collision — so a flat base+workload list could resolve a module to
-    // the WRONG manifest (wrong ISR safety / timer class / hardware / pre_tick
+    // the WRONG manifest (wrong ISR safety / timer class / hardware / pre_pass
     // metadata). Give every workload module a graph-scoped unique `name` for the
     // validation list while preserving its `type` (manifests resolve by type), so
     // each module is validated against its own manifest with no overwrite. This
@@ -278,8 +280,8 @@ fn generate_config_impl(
     // config-gen uses, or an external/project tick_counted module would fail
     // open on an adaptive domain.
 
-    // ISR-tier admission: every module routed to a Tier 1b/2 domain
-    // must declare `isr_safe = true` in its manifest, and the wiring
+    // Interrupt-mode admission: every module routed to a `timer`/`irq` domain
+    // must declare `interrupt_safe = true` in its manifest, and the wiring
     // touching it cannot use an edge class incompatible with bridge
     // routing. This build-time gate is one half of the contract; the
     // runtime routing in `channel_open` is the other.
@@ -292,15 +294,15 @@ fn generate_config_impl(
         project_root,
     )?;
 
-    // Tier 1c pre-pass drain admission: a module flagged
-    // `pre_tick_drain = true` in its manifest is cooperative-only —
-    // the kernel iterates pre-tick modules before the regular
+    // Pre-pass admission: a module flagged
+    // `pre_pass = true` in its manifest is cooperative-only —
+    // the kernel iterates pre-pass modules before the regular
     // `domain_exec_order` rotation, and the entry point still calls
     // through `step_one_module` which assumes cooperative context.
-    // Placement in Tier 1b/2/3 domains is rejected here so the
+    // Placement outside a `tick` domain is rejected here so the
     // misconfiguration surfaces at build time rather than as silent
     // misbehaviour at runtime.
-    validate_pre_tick_drain_admission(
+    validate_pre_pass_admission(
         config,
         validation_list,
         extra_module_dirs,
@@ -328,7 +330,7 @@ fn generate_config_impl(
     // Load manifests FIRST (via the rich resolver — standard module
     // dirs + project/install roots + caller-supplied extras) so that
     // `parse_modules_map` / `build_module_entry` can read per-module
-    // flags like `pre_tick_drain` from the resolved manifest instead
+    // flags like `pre_pass` from the resolved manifest instead
     // of doing a second, narrower lookup that may miss modules
     // outside the hard-coded `Manifest::from_source_tree` search
     // list (e.g. modules in the install root or in extras).
@@ -753,46 +755,6 @@ fn generate_config_impl(
         }
     }
 
-    // Mirrors `kernel::config`'s version check. The format is latest-only
-    // (kernel + tools ship together), so a stale blob is rejected by the
-    // body-size/CRC check, not by a version number. Standing rule: never bump
-    // format versions — it breaks every sibling consumer.
-    let version: u16 = 1;
-
-    let mut result = Vec::new();
-
-    // Header (8 bytes): magic, version, checksum
-    result.extend_from_slice(&MAGIC_FXWR.to_le_bytes()); // "FXWR"
-    result.extend_from_slice(&version.to_le_bytes());
-    result.extend_from_slice(&0u16.to_le_bytes()); // checksum (computed later)
-
-    // Counts (8 bytes): module_count low byte(1), edge_count low byte(1),
-    // tick_us(2), graph_sample_rate(4). The high bytes ride the module
-    // section header and the graph section header.
-    result.push((module_entries.len() & 0xFF) as u8); // module_count
-    result.push((edges.len() & 0xFF) as u8); // edge_count (high byte: graph-section byte 2)
-    result.extend_from_slice(&tick_us.to_le_bytes()); // tick_us (u16, bytes 10-11)
-    result.extend_from_slice(&graph_sample_rate.to_le_bytes()); // graph_sample_rate (u32, bytes 12-15)
-
-    // Calculate total module section size
-    let module_section_size: usize = module_entries.iter().map(|e| e.len()).sum();
-
-    // Module section header (6 bytes). `section_size` is u32 so the
-    // synth host can carry per-component embedded shells (~60 KiB
-    // each) without overflowing — split scenarios that mount a
-    // viewer/player alongside a producer easily sum to >64 KiB of
-    // module data when both halves' http modules inline their
-    // shells. Embedded targets (rp/bcm) still fit in u16 worth of
-    // bytes in practice; the wider field costs 2 bytes per config.
-    result.push((module_entries.len() & 0xFF) as u8); // module_count, low byte
-    result.push((module_entries.len() >> 8) as u8); // module_count, high byte
-    result.extend_from_slice(&(module_section_size as u32).to_le_bytes()); // section_size
-
-    // Module entries (variable length)
-    for entry in &module_entries {
-        result.extend_from_slice(entry);
-    }
-
     // Validate manifests: check dependencies and resource conflicts
     if !module_caps.is_empty() {
         validate_manifests(&module_names, module_caps)?;
@@ -903,217 +865,147 @@ fn generate_config_impl(
                 }
             }
             let retains = edges
-            .get(i)
-            .and_then(|&(_, to_id, to_port, _, to_pi)| {
-                let to_dir = if to_port == 1 { 2u8 } else { 0u8 };
-                module_names
-                    .get(to_id as usize)
-                    .and_then(|n| manifests.get(n))
-                    .and_then(|m| m.find_port_spec(to_dir, to_pi))
-            })
-            .is_some_and(|p| p.retains_send);
+                .get(i)
+                .and_then(|&(_, to_id, to_port, _, to_pi)| {
+                    let to_dir = if to_port == 1 { 2u8 } else { 0u8 };
+                    module_names
+                        .get(to_id as usize)
+                        .and_then(|n| manifests.get(n))
+                        .and_then(|m| m.find_port_spec(to_dir, to_pi))
+                })
+                .is_some_and(|p| p.retains_send);
             flags.push(wake as u8 | (u8::from(retains) << 1));
         }
         flags
     };
 
-    // Graph section.
-    //   header (4 bytes): edge_count low, flags, edge_count high, slot code
-    //   edges  (slots * GRAPH_EDGE_SIZE bytes)
-    //   domain metadata (DOMAIN_META_SIZE bytes)
-    //
-    // Edge format (GRAPH_EDGE_SIZE bytes; mirrors
-    // `kernel::boot::config::parse_graph_edge`):
-    //   byte 0:    from_id, low byte
-    //   byte 1:    to_id, low byte
-    //   byte 2:    bit 7    = to_port
-    //              bits 6:5 = edge_class (2 bits)
-    //              bits 4:0 = buffer_group (5 bits, 0..31)
-    //   byte 3:    bits 7:4 = from_port_index (4 bits, 0..15)
-    //              bits 3:0 = to_port_index   (4 bits, 0..15)
-    //   bytes 4-7: buffer_bytes (u32 LE; 0 = use module hints)
-    //   byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk, 4=transaction)
-    //              — resolved at build time from the per-edge `rate:`
-    //              override or the consumer/producer port's content-
-    //              type default. Consumed by the kernel's
-    //              MODULE_FLOW_BUDGET query.
-    //   byte 9:    bit 0 = wake_on_write (`wake: true` — control and
-    //              transaction classes only); bit 1 = retains_send (the
-    //              consumer port keeps its own copy of what it sends, read
-    //              back by the producer through `channel::FACTS`); bits 2-7
-    //              reserved
-    //   byte 10:   from_id, high byte
-    //   byte 11:   to_id, high byte
-    //
-    // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`. The
-    // 5-bit `buffer_group` ceiling (31) is enforced by
-    // `assign_buffer_groups`.
-    // Graph section header layout — must agree with the parser at
-    // `src/kernel/boot/config.rs::read_config_at_into` (graph_flags read).
-    //   byte 0: edge_count low byte
-    //   byte 1: graph_flags (bit 0 = ACCEPT_CYCLES; bits 1-7 reserved)
-    //   byte 2: edge_count high byte (0 up to 255 edges)
-    //   byte 3: edge-slot code — the section's size (`capacity::graph_slots_code`)
     let accept_cycles = config
         .get("scheduler")
         .and_then(|s| s.get("accept_cycles"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let graph_flags: u8 = if accept_cycles { 0x01 } else { 0x00 };
+    let graph_flags = if accept_cycles {
+        boot_config::GRAPH_FLAG_ACCEPT_CYCLES
+    } else {
+        0
+    };
 
-    // The slots the section is laid out for: the static profile's count, or on
-    // Linux and bcm2712 the graph's own edges rounded up to 128
-    // (`capacity::graph_slots`).
-    let slots = crate::capacity::graph_slots(resolved_target.unwrap_or("linux"), edges.len());
-    let graph_section_size = 4 + slots * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
-    let mut graph_section = Vec::with_capacity(graph_section_size);
-    graph_section.push((edges.len() & 0xFF) as u8);
-    graph_section.push(graph_flags);
-    graph_section.push((edges.len() >> 8) as u8);
-    graph_section.push(crate::capacity::graph_slots_code(slots));
-    for (i, (from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
-        let group = buffer_groups.get(i).copied().unwrap_or(0);
-        let ec = edge_classes.get(i).copied().unwrap_or(0);
-        let buffer_bytes = edge_buffer_bytes.get(i).copied().unwrap_or(0);
-        graph_section.push((*from_id & 0xFF) as u8);
-        graph_section.push((*to_id & 0xFF) as u8);
-        graph_section.push((to_port << 7) | ((ec & 0x03) << 5) | (group & 0x1F));
-        graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
-        graph_section.extend_from_slice(&buffer_bytes.to_le_bytes());
-        graph_section.push(edge_rate_classes.get(i).copied().unwrap_or(0));
-        // byte 9: bit 0 = wake_on_write; bit 1 = retains_send; bits 2-7 reserved.
-        graph_section.push(edge_wake_flags.get(i).copied().unwrap_or(0) & 0x03);
-        graph_section.push((*from_id >> 8) as u8);
-        graph_section.push((*to_id >> 8) as u8);
-    }
-    // Pad edge entries to fixed offset, then write domain metadata
-    while graph_section.len() < 4 + slots * GRAPH_EDGE_SIZE {
-        graph_section.push(0);
-    }
-    // Domain metadata: 4 entries × DOMAIN_META_ENTRY_SIZE (4) bytes:
-    //   tick_us:u16 LE | exec_mode:u8 | adaptive_flags:u8
-    // tick_min_us/tick_max_us are appended in the post-body adaptive section
-    // after the checksum (see below), not in this entry.
+    // One record per edge, in wiring order: its index is its channel id.
+    let edge_records: Vec<boot_config::EdgeRecord> = edges
+        .iter()
+        .enumerate()
+        .map(
+            |(i, &(from, to, to_port, from_port, to_port_index))| boot_config::EdgeRecord {
+                from,
+                to,
+                from_port,
+                to_port: to_port_index,
+                to_ctrl: to_port == 1,
+                class: match edge_classes.get(i).copied().unwrap_or(0) {
+                    1 => boot_config::EdgeClass::DmaOwned,
+                    2 => boot_config::EdgeClass::CrossCore,
+                    3 => boot_config::EdgeClass::NicRing,
+                    _ => boot_config::EdgeClass::Local,
+                },
+                buffer_group: buffer_groups.get(i).copied().unwrap_or(0),
+                rate_class: edge_rate_classes.get(i).copied().unwrap_or(0),
+                wake_on_write: edge_wake_flags.get(i).copied().unwrap_or(0) & 0x01 != 0,
+                retains_send: edge_wake_flags.get(i).copied().unwrap_or(0) & 0x02 != 0,
+                buffer_bytes: edge_buffer_bytes.get(i).copied().unwrap_or(0),
+            },
+        )
+        .collect();
+
+    // One record per declared domain, at least one. A domain's tick of 0
+    // takes the graph's; tick_min_us/tick_max_us of 0 take the domain's
+    // tick (adaptive is a no-op when unconfigured). Their ranges were
+    // checked by `validate_adaptive_tick`.
     let domains_arr = config
         .get("execution")
         .and_then(|e| e.get("domains"))
         .and_then(|d| d.as_array());
-    for d in 0..4usize {
-        let dtick = domain_tick_us.get(d).copied().unwrap_or(0);
-        let dom = domains_arr.and_then(|a| a.get(d));
-        let mode = dom
-            .map(|x| parse_domain_tier_to_exec_mode(x).unwrap_or(0))
-            .unwrap_or(0);
-        // Adaptive-tick per-domain config, all optional.
-        // 0 ⇒ adaptive off / "use tick_us" (the kernel parser default-fills
-        // tick_min/tick_max to the domain's tick), so a domain that sets none
-        // of these behaves exactly as a fixed tick at `tick_us`.
-        let flags = dom
-            .and_then(|x| x.get("adaptive_flags"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u8;
-        let tmin = dom
-            .and_then(|x| x.get("tick_min_us"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u16;
-        let tmax = dom
-            .and_then(|x| x.get("tick_max_us"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u16;
-        let _ = (tmin, tmax); // not stored in the wire (4-byte entry, no growth)
-        graph_section.extend_from_slice(&dtick.to_le_bytes());
-        graph_section.push(mode);
-        graph_section.push(flags); // adaptive_flags = byte 3 of the domain entry
-    }
-    while graph_section.len() < graph_section_size {
-        graph_section.push(0);
-    }
-    result.extend_from_slice(&graph_section);
+    let field_u16 = |dom: Option<&Value>, key: &str| -> u16 {
+        dom.and_then(|x| x.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u16
+    };
+    let domain_records: Vec<boot_config::DomainRecord> = (0..domain_tick_us.len().max(1))
+        .map(|d| {
+            let dom = domains_arr.and_then(|a| a.get(d));
+            boot_config::DomainRecord {
+                tick_us: domain_tick_us.get(d).copied().unwrap_or(0),
+                tick_min_us: field_u16(dom, "tick_min_us"),
+                tick_max_us: field_u16(dom, "tick_max_us"),
+                exec_mode: domain_modes.get(d).copied().unwrap_or_default(),
+                adaptive_flags: dom
+                    .and_then(|x| x.get("adaptive_flags"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u8,
+            }
+        })
+        .collect();
 
-    // Hardware section
+    // The hardware section is RP pin policy, decoded by the RP platform
+    // alone: an RP config always carries it (counts of zero when the graph
+    // declares no `hardware:`), and any other target refuses a `hardware:`
+    // that configures anything, since its kernel would refuse the section.
     let hw_section =
         build_hardware_section(&config["hardware"], &module_names, max_gpio, pio_count)?;
-    result.extend_from_slice(&hw_section);
-
-    // Compute CRC16-CCITT checksum of body (bytes 8 onwards)
-    let checksum = crc16_ccitt(&result[8..]);
-    result[6..8].copy_from_slice(&checksum.to_le_bytes());
-
-    // Adaptive-tick post-body section: 4 domains × [tick_min_us:u16 LE,
-    // tick_max_us:u16 LE] = 16 bytes, appended AFTER the checksum so it sits
-    // past body_size (the kernel reads it at total_size), not checksum-covered:
-    // the kernel range-checks each value.
-    // Mirrors `kernel::boot::config::ADAPTIVE_POST_SIZE`; default 0 ⇒ kernel uses the
-    // domain tick (adaptive is a no-op when unconfigured).
-    let adaptive_domains = config
-        .get("execution")
-        .and_then(|e| e.get("domains"))
-        .and_then(|d| d.as_array());
-    for d in 0..4usize {
-        let dom = adaptive_domains.and_then(|a| a.get(d));
-        let tmin = dom
-            .and_then(|x| x.get("tick_min_us"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u16;
-        let tmax = dom
-            .and_then(|x| x.get("tick_max_us"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u16;
-        result.extend_from_slice(&tmin.to_le_bytes());
-        result.extend_from_slice(&tmax.to_le_bytes());
-    }
-
-    // Resident-workload section: each top-level `workloads:`
-    // entry becomes a self-contained `AddSubgraph` (FLXA) blob the kernel admits
-    // at boot via `apply_add`. Appended right AFTER the 16-byte adaptive post-body
-    // (so the kernel reads it at `total_size + ADAPTIVE_POST_SIZE`), also PAST the
-    // checksummed body. Absent `workloads:` ⇒ empty ⇒ no section.
-    let workload_section = if workloads.is_empty() {
-        Vec::new()
+    let rp_target = runtime_owned
+        .as_deref()
+        .is_some_and(|r| r == "rp2040" || r == "rp2350");
+    let hardware = if rp_target {
+        Some(hw_section.as_slice())
+    } else if hw_section.len() > HARDWARE_HEADER_LEN {
+        return Err(Error::Config(format!(
+            "`hardware:` configures buses or pins, but the {} runtime has no hardware \
+             section: its drivers claim what they use at runtime",
+            runtime_owned.as_deref().unwrap_or("linux")
+        )));
     } else {
-        crate::add_subgraph::encode_workload_section(&workloads).map_err(Error::Config)?
+        None
     };
-    result.extend_from_slice(&workload_section);
 
-    // Capacity-envelope section (FXEV): the optional top-level `capacity:`
-    // map, each entry a pool's live-add reserve (an arena's size). Absent
-    // `capacity:` writes no section, and every pool takes the profile's
-    // default reserve.
+    // Resident workloads: each top-level `workloads:` entry is a
+    // self-contained `AddSubgraph` (FLXA) blob the kernel admits at boot via
+    // `apply_add`.
+    let workload_blobs: Vec<(bool, Vec<u8>)> = workloads
+        .iter()
+        .map(|w| crate::add_subgraph::encode_add_subgraph(w).map(|b| (w.idle_safe, b)))
+        .collect::<std::result::Result<_, String>>()
+        .map_err(Error::Config)?;
+    let workload_records: Vec<boot_config::WorkloadRecord<'_>> = workload_blobs
+        .iter()
+        .map(|(idle_safe, blob)| boot_config::WorkloadRecord {
+            idle_safe: *idle_safe,
+            blob,
+        })
+        .collect();
+
+    // The capacity envelope: the optional top-level `capacity:` map, each
+    // entry a pool's live-add reserve (an arena's size). Absent `capacity:`
+    // writes no section, and every pool takes the profile's default reserve.
     let target = resolved_target.unwrap_or("linux");
     let envelope = envelope_entries(config, target)?;
-    result.extend_from_slice(&encode_envelope(&envelope));
-    // Declared-demand section (FXDM), after the envelope: what the graph's
-    // modules declare of the kernel pools, which the kernel adds to their
-    // derived sizes. Absent when nothing declares.
+    let envelope_records = envelope_pool_entries(&envelope);
+    // Declared demand: what the graph's modules declare of the kernel pools,
+    // which the kernel adds to their derived sizes. Absent when nothing
+    // declares.
     let declared = declared_demand(config, &module_names, &manifests, &demand)?;
     if let Some(line) = heap_per_demand_report(&plan, &demand, &module_entries) {
         println!("{line}");
     }
-    if !declared.is_empty() {
-        let wire: Vec<(u16, u32)> = declared.iter().map(|&(_, id, n)| (id, n)).collect();
-        result.extend_from_slice(&crate::capacity::encode_pool_section(
-            crate::capacity::DEMAND_SECTION_MAGIC,
-            &wire,
-        ));
-    }
+    let demand_records: Vec<boot_config::PoolEntry> = declared
+        .iter()
+        .map(|&(_, pool, n)| boot_config::PoolEntry { pool, n })
+        .collect();
     // The kernel's boot plan for this config, run here: a pool whose ceiling
     // (derived + reserve) the target's kernel cannot hold is refused at build,
     // naming the pool, instead of at boot.
-    let (workloads, workload_modules, workload_edges) =
-        crate::capacity::resident_demand(&workload_section);
-    // Each module's domain by its config id, as the entries carry them (byte
-    // 8 and the id bits of byte 9; the domain in byte 9's bits 0-2).
-    let domains: HashMap<u16, u8> = module_entries
-        .iter()
-        .filter(|e| e.len() >= 10)
-        .map(|e| {
-            let id = u16::from(e[8])
-                | (u16::from((e[9] >> 5) & 0x03) << 8)
-                | (u16::from(e[9] >> 7) << 10)
-                | (u16::from((e[9] >> 3) & 0x01) << 11);
-            (id, e[9] & 0x07)
-        })
-        .collect();
+    let (workload_count, workload_modules, workload_edges) =
+        crate::capacity::resident_demand(&workload_records);
+    // Each module's domain by its config id.
+    let domains: HashMap<u16, u8> = module_entries.iter().map(|e| (e.id, e.domain)).collect();
     let crossings = crate::capacity::crossing_count(edges.iter().enumerate().map(
         |(i, &(from_id, to_id, ..))| {
             (
@@ -1127,7 +1019,7 @@ fn generate_config_impl(
         modules: module_entries.len() as u64,
         edges: edges.len() as u64,
         fans: crate::capacity::fan_count(&edges),
-        workloads,
+        workloads: workload_count,
         workload_modules,
         workload_edges,
         crossings,
@@ -1144,75 +1036,49 @@ fn generate_config_impl(
         .map_err(Error::Config)?;
     println!("{summary}");
 
-    // Boot parameters (FXBO), from the optional top-level `boot:` map.
-    if let Some(params) = boot_params(config)? {
-        result.extend_from_slice(&crate::capacity::encode_boot_section(&params));
-    }
-
-    Ok(result)
+    let module_records: Vec<boot_config::ModuleRecord<'_>> =
+        module_entries.iter().map(ModuleEntry::record).collect();
+    boot_config::encode(&boot_config::BootConfigSpec {
+        tick_us,
+        graph_sample_rate,
+        graph_flags,
+        modules: &module_records,
+        edges: &edge_records,
+        domains: &domain_records,
+        hardware,
+        workloads: (!workload_records.is_empty()).then_some(workload_records.as_slice()),
+        envelope: (!envelope_records.is_empty()).then_some(envelope_records.as_slice()),
+        demand: (!demand_records.is_empty()).then_some(demand_records.as_slice()),
+    })
+    .map_err(|e| Error::Config(e.to_string()))
 }
 
-/// The top-level `boot:` map: how a machine behaves on a test rig. `None`
-/// without one.
-pub(super) fn boot_params(config: &Value) -> Result<Option<crate::capacity::BootParams>> {
-    let Some(boot) = config.get("boot") else {
-        return Ok(None);
-    };
-    let obj = boot
-        .as_object()
-        .ok_or_else(|| Error::Config("boot: must be a map".into()))?;
-    let mut p = crate::capacity::BootParams::default();
-    for (key, value) in obj {
-        let seconds = || {
-            value
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| Error::Config(format!("boot.{key}: must be a number of seconds")))
-        };
-        match key.as_str() {
-            "fault_probe" => {
-                p.fault_probe = value
-                    .as_bool()
-                    .ok_or_else(|| Error::Config("boot.fault_probe: must be a bool".into()))?
-            }
-            "lockup_probe" => {
-                p.lockup_probe = value
-                    .as_bool()
-                    .ok_or_else(|| Error::Config("boot.lockup_probe: must be a bool".into()))?
-            }
-            "summary_every_s" => p.summary_every_s = seconds()?,
-            "summary_for_s" => p.summary_for_s = seconds()?,
-            "max_uptime_s" => p.max_uptime_s = seconds()?,
-            other => return Err(Error::Config(format!("boot: unknown key '{other}'"))),
-        }
-    }
-    Ok(Some(p))
-}
+/// Bytes of the hardware section's counts header (spi, i2c, gpio, pio,
+/// reserved, uart), before any record.
+const HARDWARE_HEADER_LEN: usize = 6;
 
-/// Build the FXEV capacity-envelope section from the top-level `capacity:`
-/// map: [`envelope_entries`], encoded. Empty without a `capacity:` block.
+/// The capacity envelope from the top-level `capacity:` map:
+/// [`envelope_entries`] as the codec's records. Empty without a `capacity:`
+/// block.
 #[cfg(test)]
-fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Result<Vec<u8>> {
+fn build_capacity_envelope(
+    config: &Value,
+    resolved_target: Option<&str>,
+) -> Result<Vec<boot_config::PoolEntry>> {
     let entries = envelope_entries(config, resolved_target.unwrap_or("linux"))?;
-    Ok(encode_envelope(&entries))
+    Ok(envelope_pool_entries(&entries))
 }
 
-/// The FXEV section for `entries` (`(pool, id, n)`), empty when there are
-/// none.
-fn encode_envelope(entries: &[(&'static str, u16, u64)]) -> Vec<u8> {
-    if entries.is_empty() {
-        return Vec::new();
-    }
-    let wire: Vec<(u16, u32)> = entries
+/// `entries` (`(pool, id, n)`) as envelope records, each figure encoded in
+/// its pool's unit (`capacity::encode_entry`).
+fn envelope_pool_entries(entries: &[(&'static str, u16, u64)]) -> Vec<boot_config::PoolEntry> {
+    entries
         .iter()
-        .map(|&(_, id, n)| {
-            (
-                id,
-                crate::capacity::encode_entry(id, n).expect("checked by envelope_entries"),
-            )
+        .map(|&(_, id, n)| boot_config::PoolEntry {
+            pool: id,
+            n: crate::capacity::encode_entry(id, n).expect("checked by envelope_entries"),
         })
-        .collect();
-    crate::capacity::encode_envelope_section(&wire)
+        .collect()
 }
 
 /// The top-level `capacity:` map (`pool name: n`) as `(pool, id, n)` envelope
@@ -1342,14 +1208,12 @@ fn base_planned_heaps(
 fn apply_heap_plan(
     plan: &HeapPlan,
     heaps: &[PlannedHeap],
-    entries: &mut [Vec<u8>],
+    entries: &mut [ModuleEntry],
     workloads: &mut [crate::add_subgraph::Workload],
 ) -> Result<()> {
     for h in heaps {
         let tlv = match h.at {
-            ParamsAt::Base(i) => entries
-                .get_mut(i)
-                .and_then(|e| e.get_mut(MODULE_ENTRY_HEADER_SIZE..)),
+            ParamsAt::Base(i) => entries.get_mut(i).map(|e| e.params.as_mut_slice()),
             ParamsAt::Workload(w, m) => workloads
                 .get_mut(w)
                 .and_then(|w| w.modules.get_mut(m))
@@ -1453,7 +1317,7 @@ fn integer_params(schema: Option<&schema::ParamSchema>) -> Vec<(u8, u32)> {
 /// a type with a `demand_from_params` rule, its param schema from `loc`.
 fn base_demand(
     modules: &Value,
-    entries: &[Vec<u8>],
+    entries: &[ModuleEntry],
     names: &[String],
     manifests: &HashMap<String, Manifest>,
     loc: schema::ModuleLocation<'_>,
@@ -1462,7 +1326,7 @@ fn base_demand(
     let mut out = Vec::new();
     for ((module, entry), name) in list.iter().zip(entries).zip(names) {
         let manifest = manifests.get(name);
-        let tlv = entry.get(MODULE_ENTRY_HEADER_SIZE..).unwrap_or(&[]);
+        let tlv = entry.params.as_slice();
         let integers = if manifest.is_some_and(|m| !m.demand_from_params.is_empty()) {
             let ty = module.get("type").and_then(Value::as_str).unwrap_or(name);
             integer_params(schema::load_schema_for_entry(module, ty, loc)?.as_ref())
@@ -1587,7 +1451,7 @@ fn unkeyed_module_provider<'a>(
 /// pool, what its instances declare ([`instance_demand`]), base graph and
 /// resident workloads summed. The kernel adds it to the pool's derived size,
 /// so a pool sized by its consumers — the store's subscription table — grows
-/// with the graph that boots. The FXDM section carries it; empty when
+/// with the graph that boots. The `DMND` section carries it; empty when
 /// nothing declares.
 ///
 /// A pool a module provider serves from its own heap
@@ -1651,7 +1515,7 @@ fn declared_demand(
 fn heap_per_demand_report(
     plan: &HeapPlan,
     demand: &[InstanceDemand],
-    entries: &[Vec<u8>],
+    entries: &[ModuleEntry],
 ) -> Option<String> {
     let mut parts = Vec::new();
     let mut per_demand = 0u64;
@@ -1678,7 +1542,7 @@ fn heap_per_demand_report(
     let caps: u64 = entries
         .iter()
         .filter_map(|e| {
-            let tlv = e.get(MODULE_ENTRY_HEADER_SIZE..)?;
+            let tlv = e.params.as_slice();
             let off = heap_cap_offset(tlv)?;
             Some(u64::from(u32::from_le_bytes(
                 tlv[off..off + 4].try_into().ok()?,
@@ -1691,24 +1555,24 @@ fn heap_per_demand_report(
     ))
 }
 
-/// Build the resident-workload config section from the optional top-level `workloads:`
-/// list. Each workload is a self-contained subgraph:
-/// modules referenced by `name_hash` (FNV-1a of type) with inline-TLV params (the
-/// same `build_params_from_schema` packing base modules use), and optional
-/// intra-workload `wiring:` (`module.port` ends among the workload's modules, the node's
-/// network as `linux_net`, see [`workload_edges`]). Cross-workload edges
-/// are refused (strict isolation). Returns an empty Vec with no workloads.
+/// The graph's resident workloads as the FLXA blobs a config's `WKLD`
+/// section carries, from the optional top-level `workloads:` list. Each
+/// workload is a self-contained subgraph: modules referenced by `name_hash`
+/// (FNV-1a of type) with inline-TLV params (the same
+/// `build_params_from_schema` packing base modules use), and optional
+/// intra-workload `wiring:` (`module.port` ends among the workload's modules,
+/// the node's network as `linux_net`, see [`workload_edges`]). Cross-workload
+/// edges are refused (strict isolation). Empty with no workloads.
 #[cfg(test)]
 fn build_workload_section(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
-) -> Result<Vec<u8>> {
-    let workloads = build_workloads(config, loc, extra_module_dirs, "linux")?;
-    if workloads.is_empty() {
-        return Ok(Vec::new());
-    }
-    crate::add_subgraph::encode_workload_section(&workloads).map_err(Error::Config)
+) -> Result<Vec<Vec<u8>>> {
+    build_workloads(config, loc, extra_module_dirs, "linux")?
+        .iter()
+        .map(|w| crate::add_subgraph::encode_add_subgraph(w).map_err(Error::Config))
+        .collect()
 }
 
 use crate::add_subgraph::{WorkloadEdge, WorkloadEnd};
@@ -1897,33 +1761,25 @@ fn build_workloads_counted(
         return Ok((Vec::new(), demand, heaps));
     }
     let data_section = config.get("data");
-    // Manifest search path for the pre_tick_drain check: mirror the validators'
+    // Manifest search path for the pre_pass check: mirror the validators'
     // resolution (extra_module_dirs first — they shadow bundled modules), then
     // `modules_dir` as a fallback so an external/project module is found and
-    // checked rather than silently passing and losing its pre-tick semantics.
+    // checked rather than silently passing and losing its pre-pass semantics.
     let manifest_search: Vec<&Path> = {
         let mut v: Vec<&Path> = extra_module_dirs.to_vec();
         v.push(loc.dir);
         v
     };
-    // Per-domain exec_mode (Tier) so workloads can be rejected from ISR-tier domains.
-    // The FLXA workload codec carries NO exec-mode / `isr_safe` / `pre_tick_drain`
-    // metadata, and workload admission runs AFTER the platform registers ISR handlers
-    // (bcm2712.rs) — so an ISR-tier workload would be admitted yet never dispatched
-    // (the cooperative runner skips ISR domains) and a `pre_tick_drain` workload would
-    // silently lose its pre-pass semantics. Both are refused.
-    let mut domain_exec_mode: [u8; 4] = [0; 4];
-    if let Some(domains) = config
-        .get("execution")
-        .and_then(|e| e.get("domains"))
-        .and_then(|d| d.as_array())
-    {
-        for (i, dom) in domains.iter().take(4).enumerate() {
-            if let Some(m) = parse_domain_tier_to_exec_mode(dom) {
-                domain_exec_mode[i] = m;
-            }
-        }
-    }
+    // Per-domain execution mode, so workloads can be refused from interrupt-mode
+    // domains. The FLXA workload codec carries NO exec-mode / `interrupt_safe` /
+    // `pre_pass` metadata, and workload admission runs AFTER the platform registers
+    // ISR handlers (bcm2712.rs) — so an interrupt-mode workload would be admitted yet
+    // never dispatched (the cooperative runner skips interrupt-mode domains) and a
+    // `pre_pass` workload would silently lose its pre-pass semantics. Both are refused.
+    let domain_exec_mode: Vec<boot_config::ExecMode> = parse_domain_execs(config)?
+        .into_iter()
+        .map(|(_, exec)| exec.mode)
+        .collect();
     let mut workloads = Vec::new();
     for (pi, workload_yaml) in workloads_yaml.iter().enumerate() {
         let mods_yaml = workload_yaml
@@ -1991,15 +1847,20 @@ fn build_workloads_counted(
             // as base modules), so workload modules share their domain's runner/budget
             // and the admission validators resolve them identically.
             let domain_id = resolve_domain_id(m, config)?;
-            // Reject ISR-tier (1b/2) workload placement — the codec cannot represent it
+            // Reject interrupt-mode workload placement — the codec cannot represent it
             // and the cooperative runner would never dispatch it.
-            let exec_mode = *domain_exec_mode.get(domain_id as usize).unwrap_or(&0);
-            if exec_mode == 2 || exec_mode == 4 {
+            let exec_mode = domain_exec_mode
+                .get(domain_id as usize)
+                .copied()
+                .unwrap_or_default();
+            if exec_mode.is_interrupt() {
                 return Err(Error::Config(format!(
-                    "workload {pi} module '{mtype}' targets an ISR-tier domain (tier 1b/2). Resident \
-                     workloads are cooperative: the FLXA codec carries no ISR metadata and workload \
-                     admission runs after ISR registration, so an ISR-tier workload would never \
-                     execute. Place ISR-tier modules in the base graph."
+                    "workload {pi} module '{mtype}' targets an `exec: {}` domain. Resident \
+                     workloads are cooperative: the FLXA codec carries no interrupt-mode \
+                     metadata and workload admission runs after ISR registration, so such a \
+                     workload would never execute. Place interrupt-mode modules in the base \
+                     graph.",
+                    exec_mode.name()
                 )));
             }
             // Resolved for the target's module ABI and the instance's
@@ -2025,15 +1886,15 @@ fn build_workloads_counted(
             if let Some(man) = manifest.as_ref() {
                 local_manifests.insert(mname.to_string(), man.clone());
             }
-            // Reject `pre_tick_drain` workload modules — the codec drops the flag, so a
+            // Reject `pre_pass` workload modules — the codec drops the flag, so a
             // workload module would silently run as an ordinary cooperative module,
-            // losing its Tier-1c pre-pass drain semantics.
-            if manifest.as_ref().is_some_and(|man| man.pre_tick_drain) {
+            // losing its pre-pass semantics.
+            if manifest.as_ref().is_some_and(|man| man.pre_pass) {
                 return Err(Error::Config(format!(
-                    "workload {pi} module '{mtype}' is a pre_tick_drain (Tier 1c) module, \
+                    "workload {pi} module '{mtype}' is a pre_pass module, \
                      which resident workloads do not support: the FLXA codec carries \
-                     no pre_tick_drain flag, so the module would silently run as an \
-                     ordinary cooperative module. Place pre_tick_drain modules in the \
+                     no pre_pass flag, so the module would silently run as an \
+                     ordinary cooperative module. Place pre_pass modules in the \
                      base graph."
                 )));
             }
@@ -2041,6 +1902,7 @@ fn build_workloads_counted(
             // reads them via `params_ptr` exactly the same way.
             let param_schema = schema::load_schema_for_entry(m, mtype, loc)?;
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
+            validate_variant_key(m, mname)?;
             let integers = integer_params(param_schema.as_ref());
             let params = if let Some(param_schema) = param_schema {
                 // tls / quic peer names: checked and packed as a base
@@ -2088,7 +1950,11 @@ fn build_workloads_counted(
                 params,
             });
         }
-        let local_claims = exercised_claims(&local_entries, &local_manifests, schema_param_is_one_of(loc))?;
+        let local_claims = exercised_claims(
+            &local_entries,
+            &local_manifests,
+            schema_param_is_one_of(loc),
+        )?;
         validate_single_provider(
             &json!({
                 "modules": local_entries,
@@ -2829,8 +2695,6 @@ fn validate_services(
 
     Ok(())
 }
-
-use crate::hash::crc16_ccitt;
 
 #[cfg(test)]
 mod buffer_group_tests {

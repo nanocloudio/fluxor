@@ -34,7 +34,6 @@ use crate::kernel::ipc::channel;
 use crate::kernel::ipc::channel::{
     channel_producer_gone, channel_set_mailbox, channel_set_reader_gone,
 };
-use crate::kernel::ipc::ring_size as rings;
 use crate::kernel::module::loader::{
     reset_state_arena, DynamicModule, ModuleLoader, PortCapacities, StartNewResult,
 };
@@ -43,6 +42,7 @@ use crate::kernel::module::syscalls::{get_syscall_table, is_spi_initialized};
 use crate::kernel::sys::hal;
 use crate::kernel::workload::bitmask::ModuleMask;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerTable, OWNER_SYSTEM};
+use fluxor_contracts::ring_size as rings;
 
 // ============================================================================
 // Graph Constants and Types
@@ -398,7 +398,7 @@ impl Edge {
 
 /// Open channels for all edges in the graph.
 ///
-/// Each ring is sized by `kernel::ipc::ring_size`: the largest of the
+/// Each ring is sized by `fluxor_contracts::ring_size`: the largest of the
 /// producer and consumer ports' declared capacities and the edge's
 /// `buffer_bytes`, rounded up to a power of two (64 bytes at least), and the
 /// default ring (`CHANNEL_BUFFER_SIZE`) where nothing sizes the edge. The

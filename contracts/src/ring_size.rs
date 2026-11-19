@@ -4,11 +4,9 @@
 //!
 //! The scheduler opens every ring by these definitions (`open_channels`),
 //! `channel_open` bounds every ring by them, and the composer sums a graph's
-//! rings by them before the graph is built (`tools/src/ring_plan.rs`, which
-//! mounts this file by `#[path]`): one definition, compiled into both.
-//! Self-contained, so it mounts anywhere: it names nothing outside itself.
-//! Kernel and tool code only — no module compiles against it, so it is not
-//! part of the module ABI.
+//! rings by them before the graph is built (`tools/src/ring_plan.rs`): one
+//! definition, linked by both. Kernel and tool code only — no module compiles
+//! against it, so it is not part of the module ABI.
 
 /// The smallest ring a channel is granted.
 pub const MIN_RING_BYTES: u32 = 64;
