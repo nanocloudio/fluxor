@@ -58,7 +58,7 @@ aead = "on_wire_sequence"
 # | 5   | require_retry      | u8   | 0       | Server: demand a Retry token.  |
 # | 6   | enable_0rtt        | u8   | 0       | 0-RTT resumption + early data. |
 # | 9   | verify_peer        | u8   | 0       | Validate the peer cert chain.  |
-# | 11  | trace_sample_permille | u16 | tier  | Span head-sampling rate (‰).   |
+# | 11  | trace_sample_permille | u16 | per-target | Span head-sampling rate (‰).   |
 # | 12  | disable_migration  | u8   | 0       | Advertise disable_active_migration. |
 # | 15  | ecdh_bits_per_step | u16  | 256     | P-256 ladder chunk per step.   |
 # | 16  | ticket_rotate_s    | u32  | 3600    | Ticket-sealing key rotation.   |

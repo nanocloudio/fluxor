@@ -54,6 +54,28 @@ pub fn mpidr_for_core(core_id: u8) -> u64 {
 /// registers and the label are the caller's, so the macro fits whatever
 /// the surrounding code has free. `$label` is a local-label reference such
 /// as `"2f"`; the caller places `"2:"` right after the expansion.
+/// Make this core's earlier stores visible to the other cores, then wake
+/// every core waiting in [`wait_for_event`].
+#[inline(always)]
+pub fn signal_cores() {
+    // SAFETY: DMB + SEV are architectural hints; no memory effects.
+    unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
+}
+
+/// Park this core until an event ([`signal_cores`]) or an interrupt.
+#[inline(always)]
+pub fn wait_for_event() {
+    // SAFETY: WFE halts the core until an event; hint-only.
+    unsafe { core::arch::asm!("wfe", options(nostack)) };
+}
+
+/// Park this core until an interrupt is pending.
+#[inline(always)]
+pub fn wait_for_interrupt() {
+    // SAFETY: WFI halts the core until an interrupt; hint-only.
+    unsafe { core::arch::asm!("wfi", options(nostack)) };
+}
+
 #[macro_export]
 macro_rules! drop_to_el1 {
     ($t0:literal, $t1:literal, $label:literal) => {

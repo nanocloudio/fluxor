@@ -15,31 +15,31 @@ use serde_json::Value;
 
 pub use fluxor_contracts::isolation::Level;
 
-/// A module's trust tier, the default source of its protection level.
+/// A module's trust class, the default source of its protection level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tier {
+pub enum TrustClass {
     Platform = 0,
     Verified = 1,
     Community = 2,
     Unsigned = 3,
 }
 
-impl Tier {
-    pub fn parse(s: &str) -> Option<Tier> {
+impl TrustClass {
+    pub fn parse(s: &str) -> Option<TrustClass> {
         match s {
-            "platform" => Some(Tier::Platform),
-            "verified" => Some(Tier::Verified),
-            "community" => Some(Tier::Community),
-            "unsigned" => Some(Tier::Unsigned),
+            "platform" => Some(TrustClass::Platform),
+            "verified" => Some(TrustClass::Verified),
+            "community" => Some(TrustClass::Community),
+            "unsigned" => Some(TrustClass::Unsigned),
             _ => None,
         }
     }
 
-    /// The level a tier implies when the graph names none.
+    /// The level a trust class implies when the graph names none.
     pub fn default_level(self) -> Level {
         match self {
-            Tier::Platform | Tier::Verified => Level::Privileged,
-            Tier::Community | Tier::Unsigned => Level::Isolated,
+            TrustClass::Platform | TrustClass::Verified => Level::Privileged,
+            TrustClass::Community | TrustClass::Unsigned => Level::Isolated,
         }
     }
 }
@@ -49,13 +49,13 @@ impl Tier {
 pub enum Source {
     Module,
     Graph,
-    Tier(Tier),
+    TrustClass(TrustClass),
 }
 
 /// One module's resolved protection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resolution {
-    pub tier: Tier,
+    pub class: TrustClass,
     pub requested: Level,
     pub source: Source,
     /// What the target provides: the weakest implemented level at or above
@@ -72,17 +72,17 @@ fn graph_str<'a>(config: &'a Value, key: &str) -> Option<&'a str> {
     })
 }
 
-/// The tier and requested level for `module`, before admission. An
+/// The trust class and requested level for `module`, before admission. An
 /// unrecognised string is an error, not a default.
-pub fn requested(module: &Value, config: &Value) -> Result<(Tier, Level, Source), String> {
-    let tier_str = module
-        .get("trust_tier")
+pub fn requested(module: &Value, config: &Value) -> Result<(TrustClass, Level, Source), String> {
+    let class_str = module
+        .get("trust_class")
         .and_then(|v| v.as_str())
-        .or_else(|| graph_str(config, "default_trust_tier"))
+        .or_else(|| graph_str(config, "default_trust_class"))
         .unwrap_or("platform");
-    let tier = Tier::parse(tier_str).ok_or_else(|| {
+    let class = TrustClass::parse(class_str).ok_or_else(|| {
         format!(
-            "invalid trust_tier '{tier_str}' (expected platform, verified, community or unsigned)"
+            "invalid trust_class '{class_str}' (expected platform, verified, community or unsigned)"
         )
     })?;
     let (explicit, source) = match module.get("protection").and_then(|v| v.as_str()) {
@@ -94,9 +94,9 @@ pub fn requested(module: &Value, config: &Value) -> Result<(Tier, Level, Source)
             let level = Level::parse(p).ok_or_else(|| {
                 format!("invalid protection '{p}' (expected privileged, contained or isolated)")
             })?;
-            Ok((tier, level, source))
+            Ok((class, level, source))
         }
-        None => Ok((tier, tier.default_level(), Source::Tier(tier))),
+        None => Ok((class, class.default_level(), Source::TrustClass(class))),
     }
 }
 
@@ -114,12 +114,12 @@ pub fn resolve(
     config: &Value,
     implemented: &[Level],
 ) -> Result<Resolution, String> {
-    let (tier, requested, source) = requested(module, config)?;
+    let (class, requested, source) = requested(module, config)?;
     let provided = provided(requested, implemented).ok_or_else(|| {
         let what = match source {
             Source::Module => "asks for".to_string(),
             Source::Graph => "takes the graph's".to_string(),
-            Source::Tier(t) => format!("is trust_tier {t:?}, which implies"),
+            Source::TrustClass(t) => format!("is trust_class {t:?}, which implies"),
         };
         let has = if implemented.is_empty() {
             "privileged only".to_string()
@@ -136,7 +136,7 @@ pub fn resolve(
         )
     })?;
     Ok(Resolution {
-        tier,
+        class,
         requested,
         source,
         provided,
@@ -381,20 +381,20 @@ mod tests {
     }
 
     #[test]
-    fn module_beats_graph_beats_tier() {
-        let cfg = json!({"protection": "privileged", "default_trust_tier": "community"});
+    fn module_beats_graph_beats_trust_class() {
+        let cfg = json!({"protection": "privileged", "default_trust_class": "community"});
         let m = json!({"name": "x", "protection": "contained"});
         assert_eq!(requested(&m, &cfg).unwrap().1, Level::Contained);
         let m = json!({"name": "x"});
         assert_eq!(requested(&m, &cfg).unwrap().1, Level::Privileged);
-        let cfg = json!({"default_trust_tier": "community"});
-        let (tier, level, _) = requested(&m, &cfg).unwrap();
-        assert_eq!((tier, level), (Tier::Community, Level::Isolated));
+        let cfg = json!({"default_trust_class": "community"});
+        let (class, level, _) = requested(&m, &cfg).unwrap();
+        assert_eq!((class, level), (TrustClass::Community, Level::Isolated));
     }
 
     #[test]
-    fn the_default_tier_is_honoured_under_graph() {
-        let cfg = json!({"graph": {"default_trust_tier": "verified"}});
+    fn the_default_trust_class_is_honoured_under_graph() {
+        let cfg = json!({"graph": {"default_trust_class": "verified"}});
         let m = json!({"name": "x"});
         assert_eq!(requested(&m, &cfg).unwrap().1, Level::Privileged);
     }
@@ -407,7 +407,7 @@ mod tests {
         // step guard runs every module.
         assert!(requested(&json!({"name": "x", "protection": "guarded"}), &cfg).is_err());
         assert!(requested(&json!({"name": "x", "protection": "none"}), &cfg).is_err());
-        assert!(requested(&json!({"name": "x", "trust_tier": "trusted"}), &cfg).is_err());
+        assert!(requested(&json!({"name": "x", "trust_class": "trusted"}), &cfg).is_err());
     }
 
     #[test]
@@ -517,11 +517,11 @@ mod tests {
     #[test]
     fn a_shortfall_names_the_levels_the_target_has() {
         let cfg = json!({});
-        let m = json!({"name": "x", "trust_tier": "community"});
+        let m = json!({"name": "x", "trust_class": "community"});
         let e = resolve(&m, &cfg, &[Level::Contained]).unwrap_err();
         assert!(e.contains("privileged, contained"), "{e}");
         let r = resolve(
-            &json!({"name": "x", "trust_tier": "community", "protection": "contained"}),
+            &json!({"name": "x", "trust_class": "community", "protection": "contained"}),
             &cfg,
             &[Level::Contained],
         )

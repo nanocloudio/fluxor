@@ -68,7 +68,7 @@ pub struct HalOps {
     /// have to be inferred from whether an encrypt call returned bytes,
     /// which it always does.
     pub seal_provenance: fn() -> SealProvenance,
-    /// The signing root modules and graph images are verified against:
+    /// The signing root modules and node images are verified against:
     /// every platform answers with the root written into its kernel image
     /// (`security::root::image_root`).
     pub signing_root: fn() -> Option<[u8; 32]>,
@@ -161,17 +161,18 @@ pub struct HalOps {
     /// Post-step elapsed check (aarch64 advisory; no-op on Cortex-M).
     pub step_guard_post_check: fn(),
 
-    // ── ISR tier ──────────────────────────────────────────────────────
+    // ── Interrupt modes ─────────────────────────────────────────────────────
     /// Read hardware cycle counter (DWT CYCCNT / CNTPCT_EL0).
     pub read_cycle_count: fn() -> u32,
-    /// Initialize ISR tier hardware (enable DWT cycle counter, etc).
-    pub isr_tier_init: fn(),
-    /// Start Tier 1b periodic timer with period in microseconds.
-    pub isr_tier_start: fn(u32),
-    /// Stop Tier 1b periodic timer.
-    pub isr_tier_stop: fn(),
-    /// Poll Tier 1b from main loop (aarch64 only; no-op on Cortex-M).
-    pub isr_tier_poll: fn(),
+    /// Initialize the cycle counter the interrupt modes budget with (DWT, ...).
+    pub module_timer_init: fn(),
+    /// Start the module timer (the `timer` mode's cadence), period in µs.
+    pub module_timer_start: fn(u32),
+    /// Stop the module timer.
+    pub module_timer_stop: fn(),
+    /// Poll the module timer from a domain loop (aarch64 only; no-op on
+    /// Cortex-M, whose alarm interrupt fires it).
+    pub module_timer_poll: fn(),
 
     // ── Platform dispatch ─────────────────────────────────────────────
     /// Platform-specific provider initialization (GPIO, SPI, etc.).
@@ -202,6 +203,19 @@ pub struct HalOps {
     /// Returns 0 on success, negative errno on failure.
     pub irq_bind: fn(irq: u32, event_handle: i32, ack: IrqAck, target_core: u8) -> i32,
 
+    /// Undo [`irq_bind`](Self::irq_bind) for `irq`: mask the line and drop
+    /// its binding, so the interrupt path no longer dispatches it. A no-op
+    /// where `irq_bind` is one. Returns 0, or a negative errno.
+    pub irq_unbind: fn(irq: u32) -> i32,
+
+    /// Mask (`true`) or unmask (`false`) the line `irq` at the interrupt
+    /// controller and nothing else: one register write, no binding table,
+    /// no log. Callable from interrupt context: the dispatcher masks a line
+    /// whose module latched an outcome, so a level-triggered line cannot
+    /// refire before thread context retires it. A no-op where `irq_bind` is
+    /// one.
+    pub irq_mask: fn(irq: u32, masked: bool),
+
     /// Block until the absolute `deadline_us` (microseconds since boot) OR an
     /// event/IRQ wakes the scheduler, whichever comes first; returns a
     /// `WOKEN_*` reason. The portable unification of the per-platform split
@@ -228,7 +242,7 @@ pub struct HalOps {
     pub protection_set_enabled: fn(bool),
     /// Drop all per-module protection state for a graph reconfigure.
     pub protection_reset: fn(),
-    /// Build a gated module's protection domain from its code/state/heap
+    /// Build a gated module's isolation region from its code/state/heap
     /// footprints, before any of its code runs. `false` fails the load
     /// closed: the module is never run privileged instead.
     pub protection_register_module: fn(
@@ -240,7 +254,7 @@ pub struct HalOps {
         heap_ptr: *mut u8,
         heap_size: usize,
     ) -> bool,
-    /// Release a gated module's protection domain (its slot, tables and
+    /// Release a gated module's isolation region (its slot, tables and
     /// stack) at teardown.
     pub protection_release_module: fn(module_idx: usize),
     /// The `SyscallTable` a gated module is handed: every entry a veneer that
@@ -693,7 +707,7 @@ pub fn step_guard_post_check() {
     (ops().step_guard_post_check)()
 }
 
-// ── ISR tier ──────────────────────────────────────────────────────────
+// ── Interrupt modes ─────────────────────────────────────────────────────────
 
 #[inline(always)]
 pub fn read_cycle_count() -> u32 {
@@ -701,23 +715,23 @@ pub fn read_cycle_count() -> u32 {
 }
 
 #[inline(always)]
-pub fn isr_tier_init() {
-    (ops().isr_tier_init)()
+pub fn module_timer_init() {
+    (ops().module_timer_init)()
 }
 
 #[inline(always)]
-pub fn isr_tier_start(period_us: u32) {
-    (ops().isr_tier_start)(period_us)
+pub fn module_timer_start(period_us: u32) {
+    (ops().module_timer_start)(period_us)
 }
 
 #[inline(always)]
-pub fn isr_tier_stop() {
-    (ops().isr_tier_stop)()
+pub fn module_timer_stop() {
+    (ops().module_timer_stop)()
 }
 
 #[inline(always)]
-pub fn isr_tier_poll() {
-    (ops().isr_tier_poll)()
+pub fn module_timer_poll() {
+    (ops().module_timer_poll)()
 }
 
 // ── Platform dispatch ─────────────────────────────────────────────────
@@ -795,4 +809,16 @@ pub enum IrqAck {
 #[inline(always)]
 pub fn irq_bind(irq: u32, event_handle: i32, ack: IrqAck, target_core: u8) -> i32 {
     (ops().irq_bind)(irq, event_handle, ack, target_core)
+}
+
+/// Mask `irq` and drop its binding.
+#[inline(always)]
+pub fn irq_unbind(irq: u32) -> i32 {
+    (ops().irq_unbind)(irq)
+}
+
+/// Mask or unmask `irq` at the interrupt controller; interrupt-safe.
+#[inline(always)]
+pub fn irq_mask(irq: u32, masked: bool) {
+    (ops().irq_mask)(irq, masked)
 }

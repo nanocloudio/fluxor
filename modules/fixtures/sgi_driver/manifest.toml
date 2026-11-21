@@ -1,0 +1,16 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "uefi"]
+grants = ["kernel.signal_core"]
+
+# Interrupt stimulus for an `exec: irq` domain: every `every_ticks` of its own
+# steps it raises SGI `sgi` on core `core` (`SIGNAL_CORE`), the interrupt an
+# IRQ-owned module on that core binds (`irq_probe`, `irq: 15`). Logs the
+# first answer and the first refusal:
+#
+#   [sgi] core=<c> sgi=<n> rc=<rc>
+#
+# Place it on a domain of its own core (core 0), never on the one it signals.
+timer_class = "tick_counted"
+
+[observability]
+exempt = "interrupt stimulus fixture; the probe's dispatch count is the observable"

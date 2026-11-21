@@ -796,7 +796,7 @@ fn unknown_module_in_wiring(name: &str, declared_names: &[String]) -> String {
 /// `to_port`: 0 = data input, 1 = control input.
 type WireTuple = (u16, u16, u8, u8, u8);
 
-/// Result bundle from `parse_wiring_edges`: tuples, force flags,
+/// What `parse_wiring_edges` returns: tuples, force flags,
 /// and the original source/destination spec strings (parallel arrays).
 type WiringEdges = (Vec<WireTuple>, Vec<bool>, Vec<String>, Vec<String>);
 
@@ -1198,7 +1198,7 @@ fn resolve_edge_classes(
 /// frame at 50 fps doesn't share a default with a low-rate
 /// telemetry edge from the same producer.
 fn resolve_edge_buffer_bytes(config: &Value) -> Result<Vec<u32>> {
-    let max = crate::ring_plan::MAX_RING_BYTES;
+    let max = fluxor_contracts::ring_size::MAX_RING_BYTES;
     let Some(wiring) = config.get("wiring").and_then(|w| w.as_array()) else {
         return Ok(Vec::new());
     };
@@ -1931,8 +1931,7 @@ pub fn validate_fault_policy(
                  provides {}. The restart releases the provider layer the module registered and does \
                  not run `module_new` again, so the \
                  module would resume as a provider nothing can reach. Choose \
-                 `fault_policy: \"skip\"` to terminate it, or `fault_policy: \"restart_graph\"` \
-                 to re-instantiate the whole graph.",
+                 `fault_policy: \"skip\"` to terminate it.",
                 m.provides.join(", ")
             )));
         }
@@ -1951,8 +1950,7 @@ pub fn validate_fault_policy(
              completes inside one step, no provider handle is held across steps, and \
              discarding in-flight channel data loses nothing the module's protocol does \
              not already treat as loss), or choose `fault_policy: \"skip\"` to terminate \
-             the module and let the operator drain and reload, or \
-             `fault_policy: \"restart_graph\"` to re-instantiate the whole graph."
+             the module and let the operator drain and reload."
         )));
     }
     Ok(())
@@ -1974,7 +1972,7 @@ pub fn validate_fault_policy(
 /// stays there. The rule is general: it holds for every module-providable
 /// contract (`manifest::provider_contracts`), not only the store.
 ///
-/// `modules` is every module the composer validates — the base graph and the
+/// `modules` is every module the composer validates — the node graph and the
 /// resident workloads' modules — each with its manifest by name. The node
 /// admits live-added workloads when its kernel holds owners beside the
 /// system's and the plan leaves the owners pool a reserve (the `capacity:`

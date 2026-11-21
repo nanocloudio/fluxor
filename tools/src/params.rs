@@ -1,8 +1,8 @@
-//! Parameters: one typed model for graphs, stacks and bundles.
+//! Parameters: one typed model for graphs, stacks and workload packages.
 //!
-//! Any runnable graph, a published stack and a bundle's graph declare
+//! Any runnable graph, a published stack and a workload package's graph declare
 //! `params:` with one schema (type, default, required, min/max,
-//! description, example) and name a value as `${param:<name>}`. A bundle's
+//! description, example) and name a value as `${param:<name>}`. A package's
 //! params are its graph's params. A run supplies values (`--param`,
 //! `--params`); a check renders with each param's default, else its example.
 //!
@@ -54,7 +54,7 @@ const PLACEHOLDER: &str = "${param:";
 /// a path (`cert_file: ${param:cert}`, `trust: ${param:ca}`). Its
 /// value renders as the file's absolute path, and a run is refused before
 /// anything is built when the file is not there. It has no default: the
-/// file is the consumer's, not the bundle's. Its example names a sample
+/// file is the consumer's, not the package's. Its example names a sample
 /// relative to the source manifest, which the checks build with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -189,7 +189,7 @@ pub(crate) fn typed_toml(what: &str, ty: ParamType, v: &toml::Value) -> Result<P
     }
 }
 
-/// The key a graph, stack or bundle graph declares its params under.
+/// The key a graph, stack or package graph declares its params under.
 pub const PARAMS_KEY: &str = "params";
 
 /// Parse a `params:` mapping. Shape errors (an unknown key, an unknown type,

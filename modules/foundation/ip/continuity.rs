@@ -765,6 +765,24 @@ fn v6_ends(s: &IpState, c: &tcp::TcpConn) -> Option<([u8; 16], [u8; 16])> {
     ))
 }
 
+/// Whether connection `idx` is the node's own: on the node's lane, from an
+/// address no workload owns. Only those are migratable.
+///
+/// # Safety
+/// `idx` is a connection slot.
+unsafe fn node_conn(s: &IpState, idx: usize) -> bool {
+    let c = &*s.tcp_conns.ptr(idx);
+    c.lane == 0 && c.owner_tag == 0
+}
+
+/// Whether an IPv4 flow names a local address a workload owns. An IPv6
+/// flow is a digest; its address is checked when its record is decoded.
+fn flow_on_workload_address(s: &IpState, flow: &[u8; 16]) -> bool {
+    flow[0] != 0xF6
+        && local_slot_for_dst(s, rd_u32_be(flow, 0))
+            .is_some_and(|slot| owner_tag_for_slot(s, slot) != 0)
+}
+
 /// The live connection a flow names on this module, if it is one this
 /// module could export.
 unsafe fn conn_of_flow(s: &IpState, flow: &[u8; 16]) -> Option<usize> {
@@ -1102,17 +1120,19 @@ unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) ->
             )
         }
     };
-    // The connection belongs to the owner of the address it lands on. The
-    // record names no owner: owners are this host's own numbering, which
-    // means nothing on the host that wrote it.
-    let here = owner_tag_for_slot(s, slot);
+    // Session control is the node graph's: a connection lands only on an
+    // address the node holds for itself. A workload's address is not
+    // migratable (the record names no owner, and the node graph's
+    // transformers would not see a workload's lane).
+    if owner_tag_for_slot(s, slot) != 0 {
+        return Err(sc::STATUS_UNSUPPORTED);
+    }
     *conn = tcp::TcpConn::new();
     conn.state = state;
     conn.local_port = lport;
     conn.remote_port = rport;
     conn.remote_ip = remote;
     conn.local_slot = slot;
-    conn.owner_tag = here;
     conn.iss = rd_u32(rec, p);
     p += 4;
     conn.snd_una = rd_u32(rec, p);
@@ -1976,6 +1996,17 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
     // A flow this module owns live prepares to export; any other prepares
     // a shadow to import.
     if let Some(idx) = conn_of_flow(s, flow) {
+        if !node_conn(s, idx) {
+            reply(
+                s,
+                flow,
+                epoch,
+                sc::CR_PAIR_PREPARED,
+                sc::STATUS_UNSUPPORTED,
+                &[transport, profile, 0, 0],
+            );
+            return;
+        }
         if let Some(mi) = find_mirror(s, flow) {
             let m = &s.cont.mirrors[mi];
             if m.epoch > epoch {
@@ -2043,6 +2074,17 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
             sc::CR_PAIR_PREPARED,
             sc::STATUS_OK,
             &[transport, profile, slot[0], slot[1], conn[0], conn[1]],
+        );
+        return;
+    }
+    if flow_on_workload_address(s, flow) {
+        reply(
+            s,
+            flow,
+            epoch,
+            sc::CR_PAIR_PREPARED,
+            sc::STATUS_UNSUPPORTED,
+            &[transport, profile, 0, 0],
         );
         return;
     }
@@ -2789,6 +2831,10 @@ unsafe fn cmd_cut_export(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
         }
     };
     let idx = s.cont.mirrors[mi].conn_idx as usize;
+    if !node_conn(s, idx) {
+        reply(s, flow, epoch, sc::CR_CUT, sc::STATUS_UNSUPPORTED, &[0; 4]);
+        return;
+    }
     let state = (*s.tcp_conns.ptr(idx)).state;
     if !state_exportable(state) {
         reply(

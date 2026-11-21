@@ -1,6 +1,6 @@
 //! WASM `image_decode` provider: the browser reads the named byte range of
 //! an object through the same object store `storage.object` serves (the
-//! written tier first, then a ranged `fetch()` of the page origin) and
+//! written layer first, then a ranged `fetch()` of the page origin) and
 //! decodes it with `createImageBitmap` + `OffscreenCanvas`, scaled to the
 //! requested size and packed as RGB565.
 //!

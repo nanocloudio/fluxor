@@ -1,4 +1,4 @@
-//! `wasm_browser_midi_in` / `wasm_browser_midi_out` built-ins — STUB.
+//! `wasm_browser_midi_in` / `wasm_browser_midi_out` native modules — STUB.
 //!
 //! Real implementations pending. When wired, these will bridge the
 //! Web MIDI API (`navigator.requestMIDIAccess`) via the host shim:
@@ -15,15 +15,17 @@
 //!   output port selected by `port_filter`.
 //!
 //! Stub behaviour:
-//!   - modules register in the built-in table so configs load
+//!   - modules register in the native module table so configs load
 //!     cleanly,
-//!   - the dispatch arms in `wasm.rs` log a STUB marker on
+//!   - the constructors log a STUB marker on
 //!     construction,
 //!   - **`midi_out` drains** the input channel every step so a
 //!     producer wired to it doesn't backpressure. Reads are
 //!     discarded. `midi_in` has no input port and is a pure no-op.
 
+use crate::abi::platform::native::wasm::wasm_browser_midi_out as midi_out_tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -62,20 +64,20 @@ unsafe fn alloc_state_out(events_in: i32) -> *mut MidiOutState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn midi_in_step(_state: *mut u8) -> i32 {
+unsafe extern "C" fn midi_in_step(_state: *mut u8) -> i32 {
     // No input port — pure no-op until Web MIDI integration lands.
     0
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn midi_out_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn midi_out_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut MidiOutState);
         if st_ptr.is_null() {
@@ -90,16 +92,40 @@ unsafe fn midi_out_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build_in() -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_midi_in", midi_in_step);
-    let raw = alloc_state_in();
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut MidiInState, raw);
-    m
+/// The `wasm_browser_midi_in` native module.
+pub static WASM_BROWSER_MIDI_IN: NativeVtable = super::heap_native(new_in, midi_in_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new_in(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    log::warn!(
+        "[wasm-kernel] module {}: wasm_browser_midi_in is a STUB (Web MIDI not yet implemented)",
+        init.slot
+    );
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<MidiInState>(), || {
+            alloc_state_in().cast()
+        })
+    }
 }
 
-pub(crate) unsafe fn build_out(events_in: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_midi_out", midi_out_step);
-    let raw = alloc_state_out(events_in);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut MidiOutState, raw);
-    m
+/// The `wasm_browser_midi_out` native module.
+pub static WASM_BROWSER_MIDI_OUT: NativeVtable = super::heap_native(new_out, midi_out_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new_out(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    log::warn!("[wasm-kernel] module {}: wasm_browser_midi_out is a STUB (Web MIDI not yet implemented; drains input channel)", init.slot);
+    let events_in = scheduler::module_port(init.slot, midi_out_tags::PORT_EVENTS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<MidiOutState>(), || {
+            alloc_state_out(events_in).cast()
+        })
+    }
 }

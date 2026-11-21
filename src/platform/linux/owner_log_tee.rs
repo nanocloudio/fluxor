@@ -50,7 +50,7 @@ static SCHED_TID: OnceLock<std::thread::ThreadId> = OnceLock::new();
 /// Owner attribution consults the scheduler (`current_module_index` → HAL),
 /// which is only legal once the runtime is initialized. Until then every
 /// record is a platform/boot record → owner 0, no scheduler access. Set by
-/// [`enable_owner_log_attribution`] right before the main loop.
+/// [`enable_owner_log_attribution`] right before the domain loop.
 static ATTRIBUTION_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct TeeLogger;
@@ -250,14 +250,14 @@ fn install_owner_log_tee() {
     let _ = log::set_logger(&TEE);
 }
 
-/// Record the calling thread as the scheduler thread (main loop). Called once,
+/// Record the calling thread as the scheduler thread (domain loop). Called once,
 /// on the main thread, before the step loop.
 fn register_scheduler_thread() {
     let _ = SCHED_TID.set(std::thread::current().id());
 }
 
 /// Enable owner attribution: called once the scheduler and HAL are fully
-/// initialized (right before the main loop). Records emitted earlier were
+/// initialized (right before the domain loop). Records emitted earlier were
 /// attributed to owner 0 without consulting the scheduler.
 fn enable_owner_log_attribution() {
     ATTRIBUTION_READY.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -265,7 +265,7 @@ fn enable_owner_log_attribution() {
 
 /// On-step owner attribution: the module the scheduler is currently stepping →
 /// its owner `(uid, slot, generation)`, or owner 0 (system) when the current
-/// module is system-owned. Valid only on the scheduler thread.
+/// module is node-owned. Valid only on the scheduler thread.
 fn on_step_attribution() -> ([u8; 16], u16, u32) {
     let idx = fluxor::kernel::exec::scheduler::current_module_index();
     fluxor::kernel::exec::scheduler::module_owner_attribution(idx).unwrap_or_default()
@@ -285,9 +285,9 @@ fn now_unix_ms() -> u64 {
 fn flush_owner_rings(logs_dir: &std::path::Path) {
     // Per-slot high-water mark of the last flushed record position, keyed by
     // the owner IDENTITY `(uid, generation, next_seq)` — not `next_seq` alone.
-    // `install_slot` resets a slot's ring to seq 0 for a new tenant, so a bare
-    // seq watermark could alias the new tenant's early records to the previous
-    // tenant's flushed ones and skip the new ring file entirely (a low-volume
+    // `install_slot` resets a slot's ring to seq 0 for a new owner, so a bare
+    // seq watermark could alias the new owner's early records to the previous
+    // owner's flushed ones and skip the new ring file entirely (a low-volume
     // module might never get its file). One entry per owner slot, grown with
     // the owner table. Main-thread-only, so a plain static is safe.
     static mut LAST_FLUSHED: Vec<([u8; 16], u32, u64)> = Vec::new();

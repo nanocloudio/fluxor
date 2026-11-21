@@ -1,4 +1,4 @@
-//! `wasm_browser_http` built-in: the browser as an HTTP exchange provider.
+//! `wasm_browser_http` native module: the browser as an HTTP exchange provider.
 //!
 //! A provider of the exchange contract (`contracts/exchange.rs`) speaking its
 //! HTTP binding (`contracts/exchange_http.rs`): request records arrive on
@@ -30,8 +30,8 @@
 //! One exchange is performed at a time; others wait collected. A graph that
 //! wants concurrency instantiates more of these.
 //!
-//! State: heap-allocated; the `BuiltInModule`'s inline state holds a
-//! `*mut HttpState`.
+//! State: heap-allocated on the module's own heap; its arena state
+//! holds the `*mut HttpState` pointer.
 
 use crate::abi::contracts::exchange::{
     self as ex, abort, flag, op, Collector, ExchangeId, PAYLOAD_MAX, RECORD_MAX, RESP_HEAD_FIXED,
@@ -39,7 +39,9 @@ use crate::abi::contracts::exchange::{
 use crate::abi::contracts::exchange_http::{
     self as http, header_lines_from_meta, meta_from_header_lines, method_name, status, Http,
 };
+use crate::abi::platform::native::wasm::wasm_browser_http as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -533,11 +535,11 @@ fn seal_body(st: &mut HttpState, more: bool) {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn http_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn http_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this
-    // module instance, holding the `*mut HttpState` written by `build`; every
+    // module instance, holding the `*mut HttpState` written by the constructor; every
     // buffer touched below lives inside that allocation, and the host
     // imports read and write only the slices they are handed.
     unsafe {
@@ -564,13 +566,22 @@ unsafe fn http_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(
-    origin: &[u8],
-    request_in: i32,
-    response_out: i32,
-) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_http", http_step);
-    let raw = alloc_state(request_in, response_out, origin);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut HttpState, raw);
-    m
+/// The `wasm_browser_http` native module.
+pub static WASM_BROWSER_HTTP: NativeVtable = super::heap_native(new, http_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut origin_buf = [0u8; 256];
+    let origin = super::param_bytes(init.params, tags::TAG_ORIGIN, &mut origin_buf);
+    let request_in = scheduler::module_port(init.slot, tags::PORT_REQUEST_IN);
+    let response_out = scheduler::module_port(init.slot, tags::PORT_RESPONSE_OUT);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<HttpState>(), || {
+            alloc_state(request_in, response_out, origin).cast()
+        })
+    }
 }

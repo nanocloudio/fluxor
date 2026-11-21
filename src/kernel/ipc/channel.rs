@@ -469,11 +469,11 @@ pub fn channel_open(config: &[u8]) -> i32 {
 /// Open a channel whose producer and consumer are both `opener` (a module's
 /// own `channel::OPEN`).
 pub fn channel_open_for_module(config: &[u8], opener: ModuleId) -> i32 {
-    // ISR-tier (Tier 1b / Tier 2) modules must not open channels — their I/O
+    // interrupt-mode (`timer`/`irq`) modules must not open channels — their I/O
     // rides bridge channels registered ahead of time. The build-time
     // validator already rejects this shape; the runtime check is defense in
     // depth for hand-rolled binaries.
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_open") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("channel_open") {
         return crate::kernel::sys::errno::EACCES;
     }
     let Some(buf_capacity) = ring_capacity(config) else {
@@ -563,14 +563,6 @@ pub fn channel_bind_end(handle: i32, end: End, module: ModuleId) {
         End::Either => return,
     };
     let _ = field.compare_exchange(NO_MODULE, module, Ordering::AcqRel, Ordering::Acquire);
-}
-
-/// Name `handle`'s producer (`NO_MODULE`: none but the kernel) — a spare
-/// lane taking or losing its producer.
-pub fn channel_set_producer(handle: i32, producer: ModuleId) {
-    if let Some((_, slot)) = resolve(handle) {
-        slot.producer.store(producer, Ordering::Release);
-    }
 }
 
 /// Close `handle` (the kernel's call).
@@ -1165,6 +1157,14 @@ pub fn writable_as(handle: i32, caller: ModuleId) -> Result<usize, i32> {
     Ok(slot.with_lock(|fifo, _| fifo.writable()))
 }
 
+/// The ring `handle` was opened with, in bytes: 0 for a handle that names
+/// no channel.
+pub fn channel_ring_bytes(handle: i32) -> u32 {
+    resolve(handle).map_or(0, |(_, slot)| {
+        slot.with_lock(|fifo, _| fifo.capacity()) as u32
+    })
+}
+
 /// The kernel's [`writable_as`]: 0 for a handle that names no channel.
 pub fn channel_writable_bytes(handle: i32) -> usize {
     writable_as(handle, NO_MODULE).unwrap_or(0)
@@ -1241,7 +1241,7 @@ pub fn channel_set_reader_gone(handle: i32) {
 // Syscall Entry Points — a module's calls, as the module stepping
 // ============================================================================
 
-/// The module whose call this is, or `EACCES` for an ISR-tier module: its
+/// The module whose call this is, or `EACCES` for an interrupt-mode module: its
 /// I/O rides bridge rings, never a channel.
 #[inline]
 fn caller(op: &'static str) -> Result<ModuleId, i32> {

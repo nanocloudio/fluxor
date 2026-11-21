@@ -1,4 +1,4 @@
-//! Module domain — PIC loader, provider dispatch, syscall surface, EL0 gateway.
+//! Module — PIC loader, provider dispatch, syscall surface, EL0 gateway.
 
 pub mod gateway;
 pub mod loader;

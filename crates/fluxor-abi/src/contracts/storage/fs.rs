@@ -125,7 +125,7 @@
 // `OPEN_CREATE`/`MKDIR` are already documented as fused `BIND` + open
 // forms — see `namespace.rs::BIND`. `FSYNC_NAME` and `RENAME` complete
 // that fusion rather than competing with it: a filesystem provider whose
-// directory entries live inside the byte tier publishes names through
+// directory entries live inside the byte surface publishes names through
 // this surface, and a split provider (an index without bytes) publishes
 // them through `storage.namespace`. Requiring every consumer to hold a
 // second namespace-provider handle to fence a name it minted through
@@ -266,7 +266,7 @@ pub use super::super::super::registry::fs::READDIR;
 ///
 /// # Capability discovery — query `CAPS` first
 ///
-/// `OPEN_CREATE` is part of the FS contract's *write tier*, which a
+/// `OPEN_CREATE` is part of the FS contract's *write surface*, which a
 /// provider may not offer: a read-only volume, or a host whose storage
 /// cannot create a file. Callers MUST query `CAPS` (see below) and
 /// branch on `caps::OPEN_CREATE` before invoking this opcode if they
@@ -345,7 +345,7 @@ pub use super::super::super::registry::fs::TRUNCATE;
 /// [`FSYNC`]. Same shape as [`WRITE`] (`handle=file`, empty `arg`, the
 /// bytes in `data`). Lets a durable append log (the WAL) pipeline its
 /// writes instead of spin-polling each, the single biggest write-
-/// throughput lever. Providers without the async tier return `ENOSYS`
+/// throughput lever. Providers without the async surface return `ENOSYS`
 /// and leave [`caps::FSYNC_ASYNC`] clear; callers fall back to `WRITE`.
 ///
 /// A short return is backpressure, not an error: the provider accepted
@@ -422,7 +422,7 @@ pub use super::super::super::registry::fs::FSYNC_POLL;
 /// `arg_len` is its length. Returns `0` on success or a negative errno, and
 /// may answer `EINPROGRESS` first: 0 means the parent entry is durable.
 ///
-/// ## Why the byte tier needs this opcode
+/// ## Why the byte surface needs this opcode
 ///
 /// [`FSYNC`] and [`FSYNC_POLL`] fence a file's *bytes and its own size
 /// metadata* through an open FD. Neither publishes the directory entry
@@ -531,7 +531,7 @@ pub use super::super::super::registry::fs::READLINK;
 ///
 /// Returns `0` on success or a negative errno, and may answer
 /// `EINPROGRESS` first. Normatively `storage.namespace::RENAME` fused into
-/// the byte tier — see `namespace.rs::RENAME`.
+/// the byte surface — see `namespace.rs::RENAME`.
 ///
 /// ## Guarantee
 ///
@@ -583,7 +583,7 @@ pub use super::super::super::registry::fs::RENAME;
 ///
 /// # Scope: what the bitmap covers (and what it doesn't)
 ///
-/// The bitmap describes **handle-acquisition + write-tier**
+/// The bitmap describes **handle-acquisition + write-surface**
 /// capabilities — the entry-point opcodes a caller invokes with
 /// `handle = -1` to obtain a new FD, plus the future mutation
 /// opcodes (`WRITE`, `FSYNC`, …) that target an FD.
@@ -626,7 +626,7 @@ pub use super::super::super::registry::fs::RENAME;
 /// "capability absent", and MUST NOT latch a bitmap they have not
 /// successfully read. The failure this prevents is silent and
 /// permanent: a consumer probing during boot latches a clear bit,
-/// runs its degraded tier for the lifetime of the process, and is
+/// runs its degraded surface for the lifetime of the process, and is
 /// indistinguishable from one running on a volume that genuinely
 /// cannot support the capability.
 pub use super::super::super::registry::fs::CAPS;
@@ -710,7 +710,7 @@ pub mod errno_classes {
 /// returning `ENOSYS`).
 ///
 pub mod caps {
-    // ── Handle-acquisition tier ─────────────────────────────
+    // ── Handle-acquisition surface ───────────────────────────
     // Opcodes called with handle = -1 that return a new FD.
     /// [`OPEN`] (`fs::OPEN`) — read-only file open by path.
     pub const OPEN: u32 = 1 << 0;
@@ -720,7 +720,7 @@ pub mod caps {
     /// [`OPEN_CREATE`] (`fs::OPEN_CREATE`) — open with O_CREAT semantics.
     pub const OPEN_CREATE: u32 = 1 << 2;
 
-    // ── Write tier (mutate state through an existing FD) ────
+    // ── Write surface (mutate state through an existing FD) ────
     /// [`WRITE`] — write bytes through an FD. Clear on a read-only
     /// provider (a wasm fetch backend).
     pub const WRITE: u32 = 1 << 3;
@@ -740,7 +740,7 @@ pub mod caps {
     /// leave its descriptor positioned at byte zero.
     pub const PREALLOCATE: u32 = 1 << 9;
     /// [`WRITE_ASYNC`] + [`FSYNC_SUBMIT`]/[`FSYNC_POLL`]
-    /// — the pipelined async durable-write tier. Set iff
+    /// — the pipelined async durable-write surface. Set iff
     /// the provider (and its block source) implement submit-now /
     /// fence-later durability; callers fall back to `WRITE`+`FSYNC` when
     /// clear.
@@ -750,7 +750,7 @@ pub mod caps {
     /// media independently of the file's own bytes.
     pub const FSYNC_NAME: u32 = 1 << 11;
 
-    // ── Object-model tier ───────────────────────────────────
+    // ── Object-model surface ─────────────────────────────────
     // What an inode-based filesystem carries and FAT32 does not. A provider
     // whose format has no answer clears the bit rather than fabricating one.
     /// A name can be added to an existing file ([`LINK`]), and `nlink`

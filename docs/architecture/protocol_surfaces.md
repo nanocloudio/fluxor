@@ -246,7 +246,7 @@ encapsulation, address and MAC rewrite, egress, and the return path. That
 work is a fluxor capability rather than a director's, by the same test
 every contract here answers to — encapsulating a frame means the same
 thing on bare metal and on a host stack, it is a primitive rather than a
-policy, and it is consumed across tenants. The director chooses WHICH
+policy, and it is consumed across owners. The director chooses WHICH
 attachment or endpoint; it does not put bytes on the wire. Nothing in the
 tree consumes `packet_fwd`, so a composition using TUNNEL or DSR supplies
 that consumer itself.
@@ -697,7 +697,7 @@ controlled relocation: if the anchor itself crashes, client-visible
 continuity is only as strong as the protocol's resume story or a
 separate anchor-HA mechanism.
 
-Machinery that fits anchor-preserved replacement: staged graph images
+Machinery that fits anchor-preserved replacement: staged node images
 via `graph_slot` with activation by epoch change, and deferred
 readiness (`deferred_ready = true` in the manifest) so a module delays live
 participation until import and attach complete. `graph_slot`

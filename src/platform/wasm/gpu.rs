@@ -1,4 +1,4 @@
-//! `wasm_browser_gpu` built-in: generic GPU raster driver (browser/WebGPU backend)
+//! `wasm_browser_gpu` native module: generic GPU raster driver (browser/WebGPU backend)
 //!
 //! Backend-agnostic 3D raster capability surface. The module holds ZERO
 //! application knowledge: no shaders, no vertex formats, no uniform layouts.
@@ -109,7 +109,9 @@
     reason = "the command-stream reference above uses intentional field-alignment indentation"
 )]
 
+use crate::abi::platform::native::wasm::wasm_browser_gpu as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -294,10 +296,10 @@ fn log_msg(msg: &[u8]) {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn gpu_step(state: *mut u8) -> i32 {
-    // SAFETY: `state` is the kernel-provided opaque state pointer written by build(),
+unsafe extern "C" fn gpu_step(state: *mut u8) -> i32 {
+    // SAFETY: `state` is the kernel-provided opaque state pointer written by the constructor,
     // holding a valid `*mut GpuState`.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut GpuState);
@@ -330,7 +332,7 @@ unsafe fn gpu_step(state: *mut u8) -> i32 {
 
         // Record ready_tick on first ready (used to discard stale frames)
         if st.ready_tick == 0 {
-            st.ready_tick = scheduler::tick_count();
+            st.ready_tick = scheduler::pass_count(0);
             log_msg(b"[gpu] backend ready");
         }
 
@@ -670,9 +672,26 @@ unsafe fn gpu_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(width: u16, height: u16, in_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_gpu", gpu_step);
-    let raw = alloc_state(in_chan, width, height);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut GpuState, raw);
-    m
+/// The `wasm_browser_gpu` native module.
+pub static WASM_BROWSER_GPU: NativeVtable = super::heap_native(new, gpu_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut width = 800u16;
+    let mut height = 600u16;
+    super::walk_tlv(init.params, |tag, value| match tag {
+        tags::TAG_WIDTH => width = super::tlv_u32(value) as u16,
+        tags::TAG_HEIGHT => height = super::tlv_u32(value) as u16,
+        _ => {}
+    });
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_COMMANDS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, heap_size_for(width, height), || {
+            alloc_state(in_chan, width, height).cast()
+        })
+    }
 }

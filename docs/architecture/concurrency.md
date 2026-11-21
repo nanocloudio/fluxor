@@ -1,13 +1,16 @@
 # Kernel Concurrency Model
 
-The kernel ships on four platforms with different concurrency profiles:
+The kernel ships on five platforms with different concurrency profiles.
+Every platform admits up to `MAX_DOMAINS` (4) execution domains; what
+differs is whether a domain gets a core of its own:
 
-| Platform | Cores | Domains | Pump shape |
+| Platform | Cores | Domains | Domain loop |
 |---|---|---|---|
-| RP2040 / RP2350 | 1 (effective) | 1 | single synchronous loop on core 0 |
-| BCM2712 (Pi 5) | 4 | up to 4 (`MAX_DOMAINS = 4`) | one bare-metal pump per core, each runs its assigned domain's modules |
-| Linux | 1 (cooperative) | 1 | std thread on the main process |
-| WASM | 1 (single-threaded) | 1 | host calls `kernel_step()` on its event loop |
+| RP2040 / RP2350 | 1 (effective) | up to 4, all on one thread | one synchronous loop on core 0 runs a pass of every domain in index order (`pass::tick_all`) |
+| BCM2712 (Pi 5) | 4 | up to 4, domain d on core d | one bare-metal domain loop per core, each running its own domain's modules |
+| uefi | up to 4 used | up to 4, domain d on core d | as BCM2712: the boot core runs domain 0, secondary n runs domain n |
+| Linux | 1 (cooperative) | up to 4, all on one thread | the main thread of the process runs a pass of every domain in index order (`pass::tick_all`) |
+| WASM | 1 (single-threaded) | up to 4, all on one thread | the browser host calls `kernel_step()` on its event loop, which runs a pass of every domain in index order |
 
 This document classifies every `static mut` in `src/kernel/` by access
 pattern. Each kernel file's top-of-file comment summarises the relevant
@@ -20,16 +23,15 @@ classes; the safety story is different for each.
 
 ### Boot-only — written before the graph runs
 
-Everything from `kernel::boot()` through the final `instantiate_one_module`
-runs on core 0 only. Secondary cores wait for `domains::release()`
+Everything from `kernel::boot()` through `scheduler::instantiate_graph`
+publishing the node's graph runs on core 0 only. Secondary cores wait for `domains::release()`
 (`src/kernel/exec/domains/mod.rs`) before entering their loops. Statics
 written exclusively in that window need no synchronisation:
 
 - `src/kernel/module/loader.rs`: `STATE_ARENA`, `STATE_ARENA_OFFSET`,
   `FREE_LIST`, `FREE_COUNT`, `PIC_IRQ_DISABLED_COUNT`
 - `src/kernel/exec/scheduler/`: `STATIC_CONFIG`, `STATIC_LOADER`,
-  `NAME_STORAGE`, `NEXT_NAME_SLOT`,
-  `INSTANTIATION_STATE`, `INSTANTIATION_IDX`, `MODULE_STATE_PTR`
+  `INSTANTIATION_STATE`, `INSTANTIATION_IDX`
 - `src/kernel/module/syscalls.rs`: `SYSCALL_TABLE`, `HARDWARE_CONTEXT`,
   `SYSTEM_EXTENSION`, `DEV_QUERY_EXTENSION`
 - `src/kernel/sys/hal.rs`: `HAL_OPS`
@@ -58,7 +60,7 @@ with a release store, and then frees the old one, so the argument that no
 reader can still hold the old block is made per platform.
 
 On bcm2712 and uefi every move runs on core 0, in `prepare_graph`, which
-core 0 enters from its pump loop between steps, holding no slice of any table
+core 0 enters from its domain loop between steps, holding no slice of any table
 (a slice lives only within the call that reads it). At boot no other core has
 left its wait for `domains::release()`. For a rebuild the other domains are
 quiesced first: each parks at its pass boundary, outside any step, and resumes
@@ -71,15 +73,15 @@ its next read. Interrupts are covered by three facts:
   binding (which signals its event slot) and the PCIe MSI multiplexer are
   bound to core 0, and `gic::irq_bind` refuses to bind an SGI or PPI, which
   is taken on whichever core raises it, to an event.
-- A Tier 1b or Tier 2 handler may run on another core: a Tier 2 IRQ is
-  delivered to its domain's core, which the quiesce parks but does not mask.
-  `prepare_graph` closes ISR-tier dispatch before it sizes a table
-  (`isr_tier::close_dispatch`). A handler raises an in-flight count and then
+- A `timer` or `irq` handler may run on another core: an `irq` module's
+  IRQ is delivered to its domain's core, which the quiesce parks but does
+  not mask. `prepare_graph` closes interrupt-mode dispatch before it sizes
+  a table (`interrupt::close_dispatch`). A handler raises an in-flight count and then
   reads the gate; the close stores the gate and then waits for the count to
   reach zero; all four accesses are sequentially consistent, so either the
   handler sees the gate closed and steps nothing, or the close sees the
   handler and waits for it to return. Dispatch reopens only when the new
-  graph registers an ISR-tier module, after every table is sized.
+  graph registers an interrupt-mode module, after every table is sized.
 - The timer tick handler on each core touches atomics only.
 
 A table its own lock guards (the net-attach lane tables) may move on a step,
@@ -111,17 +113,14 @@ so two cores never touch the same byte:
   each record sits in a cell, so every access borrows the table shared,
   and the table moves only while a graph is prepared.
 - `GRAPH_PACERS` and `RESIDENT_GRAPHS`
-  (`src/kernel/exec/scheduler/merge.rs`, `multigraph.rs`) — the multi-graph
-  runner's per-owner tables, one entry per owner slot and execution domain.
-  An entry's pass state is read and written only by the runner of its own
-  domain; of another domain's resident-graph entry a runner reads only the
+  (`src/kernel/exec/scheduler/pacer.rs`, `multigraph.rs`) — the pass
+  engine's per-owner tables, one entry per owner slot and execution domain.
+  An entry's pass state is read and written only by the domain loop of its
+  own domain; of another domain's resident-graph entry a domain loop reads
+  only the
   domain it names, which changes only when the index is rebuilt, with the
   other domains parked.
-- `FAN_BUFS[d]` (`src/kernel/exec/scheduler/module_types.rs`) —
-  per-domain scratch for tee / merge. Tee and merge inherit their fan
-  group's `domain_id`; a domain runs on exactly one core, so
-  per-domain indexing keeps each core on its own buffer.
-- `CURRENT_MODULE_PER_CORE[c]` (`src/kernel/exec/scheduler/merge.rs`)
+- `CURRENT_MODULE_PER_CORE[c]` (`src/kernel/exec/scheduler/state.rs`)
   — `AtomicU32` array indexed by `hal::core_id()`.
 
 Per-module / per-core arrays in this category are not annotated as

@@ -206,7 +206,7 @@ pub const TTY_EXITED: u8 = 1;
 /// CREATE with the kernel's errno (`EPERM`): a workload that asked for it
 /// never runs without it.
 ///
-/// NOT a bundle/OCI format: the backend reads no files but the user
+/// NOT a workload package or OCI format: the backend reads no files but the user
 /// databases of the workload's own root; the orchestrator composes the
 /// params. Malformed → `EINVAL`. The native contract defines only
 /// `SOURCE_FMOD_GRAPH = 0`; nonzero kinds are backend-defined.

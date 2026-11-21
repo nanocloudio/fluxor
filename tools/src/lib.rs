@@ -25,6 +25,7 @@ pub mod agent_protocol;
 pub mod asset_bank;
 pub mod ci;
 pub mod collect;
+pub mod native_params;
 // `fluxor.toml`'s schema, gated by `fluxor ci`'s `fluxor-toml-schema`
 // phase: which keys a project must carry, which its shape forbids, and
 // the one meaning each key has.
@@ -69,7 +70,7 @@ pub mod modules_build;
 pub mod monitor;
 pub mod observability;
 // Local OCI image-layout content store for `.fmod` modules and workload
-// bundles. Offline-first: publish and consume both touch only the
+// packages. Offline-first: publish and consume both touch only the
 // local store.
 pub mod oci_store;
 // Standalone, unit-testable validator for `presentation.shell` /
@@ -81,7 +82,7 @@ pub mod content_render;
 // read and checked. `fluxor publish`'s sweep and `fluxor ci` share it.
 pub mod packaging;
 // The one typed parameter model: `params:` declared in a graph, stack or
-// bundle graph, `${param:<name>}` placeholders, and the values a run or a
+// package graph, `${param:<name>}` placeholders, and the values a run or a
 // check renders with.
 pub mod params;
 pub mod presentation_resolver;

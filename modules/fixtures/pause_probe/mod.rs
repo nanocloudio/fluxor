@@ -6,7 +6,7 @@
 //! consecutive steps exceeds `gap_min_ms` it logs
 //! `[pprobe] gap_ms=<gap>` — the workload's OWN proof that it was not stepped
 //! for that window. Paired with `pause_driver`, which pauses/resumes the
-//! workload's owner from the base graph: the gap line can only appear if the
+//! workload's owner from the node graph: the gap line can only appear if the
 //! pause actually froze the workload, and its magnitude must match the
 //! driver's pause→resume window.
 

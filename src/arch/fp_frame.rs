@@ -23,9 +23,9 @@ pub type IsrEntry = unsafe extern "C" fn(state: *mut u8) -> i32;
 core::arch::global_asm!(
     ".text",
     ".balign 4",
-    ".global fluxor_tier2_isr_frame",
-    ".type fluxor_tier2_isr_frame, %function",
-    "fluxor_tier2_isr_frame:",
+    ".global fluxor_irq_fp_frame",
+    ".type fluxor_irq_fp_frame, %function",
+    "fluxor_irq_fp_frame:",
     "sub sp, sp, #544",
     "stp x29, x30, [sp, #0]",
     "mov x29, sp",
@@ -73,20 +73,20 @@ core::arch::global_asm!(
     "ldp x29, x30, [sp, #0]",
     "add sp, sp, #544",
     "ret",
-    ".size fluxor_tier2_isr_frame, . - fluxor_tier2_isr_frame",
+    ".size fluxor_irq_fp_frame, . - fluxor_irq_fp_frame",
 );
 
 extern "C" {
-    fn fluxor_tier2_isr_frame(entry: IsrEntry, state: *mut u8) -> i32;
+    fn fluxor_irq_fp_frame(entry: IsrEntry, state: *mut u8) -> i32;
 }
 
 /// Call a module's `module_isr_entry` with the interrupted context's
 /// FP/SIMD state kept across it.
 ///
 /// # Safety
-/// `entry` and `state` are a registered Tier-2 module's entry and state,
+/// `entry` and `state` are a registered `irq` module's entry and state,
 /// valid for the duration of the call.
 #[inline(always)]
 pub unsafe fn call_isr_entry(entry: IsrEntry, state: *mut u8) -> i32 {
-    fluxor_tier2_isr_frame(entry, state)
+    fluxor_irq_fp_frame(entry, state)
 }

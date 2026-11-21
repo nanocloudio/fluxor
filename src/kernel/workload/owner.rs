@@ -5,7 +5,7 @@
 //! indices. Every workload-owned object (module, channel, buffer, provider
 //! handle, endpoint lease, timer, telemetry record) is stamped with its owner
 //! so the runtime can authorize access, account resources, and reclaim
-//! everything on deletion. System graph components use [`OWNER_SYSTEM`]
+//! everything on deletion. Node graph components use [`OWNER_NODE`]
 //! (slot 0).
 //!
 //! Generation guard: every slot carries a reuse generation that increases on
@@ -15,8 +15,8 @@
 //!
 //! One shape on every target: the owner table is sized at boot from the
 //! plan's `owners` ceiling (`resource_ledger::plan`), so an image whose plan
-//! holds only the system owner carries one slot and every handle it stamps is
-//! [`OWNER_SYSTEM`].
+//! holds only the node owner carries one slot and every handle it stamps is
+//! [`OWNER_NODE`].
 //!
 //! Authority: an owner is also the authority its modules act with, unless it
 //! was admitted to act with the node's ([`Authority::Node`]). The owner
@@ -28,9 +28,9 @@
 
 use crate::kernel::workload::storage::StorageGrant;
 
-/// The owner-slot DOMAIN, not a table size: the owner table — and every
+/// The owner-slot RANGE, not a table size: the owner table — and every
 /// per-owner table beside it (log rings, code-pack regions, workload slots)
-/// — is sized at boot from the plan's `owners` ceiling (the system slot, the
+/// — is sized at boot from the plan's `owners` ceiling (the node owner's slot, the
 /// resident workloads and the owner reserve, `resource_ledger::plan`). What
 /// this bounds is what a slot may be at all: the host-process backend's
 /// workload index, which shares an fd slot space with the graph backend's
@@ -48,9 +48,12 @@ pub const OWNER_TABLE_SLOTS: usize =
         None => MAX_OWNERS,
     };
 
-const _: () = assert!(MAX_OWNERS >= 1, "MAX_OWNERS must include the system slot");
+const _: () = assert!(
+    MAX_OWNERS >= 1,
+    "MAX_OWNERS must include the node owner's slot"
+);
 const _: () = assert!(OWNER_TABLE_SLOTS >= 1 && OWNER_TABLE_SLOTS <= MAX_OWNERS);
-// Slot is a u16; keep the table within that index domain.
+// Slot is a u16; keep the table within that index range.
 const _: () = assert!(MAX_OWNERS <= u16::MAX as usize);
 
 /// A bounded runtime capability identifying one workload owner. Not persisted
@@ -61,10 +64,10 @@ pub struct OwnerHandle {
     pub generation: u32,
 }
 
-/// The system owner. Platform drivers, the network/storage/telemetry
+/// The node owner. Platform drivers, the network/storage/telemetry
 /// substrate, the graph manager, OTA, and the node agent run as this owner and
 /// cannot be replaced by ordinary workload updates.
-pub const OWNER_SYSTEM: OwnerHandle = OwnerHandle {
+pub const OWNER_NODE: OwnerHandle = OwnerHandle {
     slot: 0,
     generation: 0,
 };
@@ -175,11 +178,11 @@ impl OwnerEntry {
     };
 }
 
-/// Bounded table of owner slots. Slot 0 is permanently the system owner.
+/// Bounded table of owner slots. Slot 0 is permanently the node owner.
 ///
 /// On Linux, aarch64 bare metal and RP the table is sized at boot to the
-/// plan's `owners` ceiling — the system slot, the resident workloads and the
-/// owner reserve — within the owner-slot domain `MAX_OWNERS`; on wasm it is
+/// plan's `owners` ceiling — the node owner's slot, the resident workloads and the
+/// owner reserve — within the owner-slot range `MAX_OWNERS`; on wasm it is
 /// the profile's static array.
 pub struct OwnerTable {
     entries: crate::kernel::mem::table::Table<OwnerEntry, OWNER_TABLE_SLOTS>,
@@ -190,7 +193,7 @@ pub struct OwnerTable {
     logs: bool,
 }
 
-/// Slot 0 is the system owner; every other slot starts free.
+/// Slot 0 is the node owner; every other slot starts free.
 #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 fn owner_init(slot: usize) -> OwnerEntry {
     if slot == 0 {
@@ -201,7 +204,7 @@ fn owner_init(slot: usize) -> OwnerEntry {
 }
 
 /// The owners a table no plan has sized takes on first use: the plan's
-/// defaults, within the owner-slot domain.
+/// defaults, within the owner-slot range.
 #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 fn owner_default() -> usize {
     (crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_OWNERS)
@@ -210,7 +213,7 @@ fn owner_default() -> usize {
 }
 
 impl OwnerTable {
-    /// A fresh table with only the system slot active.
+    /// A fresh table with only the node owner's slot active.
     pub const fn new() -> Self {
         #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
         {
@@ -245,7 +248,7 @@ impl OwnerTable {
         }
     }
 
-    /// Size the table to `n` slots, all live (slot 0 the system owner).
+    /// Size the table to `n` slots, all live (slot 0 the node owner).
     ///
     /// # Safety
     /// Graph-preparation context: no reference into the table is live.
@@ -257,13 +260,13 @@ impl OwnerTable {
         self.entries.grow(n)
     }
 
-    /// Slots the table holds, the system slot among them: its live length,
+    /// Slots the table holds, the node owner's slot among them: its live length,
     /// what a per-owner walk iterates.
     pub fn slot_count(&self) -> usize {
         self.slots().len()
     }
 
-    /// A new tenant took `slot`: its log ring starts (or, for the same
+    /// A new owner took `slot`: its log ring starts (or, for the same
     /// triple, carries on).
     #[inline]
     fn ring_installed(&self, _slot: u16, _uid: [u8; 16], _generation: u32) {
@@ -321,7 +324,7 @@ impl OwnerTable {
                 return None;
             }
         }
-        // Empty on a table of the system slot alone.
+        // Empty on a table of the node owner's slot alone.
         for slot in 1..self.slots().len() {
             if matches!(self.entries[slot].state, OwnerState::Free) {
                 let generation = self.entries[slot].generation.wrapping_add(1);
@@ -346,7 +349,7 @@ impl OwnerTable {
     /// Install an owner at a specific `slot`/`generation` as dictated by a
     /// composed plan (the plan is authoritative for slot and
     /// generation, unlike [`alloc`](Self::alloc) which picks them). The owner is
-    /// installed `Active`. Returns `None` for the system slot, an out-of-range
+    /// installed `Active`. Returns `None` for the node owner's slot, an out-of-range
     /// slot, or a `generation` that would *decrease* the slot's reuse counter.
     /// Used by the kernel plan-apply path.
     ///
@@ -432,7 +435,7 @@ impl OwnerTable {
     /// [`authorize_admit`](Self::authorize_admit) — a `Draining`/`Revoked`
     /// owner resolves but must not admit new work.
     pub fn find_by_uid(&self, owner_uid: [u8; 16]) -> Option<OwnerHandle> {
-        // Empty on a table of the system slot alone.
+        // Empty on a table of the node owner's slot alone.
         for slot in 1..self.slots().len() {
             let e = &self.entries[slot];
             if !matches!(e.state, OwnerState::Free) && e.owner_uid == owner_uid {
@@ -524,7 +527,7 @@ impl OwnerTable {
         true
     }
 
-    /// Free every non-system owner slot (generation counters preserved, so
+    /// Free every non-node owner slot (generation counters preserved, so
     /// later installs still issue strictly higher generations). Used by the
     /// plan-apply path: the composed plan is authoritative for residency,
     /// so owners absent from the new plan are revoked here before the
@@ -547,7 +550,7 @@ impl OwnerTable {
         self.slots().get(slot)
     }
 
-    /// Number of active workload owners (excludes the system slot).
+    /// Number of active workload owners (excludes the node owner's slot).
     pub fn active_workload_count(&self) -> usize {
         self.entries[1..]
             .iter()
@@ -559,7 +562,7 @@ impl OwnerTable {
     //
     // Caps are the admitted hard limits from the signed resource profile,
     // installed by the node agent at reservation. A cap of 0 means
-    // "unset/unlimited"; the system owner is never charged or capped.
+    // "unset/unlimited"; the node owner is never charged or capped.
 
     /// Install the admitted state/buffer byte caps for an owner.
     pub fn set_caps(&mut self, h: OwnerHandle, state_cap: u32, buffer_cap: u32) -> bool {
@@ -587,16 +590,16 @@ impl OwnerTable {
         }
     }
 
-    /// The authority `h` acts with: [`OWNER_SYSTEM`] for the system owner and
+    /// The authority `h` acts with: [`OWNER_NODE`] for the node owner and
     /// for an owner admitted with the node's authority, `h` itself otherwise
     /// — including a handle that no longer resolves, which so fails closed as
     /// the workload it was.
     pub fn authority_of(&self, h: OwnerHandle) -> OwnerHandle {
         if h.is_system() {
-            return OWNER_SYSTEM;
+            return OWNER_NODE;
         }
         match self.lookup(h) {
-            Some(e) if e.authority == Authority::Node => OWNER_SYSTEM,
+            Some(e) if e.authority == Authority::Node => OWNER_NODE,
             _ => h,
         }
     }
@@ -625,7 +628,7 @@ impl OwnerTable {
 
     /// Charge `bytes` of storage to `h`. `Err(())` when the owner's storage
     /// cap would be exceeded (the provider refuses the write), or `h` is
-    /// stale. The system owner is never charged.
+    /// stale. The node owner is never charged.
     #[allow(
         clippy::result_unit_err,
         reason = "the failure is a payload-free cap-exceeded/stale signal; the \
@@ -665,7 +668,7 @@ impl OwnerTable {
 
     /// Charge `bytes` of module state to `h`. Returns `Err(())` if it would
     /// exceed the owner's cap (the caller must then reject the allocation), or
-    /// if `h` is stale. The system owner is always permitted.
+    /// if `h` is stale. The node owner is always permitted.
     #[allow(
         clippy::result_unit_err,
         reason = "the failure is a payload-free cap-exceeded/stale signal; the \
@@ -757,8 +760,8 @@ impl Default for OwnerTable {
 }
 
 /// Cross-owner access predicate: a caller may touch a target resource when the
-/// target is system-owned or the same owner — slot and generation both, so a
-/// resource stamped by an owner that is gone is never the next tenant of its
+/// target is node-owned or the same owner — slot and generation both, so a
+/// resource stamped by an owner that is gone is never the next owner of its
 /// slot's. Explicit cross-owner bindings are not modeled by this predicate.
 #[inline]
 pub fn same_or_system(caller: OwnerHandle, target: OwnerHandle) -> bool {

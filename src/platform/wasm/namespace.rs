@@ -12,7 +12,7 @@
 //!
 //! The index is the **same flat key space** the object provider writes:
 //! a key like `saves/tetris` in the host's `objStore` (the OPFS-backed
-//! write tier — see `host_shims.js`) is simultaneously a namespace entry.
+//! write layer — see `host_shims.js`) is simultaneously a namespace entry.
 //! `/` is the hierarchy separator, so that one key makes `LIST("")` yield
 //! `saves` (a namespace) and `LIST("saves/")` yield `tetris` (an object).
 //! The index unions two sources, both owned by the host shim:
@@ -62,7 +62,7 @@ use crate::kernel::sys::errno;
 
 pub(super) const MAX_OPEN: usize = 16;
 /// Longest `LOOKUP` path: every path in this index is a whole key of the
-/// object tier, which `PUT` bounds by `STORAGE_KEY_MAX`.
+/// object layer, which `PUT` bounds by `STORAGE_KEY_MAX`.
 const MAX_PATH_LEN: usize = crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
 
 struct NsSlot {

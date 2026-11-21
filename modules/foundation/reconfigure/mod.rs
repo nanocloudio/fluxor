@@ -8,7 +8,7 @@
 //! transition, or timeout logic.
 //!
 //! Input:
-//!   - ctrl channel: reading any byte starts a reconfigure. The main loop
+//!   - ctrl channel: reading any byte starts a reconfigure. The domain loop
 //!     reloads STATIC_CONFIG; the trigger payload is not consumed.
 //!
 //! Params (TLV, optional):
@@ -58,7 +58,9 @@ use abi::contracts::storage::graph_slot::channel::{FRAME_HDR as GS_FRAME_HDR, RE
 use abi::internal::monitor::FAULT_RAISE as SYS_FAULT_RAISE;
 const FAULT_KIND_DRAIN_TIMEOUT: u8 = 5;
 
-// Phase values mirror scheduler::ReconfigurePhase.
+// This module's phases. The first two are the kernel's
+// (`scheduler::ReconfigurePhase`, set with `SET_PHASE`); migrating is this
+// module's own, and the kernel runs it as `Running`.
 const PHASE_RUNNING: u8 = 0;
 const PHASE_DRAINING: u8 = 1;
 const PHASE_MIGRATING: u8 = 2;
@@ -506,7 +508,7 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
 }
 
 unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
-    sys_set_phase(sys, PHASE_MIGRATING);
+    sys_set_phase(sys, PHASE_RUNNING);
     s.phase = PHASE_MIGRATING;
     let elapsed = s.tick_count.wrapping_sub(s.drain_start_tick);
     let elapsed_u16 = if elapsed > u16::MAX as u32 {
@@ -672,7 +674,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             PHASE_MIGRATING => {
-                // The main loop takes over once the rebuild request has been
+                // The domain loop takes over once the rebuild request has been
                 // observed. Continuing to step here is a no-op.
             }
             _ => {}

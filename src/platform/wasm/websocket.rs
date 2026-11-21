@@ -1,9 +1,9 @@
-//! `wasm_browser_websocket` built-in: WebSocket client. Connects to
+//! `wasm_browser_websocket` native module: WebSocket client. Connects to
 //! a configured URL via the host shim and tunnels raw bytes between
 //! the input/output channels and the WS.
 //!
-//! State: heap-allocated; the BuiltInModule's 64-byte inline state
-//! holds a `*mut WsState` pointer.
+//! State: heap-allocated on the module's own heap; its arena state
+//! holds the `*mut WsState` pointer.
 //!
 //! ## Backpressure (lossless under steady-state)
 //!
@@ -21,7 +21,9 @@
 //!     direction makes progress; this is the normal
 //!     connection-pending state.
 
+use crate::abi::platform::native::wasm::wasm_browser_websocket as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -111,12 +113,12 @@ unsafe fn shift_consume(buf: *mut u8, len: usize, consumed: usize) -> usize {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn ws_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn ws_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut WsState);
         if st_ptr.is_null() {
@@ -206,9 +208,22 @@ unsafe fn ws_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(url: &[u8], in_chan: i32, out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_websocket", ws_step);
-    let raw = alloc_state(in_chan, out_chan, url);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut WsState, raw);
-    m
+/// The `wasm_browser_websocket` native module.
+pub static WASM_BROWSER_WEBSOCKET: NativeVtable = super::heap_native(new, ws_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut url_buf = [0u8; 256];
+    let url = super::param_bytes(init.params, tags::TAG_URL, &mut url_buf);
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_TX);
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_RX);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<WsState>(), || {
+            alloc_state(in_chan, out_chan, url).cast()
+        })
+    }
 }

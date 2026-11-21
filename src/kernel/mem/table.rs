@@ -594,13 +594,13 @@ mod imp {
         ///   would be taken on whichever core raised it), and an event
         ///   signal writes its slot. A handler that runs before the copy or
         ///   after the restore finds the table whole.
-        /// - A Tier 1b or Tier 2 handler, which may run on another core (a
-        ///   Tier 2 IRQ is delivered to its domain's core, which the quiesce
+        /// - A `timer` or `irq` handler, which may run on another core (a
+        ///   `irq` IRQ is delivered to its domain's core, which the quiesce
         ///   parks but does not mask), steps no module while a graph is
-        ///   prepared: `prepare_graph` closes ISR-tier dispatch and waits out
-        ///   every handler in flight on any core (`isr_tier::close_dispatch`)
+        ///   prepared: `prepare_graph` closes interrupt-mode dispatch and waits out
+        ///   every handler in flight on any core (`interrupt::close_dispatch`)
         ///   before it sizes a table, and dispatch reopens only when the new
-        ///   graph registers an ISR-tier module, after every table is sized.
+        ///   graph registers an interrupt-mode module, after every table is sized.
         ///   The timer tick handler on each core touches atomics only.
         /// - A table a lock guards (the net-attach lane tables) is reserved
         ///   under that lock, which every reader of it holds.
@@ -612,7 +612,7 @@ mod imp {
         /// - The scheduler (every module step, and every syscall and
         ///   provider call a module makes) runs on the main thread
         ///   (`platform/linux.rs`), and a rebuild is taken there between
-        ///   passes (`take_rebuild_request` in the main loop), when no pass
+        ///   passes (`take_rebuild_request` in the domain loop), when no pass
         ///   holds a slice. Each pass borrows the tables afresh.
         /// - Every other thread of the runtime exchanges with the scheduler
         ///   through state of its own and never reads a kernel table: the

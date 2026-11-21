@@ -1,0 +1,17 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+grants = ["telemetry"]
+
+# Owner-plan probe: reads the resource ledger's `owners` pool from the
+# kernel's PSTATUS `POOL` records on the telemetry ring and logs its in-use
+# figure (the active workload owners) whenever it changes:
+#
+#   [plan] owners in_use=<n> cap=<n>
+#
+# A graph whose `workloads:` stanza seats one workload reads `in_use=1` once
+# the boot config has admitted it. `interval_ms` is the PSTATUS cadence it
+# asks of the kernel.
+timer_class = "wall_clock"
+
+[observability]
+exempt = "owner-plan probe fixture; its '[plan]' line is the observable"

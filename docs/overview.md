@@ -12,7 +12,7 @@ processors, Linux-hosted runs, and browser-hosted WASM bundles.
 ## Start Here
 
 - [guides/running.md](guides/running.md) — bring a graph up on the Linux host, config included
-- [architecture/pipeline.md](architecture/pipeline.md) — graph runner, channels, and execution model
+- [architecture/pipeline.md](architecture/pipeline.md) — domain loop, channels, and execution model
 - [architecture/module_architecture.md](architecture/module_architecture.md) — module contract, step semantics, composition rules
 - [vision.md](vision.md) — the capability-centric argument and where the model is headed
 
@@ -20,10 +20,11 @@ processors, Linux-hosted runs, and browser-hosted WASM bundles.
 
 How the system works. These are the authoritative references.
 
-- [architecture/pipeline.md](architecture/pipeline.md) — graph runner, channels, FIFO and mailbox IPC, burst stepping, capacity profiles
+- [architecture/vocabulary.md](architecture/vocabulary.md) — the one term for each concept (node, domain, exec mode, graph kinds, owner, workload, artefacts) and the words they retire
+- [architecture/pipeline.md](architecture/pipeline.md) — domain loop, channels, FIFO and mailbox IPC, burst stepping, capacity profiles
 - [architecture/module_architecture.md](architecture/module_architecture.md) — module lifecycle, step contract, fault recovery, drain protocol
 - [architecture/module_isolation.md](architecture/module_isolation.md) — protection levels, the gateway, MPU/MMU backends, device windows
-- [architecture/scheduler.md](architecture/scheduler.md) — execution tiers, ISR-tier admission and I/O contract, domain loops
+- [architecture/scheduler.md](architecture/scheduler.md) — execution modes, interrupt-mode admission and I/O contract, domain loops
 - [architecture/concurrency.md](architecture/concurrency.md) — what is shared, what is domain-local, and why it is safe
 - [architecture/timing.md](architecture/timing.md) — stream clock vs wall clock, StreamTime, producer scheduling
 - [architecture/events.md](architecture/events.md) — event objects, IRQ binding, scheduler wake, ISR safety contract
@@ -41,18 +42,18 @@ How the system works. These are the authoritative references.
 - [architecture/input_capability_surface.md](architecture/input_capability_surface.md) — input surfaces, payload contracts, mapper discipline
 - [architecture/av_capability_surface.md](architecture/av_capability_surface.md) — audio/video surfaces, presentation groups, clock authority
 - [architecture/browser_capability_surface.md](architecture/browser_capability_surface.md) — the browser as a capability provider
-- [architecture/wasm_platform.md](architecture/wasm_platform.md) — the WASM target: bundle format, entry points, host imports
+- [architecture/wasm_platform.md](architecture/wasm_platform.md) — the WASM target: wasm bundle format, entry points, host imports
 - [architecture/wasm_browser_host.md](architecture/wasm_browser_host.md) — the browser host runtime and its built-in modules
 - [architecture/network.md](architecture/network.md) — channel-based networking, net_proto, drivers, IP module, TLS
 - [architecture/datagram_secure_transports.md](architecture/datagram_secure_transports.md) — DTLS 1.3 and QUIC v1 on the datagram surface
 - [architecture/exchange.md](architecture/exchange.md) — the exchange contract: one request and its answer between any requester and provider
 - [architecture/protocol_surfaces.md](architecture/protocol_surfaces.md) — datagram, packet, mux, and session-control contracts; continuity classes
-- [architecture/network_boot.md](architecture/network_boot.md) — OTA graph delivery: graph images, registry pull, staging, activation
+- [architecture/network_boot.md](architecture/network_boot.md) — OTA graph delivery: node images, registry pull, staging, activation
 - [architecture/mesh.md](architecture/mesh.md) — the mesh architecture: distributed objects, capability-based authority, events, leases
 - [architecture/security.md](architecture/security.md) — trust root, module signing, KEY_VAULT, network hardening
 - [architecture/pin_allocation.md](architecture/pin_allocation.md) — GPIO allocation, pin validation, peripheral assignments
 - [architecture/owner_status.md](architecture/owner_status.md) — per-owner live status and `owner_status.json`
-- [architecture/agent_protocol.md](architecture/agent_protocol.md) — one request and its answer between a controller and a target's node agent
+- [architecture/agent_protocol.md](architecture/agent_protocol.md) — one request and its answer between a controller and a node's node agent
 - [architecture/monitor-protocol.md](architecture/monitor-protocol.md) — the monitor record stream and its vocabularies
 - [architecture/rig-backend-protocol.md](architecture/rig-backend-protocol.md) — how a rig backend executable is invoked and what it reports
 
@@ -62,7 +63,7 @@ How to build and run things with the system.
 
 - [guides/running.md](guides/running.md) — the simplest validated bring-up, config embedded
 - [guides/project-layout.md](guides/project-layout.md) — a project's shape: what it ships under `packaging/`, references as pins, one params model, the Makefile
-- [guides/service-bundles.md](guides/service-bundles.md) — service and applet bundles: identity, the graph's params, references and runs
+- [guides/workload-packages.md](guides/workload-packages.md) — workload packages (service and applet): identity, the graph's params, references and runs
 - [guides/publishing.md](guides/publishing.md) — publishing artefacts into the local OCI store, consuming them downstream, and keeping the store itself (pins, quarantine, collection)
 - [guides/foundation.md](guides/foundation.md) — foundation layer, driver/foundation boundary, contract patterns
 - [guides/audio.md](guides/audio.md) — audio pipeline architecture and format handling

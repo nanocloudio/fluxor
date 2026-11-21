@@ -1,11 +1,11 @@
 //! OTA RAM staging surface — the Pi 5 / hosted-Linux counterpart of the
 //! RP flash graph-slot A/B path.
 //!
-//! A module (normally `ota_registry`) streams a GRAPH IMAGE (`fluxor
-//! build --emit=image`: the `wire::graph_image` header, the module table
+//! A module (normally `ota_registry`) streams a NODE IMAGE (`fluxor
+//! build --emit=image`: the `wire::node_image` header, the module table
 //! and the config) into the inactive one of two RAM staging buffers via
 //! `OTA_STAGE_WRITE`, then commits it with `OTA_STAGE_CTRL`. Commit admits
-//! the image as boot admits one (`boot::graph_image::admit`: header shape,
+//! the image as boot admits one (`boot::node_image::admit`: header shape,
 //! ABI-surface pin, on a kernel image with a signing root its signature,
 //! SHA-256 over the payload) and requires an epoch above the live one — flips
 //! the region executable (cache maintenance / page permissions via
@@ -34,7 +34,7 @@ use crate::kernel::sys::hal;
 
 /// Staging capacity per buffer. Mirrors the loader's
 /// `MAX_MODULES_BLOB_SIZE` reasoning (loader.rs): comfortably above any
-/// realistic graph bundle.
+/// realistic node image.
 pub const STAGE_CAPACITY: usize = 8 * 1024 * 1024;
 
 /// Page-aligned staging buffer. 64 KiB is the largest page an aarch64 Linux
@@ -59,7 +59,7 @@ static mut STAGE_B: StageBuf = StageBuf {
 static mut LIVE_BUF: u8 = 0xFF;
 /// Bytes staged so far into the inactive buffer.
 static mut STAGED_LEN: usize = 0;
-/// Epoch of the live committed image (0 = the boot image; a staged
+/// Epoch of the live committed image (0 = the firmware image; a staged
 /// image's epoch must exceed it).
 static mut LIVE_EPOCH: u64 = 0;
 
@@ -143,11 +143,11 @@ fn commit() -> i32 {
     // bytes this thread wrote.
     let staged_len = unsafe { STAGED_LEN };
     let image = &buf.bytes[..staged_len];
-    let own = crate::kernel::boot::graph_image::own_abi_pin();
-    let header = match crate::kernel::boot::graph_image::admit(image, &own) {
+    let own = crate::kernel::boot::node_image::own_abi_pin();
+    let header = match crate::kernel::boot::node_image::admit(image, &own) {
         Ok(header) => header,
         Err(why) => {
-            use crate::kernel::boot::graph_image::Refusal;
+            use crate::kernel::boot::node_image::Refusal;
             log::error!("[ota] commit: image refused: {}", why.reason());
             return match why {
                 Refusal::Pin | Refusal::Signature(_) => errno::EACCES,

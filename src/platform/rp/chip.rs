@@ -34,6 +34,26 @@ const _: () = assert!(
 /// Default step deadline: 2 ms.
 pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 
+/// Default budget of one interrupt-mode step, in the core's cycle counter
+/// (DWT `CYCCNT`): about 13 µs at 150 MHz.
+pub const DEFAULT_ISR_BUDGET_CYCLES: u32 = 2000;
+
+/// Size the kernel's tables from the boot plan (`size`) inside one plan of
+/// the static pool: the graph plans it afresh, and the arenas take what the
+/// tables left of it.
+///
+/// # Safety
+/// Graph preparation: no module runs and nothing holds a reference into
+/// any of the tables.
+pub unsafe fn plan_tables(
+    size: impl FnOnce() -> Result<(), crate::kernel::sys::resource_ledger::Refused>,
+) -> Result<(), crate::kernel::sys::resource_ledger::Refused> {
+    let _window = crate::kernel::mem::carve::begin_plan();
+    size()?;
+    crate::kernel::mem::carve::finish_plan()?;
+    Ok(())
+}
+
 /// Whether PIO GPIOBASE register is available.
 #[inline(always)]
 pub const fn has_pio_gpiobase() -> bool {

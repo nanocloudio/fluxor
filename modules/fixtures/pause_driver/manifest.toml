@@ -2,11 +2,11 @@ version = "1.0.0"
 hardware_targets = ["bcm2712"]
 grants = ["reconfigure.owner"]
 
-# System-graph driver proving owner-pause on silicon: issues
+# Node-graph driver proving owner-pause on silicon: issues
 # OWNER_PAUSE (0x0C49) /
 # OWNER_RESUME (0x0C4A) against a resident workload's owner handle on a
 # wall-clock schedule and logs `[pdrv] pause/resume ms=<t> rc=<rc>`,
-# plus a `[pdrv] hb` heartbeat proving the system graph keeps stepping
+# plus a `[pdrv] hb` heartbeat proving the node graph keeps stepping
 # through the workload's pause window. The ops sit in the 0x0C47..=0x0C4A
 # live-mutation block (PLATFORM_RAW permission category, like
 # APPLY_ADD/FREE_OWNER).

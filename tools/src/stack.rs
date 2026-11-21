@@ -67,7 +67,7 @@
 //! an edge. A graph may forward its own `${param:x}` into an include's param
 //! when the two are declared with the same type.
 //!
-//! A published stack carries its module references the way a bundle
+//! A published stack carries its module references the way a workload package
 //! carries its modules: as the exact module artifacts, per target, it was
 //! composed against — resolved at publish time through the publishing
 //! project's own published modules and its `fluxor.lock`. A stack name a
@@ -97,7 +97,7 @@ pub const INCLUDE_KEY: &str = "include";
 /// Set on a module a graph's own `include:` brought in. Such a member is
 /// private to its stack: only the stack's exports can be wired, so it cannot
 /// stand in for a module a platform stack would add. Never authored; an
-/// expanded bundle graph with a `platform:` carries it to the build that
+/// expanded package graph with a `platform:` carries it to the build that
 /// reads it, and platform stack expansion removes it there, so it never
 /// reaches a config.
 pub const STACK_MEMBER_KEY: &str = "_stack_member";
@@ -129,7 +129,7 @@ const DOC_KEYS: &[&str] = &[
 pub const WORKLOADS_KEY: &str = "workloads";
 
 /// The node's network as a workload's `wiring:` names it — the platform
-/// provider a base graph declares, `linux_net` on a hosted node and `ip` on
+/// provider a node graph declares, `linux_net` on a hosted node and `ip` on
 /// metal — when the workload has no module of that name.
 pub const WORKLOAD_NET_ENDS: &[&str] = &["linux_net", "ip"];
 
@@ -2556,7 +2556,7 @@ wiring:
     }
 
     #[test]
-    fn a_stack_schema_is_held_to_the_bundle_rules() {
+    fn a_stack_schema_is_held_to_the_package_rules() {
         let e = Stack::parse(
             "stack: s\nparams:\n  a: {type: integer, default: \"x\"}\n  b: {type: string, \
              required: true}\n  c: {type: string, min: 1, default: y}\nmodules:\n  - name: m\n    \

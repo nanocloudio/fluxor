@@ -12,13 +12,15 @@
 //   - RP1 peripheral access via PCIe BAR (GPIO, SPI, I2C register bridges)
 //   - Multi-domain execution with config-driven domain assignment and core wakeup
 //
-// Fully config-driven: the boot image carries a graph image (header, module
+// Fully config-driven: the firmware image carries a node image (header, module
 // table, config) after the fixed kernel binary, admitted at boot
-// (`kernel::boot::graph_image`).
+// (`kernel::boot::node_image`).
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use fluxor_contracts::boot_config::ExecMode;
 
 use fluxor::arch::aarch64::isolation;
 use fluxor::kernel::exec::domains::{self, cross};
@@ -50,6 +52,11 @@ mod logger;
 mod rp1;
 #[path = "bcm2712/uart.rs"]
 mod uart;
+
+/// The board's `[kernel.tick]` wake mechanisms.
+mod board_tick {
+    include!(concat!(env!("OUT_DIR"), "/board_tick.rs"));
+}
 
 // Bring the UART, GIC and exception names into the binary's namespace so
 // the callsites (`uart_puts(b"…")`, `irq_bind(…)`, `IRQ_BINDING_COUNT`,
@@ -206,7 +213,7 @@ global_asm!(
     "    .word 0x4B505846", // PACKAGE_HEADER_MAGIC
     "    .byte 1, 0, 0, 0", // version + reserved
     // runtime_end: end of file-backed sections (must NOT include BSS
-    // or stack). The kernel finds the graph image after it through this
+    // or stack). The kernel finds the node image after it through this
     // same symbol (`config::read_layout`). `_start`'s relocator copies
     // `package_size` bytes here only when package_size != 0; RAM-loaded
     // aarch64 images leave it at 0 and skip the copy.
@@ -503,7 +510,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     configure_arch();
     // The memory map, from the device tree the firmware handed over (QEMU:
     // left at the base of RAM): what the boot page tables map as DRAM, and
-    // the zone above the boot image that the kernel's tables are carved from
+    // the zone above the firmware image that the kernel's tables are carved from
     // and the state arena takes the rest of. Before the page tables, which
     // are built from it; nothing is written to the zone here.
     // SAFETY: once, on the boot core, before anything allocates.
@@ -639,15 +646,15 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // --- Config-driven module graph ---
     //
-    // `scheduler::prepare_graph` compiles the graph (edge decode, fan
-    // module insertion, channel allocation, port-table population). This
-    // shared domain runtime (`kernel::exec::domains`) layers the multi-core
-    // concerns on top: cross-domain edges are bridged, and each core's run
-    // loop steps its domain through the shared `step_one_module` body.
+    // `scheduler::prepare_graph` stages the composed graph (channels opened,
+    // port tables populated). This shared domain runtime
+    // (`kernel::exec::domains`) layers the multi-core concerns on top:
+    // cross-domain edges are bridged before the modules instantiate, and
+    // each core's run loop steps its domain through `pass::run`.
     use fluxor::kernel::boot::config;
 
     // Parse config + loader into the kernel's static state. Pi 5 reads
-    // the graph image after the kernel; QEMU side-loads a packed blob at a fixed
+    // the node image after the kernel; QEMU side-loads a packed blob at a fixed
     // address. `prepare_graph` reads STATIC_CONFIG / STATIC_LOADER from
     // there.
     loader::reset_state_arena();
@@ -690,7 +697,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         }
         #[cfg(feature = "board-pi5")]
         {
-            // The graph image after the kernel: the loader and the config
+            // The node image after the kernel: the loader and the config
             // read the regions its admitted header states.
             // SAFETY: boot-time single-thread init.
             let loader_ref = unsafe { scheduler::static_loader_mut() };
@@ -723,7 +730,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     } else {
         62500 * tick_us / 1000
     };
-    // Core 0 runs the default domain (domain 0); its Tier-0 cadence is the
+    // Core 0 runs the default domain (domain 0); its `tick` cadence is the
     // global tick. Seed core 0's per-core deadline slot and arm the timer.
     // Cores 1-3 re-seed their own slots from `domain_tick_us` in
     // `secondary_core_main`; the per-core slot is what survives the IRQ
@@ -738,15 +745,16 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(tick_us);
     uart_puts(b"\r\n");
 
-    // The SGI wake doorbell and the absolute `cval` re-arm are off by
-    // default and in production; this build-time feature turns them on at
-    // boot so the rig can validate them on silicon without disturbing the
-    // default path.
-    #[cfg(feature = "adaptive_deferred_rig")]
-    {
-        set_wake_doorbell(true);
-        set_absolute_rearm(true);
-        log::info!("[adaptive] deferred mechanisms ON (wake_doorbell + absolute_rearm) — rig validation build");
+    // The SGI wake doorbell and the absolute `cval` re-arm are the board's
+    // to turn on (`[kernel.tick]`); both are off unless it does.
+    set_wake_doorbell(board_tick::WAKE_DOORBELL);
+    set_absolute_rearm(board_tick::ABSOLUTE_REARM);
+    if board_tick::WAKE_DOORBELL || board_tick::ABSOLUTE_REARM {
+        log::info!(
+            "[adaptive] wake_doorbell={} absolute_rearm={}",
+            board_tick::WAKE_DOORBELL,
+            board_tick::ABSOLUTE_REARM
+        );
     }
 
     uart_puts(b"[config] ");
@@ -755,36 +763,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(n_edges as u32);
     uart_puts(b" edges\r\n");
 
-    // Test hook (feature `test-plan`): stage an embedded owner plan so the boot
-    // `apply_staged()` exercises the live-ownership path on hardware. The blob
-    // (one workload in slot 1 owning module 0) is generated by
-    // `cargo run -p fluxor-tools --example emit_plan`. test-only, never shipped.
-    #[cfg(feature = "test-plan")]
-    {
-        // One workload (slot 1, gen 2) owning module index 100 — deliberately beyond
-        // any real graph module, so the stamp is observable yet harmless (it
-        // does not re-own the live net-stack modules and break the netconsole).
-        static TEST_PLAN: [u8; 90] = [
-            0x46, 0x4c, 0x58, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
-            0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x1b, 0x97, 0x01, 0x60, 0x9a, 0xb6, 0xd0, 0xd4, 0x07, 0x20, 0x5f, 0x44,
-            0x14, 0x8b, 0xed, 0x5e, 0x42, 0xa9, 0x63, 0x47, 0x6b, 0x72, 0x4d, 0xc6, 0xc8, 0x58,
-            0xf7, 0x14, 0x6e, 0x50, 0x2c, 0x35,
-        ];
-        // SAFETY: TEST_PLAN is 'static; the pointer stays valid for the run.
-        unsafe {
-            fluxor::kernel::workload::owner_plan::set_staged_plan(
-                TEST_PLAN.as_ptr(),
-                TEST_PLAN.len(),
-            );
-        }
-        uart_puts(b"[test] staged embedded owner plan\r\n");
-    }
-
-    let (module_list, module_count) = match scheduler::prepare_graph() {
-        Ok(v) => v,
+    let staged = match scheduler::prepare_graph() {
+        Ok(st) => st,
         Err(_) => {
             uart_puts(b"[graph] prepare_graph failed\r\n");
             loop {
@@ -810,7 +790,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     }
 
     // Instantiate + activate the compiled graph (shared with live rebuild).
-    let total_mods = match domains::instantiate(&module_list, module_count) {
+    let total_mods = match domains::instantiate(staged) {
         Ok(n) => n,
         Err(why) => {
             // Fail closed at boot. Running a graph whose modules did not all
@@ -821,10 +801,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 debug_drain_poll_core0();
             }
             match why {
-                domains::InstantiateError::Modules(failed) => {
-                    uart_puts(b"[inst] REFUSING GRAPH: ");
-                    uart_put_u32(failed as u32);
-                    uart_puts(b" module(s) failed to instantiate\r\n");
+                domains::InstantiateError::Refused(_) => {
+                    uart_puts(b"[inst] REFUSING GRAPH: a module failed to instantiate\r\n");
                 }
                 domains::InstantiateError::OwnerPlan(_) => {
                     uart_puts(b"[owner] REFUSING GRAPH: staged plan invalid\r\n");
@@ -838,13 +816,13 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(total_mods as u32);
     uart_puts(b" modules loaded total\r\n");
 
-    fluxor::kernel::exec::scheduler::finalize_instantiation_accounting();
+    fluxor::kernel::exec::scheduler::log_arena_usage();
 
     // Admit resident workloads declared in the config's `WKLD` section
     // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via
-    // `apply_add` + finalize. Boot-time, before the run loops start. No-op
-    // without a workload section; the multi-graph runner multiplexes the
-    // workloads with the base graph on the shared cooperative runner.
+    // the splice + finalize. Boot-time, before the run loops start. No-op
+    // without a workload section; the domain loop multiplexes the
+    // workloads with the node graph on the shared domain loop.
     fluxor::kernel::exec::scheduler::admit_resident_workloads_from_config();
 
     uart_puts(b"[cross] channels=");
@@ -896,17 +874,17 @@ fn bcm_has_core(domain_id: usize) -> bool {
     u8::try_from(domain_id).is_ok_and(multicore::is_core_started)
 }
 
-/// After each pass: core 0 drains the log to the UART; the cooperative and
-/// high-rate loops report the die temperature; a high-rate domain 0 reports
-/// the cross-domain bridges.
-fn bcm_after_pass(domain_id: usize, core_id: usize, tier: domains::Tier) {
+/// After each pass: core 0 drains the log to the UART; the `tick` loops
+/// report the die temperature; domain 0 reports the cross-domain bridges
+/// when the graph has more than one domain.
+fn bcm_after_pass(domain_id: usize, core_id: usize, mode: ExecMode) {
     if core_id == 0 {
         debug_drain_poll_core0();
     }
-    if matches!(tier, domains::Tier::Cooperative | domains::Tier::HighRate) {
+    if mode == ExecMode::Tick {
         maybe_emit_soc_temp(core_id);
     }
-    if tier == domains::Tier::HighRate && domain_id == 0 && xdom_due() {
+    if mode == ExecMode::Tick && domain_id == 0 && domains::domains_needed() > 1 && xdom_due() {
         report_cross_domain();
     }
 }
@@ -933,7 +911,7 @@ fn bcm_after_step(domain_id: usize) {
 fn report_cross_domain() {
     let (drops, bp) = cross::cross_domain_stats();
     let depth = cross::cross_domain_queue_depths();
-    let passes: [u32; scheduler::MAX_DOMAINS] = core::array::from_fn(domains::domain_ticks);
+    let passes: [u32; scheduler::MAX_DOMAINS] = core::array::from_fn(scheduler::pass_count);
     log::info!("[xdom] drops={drops} bp={bp} depth={depth:?} passes={passes:?}");
     for from in 0..scheduler::MAX_DOMAINS {
         for to in (0..scheduler::MAX_DOMAINS).filter(|&to| to != from) {
@@ -1157,12 +1135,8 @@ fn bcm_now_micros() -> u64 {
     counter.wrapping_mul(1_000_000) / freq
 }
 fn bcm_tick_count() -> u32 {
-    // The HAL `tick_count` is wall-clock milliseconds from the counter, not
-    // the scheduler's logical tick (`DBG_TICK`): "1 tick == 1 ms" holds only
-    // at the fixed 1 ms default, while an adaptive domain varies its period
-    // and an idle one stops advancing the tick, so only the counter gives
-    // "ms since boot" under any pacing — as `rp_tick_count` does from its
-    // `Instant`.
+    // Wall-clock milliseconds from the counter: a domain's pass count is
+    // not a clock under adaptive pacing.
     bcm_now_millis() as u32
 }
 
@@ -1247,17 +1221,17 @@ fn maybe_emit_soc_temp(core_id: usize) {
     // inside budget and whether the floor rises on load and decays on cool-down.
     let worst_us = scheduler::domain_worst_step_us(0);
     let ovr = scheduler::domain_budget_overruns(0);
-    // Surface the Tier-2 IRQ-dispatch count on the reliable core-0 cadence so a
-    // dedicated-core Tier-2 module's `module_isr_entry` firing is observable
+    // Surface the `irq` IRQ-dispatch count on the reliable core-0 cadence so a
+    // dedicated-core `irq` module's `module_isr_entry` firing is observable
     // over UDP (its own loop logs only every 1M wakes).
-    let t2disp = fluxor::kernel::exec::isr_tier::tier2_dispatch_count();
+    let irqdisp = fluxor::kernel::exec::irq::dispatch_count();
     if let Some(mc) = soc_temp_mc() {
         log::info!(
-            "[therm] soc_temp_mC={mc} t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr} t2disp={t2disp}"
+            "[therm] soc_temp_mC={mc} t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr} irqdisp={irqdisp}"
         );
     } else {
         log::info!(
-            "[therm] soc_temp_mC=na t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr} t2disp={t2disp}"
+            "[therm] soc_temp_mC=na t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr} irqdisp={irqdisp}"
         );
     }
     // Re-emit the fan PWM register readback on the same cadence. The one-shot
@@ -1402,46 +1376,50 @@ fn bcm_read_cycle_count() -> u32 {
     bcm_read_counter() as u32
 }
 
-fn bcm_isr_tier_init() {}
+fn bcm_module_timer_init() {}
 
-// ISR tier 1b: software poll on aarch64
-static mut BCM_ISR_LAST_TICK: u64 = 0;
-static mut BCM_ISR_PERIOD_TICKS: u64 = 0;
+// The module timer on aarch64: polled by the domain loops, no alarm.
+static BCM_MODULE_TIMER_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BCM_MODULE_TIMER_PERIOD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
-fn bcm_isr_tier_start(period_us: u32) {
-    use fluxor::kernel::exec::isr_tier;
-    isr_tier::set_tier1b_period_us(period_us);
+fn bcm_module_timer_start(period_us: u32) {
+    use fluxor::kernel::exec::timer as module_timer;
+    module_timer::set_period_us(period_us);
     let freq = bcm_counter_freq();
-    // SAFETY: ISR-tier statics are set during init before any tier-1b
-    // module runs; sole writer on the scheduler thread.
-    unsafe {
-        BCM_ISR_PERIOD_TICKS = (period_us as u64 * freq) / 1_000_000;
-        BCM_ISR_LAST_TICK = bcm_read_counter();
+    BCM_MODULE_TIMER_PERIOD.store((period_us as u64 * freq) / 1_000_000, Ordering::Relaxed);
+    BCM_MODULE_TIMER_LAST.store(bcm_read_counter(), Ordering::Relaxed);
+    module_timer::TIMER_ACTIVE.store(true, Ordering::Release);
+}
+
+fn bcm_module_timer_stop() {
+    fluxor::kernel::exec::timer::TIMER_ACTIVE.store(false, Ordering::Release);
+}
+
+/// Fire the module timer once its period has elapsed. Every `tick` domain
+/// loop polls it, on its own core: the one whose compare-exchange moves the
+/// last-fired stamp runs the handler, so a period fires once.
+fn bcm_module_timer_poll() {
+    use fluxor::kernel::exec::timer as module_timer;
+    if !module_timer::TIMER_ACTIVE.load(Ordering::Acquire) {
+        return;
     }
-    isr_tier::TIER1B_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
-}
-
-fn bcm_isr_tier_stop() {
-    fluxor::kernel::exec::isr_tier::TIER1B_ACTIVE
-        .store(false, core::sync::atomic::Ordering::Release);
-}
-
-fn bcm_isr_tier_poll() {
-    use fluxor::kernel::exec::isr_tier;
-    if !isr_tier::TIER1B_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+    let period = BCM_MODULE_TIMER_PERIOD.load(Ordering::Relaxed);
+    if period == 0 {
         return;
     }
     let now = bcm_read_counter();
-    // SAFETY: ISR poll runs on the scheduler thread; sole reader.
-    let elapsed = now.wrapping_sub(unsafe { BCM_ISR_LAST_TICK });
-    // SAFETY: as above.
-    let period = unsafe { BCM_ISR_PERIOD_TICKS };
-    if period > 0 && elapsed >= period {
-        // SAFETY: sole writer for the ISR poll counter.
-        unsafe {
-            BCM_ISR_LAST_TICK = now;
-            isr_tier::isr_tier1b_handler();
-        }
+    let last = BCM_MODULE_TIMER_LAST.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < period {
+        return;
+    }
+    if BCM_MODULE_TIMER_LAST
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        // SAFETY: interrupt-contract handler; this core won the period, so
+        // no other poll runs it concurrently.
+        unsafe { module_timer::handler() };
     }
 }
 
@@ -1511,7 +1489,7 @@ fn bcm_init_providers() {
     // BCM2712 system extension for MMIO and NIC opcodes
     fluxor::kernel::module::syscalls::register_system_extension(bcm_system_extension_dispatch);
     // Metal fmod-graph `workload` (0x1A) backend: stages a workload as an
-    // owned module subgraph via `apply_add`/owner/lease. Gated exactly like
+    // owned module subgraph via the splice/owner/lease. Gated exactly like
     // the Linux install, by the `workload.create` grant. The core logic is
     // kernel-generic
     // (`kernel::workload::workload_graph`); this is the metal registration
@@ -1561,7 +1539,7 @@ fn bcm_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
 /// Metal `workload` (0x1A) provider dispatch — the thin bcm registration hook.
 /// Delegates to the kernel-generic backend
 /// (`kernel::workload::workload_graph`), which runs on the primary domain /
-/// core 0 (the system graph's domain) so the runtime `apply_add`/`free_owner`
+/// core 0 (the node graph's domain) so the runtime splice/`free_owner`
 /// it drives honor the primary-only quiesce invariant.
 fn bcm_workload_dispatch(
     handle: i32,
@@ -2170,10 +2148,10 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     step_guard_disarm: bcm_step_guard_disarm,
     step_guard_post_check: bcm_step_guard_post_check,
     read_cycle_count: bcm_read_cycle_count,
-    isr_tier_init: bcm_isr_tier_init,
-    isr_tier_start: bcm_isr_tier_start,
-    isr_tier_stop: bcm_isr_tier_stop,
-    isr_tier_poll: bcm_isr_tier_poll,
+    module_timer_init: bcm_module_timer_init,
+    module_timer_start: bcm_module_timer_start,
+    module_timer_stop: bcm_module_timer_stop,
+    module_timer_poll: bcm_module_timer_poll,
     init_providers: bcm_init_providers,
     release_module_handles: bcm_release_module_handles,
     boot_scan: bcm_boot_scan,
@@ -2182,6 +2160,8 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     csprng_fill: bcm_csprng_fill,
     core_id: bcm_core_id,
     irq_bind,
+    irq_unbind,
+    irq_mask,
     sleep_until: bcm_sleep_until,
     smp_quiesce_peers: domains::quiesce_peers,
     smp_release_peers: domains::release_quiesce,

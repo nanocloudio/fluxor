@@ -135,31 +135,20 @@ mod stream_time;
 #[path = "wasm/hal.rs"]
 mod hal;
 
-use crate::platform::builtin_param_tags::{
-    host_browser_fetch as fetch_tags, wasm_browser_action as action_tags,
-    wasm_browser_audio as audio_tags, wasm_browser_button as button_tags,
-    wasm_browser_camera as camera_tags, wasm_browser_canvas as canvas_tags,
-    wasm_browser_compute as compute_tags, wasm_browser_display_capture as display_capture_tags,
-    wasm_browser_dom_input as dom_input_tags, wasm_browser_gamepad as gamepad_tags,
-    wasm_browser_gpu as gpu_tags, wasm_browser_http as http_tags,
-    wasm_browser_image_codec as image_codec_tags, wasm_browser_keyboard as keyboard_tags,
-    wasm_browser_midi_out as midi_out_tags, wasm_browser_pointer as pointer_tags,
-    wasm_browser_scan_out as scan_out_tags, wasm_browser_surface_traits as surface_traits_tags,
-    wasm_browser_surface_traits_probe as surface_traits_probe_tags,
-    wasm_browser_touch_gamepad_overlay as touch_gamepad_overlay_tags,
-    wasm_browser_websocket as websocket_tags, wasm_browser_ws as ws_tags,
-    wasm_browser_ws_source as ws_source_tags,
-};
+// The module host: every loader-resolved module is a wasm payload,
+// instantiated as its own wasm instance through the host.
+#[path = "wasm/module_host.rs"]
+mod module_host;
 
-/// Lightweight TLV walker for built-in module params. Mirrors
-/// `src/platform/linux/builtin_params.rs::walk_tlv`. Built-ins receive
-/// a per-instance TLV blob via `ModuleEntry::params()`; tags 10..0xEF
-/// are the manifest-declared params, tags 0xF0..0xFF are reserved.
+/// Lightweight TLV walker for native module params. Mirrors
+/// `src/platform/linux/builtin_params.rs::walk_tlv`. A native module
+/// receives its per-instance TLV blob as `NativeInit::params`; tags
+/// 10..0xEF are the manifest-declared params, tags 0xF0..0xFF are reserved.
 ///
-/// Each tag below, and each port a built-in binds by name through
-/// `scheduler::module_port`, comes from `crate::platform::builtin_param_tags`,
-/// which `build.rs` generates from the `[[params]]` and `[[ports]]` tables of
-/// the wasm built-in manifests.
+/// Each tag a native module reads, and each port it binds by name through
+/// `scheduler::module_port`, comes from `crate::abi::platform::native::wasm`,
+/// which `fluxor abi-regen` generates from the `[[params]]` and `[[ports]]`
+/// tables of the wasm native module manifests.
 fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], f: F) {
     fluxor_contracts::params_tlv::walk_declared(blob, f);
 }
@@ -176,7 +165,7 @@ fn tlv_u32(value: &[u8]) -> u32 {
 // The host (browser shim, wasmtime shim, edge runtime) provides these
 // functions. They are the kernel-uniform surface from
 // `wasm_platform.md` §6 plus the WASM-specific module-instantiation
-// imports. Browser-host built-ins live in `src/platform/wasm/{...}.rs`
+// imports. Browser-host native modules live in `src/platform/wasm/{...}.rs`
 // and import their own per-capability host functions directly.
 
 extern "C" {
@@ -232,10 +221,6 @@ extern "C" {
     /// Free the module instance identified by `handle`. Subsequent
     /// `host_invoke_module` calls with the same handle return an
     /// error.
-    #[allow(
-        dead_code,
-        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-    )]
     fn host_destroy_module(handle: i32) -> i32;
 }
 
@@ -313,15 +298,228 @@ impl log::Log for WasmLogger {
 
 static WASM_LOGGER: WasmLogger = WasmLogger;
 
-// ── Loaded-module bookkeeping ────────────────────────────────────────
+// ── Graph bookkeeping ────────────────────────────────────────────────
 //
-// `kernel_init` populates SCHED via `store_builtin_module` /
-// `instantiate_one_module`. `MODULE_COUNT` is the upper bound
-// `kernel_step` iterates over — mirrors `module_count` in
-// `src/platform/linux.rs::main`.
+// `MODULE_COUNT` is what `kernel_module_count` reports: the module count of
+// the graph `kernel_init` built (or the tick demo's two).
 static mut MODULE_COUNT: usize = 0;
 
-// ── Kernel exports ───────────────────────────────────────────────────
+// ── Native modules ───────────────────────────────────────────────────
+//
+// Each browser-host bridge is a native module: a vtable in its own file,
+// registered under its name hash from the one table below. Its instance
+// lives on its own module heap, sized by its constructor; the arena state
+// holds the instance pointer (where every step reads it) and that heap's
+// arena, which its drop returns.
+
+use crate::kernel::exec::scheduler::native::NativeNewFn;
+use crate::kernel::exec::scheduler::{native, NativeInit, NativeVtable};
+use crate::kernel::module::loader::{self, ModuleStepFn};
+
+/// The wasm platform's native modules, registered once at init before the
+/// graph is prepared: a graph names each by its name hash, and the splice
+/// resolves it here when the loader does not.
+static NATIVE_MODULES: &[(u32, &NativeVtable)] = &[
+    (
+        crate::abi::platform::native::wasm::wasm_browser_canvas::NAME_HASH,
+        &canvas::WASM_BROWSER_CANVAS,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_camera::NAME_HASH,
+        &camera::WASM_BROWSER_CAMERA,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_display_capture::NAME_HASH,
+        &display_capture::WASM_BROWSER_DISPLAY_CAPTURE,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_scan_out::NAME_HASH,
+        &scan_out::WASM_BROWSER_SCAN_OUT,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_dom_input::NAME_HASH,
+        &dom_input::WASM_BROWSER_DOM_INPUT,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_keyboard::NAME_HASH,
+        &keyboard::WASM_BROWSER_KEYBOARD,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_pointer::NAME_HASH,
+        &pointer::WASM_BROWSER_POINTER,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_gamepad::NAME_HASH,
+        &gamepad::WASM_BROWSER_GAMEPAD,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_surface_traits::NAME_HASH,
+        &surface_traits::WASM_BROWSER_SURFACE_TRAITS,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_surface_traits_probe::NAME_HASH,
+        &surface_traits_probe::WASM_BROWSER_SURFACE_TRAITS_PROBE,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_button::NAME_HASH,
+        &button::WASM_BROWSER_BUTTON,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_action::NAME_HASH,
+        &action::WASM_BROWSER_ACTION,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_midi_in::NAME_HASH,
+        &midi::WASM_BROWSER_MIDI_IN,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_midi_out::NAME_HASH,
+        &midi::WASM_BROWSER_MIDI_OUT,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_audio::NAME_HASH,
+        &audio::WASM_BROWSER_AUDIO,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_websocket::NAME_HASH,
+        &websocket::WASM_BROWSER_WEBSOCKET,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_ws_source::NAME_HASH,
+        &ws_source::WASM_BROWSER_WS_SOURCE,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_http::NAME_HASH,
+        &http::WASM_BROWSER_HTTP,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_ws::NAME_HASH,
+        &ws::WASM_BROWSER_WS,
+    ),
+    (
+        crate::abi::platform::native::wasm::host_browser_fetch::NAME_HASH,
+        &fetch::HOST_BROWSER_FETCH,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_image_codec::NAME_HASH,
+        &image_codec::WASM_BROWSER_IMAGE_CODEC,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_terminal::NAME_HASH,
+        &terminal::WASM_BROWSER_TERMINAL,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_touch_gamepad_overlay::NAME_HASH,
+        &touch_gamepad_overlay::WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_gpu::NAME_HASH,
+        &gpu::WASM_BROWSER_GPU,
+    ),
+    (
+        crate::abi::platform::native::wasm::wasm_browser_compute::NAME_HASH,
+        &gpu_compute::WASM_BROWSER_COMPUTE,
+    ),
+];
+
+/// Arena state of a native module whose instance lives on its own module
+/// heap. The instance pointer comes first: every step reads it from the
+/// start of its state.
+#[repr(C)]
+struct HeapInstance {
+    instance: *mut u8,
+    arena: *mut u8,
+    arena_size: usize,
+}
+
+/// The vtable of a native module built by `new` on its own heap and stepped
+/// by `step`.
+const fn heap_native(new: NativeNewFn, step: ModuleStepFn) -> NativeVtable {
+    NativeVtable {
+        new,
+        step,
+        refill: None,
+        flush: None,
+        isr_entry: None,
+        drop: Some(release_heap_instance),
+        state_size: core::mem::size_of::<HeapInstance>() as u32,
+    }
+}
+
+/// Heap bytes for an instance that allocates one `S` and nothing else: the
+/// struct plus the heap's block header and alignment slack.
+const fn heap_for<S>() -> usize {
+    core::mem::size_of::<S>() + 32
+}
+
+/// Seat a module heap of `heap_bytes` for `slot`, build the instance on it
+/// with `build` (which allocates through the slot's heap and answers null
+/// when it cannot), and record both in `state`. `0`, or `ENOMEM` with
+/// nothing kept.
+///
+/// # Safety
+/// `state` is the zeroed arena state of a [`heap_native`] instance, and the
+/// current module is `slot` (as the constructor is called).
+unsafe fn seat_heap_instance(
+    state: *mut u8,
+    slot: usize,
+    heap_bytes: usize,
+    build: impl FnOnce() -> *mut u8,
+) -> i32 {
+    let Ok(arena) = loader::alloc_state(heap_bytes) else {
+        log::error!("[wasm-kernel] module {slot}: no state arena for a {heap_bytes}-byte heap");
+        return crate::kernel::sys::errno::ENOMEM;
+    };
+    crate::kernel::mem::heap::init_module_heap(slot, arena, heap_bytes);
+    let instance = build();
+    if instance.is_null() {
+        log::error!(
+            "[wasm-kernel] module {slot}: instance does not fit its {heap_bytes}-byte heap"
+        );
+        crate::kernel::mem::heap::reset_module_heap(slot);
+        // SAFETY: the range just allocated; nothing kept a pointer into it.
+        unsafe { loader::free_state_range(arena, heap_bytes) };
+        return crate::kernel::sys::errno::ENOMEM;
+    }
+    // SAFETY: the caller's contract: `state` holds a `HeapInstance`, 8-byte
+    // aligned.
+    unsafe {
+        core::ptr::write(
+            state.cast::<HeapInstance>(),
+            HeapInstance {
+                instance,
+                arena,
+                arena_size: heap_bytes,
+            },
+        )
+    };
+    0
+}
+
+/// # Safety
+/// `state` is the arena state [`seat_heap_instance`] filled; this is its one
+/// release, after the module's last step.
+unsafe fn release_heap_instance(state: *mut u8) {
+    // SAFETY: the caller's contract.
+    let seated = unsafe { core::ptr::read(state.cast::<HeapInstance>()) };
+    // SAFETY: the heap arena `seat_heap_instance` allocated; the instance on
+    // it is never stepped again.
+    unsafe { loader::free_state_range(seated.arena, seated.arena_size) };
+}
+
+/// The value of param `tag` in `params`, copied into `buf` (truncated to
+/// it); empty when the params name none.
+fn param_bytes<'b>(params: &[u8], tag: u8, buf: &'b mut [u8]) -> &'b [u8] {
+    let mut len = 0usize;
+    walk_tlv(params, |t, value| {
+        if t == tag {
+            let n = value.len().min(buf.len());
+            buf[..n].copy_from_slice(&value[..n]);
+            len = n;
+        }
+    });
+    &buf[..len]
+}
 
 /// In-kernel tick_source / tick_sink demo. Runs only when no bundled
 /// modules are present — mainly for the bare `firmware.wasm` smoke
@@ -332,14 +530,13 @@ fn init_tick_demo() {
         log_str(4, b"[wasm-kernel] channel_open failed");
         return;
     }
-
-    let mut source = scheduler::BuiltInModule::new("wasm_tick_source", tick_source_step);
-    source.state[0..4].copy_from_slice(&chan.to_le_bytes());
-    scheduler::store_builtin_module(0, source);
-
-    let mut sink = scheduler::BuiltInModule::new("wasm_tick_sink", tick_sink_step);
-    sink.state[0..4].copy_from_slice(&chan.to_le_bytes());
-    scheduler::store_builtin_module(1, sink);
+    let params = chan.to_le_bytes();
+    if scheduler::store_native_module(0, &TICK_SOURCE, &params).is_err()
+        || scheduler::store_native_module(1, &TICK_SINK, &params).is_err()
+    {
+        log_str(4, b"[wasm-kernel] tick demo: modules not stored");
+        return;
+    }
 
     // SAFETY: MODULE_COUNT mutated once at boot under single-threaded
     // wasm runtime; init_tick_demo is the only writer in this path.
@@ -348,1230 +545,62 @@ fn init_tick_demo() {
     }
     log_str(
         2,
-        b"[wasm-kernel] tick demo: 2 builtins (tick_source -> tick_sink)",
+        b"[wasm-kernel] tick demo: 2 native modules (tick_source -> tick_sink)",
     );
 }
 
-use crate::abi::wire::fnv1a32;
-
-const WASM_BROWSER_CANVAS_HASH: u32 = fnv1a32(b"wasm_browser_canvas");
-const WASM_BROWSER_CAMERA_HASH: u32 = fnv1a32(b"wasm_browser_camera");
-const WASM_BROWSER_DISPLAY_CAPTURE_HASH: u32 = fnv1a32(b"wasm_browser_display_capture");
-const WASM_BROWSER_SCAN_OUT_HASH: u32 = fnv1a32(b"wasm_browser_scan_out");
-const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
-const WASM_BROWSER_KEYBOARD_HASH: u32 = fnv1a32(b"wasm_browser_keyboard");
-const WASM_BROWSER_POINTER_HASH: u32 = fnv1a32(b"wasm_browser_pointer");
-const WASM_BROWSER_BUTTON_HASH: u32 = fnv1a32(b"wasm_browser_button");
-const WASM_BROWSER_ACTION_HASH: u32 = fnv1a32(b"wasm_browser_action");
-const WASM_BROWSER_GAMEPAD_HASH: u32 = fnv1a32(b"wasm_browser_gamepad");
-const WASM_BROWSER_SURFACE_TRAITS_HASH: u32 = fnv1a32(b"wasm_browser_surface_traits");
-const WASM_BROWSER_SURFACE_TRAITS_PROBE_HASH: u32 = fnv1a32(b"wasm_browser_surface_traits_probe");
-const WASM_BROWSER_AUDIO_HASH: u32 = fnv1a32(b"wasm_browser_audio");
-const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
-const WASM_BROWSER_WS_SOURCE_HASH: u32 = fnv1a32(b"wasm_browser_ws_source");
-const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
-const WASM_BROWSER_HTTP_HASH: u32 = fnv1a32(b"wasm_browser_http");
-const WASM_BROWSER_WS_HASH: u32 = fnv1a32(b"wasm_browser_ws");
-const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
-const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
-const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 = fnv1a32(b"wasm_browser_touch_gamepad_overlay");
-const WASM_BROWSER_GPU_HASH: u32 = fnv1a32(b"wasm_browser_gpu");
-const WASM_BROWSER_COMPUTE_HASH: u32 = fnv1a32(b"wasm_browser_compute");
-// MIDI built-ins — STUB. See `wasm/midi.rs` for the unimplemented
-// state. Registered here so configs that reference the modules
-// load cleanly instead of failing at the runtime dispatch step.
-const WASM_BROWSER_MIDI_IN_HASH: u32 = fnv1a32(b"wasm_browser_midi_in");
-const WASM_BROWSER_MIDI_OUT_HASH: u32 = fnv1a32(b"wasm_browser_midi_out");
-
-/// Initialise a per-module heap sized for one `State` struct plus
-/// alignment slack. Each built-in's `alloc_state` makes one
-/// `heap_alloc(size_of::<State>())` call, so the heap doesn't need
-/// to grow. Returns false if the shared STATE_ARENA is full; caller
-/// logs and skips the module.
-fn init_builtin_heap<S>(module_idx: usize) -> bool {
-    init_builtin_heap_sized(module_idx, core::mem::size_of::<S>() + 32)
-}
-
-/// Variant for built-ins whose runtime heap need exceeds their
-/// State struct (e.g. `wasm_browser_image_codec` heap-allocs a
-/// max_bytes-sized encoded buffer alongside its small State).
-fn init_builtin_heap_sized(module_idx: usize, bytes: usize) -> bool {
-    match crate::kernel::module::loader::alloc_state(bytes) {
-        Ok(arena_ptr) => {
-            crate::kernel::mem::heap::init_module_heap(module_idx, arena_ptr, bytes);
-            true
-        }
-        Err(_) => false,
+/// Bytes the bundle tool wrote into the modules and config blobs: zero for
+/// an unbundled kernel (bare `firmware.wasm`).
+fn embedded_lens() -> (usize, usize) {
+    // SAFETY: volatile reads of the 'static placeholders the bundle tool
+    // rewrites in place.
+    unsafe {
+        (
+            core::ptr::read_volatile(&EMBEDDED_MODULES_BLOB.used_len) as usize,
+            core::ptr::read_volatile(&EMBEDDED_CONFIG_BLOB.used_len) as usize,
+        )
     }
 }
 
-/// Walk the kernel's compiled module list (populated from
-/// `EMBEDDED_CONFIG_BLOB` by `populate_static_state` + `prepare_graph`)
-/// and instantiate each module — either as a kernel-side built-in
-/// (for `wasm_browser_*` host bridges) or as a packed wasm payload
-/// via `host_instantiate_module`.
+/// Install the embedded config and modules blobs and build the graph they
+/// compose: every module resolves in the loader (a wasm payload, through
+/// the module host) or the native table, or the graph is refused.
 ///
-/// Returns the number of modules successfully registered. Failures
-/// (unsatisfied imports, missing bridges, etc.) are logged and
-/// skipped so partial bring-up doesn't take down the kernel.
+/// The module count; 0 for an unbundled kernel or a refused graph.
+///
+/// # Safety
+/// Single-threaded wasm boot, once, before the first `kernel_step`.
 unsafe fn load_embedded_modules() -> usize {
-    let modules_used = core::ptr::read_volatile(&EMBEDDED_MODULES_BLOB.used_len) as usize;
-    let config_used = core::ptr::read_volatile(&EMBEDDED_CONFIG_BLOB.used_len) as usize;
+    let (modules_used, config_used) = embedded_lens();
     if modules_used == 0 || config_used == 0 {
         return 0;
     }
 
-    // Populate the kernel's STATIC_CONFIG / STATIC_LOADER from the
-    // embedded blobs and compile the graph. `prepare_graph` builds
-    // the per-module port table, allocates channels, and returns the
-    // resolved module list keyed by name_hash.
     // Length-aware: `config_used` is the actual content size inside the
     // statically-allocated CONFIG_BLOB_CAPACITY-sized array. Bounded slice
     // construction makes the parser reject any section that overruns it.
-    let cfg_slice = core::slice::from_raw_parts(EMBEDDED_CONFIG_BLOB.data.as_ptr(), config_used);
+    // SAFETY: `config_used` bytes of the 'static config placeholder.
+    let cfg_slice =
+        unsafe { core::slice::from_raw_parts(EMBEDDED_CONFIG_BLOB.data.as_ptr(), config_used) };
     let mod_ptr = EMBEDDED_MODULES_BLOB.data.as_ptr();
-    if let Err(msg) = scheduler::populate_static_state_with_len(cfg_slice, mod_ptr, modules_used) {
+    // SAFETY: both blobs are 'static and outlive the graph built from them.
+    let populated =
+        unsafe { scheduler::populate_static_state_with_len(cfg_slice, mod_ptr, modules_used) };
+    if let Err(msg) = populated {
         log_str(4, b"[wasm-kernel] populate_static_state failed:");
         log_str(4, msg.as_bytes());
         return 0;
     }
-    let (module_list, module_count) = match scheduler::prepare_graph() {
-        Ok(v) => v,
+    match scheduler::build_graph() {
+        Ok(n) => n,
         Err(rc) => {
             log_fmt2(
                 4,
-                "[wasm-kernel] prepare_graph failed rc=",
+                "[wasm-kernel] graph refused rc=",
                 rc as i64 as u64,
                 "",
                 0,
             );
-            return 0;
-        }
-    };
-
-    let modules_blob_len = EMBEDDED_MODULES_BLOB.data.len().min(modules_used);
-    let mut registered = 0usize;
-
-    for (module_idx, entry_opt) in module_list.iter().enumerate().take(module_count) {
-        let entry = match entry_opt {
-            Some(e) => e,
-            None => continue,
-        };
-        scheduler::set_current_module(module_idx);
-
-        // Kernel-internal fan modules (`_tee` / `_merge`) inserted by
-        // `prepare_graph` for fan-out / fan-in groups. They have no PIC
-        // `.fmod` and aren't host built-ins, so the dispatch below would
-        // fall through to the (failing) host-instantiate path and leave
-        // them as no-op slots — silently dropping forwarded data. Install
-        // them as real Tee/Merge slots here (the wasm analog of
-        // `instantiate_one_module`'s internal-module handling).
-        if entry.name_hash == scheduler::INTERNAL_MERGE_HASH
-            || entry.name_hash == scheduler::INTERNAL_TEE_HASH
-        {
-            let is_merge = entry.name_hash == scheduler::INTERNAL_MERGE_HASH;
-            if scheduler::install_fan_module(
-                module_idx,
-                is_merge,
-                entry.domain_id,
-                entry.frame_kind,
-            ) {
-                registered += 1;
-                log_fmt2(
-                    2,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    if is_merge {
-                        " = _merge (internal fan-in)"
-                    } else {
-                        " = _tee (internal fan-out)"
-                    },
-                    0,
-                );
-            } else {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = internal fan module: install failed",
-                    0,
-                );
-            }
-            continue;
-        }
-
-        // Browser-host built-ins, dispatched by name_hash. Same
-        // pattern as the Linux platform (`linux_audio`,
-        // `host_image_codec`).
-        //
-        // Each built-in's `alloc_state` calls `(table.heap_alloc)(size)`
-        // for its single State struct, routing through
-        // `MODULE_HEAPS[module_idx].alloc`. That heap returns null
-        // until initialised; the PIC loader sets it up from the manifest's
-        // arena for compiled wasm modules, but built-ins
-        // skip the loader. Each branch below sizes a heap to fit its
-        // own State struct (plus alignment slack) before calling
-        // `build()`.
-        if entry.name_hash == WASM_BROWSER_CANVAS_HASH {
-            // Width/height first — the per-module heap holds the
-            // RGB565 frame buffer (width * height * 2), so heap
-            // sizing depends on the params.
-            let mut width = 0u16;
-            let mut height = 0u16;
-            let mut header = false;
-            walk_tlv(entry.params(), |tag, value| match tag {
-                canvas_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
-                canvas_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
-                canvas_tags::TAG_HEADER => header = tlv_u32(value) != 0,
-                _ => {}
-            });
-            let heap_bytes = canvas::heap_size_for(width, height);
-            if !init_builtin_heap_sized(module_idx, heap_bytes) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_canvas: STATE_ARENA full, skipping",
-                    heap_bytes as u64,
-                );
-                continue;
-            }
-            let in_chan = scheduler::module_port(module_idx, canvas_tags::PORT_PIXELS);
-            let m = canvas::build(width, height, header, in_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_canvas (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_DOM_INPUT_HASH {
-            if !init_builtin_heap::<dom_input::DomInputState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_dom_input: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, dom_input_tags::PORT_EVENTS);
-            let m = dom_input::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_dom_input (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // Camera-frame source: getUserMedia luma frames into the graph (for
-        // qr_scan). Needs a heap for its frame buffer, like canvas.
-        if entry.name_hash == WASM_BROWSER_CAMERA_HASH {
-            if !init_builtin_heap_sized(module_idx, camera::heap_size_for()) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_camera: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, camera_tags::PORT_FRAMES);
-            let m = camera::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_camera (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // Display-capture source: frames of the surface the person chose to
-        // share. Heap-sized from the params, like canvas, because the buffer
-        // is also the bound on what a stream-supplied header may claim.
-        if entry.name_hash == WASM_BROWSER_DISPLAY_CAPTURE_HASH {
-            let mut width = 0u16;
-            let mut height = 0u16;
-            let mut header = true;
-            walk_tlv(entry.params(), |tag, value| match tag {
-                display_capture_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
-                display_capture_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
-                display_capture_tags::TAG_HEADER => header = tlv_u32(value) != 0,
-                _ => {}
-            });
-            let heap_bytes = display_capture::heap_size_for(width, height);
-            if !init_builtin_heap_sized(module_idx, heap_bytes) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_display_capture: STATE_ARENA full, skipping",
-                    heap_bytes as u64,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, display_capture_tags::PORT_PIXELS);
-            let m = display_capture::build(width, height, header, out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_display_capture (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // Result sink: hand a decoded byte result (qr_scan token) to the page.
-        if entry.name_hash == WASM_BROWSER_SCAN_OUT_HASH {
-            if !init_builtin_heap::<scan_out::ScanOutState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_scan_out: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let in_chan = scheduler::module_port(module_idx, scan_out_tags::PORT_RESULT);
-            let m = scan_out::build(in_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_scan_out (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // Per-class input modules — capability-surface partition of
-        // `dom_input`. Each emits its corresponding
-        // `crates/fluxor-abi/src/contracts/input/*` contract on its single
-        // output port (port idx 0 — input modules are sources).
-        if entry.name_hash == WASM_BROWSER_KEYBOARD_HASH {
-            if !init_builtin_heap::<keyboard::KeyboardState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_keyboard: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, keyboard_tags::PORT_EVENTS);
-            let m = keyboard::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_keyboard (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_POINTER_HASH {
-            if !init_builtin_heap::<pointer::PointerState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_pointer: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, pointer_tags::PORT_EVENTS);
-            let m = pointer::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_pointer (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_GAMEPAD_HASH {
-            if !init_builtin_heap::<gamepad::GamepadState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_gamepad: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, gamepad_tags::PORT_EVENTS);
-            let m = gamepad::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_gamepad (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // SURFACE TRAITS authority — drains coalesced environment-plane
-        // snapshots (viewport / orientation / size class / modality /
-        // audio) from the browser host shim and emits 24-byte
-        // `input::surface_traits::MSG_TRAITS` records on out[0].
-        if entry.name_hash == WASM_BROWSER_SURFACE_TRAITS_HASH {
-            if !init_builtin_heap::<surface_traits::SurfaceTraitsState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_surface_traits: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, surface_traits_tags::PORT_EVENTS);
-            let m = surface_traits::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_surface_traits (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // SURFACE TRAITS probe — demo consumer that logs decoded
-        // MSG_TRAITS records (round-trip acceptance check).
-        if entry.name_hash == WASM_BROWSER_SURFACE_TRAITS_PROBE_HASH {
-            if !init_builtin_heap::<surface_traits_probe::ProbeState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_surface_traits_probe: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let in_chan =
-                scheduler::module_port(module_idx, surface_traits_probe_tags::PORT_EVENTS);
-            let m = surface_traits_probe::build(in_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_surface_traits_probe (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // BUTTON capability driver — emits raw button transitions
-        // (one byte per debounced edge) on out[0]. Symmetric to
-        // `flash_rp` on rp boards; same `input::button` contract,
-        // same downstream `gesture` chain.
-        if entry.name_hash == WASM_BROWSER_BUTTON_HASH {
-            if !init_builtin_heap::<button::ButtonState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_button: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, button_tags::PORT_RAW);
-            let m = button::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_button (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // ACTION source — drains the host action queue and emits FMP
-        // command verbs (next/prev/toggle) mapped from the canonical
-        // presentation-shell `InputAction` vocabulary. Lets the
-        // browser-overlay media/gallery controls drive `bank` and other
-        // FMP consumers, the same way `gesture` drives them from taps.
-        if entry.name_hash == WASM_BROWSER_ACTION_HASH {
-            if !init_builtin_heap::<action::ActionState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_action: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let out_chan = scheduler::module_port(module_idx, action_tags::PORT_COMMANDS);
-            let m = action::build(out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_action (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // MIDI input/output — STUB. See `wasm/midi.rs`. Registers
-        // so the module loads cleanly. `midi_out` drains its input
-        // channel every step so wired producers don't backpressure.
-        if entry.name_hash == WASM_BROWSER_MIDI_IN_HASH {
-            if !init_builtin_heap::<midi::MidiInState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_midi_in: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let m = midi::build_in();
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                3,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_midi_in (built-in, STUB - Web MIDI not yet implemented)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_MIDI_OUT_HASH {
-            if !init_builtin_heap::<midi::MidiOutState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_midi_out: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let events_in = scheduler::module_port(module_idx, midi_out_tags::PORT_EVENTS);
-            let m = midi::build_out(events_in);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_midi_out (built-in, STUB - Web MIDI not yet implemented; drains input channel)", 0);
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_AUDIO_HASH {
-            if !init_builtin_heap::<audio::AudioState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_audio: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let mut sample_rate = 0u32;
-            let mut channels = 1u32;
-            let mut lead_ms = 0u32; // 0 = module default (codec-depth)
-            walk_tlv(entry.params(), |tag, value| match tag {
-                audio_tags::TAG_SAMPLE_RATE => sample_rate = tlv_u32(value),
-                audio_tags::TAG_CHANNELS => channels = tlv_u32(value),
-                audio_tags::TAG_LEAD_MS => lead_ms = tlv_u32(value),
-                _ => {}
-            });
-            let in_chan = scheduler::module_port(module_idx, audio_tags::PORT_AUDIO);
-            let m = audio::build(sample_rate, channels, lead_ms, in_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_audio (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_WEBSOCKET_HASH {
-            if !init_builtin_heap::<websocket::WsState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_websocket: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let mut url_buf = [0u8; 256];
-            let mut url_len = 0usize;
-            walk_tlv(entry.params(), |tag, value| {
-                if tag == websocket_tags::TAG_URL {
-                    let n = value.len().min(url_buf.len());
-                    url_buf[..n].copy_from_slice(&value[..n]);
-                    url_len = n;
-                }
-            });
-            let in_chan = scheduler::module_port(module_idx, websocket_tags::PORT_TX);
-            let out_chan = scheduler::module_port(module_idx, websocket_tags::PORT_RX);
-            let m = websocket::build(&url_buf[..url_len], in_chan, out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_websocket (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_WS_SOURCE_HASH {
-            if !init_builtin_heap::<ws_source::WsSourceState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_ws_source: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let mut url_buf = [0u8; 256];
-            let mut url_len = 0usize;
-            walk_tlv(entry.params(), |tag, value| {
-                if tag == ws_source_tags::TAG_URL {
-                    let n = value.len().min(url_buf.len());
-                    url_buf[..n].copy_from_slice(&value[..n]);
-                    url_len = n;
-                }
-            });
-            // RX-only: no input port. Output port `bytes` is index 0
-            // on direction=1 (output) by manifest declaration order.
-            let out_chan = scheduler::module_port(module_idx, ws_source_tags::PORT_BYTES);
-            let m = ws_source::build(&url_buf[..url_len], out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_ws_source (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_HTTP_HASH {
-            if !init_builtin_heap::<http::HttpState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_http: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let mut origin_buf = [0u8; 256];
-            let mut origin_len = 0usize;
-            walk_tlv(entry.params(), |tag, value| {
-                if tag == http_tags::TAG_ORIGIN {
-                    let n = value.len().min(origin_buf.len());
-                    origin_buf[..n].copy_from_slice(&value[..n]);
-                    origin_len = n;
-                }
-            });
-            let request_in = scheduler::module_port(module_idx, http_tags::PORT_REQUEST_IN);
-            let response_out = scheduler::module_port(module_idx, http_tags::PORT_RESPONSE_OUT);
-            let m = http::build(&origin_buf[..origin_len], request_in, response_out);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_http (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_WS_HASH {
-            if !init_builtin_heap::<ws::WsState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_ws: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let mut origin_buf = [0u8; 256];
-            let mut origin_len = 0usize;
-            walk_tlv(entry.params(), |tag, value| {
-                if tag == ws_tags::TAG_ORIGIN {
-                    let n = value.len().min(origin_buf.len());
-                    origin_buf[..n].copy_from_slice(&value[..n]);
-                    origin_len = n;
-                }
-            });
-            let open_in = scheduler::module_port(module_idx, ws_tags::PORT_OPEN_IN);
-            let ws_in = scheduler::module_port(module_idx, ws_tags::PORT_WS_IN);
-            let ws_out = scheduler::module_port(module_idx, ws_tags::PORT_WS_OUT);
-            let event_out = scheduler::module_port(module_idx, ws_tags::PORT_EVENT_OUT);
-            let m = ws::build(&origin_buf[..origin_len], open_in, ws_in, ws_out, event_out);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_ws (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == HOST_BROWSER_FETCH_HASH {
-            if !init_builtin_heap::<fetch::FetchState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = host_browser_fetch: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let mut url_buf = [0u8; 256];
-            let mut url_len = 0usize;
-            walk_tlv(entry.params(), |tag, value| {
-                if tag == fetch_tags::TAG_URL {
-                    let n = value.len().min(url_buf.len());
-                    url_buf[..n].copy_from_slice(&value[..n]);
-                    url_len = n;
-                }
-            });
-            let out_chan = scheduler::module_port(module_idx, fetch_tags::PORT_BYTES);
-            let m = fetch::build(&url_buf[..url_len], out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = host_browser_fetch (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        if entry.name_hash == WASM_BROWSER_IMAGE_CODEC_HASH {
-            // Read params first — `max_bytes` determines per-module
-            // heap size (State + encoded buffer + slack).
-            let mut width = 0u16;
-            let mut height = 0u16;
-            let mut max_bytes = 8u32 * 1024 * 1024;
-            walk_tlv(entry.params(), |tag, value| match tag {
-                image_codec_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
-                image_codec_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
-                image_codec_tags::TAG_MAX_BYTES => max_bytes = tlv_u32(value),
-                _ => {}
-            });
-            let heap_bytes = image_codec::heap_size_for(max_bytes);
-            if !init_builtin_heap_sized(module_idx, heap_bytes) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_image_codec: STATE_ARENA full, skipping",
-                    heap_bytes as u64,
-                );
-                continue;
-            }
-            let in_chan = scheduler::module_port(module_idx, image_codec_tags::PORT_ENCODED);
-            let out_chan = scheduler::module_port(module_idx, image_codec_tags::PORT_PIXELS);
-            let m = image_codec::build(in_chan, out_chan, width, height, max_bytes);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_image_codec (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // DOM scrollback terminal — drains the kernel log ring into
-        // a `<pre>` widget in the page. No data ports; the module
-        // pulls from the log ring via the diag-contract drain
-        // opcode same as `log_net` on embedded.
-        if entry.name_hash == WASM_BROWSER_TERMINAL_HASH {
-            if !init_builtin_heap::<terminal::TerminalState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_terminal: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let m = terminal::build();
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_terminal (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // Touch-overlay → gamepad transformer. PointerEvents in,
-        // GamepadEvents out. The runtime shell renders the visual
-        // overlay buttons (DPAD cross + face-button diamond) from
-        // the same canonical region table the module hit-tests
-        // against — see `touch_gamepad_overlay::REGIONS`.
-        if entry.name_hash == WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH {
-            if !init_builtin_heap::<touch_gamepad_overlay::OverlayState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_touch_gamepad_overlay: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
-            let in_chan =
-                scheduler::module_port(module_idx, touch_gamepad_overlay_tags::PORT_EVENTS_IN);
-            let out_chan =
-                scheduler::module_port(module_idx, touch_gamepad_overlay_tags::PORT_EVENTS_OUT);
-            let m = touch_gamepad_overlay::build(in_chan, out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_touch_gamepad_overlay (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // WebGPU rendering backend — receives draw commands via channel,
-        // renders using browser WebGPU API through host_gpu_raster_* shims.
-        if entry.name_hash == WASM_BROWSER_GPU_HASH {
-            let mut width = 800u16;
-            let mut height = 600u16;
-            walk_tlv(entry.params(), |tag, value| match tag {
-                gpu_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
-                gpu_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
-                _ => {}
-            });
-            let heap_bytes = gpu::heap_size_for(width, height);
-            if !init_builtin_heap_sized(module_idx, heap_bytes) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_gpu: STATE_ARENA full, skipping",
-                    heap_bytes as u64,
-                );
-                continue;
-            }
-            let in_chan = scheduler::module_port(module_idx, gpu_tags::PORT_COMMANDS);
-            let m = gpu::build(width, height, in_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_gpu (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // Generic GPU provider. The same contract and the same shared cores
-        // as the replay and native providers; only the device objects
-        // behind the slot numbers differ. Draws from the page's one WebGPU
-        // device, so a compute output can be handed to raster without a CPU
-        // round trip.
-        if entry.name_hash == WASM_BROWSER_COMPUTE_HASH {
-            let heap_bytes = gpu_compute::heap_size_for();
-            if !init_builtin_heap_sized(module_idx, heap_bytes) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_compute: STATE_ARENA full, skipping",
-                    heap_bytes as u64,
-                );
-                continue;
-            }
-            let in_chan = scheduler::module_port(module_idx, compute_tags::PORT_COMMANDS);
-            let out_chan = scheduler::module_port(module_idx, compute_tags::PORT_OUTCOMES);
-            let m = gpu_compute::build(in_chan, out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(
-                2,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                " = wasm_browser_compute (built-in)",
-                0,
-            );
-            continue;
-        }
-
-        // Non-builtin: locate the .fmod in modules.bin via the static
-        // loader's name-hash index, verify it's a wasm payload, and
-        // hand the wasm bytes to `host_instantiate_module`.
-        let _ = modules_blob_len; // (loader does its own bounds check)
-        let _ = mod_ptr;
-        let loader = scheduler::static_loader();
-        let loaded = match loader.find_by_name_hash(entry.name_hash) {
-            Ok(l) => l,
-            Err(_) => {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    ": no .fmod entry for name_hash",
-                    entry.name_hash as u64,
-                );
-                continue;
-            }
-        };
-        let header = &loaded.header;
-        if header.flags & crate::abi::wire::fmod::header::flag::WASM_PAYLOAD == 0 {
-            log_fmt2(
-                3,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                ": .fmod is not wasm-payload; skipping",
-                0,
-            );
-            continue;
-        }
-
-        // Run the same admission pipeline native modules go through:
-        // ABI-version, code-size, manifest-integrity and signing-root
-        // checks all apply to hosted WASM modules
-        // identically to RP/BCM. The wasm payload itself goes through
-        // the host's wasmtime/browser instantiation below — the
-        // kernel can't verify wasm32 instructions itself — but the
-        // `.fmod` envelope is verified here.
-        if let Err(_e) = crate::kernel::module::loader::validate_module(&loaded, "wasm-child") {
-            log_fmt2(
-                3,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                ": validate_module rejected the .fmod envelope",
-                0,
-            );
-            continue;
-        }
-
-        // The wasm platform's `host_instantiate_module` loop bypasses
-        // `scheduler::instantiate_one_module`, so the grants have to be
-        // staged here, or every op that needs one is refused.
-        scheduler::set_module_grants(module_idx, loaded.manifest_grants());
-        scheduler::set_module_type_hash(module_idx, entry.name_hash);
-
-        let code_size = header.code_size as usize;
-        let code_ptr = loaded.code_base();
-
-        let handle = host_instantiate_module(code_ptr, code_size, core::ptr::null(), 0);
-        if handle < 0 {
-            log_fmt2(
-                3,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                ": host_instantiate_module failed",
-                0,
-            );
-            continue;
-        }
-
-        // Resolve channel handles for the module's first three port
-        // slots (in[0], out[0], ctrl[0] — slot 0 of each direction).
-        // Modules with more ports look the rest up internally via
-        // `dev_channel_port`.
-        //
-        // Port direction id 2 = ctrl_input. Modules that declare a
-        // `ctrl_input` port (e.g. bank.commands) need this; without
-        // it the module gets `ctrl_chan = -1` and silently ignores
-        // every FMP message on its ctrl port. Same lookup pattern
-        // bcm2712 and rp2350 use in
-        // `kernel::exec::scheduler::instantiate_one_module`.
-        let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-        let out_chan = scheduler::get_module_port(module_idx, 1, 0);
-        let ctrl_chan = scheduler::get_module_port(module_idx, 2, 0);
-
-        // Diagnostic: log the full port table for each PIC module so
-        // wiring issues are visible. Three log lines, one per
-        // direction. `i1`/`o1` are the second-port handles modules
-        // commonly look up via `dev_channel_port`.
-        let in1 = scheduler::get_module_port(module_idx, 0, 1);
-        let out1 = scheduler::get_module_port(module_idx, 1, 1);
-        log_fmt3(
-            2,
-            "[wasm-kernel] ports idx=",
-            module_idx as u64,
-            " in0=",
-            in_chan as i64 as u64,
-            " in1=",
-            in1 as i64 as u64,
-        );
-        log_fmt3(
-            2,
-            "[wasm-kernel] ports idx=",
-            module_idx as u64,
-            " out0=",
-            out_chan as i64 as u64,
-            " out1=",
-            out1 as i64 as u64,
-        );
-        log_fmt2(
-            2,
-            "[wasm-kernel] ports idx=",
-            module_idx as u64,
-            " ctrl0=",
-            ctrl_chan as i64 as u64,
-        );
-
-        // The heap arena the module's manifest declares (0 for none).
-        let arena_size = loaded.manifest_arena_bytes() as u32;
-
-        // Allocate a per-module kernel-side scratch heap. The wasm
-        // host shim routes every PIC syscall that crosses linear-memory
-        // boundaries (`channel_read`/`channel_write`/`provider_call`)
-        // through `kernel_heap_alloc`, which reads `MODULE_HEAPS[idx]`.
-        // Without this initialisation the alloc returns null and every
-        // such syscall silently fails with -1. Sized at 256 KiB so a
-        // single read up to 64 KiB (e.g. media_loader's snapshot poll)
-        // fits even after the heap's per-block header + alignment
-        // slack, and tolerates a few in-flight syscalls per step.
-        const PIC_KERNEL_SCRATCH_BYTES: usize = 256 * 1024;
-        match crate::kernel::module::loader::alloc_state(PIC_KERNEL_SCRATCH_BYTES) {
-            Ok(arena_ptr) => {
-                crate::kernel::mem::heap::init_module_heap(
-                    module_idx,
-                    arena_ptr,
-                    PIC_KERNEL_SCRATCH_BYTES,
-                );
-            }
-            Err(_) => {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    ": kernel scratch arena alloc failed",
-                    0,
-                );
-            }
-        }
-
-        // wasm32 imports are scalar-only, so the per-instance params
-        // blob can't ride along on `module_init_wasm` the way it does
-        // on Linux / bare metal. Register it here so the module can
-        // pull it via `MODULE_INSTANCE_PARAMS` instead. The blob
-        // borrows from the `'static` embedded-modules section.
-        let params_slice = entry.params();
-        // SAFETY: `params_slice` borrows from the 'static embedded-modules
-        // section; `set_module_params` records the pointer + length for the
-        // module's first init call.
-        unsafe {
-            scheduler::set_module_params(module_idx, params_slice.as_ptr(), params_slice.len());
-        }
-
-        // `module_init_wasm` is the wasm-only entry point each PIC
-        // module exports from `crates/fluxor-rt/src/wasm_entry.rs`. It owns
-        // state allocation (via the module's bump heap) and calls
-        // the module's `module_new` with `&WASM_SYSCALLS`. Args are
-        // packed as four i32 LE values: in_chan, out_chan, ctrl_chan,
-        // arena_size.
-        let init_export = b"module_init_wasm";
-        let init_args = [
-            (in_chan as u32).to_le_bytes(),
-            (out_chan as u32).to_le_bytes(),
-            (ctrl_chan as u32).to_le_bytes(),
-            arena_size.to_le_bytes(),
-        ];
-        let mut init_args_packed = [0u8; 16];
-        init_args_packed[0..4].copy_from_slice(&init_args[0]);
-        init_args_packed[4..8].copy_from_slice(&init_args[1]);
-        init_args_packed[8..12].copy_from_slice(&init_args[2]);
-        init_args_packed[12..16].copy_from_slice(&init_args[3]);
-        let mut init_ret = [0u8; 4];
-        let init_rc = host_invoke_module(
-            handle,
-            init_export.as_ptr(),
-            init_export.len(),
-            init_args_packed.as_ptr(),
-            init_args_packed.len(),
-            init_ret.as_mut_ptr(),
-            init_ret.len(),
-        );
-        if init_rc < 0 {
-            log_fmt2(
-                3,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                ": module_init_wasm failed",
-                init_rc as i64 as u64,
-            );
-            continue;
-        }
-        let init_value = if init_rc >= 4 {
-            i32::from_le_bytes(init_ret)
-        } else {
-            0
-        };
-        if init_value != 0 {
-            log_fmt2(
-                3,
-                "[wasm-kernel] module ",
-                module_idx as u64,
-                ": module_init_wasm returned non-zero",
-                init_value as i64 as u64,
-            );
-            continue;
-        }
-
-        let mut bm = scheduler::BuiltInModule::new("wasm_module", wasm_module_step);
-        bm.state[0..4].copy_from_slice(&(handle as i32).to_le_bytes());
-        scheduler::store_builtin_module(module_idx, bm);
-        registered += 1;
-        log_fmt2(
-            2,
-            "[wasm-kernel] module ",
-            module_idx as u64,
-            " = wasm-instantiated + initialised",
-            0,
-        );
-    }
-
-    // Return the `prepare_graph` module count, not `registered`.
-    // Modules that failed to register (e.g. STATE_ARENA full) are
-    // left at their original slot index; the scheduler's
-    // `step_modules` tolerates `ModuleSlot::Empty` gracefully via
-    // `as_module_mut().is_some()`. Returning `registered` here would
-    // shrink `MODULE_COUNT` and silently skip later,
-    // successfully-registered modules at the tail.
-    if registered < module_count {
-        log_fmt2(
-            3,
-            "[wasm-kernel] partial bring-up: ",
-            registered as u64,
-            " of N modules registered (slots with failures will be skipped per-tick)",
-            module_count as u64,
-        );
-    }
-    module_count
-}
-
-/// BuiltInModule step function for a wasm-instantiated module. Reads
-/// the host module handle from `state[0..4]` and invokes
-/// `host_invoke_module(handle, "module_step_wasm", ...)`. The wasm
-/// module manages its own state in its own linear memory — the
-/// kernel-side state buffer is just a handle holder. Module's
-/// `module_step_wasm` is a no-arg wasm32-only entry point that
-/// dispatches into the module's existing `module_step(state_ptr)`
-/// using its internal static state buffer.
-///
-/// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
-/// step's for its duration.
-unsafe fn wasm_module_step(state: *mut u8) -> i32 {
-    // SAFETY: state is the kernel-provided opaque state pointer; the first
-    // 4 bytes hold the host module handle written in load_embedded_modules.
-    // `host_invoke_module` is a wasm import; we pass it the handle plus a
-    // small local return buffer.
-    unsafe {
-        let handle = core::ptr::read_unaligned(state as *const i32);
-        if handle < 0 {
-            return -1;
-        }
-        let export = b"module_step_wasm";
-        let mut ret = [0u8; 4];
-        let n = host_invoke_module(
-            handle,
-            export.as_ptr(),
-            export.len(),
-            core::ptr::null(),
-            0,
-            ret.as_mut_ptr(),
-            ret.len(),
-        );
-        if n < 0 {
-            return n;
-        }
-        if n >= 4 {
-            i32::from_le_bytes(ret)
-        } else {
             0
         }
     }
@@ -1597,32 +626,37 @@ pub extern "C" fn kernel_init() -> i32 {
     // host imports.
     crate::kernel::boot(&hal::WASM_HAL_OPS);
 
-    // Walk the embedded modules blob (rewritten in-place by the
-    // bundle tool when building a `<config>.wasm`) and instantiate
-    // each entry. Returns zero for a bare `firmware.wasm` (no
-    // bundled modules), in which case we fall back to the in-kernel
+    // The native modules a graph may name, and the host every
+    // loader-resolved module (a wasm payload) instantiates through.
+    native::register_all(NATIVE_MODULES);
+    native::set_loaded_module_host(&module_host::WASM_MODULE_HOST);
+
+    // Build the graph the embedded blobs (rewritten in-place by the
+    // bundle tool when building a `<config>.wasm`) compose. A bare
+    // `firmware.wasm` carries none, and falls back to the in-kernel
     // tick demo so the smoke artifact still exercises scheduler
     // dispatch and channel IPC.
-    // SAFETY: walks the 'static embedded-modules section. Single-threaded
-    // wasm boot; runs once at init.
-    let module_count = unsafe { load_embedded_modules() };
-
-    if module_count == 0 {
+    let (modules_used, config_used) = embedded_lens();
+    if modules_used == 0 || config_used == 0 {
         log_str(2, b"[wasm-kernel] no bundled modules; running tick demo");
         init_tick_demo();
     } else {
+        // SAFETY: single-threaded wasm boot; runs once at init.
+        let module_count = unsafe { load_embedded_modules() };
         // SAFETY: MODULE_COUNT mutated once at boot, single-threaded wasm.
         unsafe {
             MODULE_COUNT = module_count;
         }
-        log_fmt2(
-            2,
-            "[wasm-kernel] loaded ",
-            module_count as u64,
-            " bundled modules",
-            0,
-        );
-        scheduler::finalize_instantiation_accounting();
+        if module_count > 0 {
+            log_fmt2(
+                2,
+                "[wasm-kernel] loaded ",
+                module_count as u64,
+                " bundled modules",
+                0,
+            );
+            scheduler::log_arena_usage();
+        }
     }
 
     // Smoke-test the host_instantiate_module / host_invoke_module
@@ -1688,20 +722,14 @@ pub extern "C" fn kernel_init() -> i32 {
 /// long the host can wait before the next call. 0 means run again
 /// immediately.
 ///
-/// Uses the shared `step_modules` path — the same one RP and Linux
-/// call — so topological execution order, every `StepOutcome`
-/// variant (including `Burst`'s cap and `Ready` signal propagation),
-/// fault transitions, step-period gating, and diagnostics are
-/// identical across platforms.
+/// Uses the one pass engine (`pass::tick_all`), as RP and Linux do, so
+/// execution order, every `StepOutcome` (including `Burst`'s cap and
+/// `Ready` propagation), fault transitions, step-period gating and
+/// diagnostics are identical across platforms.
 ///
 #[no_mangle]
 pub extern "C" fn kernel_step() -> u32 {
-    // SAFETY: MODULE_COUNT and the scheduler globals are accessed from
-    // the single-threaded wasm runtime.
-    let count = unsafe { MODULE_COUNT };
-    // SAFETY: as above.
-    let sched = unsafe { scheduler::sched_mut() };
-    let _ = scheduler::step_modules(&mut sched.modules, count);
+    let _ = scheduler::pass::tick_all();
     // Heartbeat opt-out on wasm: the browser tab is a single-step
     // animation-frame loop and tab-side `console.log` already
     // surfaces liveness via the scenario shell's status updates. A
@@ -1847,21 +875,60 @@ pub extern "C" fn kernel_config_blob_capacity() -> u32 {
     EMBEDDED_CONFIG_BLOB.capacity
 }
 
-// ── tick_source / tick_sink built-ins ────────────────────────────────
+// ── tick_source / tick_sink native modules ───────────────────────────
 //
-// State layout for both modules (64-byte BuiltInModule state buffer):
-//   bytes 0..4:  i32 channel handle (set by kernel_init before first step)
+// Arena state of both modules:
+//   bytes 0..4:  i32 channel handle (from the params `init_tick_demo` builds)
 //   bytes 4..8:  u32 step counter
 //   bytes 8..16: u64 first-tick timestamp from host_now_us (LE)
 
 const REPORT_INTERVAL: u32 = 60;
 
+/// Bytes of a tick module's arena state.
+const TICK_STATE_SIZE: u32 = 16;
+
+/// The demo's source: one tick count per step onto its channel.
+static TICK_SOURCE: NativeVtable = NativeVtable {
+    new: tick_new,
+    step: tick_source_step,
+    refill: None,
+    flush: None,
+    isr_entry: None,
+    drop: None,
+    state_size: TICK_STATE_SIZE,
+};
+
+/// The demo's sink: drains the channel and reports every
+/// `REPORT_INTERVAL` messages.
+static TICK_SINK: NativeVtable = NativeVtable {
+    new: tick_new,
+    step: tick_sink_step,
+    refill: None,
+    flush: None,
+    isr_entry: None,
+    drop: None,
+    state_size: TICK_STATE_SIZE,
+};
+
+/// Both tick modules: the params are the channel handle, 4 bytes LE.
+///
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
-/// step's for its duration.
-unsafe fn tick_source_step(state: *mut u8) -> i32 {
-    // SAFETY: state is the BuiltInModule's 64-byte state buffer; we read
-    // the channel handle from [0..4] and the tick counter from [4..8].
+/// `state` is `TICK_STATE_SIZE` zeroed bytes, exclusively the constructor's.
+unsafe fn tick_new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let Some(chan) = init.params.get(..4) else {
+        return crate::kernel::sys::errno::EINVAL;
+    };
+    // SAFETY: the first 4 of the state's `TICK_STATE_SIZE` bytes.
+    unsafe { core::ptr::copy_nonoverlapping(chan.as_ptr(), state, 4) };
+    0
+}
+
+/// # Safety
+/// `state` is this module's own arena state, exclusively the step's for
+/// its duration.
+unsafe extern "C" fn tick_source_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the module's 16-byte arena state; we read the
+    // channel handle from [0..4] and the tick counter from [4..8].
     unsafe {
         let chan = core::ptr::read_unaligned(state as *const i32);
         let counter_ptr = state.add(4) as *mut u32;
@@ -1878,11 +945,11 @@ unsafe fn tick_source_step(state: *mut u8) -> i32 {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
-/// step's for its duration.
-unsafe fn tick_sink_step(state: *mut u8) -> i32 {
-    // SAFETY: state is the BuiltInModule's 64-byte state buffer; we read
-    // the channel handle from [0..4], counter from [4..8], timestamp from [8..16].
+/// `state` is this module's own arena state, exclusively the step's for
+/// its duration.
+unsafe extern "C" fn tick_sink_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the module's 16-byte arena state; we read the
+    // channel handle from [0..4], counter from [4..8], timestamp from [8..16].
     unsafe {
         let chan = core::ptr::read_unaligned(state as *const i32);
         let counter_ptr = state.add(4) as *mut u32;

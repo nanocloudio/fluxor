@@ -91,8 +91,8 @@ through `remote_channel` and never holds the grant.
 
 A front's scope is its root. The request target `/<rest>` names the object
 `<scope><rest>`: the scope followed by everything after the leading `/`, taken
-verbatim as opaque bytes. With scope `tenant/a/`, `/x/y` names the object
-`tenant/a/x/y`; with no scope, `/x/y` names `x/y`. Nothing in the target is
+verbatim as opaque bytes. With scope `owner/a/`, `/x/y` names the object
+`owner/a/x/y`; with no scope, `/x/y` names `x/y`. Nothing in the target is
 decoded: `/a%41` names `<scope>a%41`.
 
 A target cannot name anything outside the scope. Names are opaque bytes, so

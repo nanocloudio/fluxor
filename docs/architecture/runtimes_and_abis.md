@@ -82,7 +82,7 @@ needs glibc 2.39 or newer.
 | Place | Uses |
 |-------|------|
 | Module `hardware_targets` | runtimes; any other token is refused |
-| Graph `target:`, bundle `[[implementation]] target` | a target, which resolves to one runtime |
+| Graph `target:`, workload package `[[implementation]] target` | a target, which resolves to one runtime |
 | Target files (`targets/*/*.toml`) | `runtime` and `module_abi` |
 | Shelf `target/fluxor/<abi>/modules` | module ABI |
 | Store tag `<abi>/<module>:<version>`, `fluxor.lock` `target` | module ABI |
@@ -100,7 +100,7 @@ needs glibc 2.39 or newer.
   are the shelves it declares and the modules built for them.
 - `fluxor modules build` exits non-zero on anything it cannot build: a
   module that does not compile, a manifest whose entry file is missing, and
-  a `manifest.toml` under `modules/` outside the tiers, which no build would
+  a `manifest.toml` under `modules/` outside the layers, which no build would
   ever reach.
 - A module naming no runtime is portable: it belongs on every shelf and
   runs under every runtime.

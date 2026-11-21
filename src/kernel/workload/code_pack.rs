@@ -1,7 +1,7 @@
 //! Per-owner code: the module packs a workload brings with it.
 //!
 //! A workload CREATE'd from `SOURCE_FMOD_PACK` carries its own modules — a
-//! module table (FXMT) of `.fmod`s the node's boot image does not hold —
+//! module table (FXMT) of `.fmod`s the node's firmware image does not hold —
 //! beside the subgraph that wires them. Modules execute in place and the
 //! loader applies no relocations (`docs/architecture/module_architecture.md`),
 //! so a pack is copied whole into a page-aligned region of [`POOL`], its
@@ -34,7 +34,7 @@ pub const PAGE: usize = 64 * 1024;
 
 /// The pool every pack is staged into. 16 MiB on a 64-bit node — several
 /// workloads' worth of modules at the 1 MiB per-module code ceiling — and
-/// none on a microcontroller, which runs only its boot image's modules.
+/// none on a microcontroller, which runs only its firmware image's modules.
 #[cfg(target_pointer_width = "64")]
 pub const POOL_SIZE: usize = 16 * 1024 * 1024;
 #[cfg(not(target_pointer_width = "64"))]

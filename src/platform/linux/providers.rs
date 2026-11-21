@@ -99,7 +99,7 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
         dir_ptr: 0,
         in_use: false,
         last_fence: Fence::Volatile,
-        owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+        owner: crate::kernel::workload::owner::OWNER_NODE,
         charged: false,
     };
     [EMPTY; MAX_OPEN_FILES]
@@ -191,7 +191,7 @@ unsafe fn claim_dir_slot(
 ///
 /// # Safety
 /// As `linux_fs_dispatch`.
-unsafe fn tenant_fs_path_op(
+unsafe fn owner_fs_path_op(
     owner: crate::kernel::workload::owner::OwnerHandle,
     opcode: u32,
     arg: &mut [u8],
@@ -789,7 +789,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8], data: 
     let rooted = crate::platform::linux::owner_root::rooted(owner);
 
     // FS capability bitmap (crates/fluxor-abi/src/contracts/storage/fs.rs::CAPS).
-    // Linux implements the full read-tier, the write-tier, both
+    // Linux implements the full read surface, the write surface, both
     // name-publication ops (RENAME, FSYNC_NAME) and TRUNCATE.
     // FSYNC_ASYNC stays clear: this provider fences with a blocking
     // `fsync(2)`. A workload's root offers no hard links.
@@ -820,7 +820,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8], data: 
 
     // Handle ops below serve both, each slot its opener alone.
     if rooted {
-        if let Some(rc) = tenant_fs_path_op(owner, opcode, arg) {
+        if let Some(rc) = owner_fs_path_op(owner, opcode, arg) {
             return rc;
         }
     }
@@ -1450,7 +1450,7 @@ static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] = [const {
         staged: [0; crate::platform::proc_executor::READ_CHUNK],
         staged_len: 0,
         staged_off: 0,
-        owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+        owner: crate::kernel::workload::owner::OWNER_NODE,
     }
 }; MAX_PROCS];
 
@@ -1470,7 +1470,7 @@ fn close_proc_slot(slot: &mut LinuxProcSlot, grace: std::time::Duration) {
     slot.deadline = None;
     slot.staged_len = 0;
     slot.staged_off = 0;
-    slot.owner = crate::kernel::workload::owner::OWNER_SYSTEM;
+    slot.owner = crate::kernel::workload::owner::OWNER_NODE;
 }
 
 /// Shut down every child `owner` spawned. Part of the platform's
@@ -1689,9 +1689,6 @@ pub fn linux_proc_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserS
 // linux_net built-in module — channel-based net_proto framing via libc sockets
 // ============================================================================
 
-/// FNV-1a hash of "linux_net"
-pub const LINUX_NET_HASH: u32 = 0xFBCC7DC9;
-
 // The stream and datagram surfaces this provider serves
 // (`contracts/net/net_proto.rs`, `contracts/net/datagram.rs`); the contract
 // modules are the only source of their values and layouts.
@@ -1837,7 +1834,7 @@ struct LinuxNetConn {
     resolve_started: Option<std::time::Instant>,
     /// The COMMANDING owner — the owner of the module whose lane issued the
     /// bind/connect that created this slot (/// attribution is carried via the lane, never inferred from the executing
-    /// module, which may be system-owned). Immutable for the life of the slot.
+    /// module, which may be node-owned). Immutable for the life of the slot.
     owner: crate::kernel::workload::owner::OwnerHandle,
     /// The lane whose command created this slot (an accepted connection
     /// takes its listener's). Every event about the slot goes to that
@@ -1908,7 +1905,7 @@ impl LinuxNetConn {
             resolve_started: None,
             release_at: None,
             peer_fin: false,
-            owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+            owner: crate::kernel::workload::owner::OWNER_NODE,
             lane: 0,
             write_buf: Vec::new(),
             alts: Vec::new(),
@@ -1952,6 +1949,8 @@ struct AttachedLane {
 /// a state-aliasing one. Per-instance ownership matches the rest of
 /// the host built-in family and makes the dispatch path uniform.
 pub struct LinuxNetState {
+    /// The slot the instance runs in.
+    slot: usize,
     /// Inbound command channels, drained in INDEX ORDER each step —
     /// index = the edge's position among `to: linux_net.net_in` lines
     /// in the graph wiring, so earlier edges are higher priority.
@@ -2290,6 +2289,7 @@ impl LinuxNetState {
             ready.push(libc::epoll_event { events: 0, u64: 0 });
         }
         Ok(Box::new(Self {
+            slot: usize::MAX,
             net_ins,
             lane_owners,
             net_outs,
@@ -2480,7 +2480,7 @@ fn lane_owner(st: &LinuxNetState, lane: usize) -> crate::kernel::workload::owner
     st.attached
         .get(lane - LINUX_NET_MAX_INBOUND)
         .and_then(|a| a.as_ref())
-        .map_or(crate::kernel::workload::owner::OWNER_SYSTEM, |a| a.owner)
+        .map_or(crate::kernel::workload::owner::OWNER_NODE, |a| a.owner)
 }
 
 /// The channel a lane's commands are read from, or -1.
@@ -2561,61 +2561,129 @@ unsafe fn set_nonblocking(fd: i32) {
 // linux_net instance registry
 //
 // The platform needs to reach every linux_net instance's connection table
-// from OUTSIDE its step — for the owner teardown hook (drain/free), the
-// rebuild fd close-out, and the bound-endpoint report. Instances register
-// their state pointer at instantiation; the registry is swept-and-cleared
-// at the top of every graph (re)build, before the old state is torn down.
-// All access is on the single platform/scheduler thread.
+// from OUTSIDE its step — for the owner teardown hook (drain/free) and the
+// bound-endpoint report. An instance registers its state at construction and
+// leaves at its drop. All access is on the single platform/scheduler thread.
 // ----------------------------------------------------------------------
 
 static mut LINUX_NET_REGISTRY: Vec<*mut LinuxNetState> = Vec::new();
 
-/// Register a freshly-instantiated linux_net state. Platform thread only.
-pub fn linux_net_register_state(ptr: *mut LinuxNetState) {
-    // SAFETY: single-threaded platform instantiation path; the registry is
-    // reached through a raw pointer, never forming a `&mut STATIC`.
-    unsafe {
-        let reg = &raw mut LINUX_NET_REGISTRY;
-        (*reg).push(ptr);
+/// Build a `linux_net` instance at `slot`: every inbound command lane (one
+/// per `to: linux_net.net_in` edge, in wiring order) with the owner of its
+/// producer, the event channels and which one each lane's producer reads,
+/// and the table and backlog sizes its params state (the manifest defaults
+/// where they are absent). The first instance is the node's net provider,
+/// the one a workload staged at runtime attaches its lanes to.
+pub fn build_linux_net(slot: usize, params: &[u8]) -> Result<Box<LinuxNetState>, i32> {
+    use super::builtin_params::{tlv_u32, walk_tlv};
+    use crate::abi::platform::native::linux::linux_net as tags;
+    use crate::kernel::exec::scheduler;
+    let mut net_ins = [-1i32; LINUX_NET_MAX_INBOUND];
+    let mut lane_owners = [crate::kernel::workload::owner::OWNER_NODE; LINUX_NET_MAX_INBOUND];
+    let mut lane_count = 0usize;
+    for (k, ch) in net_ins.iter_mut().enumerate() {
+        *ch = scheduler::module_port(slot, (tags::PORT_NET_IN.0, tags::PORT_NET_IN.1 + k as u8));
+        if *ch >= 0 {
+            lane_owners[k] = scheduler::channel_producer_owner(*ch);
+            lane_count = k + 1;
+        }
+    }
+    let mut net_outs = [-1i32; LINUX_NET_MAX_INBOUND];
+    for (k, ch) in net_outs.iter_mut().enumerate() {
+        *ch = scheduler::module_port(slot, (tags::PORT_NET_OUT.0, tags::PORT_NET_OUT.1 + k as u8));
+    }
+    let mut lane_out = [0u8; LINUX_NET_MAX_INBOUND];
+    for (k, out) in lane_out.iter_mut().enumerate() {
+        let producer = scheduler::channel_producer_module(net_ins[k]);
+        if let Some(j) = net_outs.iter().position(|&ch| {
+            ch >= 0 && producer.is_some() && scheduler::channel_consumer_module(ch) == producer
+        }) {
+            *out = j as u8;
+        }
+    }
+    let mut max_conns = LINUX_NET_MAX_CONNS_DEFAULT as u32;
+    let mut write_buf_kib = (LINUX_NET_WRITE_BUF_DEFAULT / 1024) as u32;
+    let mut listen_backlog = LINUX_NET_LISTEN_BACKLOG_DEFAULT as u32;
+    walk_tlv(params, |tag, value| match tag {
+        tags::TAG_MAX_CONNS => max_conns = tlv_u32(value),
+        tags::TAG_WRITE_BUF_KIB => write_buf_kib = tlv_u32(value),
+        tags::TAG_LISTEN_BACKLOG => listen_backlog = tlv_u32(value),
+        _ => {}
+    });
+    let mut state = LinuxNetState::new(
+        net_ins,
+        lane_owners,
+        net_outs,
+        lane_out,
+        max_conns as usize,
+        write_buf_kib as usize * 1024,
+        listen_backlog.min(i32::MAX as u32) as i32,
+    )
+    .map_err(|why| {
+        // A graph whose table cannot be what it states is refused, not run
+        // at a size it did not ask for.
+        log::error!("[inst] module {slot} = linux_net refused: {why}");
+        crate::kernel::sys::errno::EINVAL
+    })?;
+    state.slot = slot;
+    // SAFETY: platform thread; the registry holds the instance until its
+    // drop removes it.
+    unsafe { (*core::ptr::addr_of_mut!(LINUX_NET_REGISTRY)).push(&mut *state) };
+    if crate::kernel::workload::net_attach::provider_slot().is_none() {
+        crate::kernel::workload::net_attach::register(
+            slot,
+            LINUX_NET_MAX_ATTACHED,
+            linux_net_attach,
+            linux_net_detach,
+        );
+    }
+    log::info!(
+        "[inst] module {slot} = linux_net (native) net_in_lanes={lane_count} net_outs={} lane_out={:?}",
+        net_outs.iter().filter(|&&c| c >= 0).count(),
+        &lane_out[..lane_count]
+    );
+    Ok(state)
+}
+
+impl super::builtin_params::HostNative for LinuxNetState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_net(slot, params)
     }
 }
 
-/// Close every fd in every registered instance and clear the registry.
-/// Called at the top of every graph (re)build, BEFORE the destructive graph
-/// reset drops the old module state — otherwise the old listener fds leak,
-/// still holding their ports, and the re-issued CMD_BINDs after the rebuild
-/// die on EADDRINUSE.
-pub fn linux_net_close_all_and_clear_registry() {
-    // SAFETY: single-threaded; pointers registered this graph generation are
-    // still valid until prepare_graph tears the old graph down (called after).
-    unsafe {
-        let reg = &raw mut LINUX_NET_REGISTRY;
-        for &st_ptr in (*reg).iter() {
-            let st = &mut *st_ptr;
-            for conn in st.conns.iter_mut() {
-                if conn.fd >= 0 {
-                    libc::close(conn.fd);
-                }
-                *conn = LinuxNetConn::empty();
+/// The `linux_net` native module.
+pub static LINUX_NET: crate::kernel::exec::scheduler::NativeVtable =
+    super::builtin_params::host_vtable::<LinuxNetState>(linux_net_step);
+
+impl Drop for LinuxNetState {
+    /// The instance's sockets and epoll set close with it, so a rebuilt
+    /// graph's binds find their ports free; it leaves the registry, and the
+    /// node's net provider with it when it was that.
+    fn drop(&mut self) {
+        for conn in self.conns.iter_mut() {
+            if conn.fd >= 0 {
+                // SAFETY: an fd this instance opened and owns.
+                unsafe { libc::close(conn.fd) };
             }
-            st.resolving = 0;
-            // Attached lanes' channels die with the graph they were opened in.
-            for a in st.attached.iter_mut() {
-                *a = None;
-            }
-            st.hold_slot = -1;
+            *conn = LinuxNetConn::empty();
         }
-        (*reg).clear();
+        if self.epfd >= 0 {
+            // SAFETY: as above.
+            unsafe { libc::close(self.epfd) };
+        }
+        let me: *mut LinuxNetState = self;
+        // SAFETY: platform thread, as every registry access.
+        unsafe { (*core::ptr::addr_of_mut!(LINUX_NET_REGISTRY)).retain(|&p| p != me) };
+        if crate::kernel::workload::net_attach::provider_slot() == Some(self.slot) {
+            crate::kernel::workload::net_attach::unregister();
+        }
     }
-    // The provider is the instance the rebuild is about to register again.
-    crate::kernel::workload::net_attach::unregister();
 }
 
 /// The instance that serves attached lanes: the first registered one.
 ///
 /// # Safety
-/// Platform thread; the pointer is valid until the next rebuild clears the
-/// registry.
+/// Platform thread; the pointer is valid until the instance drops.
 unsafe fn linux_net_provider_state() -> Option<&'static mut LinuxNetState> {
     let reg = &raw const LINUX_NET_REGISTRY;
     (*reg).first().map(|&p| &mut *p)
@@ -2937,7 +3005,7 @@ unsafe fn linux_net_send_dg_ep_error(st: &mut LinuxNetState, lane: usize, ep: u8
 /// (a Draining owner binds nothing new — same-owner re-binds of held ports
 /// never reach this, they take the use-class fast path), and when the
 /// committed plan is lease-aware the (protocol, port) must be granted.
-/// System-owned commanders are ungated, as everywhere; one acting with the
+/// Node-owned commanders are ungated, as everywhere; one acting with the
 /// node's authority binds as the node does once its own admission is open.
 /// Returns the refusal errno, or None to proceed.
 fn linux_net_new_bind_refusal(
@@ -3774,7 +3842,7 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
             racing: dial.racing,
             // Stamp the commanding owner so this outbound data conn is torn
             // down with its owner on drain/revoke; otherwise it stays
-            // OWNER_SYSTEM and outlives revocation.
+            // OWNER_NODE and outlives revocation.
             owner: dial.owner,
             lane: dial.lane,
             ..LinuxNetConn::empty()
@@ -4674,7 +4742,7 @@ unsafe fn linux_net_refuse_oversized(
 /// # Safety
 /// `state` is the module's per-instance arena, holding a `LinuxNetState`
 /// pointer the platform stored at build; scheduler thread only.
-pub unsafe fn linux_net_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn linux_net_step(state: *mut u8) -> i32 {
     // SAFETY: the function's contract.
     unsafe {
         let st = instance_state::<LinuxNetState>(state);

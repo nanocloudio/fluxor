@@ -917,7 +917,7 @@ pub mod el0 {
             }
             // Trampoline page: RO + X at EL0.
             mapped &= map_region(slot, tramp, PAGE, AP_EL0_RO, false);
-            // The programs the bundle carries for this instance, EL0
+            // The programs the node image carries for this instance, EL0
             // read-only and never executable. The loader admits a
             // section only when each owner's programs share one region
             // that starts on a page and ends before the page the next

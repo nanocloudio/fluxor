@@ -163,7 +163,7 @@ const MAX_CHUNK_LINE: usize = 1024;
 /// Ceiling on the trailer section of a chunked body.
 const MAX_TRAILER_BYTES: usize = 16 * 1024;
 const MAX_REDIRECTS: usize = 3;
-/// Upper bound on any single response body (blobs are graph images and
+/// Upper bound on any single response body (blobs are node images and
 /// firmware, well under this).
 const MAX_BODY: usize = 256 * 1024 * 1024;
 /// Upper bound on a manifest body.
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[test]
     fn pull_verifies_and_stores() {
-        let layer = b"graph-image-bytes".to_vec();
+        let layer = b"node-image-bytes".to_vec();
         let cfg_bytes = b"{}".to_vec();
         let (m, manifest_bytes) = manifest_with_one_layer(&layer);
         let stub = StubRegistry::start(vec![

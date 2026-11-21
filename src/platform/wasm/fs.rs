@@ -41,9 +41,9 @@
 //! equivalent.
 //!
 //! FS_WRITE is served, and not by fetch: writes stage against the handle
-//! and publish as one file at FS_CLOSE into the same persistent tier
+//! and publish as one file at FS_CLOSE into the same persistent layer
 //! `storage.object` uses (OPFS, or IndexedDB where OPFS is absent — it
-//! needs a secure context). FS_OPEN consults that tier before reaching
+//! needs a secure context). FS_OPEN consults that layer before reaching
 //! for the network, so a path written here reads back as itself, this
 //! session and the next. Until this existed the contract was half served
 //! on this target: a graph could be granted `fs` and then not write
@@ -160,11 +160,11 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8], data: 
         };
     }
     // FS capability bitmap (crates/fluxor-abi/src/contracts/storage/fs.rs::CAPS).
-    // Reports handle-acquisition / write-tier capability only;
+    // Reports handle-acquisition / write-layer capability only;
     // per-FD ops (READ, STAT, CLOSE) are always supported on any
     // FD this provider hands back and aren't represented in the
     // bitmap. The wasm backend offers OPEN against asset URLs and
-    // WRITE against the persistent tier. OPENDIR is not advertised
+    // WRITE against the persistent layer. OPENDIR is not advertised
     // (browsers expose no generic list-files primitive for arbitrary
     // URL roots); the browser's storage primitives are key-value, so a
     // path is the key, which is why `fs` paths and `storage.object`
@@ -172,7 +172,7 @@ unsafe fn fs_dispatch_on_thread(handle: i32, opcode: u32, arg: &mut [u8], data: 
     // names for one byte range would let a program write under one and
     // fail to find it under the other.
     if opcode == dev_fs::CAPS {
-        // Writes go to the same persistent tier `storage.object` uses
+        // Writes go to the same persistent layer `storage.object` uses
         // (OPFS, IndexedDB where OPFS is absent), which is also what reads
         // consult first, so a path written here reads back as itself.
         let caps: u32 = dev_fs::caps::OPEN | dev_fs::caps::WRITE;

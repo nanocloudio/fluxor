@@ -1,4 +1,4 @@
-//! `wasm_browser_surface_traits` built-in: runtime environment-plane
+//! `wasm_browser_surface_traits` native module: runtime environment-plane
 //! source backed by the browser. The host shim listens to DOM `resize`,
 //! `visualViewport`, `matchMedia('(pointer: coarse)')`, gamepad
 //! connect/disconnect, and AudioContext state, coalesces them to at most
@@ -12,7 +12,9 @@
 //! Host shim contract: `host_surface_traits_pop(buf, len)` returns one
 //! 24-byte record per call, or 0 when the queue is empty.
 
+use crate::abi::platform::native::wasm::wasm_browser_surface_traits as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -58,12 +60,12 @@ unsafe fn alloc_state(out_chan: i32) -> *mut SurfaceTraitsState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn surface_traits_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn surface_traits_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for this
     // module instance; we cast it back to the module-private state type
-    // allocated by the new_fn and operate within that allocation.
+    // allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut SurfaceTraitsState);
         if st_ptr.is_null() {
@@ -97,9 +99,22 @@ unsafe fn surface_traits_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_surface_traits", surface_traits_step);
-    let raw = alloc_state(out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut SurfaceTraitsState, raw);
-    m
+/// The `wasm_browser_surface_traits` native module.
+pub static WASM_BROWSER_SURFACE_TRAITS: NativeVtable = super::heap_native(new, surface_traits_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_EVENTS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            super::heap_for::<SurfaceTraitsState>(),
+            || alloc_state(out_chan).cast(),
+        )
+    }
 }

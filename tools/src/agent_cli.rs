@@ -15,7 +15,7 @@
 //! answer, over the agent's Unix socket, stdio, or a runtime's mutual-TLS
 //! channel. `commit` and `remove` stay beside them because their argv says more
 //! than the protocol does and they answer in their own stdout: a name, a
-//! namespace, a resource profile or a bundle path, a per-call grace. They share
+//! namespace, a resource profile or a workload package path, a per-call grace. They share
 //! the protocol's store lock.
 
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -37,7 +37,7 @@ use fluxor_tools::compose::{
 use fluxor_tools::genstore::{FsStorage, GenStore};
 use fluxor_tools::node_agent::{
     node_status_with_runtime, publish_committed_plan, record_publish_path,
-    remove_workload_and_commit, resolve_bundle, upsert_workload_and_commit, RuntimePhase,
+    remove_workload_and_commit, resolve_package, upsert_workload_and_commit, RuntimePhase,
     WorkloadRuntimeStatus,
 };
 
@@ -62,7 +62,7 @@ pub enum AgentCommand {
     /// Read or set the node policy composition consults on every commit/remove
     /// — node-scoped, never per-workload: today the reserved-port set.
     Policy(PolicyArgs),
-    /// Answer agent-protocol requests for this target until the transport ends.
+    /// Answer agent-protocol requests for this node until the transport ends.
     Serve(ServeArgs),
     /// Send one agent-protocol request and print its answer as JSON. Exits
     /// non-zero unless the result is OK.
@@ -77,13 +77,13 @@ pub struct ServeArgs {
     /// Path to publish the committed plan blob to (FLUXOR_PLAN target).
     #[arg(long)]
     pub publish: PathBuf,
-    /// Directory of bundles, one per `<workload digest hex>/`.
+    /// Directory of workload packages, one per `<workload digest hex>/`.
     #[arg(long)]
     pub bundles: PathBuf,
-    /// The target descriptor; its sha256 is the descriptor revision.
+    /// The node descriptor; its sha256 is the descriptor revision.
     #[arg(long)]
     pub descriptor: PathBuf,
-    /// This target's key fingerprint: 64 hex chars.
+    /// This node's key fingerprint: 64 hex chars.
     #[arg(long)]
     pub target_id: String,
     /// A controller's key fingerprint: 64 hex chars. Repeatable.
@@ -114,7 +114,7 @@ pub struct TransportArgs {
     /// A fluxor-linux to carry frames over mutual TLS.
     #[arg(long)]
     pub runtime: Option<PathBuf>,
-    /// The runtime's graph image, as `fluxor build` writes it (a graph
+    /// The runtime's node image, as `fluxor build` writes it (a graph
     /// that includes the `agent_listen` or `agent_dial` stack).
     #[arg(long, requires = "runtime")]
     pub image: Option<PathBuf>,
@@ -132,13 +132,13 @@ pub struct CallArgs {
     #[arg(long)]
     pub op: String,
     /// Workload UID as 32 hex chars (dashes allowed). Default for `observe`:
-    /// none, which reports the target alone.
+    /// none, which reports the node alone.
     #[arg(long)]
     pub workload_uid: Option<String>,
-    /// `apply`: the desired bundle's workload digest, 64 hex chars.
+    /// `apply`: the desired workload package's digest, 64 hex chars.
     #[arg(long)]
     pub bundle_digest: Option<String>,
-    /// `apply`: the target descriptor revision this was validated against, 64
+    /// `apply`: the node descriptor revision this was validated against, 64
     /// hex chars.
     #[arg(long)]
     pub descriptor_revision: Option<String>,
@@ -150,7 +150,7 @@ pub struct CallArgs {
     pub fence_epoch: u64,
     #[arg(long, default_value_t = 0)]
     pub fence_seq: u64,
-    /// The target's key fingerprint this call must reach, 64 hex chars. On a
+    /// The node's key fingerprint this call must reach, 64 hex chars. On a
     /// runtime transport the response's `target_id` is held to the fingerprint
     /// the channel verified whether or not this is given.
     #[arg(long)]
@@ -256,7 +256,7 @@ pub struct CommitArgs {
     /// Signed resource profile: buffer-byte cap.
     #[arg(long, default_value_t = 0)]
     pub buffer_bytes: u32,
-    /// Workload bundle directory: validates `workload.json`, selects
+    /// Workload package directory: validates `workload.json`, selects
     /// the linux implementation, and takes the resource profile from
     /// `resources.json` — overriding the explicit profile flags above.
     #[arg(long)]
@@ -309,7 +309,7 @@ fn hex_arg<const N: usize>(flag: &str, text: &str) -> Result<[u8; N]> {
     parse_hex::<N>(text).map_err(|e| Error::Config(format!("--{flag}: {e}")))
 }
 
-/// The runtime and the graph image it is started with.
+/// The runtime and the node image it is started with.
 fn transport_files(t: &TransportArgs) -> Result<Option<(&Path, &Path)>> {
     let Some(runtime) = t.runtime.as_deref() else {
         return Ok(None);
@@ -533,7 +533,7 @@ fn call(c: CallArgs) -> Result<()> {
     );
     if reply.result != result::OK {
         return Err(Error::Config(format!(
-            "the target answered {}: {}",
+            "the node answered {}: {}",
             result_name(reply.result),
             String::from_utf8_lossy(&reply.diag)
         )));
@@ -783,7 +783,7 @@ fn commit(c: CommitArgs) -> Result<()> {
     let workload_uid = parse_workload_uid(&c.workload_uid)?;
     let (profile, workload_digest, exports) = match &c.bundle {
         Some(dir) => {
-            let b = resolve_bundle(dir).map_err(Error::Config)?;
+            let b = resolve_package(dir).map_err(Error::Config)?;
             (b.profile, b.workload_digest, b.exports)
         }
         None => (
@@ -795,7 +795,7 @@ fn commit(c: CommitArgs) -> Result<()> {
                 endpoints: 0,
                 domains: 1,
             },
-            // No bundle → ad-hoc profile, no workload identity to pin.
+            // No workload package → ad-hoc profile, no workload identity to pin.
             [0u8; 32],
             Vec::new(),
         ),

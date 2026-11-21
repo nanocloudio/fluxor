@@ -86,10 +86,10 @@ pub fn init_syscall_table() {
 
 // ── Handle-scoped provider dispatch ─────────────────────────────────
 //
-// Every `syscall_provider_*` wrapper fires the ISR-tier gate as its
-// FIRST check, before the grant check and the dispatch, so an ISR-tier
+// Every `syscall_provider_*` wrapper fires the interrupt-mode gate as its
+// FIRST check, before the grant check and the dispatch, so an interrupt-mode
 // module calling an op it holds no grant for is told `EACCES` by the
-// ISR-tier gate, not by the grant check. The inner `provider::*`
+// interrupt-mode gate, not by the grant check. The inner `provider::*`
 // functions also gate as defense in depth.
 
 /// The caller's `[ptr, ptr + len)` as a slice: empty for a zero length,
@@ -117,7 +117,7 @@ unsafe extern "C" fn syscall_provider_open(
     config: *const u8,
     config_len: usize,
 ) -> i32 {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_open") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_open") {
         return crate::kernel::sys::errno::EACCES;
     }
     // INTERNAL_DISPATCH_BUCKET (the `kernel` contract) is kernel-internal only — module
@@ -174,12 +174,12 @@ unsafe extern "C" fn syscall_provider_call(
     data: *mut u8,
     data_len: usize,
 ) -> i32 {
-    // ISR-tier (Tier 1b/2) modules are denied `provider_call` in general,
+    // interrupt-mode (`timer`/`irq`) modules are denied `provider_call` in general,
     // but the bridge ops and `SELF_BRIDGE` are exempt:
     // their underlying ring operations are lock-free and allocation-free, so
-    // they are the *sanctioned* I/O path for an ISR-tier step body.
+    // they are the *sanctioned* I/O path for an interrupt-mode step body.
     if !crate::abi::internal::bridge::is_isr_safe(op)
-        && crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_call")
+        && crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_call")
     {
         return crate::kernel::sys::errno::EACCES;
     }
@@ -222,7 +222,7 @@ unsafe extern "C" fn syscall_provider_query(
     out: *mut u8,
     out_len: usize,
 ) -> i32 {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_query") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_query") {
         return crate::kernel::sys::errno::EACCES;
     }
     if let Some(rc) = check_grant(key) {
@@ -245,7 +245,7 @@ unsafe extern "C" fn syscall_provider_query(
 }
 
 unsafe extern "C" fn syscall_provider_close(handle: i32) -> i32 {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_close") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_close") {
         return crate::kernel::sys::errno::EACCES;
     }
     if let Some(rc) = check_handle_grant(handle) {
@@ -277,7 +277,7 @@ pub fn get_syscall_table() -> &'static SyscallTable {
 /// work. Admission closes the moment a drain begins; existing-handle use
 /// stays state-blind (`authorize_use` semantics), which is what lets
 /// in-flight work run dry. It is open while the owner is being added, for
-/// its modules' `module_new` (`authorize_own_admit`). System-owned modules
+/// its modules' `module_new` (`authorize_own_admit`). Node-owned modules
 /// always pass. Every module-facing create/open/accept/allocate/arm path
 /// consults this: provider open/bind, `channel_open`, open-style
 /// `provider_call` ops (`admission_class_op`), event create, heap
@@ -494,9 +494,9 @@ fn bridge_handle_poll(slot: i32, events: u32) -> i32 {
     if slot < 0 || events & crate::abi::kernel_abi::poll::IN == 0 {
         return 0;
     }
-    let ready = crate::kernel::bridge::bridge_dispatch(
+    let ready = crate::kernel::ipc::isr_ring::dispatch(
         slot as usize,
-        bridge::POLL - bridge::WRITE,
+        bridge::POLL,
         &mut [],
         UserSpan::empty(),
     );
@@ -1165,7 +1165,7 @@ fn dev_query_extension() -> Option<QueryExtensionFn> {
 }
 
 /// `PROGRAM_INFO`, `PROGRAM_READ`, `SIGNING_ROOT` and `SLOT_ADMITTED`:
-/// the calling module's own programs, the root graph slots are signed
+/// the calling module's own programs, the node graph slots are signed
 /// against, and the slots this boot admitted. A module names a program only
 /// by its slot among its own; whose programs they are comes from which module
 /// is running, never from the request.
@@ -1313,7 +1313,7 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
         | MODULE_INSTANCE_PARAMS
         | MODULE_FLOW_BUDGET
         | bridge::SELF_BRIDGE
-        | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, data),
+        | monitor::INTERRUPT_METRICS => handle_core_primitive(handle, opcode, arg, data),
         // A module provider rings a doorbell it was handed: `[doorbell u32]`.
         DOORBELL_RING => match arg_u32(arg) {
             Some(d) => crate::kernel::ipc::event::doorbell_ring_by(
@@ -1357,12 +1357,7 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
             if handle < 0 {
                 return E_INVAL;
             }
-            crate::kernel::bridge::bridge_dispatch(
-                handle as usize,
-                opcode - bridge::WRITE,
-                arg,
-                data,
-            )
+            crate::kernel::ipc::isr_ring::dispatch(handle as usize, opcode, arg, data)
         }
         // ── Fault monitor ──
         monitor::FAULT_MONITOR_SUBSCRIBE
@@ -1397,7 +1392,7 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
         // new owner's `[slot u16][generation u32]` is answered into `arg`.
         reconfigure::APPLY_ADD => {
             // A node whose plan seats no workload owner stages no add.
-            if scheduler::live::add_capacity() == 0 {
+            if scheduler::splice::add_capacity() == 0 {
                 return crate::kernel::sys::errno::ENOSPC;
             }
             if arg.len() < 6 {
@@ -1406,13 +1401,13 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
             // SAFETY: `data` is the caller's span for this call and the add
             // completes within it. The calling module is the add's creator.
             match unsafe {
-                scheduler::live::apply_add_encoded_by(
+                scheduler::splice::apply_encoded_by(
                     data.as_slice(),
                     scheduler::current_module_index(),
                 )
             } {
                 Ok(owner) => {
-                    scheduler::live::write_handle(&mut arg[..6], owner);
+                    scheduler::splice::write_handle(&mut arg[..6], owner);
                     0
                 }
                 Err(e) => e,
@@ -1452,7 +1447,7 @@ fn system_provider_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: User
 // The class-routed opcodes are split across small category handlers below
 // so the top-level match stays readable and each concern is local.
 
-/// `ELASTIC_ALLOC` (`resource` contract): grant a Tier B chunk from the
+/// `ELASTIC_ALLOC` (`resource` contract): grant an elastic-region chunk from the
 /// kernel elastic region to the calling module. `arg` in `[bytes u32 LE]`,
 /// out `[addr u64 LE][len u32 LE]` (an address answer); returns 0 or an
 /// accounted `ENOSPC`.
@@ -1468,8 +1463,8 @@ fn handle_elastic_alloc(arg: &mut [u8]) -> i32 {
     if idx >= crate::kernel::exec::scheduler::module_slots() {
         return E_INVAL;
     }
-    // The deployment envelope may size the region down (Tier A over the
-    // Tier B reserve): check the enforced ceiling before granting.
+    // The deployment envelope may size the region down (static reservation over the
+    // elastic region reserve): check the enforced ceiling before granting.
     {
         use crate::kernel::config::ELASTIC_QUANTUM;
         let (used, _) = crate::kernel::mem::elastic::region_usage();
@@ -1581,7 +1576,7 @@ fn log_write(level: u8, msg: &[u8]) {
 
 fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     use crate::abi::internal::bridge;
-    use crate::abi::internal::monitor::ISR_METRICS;
+    use crate::abi::internal::monitor::INTERRUPT_METRICS;
     use crate::abi::kernel_abi::{
         ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
         MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, RANDOM_FILL,
@@ -1604,12 +1599,12 @@ fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
         }
         // Net-identity provider self-registration: the calling BASE-GRAPH
         // module declares itself the node's shared network stack, carrying its
-        // own `addr_ctl` / ingress input-port indices in `arg` (see
+        // own `addr_ctl` input-port index in `arg` (see
         // `kernel_abi::NET_IDENT_PROVIDER`). Workload modules are refused —
-        // a tenant must not hijack identity installs.
+        // a owner must not hijack identity installs.
         NET_IDENT_PROVIDER => {
-            let (addr_ctl, ingress) = match *arg {
-                [a, b, ..] => (a, b),
+            let addr_ctl = match *arg {
+                [a, ..] => a,
                 _ => return E_INVAL,
             };
             let idx = scheduler::current_module_index();
@@ -1617,7 +1612,7 @@ fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
                 return crate::kernel::sys::errno::EACCES;
             }
             crate::kernel::workload::workload_graph::register_net_identity_provider(
-                idx as u16, addr_ctl, ingress,
+                idx as u16, addr_ctl,
             )
         }
         // One of the calling module's own ISR bridges: `arg = [dir u8][index
@@ -1631,7 +1626,7 @@ fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
                 return crate::kernel::sys::errno::ENODEV;
             }
             let Some((in_b, out_b)) =
-                crate::kernel::exec::isr_tier::module_bridge_slots(idx as ModuleId)
+                crate::kernel::exec::interrupt::module_bridge_slots(idx as ModuleId)
             else {
                 return crate::kernel::sys::errno::ENODEV;
             };
@@ -1732,7 +1727,7 @@ fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
             }
             hal::csprng_fill(out)
         }
-        ISR_METRICS => crate::kernel::exec::isr_tier::isr_metrics_dispatch(arg),
+        INTERRUPT_METRICS => crate::kernel::exec::interrupt::interrupt_metrics_dispatch(arg),
         _ => E_NOSYS,
     }
 }
@@ -1754,7 +1749,6 @@ fn handle_reconfigure_op(opcode: u32, arg: &mut [u8]) -> i32 {
             let phase = match arg.first() {
                 Some(0) => scheduler::ReconfigurePhase::Running,
                 Some(1) => scheduler::ReconfigurePhase::Draining,
-                Some(2) => scheduler::ReconfigurePhase::Migrating,
                 _ => return E_INVAL,
             };
             scheduler::set_reconfigure_phase(phase);
@@ -2173,12 +2167,12 @@ unsafe extern "C" fn stub_provider_close(_handle: i32) -> i32 {
 
 /// Allocate from the calling module's heap.
 ///
-/// ISR-tier modules are forbidden from heap operations.
+/// interrupt-mode modules are forbidden from heap operations.
 /// The gate fires here (at the syscall boundary) rather than in
 /// `heap::heap_alloc` itself because kernel-internal heap callers
 /// must keep working — only the module-facing path is gated.
 unsafe extern "C" fn syscall_heap_alloc(size: u32) -> *mut u8 {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("heap_alloc") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("heap_alloc") {
         return core::ptr::null_mut();
     }
     // Admission gate: heap growth is new allocation. Frees (and
@@ -2192,7 +2186,7 @@ unsafe extern "C" fn syscall_heap_alloc(size: u32) -> *mut u8 {
 
 /// Free a previous allocation from the calling module's heap.
 unsafe extern "C" fn syscall_heap_free(ptr: *mut u8) {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("heap_free") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("heap_free") {
         return;
     }
     let idx = crate::kernel::exec::scheduler::current_module_index();
@@ -2201,7 +2195,7 @@ unsafe extern "C" fn syscall_heap_free(ptr: *mut u8) {
 
 /// Reallocate from the calling module's heap.
 unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u8 {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("heap_realloc") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("heap_realloc") {
         return core::ptr::null_mut();
     }
     // Admission gate: realloc can grow — new allocation.
@@ -2216,6 +2210,6 @@ unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u
 // rp/providers.rs is included from the RP platform entrypoint.
 //
 // The cap-class grant policy (`CAP_CONTRACT_MASK`) is pinned by an out-of-tree
-// test — `service_tiers_admit_storage_family_like_fs` in
+// test — `service_contracts_admit_storage_family_like_fs` in
 // `tests/harness/tests/kernel_permissions.rs` — so production `src/` stays
 // inline-test-free.

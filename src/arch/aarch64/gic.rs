@@ -50,6 +50,7 @@ static CPU_INTERFACE: [AtomicU8; MAX_CORES] = [const { AtomicU8::new(0) }; MAX_C
 // Distributor registers (GICv2 architecture specification, 4.3).
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
+const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
 const GICD_ITARGETSR: usize = 0x800;
 const GICD_SGIR: usize = 0xF00;
@@ -78,6 +79,7 @@ const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 const GICR_SGI: usize = 0x1_0000;
 const GICR_IGROUPR0: usize = GICR_SGI + 0x080;
 const GICR_ISENABLER0: usize = GICR_SGI + 0x100;
+const GICR_ICENABLER0: usize = GICR_SGI + 0x180;
 const GICR_IPRIORITYR: usize = GICR_SGI + 0x400;
 /// The priority every interrupt takes on a GICv3, and the mask, which admits
 /// every priority but the lowest. Both are as a non-secure access sees them; a
@@ -310,7 +312,7 @@ pub unsafe fn send_sgi_all(sgi_id: u32) {
     mmio::write32(gicd_base() + GICD_SGIR, val);
 }
 
-/// Send SGI `sgi_id` to core `core` alone — the core a Tier-2 IRQ-owned
+/// Send SGI `sgi_id` to core `core` alone — the core a `irq`
 /// domain runs on, for instance.
 ///
 /// # Safety
@@ -334,7 +336,7 @@ pub struct IrqBinding {
     /// GIC INTID (an SPI is 32 + its number: SPI 16 is INTID 48).
     pub irq: u32,
     /// The event to signal, or a sentinel ([`EVENT_HANDLE_MUX`], the
-    /// Tier-2 dispatch handle).
+    /// `irq` dispatch handle).
     pub event_handle: i32,
     /// A virtio-mmio device to acknowledge (`InterruptStatus` read back
     /// into `InterruptACK`), or 0.
@@ -363,6 +365,10 @@ pub static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = [
     },
 ];
 pub static mut IRQ_BINDING_COUNT: usize = 0;
+
+/// The `irq` of a binding [`irq_unbind`] dropped: no INTID matches it, and
+/// [`irq_bind`] takes the entry again before it grows the table.
+pub const UNBOUND_IRQ: u32 = u32::MAX;
 
 /// Sentinel event_handle that tells the IRQ handler to call the platform's
 /// multiplexer ([`set_irq_mux`]) instead of signalling a single event: one
@@ -393,7 +399,7 @@ pub(crate) fn irq_mux() -> Option<fn()> {
 /// transport behind `irq` (its `InterruptStatus`, offset 0x60, written back
 /// to `InterruptACK`, 0x64); `EINVAL` when the machine has none there.
 /// `target_core`: the core the distributor delivers this SPI to
-/// (`GICD_ITARGETSR` on a GICv2, `GICD_IROUTER` on a GICv3) — for a Tier-2
+/// (`GICD_ITARGETSR` on a GICv2, `GICD_IROUTER` on a GICv3) — for an `irq`
 /// IRQ the core its owning domain runs on, otherwise core 0. For an SGI or
 /// PPI (INTID < 32) the enable and priority registers are banked per core
 /// (in each core's redistributor on a GICv3), so this programs the calling
@@ -430,16 +436,40 @@ pub fn irq_bind(irq: u32, event_handle: i32, ack: IrqAck, target_core: u8) -> i3
     // and only grow at boot/configure time; `idx` is range-checked above.
     // The distributor is mapped by the boot page tables.
     unsafe {
-        if IRQ_BINDING_COUNT >= MAX_IRQ_BINDINGS {
-            return crate::kernel::sys::errno::ENOMEM;
+        let bindings_ptr = &raw mut IRQ_BINDINGS;
+        let bindings = &mut *bindings_ptr;
+        let count = IRQ_BINDING_COUNT;
+        match bindings[..count].iter().position(|b| b.irq == UNBOUND_IRQ) {
+            Some(idx) => {
+                // A dropped entry: its line is masked, so the interrupt path
+                // cannot match the INTID before the fields are in place. Its
+                // fields are rewritten with every other domain parked, so no
+                // other core's dispatch is between reading a dropped entry's
+                // INTID and its fields.
+                let parked = crate::kernel::sys::hal::smp_quiesce_peers();
+                let b = &mut bindings[idx];
+                b.event_handle = event_handle;
+                b.mmio_base = mmio_base;
+                // An aligned u32 published with one atomic store, after the
+                // fields it guards.
+                core::sync::atomic::AtomicU32::from_ptr(&raw mut b.irq)
+                    .store(irq, Ordering::Release);
+                if parked {
+                    crate::kernel::sys::hal::smp_release_peers();
+                }
+            }
+            None => {
+                if count >= MAX_IRQ_BINDINGS {
+                    return crate::kernel::sys::errno::ENOMEM;
+                }
+                bindings[count] = IrqBinding {
+                    irq,
+                    event_handle,
+                    mmio_base,
+                };
+                IRQ_BINDING_COUNT = count + 1;
+            }
         }
-        let idx = IRQ_BINDING_COUNT;
-        IRQ_BINDINGS[idx] = IrqBinding {
-            irq,
-            event_handle,
-            mmio_base,
-        };
-        IRQ_BINDING_COUNT = idx + 1;
 
         // An event binding goes to core 0 whatever the caller named.
         let core = if event_handle >= 0 { 0 } else { target_core };
@@ -462,6 +492,84 @@ pub fn irq_bind(irq: u32, event_handle: i32, ack: IrqAck, target_core: u8) -> i3
         log::info!("[irq] bind irq={irq} event={event_handle} mmio={mmio_base:#x} core={core}");
     }
     0
+}
+
+/// Undo [`irq_bind`] for `irq`: disable the INTID (in the calling core's
+/// redistributor for an SGI or PPI on a GICv3, the banked distributor
+/// register on a GICv2, the distributor for an SPI) and drop every binding
+/// for it. Disabled first, so the interrupt path stops taking the line
+/// before its bindings go. Called on the scheduler thread of the core the
+/// line was routed to.
+///
+/// Returns 0, or `EINVAL` for an INTID past the GIC's.
+pub fn irq_unbind(irq: u32) -> i32 {
+    if irq > MAX_INTID {
+        return crate::kernel::sys::errno::EINVAL;
+    }
+    let gicd = gicd_base();
+    // SAFETY: the distributor and redistributors are mapped by the boot page
+    // tables; ICENABLER is write-1-to-clear. IRQ_BINDINGS is
+    // scheduler-thread-written; a dropped entry is retired by one aligned
+    // store of its `irq`, which the interrupt path reads as no match.
+    unsafe {
+        if irq < 32 && v3() {
+            let rd = CORE_GICR
+                .get(super::cpu::current_core_id() as usize)
+                .map(|r| r.load(Ordering::Relaxed))
+                .filter(|&r| r != 0)
+                .unwrap_or_else(|| GICR.load(Ordering::Relaxed));
+            mmio::write32(rd + GICR_ICENABLER0, 1u32 << irq);
+        } else {
+            let reg = gicd + GICD_ICENABLER + (irq as usize / 32) * 4;
+            mmio::write32(reg, 1u32 << (irq % 32));
+        }
+        let bindings_ptr = &raw mut IRQ_BINDINGS;
+        let bindings = &mut *bindings_ptr;
+        for b in bindings[..IRQ_BINDING_COUNT].iter_mut() {
+            if b.irq == irq {
+                core::sync::atomic::AtomicU32::from_ptr(&raw mut b.irq)
+                    .store(UNBOUND_IRQ, Ordering::Release);
+            }
+        }
+    }
+    log::info!("[irq] unbind irq={irq}");
+    0
+}
+
+/// Mask (`masked`) or unmask `irq` at the GIC: one write to its
+/// clear-enable or set-enable bit (in the calling core's redistributor for
+/// an SGI or PPI on a GICv3, which is the core the line is routed to), and
+/// nothing else. Interrupt-safe: no binding table, no log. Unmasking an SPI
+/// keeps the routing and priority [`irq_bind`] programmed.
+pub fn irq_mask(irq: u32, masked: bool) {
+    if irq > MAX_INTID {
+        return;
+    }
+    let (set, clear) = (GICD_ISENABLER, GICD_ICENABLER);
+    // SAFETY: the distributor and redistributors are mapped by the boot page
+    // tables; the enable registers are write-1-to-set / write-1-to-clear, so
+    // one bit's write disturbs no other line.
+    unsafe {
+        if irq < 32 && v3() {
+            let rd = CORE_GICR
+                .get(super::cpu::current_core_id() as usize)
+                .map(|r| r.load(Ordering::Relaxed))
+                .filter(|&r| r != 0)
+                .unwrap_or_else(|| GICR.load(Ordering::Relaxed));
+            let reg = if masked {
+                GICR_ICENABLER0
+            } else {
+                GICR_ISENABLER0
+            };
+            mmio::write32(rd + reg, 1u32 << irq);
+        } else {
+            let reg = if masked { clear } else { set };
+            mmio::write32(
+                gicd_base() + reg + (irq as usize / 32) * 4,
+                1u32 << (irq % 32),
+            );
+        }
+    }
 }
 
 /// Bind an LPI, which an ITS translated from a device's MSI, to an event. Its

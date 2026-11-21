@@ -10,13 +10,12 @@
 // pointer records, scaled from the device axis range to the surface's
 // logical geometry. Included into `linux.rs`; shares its imports.
 
-use fluxor::platform::builtin_param_tags::linux_pointer as pointer_tags;
-use fluxor::platform::builtin_param_tags::linux_pointer::{
+use fluxor::abi::platform::native::linux::linux_pointer as pointer_tags;
+use fluxor::abi::platform::native::linux::linux_pointer::{
     TAG_HEIGHT as POINTER_TAG_HEIGHT, TAG_PATH as POINTER_TAG_PATH, TAG_WIDTH as POINTER_TAG_WIDTH,
     TAG_X_MAX as POINTER_TAG_X_MAX, TAG_Y_MAX as POINTER_TAG_Y_MAX,
 };
 
-const LINUX_POINTER_HASH: u32 = 0xEEA3_12EF; // fnv1a32("linux_pointer")
 
 // Linux `struct input_event` on 64-bit: timeval(16) + type(2) + code(2) +
 // value(4). Reads on an evdev node return whole events; a FIFO may split,
@@ -115,9 +114,9 @@ fn linux_pointer_emit(st: &mut LinuxPointerState) {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_pointer_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn linux_pointer_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxPointerState` by the loader.
     let st = unsafe { instance_state::<LinuxPointerState>(state) };
     if st.out_chan < 0 {
@@ -222,7 +221,7 @@ unsafe fn linux_pointer_step(state: *mut u8) -> i32 {
     0
 }
 
-fn build_linux_pointer(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_linux_pointer(module_idx: usize, params: &[u8]) -> Result<Box<LinuxPointerState>, i32> {
     let mut path = String::from("/dev/input/event0");
     let mut width: i32 = 960;
     let mut height: i32 = 540;
@@ -236,13 +235,8 @@ fn build_linux_pointer(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
         POINTER_TAG_Y_MAX => y_max = tlv_u32(value) as i32,
         _ => {}
     });
-
-    scheduler::set_current_module(module_idx);
     let out_chan = scheduler::module_port(module_idx, pointer_tags::PORT_EVENTS);
-    let mut m = scheduler::BuiltInModule::new("linux_pointer", linux_pointer_step);
-    install_state(
-        &mut m,
-        Box::new(LinuxPointerState {
+    let st = Box::new(LinuxPointerState {
             fd: -1,
             opened: false,
             out_chan,
@@ -259,8 +253,16 @@ fn build_linux_pointer(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
             path,
             rbuf: [0u8; EVDEV_EVENT_SIZE * 64],
             rbuf_len: 0,
-        }),
-    );
+        });
     log::info!("[inst] module {module_idx} = linux_pointer (built-in) out_chan={out_chan}");
-    m
+    Ok(st)
 }
+
+impl HostNative for LinuxPointerState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_pointer(slot, params)
+    }
+}
+
+/// The `linux_pointer` native module.
+pub static LINUX_POINTER: NativeVtable = host_vtable::<LinuxPointerState>(linux_pointer_step);

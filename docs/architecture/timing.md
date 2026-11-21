@@ -34,7 +34,7 @@ struct StreamTime {
 };
 ```
 
-Units are domain-defined — for I2S they are PIO words (= stereo frames).
+Units are defined by the stream — for I2S they are PIO words (= stereo frames).
 `t0_micros` is captured on the first push, not at init or alloc.
 
 Derive played/committed counts from `StreamTime`:

@@ -210,7 +210,7 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
 
 /// Layouts the kernel reads, from the SDK through `fluxor-abi`, so the packer writes the
 /// one definition the kernel and modules compile against: the program
-/// section (`kernel_abi::program`) and the graph-image header
+/// section (`kernel_abi::program`) and the node-image header
 /// (`flash_layout::GRAPH_SLOT_*`).
 pub mod sdk_layout {
     pub use fluxor_abi::kernel_abi;
@@ -561,6 +561,35 @@ fn verify_module_abi_surface(info: &ModuleInfo, path: &Path) -> Result<()> {
     }
 }
 
+/// Add the fan module types `types` (`tee`, `merge`) a composed graph runs
+/// to `modules` where it does not carry them already, resolved and verified
+/// as any module a graph names: a fan is an ordinary module of the graph,
+/// loaded from the image's module table by its name hash.
+pub fn add_fan_modules(
+    modules: &mut Vec<ModuleInfo>,
+    types: &[&str],
+    modules_dir: &Path,
+    extra_dirs: &[&Path],
+    store_fallback: Option<StoreFallback<'_>>,
+) -> Result<()> {
+    let missing: Vec<serde_json::Value> = types
+        .iter()
+        .filter(|t| !modules.iter().any(|m| m.name == **t))
+        .map(|t| serde_json::json!({ "name": t }))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let fans = parse_modules_from_config_multi(
+        &serde_json::json!({ "modules": missing }),
+        modules_dir,
+        extra_dirs,
+        store_fallback,
+    )?;
+    modules.extend(fans);
+    Ok(())
+}
+
 /// Parse modules from config YAML/JSON, resolving each `.fmod` against
 /// `modules_dir` first and then falling back to `extra_dirs` in order.
 ///
@@ -724,8 +753,8 @@ pub fn parse_modules_from_config_multi(
 
     // Module types a subgraph staged by `apply_add` references by `name_hash`,
     // which resolves only against the module table — so their .fmod must be
-    // packed into that table though the base graph does not instantiate
-    // them. Two sources, loaded alike (dedup against the base graph's
+    // packed into that table though the node graph does not instantiate
+    // them. Two sources, loaded alike (dedup against the node graph's
     // modules):
     // - resident workloads, admitted at boot: `workloads:[*].modules:[*].type`;
     // - `workload_modules:`, the types a workload may be staged with at run
@@ -763,17 +792,17 @@ pub fn parse_modules_from_config_multi(
             modules.iter().map(|m| m.name.clone()).collect();
         for &(module_type, variant) in &staged {
             // Variant conflict check BEFORE the dedup skip: a staged
-            // type naming a different variant than the base graph (or an
+            // type naming a different variant than the node graph (or an
             // earlier staged type) loaded must fail, not silently ride on
             // whichever build got there first — same rule as the
-            // base graph: one FXMT entry per type, so one build.
+            // node graph: one FXMT entry per type, so one build.
             match loaded_variants.entry(module_type.to_string()) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     if e.get().as_deref() != variant {
                         return Err(Error::Module(format!(
                                 "module type '{}' (staged by a workload or workload_modules) requests variant '{}' but the \
                                  image already carries '{}' — one image carries one build of a \
-                                 module type; align workloads, workload_modules and the base graph \
+                                 module type; align workloads, workload_modules and the node graph \
                                  on a single variant",
                                 module_type,
                                 variant.unwrap_or("<default>"),
@@ -2778,7 +2807,7 @@ content_type = "NetProto"
         assert!(msg.contains("'<default>'"), "got: {msg}");
     }
 
-    /// `workload_modules:` types are resolved like the base graph's: one the
+    /// `workload_modules:` types are resolved like the node graph's: one the
     /// image cannot carry fails the build, naming where it came from.
     #[test]
     fn a_missing_workload_module_fails_naming_its_source() {
@@ -2811,9 +2840,9 @@ content_type = "NetProto"
     }
 
     /// One image carries one build of a type: a workload module naming a
-    /// variant the base graph did not load is refused, as a workload's is.
+    /// variant the node graph did not load is refused, as a workload's is.
     #[test]
-    fn a_workload_module_variant_conflicting_with_the_base_graph_fails() {
+    fn a_workload_module_variant_conflicting_with_the_node_graph_fails() {
         let config = serde_json::json!({
             "modules": [{ "name": "net", "type": "linux_net" }],
             "workload_modules": [{ "type": "linux_net", "variant": "slim" }],

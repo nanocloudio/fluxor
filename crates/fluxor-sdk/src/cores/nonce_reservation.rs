@@ -27,8 +27,8 @@
 //     `reservation_exhausted_stall` telemetry event) is rare rather
 //     than periodic.
 //
-// The same reserve-ahead discipline covers all three tier-3
-// counters (egress AEAD nonce, reliable-ordered send index, outbound
+// The same reserve-ahead discipline covers all three
+// per-session counters (egress AEAD nonce, reliable-ordered send index, outbound
 // datagram sequence): instantiate one `NonceReservation` per counter.
 //
 // `no_std`, zero-alloc, `Copy`-free plain state — embeddable directly

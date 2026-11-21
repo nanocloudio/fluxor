@@ -196,10 +196,10 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                     let digest = ticket_digest(id_bytes);
                     let now_ms = dev_millis(sys);
                     // A ticket opens only under the key that sealed it and
-                    // the replay domain it was minted in, so both must be
+                    // the replay scope it was minted in, so both must be
                     // in hand before there is anything to open.
                     let sealing = if key >= 0 {
-                        replay_domain(&mut s.replay_domain, sys)
+                        replay_scope(&mut s.replay_scope, sys)
                     } else {
                         None
                     };
@@ -211,8 +211,8 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                         // handshake continues as a full one.
                         let msg = b"[quic] ticket replay rejected";
                         dev_log(sys, 2, msg.as_ptr(), msg.len());
-                    } else if let Some(domain) = sealing {
-                        let aad = ticket_aad(parity as u8, &domain);
+                    } else if let Some(scope) = sealing {
+                        let aad = ticket_aad(parity as u8, &scope);
                         let mut pt = [0u8; TICKET_PT_LEN];
                         let n = vault_open(sys, key, &aad, &id_bytes[1..], &mut pt);
                         if n == TICKET_PT_LEN {
@@ -1045,7 +1045,7 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
         return;
     }
     // Resumption that cannot be sealed is not offered, and the handshake
-    // stays a full one. That needs both a key and a replay domain: a
+    // stays a full one. That needs both a key and a replay scope: a
     // ticket outliving the store that records its use is a replay waiting
     // for the next restart.
     let parity = s.ticket_parity as usize;
@@ -1053,7 +1053,7 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     if key < 0 {
         return;
     }
-    let Some(domain) = replay_domain(&mut s.replay_domain, sys) else {
+    let Some(scope) = replay_scope(&mut s.replay_scope, sys) else {
         return;
     };
     // Random ticket_age_add + 8-byte nonce; with no entropy, no ticket.
@@ -1081,7 +1081,7 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     pt[55..63].copy_from_slice(&now_ms.to_le_bytes());
     pt[63..67].copy_from_slice(&lifetime_s.to_le_bytes());
     pt[67..75].copy_from_slice(&nonce);
-    let aad = ticket_aad(parity as u8, &domain);
+    let aad = ticket_aad(parity as u8, &scope);
     let mut ticket_bytes = [0u8; MAX_TICKET_LEN];
     ticket_bytes[0] = parity as u8;
     let sealed = vault_seal(sys, key, &aad, &pt, &mut ticket_bytes[1..]);

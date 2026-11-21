@@ -76,7 +76,7 @@ impl<'a> JsonBuf<'a> {
 
     /// Datapoint attributes: the module index, plus — when nonzero — the raw
     /// composite dimension index as `fluxor.dim`. The id-table holds the key
-    /// names and domain factorisation; emitting the raw index keeps distinct
+    /// names and range factorisation; emitting the raw index keeps distinct
     /// series distinct on-device, where the table is absent — collapsing them
     /// would silently merge per-dimension cumulative streams into one lying
     /// series. A host collector resolves `fluxor.dim` into the declared keys.

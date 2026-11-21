@@ -1,6 +1,6 @@
 //! Per-target facts about what the PLATFORM provides, as opposed to what a
 //! module declares: the calendar-time source its HAL can vouch for, the key
-//! suites its vault holds, the custody tier its vault can reach, and the
+//! suites its vault holds, the custody its vault can reach, and the
 //! step budget its scheduler grants a module.
 //!
 //! These are properties of the kernel build and the silicon, so no manifest
@@ -36,7 +36,7 @@ pub mod vault_suite {
     pub const RSA_4096: u16 = 12;
 }
 
-/// Vault custody tiers, `crates/fluxor-abi/src/contracts/key_vault.rs::tier`.
+/// Vault custody values, `crates/fluxor-abi/src/contracts/key_vault.rs::tier`.
 pub mod vault_tier {
     pub const SOFTWARE: u8 = 0;
     pub const DEVICE_HW: u8 = 2;
@@ -130,7 +130,7 @@ pub struct TargetFacts {
     pub trust_system: bool,
     /// Key suites the kernel vault holds on this target.
     pub vault_suites: &'static [u16],
-    /// The highest custody tier the kernel vault can report here: the tier
+    /// The highest custody the kernel vault can report here: the custody
     /// `SealProvenance::DeviceUnique` raises it to where the platform reads
     /// a device-unique sealing key, `SOFTWARE` everywhere else.
     pub vault_tier_ceiling: u8,
@@ -150,7 +150,7 @@ pub struct TargetFacts {
 
 impl TargetFacts {
     /// Facts for a runtime id. Unknown names answer the weakest
-    /// row — no clock, base suites, software tier — so a requirement on an
+    /// row — no clock, base suites, software custody — so a requirement on an
     /// unregistered target fails closed.
     pub fn for_runtime(name: &str) -> Self {
         match name {

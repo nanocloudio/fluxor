@@ -256,17 +256,6 @@ fn validate_isr_modules(
                 ));
             }
             timer_budget[domain] += max_cycles;
-
-            // FPU usage warning
-            if module
-                .get("uses_fpu")
-                .and_then(|f| f.as_bool())
-                .unwrap_or(false)
-            {
-                result.add_warning(format!(
-                    "{prefix} ({name}): FPU in an `exec: timer` ISR adds 33 cycle lazy stacking overhead on Cortex-M33"
-                ));
-            }
         }
 
         if exec.mode == ExecMode::Irq {
@@ -623,8 +612,8 @@ fn validate_sink_pins(
 /// Validate protection settings against what the target implements.
 ///
 /// Every module's level is resolved once (`protection::resolve`): an explicit
-/// `protection:` on the module, else the graph's, else its trust tier's
-/// default (the module's `trust_tier`, else the graph's `default_trust_tier`).
+/// `protection:` on the module, else the graph's, else its trust class's
+/// default (the module's `trust_class`, else the graph's `default_trust_class`).
 /// The level is a floor; a request above every level the target implements is
 /// refused here, naming the levels it has. A gated module (`contained`,
 /// `isolated`) cannot also be an interrupt-mode module: an ISR runs
@@ -695,10 +684,10 @@ fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut Va
                 .get("graph")
                 .and_then(|g| g.get("protection"))
                 .is_some()
-            || config.get("default_trust_tier").is_some()
+            || config.get("default_trust_class").is_some()
             || config
                 .get("graph")
-                .and_then(|g| g.get("default_trust_tier"))
+                .and_then(|g| g.get("default_trust_class"))
                 .is_some()
         {
             result.add_error(format!("graph defaults: {e} on target '{}'", target.id));
@@ -729,8 +718,8 @@ mod tests {
     fn isolation_is_admitted_only_where_the_kernel_isolates() {
         let graph = json!({ "protection": "isolated" });
         let module = json!({ "modules": [{ "name": "m", "protection": "isolated" }] });
-        let tier = json!({ "modules": [{ "name": "m", "trust_tier": "community" }] });
-        for config in [&graph, &module, &tier] {
+        let trust_class = json!({ "modules": [{ "name": "m", "trust_class": "community" }] });
+        for config in [&graph, &module, &trust_class] {
             // The MMU backend (pi5) and both MPU backends (rp2350, rp2040).
             for board in ["pi5", "pico2w", "pico"] {
                 assert!(
@@ -752,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn a_module_carries_no_tier_or_rate() {
+    fn a_module_carries_no_mode_key_or_rate() {
         let config = json!({ "modules": [{ "name": "m", "tier": "1b", "rate_hz": 1000 }] });
         let errors = isr_errors(&config);
         assert!(

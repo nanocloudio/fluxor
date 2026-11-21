@@ -56,7 +56,7 @@
 // Network: when the workload spec asks for its own network domain
 // (`NET_ISO_OWN` on any endpoint), NEWNET joins the unshare set (orthogonal to
 // `isolate` — a null sandbox can have its own netns too), and the sibling
-// `net_identity` module realizes the Tier-1 network fields (lo up; veth +
+// `net_identity` module realizes the header's network fields (lo up; veth +
 // identity address when one is assigned) before START releases the barrier.
 //
 // Spawn inputs are EXPLICIT parameters, never an on-disk bundle/OCI format —
@@ -148,7 +148,7 @@ const HP_STATE_SIGNALLED: u8 = 2;
 // Live, not terminal: frozen via PAUSE.
 const HP_STATE_PAUSED: u8 = 3;
 
-/// The sandbox-index DOMAIN, not a table size. The table holds a sandbox
+/// The sandbox-index RANGE, not a table size. The table holds a sandbox
 /// for every workload of the host-process backend, a finished one included
 /// until it is destroyed: an orchestrator keeps a terminated workload's exit
 /// status and logs for as long as the workload it belongs to exists. Each is
@@ -309,7 +309,7 @@ pub struct SpawnPlan {
     /// Make the root read-only, last, before the identity change.
     root_read_only: bool,
     /// Unshare NEWNET so the workload gets its own network domain
-    /// (`workload` Tier-1 `NET_ISO_OWN`). Set by the caller from the spec;
+    /// (`workload` header `NET_ISO_OWN`). Set by the caller from the spec;
     /// network isolation is contract intent.
     own_netns: bool,
     /// cgroup.v2 resource limits from the portable `ResourceEnvelope`, applied
@@ -911,7 +911,7 @@ pub fn plan_process(plan: &mut SpawnPlan, p: &ProcessParams) -> Result<(), i32> 
 }
 
 /// A volume the workload sees at `dst` inside its root: the host path `src`
-/// bind-mounted there (`workload` Tier-2 option `mount`/`bind`).
+/// bind-mounted there (`workload` options entry `mount`/`bind`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeBind {
     pub src: String,
@@ -1132,7 +1132,7 @@ pub fn cgroup_writes(plan: &SpawnPlan) -> Vec<(&'static str, &str)> {
     w
 }
 
-/// Portable Tier-1 resource intents from the `workload` header (0 = unset).
+/// Portable header resource intents from the `workload` header (0 = unset).
 /// Named for the intent, never the cgroup file — the mapping to cgroup.v2 lives
 /// in `envelope_cgroup_values`.
 #[derive(Clone, Copy)]
@@ -2600,10 +2600,10 @@ unsafe fn proc_mask(m: i32, name: &core::ffi::CStr) -> bool {
 /// owner-binding is the caller's concern (the `workload` provider records it).
 /// `env` carries the portable resource intents from a `workload` spec — the
 /// sole source of cgroup limits (this backend reads no files). `own_netns` +
-/// `ident` carry the Tier-1 network fields: with `own_netns` the container
+/// `ident` carry the header's network fields: with `own_netns` the container
 /// gets its own netns (lo up); with `ident` also a veth pair carrying the
 /// identity address (see `net_identity`). A network-realization failure fails
-/// the spawn — Tier-1 fields are never silently dropped.
+/// the spawn — header fields are never silently dropped.
 /// # Safety
 /// Single-threaded platform dispatch only: mutates the process-global
 /// sandbox slot table without synchronization, and forks — no other
@@ -2809,7 +2809,7 @@ pub unsafe fn hp_spawn_with_binds(
     slot.cgrouped = cgrouped;
     slot.contained = contained;
     // Realize the network domain before START releases the container. Unlike
-    // cgroups this is NOT best-effort: the network fields are Tier-1 spec, so
+    // cgroups this is NOT best-effort: the network fields are in the spec header, so
     // a failure fails the spawn rather than running with weaker networking.
     if own_netns {
         let rc = super::net_identity::realize(idx, container_pid, ident);
@@ -2922,7 +2922,7 @@ pub unsafe fn hp_read(raw: i32, out: &mut [u8]) -> i32 {
 // from any other caller answer EACCES. The opener's owner release
 // (`hp_tty_release_owner`) and the workload's DESTROY close it.
 
-/// The session-id DOMAIN, not a table size: the table is sized at boot to
+/// The session-id RANGE, not a table size: the table is sized at boot to
 /// the plan's `tty_sessions` ceiling (`size_kernel_tables`) — interactive
 /// terminals (an interactive exec, an attach) open at once across every
 /// sandbox, each a pseudo-terminal and a child pumped every step; a one-shot
@@ -2952,7 +2952,7 @@ const TTY_EMPTY: TtySession = TtySession {
     reaped: false,
     exit_code: 0,
     sandbox: -1,
-    owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+    owner: crate::kernel::workload::owner::OWNER_NODE,
     module: usize::MAX,
 };
 

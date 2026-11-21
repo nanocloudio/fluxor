@@ -9,26 +9,16 @@
 pub(crate) struct ModuleEntry {
     /// FNV-1a of the module's type name, the `.fmod` it loads.
     pub name_hash: u32,
-    /// The module's index in the graph.
+    /// The module's index in the graph: its position in `modules:`.
     pub id: u16,
     /// The execution domain it runs in.
     pub domain: u8,
     /// It runs in its domain's pre-pass (`pre_pass` in its manifest).
     pub pre_pass: bool,
+    /// Its step deadline, burst deadline and fault policy.
+    pub budget: crate::add_subgraph::StepBudget,
     /// Its params TLV.
     pub params: Vec<u8>,
-}
-
-impl ModuleEntry {
-    pub(crate) fn record(&self) -> fluxor_contracts::boot_config::ModuleRecord<'_> {
-        fluxor_contracts::boot_config::ModuleRecord {
-            name_hash: self.name_hash,
-            id: self.id,
-            domain: self.domain,
-            pre_pass: self.pre_pass,
-            params: &self.params,
-        }
-    }
 }
 
 /// What a module entry's params buffer starts at before it grows to fit:
@@ -154,13 +144,13 @@ const TICK_US_MAX: u32 = 50_000;
 const DEFAULT_HEARTBEAT_MS: u64 = 150;
 
 /// Effective tick_us when the config doesn't set one anywhere. Mirrors
-/// the platform main-loop fallback (`tick_period_us = 1000` when
+/// the platform domain-loop fallback (`tick_period_us = 1000` when
 /// `cfg_header_tick_us == 0`).
 const DEFAULT_TICK_US: u32 = 1000;
 
 /// Hard absolute cap on a single module's burst deadline. The burst
 /// path uses `step_deadline_us * BURST_MULTIPLIER` as its extended
-/// timeout; capping the product at 100 ms keeps Tier 1a loops
+/// timeout; capping the product at 100 ms keeps `tick` loops
 /// responsive even when a misconfigured module runs through its full
 /// burst budget. 100 ms is the conservative side of "no human-
 /// perceivable jitter" for audio/video pipelines; raise this only
@@ -389,14 +379,9 @@ fn validate_scheduler_budgets(
 ///     `replica_agreed_cadence: true` (and never on a multi-node cluster);
 ///     mechanism (a) idle is clamped so `tick_max_us` stays below the tick
 ///     emission interval.
-///   * **Guaranteed-tier WCET**: a `guaranteed`-class module is blocked on (b)
+///   * **Guaranteed-class WCET**: a `guaranteed`-class module is blocked on (b)
 ///     unless the domain asserts `guaranteed_wcet_revalidated: true` (the
 ///     operator re-ran WCET/budget schedulability at `tick_min_us`).
-///   * **Domain-0 `DBG_TICK` rate-coupling**: on a DBG_TICK-backed target with
-///     ≥2 domains, an adaptive domain 0 must set a finite `tick_max_us` so its
-///     variable pacing can't stall sibling-domain `tick_count()` reads (the
-///     `*-TICKS` drain/quarantine/backoff windows are wall-clocked, so only the
-///     DBG_TICK advance rate couples the domains).
 ///   * **`tick_count()`-as-milliseconds**: no gate is needed here — the
 ///     bcm2712/Linux HAL `tick_count` is wall-clock-backed and timer FDs use
 ///     `hal::now_millis`; a module that counts ticks as time declares
@@ -413,6 +398,18 @@ fn module_param_u64(m: &Value, key: &str) -> Option<u64> {
             .and_then(|p| p.get(key))
             .and_then(|v| v.as_u64())
     })
+}
+
+/// Whether `target`'s kernel runs each execution domain on a core of its own
+/// (domain `d` on core `d`): the SMP kernels, bcm2712 and uefi. Every other
+/// target (rp, Linux, wasm) and an unresolved one runs all domains' loops on
+/// one thread.
+fn domains_have_own_cores(target: Option<&str>) -> bool {
+    let Some(name) = target else {
+        return false;
+    };
+    crate::target::load_target(&name.to_ascii_lowercase(), &crate::project::root())
+        .is_ok_and(|desc| matches!(desc.id.as_str(), "bcm2712" | "uefi"))
 }
 
 #[allow(
@@ -445,23 +442,23 @@ fn validate_adaptive_tick(
     //    `replicated_clock`-class module on a (single-node) (b) domain.
     let mut guar_reval = [false; MAX_DOMAINS];
     let mut replica_agreed = [false; MAX_DOMAINS];
-    // Per-domain core bitmask (shared-runner detection). A domain that
-    // pins `cores: [N, ...]` runs on those cores; a domain with no `cores`
-    // shares the cooperative runner (modelled as core 0 — true on single-core
-    // Linux/rp/wasm, and the default lane on bcm2712). Two domains whose
-    // bitmasks overlap share a physical runner.
+    // Per-domain core bitmask (shared-core detection). On a target whose
+    // kernel runs domain `d` on core `d` every domain has its own core; on
+    // the others (rp, Linux, wasm) every domain's loop runs on one thread.
+    // Two domains whose bitmasks overlap share a core.
+    let own_cores = domains_have_own_cores(
+        resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str())),
+    );
     let mut core_mask = [0u64; MAX_DOMAINS];
     // Per-domain "hosts a timing-strict module" (Guaranteed WCET, replicated
-    // clock, or raft liveness) — the shared-runner co-residency check rejects an
-    // adaptive domain sharing a runner with one of these.
+    // clock, or raft liveness) — the co-residency check rejects an
+    // adaptive domain sharing a domain loop with one of these.
     let mut has_strict = [false; MAX_DOMAINS];
-    let mut domain_count = 0usize;
     if let Some(domains) = config
         .get("execution")
         .and_then(|e| e.get("domains"))
         .and_then(|d| d.as_array())
     {
-        domain_count = domains.len();
         for (i, dom) in domains.iter().take(MAX_DOMAINS).enumerate() {
             flags[i] = dom
                 .get("adaptive_flags")
@@ -477,17 +474,7 @@ fn validate_adaptive_tick(
                 .get("replica_agreed_cadence")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            match dom.get("cores").and_then(|v| v.as_array()) {
-                Some(arr) if !arr.is_empty() => {
-                    for c in arr {
-                        if let Some(n) = c.as_u64() {
-                            core_mask[i] |= 1u64 << (n & 63);
-                        }
-                    }
-                }
-                // No (or empty) `cores` ⇒ the shared cooperative runner (core 0).
-                _ => core_mask[i] = 1,
-            }
+            core_mask[i] = if own_cores { 1u64 << i } else { 1 };
             // Adaptive cadence reduces a tick domain's idle work; a poll
             // domain steps back to back and never relaxes. Declaring both is
             // contradictory intent.
@@ -504,7 +491,7 @@ fn validate_adaptive_tick(
             }
         }
     }
-    // Pacers need no admission gate. The base graph has one per execution
+    // Pacers need no admission gate. The node graph has one per execution
     // domain, and `execution.domains` past `MAX_DOMAINS` is refused before
     // this runs. Resident graphs have one per owner slot and execution
     // domain, sized at boot with the owner table, so every workload the owner
@@ -516,16 +503,7 @@ fn validate_adaptive_tick(
         return Ok(());
     }
 
-    // The domain-0 coupling rule below is scoped to platforms whose HAL
-    // `tick_count` is `DBG_TICK`-backed — bcm2712 and Linux. rp2350/pico read
-    // `tick_count` from a wall-clock `Instant` and drive timer FDs off
-    // `hal::now_millis`, so nothing on those targets reads a shared tick
-    // counter for time and they are immune.
     let silicon = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
-    let dbg_tick_backed = silicon.is_none_or(|s| {
-        let s = s.to_ascii_lowercase();
-        !(s.contains("rp2") || s.contains("pico") || s.contains("rp1") || s.contains("wasm"))
-    });
 
     let eff = |d: usize| -> u32 {
         let dt = domain_tick_us.get(d).copied().unwrap_or(0);
@@ -579,37 +557,9 @@ fn validate_adaptive_tick(
         }
     }
 
-    // Domain-0 DBG_TICK rate-coupling on a multi-domain bcm2712 node.
-    // `DBG_TICK` is advanced ONLY by domain 0, and every domain
-    // reads it for `tick_count()`. If domain 0 paces variably (b) or idle-sleeps
-    // to tick_max_us (a), the shared logical clock re-times for ALL domains.
-    // The `*-TICKS` drain/quarantine/backoff windows are wall-clocked, so they
-    // are immune. The residual coupling is the DBG_TICK *advance rate* feeding
-    // sibling-domain `tick_count()` reads: bound it by requiring domain 0 to
-    // declare a finite `tick_max_us` (no unbounded idle widen) whenever it
-    // enables adaptive tick alongside sibling domains. An unbounded
-    // (`tick_max_us == 0` ⇒ platform default, but bit-0 idle can widen the
-    // programmed deadline arbitrarily) domain-0 widen maximally stalls sibling
-    // tick reads.
-    if dbg_tick_backed && domain_count >= 2 && flags[0] != 0 && tmax[0] == 0 {
-        return Err(Error::Config(format!(
-            "domain '{}' (domain 0) enables adaptive_flags={:#x} in a multi-domain \
-             configuration ({} domains) on a DBG_TICK-backed target ({}), but does \
-             not set a finite tick_max_us. Domain 0 alone advances the shared \
-             DBG_TICK that every sibling domain reads via tick_count(); an unbounded \
-             idle/cadence widen on domain 0 stalls sibling-domain timing. Set an \
-             explicit tick_max_us on domain 0 to bound the coupling, or disable \
-             adaptive tick on domain 0.",
-            label(0),
-            flags[0],
-            domain_count,
-            silicon.unwrap_or("unknown"),
-        )));
-    }
-
     // BCM2712 wake-policy declaration (required statement). On bcm2712 (pi5),
     // demand-driven idle (mechanism (a), bit 0) is NOT fully event-driven —
-    // Tier-0/1a idle uses WFI, which software SEV does not break — so every
+    // `tick` idle uses WFI, which software SEV does not break — so every
     // adaptive-idle config MUST declare how it bounds first-wake latency:
     // `clamp` (the default), `doorbell` (a software-generated inter-processor
     // interrupt that kicks the idle core, opt-in), or `wfe` (only where the
@@ -792,17 +742,12 @@ fn validate_adaptive_tick(
                         label(d),
                     )));
                 }
-                // `tick_count()`-as-milliseconds needs no gate of its own: on
-                // the DBG_TICK-backed HALs (bcm2712/Linux) the HAL
-                // `tick_count` op is wall-clock-backed
-                // (`bcm_now_millis`/`elapsed_micros`), matching rp's `Instant` HAL,
-                // and timer FDs derive deadlines from `hal::now_millis`
+                // `tick_count()`-as-milliseconds needs no gate of its own:
+                // every HAL's `tick_count` op is wall-clock-backed, and timer FDs derive deadlines from `hal::now_millis`
                 // (`fd.rs`). A module that *itself* counts scheduler ticks as time
                 // declares `tick_counted` and is already rejected above by the
                 // attestation gate, on every platform. So no residual graph shape
                 // is left for the validator to reject here.
-                // `dbg_tick_backed`/`silicon` remain in scope for the domain-0
-                // DBG_TICK gate above.
             } else if man.timer_class.forbids_adaptive() {
                 return Err(Error::Config(format!(
                     "module '{mname}' (timer_class={}) cannot run on adaptive-tick \
@@ -922,7 +867,7 @@ fn validate_adaptive_tick(
         }
     }
 
-    // Shared-runner co-residency gate (reject-by-default). Populate `has_strict`
+    // Shared-domain-loop co-residency gate (reject-by-default). Populate `has_strict`
     // across ALL domains — a timing-strict module (Guaranteed WCET,
     // replicated clock, raft liveness) usually sits on a NON-adaptive domain, so
     // the adaptive-only module loop above doesn't see it.
@@ -951,12 +896,12 @@ fn validate_adaptive_tick(
             has_strict[d] = true;
         }
     }
-    // An adaptive domain sharing a physical runner (overlapping core mask) with
-    // a timing-strict domain is rejected: a variable-cadence sibling can delay
+    // An adaptive domain sharing a core (overlapping core mask) with a
+    // timing-strict domain is rejected: a variable-cadence sibling can delay
     // the strict domain's deadline/emission/wake, and proving the bound under
     // worst-case adaptive load is intractable, so the gate rejects by default.
-    // The fix is placement — a dedicated runner / ISR tier — not a
-    // schedulability proof.
+    // The fix is placement — a domain on its own core, or an interrupt mode
+    // — not a schedulability proof.
     for a in 0..MAX_DOMAINS {
         if flags[a] == 0 {
             continue; // `a` is not adaptive
@@ -967,13 +912,14 @@ fn validate_adaptive_tick(
             }
             if core_mask[a] & core_mask[b] != 0 {
                 return Err(Error::Config(format!(
-                    "adaptive domain '{}' shares a runner (overlapping cores) with \
-                     timing-strict domain '{}' (a guaranteed-WCET, replicated-clock, \
-                     or raft-liveness module). A variable-cadence sibling can delay \
-                     the strict domain's deadline/emission/wake, and the bound cannot \
-                     be proven under worst-case adaptive load. Pin the strict domain \
-                     to its own core or an ISR tier, or remove adaptive_flags from \
-                     '{}'.",
+                    "adaptive domain '{}' shares a core with timing-strict domain '{}' \
+                     (a guaranteed-WCET, replicated-clock, or raft-liveness module). A \
+                     variable-cadence sibling can delay the strict domain's \
+                     deadline/emission/wake, and the bound cannot be proven under \
+                     worst-case adaptive load. On this target every domain shares one \
+                     core; move the strict module to an interrupt mode or to a target \
+                     that runs each domain on its own core, or remove adaptive_flags \
+                     from '{}'.",
                     label(a),
                     label(b),
                     label(a),
@@ -1021,7 +967,7 @@ fn validate_adaptive_tick(
 /// default ports) would otherwise slip through both this gate and
 /// the wiring check unchecked. The diagnostic names the module +
 /// the directory it should live under.
-fn validate_isr_tier_admission(
+fn validate_interrupt_admission(
     config: &Value,
     module_list: &[Value],
     modules_dir: &std::path::Path,
@@ -1041,7 +987,7 @@ fn validate_isr_tier_admission(
     // `irq` admission: an `irq` module is dispatched from its
     // `module_isr_entry` export (resolved by the kernel loader into
     // `DynamicModule::isr_entry_fn()` and routed through
-    // `register_tier2_module`). Rules 1/3 below require every `irq`
+    // `irq::register_module`). Rules 1/3 below require every `irq`
     // module to declare `interrupt_safe = true`, an `irq:` field, and an
     // actual `module_isr_entry` export in its source.
 
@@ -1065,7 +1011,7 @@ fn validate_isr_tier_admission(
     //
     //   - GIC-400 (bcm2712): INTIDs 0..=1019. 1020..=1023 are
     //     reserved/special (e.g. 1023 = spurious). SGIs (0-15), PPIs (16-31) and
-    //     SPIs (32-1019) are all valid `irq` owners (the `tier2_probe` example
+    //     SPIs (32-1019) are all valid `irq` owners (the `irq_probe` example
     //     legitimately owns SGI 15).
     //   - RP2350 (Cortex-M33/Hazard3 NVIC): highest line is SWI_IRQ_5 = 52, so
     //     0..=52 (rp-pac `rp235x::Interrupt`). SWI lines are real NVIC lines and
@@ -1262,7 +1208,7 @@ fn validate_isr_tier_admission(
                 "IRQ {irq} declared by both module '{prev_name}' and \
                  module '{name}'. Two modules sharing one hardware IRQ produce \
                  undefined dispatch ordering — the kernel's \
-                 `isr_tier2_trampoline` is a single-handler-per-IRQ table. Give \
+                 `irq_trampoline` is a single-handler-per-IRQ table. Give \
                  each `irq` module a distinct IRQ number."
             )));
         }
@@ -1282,7 +1228,7 @@ fn validate_isr_tier_admission(
     // and the ISR module would have no supported way to read them.
     //
     // With no module-facing bridge ABI (see
-    // `docs/architecture/scheduler.md` §"ISR-tier I/O contract"), the
+    // `docs/architecture/scheduler.md` §"interrupt-mode I/O contract"), the
     // build rejects ANY YAML edge with an interrupt-mode endpoint. Tests that
     // bypass YAML (e.g. `tests/harness/tests/scheduler_isr_bridges.rs`)
     // continue to exercise the kernel-side mechanism through
@@ -1323,7 +1269,7 @@ fn validate_isr_tier_admission(
                  tested, but the SDK surface is not. Drop the edge from your YAML \
                  (`timer` modules do private-state work only), or move both \
                  endpoints to cooperative domains. See \
-                 `docs/architecture/scheduler.md` §\"ISR-tier I/O contract\"."
+                 `docs/architecture/scheduler.md` §\"interrupt-mode I/O contract\"."
             )));
         }
         // Past this point both endpoints are cooperative. Any
@@ -1436,9 +1382,18 @@ pub(crate) struct DomainExec {
 /// (`tick` when omitted). A `timer` domain declares its cadence as
 /// `rate_hz`, a whole number of µs per period that fits the domain record's
 /// u16 `tick_us`; no other mode takes `rate_hz`, and a `timer` domain takes
-/// no `tick_us`. `tier:` and `exec_mode:` are not keys.
+/// no `tick_us`. `tier:`, `exec_mode:` and `cores:` are not keys: a domain's
+/// index is its core on a kernel that runs domains on their own cores, and
+/// every domain shares one core elsewhere.
 pub(crate) fn parse_domain_exec(domain: &Value, label: &str) -> Result<DomainExec> {
     use boot_config::ExecMode;
+    if domain.get("cores").is_some() {
+        return Err(Error::Config(format!(
+            "execution.domains entry '{label}': unknown key `cores`; domain d runs on core d \
+             where the kernel gives each domain its own core (bcm2712, uefi), and every \
+             domain shares one core elsewhere"
+        )));
+    }
     for key in ["tier", "exec_mode"] {
         if domain.get(key).is_some() {
             return Err(Error::Config(format!(
@@ -1615,10 +1570,10 @@ fn load_builtin_param_schema(
 /// default. Structural metadata (name, type, …) is skipped.
 ///
 /// Top-level YAML keys that are structural metadata, not module params.
-/// Mirrors `schema.rs::SKIP_KEYS` plus the protection/policy/trust tier
-/// fields that `build_module_entry` writes as reserved TLV tags
-/// (0xF0..0xF5) and a few other cross-cutting fields that the config
-/// generator injects.
+/// Mirrors `schema.rs::SKIP_KEYS` plus the step budget the module record
+/// carries, the restart and protection fields that `build_module_entry`
+/// writes as reserved TLV tags (0xF2..0xF5) and a few other cross-cutting
+/// fields that the config generator injects.
 const NON_PARAM_KEYS: &[&str] = &[
     "name",
     "type",
@@ -1626,7 +1581,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     // (`parse_modules_from_config_multi`) and the manifest loader,
     // never a wire param.
     "variant",
-    // Program blobs the module instance owns: packed into the bundle's
+    // Program blobs the module instance owns: packed into the image's
     // program section (`modules::collect_programs`), never a wire param.
     "program",
     "programs",
@@ -1639,7 +1594,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     "fault_policy",
     "max_restarts",
     "restart_backoff_ms",
-    "trust_tier",
+    "trust_class",
     "protection",
     "device_window",
     // `cert_file`, `key_file` and `trust` are NOT here: they are schema
@@ -1650,10 +1605,10 @@ const NON_PARAM_KEYS: &[&str] = &[
     // form by `normalize_peer_names`.
     "domain",
     "sample_rate", // injected by graph_sample_rate
-    // Protection-control keys emitted as TLV tags by
-    // `build_module_entry`. These are top-level module entries, not
-    // schema params, so the allow-list lets `validate_yaml_params`
-    // pass them through to the dedicated emitter.
+    // The burst deadline rides the module record and the quarantine
+    // partner a TLV tag of `build_module_entry`'s. These are top-level
+    // module entries, not schema params, so the allow-list lets
+    // `validate_yaml_params` pass them through.
     "step_deadline_burst_us",
     "quarantine_partner",     // name form, resolved at wiring pass
     "quarantine_partner_idx", // numeric form passed straight through
@@ -2549,7 +2504,7 @@ fn expand_compound_yaml_fields(type_name: &str, module: &Value, config: &Value) 
 /// A module's u32 YAML setting (`step_deadline_us`,
 /// `step_deadline_burst_us`): `None` when absent or null, else the value
 /// range-checked as a u32. A non-integer or an overflowing value is an
-/// error, never a silent wrap or omission. Shared by the base-graph module
+/// error, never a silent wrap or omission. Shared by the node-graph module
 /// entry and the workload module record, so both read a setting the same
 /// way.
 fn yaml_u32_setting(module: &Value, key: &str, name: &str) -> Result<Option<u32>> {
@@ -2570,10 +2525,10 @@ fn yaml_u32_setting(module: &Value, key: &str, name: &str) -> Result<Option<u32>
     }
 }
 
-/// A module's `fault_policy` as its wire byte (the params TLV tag `0xF1`
-/// and the FLXA module record share the numbering: 0 skip, 1 restart,
-/// 2 restart_graph, 3 tolerate), or `None` when absent or null.
-fn yaml_fault_policy(module: &Value, name: &str) -> Result<Option<u8>> {
+/// A module's `fault_policy`, or `None` when absent or null.
+/// `restart_graph` is refused: a module's fault is the module's, and no
+/// policy reaches past it to the graph (SCH-08).
+fn yaml_fault_policy(module: &Value, name: &str) -> Result<Option<FaultPolicy>> {
     let Some(v) = module.get("fault_policy") else {
         return Ok(None);
     };
@@ -2583,22 +2538,38 @@ fn yaml_fault_policy(module: &Value, name: &str) -> Result<Option<u8>> {
     let policy_str = v.as_str().ok_or_else(|| {
         Error::Config(format!(
             "module '{name}': fault_policy must be a string \
-             (\"skip\" | \"restart\" | \"restart_graph\" | \"tolerate\"); got {v}"
+             (\"skip\" | \"restart\" | \"tolerate\"); got {v}"
         ))
     })?;
     match policy_str {
-        "skip" => Ok(Some(crate::add_subgraph::FAULT_POLICY_SKIP)),
-        "restart" => Ok(Some(crate::add_subgraph::FAULT_POLICY_RESTART)),
-        "restart_graph" => Ok(Some(crate::add_subgraph::FAULT_POLICY_RESTART_GRAPH)),
+        "skip" => Ok(Some(FaultPolicy::Skip)),
+        "restart" => Ok(Some(FaultPolicy::Restart)),
         // Overruns recorded but never fatal — for storage modules whose
         // synchronous device ops have a legitimate heavy tail. Step errors
         // still fault.
-        "tolerate" => Ok(Some(crate::add_subgraph::FAULT_POLICY_TOLERATE)),
+        "tolerate" => Ok(Some(FaultPolicy::Tolerate)),
+        "restart_graph" => Err(Error::Config(format!(
+            "module '{name}': fault_policy = 'restart_graph' is not a policy: a module's \
+             fault is its own, and no policy tears down the graph around it. Use \"skip\" \
+             to terminate the module, \"restart\" to run it again, or \"tolerate\" to \
+             record overruns without faulting"
+        ))),
         _ => Err(Error::Config(format!(
             "module '{name}': fault_policy = '{policy_str}' is invalid \
-             (use \"skip\", \"restart\", \"restart_graph\", or \"tolerate\")"
+             (use \"skip\", \"restart\", or \"tolerate\")"
         ))),
     }
+}
+
+/// A module's step budget as its YAML declares it, unchecked against any
+/// ceiling: the deadline, the burst deadline and the fault policy (`skip`
+/// when undeclared).
+fn yaml_step_budget(module: &Value, name: &str) -> Result<crate::add_subgraph::StepBudget> {
+    Ok(crate::add_subgraph::StepBudget {
+        deadline_us: yaml_u32_setting(module, "step_deadline_us", name)?.unwrap_or(0),
+        burst_us: yaml_u32_setting(module, "step_deadline_burst_us", name)?.unwrap_or(0),
+        fault_policy: yaml_fault_policy(module, name)?.unwrap_or_default(),
+    })
 }
 
 /// The step budget a workload module declares, admitted as the node's
@@ -2608,15 +2579,14 @@ fn yaml_fault_policy(module: &Value, name: &str) -> Result<Option<u8>> {
 ///   * `fault_policy` is `skip`, the one policy whose whole effect stays on
 ///     the faulting module: it terminates the module. `restart` releases the
 ///     module's provider layers and flushes its channels, which other owners
-///     may hold. `restart_graph` names the whole graph. `tolerate` records an
-///     overrun and lets the module run on, so the domain's other modules pay
-///     for every late step and the deadline it was admitted under never
-///     binds it. A workload is refused all three.
+///     may hold. `tolerate` records an overrun and lets the module run on, so
+///     the domain's other modules pay for every late step and the deadline it
+///     was admitted under never binds it. A workload is refused both.
 ///   * A declared `step_deadline_us` and the effective burst deadline
 ///     (`step_deadline_burst_us`, else `step_deadline_us ×
 ///     BURST_MULTIPLIER`) each fit `16 ×` the domain's shortest tick
 ///     (`tick_min_us` on an adaptive-cadence domain) and the absolute
-///     `HARD_BURST_CAP_US`. The burst rule is the base graph's
+///     `HARD_BURST_CAP_US`. The burst rule is the node graph's
 ///     (`validate_scheduler_budgets`); the step deadline is held to the
 ///     same ceiling because the kernel holds a workload to it.
 ///
@@ -2627,29 +2597,21 @@ pub(crate) fn workload_step_budget(
     config: &Value,
     label: &str,
 ) -> Result<crate::add_subgraph::StepBudget> {
-    let deadline = yaml_u32_setting(module, "step_deadline_us", label)?;
-    let burst = yaml_u32_setting(module, "step_deadline_burst_us", label)?;
-    let policy =
-        yaml_fault_policy(module, label)?.unwrap_or(crate::add_subgraph::FAULT_POLICY_SKIP);
-    if policy != crate::add_subgraph::FAULT_POLICY_SKIP {
+    let budget = yaml_step_budget(module, label)?;
+    if budget.fault_policy != FaultPolicy::Skip {
         return Err(Error::Config(format!(
             "{label}: fault_policy {} is not available to a workload module; a node admits a \
              workload only \"skip\", which terminates the faulting module and touches nothing \
              else. restart releases the module's provider layers and flushes its channels, \
-             which other owners may hold. restart_graph names the whole graph. tolerate \
-             records an overrun and lets the module run on, so the domain's other modules pay \
-             for every late step and the deadline it was admitted under never binds it.",
+             which other owners may hold. tolerate records an overrun and lets the module run \
+             on, so the domain's other modules pay for every late step and the deadline it was \
+             admitted under never binds it.",
             module
                 .get("fault_policy")
                 .map(|v| v.to_string())
                 .unwrap_or_default()
         )));
     }
-    let budget = crate::add_subgraph::StepBudget {
-        deadline_us: deadline.unwrap_or(0),
-        burst_us: burst.unwrap_or(0),
-        fault_policy: policy,
-    };
     if !budget.declares_deadline() {
         return Ok(budget);
     }
@@ -2803,7 +2765,7 @@ fn build_module_entry_in(
     let pre_pass = manifests.get(name).is_some_and(|m| m.pre_pass);
 
     // Track actual params length used
-    let params_len: usize;
+    let mut params_len: usize;
 
     // Some modules accept compound YAML fields that don't map 1:1 to
     // schema params (e.g. `broker: "host:port"` in mqtt). Expand them
@@ -2821,10 +2783,10 @@ fn build_module_entry_in(
     let pic_schema = schema::load_schema_for_entry(module, type_name, loc)?;
     // On a module whose schema declares `trust` (tls, quic) the key is a
     // trust-anchor source spec: validated against the schema with the
-    // other keys, then lifted out, since its value is resolved to a bundle
+    // other keys, then lifted out, since its value is resolved to an anchor bundle
     // (extended tag 12 below) and never packed as a string TLV. On any
     // other module `trust` keeps whatever meaning that module gives it —
-    // an ISR-tier module's `trust: platform` is a trust LEVEL, read by
+    // an interrupt-mode module's `trust: platform` is a trust LEVEL, read by
     // `board::validate_config`, and is left exactly as written.
     let declares = |key: &str| pic_schema.as_ref().is_some_and(|s| s.find(key).is_some());
     let normalized_module = normalize_peer_names(name, type_name, normalized_module, declares)?;
@@ -2878,8 +2840,8 @@ fn build_module_entry_in(
         params_len = 0;
     }
 
-    // Append protection / fault-policy params as reserved TLV tags
-    // (0xF0..0xFA). Parsed by the kernel scheduler during
+    // Append restart and protection params as reserved TLV tags
+    // (0xF2..0xFA). Parsed by the kernel scheduler during
     // instantiation via `parse_protection_config`.
     //
     // The schema packer writes a `0xFF 0x00` TLV end-marker at the
@@ -2891,6 +2853,12 @@ fn build_module_entry_in(
     // schema source (`params_len == 0`) don't have an end marker to
     // strip; one is added here only if at least one protection tag
     // fires, so a module declaring no policy stays at `params_len == 0`.
+    // Params with no schema TLV of their own start one, so the tags below
+    // sit after the same header every params blob has.
+    if params_len == 0 && entry.len() >= 4 {
+        entry[..4].copy_from_slice(&[0xFE, 0x01, 0, 0]);
+        params_len = 4;
+    }
     let mut extra_len = 0usize;
     let had_end_marker = params_len >= 2
         && entry.get(params_len - 2).copied() == Some(0xFF)
@@ -3003,28 +2971,8 @@ fn build_module_entry_in(
     // non-numeric case (string typos like `"forever"`) also rejects
     // explicitly so a malformed YAML value can't disable the field.
 
-    // Tag 0xF0: step_deadline_us (u32, 4 bytes)
-    if let Some(deadline) = yaml_u32_setting(module, "step_deadline_us", name)? {
-        if base + extra_len + 6 < entry.len() {
-            entry[base + extra_len] = 0xF0;
-            entry[base + extra_len + 1] = 4;
-            let bytes = deadline.to_le_bytes();
-            entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&bytes);
-            extra_len += 6;
-        }
-    }
-
-    // Tag 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph,
-    // 3=tolerate). Unknown policy strings error explicitly; the accepted
-    // set mirrors the kernel-side `FaultPolicy` enum.
-    if let Some(policy_val) = yaml_fault_policy(module, name)? {
-        if base + extra_len + 3 < entry.len() {
-            entry[base + extra_len] = 0xF1;
-            entry[base + extra_len + 1] = 1;
-            entry[base + extra_len + 2] = policy_val;
-            extra_len += 3;
-        }
-    }
+    // The step budget rides the module record, never the params.
+    let budget = yaml_step_budget(module, name)?;
 
     // Tag 0xF2: max_restarts (u16, 2 bytes)
     if let Some(v) = module.get("max_restarts") {
@@ -3080,20 +3028,14 @@ fn build_module_entry_in(
         }
     }
 
-    // Tags 0xF4 (trust tier) and 0xF5 (protection level), from the one
-    // resolution the validator admitted (`protection::resolve`): the level
+    // Tag 0xF5 (protection level), from the one resolution the validator
+    // admitted (`protection::resolve`), which a trust class implies: the level
     // emitted is the level the target PROVIDES — a `contained` request on a
     // target that implements only `isolated` is sent as `isolated` — so the
     // kernel enforces what the composer printed. A request the target cannot
     // meet was refused by the validator; it never reaches here.
     let resolved = crate::protection::resolve(module, config, &isolation.levels)
         .map_err(|e| Error::Config(format!("module '{name}': {e}")))?;
-    if base + extra_len + 3 < entry.len() {
-        entry[base + extra_len] = 0xF4;
-        entry[base + extra_len + 1] = 1;
-        entry[base + extra_len + 2] = resolved.tier as u8;
-        extra_len += 3;
-    }
     if base + extra_len + 3 < entry.len() {
         entry[base + extra_len] = 0xF5;
         entry[base + extra_len + 1] = 1;
@@ -3106,22 +3048,6 @@ fn build_module_entry_in(
     // reads each tag and routes to the appropriate setter. All tags
     // are optional; omit when the field isn't declared so module
     // graphs that opt out see no change.
-
-    // Tag 0xF6: step_deadline_burst_us (u32 LE, 4 bytes). Range-
-    // check the YAML value as u32 explicitly and reject non-numeric
-    // values. `validate_scheduler_budgets` also rejects out-of-range
-    // values, but `build_module_entry` runs in paths that bypass the
-    // validator (e.g. built-in packing tests); enforcing here too
-    // keeps the wire tag from ever being silently wrapped.
-    if let Some(burst_us) = yaml_u32_setting(module, "step_deadline_burst_us", name)? {
-        let burst = burst_us.to_le_bytes();
-        if base + extra_len + 6 < entry.len() {
-            entry[base + extra_len] = 0xF6;
-            entry[base + extra_len + 1] = 4;
-            entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&burst);
-            extra_len += 6;
-        }
-    }
 
     // Tag 0xF7: quarantine_partner (u16 LE module index).
     // Accepts either the partner's index directly (`quarantine_partner:
@@ -3222,7 +3148,7 @@ fn build_module_entry_in(
     }
 
     // Tag 0xFB: isr_budget_cycles (u32 LE, 4 bytes). Per-module
-    // Tier 1b/2 cycle budget override: the ISR budget guard trips a
+    // `timer`/`irq` cycle budget override: the ISR budget guard trips a
     // module whose handler exceeds it. Default `0` falls back to the
     // kernel's `DEFAULT_ISR_BUDGET_CYCLES`.
     if let Some(v) = module.get("isr_budget_cycles") {
@@ -3252,9 +3178,9 @@ fn build_module_entry_in(
     }
 
     // Tag 0xFC: irq (u16 LE, 2 bytes). Per-module hardware IRQ
-    // number for Tier 2 admission. Required for Tier 2 modules
-    // (`validate_isr_tier_admission` enforces); the kernel passes
-    // it to `register_tier2_module` at admission time.
+    // number for `irq` admission. Required for `irq` modules
+    // (`validate_interrupt_admission` enforces); the kernel passes
+    // it to `irq::register_module` at admission time.
     if let Some(v) = module.get("irq") {
         if !v.is_null() {
             let irq_num = match v.as_u64() {
@@ -3299,7 +3225,7 @@ fn build_module_entry_in(
     }
 
     // Emit the schema-section end marker `0xFF 0x00` here, after the
-    // protection tags (0xF0-0xFA) but BEFORE any extended cert/key
+    // protection tags (0xF2-0xFA) but BEFORE any extended cert/key
     // blobs. The schema SDK parser walks until it hits 0xFF and
     // ignores everything after; cert/key extended tags reuse low
     // tag numbers (10/11/12/13) that collide with real schema tags
@@ -3457,6 +3383,7 @@ fn build_module_entry_in(
         id,
         domain,
         pre_pass,
+        budget,
         params: entry,
     })
 }
@@ -3800,7 +3727,7 @@ mod tests {
         for ok in [
             "spiffe://example.org/peers/",
             "spiffe://example.org/workload/a",
-            "spiffe://cluster.test/tenant/peers/device/",
+            "spiffe://cluster.test/owner/peers/device/",
         ] {
             assert!(check_verify_uri(ok).is_ok(), "{ok}");
         }

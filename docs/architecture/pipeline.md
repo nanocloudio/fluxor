@@ -1,7 +1,8 @@
-# Graph Runner Architecture
+# Graph Pipeline Architecture
 
-The graph runner loads PIC modules into a runtime graph, opens channels
-between them, and steps them cooperatively in topological order. This
+The kernel loads PIC modules into a runtime graph, opens channels
+between them, and its domain loops step them cooperatively in
+topological order. This
 document describes the runtime model, the channel mechanics, the
 execution loop, and the lifecycle of modules and graphs.
 
@@ -19,18 +20,18 @@ execution loop, and the lifecycle of modules and graphs.
 Source: `src/kernel/exec/scheduler/mod.rs`
 
 ```
-Config (flash or boot image)              Runtime
------------------------------             -------
+Config (flash or firmware image)          Runtime
+--------------------------------          -------
 modules[]   ───────────────────►  ModuleSlot[] (state, hints, caps)
 edges[]     ───────────────────►  Edge[] with channel handles
 domains[]   ───────────────────►  Per-domain tick budget
-            ───────────────────►  setup() → graph instantiation → main loop
+            ───────────────────►  setup() → graph instantiation → domain loop
 ```
 
 A graph is a set of module instances and a set of directed edges that
 connect them. Each module is a `.fmod` artefact loaded from flash. Each
-edge becomes a kernel-allocated channel ring buffer. The runner steps
-all instantiated modules each iteration, in topological order, until
+edge becomes a kernel-allocated channel ring buffer. Each domain loop
+steps its domain's instantiated modules each pass, in topological order, until
 the graph reaches a terminal state, encounters a fault, or is asked to
 reconfigure.
 
@@ -95,7 +96,7 @@ The config tool enforces:
 ## Module Execution
 
 Source: `src/kernel/module/loader.rs`,
-`src/kernel/exec/scheduler/module_types.rs`
+`src/kernel/exec/scheduler/slot.rs`
 
 A module states its facts once, at the crate root, and implements its
 entry points:
@@ -121,7 +122,7 @@ Further capabilities are manifest facts or optional entry points:
 | `in_place_writer = true` | Declare safe in-place mailbox transformation |
 | `module_pipeline_refill` | Bounded input-refill hook called between steps |
 | `module_post_tick_flush` | TX-only flush hook called after the module pass |
-| `module_isr_entry` | Tier 2 ISR entry (see [scheduler.md](scheduler.md)) |
+| `module_isr_entry` | `irq`-mode interrupt entry (see [scheduler.md](scheduler.md)) |
 | `provider_contracts` + `module_provider_dispatch` / `module_provider_selector` | Provider contract surface (see [abi_layers.md](abi_layers.md)) |
 
 ### Step Outcome
@@ -181,25 +182,28 @@ This pattern keeps every module cooperative and predictable. There is
 no blocking syscall in the table; even DMA-backed transfers are
 expressed as start/poll pairs.
 
-## The Main Loop
+## The Domain Loop
 
-Source: `src/platform/rp.rs`, `src/platform/bcm2712.rs`
+Source: `src/kernel/exec/scheduler/pass.rs`, `src/platform/rp.rs`,
+`src/kernel/exec/domains/mod.rs`
 
-The kernel main loop on every target is the same shape:
+Every target's loop drives the one pass engine, `pass::run(domain,
+PassKind::Tick | PassKind::Wake(&mask))`, which returns the pass's result,
+the domain's next sleep deadline and whether work is still bursting. A
+single-core loop runs every domain in order:
 
 ```
 loop {
-    poll_gpio_edges();               // GPIO/IRQ → event signals
-    step_modules(modules, count);    // topological walk
-    if let wake = take_wake_pending() {
-        step_woken_modules(wake);    // intra-tick wake from events
-    }
-    sleep_until_tick_or_event();
-    if let wake = take_wake_pending() {
-        step_woken_modules(wake);    // post-sleep wake from ISR
-    }
+    poll_gpio_edges();                     // GPIO/IRQ → event signals
+    let pass = pass::tick_all();           // tick pass, every domain in order
+    pass::wake_all();                      // intra-tick wake from events
+    sleep_until(pass.deadline_us, wake);   // pacer deadline or an event
+    pass::wake_all();                      // post-sleep wake from ISR
 }
 ```
+
+A domain loop on its own core runs `pass::run(d, PassKind::Tick)` and
+then a wake pass over `pass::take_domain_wakes(d)` for its one domain.
 
 The "sleep until tick or event" step differs by target:
 
@@ -209,8 +213,9 @@ The "sleep until tick or event" step differs by target:
 | BCM2712 (Pi 5) | Synchronous wait on the chip's monotonic timer with interrupt unmasking |
 
 In both cases an event signal from an ISR or another module wakes the
-loop early: the sleep is bounded above by the configured tick period
-but can return immediately when there is work to do. See
+loop early: the sleep is bounded above by the deadline the tick pass
+returned (the graphs' pacers, bounded by the domain's armed timers) but
+can return immediately when there is work to do. See
 [events.md](events.md) for the event/wake contract.
 
 ## Channel-Based IPC
@@ -231,7 +236,7 @@ if ready & POLL_IN != 0 {
 
 A channel is a ring buffer between exactly one producer and one
 consumer. Fan-out and fan-in are handled by tee/merge helper modules
-inserted by the runner when wiring requires them: at boot for the graph,
+inserted by the composer when wiring requires them: at boot for the graph,
 and when a workload's subgraph is staged at runtime for the ports of that
 subgraph's own modules, by the same rules. The kernel allocates
 channel buffers from a dedicated buffer arena, separate from module
@@ -426,7 +431,7 @@ config's mailbox chains are consistent; a module without
 - At most one in-place transform per alias chain (the `processed` bit
   prevents double-processing)
 - No alias chain passes through a tee/merge helper. Over a port whose
-  content type is `Framed` (or a port declared `framed = true`) the runner
+  content type is `Framed` (or a port declared `framed = true`) the composer
   gives every edge around the helper a `buffer_group` of its own, so each
   is a mailbox and the helper moves one record per transfer; over any
   other port it clears `buffer_group` and the edges are FIFOs
@@ -504,11 +509,11 @@ emitting Ethernet frames, or fanning out an application event; see
 
 ## Tee and Merge
 
-Source: `src/kernel/exec/scheduler/wiring.rs`,
-`src/kernel/exec/scheduler/module_types.rs`
+Source: `contracts/src/graph/plan.rs`, `modules/foundation/tee`,
+`modules/foundation/merge`
 
 When the wiring connects one output to multiple inputs, or multiple
-outputs to one input, the runner inserts a helper module:
+outputs to one input, the composer inserts a helper module:
 
 ```
 Config:                Runtime:
@@ -520,11 +525,12 @@ A → C                  A → [merge] → C
 B → C                  B →
 ```
 
-Tee and merge are kernel-built modules (`TeeModule`, `MergeModule`)
-that share per-domain fan scratch buffers. They are not visible in the
-config, but the inserted instances do occupy module slots, so a
-heavily fanned graph consumes more of `MAX_MODULES` than its config
-lists.
+Tee and merge are foundation modules (`tee`, `merge`) the composer
+adds to the composed graph and to the image's module table; each takes
+scratch from its own heap, sized to the largest ring beside it. They are
+not visible in the config, but the inserted instances do occupy module
+slots, so a heavily fanned graph consumes more of `MAX_MODULES` than its
+config lists.
 
 A helper always copies, and what it copies per transfer is set by the
 fanned port's content type. Over a byte stream it moves whatever is
@@ -601,7 +607,6 @@ per-module fault policy:
 |--------|-----------|
 | `Skip` | Terminate the module; the graph continues without it |
 | `Restart` | Flush the module's channels and resume stepping. State is not zeroed and `module_new` is not re-called, so this is safe only for stateless or idempotent modules |
-| `RestartGraph` | Tear down and re-instantiate the entire graph |
 | `Tolerate` | Step-deadline overruns are recorded (fault counter, log, fault ring) but never fault the module; step errors still fault normally. Intended for modules whose synchronous device operations have a legitimate heavy tail, such as storage cache flushes |
 
 The same step guard catches modules that exceed their per-step time
@@ -613,14 +618,14 @@ machine.
 The scheduler supports updating a running graph through phases:
 
 ```
-RUNNING → DRAINING → MIGRATING → RUNNING
+RUNNING → DRAINING → RUNNING (rebuild)
 ```
 
 In `Draining`, modules with the `drain_capable` flag have `module_drain`
 called in reverse topological order. They stop accepting new work but
 keep stepping until in-flight work completes (or the drain timeout
-expires). In `Migrating`, the new graph's modules are instantiated and
-the scheduler swaps over. Surviving modules (same binary, same config,
+expires). The graph is then `Running` again while the new graph's modules
+are instantiated and the scheduler swaps over. Surviving modules (same binary, same config,
 same wiring) are preserved across the swap.
 
 This is what makes live config updates possible: an HTTP server can
@@ -631,9 +636,9 @@ drain protocol.
 
 ## Static Memory
 
-Source: `src/kernel/exec/scheduler/merge.rs`, `src/kernel/config.rs`
+Source: `src/kernel/exec/scheduler/state.rs`, `src/kernel/config.rs`
 
-The runner consolidates per-module arrays into a single
+The scheduler consolidates per-module arrays into a single
 `SchedulerState` struct held in a `static mut SCHED`: edges, module
 slots, ports, channel hints, arenas, capability classes, permissions,
 and drain state all live in one struct with a single `reset()`.

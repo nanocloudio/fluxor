@@ -1,4 +1,4 @@
-//! RP-family step guard + Tier-1b ISR hardware backends.
+//! RP-family step guard + `timer` ISR hardware backends.
 //!
 //! Which timer instance, alarm index and IRQ each owner gets is declared in
 //! the silicon TOML's `[kernel.timers]` ledger and generated into
@@ -144,70 +144,70 @@ pub unsafe extern "C" fn TIMER_IRQ_3() {
     guard::on_timer_irq();
 }
 
-use crate::kernel::exec::isr_tier;
+use crate::kernel::exec::timer;
 
 // ── RP2350 backend ────────────────────────────────────────────────────
 
-// ── Tier-1b cadence backend (one implementation, both chips) ─────────
+// ── `timer` cadence backend (one implementation, both chips) ─────────
 
-mod tier1b {
+mod module_timer {
     use super::*;
-    use crate::platform::chip::TIMER_ALARM_TIER1B as IDX;
+    use crate::platform::chip::TIMER_ALARM_MODULE_TIMER as IDX;
     use crate::platform::rp_timer::alarm;
 
     pub fn start(period_us: u32) {
-        isr_tier::set_tier1b_period_us(period_us);
+        timer::set_period_us(period_us);
         alarm::set_enabled(IDX, false);
         alarm::ack(IDX);
         alarm::set_target_from_now(IDX, period_us);
         alarm::set_enabled(IDX, true);
-        crate::arch::cortex_m::nvic_unmask(crate::platform::chip::TIMER_IRQ_TIER1B);
-        isr_tier::TIER1B_ACTIVE.store(true, portable_atomic::Ordering::Release);
+        crate::arch::cortex_m::nvic_unmask(crate::platform::chip::TIMER_IRQ_MODULE_TIMER);
+        timer::TIMER_ACTIVE.store(true, portable_atomic::Ordering::Release);
     }
 
     pub fn stop() {
         alarm::set_enabled(IDX, false);
         alarm::ack(IDX);
-        isr_tier::TIER1B_ACTIVE.store(false, portable_atomic::Ordering::Release);
+        timer::TIMER_ACTIVE.store(false, portable_atomic::Ordering::Release);
     }
 
     pub fn on_timer_irq() {
         // Acknowledge first: the cadence re-arms below, and a late ack would
         // clear the flag the re-armed alarm has just set.
         alarm::ack(IDX);
-        let period = isr_tier::tier1b_period_us();
-        if period > 0 && isr_tier::TIER1B_ACTIVE.load(portable_atomic::Ordering::Acquire) {
+        let period = timer::period_us();
+        if period > 0 && timer::TIMER_ACTIVE.load(portable_atomic::Ordering::Acquire) {
             alarm::set_target_from_now(IDX, period);
         } else {
             alarm::set_enabled(IDX, false);
             return;
         }
-        // SAFETY: invoked from the Tier-1b alarm ISR; `isr_tier1b_handler`
+        // SAFETY: invoked from the `timer` alarm ISR; `timer::handler`
         // documents itself as ISR-callable.
         unsafe {
-            isr_tier::isr_tier1b_handler();
+            timer::handler();
         }
     }
 }
 
 pub fn rp_isr_backend_start(period_us: u32) {
-    tier1b::start(period_us);
+    module_timer::start(period_us);
 }
 
 pub fn rp_isr_backend_stop() {
-    tier1b::stop();
+    module_timer::stop();
 }
 
 // ── ISR vector entry points ───────────────────────────────────────────
 
 /// # Safety
 /// ISR vector entry — invoked by the NVIC, never directly. Drives
-/// the Tier-1B periodic ISR backend; must not block or touch
+/// the `timer` periodic ISR backend; must not block or touch
 /// non-ISR-safe state.
 #[cfg(not(feature = "chip-rp2040"))]
 #[no_mangle]
 pub unsafe extern "C" fn TIMER1_IRQ_1() {
-    tier1b::on_timer_irq();
+    module_timer::on_timer_irq();
 }
 
 /// # Safety
@@ -216,5 +216,5 @@ pub unsafe extern "C" fn TIMER1_IRQ_1() {
 #[cfg(feature = "chip-rp2040")]
 #[no_mangle]
 pub unsafe extern "C" fn TIMER_IRQ_2() {
-    tier1b::on_timer_irq();
+    module_timer::on_timer_irq();
 }

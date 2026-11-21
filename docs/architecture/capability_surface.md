@@ -5,7 +5,7 @@ content types that type every channel, the capability and provider-contract
 registries that module manifests declare against, and the build-time
 validation the config tool applies to those declarations. It also describes
 platform stack expansion, the mechanism that turns a board-independent
-application config into a concrete driver-and-foundation module graph.
+graph config into a concrete driver-and-foundation module graph.
 
 ## Scope
 
@@ -152,10 +152,10 @@ Source: `contracts/src/lib.rs`.
 | 0 | `OctetStream` | Untyped byte stream: block I/O, file data, project-local protocols |
 | 1 | `Cbor` | CBOR-encoded structured data |
 | 2 | `Json` | JSON structured data |
-| 3 | `AudioSample` | Decoded sample-domain audio (PCM) |
+| 3 | `AudioSample` | Decoded audio samples (PCM) |
 | 4 | `TextPlain` | Plain text |
 | 5 | `TextHtml` | HTML text |
-| 6 | `VideoRaster` | Pixel-domain frames |
+| 6 | `VideoRaster` | Raw pixel frames |
 | 7 | `MeshEvent` | Mesh event payloads |
 | 8 | `MeshCommand` | Mesh command payloads |
 | 9 | `MeshState` | Mesh state payloads |
@@ -165,8 +165,8 @@ Source: `contracts/src/lib.rs`.
 | 13 | `FmpMessage` | FMP control messages (next / prev / toggle) |
 | 14 | `EthernetFrame` | Raw Ethernet frames |
 | 15 | `HciMessage` | Bluetooth HCI messages |
-| 16 | `AudioEncoded` | Codec-domain audio access units; codec identity travels in-band, never as a content-type fork |
-| 17 | `VideoEncoded` | Codec-domain video access units |
+| 16 | `AudioEncoded` | Encoded audio access units; codec identity travels in-band, never as a content-type fork |
+| 17 | `VideoEncoded` | Encoded video access units |
 | 18 | `VideoDraw` | Retained / replayable draw lists |
 | 19 | `VideoScanout` | Present-ready output to a paced display sink |
 | 20 | `MediaMuxed` | Combined AV / timing / container streams |
@@ -218,9 +218,9 @@ from the class.
 Source: `contracts/src/vocabulary.rs` (`CAPABILITY_NAMES`).
 
 The registry accepted in a manifest's `capabilities = [...]` list has two
-tiers sharing one namespace: hardware-facing roles (the role a module plays)
+kinds of name sharing one namespace: hardware-facing roles (the role a module plays)
 and service-level surfaces (the substitutable data a producer or consumer
-carries). Grammar is domain-leading lowercase dotted, with the role noun
+carries). Grammar is area-leading lowercase dotted, with the role noun
 before any refinement (`display.scanout.protected`). Quantities and limits
 are capability facts, not name segments.
 
@@ -245,11 +245,11 @@ Service-level surfaces (mirroring the content-type surface family):
 
 | Capability | Meaning |
 |------------|---------|
-| `audio.sample` | Decoded sample-domain audio |
-| `audio.encoded` | Codec-domain audio |
-| `video.encoded` | Codec-domain video |
+| `audio.sample` | Decoded audio samples |
+| `audio.encoded` | Encoded audio |
+| `video.encoded` | Encoded video |
 | `video.draw` | Draw-list video |
-| `video.raster` | Pixel-domain video |
+| `video.raster` | Raw pixel video |
 | `video.scanout` | Present-ready scanout stream |
 | `media.muxed` | Container-muxed media |
 | `media.path.protected` | End-to-end protected media path |
@@ -401,7 +401,7 @@ A few capabilities are properties of the platform rather than of any
 module: no manifest declares them, no graph wires them, and the kernel's
 HAL is what answers them at runtime. The composer answers them per target
 from the target-facts table, which also carries the vault's suite set and
-custody-tier ceiling for the same reason — the vault is a kernel contract
+custody ceiling for the same reason — the vault is a kernel contract
 class, per target, not a module.
 
 Two capabilities are answered this way: `time.wall` and `trust.system`.
@@ -649,13 +649,13 @@ inserts TLS / DTLS silently, invents anchors, or promotes `resumable` to
 Source: `tools/src/stack_expand.rs`, `stacks/*.toml`,
 `tools/src/target.rs`.
 
-Stack expansion is how a board-independent application config acquires its
+Stack expansion is how a board-independent graph config acquires its
 hardware substrate. A graph YAML's `platform:` section names the stacks it
 wants (`net`, `audio`, `display`, …); each is a profile under `stacks/`
 whose `[[variant]]` is selected by matching the board and target, and whose
 matching `[[overlay]]` blocks are applied on top. The selected variant
 injects concrete modules, wiring, params and services before the ordinary
-generation pipeline runs, so one application graph runs unchanged over
+generation pipeline runs, so one node graph runs unchanged over
 `virtio_net + ip` on qemu-virt and `rp1_gem + conn_guard + ip` on a Pi 5.
 [stacks.md](stacks.md) describes platform stacks in full, beside the
 published stacks a graph includes by name.
@@ -682,14 +682,14 @@ by platform stack expansion, and application wiring is explicit.
 - `storage_capability_surface.md` — the storage surface family, the
   `Fence` axis, and multi-volume provider routing.
 - `av_capability_surface.md` and `input_capability_surface.md` — the AV
-  and input tiers of the capability registry.
+  and input names of the capability registry.
 - `mesh.md` — mesh events carry the same content-type identifiers as
   on-device channels, so intra-device ports and inter-device mesh bindings
   share one type vocabulary.
 - `hal_architecture.md` — the kernel-level primitives (GPIO, SPI, PIO,
   I2C) behind the `requires_contract` names.
 - `pipeline.md` — the runtime execution substrate. Stack expansion adds
-  modules and wiring before the runner sees the graph; injected modules
+  modules and wiring before the kernel sees the graph; injected modules
   are indistinguishable from user-declared ones at runtime.
 
 The machine-readable rename map for this vocabulary (old spelling to

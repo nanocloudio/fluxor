@@ -326,9 +326,9 @@ pub fn build_client_hello_ext(
 /// (RFC 6066 §3) when `sni` is non-empty.
 ///
 /// `sni` carries the DNS identity the caller also requires of the peer's
-/// certificate. Emitting a name selects which certificate a multi-tenant
-/// peer returns, so a client that sends one it does not then require would
-/// hold a handshake with a service it never asked to reach.
+/// certificate. Emitting a name selects which certificate a peer serving
+/// several names returns, so a client that sends one it does not then
+/// require would hold a handshake with a service it never asked to reach.
 #[allow(
     clippy::too_many_arguments,
     reason = "one ClientHello extension per argument; grouping them into a struct would move the same fields behind a name that adds nothing"

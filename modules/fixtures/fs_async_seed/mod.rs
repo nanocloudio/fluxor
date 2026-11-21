@@ -1,10 +1,10 @@
-//! fs_async_seed — write files through the fs contract's ASYNC fence tier,
+//! fs_async_seed — write files through the fs contract's ASYNC fence surface,
 //! on the device the graph is running on.
 //!
 //! `fat32_seed` proves the synchronous path (`FSYNC`, `FSYNC_NAME`). A
-//! store's flush uses the other tier — `FSYNC_SUBMIT` for a ticket,
+//! store's flush uses the other surface — `FSYNC_SUBMIT` for a ticket,
 //! `FSYNC_POLL` until it answers Durable — and the question a power cut asks
-//! of that tier is whether a NAME whose fence polled Durable is still in the
+//! of that surface is whether a NAME whose fence polled Durable is still in the
 //! directory afterwards. This fixture creates `count` files that way, one
 //! operation per step, logs each name as its fence lands, and ends with one
 //! verdict:

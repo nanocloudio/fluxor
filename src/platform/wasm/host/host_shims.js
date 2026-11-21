@@ -602,7 +602,7 @@ registerProcessor('pcm-ring', PcmRing);
           const entry = { reader: null, queue: [], eof: false, contentLength: -3, bytes: 0, consumed: 0, writeKey: null, staged: [] };
           fetches.set(handle, entry);
 
-          // The write tier comes first. `objStore` holds everything
+          // The write layer comes first. `objStore` holds everything
           // written through this shim (and everything hydrated from OPFS
           // or IndexedDB at boot), so a path written in this session or a
           // previous one reads back as itself rather than falling through
@@ -755,9 +755,9 @@ registerProcessor('pcm-ring', PcmRing);
     // provider call that returns EAGAIN and retries re-finds the same
     // in-flight request instead of issuing a duplicate fetch.
     //
-    // Read tier vs. write tier: `fetch()` + `asset://` are read-only and
+    // Read layer vs. write layer: `fetch()` + `asset://` are read-only and
     // serve shipped content. `host_object_put` adds the persistent write
-    // tier (save-states, imports) backed by OPFS. Writes land
+    // layer (save-states, imports) backed by OPFS. Writes land
     // synchronously in `objStore` (so an immediately-following read sees
     // them) and persist to OPFS in the background; `objStore` is also
     // hydrated from OPFS at boot. Reads consult `objStore` before
@@ -767,14 +767,14 @@ registerProcessor('pcm-ring', PcmRing);
     const rangeByKey = new Map(); // `${url}\0${off}\0${len}` -> handle
     let nextObjectHandle = 1;
 
-    // Persistent write tier: key -> Uint8Array. Source of truth for
+    // Persistent write layer: key -> Uint8Array. Source of truth for
     // reads of written/hydrated objects; OPFS is its durable backing.
     const objStore = new Map();
 
     // OPFS root directory handle (a promise that resolves to the handle,
     // or to null when the host has no OPFS — older browsers, Node tests
     // without a mock, private-mode quotas). All OPFS work awaits this and
-    // no-ops on null, so the provider degrades to the fetch read tier.
+    // no-ops on null, so the provider degrades to the fetch read layer.
     const opfsRootP = (typeof navigator !== 'undefined'
       && navigator.storage && typeof navigator.storage.getDirectory === 'function')
       ? Promise.resolve().then(() => navigator.storage.getDirectory()).catch((err) => {
@@ -783,10 +783,10 @@ registerProcessor('pcm-ring', PcmRing);
         })
       : Promise.resolve(null);
 
-    // IndexedDB fallback persistence tier. OPFS (`navigator.storage`) only
+    // IndexedDB fallback persistence layer. OPFS (`navigator.storage`) only
     // exists in SECURE contexts — over plain-http (a LAN-IP dev box, the
     // same constraint that forces the ScriptProcessor audio fallback) it is
-    // absent entirely, so an OPFS-only write tier silently loses every blob
+    // absent entirely, so an OPFS-only write layer silently loses every blob
     // on refresh and warm-boot consumers (the shell's catalog projection)
     // cold-scan forever. IndexedDB works in insecure contexts and Workers.
     // OPFS is preferred when present; IDB enumeration (a key cursor) is
@@ -902,7 +902,7 @@ registerProcessor('pcm-ring', PcmRing);
       });
     };
 
-    // Remove `key` from the persistent tier: the OPFS file and its entry
+    // Remove `key` from the persistent layer: the OPFS file and its entry
     // in the key index, or the IDB record when OPFS is absent. Runs on the
     // same chain as `opfsPersist` so a delete cannot race a write of the
     // same key, and so the index read-modify-write stays serialized.
@@ -970,7 +970,7 @@ registerProcessor('pcm-ring', PcmRing);
     const opfsHydrateP = Promise.allSettled([opfsHydrate(), idbHydrate()]).then(() => {});
 
     // ── namespace index (host_ns_*, storage.namespace enumeration) ───
-    // Directory enumeration over the SAME flat key space the object tier
+    // Directory enumeration over the SAME flat key space the object layer
     // writes (`objStore`, OPFS-backed) unioned with a fetched manifest of
     // shipped, immutable content. `/` is the hierarchy separator, so a
     // key "saves/tetris" makes LIST("") yield "saves" (namespace) and
@@ -983,7 +983,7 @@ registerProcessor('pcm-ring', PcmRing);
     const etagAlias = new Map();
     const manifestUrl = o.manifestUrl || 'fluxor-manifest.json';
     // Boot fetch of the shipped-content manifest: a JSON array of
-    // { key, size, mtime?, etag? }. Absent/garbled → the namespace tier
+    // { key, size, mtime?, etag? }. Absent/garbled → the namespace layer
     // serves objStore (user data) only. Returns its promise so startup can
     // wait for it.
     const manifestHydrateP = (function loadManifest() {
@@ -1119,7 +1119,7 @@ registerProcessor('pcm-ring', PcmRing);
           if (!objStore.has(rawKey) && !manifestIndex.has(rawKey) && etagAlias.has(rawKey)) {
             rawKey = etagAlias.get(rawKey);
           }
-          // Persistent write tier first: a PUT/hydrated key serves its
+          // Persistent write layer first: a PUT/hydrated key serves its
           // size from memory without a HEAD round-trip. Keyed by the raw
           // PUT key, before any fetch URL override.
           const stored = objStore.get(rawKey);
@@ -1177,7 +1177,7 @@ registerProcessor('pcm-ring', PcmRing);
           }
           const off = Number(offset);
           const len = Number(length);
-          // Persistent write tier first: serve the window straight from
+          // Persistent write layer first: serve the window straight from
           // the in-memory blob (same windowing as the asset:// branch).
           const stored = objStore.get(rawKey);
           if (stored !== undefined) {
@@ -1286,7 +1286,7 @@ registerProcessor('pcm-ring', PcmRing);
         return 0;
       },
 
-      // Write tier (OPFS). Stage the bytes synchronously so a following
+      // Write layer (OPFS). Stage the bytes synchronously so a following
       // read sees them, then persist to OPFS in the background. Returns 0
       // on acceptance, -1 on a hard failure (e.g. memory read fault).
       host_object_put: (keyPtr, keyLen, bodyPtr, bodyLen) => {
@@ -1305,11 +1305,11 @@ registerProcessor('pcm-ring', PcmRing);
         }
       },
 
-      // Remove a key from the write tier. Returns 0 when the key is gone
+      // Remove a key from the write layer. Returns 0 when the key is gone
       // (including when it was already absent — that is the state the
       // caller asked for) or -2 ENOENT when the key never existed here,
       // so a caller can tell "I removed something" from "there was
-      // nothing of mine to remove". Keys served only by the read tier
+      // nothing of mine to remove". Keys served only by the read layer
       // (shipped content behind fetch) are not deletable and report
       // ENOENT: this provider did not put them there.
       host_object_delete: (keyPtr, keyLen) => {
@@ -1324,7 +1324,7 @@ registerProcessor('pcm-ring', PcmRing);
             if (k.slice(0, k.indexOf('\0')) === key) rangeByKey.delete(k);
           }
           opfsForget(key);
-          return had ? 0 : -2; // ENOENT when this tier never held it
+          return had ? 0 : -2; // ENOENT when this layer never held it
         } catch (err) {
           console.error(`host_object_delete threw: ${err.message}`);
           return -22;
@@ -2171,7 +2171,7 @@ registerProcessor('pcm-ring', PcmRing);
     };
 
     // Bytes [off, off + len) of an object, resolved the way
-    // `host_object_range_open` resolves a key: the written tier, then
+    // `host_object_range_open` resolves a key: the written layer, then
     // `asset://`, then a ranged fetch of the origin. A short read rejects.
     // The Range header is built by concatenation: a host serving this file
     // through env substitution rewrites `${`.

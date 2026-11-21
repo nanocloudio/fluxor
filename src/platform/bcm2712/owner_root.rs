@@ -1,7 +1,7 @@
 //! Owner-rooted storage on bare metal: the `fs` contract for workloads.
 //!
-//! A workload is a tenant of the node. The node's file system (`fat32` over
-//! the board's NVMe, a system-owned provider layer) serves the node alone —
+//! A workload runs on the node for its owner. The node's file system (`fat32` over
+//! the board's NVMe, a node-owned provider layer) serves the node alone —
 //! `provider::layer_visible` — so a workload's `fs` call reaches the
 //! platform's kernel-registered provider instead: this one. It answers the
 //! call inside a root of the workload's own, the same root Linux gives it
@@ -78,7 +78,7 @@ use crate::abi::contracts::storage::fs as op;
 use crate::kernel::exec::scheduler;
 use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
-use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
+use crate::kernel::workload::owner::{OwnerHandle, OWNER_NODE};
 use crate::kernel::workload::storage::{
     file_cost, may_hold_storage, ENTRY_COST, OWNER_MAX_OPEN_FILES,
 };
@@ -386,7 +386,7 @@ const PENDING_EMPTY: Pending = Pending {
 #[derive(Clone, Copy)]
 struct Root {
     phase: Phase,
-    /// The owner it serves; the system owner once released.
+    /// The owner it serves; the node owner once released.
     owner: OwnerHandle,
     name: Name,
     /// The name is an identity in hex (not a name a sweep found).
@@ -403,7 +403,7 @@ struct Root {
 
 const ROOT_EMPTY: Root = Root {
     phase: Phase::Free,
-    owner: OWNER_SYSTEM,
+    owner: OWNER_NODE,
     name: Name::EMPTY,
     hexed: false,
     found_tombstone: false,
@@ -429,7 +429,7 @@ struct Slot {
 
 const SLOT_EMPTY: Slot = Slot {
     in_use: false,
-    owner: OWNER_SYSTEM,
+    owner: OWNER_NODE,
     inner: -1,
     pos: 0,
     size: 0,
@@ -1250,7 +1250,7 @@ pub fn release(owner: OwnerHandle) {
                     scan_reset(scan);
                 }
                 let r = &mut rs[i];
-                r.owner = OWNER_SYSTEM;
+                r.owner = OWNER_NODE;
                 r.pend = [PENDING_EMPTY; MAX_PENDING];
                 r.then_setup = false;
                 match r.phase {

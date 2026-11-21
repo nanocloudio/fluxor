@@ -37,11 +37,11 @@ enum Commands {
     /// Emit forms (flash/deploy encodings — never store artifacts):
     ///   uf2       config UF2 for drag-drop flashing
     ///   bin       raw config binary
-    ///   combined  firmware + graph image in one UF2. Dev-flash
-    ///             convenience only: the graph image placed after the
+    ///   combined  firmware + node image in one UF2. Dev-flash
+    ///             convenience only: the node image placed after the
     ///             firmware is NOT an OTA path — OTA devices update
     ///             runtime modules exclusively through `--emit=image`.
-    ///   image     graph image (modules + config + header): the
+    ///   image     node image (modules + config + header): the
     ///             packaged deployable graph — what an RP flash A/B
     ///             graph slot holds and what an OTA device pulls;
     ///             excludes firmware. The ONLY sanctioned
@@ -91,7 +91,7 @@ enum Commands {
         #[arg(long)]
         sign_key: Option<PathBuf>,
         /// The signing root to write into the kernel image this build packs:
-        /// the 64-hex-digit public key modules and graph images must be
+        /// the 64-hex-digit public key modules and node images must be
         /// signed by. Without it the image takes the public key of the
         /// workspace's signing key (`$FLUXOR_SIGNING_KEY`, `[signing] key`),
         /// and without one it carries no root and verifies nothing.
@@ -142,8 +142,8 @@ enum Commands {
     Run {
         /// Config file (YAML), or `-` to read the config from stdin
         /// (heredoc-friendly; works with `--replicas` templates too); a
-        /// workload bundle (source manifest or bundle dir); or a bundle
-        /// name — the project's own `packaging/` bundle, else one its
+        /// workload package (source manifest or package dir); or a package
+        /// name — the project's own `packaging/` package, else one its
         /// `fluxor.lock` pins. Optional only when `--list` is given.
         config: Option<PathBuf>,
         /// Scenario only: dump the synthesised host graph YAML and exit.
@@ -186,7 +186,7 @@ enum Commands {
         /// applied uniformly to every replica. Repeat for multiple.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
-        /// One param value, typed by the graph's (or bundle's) declared
+        /// One param value, typed by the graph's (or package's) declared
         /// `params:`. Repeatable; overrides `--params`.
         #[arg(long = "param", value_name = "NAME=VALUE")]
         params: Vec<String>,
@@ -198,7 +198,7 @@ enum Commands {
         /// of every CLIENT-MODE `tls` / `quic` instance for this run. A
         /// server instance is never widened, whether or not it verifies
         /// its clients. Under `trust: system` they add to the platform's
-        /// store. A linux graph or a bundle only — not a scenario and not
+        /// store. A linux graph or a package only — not a scenario and not
         /// `--replicas`; there is no environment-variable form.
         #[arg(long, value_name = "PEM")]
         ca: Option<PathBuf>,
@@ -213,19 +213,19 @@ enum Commands {
         /// Program argv, after `--`. Forwarded to the graph's `cli_in`
         /// exactly as `fluxor exec` forwards an applet's, so a graph that
         /// takes arguments can be run from its source as well as from an
-        /// installed bundle. Linux graphs only: nothing else has an argv.
+        /// installed package. Linux graphs only: nothing else has an argv.
         #[arg(last = true)]
         args: Vec<String>,
     },
     /// Run an installed applet: resolve <NAME> through the applet catalogue
-    /// (or the project's `target/fluxor/<NAME>/` bundle) and exec its
-    /// cached bundle, passing everything after `--` to the app.
+    /// (or the project's `target/fluxor/<NAME>/` package) and exec its
+    /// cached package, passing everything after `--` to the app.
     Exec {
         /// Applet name.
         name: String,
         /// Append the certificates in this PEM file to the trust anchors
         /// of every CLIENT-MODE `tls` / `quic` instance for this run. A
-        /// server instance is never widened. The cached bundle is not
+        /// server instance is never widened. The cached package is not
         /// modified.
         #[arg(long, value_name = "PEM")]
         ca: Option<PathBuf>,
@@ -241,15 +241,15 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Register an applet: map a name to a workload bundle. Accepts
+    /// Register an applet: map a name to a workload package. Accepts
     /// an applet name (the project's own `packaging/applet/<name>/`,
-    /// else the bundle `fluxor.lock` pins under that name), a built
-    /// bundle dir, or a source manifest (`workload.toml` — emitted
+    /// else the package `fluxor.lock` pins under that name), a built
+    /// package dir, or a source manifest (`workload.toml` — emitted
     /// first).
     Install {
-        /// Applet name, bundle dir, or workload.toml.
-        bundle: PathBuf,
-        /// Applet name (default: the bundle's workload name).
+        /// Applet name, package dir, or workload.toml.
+        package: PathBuf,
+        /// Applet name (default: the package's workload name).
         #[arg(long)]
         name: Option<String>,
         /// Also drop a busybox symlink `<DIR>/<name> -> fluxor` so the
@@ -436,7 +436,7 @@ enum Commands {
     },
 
     /// A built kernel image's signing root: the public key its loader
-    /// verifies modules and graph images against. `fluxor build` writes it
+    /// verifies modules and node images against. `fluxor build` writes it
     /// into the bare-metal images it packs; these verbs read and write it in
     /// any kernel image, the Linux runtime binary among them.
     Image {
@@ -505,9 +505,9 @@ enum Commands {
     /// Bare `publish` sweeps everything the project ships, in dependency
     /// order: its sources; its fmods and runtimes; its stacks
     /// (`packaging/stack/<name>.yaml`), which record the module digests
-    /// they compose; and its bundles (`packaging/service/<name>/` and
+    /// they compose; and its packages (`packaging/service/<name>/` and
     /// `packaging/applet/<name>/`, which the `fluxor ci` packaging phase
-    /// checks), which may include those stacks. Every stack and bundle is
+    /// checks), which may include those stacks. Every stack and package is
     /// checked first, so one that cannot be published refuses the sweep
     /// before anything is written.
     ///
@@ -534,7 +534,7 @@ enum Commands {
         project_root: Option<PathBuf>,
         /// Print the displacement report — which manifests this publish
         /// would move off their tags, and which checkouts on this
-        /// machine still pin them — and the stacks and bundles the sweep
+        /// machine still pin them — and the stacks and packages the sweep
         /// would publish, and write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -550,7 +550,7 @@ enum Commands {
     /// (`<dep>/meta:latest`) and rewrite the `[[artifact]]` pin set —
     /// the dependencies' modules, sources and runtimes, plus every stack
     /// a graph includes by name (with the module references it carries)
-    /// and every bundle `[uses] bundles` lists. The deliberate "take
+    /// and every package `[uses] bundles` lists. The deliberate "take
     /// upstream's new state" verb — `sync` only re-resolves workspace
     /// members.
     Update {
@@ -566,7 +566,7 @@ enum Commands {
     /// Materialise `fluxor.lock` into the tree from the OCI store:
     /// fmods → `target/fluxor/<abi>/modules/`, source trees →
     /// `target/fluxor/<name>/`, runtimes → `target/<triple>/release/`,
-    /// bundles → `target/fluxor/bundles/<name>/`; a pinned stack, which
+    /// packages → `target/fluxor/bundles/<name>/`; a pinned stack, which
     /// the build reads from the store, is checked present and intact.
     /// Workspace members' pins re-resolve `:latest` (write-through);
     /// everyone else's pins replay verbatim. Digest- and
@@ -583,14 +583,14 @@ enum Commands {
     /// Maintain the local OCI artifact store
     /// (`$XDG_DATA_HOME/fluxor/store`, override `$FLUXOR_STORE`):
     /// `ls`, `rm`, `snapshot`, `push`, `pull`, `adopt`, `fsck`,
-    /// `gc`. Modules, stacks and workload bundles publish into it as OCI
+    /// `gc`. Modules, stacks and workload packages publish into it as OCI
     /// artifacts; consume paths read only from it (offline-first), and
     /// `push`/`pull` are the only verbs that touch the network.
     /// Read-only artifact display lives on `fluxor inspect <ref>`.
     Store(store_cli::StoreArgs),
 
     /// Export a graph's observability id-table as JSON: instrument names,
-    /// per-instrument kinds / histogram bounds / dimension domains, and the
+    /// per-instrument kinds / histogram bounds / dimension ranges, and the
     /// table digest carried by the FXTL batch envelope. `fluxor-collect`
     /// loads this file to resolve id-interned telemetry records; a digest
     /// mismatch there refuses resolution rather than reporting wrong names.
@@ -650,7 +650,7 @@ enum PublishAction {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Publish a built graph image (`fluxor build --emit=image`) as a
+    /// Publish a built node image (`fluxor build --emit=image`) as a
     /// device artifact: the packaged deployable graph a device pulls
     /// from a registry (`fluxor store push` serves it onward). Target,
     /// epoch and ABI pin are read from the FXSL header and mirrored as
@@ -660,7 +660,7 @@ enum PublishAction {
     /// devices fetch only what changed; `--packed` keeps the single
     ///-blob form (the RP flash-slot path's shape).
     Image {
-        /// The graph image file.
+        /// The node image file.
         file: PathBuf,
         /// Publish as one packed blob instead of exploded layers.
         #[arg(long)]
@@ -679,7 +679,7 @@ enum PublishAction {
         #[arg(long)]
         store: Option<PathBuf>,
     },
-    /// Publish a boot image (e.g. Pi 5 `kernel_2712.img`) as a device
+    /// Publish a firmware image (e.g. Pi 5 `kernel_2712.img`) as a device
     /// artifact for staging hosts (TFTP root, SD writers) to pull.
     Firmware {
         /// The firmware image file.
@@ -698,14 +698,14 @@ enum PublishAction {
         #[arg(long)]
         store: Option<PathBuf>,
     },
-    /// Publish a workload bundle into the local OCI store, under the
+    /// Publish a workload package into the local OCI store, under the
     /// project its tree belongs to. Takes a source manifest
     /// (`packaging/<service|applet>/<name>/workload.toml`, checked and
-    /// emitted first) or a bundle directory. The bundle
+    /// emitted first) or a package directory. The package
     /// carries the `.fmod` bytes of every module `workload.json` pins.
     Bundle {
-        /// Source manifest or bundle directory.
-        bundle: PathBuf,
+        /// Source manifest or package directory.
+        package: PathBuf,
         /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
         /// override with $FLUXOR_STORE).
         #[arg(long)]
@@ -742,7 +742,7 @@ enum PublishAction {
     /// Publish a workload image (`fluxor build <graph> --emit=workload -o
     /// <dir>`): a workload that brings its own modules, as a node pulls it.
     /// One layer per `.fmod`, so a module's layer digest is the sha256 pin
-    /// the kernel admits it by, plus the FLXA subgraph; target, module ABI
+    /// the kernel admits it by, plus the composed graph; target, module ABI
     /// and ABI-surface pin are annotations for pre-fetch admission.
     /// `fluxor store push` serves it onward.
     Workload {
@@ -898,7 +898,7 @@ pub enum AppletAction {
 
 #[derive(Subcommand)]
 enum LintAction {
-    /// AST-based hygiene scanner. Bans inline tests in tiers listed
+    /// AST-based hygiene scanner. Bans inline tests in the directories listed
     /// in `fluxor.toml::[ci.hygiene].forbid_inline_tests` and
     /// requires `reason = "..."` on every `#[allow(...)]`. Reports
     /// every violation in one pass.
@@ -1012,8 +1012,8 @@ enum ModulesAction {
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
     },
-    /// Inventory every module discovered under the tier directories —
-    /// `<tier>/<name>/manifest.toml`.
+    /// Inventory every module discovered under the layer directories —
+    /// `<layer>/<name>/manifest.toml`.
     ///
     /// A declaration-only manifest — a kernel-resident built-in, with
     /// no PIC artefact to build — is marked `entry=<builtin>` in the

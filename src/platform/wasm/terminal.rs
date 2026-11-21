@@ -1,4 +1,4 @@
-//! `wasm_browser_terminal` built-in: DOM scrollback widget that
+//! `wasm_browser_terminal` native module: DOM scrollback widget that
 //! drains the kernel log ring and renders each line into a `<pre>`
 //! element through the host shim. Same role the UART has on
 //! embedded targets — see the log strings flow at runtime without
@@ -16,7 +16,7 @@
 //! handles auto-scroll and line wrapping; this module just hands
 //! over UTF-8 bytes as they come off the ring.
 
-use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::module::syscalls;
 
 extern "C" {
@@ -58,12 +58,12 @@ unsafe fn alloc_state() -> *mut TerminalState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn terminal_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn terminal_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut TerminalState);
         if st_ptr.is_null() {
@@ -91,9 +91,18 @@ unsafe fn terminal_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build() -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_terminal", terminal_step);
-    let raw = alloc_state();
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut TerminalState, raw);
-    m
+/// The `wasm_browser_terminal` native module.
+pub static WASM_BROWSER_TERMINAL: NativeVtable = super::heap_native(new, terminal_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<TerminalState>(), || {
+            alloc_state().cast()
+        })
+    }
 }

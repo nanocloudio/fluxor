@@ -24,13 +24,11 @@
 // printed is still in flight when the process ends.
 
 use fluxor::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
-use fluxor::platform::builtin_param_tags::cli_in as cli_in_tags;
-use fluxor::platform::builtin_param_tags::cli_out as cli_out_tags;
+use fluxor::abi::platform::native::linux::cli_in as cli_in_tags;
+use fluxor::abi::platform::native::linux::cli_out as cli_out_tags;
 use portable_atomic::AtomicI32;
 use std::sync::Arc;
 
-const CLI_IN_HASH: u32 = 0x39EB09AD; // fnv1a32("cli_in")
-const CLI_OUT_HASH: u32 = 0xD0D89096; // fnv1a32("cli_out")
 
 /// Ring capacity per stream. Power of two, > frame header, several channel
 /// buffers deep so a slow consumer doesn't immediately stall the pump.
@@ -180,9 +178,9 @@ struct CliInState {
 const ARGS_WRITE_RETRIES: u32 = 20_000;
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn cli_in_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn cli_in_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `CliInState` by the loader.
     let st = unsafe { instance_state::<CliInState>(state) };
 
@@ -287,8 +285,7 @@ unsafe fn cli_in_step(state: *mut u8) -> i32 {
 
 /// Construct a `cli_in` built-in: read this process's argv/stdin. The stdin
 /// pump thread is spawned only when `stdin_out` is wired.
-fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
-    scheduler::set_current_module(module_idx);
+fn build_cli_in(module_idx: usize, _params: &[u8]) -> Result<Box<CliInState>, i32> {
     let args_out = scheduler::module_port(module_idx, cli_in_tags::PORT_ARGS_OUT);
     let stdin_out = scheduler::module_port(module_idx, cli_in_tags::PORT_STDIN_OUT);
 
@@ -319,11 +316,7 @@ fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
         eof.store(true, Ordering::Release);
         None
     };
-
-    let mut m = scheduler::BuiltInModule::new("cli_in", cli_in_step);
-    install_state(
-        &mut m,
-        Box::new(CliInState {
+    let st = Box::new(CliInState {
             args_out,
             stdin_out,
             args_sent: false,
@@ -332,13 +325,21 @@ fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
             pending: Vec::new(),
             pending_pos: 0,
             args_retries: 0,
-        }),
-    );
+        });
     log::info!(
         "[inst] module {module_idx} = cli_in (built-in) args_out={args_out} stdin_out={stdin_out}"
     );
-    m
+    Ok(st)
 }
+
+impl HostNative for CliInState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_cli_in(slot, params)
+    }
+}
+
+/// The `cli_in` native module.
+pub static CLI_IN: NativeVtable = host_vtable::<CliInState>(cli_in_step);
 
 // ── host stream I/O ─────────────────────────────────────────────────────────
 //
@@ -434,9 +435,9 @@ fn channel_drained(chan: i32) -> bool {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn cli_out_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn cli_out_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `CliOutState` by the loader.
     let st = unsafe { instance_state::<CliOutState>(state) };
 
@@ -549,19 +550,14 @@ fn spawn_sink(fd: i32, gone: &'static core::sync::atomic::AtomicBool) -> CliSink
 }
 
 /// Construct a `cli_out` built-in: own stdout/stderr and the exit-code latch.
-fn build_cli_out(module_idx: usize) -> scheduler::BuiltInModule {
-    scheduler::set_current_module(module_idx);
+fn build_cli_out(module_idx: usize, _params: &[u8]) -> Result<Box<CliOutState>, i32> {
     let bytes_in = scheduler::module_port(module_idx, cli_out_tags::PORT_BYTES_IN);
     let err_in = scheduler::module_port(module_idx, cli_out_tags::PORT_ERR_IN);
     let exit_in = scheduler::module_port(module_idx, cli_out_tags::PORT_EXIT_IN);
 
     let stdout_sink = (bytes_in >= 0).then(|| spawn_sink(libc::STDOUT_FILENO, &STDOUT_GONE));
     let stderr_sink = (err_in >= 0).then(|| spawn_sink(libc::STDERR_FILENO, &STDERR_GONE));
-
-    let mut m = scheduler::BuiltInModule::new("cli_out", cli_out_step);
-    install_state(
-        &mut m,
-        Box::new(CliOutState {
+    let st = Box::new(CliOutState {
             module_idx,
             bytes_in,
             err_in,
@@ -569,10 +565,18 @@ fn build_cli_out(module_idx: usize) -> scheduler::BuiltInModule {
             stdout_sink,
             stderr_sink,
             exited: false,
-        }),
-    );
+        });
     log::info!(
         "[inst] module {module_idx} = cli_out (built-in) bytes_in={bytes_in} err_in={err_in} exit_in={exit_in}"
     );
-    m
+    Ok(st)
 }
+
+impl HostNative for CliOutState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_cli_out(slot, params)
+    }
+}
+
+/// The `cli_out` native module.
+pub static CLI_OUT: NativeVtable = host_vtable::<CliOutState>(cli_out_step);

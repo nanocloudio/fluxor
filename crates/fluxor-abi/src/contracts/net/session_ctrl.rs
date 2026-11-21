@@ -37,7 +37,7 @@
 //
 // `session_id` is minted by the protocol owner at the continuity
 // boundary (anchor at first attach; resumption layer on reconnect).
-// It is scoped to a tenant or cluster continuity domain, not globally
+// It is scoped to one owner or one cluster continuity scope, not globally
 // unique across deployments. It does not have to appear on the public
 // wire.
 //

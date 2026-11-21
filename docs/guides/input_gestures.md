@@ -8,7 +8,7 @@ ordinary module connected by graph wiring:
 - application modules act on the commands
 
 This separation keeps control behaviour reusable across boards: the same
-application graph works whether the button is a GPIO switch, the BOOTSEL
+node graph works whether the button is a GPIO switch, the BOOTSEL
 button, or a browser tap.
 
 Source: `modules/foundation/gesture/`, `modules/drivers/button/`,
@@ -60,8 +60,8 @@ kernel-side action registry or dispatch table.
 - **Input modules**: source-specific edge and state capture. No
   application semantics.
 - **Gesture module**: timing and pattern recognition, command emission. No
-  domain side effects.
-- **Targets**: domain behaviour (playback, selection, toggles, mode
+  application side effects.
+- **Targets**: application behaviour (playback, selection, toggles, mode
   changes).
 
 Keeping control channels independent from bulk data channels prevents

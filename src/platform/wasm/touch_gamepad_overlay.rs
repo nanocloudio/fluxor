@@ -1,4 +1,4 @@
-//! `wasm_browser_touch_gamepad_overlay` built-in: transformer that
+//! `wasm_browser_touch_gamepad_overlay` native module: transformer that
 //! consumes `input::pointer::MSG_EVENT` and emits
 //! `input::gamepad::MSG_STATE`. On-screen virtual gamepad — touch
 //! contacts hit the configured regions and become W3C-standard
@@ -42,7 +42,9 @@
 //! params so per-graph custom layouts (a single big steering wheel,
 //! a dance-pad grid, etc.) can override.
 
+use crate::abi::platform::native::wasm::wasm_browser_touch_gamepad_overlay as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -191,12 +193,12 @@ fn composite_bits(active: &[ActivePointer; MAX_ACTIVE_POINTERS]) -> u16 {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn overlay_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn overlay_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut OverlayState);
         if st_ptr.is_null() {
@@ -301,9 +303,20 @@ unsafe fn overlay_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(in_chan: i32, out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_touch_gamepad_overlay", overlay_step);
-    let raw = alloc_state(in_chan, out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut OverlayState, raw);
-    m
+/// The `wasm_browser_touch_gamepad_overlay` native module.
+pub static WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY: NativeVtable = super::heap_native(new, overlay_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_EVENTS_IN);
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_EVENTS_OUT);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<OverlayState>(), || {
+            alloc_state(in_chan, out_chan).cast()
+        })
+    }
 }

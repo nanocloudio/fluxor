@@ -197,7 +197,7 @@ esac
 # inheritance rather than by verification.
 case "$SILICON" in
   rp2040|rp2350)
-    python3 tools/img/verify_boot_image.py "$SILICON" "target/$TARGET/firmware.bin" || exit 4
+    python3 tools/img/verify_firmware_image.py "$SILICON" "target/$TARGET/firmware.bin" || exit 4
     ;;
 esac
 

@@ -916,7 +916,7 @@ pub unsafe fn dtls_emit_from_driver(
     written
 }
 
-/// Bundle of all DTLS-side state owed by a single endpoint (one peer).
+/// All DTLS-side state owed by a single endpoint (one peer).
 /// A DTLS server keeps one of these per accepted client (keyed by
 /// peer addr); a DTLS client keeps exactly one. Reuses the existing
 /// HandshakeDriver verbatim — every TLS 1.3 handshake state, key

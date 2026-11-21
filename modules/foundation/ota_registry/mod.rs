@@ -1,4 +1,4 @@
-//! OTA registry puller — pull a graph image from an OCI distribution
+//! OTA registry puller — pull a node image from an OCI distribution
 //! registry and activate it through the kernel OTA staging surface.
 //!
 //! See manifest.toml for the wiring (net pair through `tls` in client

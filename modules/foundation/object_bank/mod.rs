@@ -9,7 +9,7 @@
 //! `storage.object::GET`/`RANGE_GET`. On the wasm host both resolve to
 //! the OPFS-backed `objStore` (plus a fetched manifest), so the shipped
 //! `bank → codec → audio_out` player runs against a *persistent,
-//! user-populatable* library instead of only bundle-baked `asset://`
+//! user-populatable* library instead of only the wasm bundle's `asset://`
 //! tracks. On any host with a `storage.namespace`+`storage.object`
 //! provider pair the same module works unchanged.
 //!

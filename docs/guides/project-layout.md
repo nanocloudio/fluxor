@@ -2,7 +2,7 @@
 
 Every fluxor project has one shape. What it ships lives under `packaging/`,
 and only there; what it references by name is pinned from what it depends
-on; and every graph, stack and bundle declares its params the same way.
+on; and every graph, stack and workload package declares its params the same way.
 
 Source: `tools/src/packaging.rs`, `tools/src/store_resolve.rs`
 (`references`), `tools/src/params.rs`, `tools/src/makefile_lint.rs`.
@@ -13,8 +13,8 @@ Source: `tools/src/packaging.rs`, `tools/src/store_resolve.rs`
   modules/                        fmods
   packaging/
     stack/<name>.yaml             published stacks
-    service/<name>/workload.toml  service bundles (graph beside it)
-    applet/<name>/workload.toml   applet (CLI) bundles
+    service/<name>/workload.toml  service packages (graph beside it)
+    applet/<name>/workload.toml   applet (CLI) packages
   …                               anything else: never published
 ```
 
@@ -25,11 +25,11 @@ Source: `tools/src/packaging.rs`, `tools/src/store_resolve.rs`
 1. source trees (`modules/common/**`, and fluxor's SDK and contracts);
 2. fmods and runtimes;
 3. stacks: `packaging/stack/*.yaml`, each named for the stack it holds;
-4. bundles: `packaging/service/*/workload.toml` and
-   `packaging/applet/*/workload.toml`, each directory named for its bundle.
+4. workload packages: `packaging/service/*/workload.toml` and
+   `packaging/applet/*/workload.toml`, each directory named for its package.
 
 One discovery finds 3 and 4, and `fluxor ci` checks exactly what it finds,
-the way the publish reads it: stacks render, and bundles' graphs, includes
+the way the publish reads it: stacks render, and workload packages' graphs, includes
 expanded and rendered with their params' defaults and examples, pass
 `fluxor build --check`. A directory with its own `fluxor.toml` or `.fluxor`
 is another project and ships its own. A stack document anywhere else is not
@@ -44,7 +44,7 @@ nothing.
 ## References are the pins
 
 A graph the project builds that includes `stack: <name>` references that
-stack. A bundle the project runs by name from a script, and the stack that
+stack. A workload package the project runs by name from a script, and the stack that
 fills each bound name (`stack: "@<name>"`) its graphs or a CLI verb use,
 are declared in `fluxor.toml`:
 
@@ -62,9 +62,9 @@ file_server = "static_files"     # what `fluxor run`'s browser host includes
 `fluxor update` resolves every reference through the projects in
 `[dependencies]` — their published indexes, `<dep>/meta:latest` — and
 writes the pin: the stack with the module references it carries, or the
-bundle. An update pins exactly the references the project makes, so a
+workload package. An update pins exactly the references the project makes, so a
 name it stops referencing has no pin after the next update. Stack and
-bundle names are unique across the ecosystem; a name two dependencies
+workload package names are unique across the ecosystem; a name two dependencies
 publish, or none does, is refused with the reason. A name the
 project ships itself resolves to its own `packaging/` and is never pinned.
 `fluxor sync` verifies and materialises the pins. Module pins come from each
@@ -81,11 +81,11 @@ than for what it ships (see
 
 ## Params
 
-A runnable graph, a stack and a bundle's graph each declare `params:` with
+A runnable graph, a stack and a workload package's graph each declare `params:` with
 one schema — `type` (`string`, `integer`, `boolean`, `file`), `default`,
 `required`, `min`, `max`, `description`, `example` — and name a value as
-`${param:<name>}`. A bundle's params are its graph's.
-[service-bundles.md](service-bundles.md) has the full rules.
+`${param:<name>}`. A package's params are its graph's.
+[workload-packages.md](workload-packages.md) has the full rules.
 
 ```sh
 fluxor run graph.yaml --param port=9100

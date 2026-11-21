@@ -3,19 +3,18 @@
 // Params declared in `modules/platform/wasm/host_asset_source/manifest.toml`:
 //   path: filesystem path to the asset (required, no default)
 // Its TLV tag is declared there too, and generated into
-// `builtin_param_tags`.
+// `abi::platform::native`.
 
 use std::fs::File;
 use std::io::Read;
 
-const HOST_ASSET_SOURCE_HASH: u32 = 0x504EEEF0; // fnv1a32("host_asset_source")
                                                 // Stay well below the smallest channel buffer (2 KB by default) — the
                                                 // kernel's ring `write` is all-or-nothing, so a chunk larger than the
                                                 // channel never gets written.
 const CHUNK_SIZE: usize = 1024;
 
-use fluxor::platform::builtin_param_tags::host_asset_source as asset_source_tags;
-use fluxor::platform::builtin_param_tags::host_asset_source::TAG_PATH as ASSET_TAG_PATH;
+use fluxor::abi::platform::native::linux::host_asset_source as asset_source_tags;
+use fluxor::abi::platform::native::linux::host_asset_source::TAG_PATH as ASSET_TAG_PATH;
 
 struct HostAssetState {
     out_chan: i32,
@@ -28,9 +27,9 @@ struct HostAssetState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn host_asset_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn host_asset_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `HostAssetState` by the loader.
     let st = unsafe { instance_state::<HostAssetState>(state) };
 
@@ -100,11 +99,9 @@ unsafe fn host_asset_step(state: *mut u8) -> i32 {
     0
 }
 
-/// Construct a `host_asset_source` BuiltInModule. Resolves params,
-/// opens the asset file, and stashes per-instance state in the
-/// bootstrap buffer so multiple `host_asset_source` modules in the
-/// same graph keep separate state.
-fn build_host_asset_source(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+/// Construct a `host_asset_source` instance: resolve its params and open the
+/// asset file. Each instance keeps its own state.
+fn build_host_asset_source(module_idx: usize, params: &[u8]) -> Result<Box<HostAssetState>, i32> {
     let mut path = String::new();
     walk_tlv(params, |tag, value| {
         if tag == ASSET_TAG_PATH {
@@ -114,8 +111,6 @@ fn build_host_asset_source(module_idx: usize, params: &[u8]) -> scheduler::Built
     // `path` carries `required = true` in the manifest, so an empty
     // string here means the loader skipped its TLV validation.
     debug_assert!(!path.is_empty(), "host_asset_source: empty path");
-
-    scheduler::set_current_module(module_idx);
     let out_chan = scheduler::module_port(module_idx, asset_source_tags::PORT_STREAM);
 
     let (file, eof) = match File::open(&path) {
@@ -128,20 +123,24 @@ fn build_host_asset_source(module_idx: usize, params: &[u8]) -> scheduler::Built
             (None, true)
         }
     };
-
-    let mut m = scheduler::BuiltInModule::new("host_asset_source", host_asset_step);
-    install_state(
-        &mut m,
-        Box::new(HostAssetState {
+    let st = Box::new(HostAssetState {
             out_chan,
             file,
             eof,
             pending: Vec::new(),
             pending_pos: 0,
-        }),
-    );
+        });
     log::info!(
         "[inst] module {module_idx} = host_asset_source (built-in) out={out_chan} path='{path}'"
     );
-    m
+    Ok(st)
 }
+
+impl HostNative for HostAssetState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_host_asset_source(slot, params)
+    }
+}
+
+/// The `host_asset_source` native module.
+pub static HOST_ASSET_SOURCE: NativeVtable = host_vtable::<HostAssetState>(host_asset_step);

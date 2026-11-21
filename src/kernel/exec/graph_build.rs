@@ -34,7 +34,8 @@ pub enum Step {
 /// Inherited from [`crate::kernel::exec::bare_metal::PendingBudget`], which
 /// is where the shared default lives; repeated here only so the walk can
 /// bound itself without the caller passing it in.
-pub const DEFAULT_PENDING_POLLS: u32 = 100;
+pub const DEFAULT_PENDING_POLLS: u32 =
+    crate::kernel::exec::bare_metal::PendingBudget::DEFAULT.max_polls;
 
 /// Cursor through a graph's module list.
 ///

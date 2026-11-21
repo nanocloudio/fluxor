@@ -28,10 +28,10 @@ everything it implements. For example, bcm2712 gives a `contained` request
 `isolated`. The level a module asks for comes from, in order:
 1. its own `protection:` key;
 2. the graph's `protection:`;
-3. the default for its trust tier (`default_trust_tier`).
+3. the default for its trust class (`default_trust_class`).
 
 The config carries the provided level, and the kernel enforces exactly that
-level. The loader refuses a gated module whose protection domain it cannot
+level. The loader refuses a gated module whose isolation region it cannot
 build; it never runs one privileged instead.
 
 A signature sets a floor the graph cannot lower. On a kernel image with a
@@ -124,7 +124,7 @@ graph whose gated modules the kernel would refuse:
 | A level above everything the target implements | No backend enforces it |
 | A permission that reaches past the gateway (`RECONFIGURE`, `FLASH_RAW`, `MONITOR`, `BRIDGE`, `PCIE_DEVICE`, `USB_HOST`, `PLATFORM_RAW`, `PLATFORM_DMA`) | The kernel would act on the module's behalf with authority it does not have |
 | Providing a contract | Other modules' calls would run its code privileged |
-| An interrupt-tier module (tier 1b, 2) | An ISR runs privileged with no gateway |
+| An interrupt-mode module (a `timer` or `irq` domain) | An ISR runs privileged with no gateway |
 | An `isolated` module whose code the model cannot draw as one region | Use `contained` |
 | More isolated modules than `isolated_slots` | The kernel's static table slots |
 | A stack deeper than the target bounds | See [Stack depth](module_architecture.md#stack-depth) |
@@ -202,7 +202,7 @@ On rp2350, ACCESSCTRL is a second layer under the MPU:
 
 The programs a graph gives a module instance (see
 [module_architecture.md](module_architecture.md#programs)) sit together in
-one region of the bundle's program section, and an isolated module is
+one region of the node image's program section, and an isolated module is
 granted exactly that region, read-only and never executable, so it reads
 them in place and reaches no other owner's:
 
@@ -232,12 +232,12 @@ stops: for example, a `privileged` module that never
 returns, which would also stop USB.
 - It is armed once the clocks are up. The boot and every graph build run
   under its longest timeout (about 8 s on rp2040 and 16 s on rp2350), and the
-  main loop feeds it with a 4 s timeout.
+  domain loop feeds it with a 4 s timeout.
 - A reset it causes brings the board up in BOOTSEL, so the board can be
   reflashed over USB without anyone touching it.
 - The stage the wedged boot reached is kept in a watchdog scratch register.
   The next boot reports it (`[boot] the previous boot wedged instantiating
-  module N`), which no log can: a wedge before the main loop never pumps USB.
+  module N`), which no log can: a wedge before the domain loop never services USB.
 - Deliberate reboots disarm it first.
 
 On bcm2712, each core's kernel stack sits above an unmapped 4 KiB guard page.

@@ -43,7 +43,7 @@ pub const POOL_TIMERS: u16 = 0x0006;
 pub const POOL_OWNERS: u16 = 0x0007;
 /// Scheduler module slot table (slots).
 pub const POOL_MODULE_SLOTS: u16 = 0x0008;
-/// Kernel elastic region (bytes) — Tier B chunk grants (`ELASTIC_ALLOC`).
+/// Kernel elastic region (bytes) — chunk grants (`ELASTIC_ALLOC`).
 pub const POOL_ELASTIC_REGION: u16 = 0x0009;
 /// Control-plane store subscriptions (slots): one per watched prefix per
 /// module. Derived from what the graph's store consumers declare.
@@ -126,9 +126,9 @@ pub const fn decode_entry(pool: u16, n: u32) -> u64 {
     }
 }
 
-// ── Tier B elastic-region chunk grants ─
+// ── Elastic-region chunk grants ─
 //
-// A module whose manifest pool supports Tier B grows it at runtime in
+// A module whose manifest pool supports elastic-region grants grows it at runtime in
 // whole chunks taken from the kernel's composer-reservable elastic
 // region — module state and heap arenas are committed at load, so
 // runtime elasticity has to come from a kernel-owned region.

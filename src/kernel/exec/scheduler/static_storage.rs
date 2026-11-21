@@ -20,7 +20,7 @@ pub unsafe fn static_loader() -> &'static ModuleLoader {
 }
 
 /// Mutable access to the static loader for platforms that initialize
-/// it themselves (e.g. Pi 5 reads the graph image after the kernel).
+/// it themselves (e.g. Pi 5 reads the node image after the kernel).
 ///
 /// # Safety
 /// Returns an exclusive `&mut` to `STATIC_LOADER`. Only sound during
@@ -169,9 +169,8 @@ pub unsafe fn populate_static_state_with_len(
 
 /// Maximum ports per direction (in/out/ctrl) per module. Sized for
 /// Quantum's session_processor, which multiplexes 7 logical input
-/// streams across 7 ports with fan-in expansion. `pub(super)` so
-/// `module_types` can size its `TeeModule::out_chans` /
-/// `MergeModule::in_chans` arrays from the same constant.
+/// streams across 7 ports with fan-in expansion; a graph's fans are 16
+/// wide for the same reason (`graph::MAX_PORT_INDEX`).
 pub(super) const MAX_PORTS: usize = 16;
 
 /// Per-module port assignments (replaces old MODULE_CHANNELS tuple)
@@ -196,28 +195,4 @@ impl ModulePorts {
             ctrl_count: 0,
         }
     }
-}
-
-/// Resolve a base-graph module's input-port channel by the module's config
-/// `name_hash`. `prepare_graph`
-/// places config module index N at scheduler slot N, so scanning
-/// `STATIC_CONFIG.modules` for the name_hash yields the slot whose port table we
-/// read. Used by the metal `workload` backend to find the shared ip module's
-/// `addr_ctl` port (`in[2]`) at CREATE. Returns the channel id, or `-1` when no
-/// base-graph module carries that name_hash or the port is unwired.
-/// Scheduler-thread only.
-pub fn resolve_module_input_channel(name_hash: u32, port_idx: u8) -> i32 {
-    // SAFETY: scheduler-thread read of STATIC_CONFIG (installed at boot, stable
-    // for the graph's lifetime). Live-added workload modules are appended to
-    // SCHED but not to STATIC_CONFIG, so this only ever resolves base-graph
-    // modules — exactly the shared-ip-module case the backend needs.
-    let cfg = unsafe { static_config() };
-    for (idx, entry) in cfg.modules.iter().enumerate() {
-        if let Some(e) = entry {
-            if !e.is_empty() && e.name_hash == name_hash {
-                return get_module_port(idx, 0 /* PORT_IN */, port_idx);
-            }
-        }
-    }
-    -1
 }

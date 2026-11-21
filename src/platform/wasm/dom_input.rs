@@ -1,4 +1,4 @@
-//! `wasm_browser_dom_input` built-in: keyboard input source that
+//! `wasm_browser_dom_input` native module: keyboard input source that
 //! pulls events from the host shim's queue (populated by DOM
 //! `keydown` / `keyup` listeners) and forwards them to the configured
 //! output channel as `InputBinaryState` snapshots.
@@ -13,7 +13,9 @@
 //! Mapper modules and emulator cores normalise this into the full
 //! `InputBinaryEvent` shape per `input_capability_surface.md`.
 
+use crate::abi::platform::native::wasm::wasm_browser_dom_input as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -54,12 +56,12 @@ unsafe fn alloc_state(out_chan: i32) -> *mut DomInputState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn dom_input_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn dom_input_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut DomInputState);
         if st_ptr.is_null() {
@@ -94,9 +96,19 @@ unsafe fn dom_input_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_dom_input", dom_input_step);
-    let raw = alloc_state(out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut DomInputState, raw);
-    m
+/// The `wasm_browser_dom_input` native module.
+pub static WASM_BROWSER_DOM_INPUT: NativeVtable = super::heap_native(new, dom_input_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_EVENTS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<DomInputState>(), || {
+            alloc_state(out_chan).cast()
+        })
+    }
 }

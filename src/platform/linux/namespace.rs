@@ -49,7 +49,7 @@ struct LinuxNsSlot {
 const NS_EMPTY: LinuxNsSlot = LinuxNsSlot {
     in_use: false,
     path: String::new(),
-    opener: fluxor::kernel::workload::owner::OWNER_SYSTEM,
+    opener: fluxor::kernel::workload::owner::OWNER_NODE,
 };
 
 static mut LINUX_NS_SLOTS: [LinuxNsSlot; NS_MAX_OPEN] = [NS_EMPTY; NS_MAX_OPEN];

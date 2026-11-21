@@ -421,7 +421,7 @@ pub const RTO_GRANULARITY_MS: u32 = 50;
 /// Maximum TCP connections (incl. LISTEN, ESTABLISHED, FIN_WAIT_*,
 /// TIME_WAIT). Each `TcpConn` is ~2.1 KiB (reorder_buf dominates).
 ///
-/// Tiered with the rest of the system: see `abi::config::ip` for
+/// Sized per board like the rest of the system: see `abi::config::ip` for
 /// the per-board profile. Tied to `http::MAX_CONCURRENT_CONNS` —
 /// the http module's slot count must not exceed this (compile-time
 /// invariant in `crates/fluxor-abi/src/config.rs`).

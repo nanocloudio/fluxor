@@ -1,471 +1,74 @@
 //! Scheduler responsibility module (real module boundary; parent statics and
-//! helpers reach us via `super`). Graph wiring: fan/port insertion + per-module instantiation.
+//! helpers reach us via `super`). Graph wiring: port tables and per-module
+//! instantiation.
 use super::*;
 
-/// Map a port's manifest `content_type` byte to a `FRAME_KIND_*`
-/// discriminant. Auto-inserted tee/merge fans must not split frames
-/// mid-payload — the consumer parser would read the body tail as a
-/// bogus header — so when this returns a non-NONE kind the fan
-/// switches to frame-aware transfer (peek length, drain full frame,
-/// write atomically to all outputs).
-pub fn port_frame_kind_from_content_type(content_type: u8) -> u8 {
-    use module_types::{
-        CONTENT_TYPE_ETHERNET_FRAME, CONTENT_TYPE_NET_PROTO, CONTENT_TYPE_TELEMETRY,
-        FRAME_KIND_ETH, FRAME_KIND_NET, FRAME_KIND_NONE, FRAME_KIND_TELEMETRY,
-    };
-    match content_type {
-        CONTENT_TYPE_ETHERNET_FRAME => FRAME_KIND_ETH,
-        CONTENT_TYPE_NET_PROTO => FRAME_KIND_NET,
-        CONTENT_TYPE_TELEMETRY => FRAME_KIND_TELEMETRY,
-        _ => FRAME_KIND_NONE,
-    }
+/// Which side of a module an edge is collected on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Out,
+    In,
 }
 
-/// Convert a `FanDirection` + ctrl bit into the manifest direction
-/// byte (0=input, 1=output, 2=ctrl_input). Mirrors the encoding
-/// produced by the manifest packer in `tools/src/manifest.rs`.
-fn manifest_direction_byte(dir: FanDirection, port_key: u8) -> u8 {
-    match dir {
-        FanDirection::Out => 1,
-        FanDirection::In => {
-            if (port_key & 0x10) != 0 {
-                2
-            } else {
-                0
-            }
-        }
-    }
-}
-
-/// A port's frame kind as its module's manifest declares it — `None` when
-/// the module has no manifest here (a host built-in) or names no such
-/// port, which is not the same as a port that declares a stream
-/// (`Some(FRAME_KIND_NONE)`).
-pub(crate) fn declared_port_frame_kind(
-    loader: &ModuleLoader,
-    name_hash: u32,
-    dir: FanDirection,
-    port_key: u8,
-) -> Option<u8> {
-    let direction_byte = manifest_direction_byte(dir, port_key);
-    let index = port_key & 0x0F;
-    let module = loader.find_by_name_hash(name_hash).ok()?;
-    let (ct, flags) = module.port_spec(direction_byte, index)?;
-    if module_types::port_is_framed(ct, flags) {
-        return Some(module_types::FRAME_KIND_RECORD);
-    }
-    Some(port_frame_kind_from_content_type(ct))
-}
-
-/// The frame kind of a fan whose fanned port declares none (a host
-/// built-in such as the stdout sink): the kind its peers across the fan
-/// declare, when every peer that declares one declares the SAME kind.
-///
-/// Peers that disagree — a `NetProto` producer and an `OctetStream` one
-/// merged into stdout — make it a byte fan (`FRAME_KIND_NONE`). A framed
-/// fan would read every peer's bytes as that one framing: an
-/// `OctetStream` producer's text parsed as `NetProto` headers names
-/// lengths no frame has, and the fan either waits forever for a frame that
-/// never completes or refuses the "malformed" one and stops — for every
-/// producer behind it, not just the odd one. The byte fan keeps each
-/// producer's writes whole (a cut-short lane is drained before another is
-/// read), which is all a sink that declares no framing can ask.
-/// Peers with no manifest here say nothing and are passed over; no peer
-/// that says anything leaves the fan a byte fan.
-pub fn agreed_frame_kind<I: IntoIterator<Item = Option<u8>>>(peers: I) -> u8 {
-    let mut agreed: Option<u8> = None;
-    for k in peers.into_iter().flatten() {
-        match agreed {
-            None => agreed = Some(k),
-            Some(a) if a == k => {}
-            Some(_) => return module_types::FRAME_KIND_NONE,
-        }
-    }
-    agreed.unwrap_or(module_types::FRAME_KIND_NONE)
-}
-
-/// The first `buffer_group` fan insertion may give an edge of its own
-/// (`ring_size::RECORD_FAN_GROUP_FIRST`, which the composer replays fans by).
-const RECORD_FAN_GROUP_FIRST: u8 = fluxor_contracts::ring_size::RECORD_FAN_GROUP_FIRST;
-
-/// A `buffer_group` no edge uses yet, for one edge around a record fan.
-///
-/// An edge in a group shares that group's channel with the group's other
-/// edges — the group IS the aliasing — so an edge that must be a mailbox of
-/// its own needs a group nobody else is in.
-pub(crate) fn fresh_record_group(edges: &[Edge]) -> Option<u8> {
-    (RECORD_FAN_GROUP_FIRST as usize..BUFFER_GROUPS)
-        .map(|g| g as u8)
-        .find(|g| !edges.iter().any(|e| e.buffer_group == *g))
-}
-
-/// Compute port grouping key for fan insertion.
-///
-/// Out: groups by from_port_index (one tee per output port).
-/// In: groups by (is_ctrl << 4) | to_port_index (separate merge per port+type).
-fn edge_port_key(edge: &Edge, direction: FanDirection) -> u8 {
-    match direction {
-        FanDirection::Out => edge.from_port_index,
-        FanDirection::In => {
-            let type_bit = if edge.is_ctrl() { 0x10 } else { 0x00 };
-            type_bit | edge.to_port_index
-        }
-    }
-}
-
-/// Whether the out-edges `group` of `module_idx` reach exactly the modules
-/// that feed its data input, each once.
-fn fan_pairs_with_inputs(
+fn collect_channels(
     edges: &[Edge],
-    edge_count: usize,
     module_idx: usize,
-    group: &[usize],
-) -> bool {
-    let feeds = |m: usize| {
-        edges
-            .iter()
-            .take(edge_count)
-            .any(|e| e.from_module == m && e.to_module == module_idx && !e.is_ctrl())
-    };
-    for (k, &ei) in group.iter().enumerate() {
-        let c = edges[ei].to_module;
-        if !feeds(c) || group[..k].iter().any(|&ej| edges[ej].to_module == c) {
-            return false;
-        }
-    }
-    edges.iter().take(edge_count).all(|e| {
-        e.to_module != module_idx
-            || e.is_ctrl()
-            || group.iter().any(|&ei| edges[ei].to_module == e.from_module)
-    })
-}
-
-/// Check if an edge connects to `module_idx` in the given direction.
-fn edge_matches_module(edge: &Edge, module_idx: usize, direction: FanDirection) -> bool {
-    match direction {
-        FanDirection::Out => edge.from_module == module_idx,
-        FanDirection::In => edge.to_module == module_idx,
-    }
-}
-
-/// Insert tee (fan-out) or merge (fan-in) modules where a single port has
-/// multiple edges.
-///
-/// Any `buffer_group` on edges that require a tee/merge is cleared and logged
-/// at error level. Aliased mailbox chains are incompatible with fan modules
-/// because in-place modification through a shared buffer would corrupt data
-/// for the other consumers/producers in the fan.
-fn insert_fan(
-    direction: FanDirection,
-    edges: &mut [Edge],
-    edge_count: &mut usize,
-    module_list: &mut ModuleList,
-    module_count: &mut usize,
-    loader: &ModuleLoader,
-) -> bool {
-    let original_count = *module_count;
-    let (internal_hash, name) = match direction {
-        FanDirection::Out => (INTERNAL_TEE_HASH, "tee"),
-        FanDirection::In => (INTERNAL_MERGE_HASH, "merge"),
-    };
-
-    // Scratch for one module's edges, sized to the edge table (the static
-    // profiles' compiled count, Linux's committed edges).
-    let edge_cap = edges.len();
-    let mut matching = crate::scratch![0usize; MAX_CHANNELS, edge_cap];
-    let mut processed = crate::scratch![false; MAX_CHANNELS, edge_cap];
-    let mut group = crate::scratch![0usize; MAX_CHANNELS, edge_cap];
-    for module_idx in 0..original_count {
-        let entry_id = match &module_list[module_idx] {
-            Some(entry) if !is_internal_module(entry) => entry.id,
-            _ => continue,
+    direction: Side,
+    ctrl_only: bool,
+    out: &mut [i32],
+) -> usize {
+    let mut count = 0;
+    for edge in edges.iter() {
+        let matches = match direction {
+            // A tap edge is written by the kernel's mirror, not the tapped
+            // module: it is never one of that module's outputs.
+            Side::Out => edge.from_module == module_idx && !edge.tap,
+            Side::In => edge.to_module == module_idx && edge.is_ctrl() == ctrl_only,
         };
-
-        // Collect all edges connecting to this module in the given direction
-        let mut match_count = 0;
-        for (i, edge) in edges.iter().take(*edge_count).enumerate() {
-            if edge_matches_module(edge, module_idx, direction) && match_count < matching.len() {
-                matching[match_count] = i;
-                match_count += 1;
-            }
-        }
-
-        if match_count <= 1 {
-            continue;
-        }
-
-        // Group edges by port key. Each unique key gets its own tee/merge.
-        // Invariant: every index in matching[0..match_count] is visited exactly once.
-        processed[..match_count].fill(false);
-        for start in 0..match_count {
-            if processed[start] {
-                continue;
-            }
-
-            let port_key = edge_port_key(&edges[matching[start]], direction);
-
-            // Collect all edges sharing this port key
-            let mut group_count = 0;
-            for j in start..match_count {
-                if !processed[j] && edge_port_key(&edges[matching[j]], direction) == port_key {
-                    group[group_count] = matching[j];
-                    group_count += 1;
-                    processed[j] = true;
+        // Producer reads `channel`; consumer reads `consumer_channel`
+        // when a platform bridge has split the edge, otherwise `channel`.
+        let chan_for_side = match direction {
+            Side::Out => edge.channel,
+            Side::In => {
+                if edge.consumer_channel >= 0 {
+                    edge.consumer_channel
+                } else {
+                    edge.channel
                 }
             }
-
-            if group_count <= 1 {
-                continue;
-            }
-
-            // A multi-outbound producer keeps one channel per edge when the
-            // consumers it fans out to are exactly the modules that produce
-            // into it: each reads only the events of what it asked for.
-            if direction == FanDirection::Out {
-                let producer_hash = module_list[module_idx]
-                    .as_ref()
-                    .map(|e| e.name_hash)
-                    .unwrap_or(0);
-                if is_multi_outbound(producer_hash)
-                    && fan_pairs_with_inputs(edges, *edge_count, module_idx, &group[..group_count])
-                {
-                    continue;
-                }
-            }
-
-            // Multi-inbound consumers keep one channel per edge (priority
-            // lanes) — no merge. Only data inputs (port_key without the
-            // ctrl bit) qualify; ctrl fan-in still merges.
-            if direction == FanDirection::In && (port_key & 0x10) == 0 {
-                let consumer_hash = module_list[module_idx]
-                    .as_ref()
-                    .map(|e| e.name_hash)
-                    .unwrap_or(0);
-                if is_multi_inbound(consumer_hash) {
-                    continue;
-                }
-            }
-
-            // Insert tee/merge module for this port group
-            if *edge_count + 1 > edges.len() {
-                log::error!(
-                    "[graph] pool 'channels' has no edge slot left for {name} module={entry_id}"
-                );
-                crate::kernel::sys::resource_ledger::deny(
-                    crate::abi::contracts::resource::POOL_CHANNELS,
-                );
-                return false;
-            }
-
-            // The tee/merge inherits the fanned-on module's domain so
-            // it runs in the same pump as the fan group it serves.
-            let (fan_domain, fan_name_hash) = match &module_list[module_idx] {
-                Some(e) => (e.domain_id, e.name_hash),
-                None => (0, 0),
+        };
+        if chan_for_side >= 0 && matches {
+            // Place at port index if it fits, otherwise append
+            let port_idx = match direction {
+                Side::Out => edge.from_port_index as usize,
+                Side::In => edge.to_port_index as usize,
             };
-            // Detect the fanned port's wire format from the module's
-            // manifest content_type. If the fanned module is a host
-            // built-in (no manifest), the peers across the fan say it —
-            // when they all say the same (`agreed_frame_kind`): a fan-in
-            // of mixed producers into an undeclared sink is a byte fan.
-            let fan_kind =
-                match declared_port_frame_kind(loader, fan_name_hash, direction, port_key) {
-                    Some(k) if k != module_types::FRAME_KIND_NONE => k,
-                    _ => agreed_frame_kind(group.iter().take(group_count).map(|&gi| {
-                        let edge = &edges[gi];
-                        let (peer_idx, peer_dir, peer_port_key) = match direction {
-                            FanDirection::Out => (
-                                edge.to_module,
-                                FanDirection::In,
-                                if edge.is_ctrl() { 0x10 } else { 0x00 } | edge.to_port_index,
-                            ),
-                            FanDirection::In => {
-                                (edge.from_module, FanDirection::Out, edge.from_port_index)
-                            }
-                        };
-                        let peer_hash = module_list[peer_idx].as_ref()?.name_hash;
-                        declared_port_frame_kind(loader, peer_hash, peer_dir, peer_port_key)
-                    })),
-                };
-            // A buffer group is aliasing: every edge in one shares one channel.
-            // No fan can keep that, since one producer feeding several
-            // consumers, or several producers one consumer, would do in-place
-            // work on a buffer every party sees at once.
-            //
-            // What the edges become depends on what the port carries. A
-            // record that states no length is whole only on a mailbox, so a
-            // record fan gives every edge around it a mailbox of its own and
-            // moves one record per transfer (`FRAME_KIND_RECORD`); on byte
-            // FIFOs a reader could not find where one record ends and the
-            // next begins. Every other kind is a byte stream or carries its
-            // own length, and its edges are FIFOs.
-            let record = fan_kind == module_types::FRAME_KIND_RECORD;
-            for &ei in group.iter().take(group_count) {
-                if record {
-                    let Some(g) = fresh_record_group(&edges[..*edge_count]) else {
-                        log::error!(
-                            "[graph] record fan module={module_idx} has no buffer group left"
-                        );
-                        return false;
-                    };
-                    edges[ei].buffer_group = g;
-                } else if edges[ei].buffer_group != 0 {
-                    log::error!(
-                        "[graph] fan module={} buffer_group={} cleared (incompatible)",
-                        module_idx,
-                        edges[ei].buffer_group
-                    );
-                    edges[ei].buffer_group = 0;
+            if port_idx < out.len() && out[port_idx] == -1 {
+                out[port_idx] = chan_for_side;
+                if port_idx >= count {
+                    count = port_idx + 1;
                 }
-            }
-
-            let fan_idx = match push_internal_module(
-                module_list,
-                module_count,
-                internal_hash,
-                fan_domain,
-                fan_kind,
-            ) {
-                Some(idx) => idx,
-                None => return false,
-            };
-
-            // Add bridge edge: original module ↔ fan module.
-            //
-            // For fan-IN, `port_key` is produced by `edge_port_key` which
-            // sets bit 0x10 when the consumer port is a *ctrl* input (see
-            // there). The merge→consumer bridge must therefore be a ctrl
-            // edge carrying the real (masked) port index — otherwise it
-            // is built as a data edge at index 0x10 (16), which both
-            // orphans the consumer's ctrl input AND lands a phantom data
-            // input at index 16 (≥ MAX_PORTS → "input port limit in=17").
-            let new_edge = match direction {
-                FanDirection::Out => {
-                    let mut e = Edge::simple(module_idx, fan_idx);
-                    e.from_port_index = port_key;
-                    e
-                }
-                FanDirection::In => {
-                    let is_ctrl_port = (port_key & 0x10) != 0;
-                    let real_port = port_key & 0x0f;
-                    let mut e = if is_ctrl_port {
-                        Edge::ctrl(fan_idx, module_idx)
-                    } else {
-                        Edge::simple(fan_idx, module_idx)
-                    };
-                    e.to_port_index = real_port;
-                    e
-                }
-            };
-            let mut new_edge = new_edge;
-            new_edge.retains_send = direction == FanDirection::Out
-                && group
-                    .iter()
-                    .take(group_count)
-                    .all(|&gi| edges[gi].retains_send);
-            if record {
-                let Some(g) = fresh_record_group(&edges[..*edge_count]) else {
-                    log::error!("[graph] record fan module={module_idx} has no buffer group left");
-                    return false;
-                };
-                new_edge.buffer_group = g;
-            }
-            edges[*edge_count] = new_edge;
-            *edge_count += 1;
-
-            // Rewire group edges to go through the fan module. The
-            // port indices on the rewritten edges must repack from 0
-            // (one slot per fanned consumer/producer) because the
-            // tee/merge module has only a single logical input/output
-            // port — `collect_channels` places channels at
-            // `from_port_index` / `to_port_index`, and if the original
-            // edges all carried the same source-side port index (e.g.
-            // every fan-out edge inheriting peer_router.raft_rpc's
-            // index 3) they would land in the same slot and overwrite,
-            // leaving the tee/merge with `out_chans[0..k] = -1` so its
-            // poll loop bails before it does any work.
-            for k in 0..group_count {
-                match direction {
-                    FanDirection::Out => {
-                        edges[group[k]].from_module = fan_idx;
-                        edges[group[k]].from_port_index = k as u8;
-                    }
-                    FanDirection::In => {
-                        edges[group[k]].to_module = fan_idx;
-                        edges[group[k]].to_port_index = k as u8;
-                        // The producer→merge hop is plain data into the
-                        // merge's inputs, regardless of whether the
-                        // original edge targeted a ctrl port — the merge
-                        // re-emits to the consumer's ctrl port via the
-                        // bridge edge above. Without clearing this, an
-                        // original ctrl edge keeps `to_port = "ctrl"`, so
-                        // `collect_input_channels` (data only) counts zero
-                        // merge inputs and the merge fails to install.
-                        edges[group[k]].to_port = "in";
-                    }
-                }
+            } else if count < out.len() {
+                out[count] = chan_for_side;
+                count += 1;
             }
         }
     }
-
-    true
+    count
 }
 
-pub(crate) fn insert_fan_out(
-    edges: &mut [Edge],
-    edge_count: &mut usize,
-    module_list: &mut ModuleList,
-    module_count: &mut usize,
-    loader: &ModuleLoader,
-) -> bool {
-    insert_fan(
-        FanDirection::Out,
-        edges,
-        edge_count,
-        module_list,
-        module_count,
-        loader,
-    )
+pub(crate) fn collect_output_channels(edges: &[Edge], module_idx: usize, out: &mut [i32]) -> usize {
+    collect_channels(edges, module_idx, Side::Out, false, out)
 }
 
-pub(crate) fn insert_fan_in(
-    edges: &mut [Edge],
-    edge_count: &mut usize,
-    module_list: &mut ModuleList,
-    module_count: &mut usize,
-    loader: &ModuleLoader,
-) -> bool {
-    insert_fan(
-        FanDirection::In,
-        edges,
-        edge_count,
-        module_list,
-        module_count,
-        loader,
-    )
+pub(crate) fn collect_input_channels(edges: &[Edge], module_idx: usize, out: &mut [i32]) -> usize {
+    // Only collect non-ctrl (data) input channels
+    collect_channels(edges, module_idx, Side::In, false, out)
 }
 
-pub(crate) fn validate_hardware_requirements(config: &RunnerConfig) -> bool {
-    let mut valid = true;
-
-    if !is_spi_initialized(config.spi_bus) {
-        log::error!("[boot] config spi bus={} not initialized", config.spi_bus);
-        valid = false;
-    }
-
-    // Log which buses are available (informational for debugging)
-    for bus in 0..2u8 {
-        if is_spi_initialized(bus) {
-            log::info!("[boot] spi{bus} available");
-        }
-    }
-    for bus in 0..2u8 {
-        if crate::kernel::module::syscalls::is_i2c_initialized(bus) {
-            log::info!("[boot] i2c{bus} available");
-        }
-    }
-
-    valid
+pub(crate) fn collect_ctrl_channels(edges: &[Edge], module_idx: usize, out: &mut [i32]) -> usize {
+    // Only collect ctrl input channels
+    collect_channels(edges, module_idx, Side::In, true, out)
 }
 
 /// Populate a module's port table from the compiled `sched.edges`.
@@ -595,39 +198,6 @@ pub fn instantiate_one_module(
         return InstantiateResult::Error(-1);
     }
 
-    if entry.name_hash == INTERNAL_TEE_HASH {
-        if in_count != 1 || out_count == 0 {
-            log::error!("[inst] tee module={} invalid ports", entry.id);
-            return InstantiateResult::Error(-1);
-        }
-        // Clamp to keep the index within `FAN_BUFS` even if an
-        // out-of-range `domain_id` slips past
-        // `compute_domain_exec_orders_static`.
-        let domain = (entry.domain_id as usize).min(MAX_DOMAINS - 1) as u8;
-        modules[instantiated] = ModuleSlot::Tee(TeeModule::new(
-            in_chans[0],
-            &out_chans,
-            out_count,
-            domain,
-            entry.frame_kind,
-        ));
-        return InstantiateResult::Done;
-    } else if entry.name_hash == INTERNAL_MERGE_HASH {
-        if out_count != 1 || in_count == 0 {
-            log::error!("[inst] merge module={} invalid ports", entry.id);
-            return InstantiateResult::Error(-1);
-        }
-        let domain = (entry.domain_id as usize).min(MAX_DOMAINS - 1) as u8;
-        modules[instantiated] = ModuleSlot::Merge(MergeModule::new(
-            &in_chans,
-            in_count,
-            out_chans[0],
-            domain,
-            entry.frame_kind,
-        ));
-        return InstantiateResult::Done;
-    }
-
     // Loader lookup
     let found_module = match loader.find_by_name_hash(entry.name_hash) {
         Ok(m) => m,
@@ -636,17 +206,7 @@ pub fn instantiate_one_module(
             return InstantiateResult::Error(-1);
         }
     };
-    let name = found_module.name_str();
-    let static_name = NameArena::intern(name);
-
-    // Validate integrity/signature BEFORE any module code runs or any
-    // manifest metadata is trusted. This is redundant with start_new's check
-    // by design: defense in depth at the two points where module code first
-    // becomes reachable.
-    if let Err(e) = crate::kernel::module::loader::validate_module(&found_module, static_name) {
-        e.log("validate");
-        return InstantiateResult::Error(-1);
-    }
+    let static_name = found_module.image_name();
 
     // Every module gets the same table; what it may call is decided per op
     // at dispatch (`check_grant`) from the grants recorded below.
@@ -735,6 +295,7 @@ pub fn instantiate_one_module(
         let r = unsafe {
             DynamicModule::start_new(
                 &found_module,
+                SCHED.module_signing[instantiated],
                 syscalls,
                 crate::kernel::module::loader::ChannelHandles {
                     in_chan,
@@ -758,16 +319,11 @@ pub fn instantiate_one_module(
             // SAFETY: scheduler-thread context; instantiated bounded.
             unsafe {
                 SCHED.step_period[instantiated] = found_module.header.step_period;
-                // Apply the manifest's `step_phase` as the initial
-                // counter value. With period P and phase φ, the first
-                // eligible tick is at `P - φ`, so coarse-period
-                // modules can be staggered to avoid convoy bursts.
-                // `step_phase < period` is validated by the loader;
-                // the clamp here is defense in depth so a malformed
-                // header can't index modulo 0.
+                // The manifest's `step_phase` staggers modules of one
+                // period (`step_phase < period`, validated by the loader).
                 let period = SCHED.step_period[instantiated];
                 let phase = found_module.header.step_phase;
-                SCHED.step_counter[instantiated] = if period > 0 { phase % period } else { 0 };
+                SCHED.step_phase[instantiated] = if period > 0 { phase % period } else { 0 };
             }
             return InstantiateResult::Pending(pending);
         }
@@ -784,7 +340,7 @@ pub fn instantiate_one_module(
         // See Pending arm above — same step_phase initialisation.
         let period = SCHED.step_period[instantiated];
         let phase = found_module.header.step_phase;
-        SCHED.step_counter[instantiated] = if period > 0 { phase % period } else { 0 };
+        SCHED.step_phase[instantiated] = if period > 0 { phase % period } else { 0 };
     }
 
     // Protection config is parsed inside `start_new`, BETWEEN heap
@@ -794,8 +350,8 @@ pub fn instantiate_one_module(
     InstantiateResult::Done
 }
 
-// Platform-specific graph setup and main loop functions have been moved
+// Platform-specific graph setup and domain loop functions have been moved
 // to their respective platform files (rp.rs, bcm2712.rs).
 // They use the pub(crate) accessors: prepare_graph(), instantiate_one_module(),
-// sched_mut(), sched_modules(), validate_buffer_groups(), compute_downstream_latency(),
-// step_modules(), step_woken_modules().
+// sched_mut(), validate_buffer_groups(), compute_downstream_latency(),
+// pass::run().

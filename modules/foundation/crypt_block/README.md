@@ -192,7 +192,7 @@ never reuses one.
 - **Reads:** a read that does not authenticate fails `EIO`. A discarded or
   never-written unit reads zeros.
 - **Rollback:** on a raw lower device the generations share the data's
-  rollback domain. They make crash recovery exact, and do not detect a
+  rollback scope. They make crash recovery exact, and do not detect a
   hostile restore of the whole device.
 - **Readiness:** `deferred_ready = true` holds consumers until the container
   mounts.

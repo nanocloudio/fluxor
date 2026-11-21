@@ -39,8 +39,7 @@ pub fn hold_idle() {
 ///
 /// Capturing the entry tick for `Draining` arms the kernel-side
 /// drain-timeout ceiling. Transitioning *out* of `Draining` clears
-/// the marker so a subsequent `Running → Migrating` transition (the
-/// normal happy path) doesn't false-trip the timeout.
+/// the marker so a later `Draining` starts its ceiling afresh.
 pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
     // SAFETY: reconfigure orchestrator runs on the scheduler thread.
     unsafe {
@@ -63,41 +62,6 @@ pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
 pub fn active_module_count() -> usize {
     // SAFETY: scheduler-thread read.
     unsafe { SCHED.active_module_count }
-}
-
-/// Return the number of modules currently in `exec_order` (the
-/// topologically-sorted list `step_modules` iterates). Exposed so tests
-/// and diagnostics can confirm `prepare_graph` populated it. Equals
-/// `active_module_count` after a clean graph prepare; >0 once any module
-/// has been ordered.
-pub fn exec_order_count() -> usize {
-    // SAFETY: scheduler-thread read.
-    unsafe { SCHED.exec_order_count }
-}
-
-/// Return the module slot scheduled at position `pos` in `exec_order`, or
-/// `None` if `pos` is past `exec_order_count`. Lets tests confirm a live
-/// mutation left existing modules at their original schedule positions.
-pub fn exec_order_slot(pos: usize) -> Option<ModuleId> {
-    // SAFETY: scheduler-thread read.
-    unsafe {
-        if pos < SCHED.exec_order_count {
-            Some(SCHED.exec_order[pos])
-        } else {
-            None
-        }
-    }
-}
-
-/// Platform hook: set the active module count. Called by platforms whose
-/// graph-setup path doesn't go through `prepare_graph` (e.g. the bcm2712
-/// domain-based instantiator) but which still want queries like
-/// `RECONFIGURE_MODULE_COUNT` to report the right value.
-pub fn set_active_module_count(n: usize) {
-    // SAFETY: scheduler-thread mutation.
-    unsafe {
-        SCHED.active_module_count = n;
-    }
 }
 
 /// Invoke `module_drain()` on module N. Returns the module's return code,
@@ -156,12 +120,15 @@ pub fn begin_stop_drain(waiting: &mut ModuleMask) -> usize {
             }
         }
     };
-    for pos in (0..sched.exec_order_count).rev() {
-        ask(sched.exec_order[pos] as usize, waiting);
-    }
-    // Slots outside the execution order (another resident graph's).
-    for i in (0..module_slots()).rev() {
-        ask(i, waiting);
+    // Each domain's order from its tail, then its pre-pass modules, which
+    // feed it.
+    for d in 0..MAX_DOMAINS {
+        for pos in (0..sched.domains[d].module_count as usize).rev() {
+            ask(usize::from(sched.domain_exec_order[d][pos]), waiting);
+        }
+        for pos in (0..sched.domains[d].pre_pass_count as usize).rev() {
+            ask(usize::from(sched.domains[d].pre_pass_order[pos]), waiting);
+        }
     }
     asked.count_ones() as usize
 }
@@ -219,47 +186,10 @@ pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
         return;
     }
     // SAFETY: heap-side caller runs on the scheduler thread (per the
-    // contract documented above: "policy runs next tick"); we only
-    // flip the fault-state machine here, finalisation happens later.
-    let sched = unsafe {
-        let p = &raw mut SCHED;
-        &mut *p
-    };
-    // SAFETY: DBG_TICK aligned u32 read.
-    let tick = unsafe { DBG_TICK };
-    let caused_by = detect_caused_by(sched, module_idx, tick);
-    let last_input_ct = last_input_content_type(module_idx);
-    sched.fault_info[module_idx].record_fault(fault_kind, tick);
-    let fi = &mut sched.fault_info[module_idx];
-    step_guard::push_fault(FaultRecord {
-        module_idx: module_idx as ModuleId,
-        fault_kind,
-        caused_by,
-        last_input_ct,
-        tick,
-        fault_count: fi.fault_count,
-        restart_count: fi.restart_count,
-    });
-    // Mark Faulted only if not already in a terminal / recovering
-    // state. Critically, do NOT call `finalize_module` here — that
-    // releases handles while the caller's `m.step()` frame may
-    // still be on the stack.
-    //
-    // Backoff is only armed for `FaultPolicy::Restart` (and only
-    // when the module is actually restartable). Skip / RestartGraph
-    // / exhausted-restart modules don't restart — leaving
-    // `backoff_remaining` at zero means the next `step_one_module`
-    // observes `Faulted + !can_restart()` and finalises immediately,
-    // instead of waiting through `restart_backoff_ms` ticks while
-    // channels and handles stay live.
-    if fi.state == FaultState::Running {
-        fi.state = FaultState::Faulted;
-        if fi.can_restart() {
-            fi.backoff_remaining = fi.effective_backoff_ticks();
-        } else {
-            fi.backoff_remaining = 0;
-        }
-    }
+    // contract documented above: "policy runs next tick"); only the fault
+    // state machine moves here, finalisation happens later.
+    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
+    super::fault::raise(sched, module_idx, fault_kind);
 }
 
 /// Module capability flag bitmask:

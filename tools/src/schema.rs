@@ -29,7 +29,7 @@ const TLV_END: u8 = 0xFF;
 // ============================================================================
 //
 // A workload module's param written `{env: NAME}` takes its value from the
-// workload's environment when the node creates it: the `env`/`var` Tier-2
+// workload's environment when the node creates it: the `env`/`var`
 // options of the workload `CREATE` (`abi::contracts::workload::env`). The
 // param is packed as an env bind record — the param's tag, its kind, whether
 // it is required, the name and any default — under the reserved tag
@@ -483,7 +483,7 @@ pub(crate) const SKIP_KEYS: &[&str] = &[
     "type",
     // `[[variant]]` selection — resolution input, never a wire param.
     "variant",
-    // Program blobs the module instance owns: packed into the bundle's
+    // Program blobs the module instance owns: packed into the image's
     // program section (`modules::collect_programs`), never a wire param.
     "program",
     "programs",

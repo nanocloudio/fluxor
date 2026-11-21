@@ -17,17 +17,14 @@
 //! Sections:
 //!
 //! ```text
-//! GRPH  module_count u16 | edge_count u16 | domain_count u8 | graph_flags u8
-//!       | tick_us u16 | graph_sample_rate u32
-//!       module × module_count:  entry_len u32 | name_hash u32 | id u16
-//!                               | domain u8 | flags u8 | params[entry_len - 12]
-//!       edge × edge_count:      from u16 | to u16 | ports u8 | kind u8
-//!                               | rate_class u8 | flags u8 | buffer_bytes u32
+//! GRPH  domain_count u8 | 0 u8 | tick_us u16 | graph_sample_rate u32
 //!       domain × domain_count:  tick_us u16 | tick_min_us u16 | tick_max_us u16
 //!                               | exec_mode u8 | adaptive_flags u8
+//!       the composed graph (`crate::graph`), owned by the system: no owner,
+//!       no caps, no flags
 //! HWRP  the platform's hardware payload, decoded by the platform that
 //!       declares one; the codec carries it as bytes
-//! WKLD  count u16 | (blob_len u32 | flags u8 | FLXA blob) × count
+//! WKLD  count u16 | (blob_len u32 | flags u8 | composed graph) × count
 //! ENVL  count u16 | (pool u16 | n u32) × count
 //! DMND  count u16 | (pool u16 | n u32) × count
 //! ```
@@ -74,39 +71,13 @@ pub mod tag {
 }
 
 /// Bytes of the graph section's own header.
-pub const GRAPH_HEAD_LEN: usize = 12;
-/// Bytes of a module record before its params.
-pub const MODULE_HEAD_LEN: usize = 12;
-/// Bytes of one edge record.
-pub const EDGE_LEN: usize = 12;
+pub const GRAPH_HEAD_LEN: usize = 8;
 /// Bytes of one domain record.
 pub const DOMAIN_LEN: usize = 8;
 /// Bytes of one envelope or demand entry.
 pub const POOL_ENTRY_LEN: usize = 6;
-/// Bytes of a workload record before its FLXA blob.
+/// Bytes of a workload record before its composed graph.
 pub const WORKLOAD_HEAD_LEN: usize = 5;
-
-/// `graph_flags` bit: the author attests that the graph's cycles are
-/// bidirectional feedback pairs, stepped in declaration order.
-pub const GRAPH_FLAG_ACCEPT_CYCLES: u8 = 0x01;
-const GRAPH_FLAGS_KNOWN: u8 = GRAPH_FLAG_ACCEPT_CYCLES;
-
-/// Module `flags` bit: the module runs in its domain's pre-pass.
-pub const MODULE_FLAG_PRE_PASS: u8 = 0x01;
-const MODULE_FLAGS_KNOWN: u8 = MODULE_FLAG_PRE_PASS;
-
-/// Edge `kind` bit: the edge ends on the consumer's control port.
-const EDGE_KIND_TO_CTRL: u8 = 0x80;
-/// The largest mailbox buffer group an edge names (5 bits; 0 = none).
-pub const MAX_BUFFER_GROUP: u8 = 31;
-/// The largest port index an edge names (4 bits).
-pub const MAX_PORT_INDEX: u8 = 15;
-
-/// Edge `flags` bit: a write on the edge wakes its consumer.
-pub const EDGE_FLAG_WAKE_ON_WRITE: u8 = 0x01;
-/// Edge `flags` bit: the consumer port keeps its own copy of what it sends.
-pub const EDGE_FLAG_RETAINS_SEND: u8 = 0x02;
-const EDGE_FLAGS_KNOWN: u8 = EDGE_FLAG_WAKE_ON_WRITE | EDGE_FLAG_RETAINS_SEND;
 
 /// Domain `adaptive_flags` bit: demand-driven idle.
 pub const ADAPTIVE_IDLE: u8 = 0x01;
@@ -119,17 +90,6 @@ pub const WORKLOAD_FLAG_IDLE_SAFE: u8 = 0x01;
 const WORKLOAD_FLAGS_KNOWN: u8 = WORKLOAD_FLAG_IDLE_SAFE;
 
 // ── Records ─────────────────────────────────────────────────────────────────
-
-/// One module of the graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ModuleRecord<'a> {
-    pub name_hash: u32,
-    pub id: u16,
-    pub domain: u8,
-    pub pre_pass: bool,
-    /// The module's params TLV, borrowed from wherever the record lives.
-    pub params: &'a [u8],
-}
 
 /// What an edge's ring is, for placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -144,39 +104,6 @@ pub enum EdgeClass {
     CrossCore = 2,
     /// A zero-copy NIC descriptor ring.
     NicRing = 3,
-}
-
-impl EdgeClass {
-    const fn from_bits(bits: u8) -> Self {
-        match bits & 0x03 {
-            1 => Self::DmaOwned,
-            2 => Self::CrossCore,
-            3 => Self::NicRing,
-            _ => Self::Local,
-        }
-    }
-}
-
-/// One edge of the graph.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EdgeRecord {
-    pub from: u16,
-    pub to: u16,
-    /// Producer port index, 0..=15.
-    pub from_port: u8,
-    /// Consumer port index, 0..=15.
-    pub to_port: u8,
-    /// The edge ends on the consumer's control port rather than its input.
-    pub to_ctrl: bool,
-    pub class: EdgeClass,
-    /// Mailbox buffer group, 0 (none) ..= 31.
-    pub buffer_group: u8,
-    /// Rate class (contracts `RateClass`).
-    pub rate_class: u8,
-    pub wake_on_write: bool,
-    pub retains_send: bool,
-    /// Requested ring bytes; 0 defers to the ports' capacities.
-    pub buffer_bytes: u32,
 }
 
 /// How a domain's modules are stepped. Two families: cooperative (`Tick`,
@@ -257,7 +184,7 @@ pub struct PoolEntry {
     pub n: u32,
 }
 
-/// One resident workload: its admission flags and its FLXA blob.
+/// One resident workload: its admission flags and its composed graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkloadRecord<'a> {
     pub idle_safe: bool,
@@ -312,6 +239,8 @@ pub enum DecodeError {
         offset: usize,
     },
     MissingGraph,
+    /// The graph section's composed graph is refused by its codec.
+    Graph(crate::graph::DecodeError),
     /// A section's payload disagrees with its own counts or holds a value
     /// outside its field.
     Malformed {
@@ -338,6 +267,7 @@ impl DecodeError {
             Self::Padding { .. } => "padding",
             Self::TrailingBytes { .. } => "trailing bytes",
             Self::MissingGraph => "no GRPH",
+            Self::Graph(e) => e.kind(),
             Self::Malformed { what, .. } => what,
         }
     }
@@ -357,6 +287,7 @@ impl DecodeError {
             | Self::Padding { tag, offset } => (tag, offset),
             Self::TrailingBytes { offset } => (0, offset),
             Self::Malformed { tag, .. } => (tag, 0),
+            Self::Graph(e) => (tag::GRAPH, e.detail()),
             Self::ReservedHeader | Self::MissingGraph => (0, 0),
         }
     }
@@ -429,6 +360,7 @@ impl core::fmt::Display for DecodeError {
             }
             Self::TrailingBytes { offset } => write!(f, "bytes after the last section at {offset}"),
             Self::MissingGraph => write!(f, "no GRPH section"),
+            Self::Graph(e) => write!(f, "section GRPH: {e}"),
             Self::Malformed { tag, what } => {
                 let n = name(tag);
                 write!(f, "section {}{}{}{}: {what}", n[0], n[1], n[2], n[3])
@@ -528,107 +460,32 @@ impl<'a> BootConfig<'a> {
 pub struct Graph<'a> {
     pub tick_us: u16,
     pub graph_sample_rate: u32,
-    pub graph_flags: u8,
-    module_count: u16,
-    edge_count: u16,
     domain_count: u8,
-    modules: &'a [u8],
-    edges: &'a [u8],
     domains: &'a [u8],
+    composed: crate::graph::ComposedGraph<'a>,
 }
 
 impl<'a> Graph<'a> {
     #[must_use]
-    pub const fn module_count(&self) -> u16 {
-        self.module_count
-    }
-
-    #[must_use]
-    pub const fn edge_count(&self) -> u16 {
-        self.edge_count
-    }
-
-    #[must_use]
     pub const fn domain_count(&self) -> u8 {
         self.domain_count
-    }
-
-    /// Bytes of params across every module record.
-    #[must_use]
-    pub fn params_bytes(&self) -> usize {
-        self.modules().map(|m| m.params.len()).sum()
-    }
-
-    /// The module records, in blob order.
-    #[must_use]
-    pub const fn modules(&self) -> Modules<'a> {
-        Modules {
-            bytes: self.modules,
-            left: self.module_count,
-        }
-    }
-
-    /// The edge records, in blob order.
-    pub fn edges(&self) -> impl ExactSizeIterator<Item = EdgeRecord> + 'a {
-        self.edges.chunks_exact(EDGE_LEN).map(read_edge)
     }
 
     /// The domain records, in domain-id order.
     pub fn domains(&self) -> impl ExactSizeIterator<Item = DomainRecord> + 'a {
         self.domains.chunks_exact(DOMAIN_LEN).map(read_domain)
     }
-}
 
-/// The module records of a validated graph section.
-#[derive(Clone, Debug)]
-pub struct Modules<'a> {
-    bytes: &'a [u8],
-    left: u16,
-}
-
-impl<'a> Iterator for Modules<'a> {
-    type Item = ModuleRecord<'a>;
-
-    fn next(&mut self) -> Option<ModuleRecord<'a>> {
-        if self.left == 0 {
-            return None;
-        }
-        self.left -= 1;
-        let len = le32(self.bytes, 0) as usize;
-        let (entry, rest) = self.bytes.split_at(len);
-        self.bytes = rest;
-        Some(ModuleRecord {
-            name_hash: le32(entry, 4),
-            id: le16(entry, 8),
-            domain: entry[10],
-            pre_pass: entry[11] & MODULE_FLAG_PRE_PASS != 0,
-            params: &entry[MODULE_HEAD_LEN..],
-        })
+    /// The composed graph: modules, edges and stepping order.
+    #[must_use]
+    pub const fn composed(&self) -> crate::graph::ComposedGraph<'a> {
+        self.composed
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (usize::from(self.left), Some(usize::from(self.left)))
-    }
-}
-
-impl ExactSizeIterator for Modules<'_> {}
-
-fn read_edge(r: &[u8]) -> EdgeRecord {
-    let ports = r[4];
-    let kind = r[5];
-    let flags = r[7];
-    EdgeRecord {
-        from: le16(r, 0),
-        to: le16(r, 2),
-        from_port: ports >> 4,
-        to_port: ports & 0x0F,
-        to_ctrl: kind & EDGE_KIND_TO_CTRL != 0,
-        class: EdgeClass::from_bits(kind >> 5),
-        buffer_group: kind & 0x1F,
-        rate_class: r[6],
-        wake_on_write: flags & EDGE_FLAG_WAKE_ON_WRITE != 0,
-        retains_send: flags & EDGE_FLAG_RETAINS_SEND != 0,
-        buffer_bytes: le32(r, 8),
+    /// Bytes of params across every module record.
+    #[must_use]
+    pub fn params_bytes(&self) -> usize {
+        self.composed.modules().map(|m| m.params.len()).sum()
     }
 }
 
@@ -805,45 +662,17 @@ fn decode_graph(p: &[u8]) -> Result<Graph<'_>, DecodeError> {
     if p.len() < GRAPH_HEAD_LEN {
         return Err(bad("shorter than its header"));
     }
-    let module_count = le16(p, 0);
-    let edge_count = le16(p, 2);
-    let domain_count = p[4];
-    let graph_flags = p[5];
-    if graph_flags & !GRAPH_FLAGS_KNOWN != 0 {
-        return Err(bad("unknown graph flag"));
+    let domain_count = p[0];
+    if p[1] != 0 {
+        return Err(bad("reserved byte is not zero"));
     }
-    let tick_us = le16(p, 6);
-    let graph_sample_rate = le32(p, 8);
-
-    let mut off = GRAPH_HEAD_LEN;
-    for _ in 0..module_count {
-        if p.len() - off < MODULE_HEAD_LEN {
-            return Err(bad("module record past the section"));
-        }
-        let len = le32(p, off) as usize;
-        if len < MODULE_HEAD_LEN || len > p.len() - off {
-            return Err(bad("module record length out of range"));
-        }
-        if p[off + 11] & !MODULE_FLAGS_KNOWN != 0 {
-            return Err(bad("unknown module flag"));
-        }
-        off += len;
+    let tick_us = le16(p, 2);
+    let graph_sample_rate = le32(p, 4);
+    let domains_end = GRAPH_HEAD_LEN + usize::from(domain_count) * DOMAIN_LEN;
+    if domains_end > p.len() {
+        return Err(bad("domain records past the section"));
     }
-    let modules = &p[GRAPH_HEAD_LEN..off];
-
-    let edges_len = usize::from(edge_count) * EDGE_LEN;
-    let domains_len = usize::from(domain_count) * DOMAIN_LEN;
-    if p.len() - off != edges_len + domains_len {
-        return Err(bad("edge and domain records disagree with the counts"));
-    }
-    let edges = &p[off..off + edges_len];
-    let domains = &p[off + edges_len..];
-    if edges
-        .chunks_exact(EDGE_LEN)
-        .any(|r| r[7] & !EDGE_FLAGS_KNOWN != 0)
-    {
-        return Err(bad("unknown edge flag"));
-    }
+    let domains = &p[GRAPH_HEAD_LEN..domains_end];
     if domains
         .chunks_exact(DOMAIN_LEN)
         .any(|r| r[7] & !ADAPTIVE_FLAGS_KNOWN != 0)
@@ -856,16 +685,17 @@ fn decode_graph(p: &[u8]) -> Result<Graph<'_>, DecodeError> {
     {
         return Err(bad("unknown execution mode"));
     }
+    let composed = crate::graph::decode(&p[domains_end..]).map_err(DecodeError::Graph)?;
+    let h = composed.header();
+    if h.flags != 0 || h.owner_uid != [0; 16] || h.state_cap != 0 || h.buffer_cap != 0 {
+        return Err(bad("the node graph names an owner, caps or flags"));
+    }
     Ok(Graph {
         tick_us,
         graph_sample_rate,
-        graph_flags,
-        module_count,
-        edge_count,
         domain_count,
-        modules,
-        edges,
         domains,
+        composed,
     })
 }
 
@@ -915,10 +745,10 @@ fn decode_pool_entries(t: u32, p: &[u8]) -> Result<PoolEntries<'_>, DecodeError>
 pub struct BootConfigSpec<'a> {
     pub tick_us: u16,
     pub graph_sample_rate: u32,
-    pub graph_flags: u8,
-    pub modules: &'a [ModuleRecord<'a>],
-    pub edges: &'a [EdgeRecord],
     pub domains: &'a [DomainRecord],
+    /// The composed graph; its owner, caps and authority flag are written
+    /// as the system's (zero) whatever the spec says.
+    pub graph: crate::graph::GraphSpec<'a>,
     /// The `HWRP` payload; `None` leaves the section out.
     pub hardware: Option<&'a [u8]>,
     /// `None` leaves the `WKLD` section out.
@@ -991,52 +821,11 @@ pub fn encode(spec: &BootConfigSpec<'_>) -> Result<Vec<u8>, EncodeError> {
 
 #[cfg(feature = "alloc")]
 fn encode_graph(spec: &BootConfigSpec<'_>) -> Result<Vec<u8>, EncodeError> {
-    if spec.graph_flags & !GRAPH_FLAGS_KNOWN != 0 {
-        return Err(EncodeError("graph flags"));
-    }
     let mut p = Vec::new();
-    p.extend_from_slice(&count_u16(spec.modules.len(), "module count")?.to_le_bytes());
-    p.extend_from_slice(&count_u16(spec.edges.len(), "edge count")?.to_le_bytes());
     p.push(u8::try_from(spec.domains.len()).map_err(|_| EncodeError("domain count"))?);
-    p.push(spec.graph_flags);
+    p.push(0);
     p.extend_from_slice(&spec.tick_us.to_le_bytes());
     p.extend_from_slice(&spec.graph_sample_rate.to_le_bytes());
-    for m in spec.modules {
-        let len = len_u32(MODULE_HEAD_LEN + m.params.len(), "module params")?;
-        p.extend_from_slice(&len.to_le_bytes());
-        p.extend_from_slice(&m.name_hash.to_le_bytes());
-        p.extend_from_slice(&m.id.to_le_bytes());
-        p.push(m.domain);
-        p.push(if m.pre_pass { MODULE_FLAG_PRE_PASS } else { 0 });
-        p.extend_from_slice(m.params);
-    }
-    for e in spec.edges {
-        if e.from_port > MAX_PORT_INDEX || e.to_port > MAX_PORT_INDEX {
-            return Err(EncodeError("edge port index"));
-        }
-        if e.buffer_group > MAX_BUFFER_GROUP {
-            return Err(EncodeError("edge buffer group"));
-        }
-        p.extend_from_slice(&e.from.to_le_bytes());
-        p.extend_from_slice(&e.to.to_le_bytes());
-        p.push((e.from_port << 4) | e.to_port);
-        p.push(
-            if e.to_ctrl { EDGE_KIND_TO_CTRL } else { 0 } | ((e.class as u8) << 5) | e.buffer_group,
-        );
-        p.push(e.rate_class);
-        p.push(
-            if e.wake_on_write {
-                EDGE_FLAG_WAKE_ON_WRITE
-            } else {
-                0
-            } | if e.retains_send {
-                EDGE_FLAG_RETAINS_SEND
-            } else {
-                0
-            },
-        );
-        p.extend_from_slice(&e.buffer_bytes.to_le_bytes());
-    }
     for d in spec.domains {
         if d.adaptive_flags & !ADAPTIVE_FLAGS_KNOWN != 0 {
             return Err(EncodeError("domain adaptive flags"));
@@ -1047,6 +836,18 @@ fn encode_graph(spec: &BootConfigSpec<'_>) -> Result<Vec<u8>, EncodeError> {
         p.push(d.exec_mode as u8);
         p.push(d.adaptive_flags);
     }
+    let system = crate::graph::GraphSpec {
+        creator_authority: false,
+        owner_uid: [0; 16],
+        state_cap: 0,
+        buffer_cap: 0,
+        ..spec.graph
+    };
+    let composed = crate::graph::encode(&system).map_err(|e| match e {
+        crate::graph::EncodeError::Field(what) => EncodeError(what),
+        crate::graph::EncodeError::BufferTooSmall { .. } => EncodeError("composed graph"),
+    })?;
+    p.extend_from_slice(&composed);
     Ok(p)
 }
 

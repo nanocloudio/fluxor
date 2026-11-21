@@ -178,7 +178,7 @@ pub fn timer_destroy(fd: i32) -> i32 {
 /// The kernel's side of "a timer is an fd": service every armed timer once
 /// per pacing pass. An expired timer whose owner has not yet been woken for
 /// this arming latches the owner's wake bit — exactly what `event_signal`
-/// does for an event — so `step_woken_modules` runs it and it finds
+/// does for an event — so a wake pass runs it and it finds
 /// `POLL_IN`. Bounded scan of `MAX_TIMERS` slots; the woken latch makes a
 /// fire an edge, not a level.
 ///

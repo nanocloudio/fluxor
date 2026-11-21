@@ -1,4 +1,4 @@
-//! Sys domain — HAL seam, critical-section guard, errno, kernel log ring,
+//! Sys — HAL seam, critical-section guard, errno, kernel log ring,
 //! resource ledger, wall-clock observation ledger.
 
 pub mod errno;

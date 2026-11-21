@@ -1,7 +1,7 @@
 # Foundation Modules Guide
 
 This guide describes the foundation layer in Fluxor: the portable
-modules that provide reusable domain capabilities (filesystem, network
+modules that provide reusable capabilities (filesystem, network
 protocol, network-plane hygiene, media control) without depending on
 hardware bus specifics.
 
@@ -10,7 +10,7 @@ Source: `modules/foundation/`.
 ## Purpose
 
 Driver modules provide hardware access. Foundation modules consume
-contracts produced by drivers and expose higher-level domain interfaces
+contracts produced by drivers and expose higher-level interfaces
 to app modules. App modules compose them into a workload.
 
 ## Architectural separation
@@ -40,7 +40,7 @@ Foundation modules do not assume board wiring or peripheral
 implementation details. If a module needs to know which SPI bus its
 data came from, it has crossed the line into being a driver.
 
-## Common domains
+## Common areas
 
 The foundation layer covers:
 
@@ -102,7 +102,7 @@ Foundation modules define clear behaviour for:
 ## Design guidance
 
 - keep foundation APIs narrow and explicit
-- separate transport concerns from domain policy
+- separate transport concerns from application policy
 - use status/control channels for observability and orchestration
 - avoid leaking driver-specific details into consumer contracts
 

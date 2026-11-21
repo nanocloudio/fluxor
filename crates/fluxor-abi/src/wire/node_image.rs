@@ -1,6 +1,6 @@
-// The graph image header.
+// The node image header.
 //
-// Every graph a kernel runs comes as one graph image: this 256-byte header,
+// Every graph a kernel runs comes as one node image: this 256-byte header,
 // the module table (with the graph's program section after it) and the static
 // config. The same header opens an RP flash A/B slot, an image staged in RAM
 // for OTA, the payload a combined firmware image carries after the kernel

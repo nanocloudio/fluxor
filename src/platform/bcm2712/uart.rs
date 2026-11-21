@@ -237,8 +237,8 @@ pub fn uart_raw_put_u32(mut n: u32) {
 // --- Platform debug drain (local UART) ---
 //
 // Normal-runtime path for kernel log output. Drains `log_ring` into
-// the UART via `DebugTx`, called from the core-0 main loop once per
-// scheduler tick (tier 0 / tier 1a). SPSC against the kernel log
+// the UART via `DebugTx`, called from the core-0 domain loop once per
+// pass. SPSC against the kernel log
 // path — single consumer. Panic / exception handlers do not use this
 // path; they hit the wire directly via `uart_raw_puts`.
 pub struct Bcm2712UartSink;
@@ -258,7 +258,7 @@ pub static mut DEBUG_SINK: Bcm2712UartSink = Bcm2712UartSink;
 pub fn debug_drain_poll_core0() {
     fluxor::arch::aarch64::exception::report_core_faults();
     // SAFETY: SPSC consumer on log_ring; only called from core 0 in
-    // the main loop or during boot before secondary cores wake.
+    // the domain loop or during boot before secondary cores wake.
     unsafe {
         let drain_p = &raw mut DEBUG_DRAIN;
         let sink_p = &raw mut DEBUG_SINK;

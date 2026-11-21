@@ -31,7 +31,7 @@ not electrical signal details.
 - bindings and timing policy are configuration-driven
 - control flow is decoupled from stream and data flow
 
-The same application graph works with different physical control hardware:
+The same node graph works with different physical control hardware:
 only the input driver at the front of the chain changes.
 
 ## Action abstraction
@@ -73,7 +73,7 @@ difference.
 - keep the action vocabulary stable and semantic
 - avoid hard-coding target-specific logic in input modules
 - keep gesture timing windows explicit so recognition is deterministic
-- separate immediate input feedback from domain-side actions when needed
+- separate immediate input feedback from application-side actions when needed
 
 ## Related documentation
 

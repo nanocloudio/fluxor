@@ -9,7 +9,7 @@ wrong layer = redraw before coding.
 | `kernel_abi` | `crates/fluxor-abi/src/kernel_abi.rs` | Every module (implicit) | Primitives the kernel owns: `SyscallTable`, channel, timer, buffer, event, log, random, arena, poll/errno, query keys, BIND_IRQ, STREAM_TIME |
 | `hal` | `crates/fluxor-abi/src/contracts/hal/*.rs` | Modules that claim the hardware contract in their manifest | Privileged hardware contracts — portable abstraction of peripherals (GPIO, SPI, I2C, PIO, UART, ADC, PWM, PCIe) |
 | stable module contracts | `crates/fluxor-abi/src/contracts/` (net, storage, key_vault, workload, input, telemetry, …) | Any consumer module | Portable module-provided contracts. Channel-served protocols live here too. |
-| `internal` | `crates/fluxor-abi/src/internal/*.rs`, `src/kernel/internal/*.rs` | Kernel and first-party orchestrator modules only | Kernel-private orchestration: bridge, fault monitor, reconfigure, flash raw, platform MMIO/DMA/PCIe. Not public; not an extension point. |
+| `internal` | `crates/fluxor-abi/src/internal/*.rs` | Kernel and first-party orchestrator modules only | Kernel-private orchestration: bridge, fault monitor, reconfigure, flash raw, platform MMIO/DMA/PCIe. Not public; not an extension point. |
 | `platform` | `crates/fluxor-abi/src/platform/`, `src/platform/*.rs` | Chip-specific drivers in `modules/drivers/`, plus the owning platform | Chip- and host-specific raw register bridges and layout constants. Not public; not portable. |
 
 Adding a new chip is a new `platform/<chip>/*` tree plus its hardware
@@ -145,7 +145,7 @@ First declared consumer: `modules/foundation/usb_midi_host`.
 `WORKLOAD` has two placement-resolved backends: an fmod-graph backend,
 which splices the workload's subgraph into the node's own graph under an
 owner and its leases, and a host-process backend (a host process in an
-isolation domain of its own, Linux). Creating and driving a workload needs the
+isolation region of its own, Linux). Creating and driving a workload needs the
 `workload.create` grant; the node's IP stack serves workloads' network lanes
 with `workload.net`.
 
@@ -163,8 +163,8 @@ it, and `LOOKUP` and `DESTROY` by identity, answer another owner's caller
 `EACCES`, while a caller acting with the node's authority acts on every
 workload. A `CREATE` staged across calls is the owner's that began it in
 the same way: another owner can neither continue, find nor abandon it, and
-the workload it ends in is that owner's whoever finishes it. A workload is a
-tenant of the node: both backends refuse the null identity (`EINVAL`),
+the workload it ends in is that owner's whoever finishes it. A workload runs
+for an owner of its own: both backends refuse the null identity (`EINVAL`),
 since everything keyed on an owner's identity would see every such
 workload as one. The graph backend refuses a subgraph any of whose modules
 holds a grant that reaches past the gateway (`reach = "kernel"` in the
@@ -333,7 +333,7 @@ the caller does not hold the grant for is refused (`EACCES`); a handle that
 is not the caller's is `EBADF`. The check runs on every path into a provider
 — by opcode class, by handle, by selector, by query key — and a gated
 module's calls through the gateway reach the same table. No module type,
-tier or name bypasses it.
+trust class or name bypasses it.
 
 | Op-level grant | Lets a module | Typical holder |
 |----------------|---------------|----------------|
@@ -666,7 +666,7 @@ One gate, `check_grant`, decides every `provider_*` call: the op's grant
 packs. An op answered by a handle's provider also needs that handle's
 contract. A module that declares nothing holds nothing beyond the free ops:
 no contract, no privileged family. This is what forces privilege to be
-declared explicitly rather than inherited by default — there is no tier and
+declared explicitly rather than inherited by default — there is no trust class and
 no module type that grants anything.
 
 ## Module categories
@@ -707,7 +707,7 @@ modules must not take this shape.
 
 ### App — sibling repositories
 
-Domain-specific compositions. Free to consume any foundation or
+Application-specific compositions. Free to consume any foundation or
 driver output over channels. App modules live in sibling
 repositories (grove, spectra, wave), built against the Fluxor SDK
 and loaded like any other PIC module. Examples: `codec`, `drum`,
@@ -718,7 +718,7 @@ and loaded like any other PIC module. Examples: `codec`, `drum`,
 Probes, load generators, and protocol-surface demonstration modules —
 built and loaded exactly like foundation/app PIC modules, but not
 part of the stable module vocabulary and never shipped in a product
-graph. Examples: `load_gen`, `test_fault`, `tier2_probe`, the
+graph. Examples: `load_gen`, `test_fault`, `irq_probe`, the
 `iso_*` EL0-isolation probes, the `nvme_*_probe` bring-up probes,
 `synth_source`, and the `echo_anchor`/`echo_worker` continuity-role
 demonstration pair. Keeping them out of `foundation/`
@@ -812,7 +812,7 @@ generic, substitutable surface. The payload schema inside it is
 sibling-owned. `EventTimelineVideo` / `EventTimelineAudio` are the
 canonical example: the surface declares "frame-aligned event stream,
 video/audio flavour" and receivers parse the sibling-defined inner
-packet; the producer's domain identity never enters the table. The GPU
+packet; the producer's application identity never enters the table. The GPU
 capabilities follow the same split (`gpu.render` / `gpu.compute` are
 central; renderer-level semantics live in the sibling that owns them).
 Any sibling that needs private semantics gets them this way — never by
@@ -865,10 +865,10 @@ Reopens if: Fluxor grows a public API audience for whom POSIX
 vocabulary actively misleads (e.g. an `fd` that stops behaving like a
 handle table).
 
-### Source organisation: domain directories
+### Source organisation: area directories
 
-Every kernel and SDK source file lives under a domain directory; there
-are no loose top-level implementation files. Domains are formed by
+Every kernel and SDK source file lives under an area directory; there
+are no loose top-level implementation files. Areas are formed by
 consolidating similar concerns into a small set of coherent
 directories (kernel: `boot exec ipc mem module security sys workload`;
 SDK: `abi contracts cores crypto internal platform runtime wire
@@ -881,15 +881,15 @@ machinery, path-referenced by `tools/src/abi_pin.rs` — see
 aggregator), `fence.rs` (a cross-cutting ABI value type at the `abi`
 root).
 
-A domain earns a new directory when a concern stops reading as one
-of the existing domains — prefer widening an existing domain over
+An area earns a new directory when a concern stops reading as one
+of the existing areas — prefer widening an existing area over
 minting a new one.
 
 ### Host-process semantics live outside the stable native surface
 
 The stable 0x1A workload contract carries only the native core
 (CREATE / START / WAIT / portable SIGNAL / DESTROY / PAUSE / RESUME /
-CAPS / OPTIONS plus the Tier-1 header). Host-process mechanics — READ / EXEC /
+CAPS / OPTIONS plus the header). Host-process mechanics — READ / EXEC /
 TTY_* opcodes, SOURCE_HOST_PROCESS and the process-executor class — live
 in the host-scoped class `abi::platform::linux::host_process`, registered
 only by the Linux platform; unregistered = `ENOSYS` = discovery.
@@ -918,7 +918,7 @@ workload CREATE source section carries explicit spawn params
 syscall filter, then length-prefixed rootfs, argv, env, cwd, user,
 numeric groups and, when flagged, the added capabilities — the layout at
 `abi::platform::linux::host_process::SOURCE_HOST_PROCESS`) rather than a
-bundle-directory path. Nanocloud owns the OCI→params mapping — the
+workload package directory path. Nanocloud owns the OCI→params mapping — the
 policy half — mirroring how the nanocloud CLI is built: a PIC fmod
 owning logic plus fluxor host built-ins for host facts.
 

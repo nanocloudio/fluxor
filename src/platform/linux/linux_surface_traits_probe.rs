@@ -6,9 +6,8 @@
 // production module — it is the live acceptance check (criterion 1) for the
 // Linux authority.
 
-use fluxor::platform::builtin_param_tags::linux_surface_traits_probe as surface_traits_probe_tags;
+use fluxor::abi::platform::native::linux::linux_surface_traits_probe as surface_traits_probe_tags;
 
-const LINUX_SURFACE_TRAITS_PROBE_HASH: u32 = 0xFADF_1AC6; // fnv1a32("linux_surface_traits_probe")
 const PROBE_EVENT_RECORD: usize = 24;
 
 struct LinuxSurfaceTraitsProbeState {
@@ -16,9 +15,9 @@ struct LinuxSurfaceTraitsProbeState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-owned per-instance arena for this module;
     // size-matched to `LinuxSurfaceTraitsProbeState` by the loader.
     let st = unsafe { instance_state::<LinuxSurfaceTraitsProbeState>(state) };
@@ -49,14 +48,18 @@ unsafe fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
     0
 }
 
-fn build_linux_surface_traits_probe(module_idx: usize) -> scheduler::BuiltInModule {
-    scheduler::set_current_module(module_idx);
+fn build_linux_surface_traits_probe(module_idx: usize, _params: &[u8]) -> Result<Box<LinuxSurfaceTraitsProbeState>, i32> {
     let in_chan = scheduler::module_port(module_idx, surface_traits_probe_tags::PORT_EVENTS);
-    let mut m = scheduler::BuiltInModule::new(
-        "linux_surface_traits_probe",
-        linux_surface_traits_probe_step,
-    );
-    install_state(&mut m, Box::new(LinuxSurfaceTraitsProbeState { in_chan }));
+    let st = Box::new(LinuxSurfaceTraitsProbeState { in_chan });
     log::info!("[inst] module {module_idx} = linux_surface_traits_probe (built-in, demo consumer; in_chan={in_chan})");
-    m
+    Ok(st)
 }
+
+impl HostNative for LinuxSurfaceTraitsProbeState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_surface_traits_probe(slot, params)
+    }
+}
+
+/// The `linux_surface_traits_probe` native module.
+pub static LINUX_SURFACE_TRAITS_PROBE: NativeVtable = host_vtable::<LinuxSurfaceTraitsProbeState>(linux_surface_traits_probe_step);

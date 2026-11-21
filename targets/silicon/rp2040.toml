@@ -331,7 +331,7 @@ timer_intr_offset = "0x34"
 timer_inte_offset = "0x38"
 alarms = [
     { index = 3, owner = "step_guard", irq = 3 },
-    { index = 2, owner = "tier1b", irq = 2 },
+    { index = 2, owner = "module_timer", irq = 2 },
     { index = 1, owner = "scheduler", irq = 1 },
 ]
 # None left: alarm 0 is the external driver's and this die has one timer.

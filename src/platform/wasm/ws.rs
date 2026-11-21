@@ -1,4 +1,4 @@
-//! `wasm_browser_ws` built-in: the browser as an addressed WebSocket
+//! `wasm_browser_ws` native module: the browser as an addressed WebSocket
 //! connector.
 //!
 //! A consumer holding several links addresses them by index, and that index
@@ -20,12 +20,14 @@
 //! whose last carries `fin`. A consumer that reassembles by RFC 6455 sees the
 //! same stream either way.
 //!
-//! State: heap-allocated; the `BuiltInModule`'s inline state holds a
-//! `*mut WsState`.
+//! State: heap-allocated on the module's own heap; its arena state
+//! holds the `*mut WsState` pointer.
 
 use crate::abi::contracts::net::ws_control::{event, parse_open, write_event, WS_LINKS};
 use crate::abi::contracts::net::ws_frame as wsf;
+use crate::abi::platform::native::wasm::wasm_browser_ws as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -414,11 +416,11 @@ unsafe fn pump_ws_out(st: &mut WsState) {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn ws_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn ws_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this
-    // module instance, holding the `*mut WsState` written by `build`; every
+    // module instance, holding the `*mut WsState` written by the constructor; every
     // buffer touched below lives inside that allocation, and the host
     // imports read only the slices they are handed.
     unsafe {
@@ -439,15 +441,24 @@ unsafe fn ws_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(
-    origin: &[u8],
-    open_in: i32,
-    ws_in: i32,
-    ws_out: i32,
-    event_out: i32,
-) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_ws", ws_step);
-    let raw = alloc_state(open_in, ws_in, ws_out, event_out, origin);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut WsState, raw);
-    m
+/// The `wasm_browser_ws` native module.
+pub static WASM_BROWSER_WS: NativeVtable = super::heap_native(new, ws_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut origin_buf = [0u8; 256];
+    let origin = super::param_bytes(init.params, tags::TAG_ORIGIN, &mut origin_buf);
+    let open_in = scheduler::module_port(init.slot, tags::PORT_OPEN_IN);
+    let ws_in = scheduler::module_port(init.slot, tags::PORT_WS_IN);
+    let ws_out = scheduler::module_port(init.slot, tags::PORT_WS_OUT);
+    let event_out = scheduler::module_port(init.slot, tags::PORT_EVENT_OUT);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<WsState>(), || {
+            alloc_state(open_in, ws_in, ws_out, event_out, origin).cast()
+        })
+    }
 }

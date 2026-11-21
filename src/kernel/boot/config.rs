@@ -20,26 +20,27 @@
 //! keeps it mapped for the life of the kernel). See
 //! `docs/architecture/concurrency.md`.
 //!
-//! ## Graph image
+//! ## Node image
 //!
-//! The graph a kernel boots is a graph image (`abi::wire::graph_image`): a
+//! The graph a kernel boots is a node image (`abi::wire::node_image`): a
 //! 256-byte header, the module table and the config, admitted by
-//! `boot::graph_image::admit` before anything in it is read. A firmware image
+//! `boot::node_image::admit` before anything in it is read. A firmware image
 //! carries one after the kernel, its header on the first 256-byte boundary
 //! past the kernel's file-backed end:
 //!
-//! ```text
+//! ``text
 //! [kernel]
-//! [graph image header, 256 bytes]
+//! [node image header, 256 bytes]
 //! [module table, 4 KiB aligned]
 //! [config, 256-byte aligned]
-//! ```
+//! ``
 //!
 //! An RP board boots the graph of one of its flash A/B slots when it has an
 //! admissible one (`platform::planner::choose_slot`). A Linux runtime is handed
 //! its image as a file and admits it itself; wasm embeds its blobs.
 
 use fluxor_contracts::boot_config::{self, BootConfig, Workloads};
+use fluxor_contracts::graph::{self, ComposedGraph};
 
 // ============================================================================
 // GPIO pin configuration (the HAL's `init_gpio` input)
@@ -148,7 +149,7 @@ impl HardwareContext {
 }
 
 // ============================================================================
-// Graph image layout
+// Node image layout
 // ============================================================================
 
 extern "C" {
@@ -157,12 +158,12 @@ extern "C" {
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     static __end_data_addr: u8;
     /// First byte `_start` zeroes on a RAM-loaded aarch64 image: the end of
-    /// the window the graph image after the kernel lies in.
+    /// the window the node image after the kernel lies in.
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     static __bss_start: u8;
 }
 
-/// Where the admitted graph image's regions lie in memory.
+/// Where the admitted node image's regions lie in memory.
 #[derive(Debug, Clone, Copy)]
 pub struct FlashLayout {
     /// Address of the module table.
@@ -179,7 +180,7 @@ pub struct FlashLayout {
 
 impl FlashLayout {
     /// The regions of an admitted image whose header lies at `base`.
-    pub fn of(base: u32, header: &crate::abi::wire::graph_image::Header) -> FlashLayout {
+    pub fn of(base: u32, header: &crate::abi::wire::node_image::Header) -> FlashLayout {
         FlashLayout {
             modules_addr: base + header.modules_offset,
             modules_size: header.modules_size,
@@ -189,7 +190,7 @@ impl FlashLayout {
     }
 }
 
-/// Where the graph image a firmware image carries lies: the first 256-byte
+/// Where the node image a firmware image carries lies: the first 256-byte
 /// boundary past the kernel's file-backed end. On RP that end is
 /// `__end_block_addr`, past everything the flash holds for the kernel; on a
 /// RAM-loaded aarch64 image it is `__end_data_addr`, before `.bss`, which
@@ -205,7 +206,7 @@ fn firmware_image_addr() -> u32 {
     end.div_ceil(256) * 256
 }
 
-/// Bytes from `at` the firmware image's graph image may occupy: what lies
+/// Bytes from `at` the firmware image's node image may occupy: what lies
 /// between it and the next thing the platform owns.
 ///
 /// - A RAM-loaded aarch64 image (Pi 5, CM5, a uefi image) carries it between
@@ -228,24 +229,24 @@ fn firmware_image_window(at: u32) -> u32 {
     }
 }
 
-/// The graph image after the kernel, admitted, or `None` (said why).
+/// The node image after the kernel, admitted, or `None` (said why).
 #[cfg(any(feature = "rp", all(target_arch = "aarch64", target_os = "none")))]
 fn firmware_image_layout(own_pin: &[u8; 32]) -> Option<FlashLayout> {
     let at = firmware_image_addr();
     let window = firmware_image_window(at);
     if window == 0 {
-        log::error!("[config] no room for a graph image at 0x{at:08x}");
+        log::error!("[config] no room for a node image at 0x{at:08x}");
         return None;
     }
     // SAFETY: `[at, at + window)` is mapped for the life of the kernel: it
     // is the flash below the graph slots on RP, and the part of a RAM-loaded
     // image's load before `.bss` on aarch64 (`firmware_image_window`).
     let image = unsafe { core::slice::from_raw_parts(at as usize as *const u8, window as usize) };
-    match super::graph_image::admit(image, own_pin) {
+    match super::node_image::admit(image, own_pin) {
         Ok(header) => Some(FlashLayout::of(at, &header)),
         Err(why) => {
             log::error!(
-                "[config] graph image at 0x{at:08x} refused: {}",
+                "[config] node image at 0x{at:08x} refused: {}",
                 why.reason()
             );
             None
@@ -259,7 +260,7 @@ fn firmware_image_layout(own_pin: &[u8; 32]) -> Option<FlashLayout> {
 static LAYOUT_CHOSEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 static mut LAYOUT: Option<FlashLayout> = None;
 
-/// The graph image this kernel boots: on RP the admitted flash slot with the
+/// The node image this kernel boots: on RP the admitted flash slot with the
 /// higher epoch, else (and on a RAM-loaded aarch64 image) the image after the
 /// kernel. `None` where no image is admitted, and on targets whose graph is
 /// handed over another way (Linux, wasm).
@@ -281,7 +282,7 @@ pub fn read_layout() -> Option<FlashLayout> {
 fn choose_layout() -> Option<FlashLayout> {
     #[cfg(any(feature = "rp", all(target_arch = "aarch64", target_os = "none")))]
     {
-        let own_pin = super::graph_image::own_abi_pin();
+        let own_pin = super::node_image::own_abi_pin();
         #[cfg(feature = "rp")]
         if let Some(layout) = crate::platform::planner::choose_slot(&own_pin) {
             return Some(layout);
@@ -294,7 +295,7 @@ fn choose_layout() -> Option<FlashLayout> {
     }
 }
 
-/// The config of the graph image this kernel boots: the bytes
+/// The config of the node image this kernel boots: the bytes
 /// `read_config_into` decodes. `None` with no admitted image.
 pub fn layout_config_window() -> Option<&'static [u8]> {
     let layout = read_layout()?;
@@ -311,7 +312,7 @@ pub fn layout_config_window() -> Option<&'static [u8]> {
 
 /// Maximum counts.
 ///
-/// `MAX_MODULES` is the kernel platform's module-index domain, stated in
+/// `MAX_MODULES` is the kernel platform's module-index range, stated in
 /// `kernel::config` (4096 on Linux, 1024 on bcm2712 and uefi, 48 on wasm, 32
 /// on RP); the per-module tables are sized from the boot plan within it. It
 /// is kernel capacity, not ABI: modules read the live slot count at runtime
@@ -321,14 +322,14 @@ pub fn layout_config_window() -> Option<&'static [u8]> {
 /// bitmap widened by hand; the limit that does bind is the `0xFFFF`
 /// no-module sentinel in the config blob's u16 module id.
 pub use crate::kernel::config::MAX_MODULES;
-use crate::kernel::exec::scheduler::{ModuleId, MAX_DOMAINS, NO_MODULE};
+use crate::kernel::exec::scheduler::{ModuleId, StepBudget, MAX_DOMAINS, NO_MODULE};
 
 const _: () = assert!(
     MAX_MODULES <= NO_MODULE as usize,
     "module ids are u16 in the config blob and 0xFFFF names no module"
 );
 
-/// The edge-id domain: the most edges a graph may carry and so the channel-id
+/// The edge-id range: the most edges a graph may carry and so the channel-id
 /// domain. On the static profiles it is the profile's compiled count
 /// (`kernel::config::GRAPH_EDGES`); on Linux and aarch64 bare metal the edge
 /// table is sized from the graph and this bounds it.
@@ -336,7 +337,7 @@ const _: () = assert!(
 pub const MAX_GRAPH_EDGES: usize = 255 * 128;
 #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 pub const MAX_GRAPH_EDGES: usize = crate::kernel::config::GRAPH_EDGES;
-/// The edge-id domain of the small (static) profiles, named so the tools'
+/// The edge-id range of the small (static) profiles, named so the tools'
 /// capacity mirror can pin it against this source text.
 pub const SMALL_GRAPH_EDGES: usize = 128;
 #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
@@ -348,7 +349,7 @@ const _: () = assert!(
 // There is no fixed ceiling on the config blob. The parser is handed the
 // blob as a slice whose length is what the platform mapped, and that length
 // is the only bound: a blob whose `total_len` runs past it is refused by the
-// codec. Wherever a graph image carries the blob, that length is the config
+// codec. Wherever a node image carries the blob, that length is the config
 // region its admitted header states; QEMU virt passes the gap to the module
 // blob it side-loads, and wasm the embedded blob's used length. The CLI
 // refuses an image whose payload would not fit the window it is packed into.
@@ -359,7 +360,7 @@ const _: () = assert!(
 
 /// Bytes of module params the parsed config borrows from its blob, and the
 /// blob's length: `(params_bytes, blob_len)`. Written by the parser, read by
-/// `finalize_instantiation_accounting` and the resource ledger
+/// `scheduler::log_arena_usage` and the resource ledger
 /// (`POOL_CONFIG_ARENA`). Params are not copied anywhere, so the pair is an
 /// observation of the graph, not a pool that can run out.
 static CONFIG_PARAMS_BYTES: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
@@ -383,27 +384,20 @@ pub struct ModuleEntry {
     pub id: ModuleId,
     /// Execution domain ID (0 = default domain)
     pub domain_id: u8,
-    /// Module opts into the Tier 1c pre-pass drain slot. Set by the
+    /// Module opts into the pre-pass drain slot. Set by the
     /// tools-side build pipeline from the module manifest's
-    /// `pre_tick_drain` field. Read by `prepare_graph` to populate
-    /// `domain_pre_tick_order` and exclude the module from
+    /// `pre_pass` field. Read by `prepare_graph` to populate
+    /// `domain_pre_pass_order` and exclude the module from
     /// `domain_exec_order`.
-    pub pre_tick_drain: bool,
-    /// Tee/merge framing mode (`FRAME_KIND_*` from `module_types`).
-    /// `FRAME_KIND_NONE` (0) is best-effort byte-stream forwarding;
-    /// `FRAME_KIND_ETH` (1) parses `[len:u16][payload]`;
-    /// `FRAME_KIND_NET` (2) parses `[msg_type:u8][len:u16][payload]`;
-    /// `FRAME_KIND_TELEMETRY` (3) sizes a `TelemetryRecord` from its
-    /// `signal`+`kind` prefix.
-    /// Set by `insert_fan` for ports that carry framed protocols;
-    /// ignored for any other module type.
-    pub frame_kind: u8,
+    pub pre_pass: bool,
     /// Pointer to the params inside the config blob, borrowed in place. Valid
     /// for as long as the blob stays mapped, which every platform guarantees
     /// for the life of the `Config` that holds this entry.
     pub params_ptr: *const u8,
     /// Length of params
     pub params_len: usize,
+    /// The step budget its graph declares for it.
+    pub budget: StepBudget,
 }
 
 impl ModuleEntry {
@@ -427,10 +421,10 @@ impl Default for ModuleEntry {
             name_hash: 0,
             id: 0,
             domain_id: 0,
-            pre_tick_drain: false,
-            frame_kind: 0,
+            pre_pass: false,
             params_ptr: core::ptr::null(),
             params_len: 0,
+            budget: StepBudget::NODE_DEFAULT,
         }
     }
 }
@@ -461,8 +455,8 @@ pub struct GraphEdge {
     /// Any edge with a non-zero group ID enables mailbox (zero-copy) mode on its
     /// channel. When multiple edges share the same group, they alias to the same
     /// channel buffer. Aliasing requires the downstream module to have `mailbox_safe`
-    /// (header flags bit 0) set. Incompatible with tee/merge — `insert_fan` clears
-    /// `buffer_group` on fan edges. 0..=31.
+    /// (header flags bit 0) set. The graph's own label: the splice maps each
+    /// graph's groups onto the kernel's.
     pub buffer_group: u8,
     /// Edge class metadata (Local, DmaOwned, CrossCore, NicRing). Pure
     /// metadata on single-core; no runtime cost.
@@ -489,11 +483,13 @@ pub struct GraphEdge {
     pub retains_send: bool,
 }
 
-impl From<boot_config::EdgeRecord> for GraphEdge {
-    fn from(e: boot_config::EdgeRecord) -> Self {
+impl GraphEdge {
+    /// The node graph's edge `e`, whose ends `splice::check_boot` has
+    /// checked are the graph's own modules.
+    fn of(e: &graph::EdgeRecord) -> Self {
         Self {
-            from_id: e.from,
-            to_id: e.to,
+            from_id: e.from.new_index().unwrap_or(0) as ModuleId,
+            to_id: e.to.new_index().unwrap_or(0) as ModuleId,
             to_port: u8::from(e.to_ctrl),
             from_port_index: e.from_port,
             to_port_index: e.to_port,
@@ -539,8 +535,8 @@ pub struct Config {
     pub edge_count: u16,
     /// Per-domain tick_us. 0 = use global.
     pub domain_tick_us: [u16; MAX_DOMAINS],
-    /// Per-domain execution mode, the `ExecMode` byte (`scheduler::exec_mode`).
-    pub domain_exec_mode: [u8; MAX_DOMAINS],
+    /// Per-domain execution mode.
+    pub domain_exec_mode: [fluxor_contracts::boot_config::ExecMode; MAX_DOMAINS],
     /// Per-domain adaptive-tick enable flags. `0` = adaptive off.
     ///   bit 0: enable mechanism (a) demand-driven idle.
     ///   bit 1: enable mechanism (b) adaptive cadence.
@@ -555,21 +551,17 @@ pub struct Config {
     /// sleep (a) and the cooldown ceiling (b) relax toward this. 0 takes the
     /// domain's effective tick, as for `domain_tick_min_us`.
     pub domain_tick_max_us: [u16; MAX_DOMAINS],
-    /// Graph-level flags (`GRAPH_FLAG_*`).
-    pub graph_flags: u8,
+    /// Execution domains the graph declares.
+    pub domain_count: u8,
+    /// The composed graph, read where it lies in the config image: its
+    /// order, and every module and edge above.
+    composed: Option<ComposedGraph<'static>>,
     /// The blob's resident workloads (`WKLD`), read where they lie in the
     /// config image. `scheduler::admit_resident_workloads_from_config` admits
     /// each at boot; the resource ledger plans for them. `None` on a config
     /// with no workloads.
     workloads: Option<Workloads<'static>>,
 }
-
-/// `graph_flags` bit 0: accept cycles in the dataflow graph. The
-/// canonical use case is bidirectional `http <-> linux_net` feedback
-/// pairs in linux http examples. The flag is graph-wide: an edge carries
-/// no feedback marking, so every cycle's members are stepped after the
-/// ordered modules, in declaration order (`compute_exec_order`).
-pub const GRAPH_FLAG_ACCEPT_CYCLES: u8 = boot_config::GRAPH_FLAG_ACCEPT_CYCLES;
 
 impl Config {
     /// Create an empty config
@@ -585,13 +577,19 @@ impl Config {
             module_count: 0,
             edge_count: 0,
             domain_tick_us: [0; MAX_DOMAINS],
-            domain_exec_mode: [0; MAX_DOMAINS],
+            domain_exec_mode: [fluxor_contracts::boot_config::ExecMode::Tick; MAX_DOMAINS],
             domain_adaptive_flags: [0; MAX_DOMAINS],
             domain_tick_min_us: [0; MAX_DOMAINS],
             domain_tick_max_us: [0; MAX_DOMAINS],
-            graph_flags: 0,
+            domain_count: 0,
+            composed: None,
             workloads: None,
         }
+    }
+
+    /// The composed node graph, `None` before a config is parsed.
+    pub fn composed(&self) -> Option<ComposedGraph<'static>> {
+        self.composed
     }
 
     /// The resident workloads the blob declares, `None` if it declares none.
@@ -651,7 +649,7 @@ enum Refusal {
         limit: &'static str,
         max: usize,
     },
-    RepeatedModule(ModuleId),
+    Graph(&'static str),
     Hardware(&'static str),
 }
 
@@ -668,7 +666,7 @@ impl core::fmt::Display for Refusal {
                 limit,
                 max,
             } => write!(f, "{what}={count} exceeds {limit}={max}"),
-            Self::RepeatedModule(id) => write!(f, "module id {id} repeated"),
+            Self::Graph(why) => write!(f, "node graph: {why}"),
             Self::Hardware(why) => write!(f, "hardware section: {why}"),
         }
     }
@@ -726,15 +724,16 @@ fn fill(blob: &'static [u8], config: &mut Config) -> Result<(), Refusal> {
     use crate::kernel::sys::resource_ledger;
     let bc = boot_config::decode(blob).map_err(Refusal::Codec)?;
     let graph = bc.graph();
+    let composed = graph.composed();
     bounded(
         "module_count",
-        usize::from(graph.module_count()),
+        usize::from(composed.module_count()),
         "MAX_MODULES",
         MAX_MODULES,
     )?;
     bounded(
         "edge_count",
-        usize::from(graph.edge_count()),
+        usize::from(composed.edge_count()),
         "MAX_GRAPH_EDGES",
         MAX_GRAPH_EDGES,
     )?;
@@ -745,7 +744,7 @@ fn fill(blob: &'static [u8], config: &mut Config) -> Result<(), Refusal> {
         MAX_DOMAINS,
     )?;
     if let Some(w) = bc.workloads() {
-        // Slot 0 is the system owner; each workload takes one of the rest.
+        // Slot 0 is the node owner; each workload takes one of the rest.
         bounded(
             "workload_count",
             usize::from(w.count()),
@@ -754,53 +753,46 @@ fn fill(blob: &'static [u8], config: &mut Config) -> Result<(), Refusal> {
         )?;
     }
     check_hardware(&bc)?;
+    crate::kernel::exec::scheduler::splice::check_boot(
+        &composed,
+        usize::from(graph.domain_count()),
+    )
+    .map_err(|e| Refusal::Graph(e.name()))?;
 
     config.header = ConfigHeader {
         checksum: bc.checksum(),
         tick_us: graph.tick_us,
         graph_sample_rate: graph.graph_sample_rate,
     };
-    config.graph_flags = graph.graph_flags;
-    config.module_count = graph.module_count();
-    config.edge_count = graph.edge_count();
+    config.module_count = composed.module_count();
+    config.edge_count = composed.edge_count();
+    config.domain_count = graph.domain_count();
+    config.composed = Some(composed);
 
-    for m in graph.modules() {
-        bounded(
-            "module id",
-            usize::from(m.id),
-            "MAX_MODULES - 1",
-            MAX_MODULES - 1,
-        )?;
-        bounded(
-            "module domain",
-            usize::from(m.domain),
-            "MAX_DOMAINS - 1",
-            MAX_DOMAINS - 1,
-        )?;
-        let slot = &mut config.modules[usize::from(m.id)];
-        if slot.is_some() {
-            return Err(Refusal::RepeatedModule(m.id));
-        }
-        *slot = Some(ModuleEntry {
+    config
+        .modules
+        .reserve_entries(usize::from(composed.module_count()));
+    for (i, m) in composed.modules().enumerate() {
+        config.modules[i] = Some(ModuleEntry {
             name_hash: m.name_hash,
-            id: m.id,
+            id: i as ModuleId,
             domain_id: m.domain,
-            pre_tick_drain: m.pre_pass,
-            frame_kind: 0,
+            pre_pass: m.pre_pass,
             params_ptr: if m.params.is_empty() {
                 core::ptr::null()
             } else {
                 m.params.as_ptr()
             },
             params_len: m.params.len(),
+            budget: crate::kernel::exec::scheduler::splice::record_budget(&m),
         });
     }
 
     config
         .graph_edges
-        .reserve_entries(usize::from(graph.edge_count()));
-    for (i, e) in graph.edges().enumerate() {
-        config.graph_edges[i] = Some(GraphEdge::from(e));
+        .reserve_entries(usize::from(composed.edge_count()));
+    for (i, e) in composed.edges().enumerate() {
+        config.graph_edges[i] = Some(GraphEdge::of(&e));
     }
 
     let global_tick = if graph.tick_us > 0 {
@@ -817,7 +809,7 @@ fn fill(blob: &'static [u8], config: &mut Config) -> Result<(), Refusal> {
             global_tick
         };
         config.domain_tick_us[d] = rec.tick_us;
-        config.domain_exec_mode[d] = rec.exec_mode as u8;
+        config.domain_exec_mode[d] = rec.exec_mode;
         config.domain_adaptive_flags[d] = rec.adaptive_flags;
         config.domain_tick_min_us[d] = if rec.tick_min_us > 0 {
             rec.tick_min_us

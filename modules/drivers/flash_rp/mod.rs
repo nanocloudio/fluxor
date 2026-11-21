@@ -731,7 +731,7 @@ pub unsafe extern "C" fn flash_store_dispatch(
 }
 
 // ============================================================================
-// Flash Store Domain Logic (PIC-safe: pointer arithmetic only)
+// Flash Store Logic (PIC-safe: pointer arithmetic only)
 // ============================================================================
 
 /// Store a parameter override for the given module.

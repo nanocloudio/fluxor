@@ -7,7 +7,7 @@
 
 /// Pop the next fault record from the fault ring.
 /// handle=-1, arg=16-byte output buffer (FaultRecord layout:
-/// `[module_idx:u16][caused_by:u16][fault_kind:u8][last_input_ct:u8]
+/// `[module_idx:u16][caused_by:u16][fault_kind:u8][0:u8]
 /// [fault_count:u16][tick:u32][restart_count:u16][0:u16]`, caused_by 0xFFFF
 /// when independent).
 /// Returns 1 if a record was copied, 0 if empty, negative on error.
@@ -29,7 +29,7 @@ pub use super::super::registry::monitor::FAULT_STATS_QUERY;
 ///
 /// Output layout (all little-endian):
 ///
-/// ```text
+/// ``text
 ///   [0..2]   idx: u16
 ///   [2]      flags: u8    — bit0 present, bit1 ready, bit2 finished
 ///   [3]      fault_state: u8  — 0 Running, 1 Faulted, 2 Recovering,
@@ -45,13 +45,13 @@ pub use super::super::registry::monitor::FAULT_STATS_QUERY;
 ///   [14..18] slot_generation: u32
 ///   [18..34] grants: [u64; 2] — contracts, then op-level grants
 ///   [34..]   name: name_len bytes — the module's type name
-/// ```
+/// ``
 ///
 /// Returns the number of bytes written, so a caller learns the width it
 /// actually got rather than assuming the one it asked for. A buffer of
 /// exactly `MODULE_STATE_LEN` is valid and yields `name_len = 0`.
 ///
-/// Trust tier is deliberately absent: the scheduler does not keep it per
+/// Trust class is deliberately absent: the scheduler does not keep it per
 /// module, and a field invented at the emitter would be a reading nobody
 /// could trust.
 pub use super::super::registry::monitor::MODULE_STATE_QUERY;
@@ -96,8 +96,8 @@ pub mod module_state_flags {
 
 /// Raise a fault against a module. handle=-1,
 /// arg=[module_idx:u16 LE, fault_kind:u8]. Fault kinds mirror
-/// `step_guard::fault_type::*` (TIMEOUT=1, STEP_ERROR=2, HARD_FAULT=3,
-/// MPU_FAULT=4, DRAIN_TIMEOUT=5). Returns 0 or -errno.
+/// `step_guard::fault_type::*` (TIMEOUT=1, STEP_ERROR=2, MPU_FAULT=4,
+/// DRAIN_TIMEOUT=5). Returns 0 or -errno.
 pub use super::super::registry::monitor::FAULT_RAISE;
 
 /// Query arena memory usage. handle=-1.
@@ -105,7 +105,9 @@ pub use super::super::registry::monitor::FAULT_RAISE;
 /// (used << 16) | total.
 pub use super::super::registry::monitor::ARENA_USAGE;
 
-/// Query ISR module metrics. handle=-1, arg=[tier:u8, slot:u8] (2 bytes input).
-/// On success, writes IsrMetrics (24 bytes) to arg buffer.
-/// tier: 1=Tier 1b, 2=Tier 2. slot: slot index within tier.
-pub use super::super::registry::monitor::ISR_METRICS;
+/// Query an interrupt-mode module's metrics. handle=-1, arg=[mode:u8, slot:u8]
+/// (2 bytes input). `mode` is the `ExecMode` byte of an interrupt mode
+/// (2 = `timer`, 3 = `irq`; any other byte is `EINVAL`); `slot` is the slot
+/// index within that mode. On success, writes the 24-byte metrics record to
+/// the arg buffer.
+pub use super::super::registry::monitor::INTERRUPT_METRICS;

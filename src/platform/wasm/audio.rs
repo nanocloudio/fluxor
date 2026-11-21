@@ -1,4 +1,4 @@
-//! `wasm_browser_audio` built-in: AudioSample sink that forwards
+//! `wasm_browser_audio` native module: AudioSample sink that forwards
 //! signed-16-bit PCM blocks to the host shim's `host_audio_play`
 //! import, which schedules them through WebAudio.
 //!
@@ -6,10 +6,12 @@
 //! input channel each tick are forwarded as a unit. The shim
 //! buffers and schedules to maintain continuous playback.
 //!
-//! State: heap-allocated; the `BuiltInModule` 64-byte inline state
-//! holds a `*mut AudioState` pointer.
+//! State: heap-allocated on the module's own heap; its arena state
+//! holds the `*mut AudioState` pointer.
 
+use crate::abi::platform::native::wasm::wasm_browser_audio as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -93,12 +95,12 @@ unsafe fn alloc_state(
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn audio_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn audio_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut AudioState);
         if st_ptr.is_null() {
@@ -138,19 +140,34 @@ unsafe fn audio_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(
-    sample_rate: u32,
-    channels: u32,
-    lead_ms: u32,
-    in_chan: i32,
-) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_audio", audio_step);
+/// The `wasm_browser_audio` native module.
+pub static WASM_BROWSER_AUDIO: NativeVtable = super::heap_native(new, audio_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut sample_rate = 0u32;
+    let mut channels = 1u32;
+    // 0 = module default (codec-depth).
+    let mut lead_ms = 0u32;
+    super::walk_tlv(init.params, |tag, value| match tag {
+        tags::TAG_SAMPLE_RATE => sample_rate = super::tlv_u32(value),
+        tags::TAG_CHANNELS => channels = super::tlv_u32(value),
+        tags::TAG_LEAD_MS => lead_ms = super::tlv_u32(value),
+        _ => {}
+    });
     let lead_target_us = if lead_ms > 0 {
         (lead_ms as u64) * 1000
     } else {
         LEAD_TARGET_US
     };
-    let raw = alloc_state(in_chan, sample_rate, channels, lead_target_us);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut AudioState, raw);
-    m
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_AUDIO);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<AudioState>(), || {
+            alloc_state(in_chan, sample_rate, channels, lead_target_us).cast()
+        })
+    }
 }

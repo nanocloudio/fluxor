@@ -65,7 +65,7 @@ struct MonitorState {
     /// `ROUND_MODULES`, so a graph larger than that is covered over
     /// successive rounds rather than cut off.
     cursor: u32,
-    /// The kernel's module-slot count (`SLOT_CAPACITY`): the index domain a
+    /// The kernel's module-slot count (`SLOT_CAPACITY`): the index range a
     /// round walks. 0 until the first round reads it.
     slot_capacity: u32,
 }
@@ -76,7 +76,7 @@ const ROUND_MODULES: usize = 64;
 /// modules or after this many slots, whichever comes first, and the cursor
 /// carries the walk on. Slots are not contiguous (a workload's modules sit
 /// wherever its add placed them), so a round walks slots and reports the
-/// present ones. The slot domain itself is the kernel's, read at runtime
+/// present ones. The slot range itself is the kernel's, read at runtime
 /// (`SLOT_CAPACITY`): kernel capacity is not compiled into this module.
 const ROUND_SLOTS: usize = 1024;
 

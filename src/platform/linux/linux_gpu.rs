@@ -9,13 +9,12 @@
 // host test harness. A backend that can only be exercised by booting a whole
 // graph is a backend whose faults are found on hardware, at the end.
 
-use fluxor::platform::builtin_param_tags::linux_gpu as gpu_tags;
-use fluxor::platform::builtin_param_tags::linux_gpu::{
+use fluxor::abi::platform::native::linux::linux_gpu as gpu_tags;
+use fluxor::abi::platform::native::linux::linux_gpu::{
     TAG_RESIDENT_MB as GPU_TAG_RESIDENT_MB, TAG_STAGING_KB as GPU_TAG_STAGING_KB,
 };
 use fluxor::platform::linux::gpu::GpuProvider;
 
-const LINUX_GPU_HASH: u32 = 0x0C49_64C4; // fnv1a32("linux_gpu")
 
 /// Bytes read from the command port per step. One whole record does not have
 /// to fit in a read: the provider buffers a partial one and decodes it when
@@ -36,11 +35,11 @@ struct LinuxGpuInstance {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_gpu_step(state: *mut u8) -> i32 {
-    // SAFETY: kernel-owned bootstrap buffer initialised by `install_state`
-    // with a `Box<LinuxGpuInstance>` in `build_linux_gpu`.
+unsafe extern "C" fn linux_gpu_step(state: *mut u8) -> i32 {
+    // SAFETY: the instance's arena state, holding the `LinuxGpuInstance`
+    // `build_linux_gpu` built.
     let st = unsafe { instance_state::<LinuxGpuInstance>(state) };
     if st.in_chan < 0 {
         return 0;
@@ -119,7 +118,7 @@ fn flush_owed(st: &mut LinuxGpuInstance) {
     st.owed.drain(..sent);
 }
 
-fn build_linux_gpu(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_linux_gpu(module_idx: usize, params: &[u8]) -> Result<Box<LinuxGpuInstance>, i32> {
     let mut resident_mb: u64 = 256;
     let mut staging_kb: u64 = 16 * 1024;
     walk_tlv(params, |tag, value| match tag {
@@ -127,8 +126,6 @@ fn build_linux_gpu(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule
         GPU_TAG_STAGING_KB => staging_kb = u64::from(tlv_u32(value)),
         _ => {}
     });
-
-    scheduler::set_current_module(module_idx);
     let in_chan = scheduler::module_port(module_idx, gpu_tags::PORT_COMMANDS);
     let out_chan = scheduler::module_port(module_idx, gpu_tags::PORT_OUTCOMES);
 
@@ -139,21 +136,25 @@ fn build_linux_gpu(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule
         resident_mb.saturating_mul(1024 * 1024),
         staging_kb.saturating_mul(1024),
     );
-
-    let mut m = scheduler::BuiltInModule::new("linux_gpu", linux_gpu_step);
-    install_state(
-        &mut m,
-        Box::new(LinuxGpuInstance {
+    let st = Box::new(LinuxGpuInstance {
             in_chan,
             out_chan,
             provider,
             owed: Vec::new(),
             announced: false,
-        }),
-    );
+        });
     log::info!(
         "[inst] module {module_idx} = linux_gpu (built-in) in={in_chan} out={out_chan} \
          resident={resident_mb} MiB staging={staging_kb} KiB"
     );
-    m
+    Ok(st)
 }
+
+impl HostNative for LinuxGpuInstance {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_gpu(slot, params)
+    }
+}
+
+/// The `linux_gpu` native module.
+pub static LINUX_GPU: NativeVtable = host_vtable::<LinuxGpuInstance>(linux_gpu_step);

@@ -6,14 +6,14 @@
 
 use fluxor::platform::rp_io::pio as pio_util;
 
-use fluxor::kernel::exec::scheduler::{self, setup, RunnerConfig, StepResult};
+use fluxor::kernel::exec::scheduler::{self, setup, StepResult};
 use fluxor::kernel::module::syscalls;
 use fluxor::platform::planner::Hardware;
 use fluxor::platform::planner::{self, PioRole};
 
-/// HAL `irq_bind` for RP: enable the NVIC line for a Tier 2 module's IRQ so it
+/// HAL `irq_bind` for RP: enable the NVIC line for an `irq` module's IRQ so it
 /// dispatches through the vector table's default interrupt handler →
-/// `isr_tier2_trampoline`. The `event_handle` and `ack` parameters are
+/// `irq_trampoline`. The `event_handle` and `ack` parameters are
 /// unused on RP (dispatch is by IRQ number). Returns 0.
 fn rp_irq_bind(
     irq: u32,
@@ -23,7 +23,7 @@ fn rp_irq_bind(
 ) -> i32 {
     // NVIC line ceiling, from the rp-pac `Interrupt` enum: the highest line on
     // each chip is SWI_IRQ_5 — 31 on RP2040, 52 on RP235x. The build-time
-    // ISR-tier validator rejects out-of-range IRQs; this is the runtime backstop
+    // interrupt-mode validator rejects out-of-range IRQs; this is the runtime backstop
     // — `NVIC::unmask` past the ceiling would index the ISER/ICER registers out
     // of bounds.
     #[cfg(feature = "chip-rp2040")]
@@ -40,6 +40,25 @@ fn rp_irq_bind(
         return fluxor::kernel::sys::errno::EINVAL;
     }
     0
+}
+
+/// HAL `irq_mask` for RP: one NVIC clear- or set-enable write.
+fn rp_irq_mask(irq: u32, masked: bool) {
+    if let Ok(irq) = u16::try_from(irq) {
+        if masked {
+            fluxor::arch::cortex_m::nvic_mask(irq);
+        } else {
+            fluxor::arch::cortex_m::nvic_unmask(irq);
+        }
+    }
+}
+
+/// HAL `irq_unbind` for RP: mask the NVIC line `rp_irq_bind` enabled.
+fn rp_irq_unbind(irq: u32) -> i32 {
+    match u16::try_from(irq) {
+        Ok(irq) if fluxor::arch::cortex_m::nvic_mask(irq) => 0,
+        _ => fluxor::kernel::sys::errno::EINVAL,
+    }
 }
 
 // ============================================================================
@@ -178,7 +197,7 @@ fn debug_drain_poll() {
 fn rp_boot_hardware() -> Option<(Hardware, planner::ResourcePlan)> {
     log::info!("[fluxor] starting");
 
-    // HAL ops, syscall table, providers: before the graph image is read,
+    // HAL ops, syscall table, providers: before the node image is read,
     // since admitting it asks the HAL for the signing root, and before any
     // bus init so module syscalls reach a populated dispatch table.
     fluxor::kernel::boot(&RP_HAL_OPS);
@@ -415,7 +434,7 @@ fn rp_read_cycle_count() -> u32 {
     unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
 }
 
-fn rp_isr_tier_init() {
+fn rp_module_timer_init() {
     // SAFETY: DEMCR (TRCENA) and DWT_CTRL (CYCCNTENA) are Cortex-M debug
     // registers; single boot-thread enabler.
     unsafe {
@@ -428,15 +447,15 @@ fn rp_isr_tier_init() {
     }
 }
 
-fn rp_isr_tier_start(period_us: u32) {
+fn rp_module_timer_start(period_us: u32) {
     step_guard_backend::rp_isr_backend_start(period_us);
 }
 
-fn rp_isr_tier_stop() {
+fn rp_module_timer_stop() {
     step_guard_backend::rp_isr_backend_stop();
 }
 
-fn rp_isr_tier_poll() {
+fn rp_module_timer_poll() {
     // No-op on Cortex-M
 }
 
@@ -562,10 +581,10 @@ static RP_HAL_OPS: HalOps = HalOps {
     step_guard_disarm: step_guard_backend::rp_step_guard_disarm,
     step_guard_post_check: rp_step_guard_post_check,
     read_cycle_count: rp_read_cycle_count,
-    isr_tier_init: rp_isr_tier_init,
-    isr_tier_start: rp_isr_tier_start,
-    isr_tier_stop: rp_isr_tier_stop,
-    isr_tier_poll: rp_isr_tier_poll,
+    module_timer_init: rp_module_timer_init,
+    module_timer_start: rp_module_timer_start,
+    module_timer_stop: rp_module_timer_stop,
+    module_timer_poll: rp_module_timer_poll,
     init_providers: rp_init_providers,
     release_module_handles: rp_release_module_handles,
     boot_scan: rp_boot_scan,
@@ -574,6 +593,8 @@ static RP_HAL_OPS: HalOps = HalOps {
     csprng_fill: rp_csprng_fill,
     core_id: || 0,
     irq_bind: rp_irq_bind,
+    irq_unbind: rp_irq_unbind,
+    irq_mask: rp_irq_mask,
     sleep_until: rp_sleep_until,
     smp_quiesce_peers: || false,
     smp_release_peers: || {},
@@ -708,103 +729,48 @@ fn rp_csprng_fill(out: &mut [u8]) -> i32 {
 }
 
 // ============================================================================
-// Graph setup and main loop
+// Graph setup and domain loop
 // ============================================================================
 
-/// Graph setup.
-///
-/// The shared walk, with a bounded spin on the monotonic clock between
-/// polls. The spin is sound only because nothing else runs yet — this is
-/// boot, before the step loop.
+/// Graph setup: the node's graph staged, the owner plan applied, every
+/// module instantiated (`scheduler::instantiate_graph`), with a bounded spin
+/// on the monotonic clock between polls of a load that completes later. The
+/// spin is sound only because nothing else runs yet — this is boot, before
+/// the step loop. After each module its pending GPIO claims are granted.
 fn rp_setup_graph() -> i32 {
-    use fluxor::kernel::exec::graph_build::GraphWalk;
-
-    let (module_list, module_count) = match scheduler::prepare_graph() {
-        Ok(v) => v,
+    let staged = match scheduler::prepare_graph() {
+        Ok(st) => st,
         Err(e) => return e,
     };
 
     // Ownership must be live before any provider handle is opened.
     if let Err(e) = fluxor::kernel::exec::bare_metal::apply_owner_plan() {
         log::error!("[owner] staged plan invalid ({e:?}); refusing the graph");
+        scheduler::splice::abandon(staged);
         return -1;
     }
 
-    // SAFETY: shared globals; this is the only thread and the scheduler runs
-    // serially within it.
-    let loader = unsafe { scheduler::static_loader() };
-    // SAFETY: as above.
-    let sched = unsafe { scheduler::sched_mut() };
-
-    let mut walk = GraphWalk::new(module_count);
-    while !walk.is_finished() {
-        let module_idx = walk.next_entry();
-        let Some(entry) = module_list[module_idx].as_ref() else {
-            walk.advance_skipped();
-            continue;
-        };
-
-        let instantiated = walk.instantiated();
-        scheduler::set_current_module(instantiated);
-        fluxor::platform::rp_watchdog::breadcrumb(
-            fluxor::platform::rp_watchdog::stage::GRAPH | (instantiated as u32 & 0xFF),
-        );
-        match scheduler::instantiate_one_module(
-            loader,
-            entry,
-            module_idx,
-            instantiated,
-            &mut sched.edges,
-            &mut sched.modules,
-            &mut sched.ports,
-        ) {
-            scheduler::InstantiateResult::Done => {}
-            scheduler::InstantiateResult::Pending(mut pending) => {
-                let mut settled = false;
-                loop {
-                    rp_spin_ms(1);
-                    fluxor::platform::rp_watchdog::feed_boot();
-                    if !walk.record_poll() {
-                        break;
-                    }
-                    // SAFETY: `pending` is owned here and not aliased.
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dynamic)) => {
-                            sched.modules[instantiated] = scheduler::ModuleSlot::Dynamic(dynamic);
-                            settled = true;
-                            break;
-                        }
-                        Ok(None) => continue,
-                        Err(e) => {
-                            e.log("scheduler");
-                            return -1;
-                        }
-                    }
-                }
-                if !settled {
-                    log::error!(
-                        "[inst] module={module_idx} pending timeout after {} polls",
-                        walk.polls()
-                    );
-                    return -1;
-                }
-            }
-            scheduler::InstantiateResult::Error(e) => {
-                log::error!("[inst] failed module={module_idx} error={e}");
-                return e;
-            }
-        }
-
-        fluxor::platform::rp_io::gpio::grant_pending_pins(
-            walk.instantiated() as fluxor::kernel::exec::scheduler::ModuleId
-        );
-        walk.advance_instantiated();
+    let mut wait = || {
         rp_spin_ms(1);
+        fluxor::platform::rp_watchdog::feed_boot();
+    };
+    // The breadcrumb names the module instantiating next, so a hang in its
+    // construction is attributed to it.
+    let crumb = |slot: usize| {
+        fluxor::platform::rp_watchdog::breadcrumb(
+            fluxor::platform::rp_watchdog::stage::GRAPH | (slot as u32 & 0xFF),
+        );
+    };
+    crumb(0);
+    let mut each = |slot: usize| {
+        fluxor::platform::rp_io::gpio::grant_pending_pins(slot as scheduler::ModuleId);
+        crumb(slot + 1);
+        rp_spin_ms(1);
+    };
+    match scheduler::instantiate_graph(staged, &mut wait, &mut each) {
+        Ok(n) => n as i32,
+        Err(e) => e,
     }
-
-    let result = walk.instantiated() as i32;
-    scheduler::compute_downstream_latency(sched, module_count);
-    result
 }
 
 /// Spin for roughly `ms` milliseconds on the monotonic clock.
@@ -821,8 +787,6 @@ fn rp_spin_ms(ms: u64) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    use fluxor::kernel::exec::scheduler::{CRASH_DATA, CRASH_MAGIC};
-
     let crash = (&raw mut CRASH_DATA) as *mut u32;
     // SAFETY: an 8-word .uninit array; magic written last so a recorder that
     // faults part-way leaves an incomplete record reading as invalid.
@@ -933,7 +897,7 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
     }
 
     fluxor::platform::rp_timer::init_scheduler_alarm();
-    // From here to the main loop nothing feeds the liveness watchdog, so it
+    // From here to the domain loop nothing feeds the liveness watchdog, so it
     // is armed for the whole boot: whatever the bootloader left it doing is
     // replaced, and a boot that hangs still ends in BOOTSEL.
     fluxor::platform::rp_watchdog::arm_for_boot();
@@ -944,7 +908,7 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
         match s {
             stage::CLOCKS => log::error!("[boot] the previous boot wedged before USB came up"),
             stage::USB => log::error!("[boot] the previous boot wedged bringing up USB"),
-            stage::MAIN_LOOP => log::error!("[boot] the previous boot wedged in the main loop"),
+            stage::DOMAIN_LOOP => log::error!("[boot] the previous boot wedged in the domain loop"),
             s if s & stage::GRAPH != 0 => log::error!(
                 "[boot] the previous boot wedged instantiating module {}",
                 s & 0xFF
@@ -979,12 +943,8 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
         park_reporting("[fluxor] boot: resource plan unsatisfiable\r\n");
     };
 
-    let config = RunnerConfig {
-        spi_bus: hw.spi_bus(),
-        cs_pin: hw.cs_pin(),
-    };
-    if !setup(&config) {
-        park_reporting("[fluxor] boot: runner setup failed\r\n");
+    if !setup() || !buses_ready(hw.spi_bus()) {
+        park_reporting("[fluxor] boot: domain loop setup failed\r\n");
     }
 
     // Build, run, rebuild. The loop returns when the reconfigure module
@@ -998,19 +958,78 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
             park_reporting("[fluxor] boot: graph setup failed\r\n");
         }
         log::info!("[boot] ready modules={module_count}");
-        scheduler::finalize_instantiation_accounting();
-        // Tier 1b admission: hand any Tier 1b-domain modules to the ISR-tier
-        // dispatcher. The step loop polls `isr_tier::poll_tier1b` each
-        // iteration, so registration here is the platform's only ISR setup.
-        let isr_registered = scheduler::register_isr_tier_modules_from_graph();
-        if isr_registered > 0 {
-            log::info!("[isr] Tier 1b admitted {isr_registered} module(s)");
-        }
+        scheduler::log_arena_usage();
         if rp_run_main_loop(module_count as usize) {
-            log::info!("[reconfigure] main loop yielded, rebuilding graph");
+            log::info!("[reconfigure] domain loop yielded, rebuilding graph");
             scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
         } else {
             park_reporting("[fluxor] graph halted\r\n");
+        }
+    }
+}
+
+/// Whether the SPI bus the board's hardware plan names came up; logs every
+/// SPI and I2C bus that did.
+fn buses_ready(spi_bus: u8) -> bool {
+    let ready = syscalls::is_spi_initialized(spi_bus);
+    if !ready {
+        log::error!("[boot] config spi bus={spi_bus} not initialized");
+    }
+    for bus in 0..2u8 {
+        if syscalls::is_spi_initialized(bus) {
+            log::info!("[boot] spi{bus} available");
+        }
+        if syscalls::is_i2c_initialized(bus) {
+            log::info!("[boot] i2c{bus} available");
+        }
+    }
+    ready
+}
+
+/// The last run's crash record, in `.uninit`: not zeroed at startup, so it
+/// survives a software reset. The panic handler writes it; the domain loop
+/// reports it once, [`CRASH_CHECK_DELAY_MS`] after boot.
+/// Layout: [0]=magic, [1]=PC, [2]=LR, [3]=module, [4]=tick, [5]=R0,
+/// [6]=CFSR, [7]=BFAR.
+#[link_section = ".uninit.CRASH_DATA"]
+#[no_mangle]
+static mut CRASH_DATA: core::mem::MaybeUninit<[u32; 8]> = core::mem::MaybeUninit::uninit();
+
+/// The marker of a valid crash record.
+const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
+
+/// Wall-clock delay after boot before the crash record is read, by when a
+/// USB console is up.
+const CRASH_CHECK_DELAY_MS: u64 = 30_000;
+
+/// Whether this boot has read the crash record.
+static CRASH_CHECKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Report the last run's crash record, once, [`CRASH_CHECK_DELAY_MS`] after
+/// boot.
+fn crash_info_once() {
+    use core::sync::atomic::Ordering;
+    if CRASH_CHECKED.load(Ordering::Relaxed)
+        || fluxor::kernel::sys::hal::now_millis() < CRASH_CHECK_DELAY_MS
+    {
+        return;
+    }
+    CRASH_CHECKED.store(true, Ordering::Relaxed);
+    // SAFETY: CRASH_DATA is in `.uninit`; 8 words, the marker re-cleared
+    // after the read so it runs once per boot.
+    unsafe {
+        let crash = (&raw const CRASH_DATA) as *const u32;
+        if core::ptr::read_volatile(crash) == CRASH_MAGIC {
+            let pc = core::ptr::read_volatile(crash.add(1));
+            let lr = core::ptr::read_volatile(crash.add(2));
+            let module = core::ptr::read_volatile(crash.add(3));
+            let prev_tick = core::ptr::read_volatile(crash.add(4));
+            let r0 = core::ptr::read_volatile(crash.add(5));
+            let cfsr = core::ptr::read_volatile(crash.add(6));
+            let bfar = core::ptr::read_volatile(crash.add(7));
+            log::error!("[crash] pc={pc:08x} lr={lr:08x} r0={r0:08x} mod={module} t={prev_tick}");
+            log::error!("[crash] cfsr={cfsr:08x} bfar={bfar:08x}");
+            core::ptr::write_volatile((&raw mut CRASH_DATA) as *mut u32, 0);
         }
     }
 }
@@ -1026,20 +1045,19 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
 fn rp_run_main_loop(module_count: usize) -> bool {
     use fluxor::kernel::exec::bare_metal::wait_for_wake;
 
-    // SAFETY: `sched_modules` returns a shared global; this is the only
-    // thread, and the scheduler runs serially within it.
-    let modules = unsafe { scheduler::sched_modules() };
     let tick_period_us = scheduler::tick_us() as u64;
 
     log::info!("[sched] running modules={module_count} tick_us={tick_period_us}");
     fluxor::platform::rp_watchdog::arm();
-    fluxor::platform::rp_watchdog::breadcrumb(fluxor::platform::rp_watchdog::stage::MAIN_LOOP);
+    fluxor::platform::rp_watchdog::breadcrumb(fluxor::platform::rp_watchdog::stage::DOMAIN_LOOP);
 
     loop {
         fluxor::platform::rp_watchdog::feed();
+        crash_info_once();
         fluxor::platform::rp_io::gpio::poll_gpio_edges();
 
-        match scheduler::step_modules(modules, module_count) {
+        let pass = scheduler::pass::tick_all();
+        match pass.result {
             StepResult::Continue => {}
             StepResult::Done => {
                 log::warn!("[sched] all modules done");
@@ -1051,7 +1069,7 @@ fn rp_run_main_loop(module_count: usize) -> bool {
             }
         }
 
-        fluxor::kernel::exec::isr_tier::poll_tier1b();
+        fluxor::kernel::exec::timer::poll();
 
         // The USB device stack, as a bounded step rather than a task. This
         // is what makes idling below safe.
@@ -1099,15 +1117,12 @@ fn rp_run_main_loop(module_count: usize) -> bool {
             return true;
         }
 
-        let wake = fluxor::kernel::ipc::event::take_wake_pending();
-        if !wake.is_empty() {
-            scheduler::step_woken_modules(modules, module_count, &wake);
-        }
+        scheduler::pass::wake_all();
 
         // The tighter of the two deadlines. The pacer speaks for the graph
         // and the device stack for the bus; idling past either one breaks
         // the thing that owns it.
-        let sleep_us = (scheduler::pacer_next_deadline_us(0).min(usb_service_us)) as u64;
+        let sleep_us = u64::from(pass.deadline_us.min(usb_service_us));
         let deadline = fluxor::platform::rp_timer::now_us().saturating_add(sleep_us);
 
         // Arm the alarm before parking, and disarm after.
@@ -1134,10 +1149,7 @@ fn rp_run_main_loop(module_count: usize) -> bool {
         );
         fluxor::platform::rp_timer::disarm_scheduler_alarm();
 
-        let wake = fluxor::kernel::ipc::event::take_wake_pending();
-        if !wake.is_empty() {
-            scheduler::step_woken_modules(modules, module_count, &wake);
-        }
+        scheduler::pass::wake_all();
     }
 }
 
@@ -1197,7 +1209,7 @@ fn descriptor_for(setup: &fluxor::kernel::usb::control::Setup) -> Option<&'stati
 /// within milliseconds. This graph's pacer sleeps for its slowest sequence
 /// step — half a second in the blink preset — and a device polled that
 /// rarely is dropped by the host before it answers anything. Polled from the
-/// main loop rather than driven by its interrupt, the stack has to say what
+/// domain loop rather than driven by its interrupt, the stack has to say what
 /// it needs.
 fn rp_usb_step() -> u32 {
     use fluxor::platform::rp_usb_device as dcd;
@@ -1336,8 +1348,8 @@ fn park_reporting(reason: &str) -> ! {
     fluxor::platform::rp_uart::flush();
     log::error!("{}", reason.trim_end());
     // Poll, never sleep. `wfe` returns only for an interrupt or event, and
-    // nothing is armed here — the main loop arms the scheduler alarm before
-    // each one, and this is not the main loop. A park that sleeps on the
+    // nothing is armed here — the domain loop arms the scheduler alarm before
+    // each one, and this is not the domain loop. A park that sleeps on the
     // first pass runs the pump exactly once, and the host never sees a
     // device answer.
     loop {

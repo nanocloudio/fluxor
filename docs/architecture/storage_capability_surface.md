@@ -26,7 +26,7 @@ Storage pipelines move data on channels typed by `content_type` and
 exchange leased handles through the mesh Handle primitive. Four surfaces
 compose the family; every provider declares one or more.
 
-| Surface             | Domain                                                          | Providers / consumers                                        |
+| Surface             | Carries                                                         | Providers / consumers                                        |
 |---------------------|-----------------------------------------------------------------|--------------------------------------------------------------|
 | `storage.block`     | Raw block I/O                                                   | nvme, sd, flash_rp (data store), file_block, crypt_block provide; fat32, crypt_block, nbd_serve and vault_store consume |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32 and the mount router provide; player / viewer modules consume |
@@ -284,7 +284,7 @@ only consumes the control messages.
 Instance-keying (a NAME bind plus a policy router like `mount`)
 is for logical, contract-dispatched service surfaces: the storage
 surfaces (`file.data`, and, when routed, `storage.namespace` /
-`storage.object`), tenant-scoped stores, and similar. It is deliberately
+`storage.object`), owner-scoped stores, and similar. It is deliberately
 not applied to physical hardware channels:
 
 - Block devices (`storage.block` on nvme / sd / file_block) and NIC frames
@@ -597,7 +597,7 @@ Both are optional capabilities (`caps::FSYNC_NAME`, `caps::RENAME`). A
 consumer that needs crash-safe publication queries `CAPS` and fails closed
 when the bit it needs is clear.
 
-### The object-model tier
+### The object-model surface
 
 `STAT` answers one 32-byte record, `[size u64][mtime u64][ino u64][nlink
 u32][0 u32]`; `ino` is 0 where the volume has no stable file identity and
@@ -626,11 +626,11 @@ invoked the current provider frame. It is a query rather than an argument on
 `provider_call` because widening that signature is a positional-ABI flag day
 across every module for a fact the kernel already holds.
 
-Publication lives on the byte-tier surface rather than moving to
+Publication lives on the byte surface rather than moving to
 `storage.namespace` because `OPEN_CREATE` and `MKDIR` are already the
 fused `BIND` + open forms (see `namespace.rs::BIND`); `FSYNC_NAME` and
 `RENAME` complete that fusion. A filesystem provider whose directory
-entries live inside the byte tier publishes names here; a split provider
+entries live inside the byte surface publishes names here; a split provider
 (an index without bytes) publishes them through `storage.namespace`. The
 two remain equivalent operations achieving the same fence.
 
@@ -643,7 +643,7 @@ when it differs, the source parent. `RENAME` replaces an existing
 destination atomically. Achieved fence: `LocalDurable`.
 
 **FAT32.** Byte durability is the block source's Flush after the data
-sectors and the file's own directory-entry size. The async tier
+sectors and the file's own directory-entry size. The async surface
 (`WRITE_ASYNC` + `FSYNC_SUBMIT`/`FSYNC_POLL`) runs a two-stage
 data-then-metadata state machine: each ticket snapshots the file's size
 and first cluster at submit, waits for the device fence over the data,
@@ -911,13 +911,13 @@ into the runtime rather than loadable modules:
   `object.rs` serve the same three contracts in the browser host. The
   wasm `storage.object` answers `LIST` with `ENOSYS`: its reads fall
   through to `fetch()` against the page origin, which cannot be
-  enumerated, and a listing of the written tier alone would omit objects
+  enumerated, and a listing of the written layer alone would omit objects
   `GET` serves.
 
 ### What a workload reaches
 
-A workload is a tenant of the node, and the platform providers above are
-the node's. A provider layer serves the owner whose module registered it
+A workload runs for an owner other than the node owner, and the platform
+providers above are the node's. A provider layer serves the owner whose module registered it
 and no one else: a contract resolves only through layers of the caller's
 own owner. The node's provider modules (its `fat32`, its `fs_object`, its
 `mount`) are invisible to a workload, and a workload's own provider modules
@@ -1051,7 +1051,7 @@ a graph selects it by wiring, not by asking which platform it is on:
 
   A workload names its own store with `store_dir` in the `[workload]`
   table of its source manifest; it is carried into `workload.json` and
-  set for the runtime at launch, relative to the installed bundle unless
+  set for the runtime at launch, relative to the installed package unless
   absolute. Declared there it wins over the caller's environment: an
   applet's state is a property of the applet, and the same applet run
   from two shells must reach the same store. The variable serves a

@@ -601,7 +601,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     //
     // `examples/` is the front door, and a graph naming a module the repo does
     // not contain still *reads* fine — it only fails when someone runs it.
-    // Every module extraction and every domain/tier rule change can strand one
+    // Every module extraction and every domain/exec-mode rule change can strand one
     // silently. Build-check each tracked example so that lands here, on the
     // day, rather than in a downstream clone.
     //
@@ -625,12 +625,12 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // and `fluxor publish` publishes nothing else, so this phase checks each
     // shippable the way the publish reads it: every stack parses, versions
     // and renders, and composes only modules a consumer can find; every
-    // bundle's linux graphs, includes expanded and rendered with their
+    // package's linux graphs, includes expanded and rendered with their
     // params' defaults and examples, pass the same `build --check` a plain
     // graph does — after the module build, for the same reason as the
     // examples phase. Omitted when the project ships nothing.
     let shippables = crate::packaging::discover(project_root);
-    if !shippables.stacks.is_empty() || !shippables.bundles.is_empty() {
+    if !shippables.stacks.is_empty() || !shippables.packages.is_empty() {
         results.push(if skip.lint {
             skipped("packaging")
         } else {
@@ -1411,7 +1411,7 @@ pub(crate) fn cargo_host_tools_dir(project_root: &Path) -> Option<PathBuf> {
     (dir != root && dir.join("Cargo.toml").is_file()).then_some(dir)
 }
 
-/// The triple the Tier-2 harness suites are built and run for. One spelling,
+/// The triple the `irq` harness suites are built and run for. One spelling,
 /// because the phase that runs them and the step that provides their binary
 /// have to agree: a binary under another triple is a binary those tests skip.
 const HARNESS_TARGET: &str = "aarch64-unknown-linux-gnu";
@@ -1797,9 +1797,9 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
             continue;
         }
         // Not examples: the harness tree is fixtures and probes, and a
-        // `bundle/` holds packaged OUTPUT (`workload.json` beside a
+        // `package/` holds packaged OUTPUT (`workload.json` beside a
         // rendered `graph.yaml`) whose source graph is checked already.
-        if rel.contains("test_harness/") || rel.contains("/bundle/") {
+        if rel.contains("test_harness/") || rel.contains("/package/") {
             continue;
         }
         let abs = project_root.join(rel);
@@ -1869,9 +1869,9 @@ fn build_check_detail(o: &std::process::Output) -> String {
 
 /// Hold every shippable to what its publish requires
 /// ([`crate::packaging`]): each stack is checked as `fluxor publish` checks
-/// it ([`crate::stack::check_publishable`]), and each bundle's linux graphs,
+/// it ([`crate::stack::check_publishable`]), and each package's linux graphs,
 /// read with their includes expanded and rendered with their params'
-/// defaults and examples ([`crate::packaging::check_bundle`]), pass
+/// defaults and examples ([`crate::packaging::check_package`]), pass
 /// `fluxor build --check`. A rendered graph is written under the project's
 /// `target/fluxor/ci-packaging/` so it resolves against this project.
 fn run_packaging(
@@ -1891,8 +1891,8 @@ fn run_packaging(
         }
     }
     let mut checked = 0usize;
-    for (_, manifest) in &shippables.bundles {
-        let graphs = match crate::packaging::check_bundle(manifest, project_root) {
+    for (_, manifest) in &shippables.packages {
+        let graphs = match crate::packaging::check_package(manifest, project_root) {
             Ok(g) => g,
             Err(e) => {
                 failures.push(e);
@@ -1940,8 +1940,8 @@ fn run_packaging(
         return vacuity(
             "packaging",
             checked,
-            shippables.bundles.len(),
-            "bundle source manifest(s) were found",
+            shippables.packages.len(),
+            "package source manifest(s) were found",
             "no manifest reached its graphs",
         );
     }
@@ -2990,11 +2990,11 @@ fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::
 
 /// Every `manifest.toml` under `modules/`, whatever layout it is in.
 ///
-/// Deliberately *not* the tier walk: the point of the count is to
-/// notice modules the tier walk cannot see. A repo with 36 modules in a
+/// Deliberately *not* the layer walk: the point of the count is to
+/// notice modules the layer walk cannot see. A repo with 36 modules in a
 /// layout the builder does not discover reported `built 0 of 0` in 0 ms
 /// and passed — that is the shape of a repo whose modules sit outside
-/// the tiers, and it must read as a failure, not as "no modules".
+/// the layers, and it must read as a failure, not as "no modules".
 fn module_manifest_count(project_root: &Path) -> usize {
     let root = project_root.join("modules");
     if !root.is_dir() {
@@ -3106,7 +3106,7 @@ fn cargo_test_in(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
     ))
 }
 
-/// `forbidden` is the `[ci.hygiene] forbid_inline_tests` tiers (relative to
+/// `forbidden` is the `[ci.hygiene] forbid_inline_tests` directories (relative to
 /// `project_root`) when the integration sweep runs this same tree, else
 /// empty: a tree whose every lib and bin source lies under them can hold no
 /// lib/bin test, so zero executed is expected there.
@@ -3232,7 +3232,7 @@ fn cargo_targets(dir: &Path) -> Vec<CargoTarget> {
     targets
 }
 
-/// Does every one of `sources` (lib and bin crate roots) lie under a tier
+/// Does every one of `sources` (lib and bin crate roots) lie under a directory
 /// whose inline tests `forbidden` forbids? Such a tree can hold no lib/bin
 /// test at all. No sources, or none forbidden, is `false`.
 fn inline_tests_forbidden_for(
@@ -3246,7 +3246,7 @@ fn inline_tests_forbidden_for(
             src.strip_prefix(project_root).is_ok_and(|rel| {
                 forbidden
                     .iter()
-                    .any(|tier| rel.starts_with(tier.trim_end_matches('/')))
+                    .any(|dir| rel.starts_with(dir.trim_end_matches('/')))
             })
         })
 }
@@ -3743,9 +3743,9 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--bin", "fluxor-linux"]));
     }
 
-    /// A tree whose every lib and bin root lies under a tier that forbids
+    /// A tree whose every lib and bin root lies under a directory that forbids
     /// inline tests can have no lib/bin test, so the unit run's zero is
-    /// expected there; a root outside those tiers, or no forbidden tier,
+    /// expected there; a root outside those directories, or no forbidden directory,
     /// keeps the zero a finding.
     #[test]
     fn zero_unit_tests_are_expected_only_where_inline_tests_are_forbidden() {
@@ -3753,7 +3753,7 @@ mod tests {
         let lib = root.join("src/lib.rs");
         let bin = root.join("src/bin/tool.rs");
         let module = root.join("modules/app/m/mod.rs");
-        let forbid = |tiers: &[&str]| tiers.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+        let forbid = |dirs: &[&str]| dirs.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
         assert!(inline_tests_forbidden_for(
             root,
             &[&lib, &bin, &module],
@@ -3770,7 +3770,7 @@ mod tests {
             &[&lib, &module],
             &forbid(&["modules"])
         ));
-        // Not swept (no tiers passed), or nothing to judge.
+        // Not swept (no directories passed), or nothing to judge.
         assert!(!inline_tests_forbidden_for(root, &[&lib], &[]));
         assert!(!inline_tests_forbidden_for(root, &[], &forbid(&["src"])));
         // A prefix is a path component, not a string prefix.

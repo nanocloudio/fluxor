@@ -344,7 +344,7 @@ route = "class"
   [[contract.op]]
   name = "NET_IDENT_PROVIDER"
   op = 0x4C
-  gate = { handle = "global", arg = "in", max = 2 }
+  gate = { handle = "global", arg = "in", max = 1 }
 
   [[contract.op]]
   name = "BOOT_INCARNATION"
@@ -2117,7 +2117,7 @@ route = "class"
   op = 0x32
 
   [[contract.op]]
-  name = "ISR_METRICS"
+  name = "INTERRUPT_METRICS"
   op = 0xE8
   grant = "none"
   gate = { handle = "global", arg = "inout", max = 24 }
@@ -3288,7 +3288,7 @@ doc = "Drain an instance before a live reconfiguration removes it."
 
 [[entry_point]]
 name = "module_isr_entry"
-doc = "The interrupt-tier entry of an ISR module."
+doc = "The interrupt entry of an `irq` module."
 
 [[entry_point]]
 name = "module_provider_dispatch"

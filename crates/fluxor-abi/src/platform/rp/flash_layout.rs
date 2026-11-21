@@ -28,8 +28,8 @@
 // on-flash data formats (parameter store entries) are the
 // property of this layer too — a second chip that happens to reuse the
 // same format still pays its own constants here rather than reaching
-// into another platform. The graph image a slot holds is not: its header is
-// the one every target's images carry (`wire::graph_image`).
+// into another platform. The node image a slot holds is not: its header is
+// the one every target's images carry (`wire::node_image`).
 
 /// XIP mapping base on RP2040 / RP2350.
 pub const XIP_BASE: u32 = 0x1000_0000;
@@ -37,7 +37,7 @@ pub const XIP_BASE: u32 = 0x1000_0000;
 // ── Graph slot A/B (OTA reconfigure) ──────────────────────────────────
 //
 // Two equal regions below the data store ([`graph_flash`]). Each holds one
-// graph image, header first (`wire::graph_image`). Of the slots the boot
+// node image, header first (`wire::node_image`). Of the slots the boot
 // selector admits, the one with the higher epoch is live. Read by the RP
 // platform's slot selection (`src/platform/rp/config.rs`) and written by
 // `modules/foundation/graph_slot`.

@@ -1,4 +1,4 @@
-# Platform-tier modules
+# Platform-layer modules
 
 Linux-host and wasm/browser built-ins. Their implementations are compiled
 into the kernel (`builtin = true`); the `manifest.toml` here is the

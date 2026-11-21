@@ -492,7 +492,7 @@ use fluxor_sdk::crypto::sha256::*; // only what the module calls
 ```
 
 - `fluxor_abi` is the ABI and nothing else: `kernel_abi` (core primitives),
-  `contracts/` (portable domain contracts such as `hal/`, `net/`,
+  `contracts/` (portable contracts such as `hal/`, `net/`,
   `storage/`, `key_vault`), `internal/` (kernel-private orchestration),
   `platform/` (chip-specific raw register bridges), `wire`, `config` and the
   generated `registry`. Every opcode lives in exactly one layer file and
@@ -558,7 +558,7 @@ The packer (`tools/src/modules.rs::collect_programs`,
 after the module table, on the first 4 KiB boundary past it; the table
 header's first reserved word (bytes 10..14) holds the section's offset
 from the table start. The section is part of the modules region of a
-graph image, so the image digest, and a graph-image signature, cover it.
+node image, so the image digest, and a node-image signature, cover it.
 Its layout is `kernel_abi::program`: a 16-byte header (`FXPG`), one
 64-byte entry per program naming its owner, slot, kind, offset, size,
 format and its owner's region, then the data. Each owner's programs share
@@ -576,7 +576,7 @@ module can only read its own:
 | `PROGRAM_READ` (`0x002C`) | `arg` = `[slot][0; 3][offset: u32 LE]` in, program bytes from `offset` out; answers the count, 0 at the end. |
 
 Both are ungated and need no capability. The kernel bounds the section
-against the mapped bundle and checks its layout — entries in owner
+against the mapped node image and checks its layout — entries in owner
 order, each owner's programs inside its region, regions disjoint and
 page-aligned within the section — and reads no program from a section
 that fails. A module reads in place where the address is non-zero; a
@@ -616,8 +616,8 @@ phase, the scheduler calls `module_drain(state)` once on the module
 (in reverse topological order) to signal "stop accepting new work".
 The module then continues stepping normally until in-flight work is
 complete and it returns `Done` (1) from `module_step`. After all
-drain-capable modules have completed, the scheduler transitions to
-`Migrating` and instantiates the new graph.
+drain-capable modules have completed, the phase returns to `Running` and
+the graph is rebuilt.
 
 See [reconfigure.md](reconfigure.md) for the full state machine.
 
@@ -659,7 +659,6 @@ Faulted modules transition through `Running → Faulted → Recovering`
 |--------|----------|
 | `Skip` | Terminate the module; the graph continues without it |
 | `Restart` | Flush the module's channels and resume stepping. State is not zeroed and `module_new` is not re-called, so this is safe only for stateless or idempotent modules; stateful modules should use `Skip` and rely on the operator to drain and reload |
-| `RestartGraph` | Trigger a full graph reconfigure (last resort) |
 | `Tolerate` | Record step-deadline overruns (fault counter, log, fault ring) without faulting the module; step errors still fault normally. For modules whose synchronous device operations have a legitimate heavy tail |
 
 Recovery is bounded by a per-module restart count and exponential
@@ -752,7 +751,7 @@ to compatible edges.
 ## Runtime Graph Model
 
 The kernel uses a graph-based execution model. Modules are connected via
-channels, and the runner steps all modules each iteration.
+channels, and the domain loop steps every module of its domain each pass.
 
 ```
 +-------------------------------------------------------------+
@@ -776,8 +775,8 @@ channels, and the runner steps all modules each iteration.
 |  manifest facts -> module_init() -> module_new()              |
 |  State in kernel RAM, code executes from flash (XIP)        |
 +-------------------------------------------------------------+
-|                      RUNNER                                  |
-|  setup() -> graph instantiation -> main loop                 |
+|                      DOMAIN LOOP                             |
+|  setup() -> graph instantiation -> passes                    |
 |  Automatic tee/merge insertion for fan-out/fan-in           |
 +-------------------------------------------------------------+
 ```

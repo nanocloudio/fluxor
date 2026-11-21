@@ -72,9 +72,9 @@ trust profiles:
 
 | Profile | Source | Integrity check | Signature check | Used by |
 |---|---|---|---|---|
-| **Trusted built-in** | Compiled-in `BuiltInModule` (e.g. `linux_net`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM host built-ins; bypass the loader entirely |
+| **Trusted native** | A platform's native module (`NativeVtable`, e.g. `linux_net`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM native modules, registered at platform init; resolved when the loader has no module of the name |
 | **Signed flash image** | RP / Pi 5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | Under a signing root: a present signature must verify; an unsigned module runs gated or not at all | Production RP2350 + Pi 5 firmware images |
-| **Embedded blob** | WASM `EMBEDDED_MODULES_BLOB`, Linux `mmap`'d `.fmod` file | `hal::verify_integrity` byte-compares SHA-256 on every platform | Same as flash image when present | Linux dev runs, WASM bundles |
+| **Embedded blob** | WASM `EMBEDDED_MODULES_BLOB`, Linux `mmap`'d `.fmod` file | `hal::verify_integrity` byte-compares SHA-256 on every platform | Same as flash image when present | Linux dev runs, wasm bundles |
 | **Network / staged** | TFTP / OTA delivered image into a staging area then promoted | Same as flash image once promoted | Same | See [reconfigure.md](reconfigure.md) and [network_boot.md](network_boot.md) for the staged-image model |
 
 Per-source signature policy (for example, always requiring a signature on
@@ -93,11 +93,11 @@ modules sign <module.fmod> --key <seed>` signs one module by hand. The
 private key is a raw 32-byte seed on disk; `fluxor modules keygen --key
 <seed>` creates one (mode 0600) and prints its public key, the root.
 
-### Graph-image signatures
+### Node-image signatures
 
 Source: `src/kernel/security/image_signature.rs`.
 
-A graph image — what an RP flash slot holds, what the Pi 5 stages in RAM,
+A node image — what an RP flash slot holds, what the Pi 5 stages in RAM,
 what a firmware image carries after the kernel and what a Linux runtime is
 given — can carry an Ed25519 signature over its header, which names the payload
 by its SHA-256. A kernel image with a signing root boots, stages and
@@ -105,7 +105,7 @@ activates only images signed by that key whose payload matches the
 digest. It is the same root that verifies modules: one key vouches for
 individual modules and for a whole graph. The image format,
 the signing command and what is refused are in
-[network_boot.md](network_boot.md#graph-image-signatures).
+[network_boot.md](network_boot.md#node-image-signatures).
 
 ### Crypto in the admission path
 
@@ -178,7 +178,7 @@ signature comes back, and a different `SIGN` on the key meanwhile answers
 
 `AEAD_SEAL` draws a random nonce per call, which suits a record now and then.
 The unit operations take the caller's nonces, which is what a storage device
-writing under one key for years needs: its nonce domain is a reserved,
+writing under one key for years needs: its nonce space is a reserved,
 monotone sequence that it owns. The key is owned by that one module, so no
 other module can seal under it.
 
@@ -766,7 +766,7 @@ so the definitions in the standard are what the code runs.
 - [module_architecture.md](module_architecture.md) — module binary format,
   manifest layout, loader lifecycle.
 - [network.md](network.md) — net_proto, IP/TLS modules, consumer pattern.
-- [network_boot.md](network_boot.md) — bundle signing, trust root,
+- [network_boot.md](network_boot.md) — node-image signing, trust root,
   deployment flow.
 - [abi_layers.md](abi_layers.md) — ABI layer boundaries, contract
   inventory, KEY_VAULT position.
@@ -808,7 +808,7 @@ The quic module's resumption tickets are what use it — the ticket
 is the session state sealed under a labelled vault key, two generations
 alternating by parity so rotation never strands a live ticket. The AAD
 binds a ticket to the generation that sealed it and to the instance's
-replay domain — 16 CSPRNG bytes drawn once and living exactly as long as
+replay scope — 16 CSPRNG bytes drawn once and living exactly as long as
 the RAM store that enforces single use — so it opens only in the instance
 that minted it: not after a restart, and not in a re-instantiation in the
 same boot, either of which starts with an empty store.

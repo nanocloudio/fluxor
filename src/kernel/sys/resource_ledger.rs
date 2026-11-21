@@ -267,7 +267,7 @@ pub fn plan_parts_in(profile: &crate::kernel::config::CapacityProfile, pool: u16
     let mut derived = DERIVED[i]
         .load(Ordering::Relaxed)
         .saturating_add(DECLARED[i].load(Ordering::Relaxed));
-    // The system owner is structural in every graph, planned or not.
+    // The node owner is structural in every graph, planned or not.
     if pool == res::POOL_OWNERS {
         derived = derived.max(1);
     }
@@ -281,7 +281,7 @@ pub fn plan_parts_in(profile: &crate::kernel::config::CapacityProfile, pool: u16
             // has: the reserve is whatever the derived part leaves.
             Some(n) => (n as u64).saturating_sub(derived),
             // The profile's default is headroom, not an ask: it takes what
-            // the pool's index domain leaves beside the derived part, so a
+            // the pool's index range leaves beside the derived part, so a
             // graph that fits the domain boots on the defaults.
             None => {
                 let default = profile.default_reserve(pool) as u64;
@@ -295,7 +295,7 @@ pub fn plan_parts_in(profile: &crate::kernel::config::CapacityProfile, pool: u16
     (derived, reserve)
 }
 
-/// The index domain `pool`'s table is held within: what an index into it may
+/// The index range `pool`'s table is held within: what an index into it may
 /// be at all, whatever the plan. A ceiling past it is refused at boot naming
 /// the pool (`size_kernel_tables`). `None` for a pool bound only by the
 /// memory the platform gives it.
@@ -358,6 +358,22 @@ fn refuse_in(profile: &crate::kernel::config::CapacityProfile, pool: u16, why: &
 /// refusal has already been logged, naming the pool ([`refuse`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Refused;
+
+/// Refuse `pool` because its table could not take its plan: [`refuse`] with
+/// the reason `e` gives.
+pub fn refuse_table(pool: u16, e: crate::kernel::mem::table::TableError) -> Refused {
+    use crate::kernel::mem::table::TableError;
+    refuse(
+        pool,
+        match e {
+            TableError::Ceiling => "past this profile's table or the format's bound",
+            TableError::NoMemory => {
+                "the platform refused the memory (the host, or a full carve zone)"
+            }
+        },
+    );
+    Refused
+}
 
 /// Check that a static profile's table holds `pool`'s plan: what the config
 /// derives and declares, plus the envelope entry when there is one (without
@@ -502,10 +518,10 @@ pub fn module_deny(pool: u16, module_idx: usize) -> i32 {
 
 // ── Boot plan ──────────────────────────────────────────────────────────────
 
-/// Tees and merges `prepare_graph` will insert: one per port that carries
-/// two or more edges in the same direction. An upper bound — a fan a
-/// multi-inbound or multi-outbound module keeps unfanned is still counted —
-/// so the tables it sizes never come up short.
+/// Ports of the composed graph that carry two or more edges in the same
+/// direction: the ports a multi-inbound or multi-outbound module keeps
+/// unfanned (every other fan is a module of the graph already). An upper
+/// bound, mirrored by the composer's capacity check.
 fn fan_count(config: &crate::kernel::boot::config::Config) -> usize {
     let n = config.edge_count as usize;
     // Keys: direction (bit 31) | module id (bits 5..16) | port key (bits 0..4:
@@ -549,17 +565,17 @@ fn resident_demand(config: &crate::kernel::boot::config::Config) -> (usize, usiz
     };
     let (mut modules, mut edges) = (0, 0);
     for w in workloads.iter() {
-        // The FLXA blob's header carries module_count at byte 32 and
-        // edge_count at 33.
-        if let Some(h) = w.blob.get(..34) {
-            modules += usize::from(h[32]);
-            edges += usize::from(h[33]);
+        // The composed graph's header carries module_count at byte 6 and
+        // edge_count at 8, each a u16 LE.
+        if let Some(h) = w.blob.get(..10) {
+            modules += usize::from(u16::from_le_bytes([h[6], h[7]]));
+            edges += usize::from(u16::from_le_bytes([h[8], h[9]]));
         }
     }
     (usize::from(workloads.count()), modules, edges)
 }
 
-/// Edges of the base graph that cross execution domains: their modules sit in
+/// Edges of the node graph that cross execution domains: their modules sit in
 /// different domains, or the edge is marked cross-core. A kernel with domains
 /// on their own cores bridges each with a consumer-side channel of its own
 /// beside the producer's (`domains::cross::bridge_edges`). A tee or merge takes the domain of the

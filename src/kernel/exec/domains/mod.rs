@@ -19,41 +19,13 @@ pub mod cross;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::aarch64::{cpu, exception, timer};
-use crate::kernel::boot::config::ModuleEntry;
+use crate::kernel::exec::irq;
 use crate::kernel::exec::scheduler::{self, MAX_DOMAINS};
+use fluxor_contracts::boot_config::ExecMode;
 
 // ============================================================================
 // The platform's part
 // ============================================================================
-
-/// How a domain's loop runs, from the domain's `exec_mode`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
-    /// `tick` on the graph's tick: one pass per tick (the default).
-    Cooperative,
-    /// `tick` on the domain's own `tick_us`: a pass per tick at that rate,
-    /// with per-pass step metrics.
-    HighRate,
-    /// `timer`: the domain's modules are stepped at its fixed period.
-    PolledIsr,
-    /// `irq`: the domain's modules run from their interrupt.
-    IrqOwned,
-    /// `poll`: passes back to back while any module bursts.
-    Poll,
-}
-
-impl Tier {
-    fn of(domain_id: usize) -> Self {
-        use scheduler::exec_mode;
-        match scheduler::domain_exec_mode(domain_id) {
-            exec_mode::POLL => Tier::Poll,
-            exec_mode::TIMER => Tier::PolledIsr,
-            exec_mode::IRQ => Tier::IrqOwned,
-            _ if scheduler::domain_declares_tick(domain_id) => Tier::HighRate,
-            _ => Tier::Cooperative,
-        }
-    }
-}
 
 /// What a platform does around the shared loop.
 pub struct Platform {
@@ -62,9 +34,9 @@ pub struct Platform {
     pub has_core: fn(domain_id: usize) -> bool,
     /// After each pass of a domain's loop, on the domain's core: the console
     /// drain, periodic reports, the uptime limit.
-    pub after_pass: fn(domain_id: usize, core_id: usize, tier: Tier),
-    /// After a cooperative or high-rate domain has stepped its modules, on its
-    /// core: work that must not race those steps.
+    pub after_pass: fn(domain_id: usize, core_id: usize, mode: ExecMode),
+    /// After a `tick` domain has stepped its modules, on its core: work that
+    /// must not race those steps.
     pub after_step: fn(domain_id: usize),
 }
 
@@ -97,8 +69,7 @@ pub fn domains_needed() -> usize {
 /// their loops.
 pub fn release() {
     RELEASED.store(true, Ordering::Release);
-    // SAFETY: DMB + SEV are architectural hints; no memory effects.
-    unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
+    cpu::signal_cores();
 }
 
 /// True once [`release`] has run.
@@ -113,24 +84,14 @@ pub fn coreless_domain(platform: &Platform) -> Option<usize> {
 }
 
 /// Seed this core's tick at domain `domain_id`'s rate, which can be faster
-/// (high-rate) or slower than the global tick. The timer handler reloads from
+/// (a domain `tick_us`) or slower than the global tick. The timer handler reloads from
 /// this core's slot, so the rate survives the first interrupt. Returns the
 /// period in counter ticks, for the platform to arm.
 pub fn seed_core_tick(domain_id: usize) -> u32 {
-    let ticks = us_to_ticks(scheduler::domain_tick_us(domain_id));
+    let ticks = timer::us_to_ticks(scheduler::domain_tick_us(domain_id));
     let slot = (cpu::current_core_id() as usize).min(exception::NEXT_DEADLINE_TICKS.len() - 1);
     exception::NEXT_DEADLINE_TICKS[slot].store(ticks, Ordering::Relaxed);
     ticks
-}
-
-fn us_to_ticks(us: u32) -> u32 {
-    let freq = timer::timer_freq();
-    if freq > 0 {
-        (u64::from(us) * freq / 1_000_000) as u32
-    } else {
-        // The counter frequency could not be read: ~1 ms at 62.5 MHz.
-        62_500
-    }
 }
 
 // ============================================================================
@@ -143,90 +104,26 @@ pub enum InstantiateError {
     /// The staged owner plan is invalid: running the graph would run it with
     /// ownership isolation off.
     OwnerPlan(crate::kernel::workload::owner_plan::PlanError),
-    /// This many modules did not instantiate, so the graph would run with
-    /// unwired ports.
-    Modules(usize),
+    /// The graph was refused with this errno: a module did not instantiate,
+    /// so the graph would run with unwired ports.
+    Refused(i32),
 }
 
-/// Instantiate every module of a prepared graph and record which domains run.
-/// Shared by first boot and live rebuild; both call `prepare_graph` and
-/// [`cross::bridge_edges`] first. Interrupts are masked throughout. Returns the
-/// number of modules loaded.
-pub fn instantiate(
-    module_list: &[Option<ModuleEntry>],
-    module_count: usize,
-) -> Result<usize, InstantiateError> {
+/// Instantiate the graph `prepare_graph` staged (`scheduler::instantiate_graph`)
+/// and record which domains run. Shared by first boot and live rebuild; both
+/// call `prepare_graph` and [`cross::bridge_edges`] first. Interrupts are
+/// masked throughout. Returns the number of modules.
+pub fn instantiate(staged: scheduler::splice::StagedAdd) -> Result<usize, InstantiateError> {
     let guard = crate::kernel::sys::guard::KernelGuard::acquire();
 
     // Ownership must be live before any provider handle is opened (see
     // `bare_metal::apply_owner_plan`).
-    crate::kernel::exec::bare_metal::apply_owner_plan().map_err(InstantiateError::OwnerPlan)?;
-
-    // SAFETY: the scheduler's thread, during instantiation.
-    let (loader_ref, sched) = unsafe { (scheduler::static_loader(), scheduler::sched_mut()) };
-    let budget = crate::kernel::exec::bare_metal::PendingBudget::default();
-    let mut loaded = 0usize;
-    let mut failed = 0usize;
-    for (index, slot) in module_list.iter().enumerate().take(module_count) {
-        let Some(entry) = slot else { continue };
-        if entry.domain_id as usize >= MAX_DOMAINS {
-            log::error!("[inst] module {index} names domain {}", entry.domain_id);
-            failed += 1;
-            continue;
-        }
-        scheduler::set_current_module(index);
-        match scheduler::instantiate_one_module(
-            loader_ref,
-            entry,
-            index,
-            index,
-            &mut sched.edges,
-            &mut sched.modules,
-            &mut sched.ports,
-        ) {
-            scheduler::InstantiateResult::Done => loaded += 1,
-            scheduler::InstantiateResult::Pending(mut pending) => {
-                let mut polls = 0u32;
-                loop {
-                    // SAFETY: allocated by the call above; polled here until done.
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(module)) => {
-                            scheduler::store_dynamic_module(index, module);
-                            loaded += 1;
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            e.log("module");
-                            failed += 1;
-                            break;
-                        }
-                    }
-                    polls += 1;
-                    if budget.exhausted(polls) {
-                        log::error!("[inst] module {index} pending timeout");
-                        failed += 1;
-                        break;
-                    }
-                    wait_ms(1);
-                }
-            }
-            scheduler::InstantiateResult::Error(e) => {
-                log::error!("[inst] module {index} failed rc={e}");
-                failed += 1;
-            }
-        }
+    if let Err(e) = crate::kernel::exec::bare_metal::apply_owner_plan() {
+        scheduler::splice::abandon(staged);
+        return Err(InstantiateError::OwnerPlan(e));
     }
-    scheduler::set_active_module_count(module_count);
-    // SAFETY: a read of the installed config, on the scheduler's thread.
-    let cfg = unsafe { scheduler::static_config() };
-    scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
-
-    // The modules of a polled-timer ISR domain go to the ISR-tier dispatcher.
-    let isr_registered = scheduler::register_isr_tier_modules_from_graph();
-    if isr_registered > 0 {
-        log::info!("[isr] Tier 1b admitted {isr_registered} module(s)");
-    }
+    let loaded = scheduler::instantiate_graph(staged, &mut || wait_ms(1), &mut |_| {})
+        .map_err(InstantiateError::Refused)?;
 
     for (d, count) in MODULE_COUNT.iter().enumerate() {
         let n = scheduler::domain_module_count(d);
@@ -243,11 +140,6 @@ pub fn instantiate(
     }
     drop(guard);
 
-    // A module that did not instantiate leaves its ports unwired, so the graph
-    // that would run is not the graph that was asked for.
-    if failed > 0 && crate::kernel::exec::bare_metal::instantiation_is_fail_closed() {
-        return Err(InstantiateError::Modules(failed));
-    }
     // Before the first step: clear the state arena's zeroed frontier its full
     // distance ahead, so the first heap growth on a step finds zeroed memory.
     crate::kernel::module::loader::prime_frontier();
@@ -295,8 +187,7 @@ static PARKED_IN: [AtomicU32; MAX_DOMAINS] = [const { AtomicU32::new(0) }; MAX_D
 /// boundary. Paired with [`release_quiesce`].
 pub fn request_quiesce() {
     QUIESCE_GEN.fetch_add(1, Ordering::SeqCst);
-    // SAFETY: DMB + SEV are architectural hints; no memory effects.
-    unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
+    cpu::signal_cores();
 }
 
 /// Pass-boundary hook: a no-op on the primary domain and when no quiesce is
@@ -312,8 +203,7 @@ fn park_if_requested(domain_id: usize) {
     }
     PARKED_IN[domain_id].store(generation, Ordering::Release);
     while QUIESCE_GEN.load(Ordering::Acquire) == generation {
-        // SAFETY: WFE is a hint to wait until the next event.
-        unsafe { core::arch::asm!("wfe", options(nostack)) };
+        cpu::wait_for_event();
     }
 }
 
@@ -336,14 +226,15 @@ pub fn wait_parked() {
 /// Primary-only. Release the parked cores. Pairs with [`request_quiesce`].
 pub fn release_quiesce() {
     QUIESCE_GEN.fetch_add(1, Ordering::SeqCst);
-    // SAFETY: DMB + SEV are architectural hints; no memory effects.
-    unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
+    cpu::signal_cores();
 }
 
 /// Park every other domain for a structural change (the `HalOps` seam):
-/// `false`, and nothing parked, before [`release`], when no other core runs.
+/// `false`, and nothing newly parked, before [`release`], when no other core
+/// runs, and when the domains are already parked by an outer quiesce (a
+/// rebuild), whose holder releases them.
 pub fn quiesce_peers() -> bool {
-    if !released() {
+    if !released() || QUIESCE_GEN.load(Ordering::SeqCst) & 1 == 1 {
         return false;
     }
     request_quiesce();
@@ -356,46 +247,18 @@ pub fn quiesce_peers() -> bool {
 // ============================================================================
 
 /// Serve a pending live rebuild, on the primary domain. Called from every
-/// domain loop so the rebuild runs whatever the primary's tier. No-op off
-/// domain 0.
+/// domain loop so the rebuild runs whatever the primary's execution mode.
+/// No-op off domain 0.
 ///
 /// On a pending request: quiesce the other domains, reload the config and
 /// rebuild the graph in place, bridges included. The old graph is gone once
 /// `prepare_graph` starts; a rebuild that cannot finish leaves the graph idle,
-/// never partly built. A parked loop resumes in the tier it was entered in
-/// and re-reads the module tables each pass, but not its exec mode, so a
-/// graph that moves a domain to another tier needs a reboot.
+/// never partly built. A parked loop resumes in the execution mode it was
+/// entered in and re-reads the module tables each pass, but not its mode, so
+/// a graph that moves a domain to another mode needs a reboot.
 fn poll_rebuild(domain_id: usize, platform: &Platform) {
     if domain_id != 0 {
         return;
-    }
-
-    // Test hook (feature `test-plan`): once, well after netconsole bring-up,
-    // report the owner-table occupancy. The boot `apply_staged()` installs the
-    // embedded plan's owner before the net is up (so its own log predates the
-    // netconsole); this late report makes that boot-applied ownership observable
-    // over the netconsole. Expect "active workloads = 1".
-    #[cfg(feature = "test-plan")]
-    {
-        static REPORTED: AtomicBool = AtomicBool::new(false);
-        let t = exception::CORE_TICKS[0].load(Ordering::Relaxed);
-        if t >= 180_000 && !REPORTED.swap(true, Ordering::Relaxed) {
-            let n = scheduler::owners().active_workload_count();
-            log::info!("[test] owner table active workloads = {n}");
-        }
-    }
-
-    // Test hook (feature `test-rebuild`): one-shot rebuild after a fixed number
-    // of timer ticks (~47 s at 9.5 kHz: long past DHCP and netconsole bring-up)
-    // so the bridge can be observed on hardware. Absent from normal builds.
-    #[cfg(feature = "test-rebuild")]
-    {
-        static FIRED: AtomicBool = AtomicBool::new(false);
-        let t = exception::CORE_TICKS[0].load(Ordering::Relaxed);
-        if t >= 450_000 && !FIRED.swap(true, Ordering::Relaxed) {
-            log::warn!("[test] one-shot rebuild trigger at tick {t}");
-            scheduler::request_rebuild();
-        }
     }
 
     if !scheduler::take_rebuild_request() {
@@ -429,18 +292,22 @@ fn poll_rebuild(domain_id: usize, platform: &Platform) {
 /// Prepare, bridge and instantiate the installed config, with every other
 /// domain parked: `(modules loaded, bridges)`, or why it could not.
 fn rebuild(platform: &Platform) -> Result<(usize, usize), &'static str> {
-    let (module_list, module_count) =
-        scheduler::prepare_graph().map_err(|_| "graph preparation failed")?;
-    let bridges = cross::bridge_edges()?;
-    let loaded = instantiate(&module_list, module_count).map_err(|why| match why {
+    let staged = scheduler::prepare_graph().map_err(|_| "graph preparation failed")?;
+    let bridges = match cross::bridge_edges() {
+        Ok(n) => n,
+        Err(why) => {
+            scheduler::splice::abandon(staged);
+            return Err(why);
+        }
+    };
+    let loaded = instantiate(staged).map_err(|why| match why {
         InstantiateError::OwnerPlan(_) => "the staged owner plan is invalid",
-        InstantiateError::Modules(_) => "modules failed to instantiate",
+        InstantiateError::Refused(_) => "a module failed to instantiate",
     })?;
     if coreless_domain(platform).is_some() {
         return Err("a domain with modules has no core to run it");
     }
-    // As at boot: owner accounting and the contract-readiness gate.
-    scheduler::finalize_instantiation_accounting();
+    scheduler::log_arena_usage();
     Ok((loaded, bridges))
 }
 
@@ -451,7 +318,7 @@ fn rebuild(platform: &Platform) -> Result<(usize, usize), &'static str> {
 /// Per-domain loop metrics, read and written only by the core running that
 /// domain's loop.
 struct DomainMetrics {
-    /// High-rate: passes whose step work exceeded half the tick.
+    /// Tick mode: passes whose step work exceeded half the domain's tick.
     slow_passes: u32,
     /// Poll mode: passes.
     poll_steps: u32,
@@ -478,26 +345,8 @@ impl DomainMetrics {
 static mut DOMAIN_METRICS: [DomainMetrics; MAX_DOMAINS] =
     [const { DomainMetrics::new() }; MAX_DOMAINS];
 
-/// Passes each domain's loop has run (every tier but poll mode, which counts
-/// its own); read from any core.
-static PASSES: [AtomicU32; MAX_DOMAINS] = [const { AtomicU32::new(0) }; MAX_DOMAINS];
-
-/// Domain `domain_id`'s pass count, for diagnostics on another core.
-pub fn domain_ticks(domain_id: usize) -> u32 {
-    PASSES
-        .get(domain_id)
-        .map_or(0, |p| p.load(Ordering::Relaxed))
-}
-
-/// Count a pass of domain `domain_id`'s loop: the count it now stands at.
-fn count_pass(domain_id: usize) -> u32 {
-    PASSES[domain_id]
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1)
-}
-
 /// Counter ticks each domain's core spent in its passes, from waking to the
-/// end of the pass (cooperative and high-rate loops), so a reader can tell a
+/// end of the pass (the `tick` loop), so a reader can tell a
 /// core that is saturated from one that is waiting.
 static BUSY_TICKS: [AtomicU64; MAX_DOMAINS] = [const { AtomicU64::new(0) }; MAX_DOMAINS];
 
@@ -531,8 +380,7 @@ fn core_interrupts(core_id: usize) -> u32 {
 /// back and an idle one still sleeps.
 fn await_tick(core_id: usize, interrupts_before_pass: u32) {
     if core_interrupts(core_id) == interrupts_before_pass {
-        // SAFETY: WFI halts the core until the next interrupt; hint-only.
-        unsafe { core::arch::asm!("wfi") };
+        cpu::wait_for_interrupt();
     }
 }
 
@@ -562,7 +410,7 @@ pub fn take_domain0_max_deadline_us() -> u32 {
 /// The next deadline (µs) each domain's last step chose (the resident-graph
 /// merge, or the single-graph pacer); written by [`domain_step_all`] before
 /// [`arm_next_deadline`] reads it in the same pass.
-static DOMAIN_RUNNER_DEADLINE_US: [AtomicU32; MAX_DOMAINS] =
+static DOMAIN_LOOP_DEADLINE_US: [AtomicU32; MAX_DOMAINS] =
     [const { AtomicU32::new(0) }; MAX_DOMAINS];
 
 /// Arm this core's next deadline from the pass just finished: the pacer's
@@ -572,7 +420,7 @@ static DOMAIN_RUNNER_DEADLINE_US: [AtomicU32; MAX_DOMAINS] =
 /// pacer). A fixed domain (`adaptive_flags == 0`) gets its fixed
 /// `domain_tick_us` back, so its cadence is a plain fixed tick.
 fn arm_next_deadline(domain_id: usize, core_id: usize) {
-    let raw_us = DOMAIN_RUNNER_DEADLINE_US[domain_id].load(Ordering::Relaxed);
+    let raw_us = DOMAIN_LOOP_DEADLINE_US[domain_id].load(Ordering::Relaxed);
     let next_us = if scheduler::domain_adaptive_flags(domain_id) != 0 {
         // The clamp must not undercut the pacer's floor (`max(tick_min_us,
         // worst_step × MARGIN)`): arming below it would run the domain faster
@@ -587,7 +435,7 @@ fn arm_next_deadline(domain_id: usize, core_id: usize) {
         DOMAIN0_MAX_DEADLINE_US.fetch_max(next_us, Ordering::Relaxed);
     }
     let slot = core_id.min(exception::NEXT_DEADLINE_TICKS.len() - 1);
-    exception::NEXT_DEADLINE_TICKS[slot].store(us_to_ticks(next_us), Ordering::Relaxed);
+    exception::NEXT_DEADLINE_TICKS[slot].store(timer::us_to_ticks(next_us), Ordering::Relaxed);
 }
 
 // ============================================================================
@@ -598,7 +446,7 @@ fn arm_next_deadline(domain_id: usize, core_id: usize) {
 /// enters it for domain 0 once the graph is released; each secondary for its
 /// own domain after [`released`].
 pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
-    let tier = Tier::of(domain_id);
+    let mode = scheduler::domain_exec_mode(domain_id);
     let core_id = cpu::current_core_id() as usize;
     let metrics = |d: usize| {
         // SAFETY: domain `d`'s metrics are touched only by the core running
@@ -610,10 +458,10 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
         IN_LOOP.fetch_or(1 << domain_id, Ordering::SeqCst);
     }
 
-    match tier {
-        Tier::HighRate => {
+    match mode {
+        ExecMode::Tick => {
             log::info!(
-                "[domain] {} core={} tier=1a tick_us={}",
+                "[domain] {} core={} exec=tick tick_us={}",
                 domain_id,
                 core_id,
                 scheduler::domain_tick_us(domain_id)
@@ -628,22 +476,26 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 domain_step_all(domain_id, platform);
                 cross::pump(domain_id);
                 let elapsed = timer::read_timer_count().wrapping_sub(t0);
-                (platform.after_pass)(domain_id, core_id, tier);
-                let passes = count_pass(domain_id);
+                // With no core of its own, a polled `timer` domain is fired
+                // from here.
+                crate::kernel::exec::timer::poll();
+                (platform.after_pass)(domain_id, core_id, mode);
+                let passes = scheduler::pass_count(domain_id);
                 scheduler::maybe_emit_alive(u64::from(passes), Some(domain_id));
                 poll_rebuild(domain_id, platform);
+                let tick_us = scheduler::domain_tick_us(domain_id);
                 let m = metrics(domain_id);
                 if elapsed > m.worst_step_ticks {
                     m.worst_step_ticks = elapsed;
                 }
-                if elapsed > us_to_ticks(scheduler::domain_tick_us(domain_id)) / 2 {
+                if elapsed > timer::us_to_ticks(tick_us) / 2 {
                     m.slow_passes += 1;
                 }
                 // Every ~10 s at the domain's rate.
-                let report_interval = 10_000_000 / scheduler::domain_tick_us(domain_id).max(1);
+                let report_interval = 10_000_000 / tick_us.max(1);
                 if passes.is_multiple_of(report_interval.max(1)) {
                     log::info!(
-                        "[tier1a] d={} ticks={} slow={} worst={}cyc",
+                        "[tick] d={} passes={} slow={} worst={}cyc",
                         domain_id,
                         passes,
                         m.slow_passes,
@@ -654,16 +506,13 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 count_busy(domain_id, woke);
             }
         }
-        Tier::Poll => {
-            log::info!("[domain] {domain_id} core={core_id} tier=3 poll-mode");
+        ExecMode::Poll => {
+            log::info!("[domain] {domain_id} core={core_id} exec=poll");
             loop {
                 park_if_requested(domain_id);
-                // SAFETY: this domain's modules, stepped on its own core.
-                let sched = unsafe { scheduler::sched_mut() };
-                let (_result, any_burst) =
-                    scheduler::step_domain_modules_poll(&mut sched.modules, domain_id);
+                let any_burst = scheduler::pass::run(domain_id, scheduler::PassKind::Tick).burst;
                 cross::pump(domain_id);
-                (platform.after_pass)(domain_id, core_id, tier);
+                (platform.after_pass)(domain_id, core_id, mode);
                 let m = metrics(domain_id);
                 m.poll_steps += 1;
                 scheduler::maybe_emit_alive(u64::from(m.poll_steps), Some(domain_id));
@@ -672,13 +521,12 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 if !any_burst {
                     m.poll_idle += 1;
                     m.wfe_count += 1;
-                    // SAFETY: WFE halts the core until an event; hint-only.
-                    unsafe { core::arch::asm!("wfe") };
+                    cpu::wait_for_event();
                 }
                 // Every ~1M passes.
                 if m.poll_steps & 0xFFFFF == 0 {
                     log::info!(
-                        "[tier3] d={} polls={} idle={}% wfe={}",
+                        "[poll] d={} passes={} idle={}% wfe={}",
                         domain_id,
                         m.poll_steps,
                         m.poll_idle * 100 / m.poll_steps.max(1),
@@ -687,33 +535,34 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 }
             }
         }
-        // The domain's modules were handed to the ISR-tier dispatcher at
+        // The domain's modules were handed to the `timer` dispatcher at
         // instantiation; the loop fires it when its period has elapsed and
         // still pumps, so a cooperative sibling can deliver work into it.
-        Tier::PolledIsr => {
+        ExecMode::Timer => {
             log::info!(
-                "[domain] {} core={} tier=1b period_us={}",
+                "[domain] {} core={} exec=timer period_us={}",
                 domain_id,
                 core_id,
                 scheduler::domain_tick_us(domain_id)
             );
             loop {
                 park_if_requested(domain_id);
-                crate::kernel::exec::isr_tier::poll_tier1b();
+                crate::kernel::exec::timer::poll();
+                // The domain's pass: the faults its modules latched.
+                let _ = scheduler::pass::run(domain_id, scheduler::PassKind::Tick);
                 cross::pump(domain_id);
-                (platform.after_pass)(domain_id, core_id, tier);
-                // SAFETY: WFE halts the core until an event arrives; the poll
-                // above is non-blocking.
-                unsafe { core::arch::asm!("wfe") };
-                let passes = count_pass(domain_id);
+                (platform.after_pass)(domain_id, core_id, mode);
+                // The poll above is non-blocking.
+                cpu::wait_for_event();
+                let passes = scheduler::pass_count(domain_id);
                 scheduler::maybe_emit_alive(u64::from(passes), Some(domain_id));
                 poll_rebuild(domain_id, platform);
                 if passes.is_multiple_of(1_000_000) {
                     log::info!(
-                        "[tier1b] d={} polls={} ticks={}",
+                        "[timer] d={} passes={} ticks={}",
                         domain_id,
                         passes,
-                        crate::kernel::exec::isr_tier::tier1b_ticks(),
+                        crate::kernel::exec::timer::ticks(),
                     );
                 }
             }
@@ -722,70 +571,39 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
         // it; the core stays in WFI to take that interrupt with least latency,
         // and between interrupts does what every domain core owes: pumping,
         // the rebuild bridge, parking for a reconfigure.
-        Tier::IrqOwned => {
-            log::info!("[domain] {domain_id} core={core_id} tier=2 irq-owned");
+        ExecMode::Irq => {
+            log::info!("[domain] {domain_id} core={core_id} exec=irq");
             loop {
-                // SAFETY: WFI halts the core until its interrupt; the
-                // trampoline runs in interrupt context.
-                unsafe { core::arch::asm!("wfi") };
+                // The trampoline runs in interrupt context.
+                cpu::wait_for_interrupt();
                 park_if_requested(domain_id);
+                // The domain's pass: the faults its modules latched.
+                let _ = scheduler::pass::run(domain_id, scheduler::PassKind::Tick);
                 cross::pump(domain_id);
-                (platform.after_pass)(domain_id, core_id, tier);
-                let passes = count_pass(domain_id);
+                (platform.after_pass)(domain_id, core_id, mode);
+                let passes = scheduler::pass_count(domain_id);
                 scheduler::maybe_emit_alive(u64::from(passes), Some(domain_id));
                 poll_rebuild(domain_id, platform);
                 if passes.is_multiple_of(1_000_000) {
                     log::info!(
-                        "[tier2] d={domain_id} wakes={} irqs={}",
+                        "[irq] d={domain_id} wakes={} irqs={}",
                         passes,
-                        crate::kernel::exec::isr_tier::tier2_dispatch_count(),
+                        irq::dispatch_count(),
                     );
                 }
-            }
-        }
-        Tier::Cooperative => {
-            let mut interrupts_before_pass = core_interrupts(core_id);
-            loop {
-                await_tick(core_id, interrupts_before_pass);
-                park_if_requested(domain_id);
-                let woke = timer::read_timer_count_64();
-                interrupts_before_pass = core_interrupts(core_id);
-                let tick = exception::CORE_TICKS[core_id.min(exception::MAX_CORES - 1)]
-                    .load(Ordering::Relaxed);
-                // Tier-2 silicon validation: from core 0, periodically send SGI 15
-                // to core 1, the interrupt its Tier-2 module owns. Build flag only.
-                #[cfg(feature = "test_tier2_sgi")]
-                if core_id == 0 && tick.is_multiple_of(2000) {
-                    // SAFETY: a single write to the distributor mapped at boot.
-                    unsafe { crate::arch::aarch64::gic::send_sgi(1, 15) };
-                }
-                domain_step_all(domain_id, platform);
-                cross::pump(domain_id);
-                // With no core of its own, a polled-timer ISR domain is fired from
-                // here.
-                crate::kernel::exec::isr_tier::poll_tier1b();
-                (platform.after_pass)(domain_id, core_id, tier);
-                count_pass(domain_id);
-                scheduler::maybe_emit_alive(u64::from(tick), Some(domain_id));
-                poll_rebuild(domain_id, platform);
-                arm_next_deadline(domain_id, core_id);
-                count_busy(domain_id, woke);
             }
         }
     }
 }
 
-/// Step every module of `domain_id` through the shared per-domain scheduler
-/// path (the `step_one_module` body every platform uses), so period gating,
-/// upstream-ready gating, `Done`, the fault state machine and `Burst` behave
-/// as they do on every other platform. With more than one resident graph in
-/// the domain, each owner steps independently and the merged deadline comes
-/// back.
+/// Run `domain_id`'s tick pass (`pass::run`), then its latched wakes, and
+/// publish the pass's deadline for the core's timer.
 fn domain_step_all(domain_id: usize, platform: &Platform) {
-    // SAFETY: this domain's modules, stepped on its own core.
-    let sched = unsafe { scheduler::sched_mut() };
-    let (_result, deadline_us) =
-        scheduler::step_resident_graphs_domain(&mut sched.modules, domain_id);
+    let pass = scheduler::pass::run(domain_id, scheduler::PassKind::Tick);
+    let woken = scheduler::pass::take_domain_wakes(domain_id);
+    if !woken.is_empty() {
+        let _ = scheduler::pass::run(domain_id, scheduler::PassKind::Wake(&woken));
+    }
     (platform.after_step)(domain_id);
-    DOMAIN_RUNNER_DEADLINE_US[domain_id].store(deadline_us, Ordering::Relaxed);
+    DOMAIN_LOOP_DEADLINE_US[domain_id].store(pass.deadline_us, Ordering::Relaxed);
 }

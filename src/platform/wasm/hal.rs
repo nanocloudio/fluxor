@@ -8,7 +8,7 @@
 //! to fn-table index 0, which has the wrong type).
 //!
 //! WASM is single-threaded, sandboxed, has no flash / interrupts /
-//! step guard / ISR tier — most ops are no-ops. The few that matter
+//! step guard / interrupt mode — most ops are no-ops. The few that matter
 //! (timers, csprng) bridge to host imports.
 //!
 //! Mirrors the Linux platform's HAL approach: same table shape, all
@@ -105,10 +105,10 @@ fn wasm_step_guard_post_check() {}
 fn wasm_read_cycle_count() -> u32 {
     wasm_tick_count()
 }
-fn wasm_isr_tier_init() {}
-fn wasm_isr_tier_start(_us: u32) {}
-fn wasm_isr_tier_stop() {}
-fn wasm_isr_tier_poll() {}
+fn wasm_module_timer_init() {}
+fn wasm_module_timer_start(_us: u32) {}
+fn wasm_module_timer_stop() {}
+fn wasm_module_timer_poll() {}
 
 /// The handles this platform's provider tables can hand modules at once:
 /// fetched files, objects, namespace handles, decode jobs and vault keys.
@@ -270,10 +270,10 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     step_guard_disarm: wasm_step_guard_disarm,
     step_guard_post_check: wasm_step_guard_post_check,
     read_cycle_count: wasm_read_cycle_count,
-    isr_tier_init: wasm_isr_tier_init,
-    isr_tier_start: wasm_isr_tier_start,
-    isr_tier_stop: wasm_isr_tier_stop,
-    isr_tier_poll: wasm_isr_tier_poll,
+    module_timer_init: wasm_module_timer_init,
+    module_timer_start: wasm_module_timer_start,
+    module_timer_stop: wasm_module_timer_stop,
+    module_timer_poll: wasm_module_timer_poll,
     init_providers: wasm_init_providers,
     release_module_handles: wasm_release_module_handles,
     boot_scan: wasm_boot_scan,
@@ -282,6 +282,8 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     csprng_fill: wasm_csprng_fill,
     core_id: wasm_core_id,
     irq_bind: wasm_irq_bind,
+    irq_unbind: |_| 0,
+    irq_mask: |_, _| {},
     sleep_until: wasm_sleep_until,
     smp_quiesce_peers: || false,
     smp_release_peers: || {},

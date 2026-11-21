@@ -1,4 +1,4 @@
-//! `wasm_browser_compute` built-in — the generic GPU contract on WebGPU.
+//! `wasm_browser_compute` native module — the generic GPU contract on WebGPU.
 //!
 //! Same contract, same shared cores and same lifetime corpus as the
 //! replay provider and the native Linux one; the only thing that differs
@@ -32,7 +32,9 @@
 //! synchronous pipeline create would stall the shared device's whole timeline
 //! behind one compile.
 
+use crate::abi::platform::native::wasm::wasm_browser_compute as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -200,7 +202,7 @@ const _: () = assert!(CMD_BUF >= gw::MAX_RECORD);
 /// Allocate every buffer and table this provider borrows each step.
 ///
 /// # Safety
-/// Runs once, from `build`, before any step.
+/// Runs once, from the constructor, before any step.
 unsafe fn alloc_state(in_chan: i32, out_chan: i32) -> *mut GpuComputeState {
     let table = syscalls::get_syscall_table();
     let raw =
@@ -298,11 +300,11 @@ unsafe fn alloc_state(in_chan: i32, out_chan: i32) -> *mut GpuComputeState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn gpu_compute_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn gpu_compute_step(state: *mut u8) -> i32 {
     // SAFETY: single-threaded module step; `state` holds the live pointer
-    // `build` wrote, and every buffer below was allocated in `alloc_state` at
+    // the constructor wrote, and every buffer below was allocated in `alloc_state` at
     // exactly the length it is reconstituted with.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut GpuComputeState);
@@ -1020,14 +1022,20 @@ fn encode_exec(
     Some(at)
 }
 
-/// Build the module. Returns a built-in whose state is null when the heap
-/// could not satisfy it — the step then does nothing rather than fault.
-///
+/// The `wasm_browser_compute` native module.
+pub static WASM_BROWSER_COMPUTE: NativeVtable = super::heap_native(new, gpu_compute_step);
+
 /// # Safety
-/// Called once per instance from the platform's graph construction.
-pub(crate) unsafe fn build(in_chan: i32, out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_compute", gpu_compute_step);
-    let raw = alloc_state(in_chan, out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut GpuComputeState, raw);
-    m
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_COMMANDS);
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_OUTCOMES);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, heap_size_for(), || {
+            alloc_state(in_chan, out_chan).cast()
+        })
+    }
 }

@@ -12,19 +12,15 @@
 //! ## Concurrency
 //!
 //! Most `static mut` storage here (`STATIC_CONFIG`, `STATIC_LOADER`,
-//! `SCHED`, `NAME_STORAGE`, `INSTANTIATION_*`,
-//! `MODULE_STATE_PTR`) is populated on core 0 during graph compile,
+//! `SCHED`, `INSTANTIATION_*`) is populated on core 0 during graph compile,
 //! then treated as read-only across all cores during step.
-//! `FAN_BUFS[d]` is per-domain scratch indexed by tee/merge `domain_id`
-//! so concurrent fan modules on different cores don't share a buffer.
 //! `CURRENT_MODULE_PER_CORE[c]` is an atomic array indexed by
 //! `hal::core_id()`. See `docs/architecture/concurrency.md`.
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::kernel::boot::config::{
-    read_config_into, Config, ModuleEntry, ModuleList, MAX_GRAPH_EDGES,
-    MAX_MODULES as CONFIG_MAX_MODULES,
+    read_config_into, Config, ModuleEntry, MAX_GRAPH_EDGES, MAX_MODULES as CONFIG_MAX_MODULES,
 };
 use crate::kernel::exec::step::StepOutcome;
 use crate::kernel::exec::step_guard::{
@@ -38,10 +34,11 @@ use crate::kernel::module::loader::{
     reset_state_arena, DynamicModule, ModuleLoader, PortCapacities, StartNewResult,
 };
 use crate::kernel::module::syscalls;
-use crate::kernel::module::syscalls::{get_syscall_table, is_spi_initialized};
+use crate::kernel::module::syscalls::get_syscall_table;
 use crate::kernel::sys::hal;
 use crate::kernel::workload::bitmask::ModuleMask;
-use crate::kernel::workload::owner::{OwnerHandle, OwnerTable, OWNER_SYSTEM};
+use crate::kernel::workload::owner::{OwnerHandle, OwnerTable, OWNER_NODE};
+use fluxor_contracts::boot_config::ExecMode;
 use fluxor_contracts::ring_size as rings;
 
 // ============================================================================
@@ -64,7 +61,7 @@ pub const NO_MODULE: ModuleId = ModuleId::MAX;
 // `ModuleId`, whose top value is reserved as `NO_MODULE`.
 const _: () = assert!(
     MAX_MODULES < NO_MODULE as usize,
-    "MAX_MODULES must leave NO_MODULE outside the module-index domain"
+    "MAX_MODULES must leave NO_MODULE outside the module-index range"
 );
 
 /// The `buffer_group` values the tables keyed by group span
@@ -72,7 +69,7 @@ const _: () = assert!(
 /// half of it on the small parts, where these tables are on the stack.
 pub(crate) const BUFFER_GROUPS: usize = rings::buffer_groups(MAX_GRAPH_EDGES);
 
-/// The edge-index domain: the config format's bound on a channel id. The
+/// The edge-index range: the config format's bound on a channel id. The
 /// edge tables are sized at boot within it (see [`edge_slots`]); on the
 /// static profiles it is the compiled channel count.
 pub const MAX_CHANNELS: usize = MAX_GRAPH_EDGES;
@@ -147,13 +144,7 @@ pub enum StepResult {
 // Live Reconfigure Types
 // ============================================================================
 
-/// Reconfigure phase state machine.
-///
-/// The scheduler manages live reconfigure as a four-phase transition:
-/// RUNNING -> DRAINING -> MIGRATING -> RUNNING
-///
-/// During RUNNING, the phase check in step_modules() is a single
-/// branch-not-taken with zero overhead.
+/// Reconfigure phase: whether the graph is draining for a rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ReconfigurePhase {
@@ -161,52 +152,7 @@ pub enum ReconfigurePhase {
     Running = 0,
     /// Drain-capable modules are completing in-flight work.
     Draining = 1,
-    /// Modules being replaced/removed, new modules instantiated.
-    Migrating = 2,
 }
-
-/// Maximum number of burst re-steps per module per tick.
-/// When step() returns StepOutcome::Burst, the scheduler re-steps the module
-/// up to this many additional times, stopping early if the module returns
-/// Continue (no more work), Done, or Error.
-/// This enables compute-heavy modules to do multiple chunks of work per tick
-/// while remaining cooperative (each individual step is still bounded).
-const MAX_BURST_STEPS: usize = 16384;
-
-/// Wall-clock window (in milliseconds) within which a paired-module
-/// fault co-incidence triggers quarantine. If module A faults and its
-/// declared `quarantine_partner` B has also faulted within this many
-/// milliseconds, both transition to `Terminated` regardless of their
-/// individual `FaultPolicy`. 100 ms is comfortable for the "two halves
-/// of a TLS handshake go wrong at the same time" case, tight enough
-/// that unrelated faults don't mistakenly cross-trigger.
-///
-/// Measured against `hal::now_millis()` (via `last_fault_ms`) rather
-/// than a tick count: a fixed tick window silently shrinks/grows the
-/// real coincidence window the moment mechanism (b) varies the tick
-/// period, and stalls entirely under mechanism (a) idle-sleep — either
-/// way the safety decision would be made on a wrong window.
-const QUARANTINE_WINDOW_MS: u64 = 100;
-
-/// Hard kernel ceiling on `Draining` phase duration, in scheduler
-/// ticks. The reconfigure PIC module owns the drain orchestration and
-/// decides when each module has finished its in-flight work — but a
-/// buggy or hung module-drain can hold the graph indefinitely. After
-/// this many ticks in `Draining`, the kernel force-finalises every
-/// non-finished module with `FaultState::Terminated`, logs
-/// `MON_DRAIN_FORCED`, and snaps the phase back to `Running` so the
-/// next reconfigure attempt can proceed.
-///
-/// 30 000 ms = 30 s. Long enough that well-behaved drains never hit
-/// it; short enough that operators don't wait minutes on a hung
-/// migration.
-///
-/// Measured against `hal::now_millis()` (via `drain_started_ms`)
-/// rather than a tick count: under mechanism (b) the tick period
-/// varies, so a 30 000-tick ceiling would not map to 30 s, and under
-/// mechanism (a) the tick stops advancing while a hung module holds
-/// the graph — the ceiling would never fire.
-const MAX_DRAIN_MS: u64 = 30_000;
 
 /// Maximum number of execution domains.
 pub const MAX_DOMAINS: usize = 4;
@@ -224,19 +170,18 @@ pub const DEFAULT_TICK_US: u32 = 1000;
 /// worst, so steady-state tracks the current worst and only stale spikes decay.
 pub const WORST_STEP_DECAY_SHIFT: u32 = 8;
 
-/// Maximum number of Tier 1c pre-tick drain modules per domain.
+/// Maximum number of pre-pass drain modules per domain.
 /// Sized for NIC RX + ARP cache drain + headroom — enough for the
 /// canonical use case (single NIC driver per domain) without
 /// bloating `SchedulerState` (each domain costs
-/// `MAX_PRE_TICK_PER_DOMAIN` bytes in `domain_pre_tick_order`).
-pub const MAX_PRE_TICK_PER_DOMAIN: usize = 4;
+/// `MAX_PRE_PASS_PER_DOMAIN` bytes in `domain_pre_pass_order`).
+pub const MAX_PRE_PASS_PER_DOMAIN: usize = 4;
 
-/// Combined cycle budget for *all* Tier 1c pre-tick modules in a
-/// single domain pass, in microseconds. Pre-tick modules run before
-/// the regular `domain_exec_order` rotation; this cap prevents
-/// cumulative pre-tick work from starving the cooperative loop.
-/// At `tick_us = 100`, 5 µs leaves >99 µs for Tier 0/1a modules.
-pub const MAX_PRE_TICK_BUDGET_US: u32 = 5;
+/// The share of its domain's tick the pre-pass slot may take, as a
+/// divisor: the slot's modules together run for at most `tick_us / 20`
+/// (5 µs of a 100 µs tick, 50 µs of a 1 ms one) before the cooperative
+/// pass, so pre-pass work cannot starve it at any cadence.
+pub const PRE_PASS_BUDGET_SHARE: u32 = 20;
 
 /// Describes a connection between two module ports.
 #[derive(Debug, Clone, Copy)]
@@ -273,12 +218,12 @@ pub struct Edge {
     /// via `max(...)` in `open_channels`. See
     /// `kernel::boot::config::GraphEdge::buffer_bytes`.
     pub buffer_bytes: u32,
-    /// Bridge slot index when at least one endpoint is in an ISR-tier
-    /// domain (Tier 1b/2). `-1` means no bridge — same-tier edges
-    /// continue to use the regular PIPE channel exclusively. Set by
+    /// Bridge slot index when at least one endpoint is in an interrupt-mode
+    /// domain (`timer`/`irq`). `-1` means no bridge — an edge between
+    /// cooperative domains continues to use the regular PIPE channel exclusively. Set by
     /// `wire_isr_bridges` after `open_channels`. The
     /// `pump_isr_bridges` routine drains PIPE↔bridge in whichever
-    /// direction the ISR-tier endpoint sits.
+    /// direction the interrupt-mode endpoint sits.
     pub bridge_slot: i8,
     /// Rate class: 0=control, 1=audio, 2=video, 3=bulk, 4=transaction.
     /// Drives MODULE_FLOW_BUDGET grants.
@@ -296,16 +241,6 @@ pub struct Edge {
     /// every fanned edge does, so `channel::FACTS` on the producer's channel
     /// answers for every consumer it reaches.
     pub retains_send: bool,
-    /// This edge references a **pre-existing shared channel** it neither
-    /// opened nor owns — an attachable-lane merge's spare input lane.
-    /// `channel` is pre-assigned to that spare-lane id;
-    /// `open_channels`/`close_channels` skip it (they must not open a fresh
-    /// ring, nor close a channel a boot merge caches) and `free_owner` never
-    /// closes it, so tearing the attaching workload down just frees the lane
-    /// (edge removed ⇒ `channel_producer_owner` reverts to system) without
-    /// disturbing the merge. `false` for every normal edge, so the whole graph
-    /// is byte-identical when no lane is attached.
-    pub shared_channel: bool,
     /// A **tap** (live mirror) edge: `channel` receives a copy of every write
     /// to `tap_source`, the output channel of `from_module`'s port. The
     /// tapped module does not write it — so it is never collected as that
@@ -313,6 +248,18 @@ pub struct Edge {
     /// `tap_source` is -1 once the tapped side has gone.
     pub tap: bool,
     pub tap_source: i32,
+    /// Whose buffer ledger the edge's ring is charged to: the owner of the
+    /// module at that end, which the add that opened the ring placed.
+    /// Only the edge that opened a ring carries its charge.
+    pub charge: EdgeCharge,
+}
+
+/// The end of an edge whose module's owner was charged the edge's ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeCharge {
+    None,
+    Producer,
+    Consumer,
 }
 
 impl Edge {
@@ -339,9 +286,9 @@ impl Edge {
             bridge_slot: -1,
             wake_on_write: false,
             retains_send: false,
-            shared_channel: false,
             tap: false,
             tap_source: -1,
+            charge: EdgeCharge::None,
         }
     }
 
@@ -370,9 +317,9 @@ impl Edge {
             bridge_slot: -1,
             wake_on_write: false,
             retains_send: false,
-            shared_channel: false,
             tap: false,
             tap_source: -1,
+            charge: EdgeCharge::None,
         }
     }
 
@@ -402,8 +349,8 @@ impl Edge {
 /// producer and consumer ports' declared capacities and the edge's
 /// `buffer_bytes`, rounded up to a power of two (64 bytes at least), and the
 /// default ring (`CHANNEL_BUFFER_SIZE`) where nothing sizes the edge. The
-/// composer replays graph preparation over the same file
-/// (`tools/src/ring_plan.rs`) and refuses at build a graph whose rings do not
+/// composer replays graph preparation over the same rule
+/// (`fluxor_contracts::graph::plan`) and refuses at build a graph whose rings do not
 /// fit the target's buffer arena; the harness test `ring_demand` pins the
 /// two together.
 ///
@@ -425,12 +372,11 @@ impl Edge {
 /// at setup by `validate_buffer_groups`).
 ///
 /// No aliased chain passes through a fan (tee/merge): in-place modification
-/// through a shared buffer would reach every party in the fan at once.
-/// `insert_fan` decides by what the fanned port carries. Over a record-
-/// carrying port (`FRAME_KIND_RECORD`) it gives every edge around the fan a
-/// `buffer_group` of its own, above the config's range, so each edge is a
-/// mailbox and the fan moves one record per transfer; over any other port it
-/// clears `buffer_group` and the edges are FIFOs.
+/// through a shared buffer would reach every party in the fan at once. The
+/// composer decides by what the fanned port carries
+/// (`fluxor_contracts::graph::plan`): around a record fan every edge has a
+/// group of its own, so each is a mailbox and the fan moves one record per
+/// transfer; around any other fan the edges are FIFOs.
 ///
 /// ## Buffer sizing for groups
 ///
@@ -466,44 +412,43 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         rings::edge_request(from_size, to_size, edge.buffer_bytes)
     };
 
-    // Pre-scan: each group's largest member request, the size of the ring
-    // the group shares.
-    let mut group_max_size = [0u32; BUFFER_GROUPS];
-    for edge in edges.iter() {
-        let group = edge.buffer_group as usize;
-        if group == 0 {
-            continue;
-        }
-        let edge_max = edge_min_size(edge);
-        if edge_max > group_max_size[group] {
-            group_max_size[group] = edge_max;
-        }
-    }
-
-    // Map buffer_group -> channel handle for aliasing
-    let mut group_channels = [-1i32; BUFFER_GROUPS];
+    // A group's ring is its largest member's request; a member aliases the
+    // ring the group's latest member before it took. Both are found among
+    // the edges themselves, so no table spans the group domain on the stack.
+    let group_max_size = |edges: &[Edge], group: u8| -> u32 {
+        edges
+            .iter()
+            .filter(|e| e.buffer_group == group)
+            .map(&edge_min_size)
+            .max()
+            .unwrap_or(0)
+    };
     let mut count = 0;
-    for edge in edges.iter_mut() {
-        // Attachable-lane edge: `channel` is a pre-existing shared spare lane
-        // (an attachable-lane merge cached it at boot). Never open a fresh
-        // ring for it — the producer must write into the lane the merge
-        // already reads. No boot edge sets this.
-        if edge.shared_channel {
-            // The lane's consumer is the merge that cached it; this edge
-            // names its producer.
-            channel::channel_set_producer(edge.channel, edge.from_module as ModuleId);
-            continue;
-        }
+    for i in 0..edges.len() {
+        let group_channel = if edges[i].buffer_group > 0 {
+            edges[..i]
+                .iter()
+                .rfind(|e| e.buffer_group == edges[i].buffer_group && e.channel >= 0)
+                .map_or(-1, |e| e.channel)
+        } else {
+            -1
+        };
+        let group_size = if edges[i].buffer_group > 0 {
+            group_max_size(edges, edges[i].buffer_group)
+        } else {
+            0
+        };
+        let edge = &mut edges[i];
         // Check for buffer group aliasing
         let group = edge.buffer_group as usize;
-        if group > 0 && group_channels[group] >= 0 {
+        if group > 0 && group_channel >= 0 {
             // Verify destination module can safely consume from mailbox
             // SAFETY: SCHED is scheduler-thread owned; `edge.to_module`
             // is bounded against MAX_MODULES by config validation.
             let safe = unsafe { SCHED.mailbox_safe[edge.to_module] };
             if safe {
                 // Alias: reuse existing channel for this group
-                edge.channel = group_channels[group];
+                edge.channel = group_channel;
                 bind_edge_ends(edge);
                 continue;
             } else {
@@ -514,8 +459,8 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
 
         // Determine buffer size: grouped edges use pre-computed max,
         // ungrouped edges use the same combined signal directly.
-        let buf_size = if group > 0 && group_max_size[group] > 0 {
-            group_max_size[group]
+        let buf_size = if group > 0 && group_size > 0 {
+            group_size
         } else {
             edge_min_size(edge)
         };
@@ -585,7 +530,6 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         // buffer_group != 0 means the config tool determined this edge should
         // use zero-copy semantics, even for a single edge in the group.
         if group > 0 {
-            group_channels[group] = chan;
             channel_set_mailbox(chan);
         }
     }
@@ -656,95 +600,8 @@ pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
 /// Close all channels in the edge list.
 pub fn close_channels(edges: &[Edge]) {
     for edge in edges {
-        // Never close a pre-existing shared spare lane — an attachable-lane
-        // merge caches it; closing it would strand the merge on a dead
-        // handle. Detaching a workload just drops the edge, reverting the
-        // lane to producer-less/free.
-        if edge.shared_channel {
-            // The lane's consumer is the merge that cached it; this edge
-            // names its producer.
-            channel::channel_set_producer(edge.channel, edge.from_module as ModuleId);
-            continue;
-        }
         if edge.channel >= 0 {
             syscalls::channel_close(edge.channel);
-        }
-    }
-}
-
-// ============================================================================
-// Name Arena (static string interning)
-// ============================================================================
-
-/// Maximum name length (including null terminator space)
-const MAX_NAME_LEN: usize = 32;
-
-/// Maximum number of interned names. One per DISTINCT module name — `intern`
-/// returns the existing slot for a repeat — so a graph of many instances of a
-/// few engines (a params control plane is mostly `decision`, `store_source`
-/// and `store_effect`) uses a handful. Sized to MAX_MODULES so even a graph of
-/// all-distinct modules cannot run out.
-const MAX_NAMES: usize = MAX_MODULES;
-
-/// Static storage for interned names
-static mut NAME_STORAGE: [[u8; MAX_NAME_LEN]; MAX_NAMES] = [[0; MAX_NAME_LEN]; MAX_NAMES];
-
-/// Next available slot index
-static mut NEXT_NAME_SLOT: usize = 0;
-
-/// Arena for interning module names as static strings.
-///
-/// Each slot is stable for the lifetime of the graph — no wrap-around,
-/// so returned `&'static str` pointers remain valid until `reset()`.
-struct NameArena;
-
-impl NameArena {
-    /// Intern a name, returning a &'static str.
-    /// Returns "?" if the arena is exhausted — not reachable while MAX_NAMES
-    /// is MAX_MODULES, since a graph cannot hold more distinct names.
-    fn intern(name: &str) -> &'static str {
-        // SAFETY: NameArena is scheduler-thread owned; static name buffers
-        // are accessed only from prepare_graph / instantiate paths.
-        unsafe {
-            // A name already interned is returned as-is: the arena holds
-            // distinct names, not one per instance.
-            let want = &name.as_bytes()[..name.len().min(MAX_NAME_LEN - 1)];
-            let storage = &raw const NAME_STORAGE;
-            for buf in (*storage).iter().take(NEXT_NAME_SLOT) {
-                let len = buf.iter().position(|&b| b == 0).unwrap_or(MAX_NAME_LEN);
-                if &buf[..len] == want {
-                    return core::str::from_utf8_unchecked(&buf[..len]);
-                }
-            }
-            if NEXT_NAME_SLOT >= MAX_NAMES {
-                log::warn!("NameArena: exhausted ({MAX_NAMES} slots), cannot intern '{name}'");
-                return "?";
-            }
-
-            let slot = NEXT_NAME_SLOT;
-            NEXT_NAME_SLOT += 1;
-
-            let buf = &mut NAME_STORAGE[slot];
-            let len = name.len().min(MAX_NAME_LEN - 1);
-            if name.len() > MAX_NAME_LEN - 1 {
-                log::warn!(
-                    "NameArena: '{}' truncated to {} bytes",
-                    name,
-                    MAX_NAME_LEN - 1
-                );
-            }
-            buf[..len].copy_from_slice(&name.as_bytes()[..len]);
-            buf[len] = 0;
-
-            core::str::from_utf8_unchecked(&buf[..len])
-        }
-    }
-
-    /// Reset the arena (call when tearing down the graph).
-    fn reset() {
-        // SAFETY: scheduler-thread reset between graph rebuilds.
-        unsafe {
-            NEXT_NAME_SLOT = 0;
         }
     }
 }
@@ -753,66 +610,119 @@ impl NameArena {
 // Module Slots
 // ============================================================================
 
-pub mod module_types;
-pub use module_types::{
-    BuiltInModule, BuiltInStepFn, DummyModule, MergeModule, ModuleSlot, TeeModule,
-    FAN_FRAMES_PER_STEP, FRAME_KIND_NET, FRAME_KIND_RECORD,
-};
+pub mod slot;
+pub use slot::ModuleSlot;
 
-/// Live graph mutation (add owner / free owner).
+/// Owner lifecycle on a running graph (free, pause, resume) and step budgets.
 pub mod live;
-pub use live::{
-    apply_add, free_owner, AddEdge, AddError, AddModule, AddSubgraph, Endpoint, FreeError,
-    ModuleSource, StepBudget,
-};
+pub use live::{free_owner, FreeError, StepBudget};
 
-// ============================================================================
-// Runner Configuration
-// ============================================================================
+/// Native modules: the platform's own, found by name hash.
+pub mod native;
+pub use native::{NativeInit, NativeModule, NativeVtable};
 
-/// Runtime configuration for the scheduler
-pub struct RunnerConfig {
-    /// SPI bus number (0 or 1)
-    pub spi_bus: u8,
-    /// GPIO pin number for CS
-    pub cs_pin: u8,
-}
+/// Composed graphs spliced into the schedule, boot and live.
+pub mod splice;
+pub use splice::{AddAuthority, AddError, StagedAdd};
 
-impl Default for RunnerConfig {
-    fn default() -> Self {
-        Self {
-            spi_bus: 0,
-            cs_pin: 17,
-        }
-    }
-}
-
-// ── Scheduler body: real responsibility modules ──────────────────────────────
-// Each is a genuine module boundary (its own namespace + explicit visibility),
-// re-exported flat so existing `scheduler::X` call sites are unchanged.
+// ── Scheduler body: responsibility modules ──────────────────────────────────
+// Each names what it gives the rest of the kernel below, explicitly.
 pub mod attest;
-pub mod built_in;
-pub mod domain_budget;
 pub mod exec_order;
+/// The module fault machine.
+pub mod fault;
 pub mod instantiation;
 pub mod live_reconfig;
-pub mod merge;
 pub mod multigraph;
 pub mod ownership;
+/// The adaptive pacer.
+pub mod pacer;
+/// The pass engine.
+pub mod pass;
 pub mod setup;
+pub mod state;
 pub mod static_storage;
-pub mod stepping;
 pub mod wiring;
-pub use built_in::*;
-pub use domain_budget::*;
-pub use exec_order::*;
-pub use instantiation::*;
-pub use live_reconfig::*;
-pub use merge::*;
-pub use multigraph::*;
-pub use ownership::*;
-pub use setup::*;
-pub use static_storage::*;
-pub use stepping::set_forced_pipeline_passes;
-pub use stepping::*;
-pub use wiring::*;
+pub use exec_order::log_dma_owned_edges;
+pub(crate) use exec_order::{
+    gate_contract_consumers, refresh_domains, splice_into_order, unsplice_from_orders,
+};
+pub(crate) use instantiation::{collect_one_module_hints, finalize_module};
+pub use instantiation::{
+    is_node_param_tag, maybe_emit_alive, module_device_window, module_level,
+    module_step_deadline_us, params_carry_tag, params_heap_arena_bytes, params_level,
+    params_node_tag, params_raw_arena, parse_protection_config, sample_flow_stalls, sample_pstatus,
+    set_pstatus_interval_ms, DBG_STEP_MODULE, HEAP_ARENA_TAG, HEAP_RAW_ARENA_TAG,
+};
+pub use live_reconfig::{
+    active_module_count, begin_stop_drain, call_module_drain, hold_idle, mark_module_finished,
+    module_completion_predecessors_finished, module_info_flags, module_upstream_words,
+    prepare_in_progress, raise_module_fault, reconfigure_phase, set_reconfigure_phase,
+    stop_drain_settled,
+};
+pub use multigraph::{
+    admit_resident_workloads_from_config, arena_get, channel_caller, channel_port_lookup,
+    clear_module_ready, deny_interrupt_mode_syscall, domain_count, domain_exec_mode,
+    domain_exec_order_at, domain_module_count, downstream_latency, get_fault_stats,
+    module_domain_id, module_fault_info, module_fault_state, module_finished,
+    module_is_interrupt_mode, module_is_ready, module_state_snapshot, query_module_state,
+    query_step_histogram, rebuild_resident_graph_index, record_step_time, report_module_latency,
+    resident_graph_count, set_domain_exec_mode, set_module_deferred_ready, set_module_domain,
+    set_module_fault_policy, set_module_quarantine_partner, set_module_step_deadline,
+    set_module_step_deadline_burst, set_module_step_period, set_module_step_phase,
+    set_module_upstream_bits, set_module_upstream_mask, ModuleStateSnapshot, PacerLine,
+    PACER_LOG_INTERVAL_US,
+};
+pub(crate) use multigraph::{
+    graph_inbound_readable, log_pacer_line, mark_graph_stepped, owner_graph_paused, resident_graph,
+    slot_resident, ResidentGraph,
+};
+pub use ownership::{
+    authorize_module_access, caller_authority, caller_owner, channel_consumer_module,
+    channel_facts, channel_producer_module, channel_producer_owner, free_module_state,
+    module_is_finished, module_owner, module_owner_attribution, owner_live_snapshot,
+    owner_live_status, owner_modules_quiescent, owners, owners_mut, request_rebuild,
+    set_module_owner, take_rebuild_request, OwnerLiveStatus, OWNER_STATE_ACTIVE,
+    OWNER_STATE_DRAINING, OWNER_STATE_PAUSED,
+};
+pub use pacer::{
+    graph_pacer_deadline, graph_pacer_reset_all, graph_pacer_set_signals, pacer_bounds,
+    pacer_current_period_us, pacer_domain_floor_us, DeadlineMerge, PacerBounds,
+    ADAPTIVE_FLAG_CADENCE, ADAPTIVE_FLAG_IDLE,
+};
+pub(crate) use pacer::{
+    graph_pacer_retain, graph_pacer_runnable, pacer_reset_all, settle_deadline,
+};
+pub(crate) use pass::MAX_PIPELINE_PASSES;
+pub use pass::{
+    domain_budget_overruns, domain_budget_us_consumed, domain_pacer_work_pending,
+    domain_pre_pass_at, domain_pre_pass_count, domain_pre_pass_overruns, pass_count,
+    report_step_effect, run, set_domain_budget_us_limit, set_forced_pipeline_passes, step_effect,
+    take_domain_wakes, tick_all, wake_all, PassKind, PassResult,
+};
+pub use setup::{
+    build_graph, instantiate_graph, log_arena_usage, module_irq, module_isr_budget_cycles,
+    prepare_graph, pump_isr_bridges, set_module_irq, set_module_isr_budget_cycles, setup,
+    size_kernel_tables, DEFAULT_ISR_BUDGET_CYCLES,
+};
+pub(crate) use setup::{register_isr_module, wire_isr_bridges, IsrRegistration};
+pub(crate) use state::{as_module_step, ArenaInfo, MonLine, SCHED};
+pub use state::{
+    caller_module_index, clear_instantiation_state, copy_module_params, current_module_grants,
+    current_module_id, current_module_index, domain_adaptive_flags, domain_tick_max_us,
+    domain_tick_min_us, domain_tick_us, domain_worst_step_us, edge_peer, get_module_port,
+    graph_sample_rate, graph_snapshot, in_module_step, module_code_region, module_index_on_core,
+    module_params, module_port, module_program, module_program_region, module_slot_generation,
+    module_state_footprint, module_type_hash, sched_mut, set_caller_module, set_current_module,
+    set_graph_sample_rate, set_instantiation_state, set_module_arena, set_module_grants,
+    set_module_params, set_module_port, set_module_type_hash, set_owner_idle_safe,
+    store_dynamic_module, store_native_module, syscall_flow_budget, syscall_input_flow_budget,
+    take_module_arena, tick_us, with_module_context, GraphSnapshot, SchedulerState,
+};
+use static_storage::MAX_PORTS;
+pub use static_storage::{
+    install_static_config, populate_static_state, populate_static_state_with_len, static_config,
+    static_config_mut, static_loader, static_loader_mut, ModulePorts,
+};
+pub(crate) use static_storage::{STATIC_CONFIG, STATIC_LOADER};
+pub use wiring::{instantiate_one_module, populate_module_ports_from_edges, InstantiateResult};

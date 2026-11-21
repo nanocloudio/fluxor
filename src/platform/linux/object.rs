@@ -43,7 +43,7 @@ const OBJ_EMPTY_SLOT: LinuxObjectSlot = LinuxObjectSlot {
     in_use: false,
     key: [0u8; OBJ_MAX_KEY],
     key_len: 0,
-    opener: fluxor::kernel::workload::owner::OWNER_SYSTEM,
+    opener: fluxor::kernel::workload::owner::OWNER_NODE,
 };
 
 static mut LINUX_OBJECTS: [LinuxObjectSlot; OBJ_MAX_OPEN] = [OBJ_EMPTY_SLOT; OBJ_MAX_OPEN];
@@ -127,7 +127,7 @@ unsafe fn linux_object_call(
     arg: &mut [u8],
     data: fluxor::kernel::module::user_span::UserSpan<'_>,
 ) -> i32 {
-    // Per-handle fence: HTTP fetches are volatile (no durability tier).
+    // Per-handle fence: HTTP fetches are volatile (no durability guarantee).
     if opcode == obj_dev_fence::QUERY_OP {
         if arg.len() < obj_dev_fence::WIRE_MAX_LEN {
             return obj_errno::EINVAL;

@@ -1,6 +1,6 @@
 //! Owner-scoped storage on Linux.
 //!
-//! A workload is a tenant of the node. What it reaches through the platform's
+//! A workload runs on the node for its owner. What it reaches through the platform's
 //! storage contracts is a root of its own, never the host filesystem, the
 //! HTTP origin or the node's control-plane store:
 //!
@@ -466,7 +466,7 @@ fn walk_inodes(dir: &Path, into: &mut BTreeMap<u64, u64>) {
 
 pub use crate::kernel::workload::storage::rooted;
 
-/// The owner's root, made on first use. `None` for the system owner (which
+/// The owner's root, made on first use. `None` for the node owner (which
 /// has no root: the host is its own), an owner that no longer resolves or is
 /// on its way out, or a root that cannot be made.
 ///

@@ -1,8 +1,8 @@
-//! `wasm_browser_action` built-in: browser-side semantic-action source.
+//! `wasm_browser_action` native module: browser-side semantic-action source.
 //!
 //! The presentation-shell overlay (`browser_overlay_runtime.js`) emits an
 //! opaque, *application-chosen* `action` id — `next`, `toggle`, or any
-//! app-specific verb — when the user activates a control. This built-in
+//! app-specific verb — when the user activates a control. This native module
 //! is the kernel-side conduit: it drains the host action queue and emits
 //! each action-id hash **unchanged** as the FMP command type. The
 //! *consumer* (a `bank` selector, a player, or any app module) decides
@@ -24,7 +24,9 @@
 //! here, so the two sides agree without shipping the strings on the
 //! wire.
 
+use crate::abi::platform::native::wasm::wasm_browser_action as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -71,11 +73,11 @@ unsafe fn alloc_state(out_chan: i32) -> *mut ActionState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn action_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn action_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque pointer to this
-    // instance's heap state, allocated by `build`.
+    // instance's heap state, allocated by the constructor.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut ActionState);
         if st_ptr.is_null() {
@@ -142,9 +144,19 @@ unsafe fn action_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_action", action_step);
-    let raw = alloc_state(out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut ActionState, raw);
-    m
+/// The `wasm_browser_action` native module.
+pub static WASM_BROWSER_ACTION: NativeVtable = super::heap_native(new, action_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_COMMANDS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<ActionState>(), || {
+            alloc_state(out_chan).cast()
+        })
+    }
 }

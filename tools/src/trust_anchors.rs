@@ -24,7 +24,8 @@
 
 use std::path::Path;
 
-use fluxor_contracts::boot_config::{self, BootConfigSpec, ModuleRecord};
+use fluxor_contracts::boot_config::{self, BootConfigSpec};
+use fluxor_contracts::graph::{self, GraphSpec, ModuleRecord};
 
 use crate::hash::fnv1a_hash;
 
@@ -396,47 +397,53 @@ pub fn append_operator_identity(
     })
 }
 
-/// An entry rewriter for [`extend_entries`]: module type hash, module id and
-/// params in; the extended entry to append (or `None`) out.
+/// An entry rewriter for [`extend_entries`]: module type hash, module index
+/// and params in; the extended entry to append (or `None`) out.
 type Extend<'a> = dyn FnMut(u32, u16, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
 
 /// Rewrite the module records of a built config blob and re-seal it.
-/// `extend` sees each record's module type, id and params, and answers the
+/// `extend` sees each record's module type, index and params, and answers the
 /// bytes to append to that record's params (an extended TLV entry), or
 /// `None` to leave it as it was. The blob is decoded and re-encoded by the
 /// codec the kernel boots with: every other record and section is carried
 /// over as decoded, and the new blob has its own length and checksum.
 fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Widened), String> {
     let cfg = boot_config::decode(blob).map_err(|e| format!("config blob refused: {e}"))?;
-    let graph = cfg.graph();
+    let section = cfg.graph();
+    let composed = section.composed();
     let mut widened = Widened::default();
-    let mut params: Vec<Vec<u8>> = Vec::with_capacity(usize::from(graph.module_count()));
-    for m in graph.modules() {
+    let mut params: Vec<Vec<u8>> = Vec::with_capacity(usize::from(composed.module_count()));
+    for (i, m) in composed.modules().enumerate() {
+        let id = i as u16;
         let mut p = m.params.to_vec();
-        if let Some(ext) = extend(m.name_hash, m.id, m.params)? {
+        if let Some(ext) = extend(m.name_hash, id, m.params)? {
             p.extend_from_slice(&ext);
-            widened.instances.push(m.id);
+            widened.instances.push(id);
         }
         params.push(p);
     }
-    let modules: Vec<ModuleRecord<'_>> = graph
+    let modules: Vec<ModuleRecord<'_>> = composed
         .modules()
         .zip(&params)
         .map(|(m, p)| ModuleRecord { params: p, ..m })
         .collect();
-    let edges: Vec<boot_config::EdgeRecord> = graph.edges().collect();
-    let domains: Vec<boot_config::DomainRecord> = graph.domains().collect();
+    let edges: Vec<graph::EdgeRecord> = composed.edges().collect();
+    let order: Vec<u16> = composed.order().collect();
+    let domains: Vec<boot_config::DomainRecord> = section.domains().collect();
     let workloads: Option<Vec<boot_config::WorkloadRecord<'_>>> =
         cfg.workloads().map(|w| w.iter().collect());
     let envelope: Option<Vec<boot_config::PoolEntry>> = cfg.envelope().map(|e| e.iter().collect());
     let demand: Option<Vec<boot_config::PoolEntry>> = cfg.demand().map(|d| d.iter().collect());
     let out = boot_config::encode(&BootConfigSpec {
-        tick_us: graph.tick_us,
-        graph_sample_rate: graph.graph_sample_rate,
-        graph_flags: graph.graph_flags,
-        modules: &modules,
-        edges: &edges,
+        tick_us: section.tick_us,
+        graph_sample_rate: section.graph_sample_rate,
         domains: &domains,
+        graph: GraphSpec {
+            order: &order,
+            modules: &modules,
+            edges: &edges,
+            ..GraphSpec::default()
+        },
         hardware: cfg.hardware(),
         workloads: workloads.as_deref(),
         envelope: envelope.as_deref(),
@@ -609,8 +616,8 @@ mod tests {
         assert!(parse_bundle(&big).unwrap_err().contains("over the"));
     }
 
-    /// A module record of the given type and id: domain 1, pre-pass set, so
-    /// a re-seal that dropped either would show.
+    /// A module record of the given type at index `id`: domain 1, pre-pass
+    /// set, so a re-seal that dropped either would show.
     struct Entry {
         name_hash: u32,
         id: u16,
@@ -637,20 +644,33 @@ mod tests {
     fn record(e: &Entry) -> ModuleRecord<'_> {
         ModuleRecord {
             name_hash: e.name_hash,
-            id: e.id,
             domain: 1,
             pre_pass: true,
+            step_deadline_us: 1500,
+            burst_us: 9000,
+            fault_policy: graph::FaultPolicy::Tolerate,
             params: &e.params,
         }
     }
 
-    const EDGES: [boot_config::EdgeRecord; 1] = [boot_config::EdgeRecord {
-        from: 0,
-        to: 1,
+    /// The record at index 0, so the entries' indices start at 1.
+    const PAD: ModuleRecord<'static> = ModuleRecord {
+        name_hash: 0x0BAD_CAFE,
+        domain: 1,
+        pre_pass: true,
+        step_deadline_us: 1500,
+        burst_us: 9000,
+        fault_policy: graph::FaultPolicy::Tolerate,
+        params: &[],
+    };
+
+    const EDGES: [graph::EdgeRecord; 1] = [graph::EdgeRecord {
+        from: graph::Endpoint::New(0),
+        to: graph::Endpoint::New(1),
         from_port: 2,
         to_port: 3,
         to_ctrl: true,
-        class: boot_config::EdgeClass::CrossCore,
+        class: graph::EdgeClass::CrossCore,
         buffer_group: 4,
         rate_class: 1,
         wake_on_write: false,
@@ -674,25 +694,35 @@ mod tests {
         },
     ];
     const HARDWARE: [u8; 6] = [0, 0, 0, 0, 0, 0];
-    const FLXA: [u8; 3] = [7, 8, 9];
+    const WORKLOAD: [u8; 3] = [7, 8, 9];
     const ENVELOPE: [boot_config::PoolEntry; 1] = [boot_config::PoolEntry { pool: 5, n: 33 }];
     const DEMAND: [boot_config::PoolEntry; 1] = [boot_config::PoolEntry { pool: 10, n: 2 }];
 
-    /// A built config holding `entries`, with an edge, two domains, a
-    /// hardware payload, a resident workload, an envelope and a demand
-    /// section beside them, so a re-seal that lost any of them would show.
+    /// A built config holding `entries` at indices 1.., with an edge, a
+    /// stepping order, two domains, a hardware payload, a resident workload,
+    /// an envelope and a demand section beside them, so a re-seal that lost
+    /// any of them would show.
     fn blob(entries: &[Entry]) -> Vec<u8> {
-        let modules: Vec<ModuleRecord<'_>> = entries.iter().map(record).collect();
+        for (k, e) in entries.iter().enumerate() {
+            assert_eq!(usize::from(e.id), k + 1, "an entry's id is its index");
+        }
+        let modules: Vec<ModuleRecord<'_>> = std::iter::once(PAD)
+            .chain(entries.iter().map(record))
+            .collect();
+        let order = order(modules.len());
         let workloads = [boot_config::WorkloadRecord {
             idle_safe: true,
-            blob: &FLXA,
+            blob: &WORKLOAD,
         }];
         boot_config::encode(&BootConfigSpec {
             tick_us: 1000,
             graph_sample_rate: 48_000,
-            graph_flags: boot_config::GRAPH_FLAG_ACCEPT_CYCLES,
-            modules: &modules,
-            edges: &EDGES,
+            graph: GraphSpec {
+                order: &order,
+                modules: &modules,
+                edges: &EDGES,
+                ..GraphSpec::default()
+            },
             domains: &DOMAINS,
             hardware: Some(&HARDWARE),
             workloads: Some(&workloads),
@@ -702,17 +732,21 @@ mod tests {
         .expect("encodes")
     }
 
+    /// A stepping order that steps the last module first.
+    fn order(n: usize) -> Vec<u16> {
+        (0..n as u16).rev().collect()
+    }
+
     /// Everything but the module params decodes from `after` as `blob`
-    /// built it; returns each module's `(id, params)`.
+    /// built it; returns each entry's `(id, params)`.
     fn reseal_kept_the_rest(after: &[u8], ids: &[u16]) -> Vec<(u16, Vec<u8>)> {
         let cfg = boot_config::decode(after).expect("the re-sealed blob decodes");
         assert_eq!(cfg.total_len(), after.len());
         let g = cfg.graph();
-        assert_eq!(
-            (g.tick_us, g.graph_sample_rate, g.graph_flags),
-            (1000, 48_000, boot_config::GRAPH_FLAG_ACCEPT_CYCLES)
-        );
-        assert_eq!(g.edges().collect::<Vec<_>>(), EDGES);
+        assert_eq!((g.tick_us, g.graph_sample_rate), (1000, 48_000));
+        let c = g.composed();
+        assert_eq!(c.edges().collect::<Vec<_>>(), EDGES);
+        assert_eq!(c.order().collect::<Vec<_>>(), order(ids.len() + 1));
         assert_eq!(g.domains().collect::<Vec<_>>(), DOMAINS);
         assert_eq!(cfg.hardware(), Some(&HARDWARE[..]));
         let w: Vec<_> = cfg.workloads().expect("WKLD").iter().collect();
@@ -720,7 +754,7 @@ mod tests {
             w,
             [boot_config::WorkloadRecord {
                 idle_safe: true,
-                blob: &FLXA
+                blob: &WORKLOAD
             }]
         );
         assert_eq!(
@@ -731,10 +765,20 @@ mod tests {
             cfg.demand().expect("DMND").iter().collect::<Vec<_>>(),
             DEMAND
         );
-        let modules: Vec<_> = g.modules().collect();
-        assert_eq!(modules.iter().map(|m| m.id).collect::<Vec<_>>(), ids);
-        assert!(modules.iter().all(|m| m.domain == 1 && m.pre_pass));
-        modules.iter().map(|m| (m.id, m.params.to_vec())).collect()
+        let modules: Vec<_> = c.modules().collect();
+        assert_eq!(modules[0], PAD);
+        let entries = &modules[1..];
+        assert_eq!(entries.len(), ids.len());
+        assert!(entries
+            .iter()
+            .all(|m| m.domain == 1 && m.pre_pass && m.step_deadline_us == 1500));
+        assert!(entries
+            .iter()
+            .all(|m| m.burst_us == 9000 && m.fault_policy == graph::FaultPolicy::Tolerate));
+        ids.iter()
+            .zip(entries)
+            .map(|(&id, m)| (id, m.params.to_vec()))
+            .collect()
     }
 
     #[test]
@@ -745,7 +789,7 @@ mod tests {
         let server = entry("tls", 2, &[(1, 1), (2, 1), (11, 2)], &deployment);
         let quic_client = entry("quic", 3, &[(2, 0), (9, 1)], &deployment);
         let quic_server = entry("quic", 4, &[(9, 1)], &deployment); // mode absent = server
-        let other = entry("ip", 300, &[(1, 0)], &[]);
+        let other = entry("ip", 5, &[(1, 0)], &[]);
         let before_params: Vec<Vec<u8>> = [&client, &server, &quic_client, &quic_server, &other]
             .iter()
             .map(|e| e.params.clone())
@@ -760,7 +804,7 @@ mod tests {
         // deployment tag; every other record is byte-identical, and every
         // other section survives.
         let ext = encode_ext(TAG_OPERATOR_TRUST, &extra);
-        let modules = reseal_kept_the_rest(&after, &[1, 2, 3, 4, 300]);
+        let modules = reseal_kept_the_rest(&after, &[1, 2, 3, 4, 5]);
         for (i, (id, params)) in modules.iter().enumerate() {
             let widened = *id == 1 || *id == 3;
             let mut expected = before_params[i].clone();
@@ -777,12 +821,12 @@ mod tests {
         assert_eq!(after.len(), before.len() + 2 * ext.len());
     }
 
-    /// The extended entries of the `n`th module record: (id, cert, key).
+    /// The extended entries of the `n`th entry: (id, cert, key).
     fn identity_of(after: &[u8], n: usize) -> (u16, Option<Vec<u8>>, Option<Vec<u8>>) {
         let cfg = boot_config::decode(after).expect("decodes");
-        let m = cfg.graph().modules().nth(n).expect("module");
+        let m = cfg.graph().composed().modules().nth(n + 1).expect("module");
         (
-            m.id,
+            n as u16 + 1,
             ext_blob(m.params, TAG_CERT).map(<[u8]>::to_vec),
             ext_blob(m.params, TAG_KEY).map(<[u8]>::to_vec),
         )

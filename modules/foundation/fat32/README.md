@@ -32,7 +32,7 @@ load-bearing for consumers:
   from the *volume's* reserved-sector geometry, not from the provider, so
   there is no honest answer before the boot sector is read. A consumer that
   probes during graph bring-up and latches a bitmap it never successfully
-  read will run its degraded tier forever.
+  read will run its degraded surface forever.
 - **`RENAME` tracks the volume.** A volume formatted with fewer than ten
   reserved sectors cannot carry the rename intent record, so the bit stays
   clear and the opcode returns `ENOSYS`. This is not a failure; it is the

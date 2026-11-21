@@ -31,7 +31,7 @@ pub fn owners_mut() -> &'static mut OwnerTable {
 #[inline]
 pub fn module_owner(module_idx: usize) -> OwnerHandle {
     if module_idx >= module_slots() {
-        return OWNER_SYSTEM;
+        return OWNER_NODE;
     }
     // SAFETY: scheduler-thread read; module_idx bounded above.
     unsafe { SCHED.module_owner[module_idx] }
@@ -49,7 +49,7 @@ pub fn set_module_owner(module_idx: usize, owner: OwnerHandle) {
 }
 
 /// Authorize `caller` to touch a resource owned by module `target_idx`.
-/// Returns true when the target is system-owned or the same owner.
+/// Returns true when the target is node-owned or the same owner.
 #[inline]
 pub fn authorize_module_access(caller: OwnerHandle, target_idx: usize) -> bool {
     crate::kernel::workload::owner::same_or_system(caller, module_owner(target_idx))
@@ -60,12 +60,12 @@ pub fn authorize_module_access(caller: OwnerHandle, target_idx: usize) -> bool {
 pub fn caller_owner() -> OwnerHandle {
     // Before the platform is up no module runs: the caller is the kernel.
     if !crate::kernel::sys::hal::is_initialised() {
-        return OWNER_SYSTEM;
+        return OWNER_NODE;
     }
     module_owner(current_module_index())
 }
 
-/// The authority the currently-executing module acts with: the system owner
+/// The authority the currently-executing module acts with: the node owner
 /// for the node and for an owner admitted with the node's authority, its own
 /// owner otherwise. What it reaches is decided by this; what it holds is
 /// stamped with [`caller_owner`].
@@ -158,7 +158,7 @@ impl OwnerLiveStatus {
 /// (`owners().slot_count()`) holds them all — and returns the record count.
 /// Scheduler-thread only (same access class as `module_fault_state`).
 ///
-/// An owner table of the system slot alone has no workload slots: 0.
+/// An owner table of the node owner's slot alone has no workload slots: 0.
 pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus]) -> usize {
     // SAFETY: scheduler-thread read of the static owner table + fault state.
     let sched = unsafe {
@@ -280,12 +280,12 @@ pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
         let p = &raw const SCHED;
         &*p
     };
-    let mut owned = [false; MAX_MODULES];
-    for (idx, is_owned) in owned.iter_mut().enumerate().take(module_slots()) {
+    let mut owned = ModuleMask::new();
+    for idx in 0..module_slots() {
         if module_owner(idx) != handle {
             continue;
         }
-        *is_owned = true;
+        owned.set(idx);
         if matches!(sched.modules[idx], ModuleSlot::Empty) {
             continue;
         }
@@ -297,8 +297,8 @@ pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
     // In-flight frames: revoking now would drop a queued input; wait for the
     // pipeline to run dry (the deadline bounds a pipeline that never does).
     for edge in sched.edges.iter().take(sched.edge_count) {
-        let touches_owner = (edge.from_module < module_slots() && owned[edge.from_module])
-            || (edge.to_module < module_slots() && owned[edge.to_module]);
+        let touches_owner = (edge.from_module < module_slots() && owned.test(edge.from_module))
+            || (edge.to_module < module_slots() && owned.test(edge.to_module));
         if touches_owner && crate::kernel::ipc::channel::channel_has_pending(edge.channel) {
             return false;
         }
@@ -309,12 +309,12 @@ pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
 /// Owner of the module that PRODUCES into channel `ch` — the carried-
 /// attribution source for provider modules that serve multiple owners over
 /// per-edge lanes (`linux_net` stamps each bind
-/// with its commanding lane's owner). `OWNER_SYSTEM` when no edge produces
-/// into the channel or the producer is system-owned. Scheduler thread only,
+/// with its commanding lane's owner). `OWNER_NODE` when no edge produces
+/// into the channel or the producer is node-owned. Scheduler thread only,
 /// resolved at instantiation (after plan apply) and re-resolved on rebuild.
 pub fn channel_producer_owner(ch: i32) -> OwnerHandle {
     if ch < 0 {
-        return crate::kernel::workload::owner::OWNER_SYSTEM;
+        return crate::kernel::workload::owner::OWNER_NODE;
     }
     // SAFETY: scheduler-thread read of the static edge table.
     let sched = unsafe {
@@ -326,7 +326,7 @@ pub fn channel_producer_owner(ch: i32) -> OwnerHandle {
             return module_owner(edge.from_module);
         }
     }
-    crate::kernel::workload::owner::OWNER_SYSTEM
+    crate::kernel::workload::owner::OWNER_NODE
 }
 
 /// `channel::FACTS` for `caller`: the owner slot of the module that writes
@@ -392,7 +392,7 @@ pub fn channel_consumer_module(ch: i32) -> Option<usize> {
 }
 
 /// Owner attribution for a module: `(owner_uid, slot, generation)`, or `None` if
-/// the module is system-owned or its owner stamp is stale (slot reused at a
+/// the module is node-owned or its owner stamp is stale (slot reused at a
 /// newer generation). Mirrors `owner_live_snapshot`'s stale-stamp rule. Used by
 /// the Linux log tee to attribute an on-step log record to its owner. Scheduler
 /// thread only.
@@ -408,7 +408,7 @@ pub fn module_owner_attribution(module_idx: usize) -> Option<([u8; 16], u16, u32
     };
     let e = sched.owners.entry_at(handle.slot as usize)?;
     if e.generation != handle.generation {
-        return None; // stale stamp: module belongs to the slot's previous tenant
+        return None; // stale stamp: module belongs to the slot's previous owner
     }
     Some((e.owner_uid, handle.slot, handle.generation))
 }
@@ -429,24 +429,6 @@ pub fn force_module_fault_state_for_test(module_idx: usize, state: FaultState, f
     }
 }
 
-/// Test-only: force module `idx`'s slot occupied (Dummy) or empty, so
-/// status-aggregation tests can stage loaded vs failed-instantiate modules.
-#[doc(hidden)]
-pub fn force_module_loaded_for_test(module_idx: usize, loaded: bool) {
-    if module_idx >= module_slots() {
-        return;
-    }
-    // SAFETY: single-threaded test context; module_idx bounded.
-    unsafe {
-        let p = &raw mut SCHED;
-        (&mut (*p).modules)[module_idx] = if loaded {
-            ModuleSlot::Dummy(DummyModule)
-        } else {
-            ModuleSlot::Empty
-        };
-    }
-}
-
 /// Test-only: force module `idx`'s `finished` flag (StepOutcome::Done).
 #[doc(hidden)]
 pub fn force_module_finished_for_test(module_idx: usize, finished: bool) {
@@ -461,9 +443,9 @@ pub fn force_module_finished_for_test(module_idx: usize, finished: bool) {
 }
 
 /// Request a graph rebuild from the boot configuration. The per-platform
-/// main loop consumes the request after `step_modules` returns.
+/// domain loop consumes the request after its pass returns.
 pub fn request_rebuild() {
-    // SAFETY: scheduler-thread mutation; the main loop consumes the request
+    // SAFETY: scheduler-thread mutation; the domain loop consumes the request
     // before it re-enters `prepare_graph`.
     unsafe {
         let p = &raw mut SCHED;
@@ -473,7 +455,7 @@ pub fn request_rebuild() {
 
 /// Consume the pending rebuild request: whether one was made.
 pub fn take_rebuild_request() -> bool {
-    // SAFETY: scheduler-thread mutation; single consumer (main loop).
+    // SAFETY: scheduler-thread mutation; single consumer (domain loop).
     unsafe {
         let p = &raw mut SCHED;
         core::mem::take(&mut (*p).rebuild_request)
@@ -482,7 +464,7 @@ pub fn take_rebuild_request() -> bool {
 
 /// Tear down a single module: take its memory (state buffer, heap arena,
 /// elastic chunks and, on a protection-unit target, its private region) back
-/// to the loader, drop its protection domain, and clear its slot, port
+/// to the loader, drop its isolation region, and clear its slot, port
 /// assignments, hints, drain flags and finished state so the slot can be
 /// reused.
 ///
@@ -511,13 +493,10 @@ pub fn free_module_state(module_idx: usize) {
     #[cfg(not(feature = "kernel-mpu"))]
     let private: Option<(*mut u8, usize)> = None;
 
-    // The heap arena (from the manifest, if any) and the
-    // state buffer, which lives inside the DynamicModule.
+    // The heap arena (from the manifest, if any) and the state buffer the
+    // instance holds; a native instance releases what it built first.
     let arena = core::mem::replace(&mut sched.arenas[module_idx], ArenaInfo::empty());
-    let state = match core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty) {
-        ModuleSlot::Dynamic(m) => m.into_state_range(),
-        _ => (core::ptr::null_mut(), 0),
-    };
+    let state = sched.modules[module_idx].take_state_range();
     // An elastic heap records a null arena (its cap is what the owner was
     // charged) and owns the segments it carved; they go with the rest.
     let memory = crate::kernel::module::loader::ModuleMemory::new(
@@ -537,7 +516,7 @@ pub fn free_module_state(module_idx: usize) {
         unsafe { memory.release() };
     }
 
-    // A gated module's protection domain goes with it: its slot, tables and
+    // A gated module's isolation region goes with it: its slot, tables and
     // stack, and every handle the gateway minted for it.
     if crate::kernel::module::gateway::is_registered(module_idx) {
         crate::kernel::sys::hal::protection_release_module(module_idx);
@@ -558,7 +537,8 @@ pub fn free_module_state(module_idx: usize) {
     sched.starvation_suspect.clear(module_idx);
     sched.starvation_reported.clear(module_idx);
     sched.step_period[module_idx] = 0;
-    sched.step_counter[module_idx] = 0;
+    sched.step_phase[module_idx] = 0;
+    sched.module_next_due_us[module_idx] = 0;
     sched.module_code_base[module_idx] = 0;
     sched.module_code_size[module_idx] = 0;
 }

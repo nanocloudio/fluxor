@@ -7,7 +7,7 @@
 //! is always the resolver; `resolve_project` walks the dependencies'
 //! project indexes (`<dep>/meta:latest`), and `cmd_update` writes the
 //! pins (optionally from a snapshot): every dependency's modules, sources
-//! and runtimes, and every stack and bundle the project references by name
+//! and runtimes, and every stack and package the project references by name
 //! ([`references`]). Epoch validation (`check_epoch`) enforces the
 //! two sync-time rules: set homogeneity for everyone, currency for
 //! live workspace members only.
@@ -34,12 +34,12 @@ pub struct Artifact {
     /// `module` | `source` | `runtime` | `bundle` | `stack`.
     pub kind: String,
     /// Artifact name (module name, source-tree name, runtime binary
-    /// name, bundle name, stack name).
+    /// name, package name, stack name).
     pub name: String,
     /// Publishing project (`io.fluxor.project`).
     pub project: String,
     /// Module ABI for modules, host triple for runtimes; absent
-    /// for sources, bundles and stacks.
+    /// for sources, packages and stacks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Artifact-manifest digest (`sha256:<hex>`) — the identity.
@@ -462,7 +462,7 @@ fn dependency_index(store: &OciStore, dep: &str) -> Result<Vec<Artifact>> {
 /// Resolve one dependency's pinnable artifacts from its project index
 /// (`<dep>/meta:latest`): every source and runtime child, plus module
 /// children whose target is in `abis` (all of them when `None`). Its
-/// stacks and bundles are pinned only when referenced ([`references`]).
+/// stacks and packages are pinned only when referenced ([`references`]).
 pub(crate) fn resolve_dependency(
     store: &OciStore,
     dep: &str,
@@ -485,7 +485,7 @@ pub(crate) fn resolve_dependency(
     Ok(out)
 }
 
-/// The stacks and bundles a project references by name.
+/// The stacks and packages a project references by name.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct References {
     /// Every `include[].stack` name in a graph the project versions — the
@@ -499,14 +499,14 @@ pub struct References {
     /// file `references` can see.
     pub bound: BTreeMap<String, String>,
     /// `fluxor.toml::[uses] bundles`, other than the project's own
-    /// `packaging/` bundles.
-    pub bundles: BTreeSet<String>,
+    /// `packaging/` packages.
+    pub packages: BTreeSet<String>,
 }
 
 /// What this project references by name: every stack a graph it versions
 /// includes by name (a file path is not a reference), every stack its
-/// `[uses.stacks]` binds, and every bundle its `[uses] bundles` declares.
-/// Its own packaged stacks and bundles resolve to themselves and are not
+/// `[uses.stacks]` binds, and every package its `[uses] bundles` declares.
+/// Its own packaged stacks and packages resolve to themselves and are not
 /// references. A nested project's graphs are its own. A graph's
 /// `stack: "@<name>"` with no `[uses.stacks]` entry is refused here,
 /// naming the graph, so an unbound name is found when the pins are
@@ -590,16 +590,16 @@ pub fn references(project_root: &Path) -> Result<References> {
             refs.bound.insert(bound, stack);
         }
     }
-    for name in crate::project::used_bundles(project_root).map_err(Error::Config)? {
-        if crate::packaging::bundle_path(project_root, &name).is_none() {
-            refs.bundles.insert(name);
+    for name in crate::project::used_packages(project_root).map_err(Error::Config)? {
+        if crate::packaging::package_path(project_root, &name).is_none() {
+            refs.packages.insert(name);
         }
     }
     Ok(refs)
 }
 
 /// The one artifact of `kind` named `name` among the dependencies' indexes,
-/// or a refusal: none publishes it, or more than one does. Stack and bundle
+/// or a refusal: none publishes it, or more than one does. Stack and package
 /// names are ecosystem-unique, so two publishers is an ambiguity this
 /// project cannot settle by guessing.
 fn find_reference<'a>(
@@ -689,7 +689,7 @@ fn every_index(store: &OciStore, me: Option<&str>) -> Result<Vec<(String, Vec<Ar
 }
 
 /// Pin every reference into `out`: each stack with the module references
-/// it carries, and each bundle, from the dependency that publishes it;
+/// it carries, and each package, from the dependency that publishes it;
 /// each bound stack, with its module references, from whichever project
 /// index publishes it. Returns, for each digest a binding pinned, the
 /// bindings it was pinned for, so a later refusal can name them.
@@ -700,7 +700,7 @@ fn pin_references(
     out: &mut Vec<Artifact>,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     let mut via: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    if refs.stacks.is_empty() && refs.bundles.is_empty() && refs.bound.is_empty() {
+    if refs.stacks.is_empty() && refs.packages.is_empty() && refs.bound.is_empty() {
         return Ok(via);
     }
     let mut indexes = Vec::new();
@@ -716,10 +716,10 @@ fn pin_references(
         let stack = find_reference(&indexes, crate::stack::KIND, name)?.clone();
         crate::stack::derived_pins(store, &stack, out, me.as_deref())?;
     }
-    for name in &refs.bundles {
-        let mut bundle = find_reference(&indexes, "bundle", name)?.clone();
-        fill_content(store, std::slice::from_mut(&mut bundle));
-        out.push(bundle);
+    for name in &refs.packages {
+        let mut package = find_reference(&indexes, "bundle", name)?.clone();
+        fill_content(store, std::slice::from_mut(&mut package));
+        out.push(package);
     }
     if refs.bound.is_empty() {
         return Ok(via);
@@ -938,7 +938,7 @@ fn withdrawal_note(project_root: &Path, before: &[Artifact], after: &[Artifact])
 
 /// A project never pins what it publishes itself: nothing builds against
 /// its own published artefacts (it builds them), and its own stacks and
-/// bundles resolve from its `packaging/`. A pin of one's own artifact is a
+/// packages resolve from its `packaging/`. A pin of one's own artifact is a
 /// dependency on oneself — the next build needs a publish that needs that
 /// build — so it is refused where it would be followed.
 pub(crate) fn refuse_own_pins(project_root: &Path, entries: &[Artifact]) -> Result<()> {
@@ -949,7 +949,7 @@ pub(crate) fn refuse_own_pins(project_root: &Path, entries: &[Artifact]) -> Resu
         return Err(Error::Config(format!(
             "{} pins `{}` ({} `{}`), an artifact this project publishes itself — a project \
              does not depend on its own artifacts. Run `fluxor update` to rewrite the pins; \
-             the project's own stacks and bundles resolve from its packaging/.",
+             the project's own stacks and packages resolve from its packaging/.",
             project_root.join(LOCKFILE_NAME).display(),
             own.reference,
             own.kind,
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     /// `fluxor update` refuses a lockfile it cannot parse rather than
-    /// rewriting it: the bundle pins inside are recorded nowhere else.
+    /// rewriting it: the package pins inside are recorded nowhere else.
     #[test]
     fn update_refuses_a_lockfile_that_does_not_parse() {
         let _env = crate::oci_store::test_env_lock();
@@ -1234,8 +1234,8 @@ mod tests {
             ("FLUXOR_STORE", &store_dir),
             ("FLUXOR_WORKSPACE", &no_workspace),
         ]);
-        let bundle = entry("bundle", "svc", "web", None);
-        write_store_lock_stamped(dir.path(), std::slice::from_ref(&bundle), None).unwrap();
+        let package = entry("bundle", "svc", "web", None);
+        write_store_lock_stamped(dir.path(), std::slice::from_ref(&package), None).unwrap();
         let path = lockfile_path(dir.path());
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.insert_str(0, "stray = 1\n");
@@ -1687,7 +1687,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            references(root).unwrap().bundles,
+            references(root).unwrap().packages,
             ["object-store".to_string()].into()
         );
         let index = vec![

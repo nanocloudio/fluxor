@@ -373,7 +373,7 @@ impl FileEntry {}
 /// Maximum concurrent FDs the FS_CONTRACT dispatch can hand out.
 ///
 /// Split by target, because the pressure is not the same on both. A
-/// multi-tenant node runs several independent consumers against one volume
+/// multi-owner node runs several independent consumers against one volume
 /// at once — a consensus WAL, its snapshot writer, an object body store, a
 /// firmware staging area — and each holds handles for as long as its own
 /// work takes. Eight slots shared between them means one busy consumer
@@ -1849,7 +1849,7 @@ const FS_FSYNC_NAME: u32 = abi::registry::fs::FSYNC_NAME;
 
 /// `CAPS` (`fs::CAPS`) — capability-discovery opcode. Returns a u32
 /// LE bitmap of supported FS opcodes. Callers query this before
-/// invoking write-tier ops (currently just `OPEN_CREATE`) so
+/// invoking write-surface ops (currently just `OPEN_CREATE`) so
 /// they can branch on capability rather than catch `ENOSYS`.
 const FS_CAPS: u32 = abi::registry::fs::CAPS;
 
@@ -9439,7 +9439,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     }
     // FS capability bitmap (crates/fluxor-abi/src/contracts/storage/fs.rs::CAPS).
     // The CAPS query is the canonical way for callers to discover which
-    // tiers this provider serves before they call an opcode and get
+    // surfaces this provider serves before they call an opcode and get
     // ENOSYS.
     //
     // `RENAME` is read from the MOUNTED volume's geometry: the intent
@@ -9450,7 +9450,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     // other opcode. Returning a pessimistic bitmap instead would be
     // worse than useless: a consumer may latch the bitmap it reads, so a
     // boot-order probe would record as absent a capability the volume
-    // does in fact have, and the consumer would run its degraded tier
+    // does in fact have, and the consumer would run its degraded surface
     // forever with nothing to distinguish that from a volume that
     // genuinely cannot carry the record. A capability answer is only
     // meaningful once there is a volume to answer about.

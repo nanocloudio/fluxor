@@ -1103,9 +1103,9 @@ pub fn generate(repo: &Path) -> Result<String> {
     rustfmt(&emit(&r))
 }
 
-/// The generated source as `rustfmt` lays it out, so the file passes the
-/// module fmt-check unchanged.
-fn rustfmt(src: &str) -> Result<String> {
+/// Generated source as `rustfmt` lays it out, so the file passes the module
+/// fmt-check unchanged.
+pub fn rustfmt(src: &str) -> Result<String> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
     let mut child = Command::new("rustfmt")
@@ -1126,7 +1126,7 @@ fn rustfmt(src: &str) -> Result<String> {
         .map_err(|e| Error::Config(format!("rustfmt: {e}")))?;
     if !out.status.success() {
         return Err(Error::Config(format!(
-            "rustfmt refused the generated registry: {}",
+            "rustfmt refused the generated source: {}",
             String::from_utf8_lossy(&out.stderr)
         )));
     }

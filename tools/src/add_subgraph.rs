@@ -1,79 +1,58 @@
-//! Host-side encoder for the on-device `AddSubgraph` wire format.
+//! The composer's last step, shared by every graph the tools emit: a
+//! declared graph — its modules, what their manifests say of their ports,
+//! and the edges between them — composed by the rules every producer links
+//! (`fluxor_contracts::graph::plan`: fans, mailbox groups, rings, stepping
+//! order) and encoded by the one composed-graph codec
+//! (`fluxor_contracts::graph`). A boot config's graph section, each of its
+//! resident workloads (`WKLD`), a workload image's graph and a workload
+//! `CREATE` carry what this produces.
+//!
+//! The composer refuses what the kernel would refuse of the composed graph:
+//! more pre-pass modules in one domain than
+//! [`graph::MAX_PRE_PASS_PER_DOMAIN`], a cycle the graph does not accept, a
+//! ring past the ceiling, and for a workload more modules or edges than one
+//! live add admits.
 //!
 //! A RESIDENT WORKLOAD is a workload-owned subgraph declared in a graph YAML's
 //! `workloads:` section and admitted by the kernel at boot, alongside the base
-//! graph rather than inside it. Each workload gets its own owner handle, its own
-//! state/buffer caps, and is scheduled as an independent resident graph — so
-//! a workload can be added, paced and parked without touching the base
-//! graph's wiring or its compiled body.
+//! graph rather than inside it. Each workload gets its own owner handle, its
+//! own state/buffer caps, and is scheduled as an independent resident graph.
+//! Workloads are self-contained: edges between the workload's own modules
+//! (`New → New`), in one domain, and lanes to the node's network (`Net`).
+//! Module params are the inline TLV `schema::build_params_from_schema`
+//! produces; a workload module cannot reference a `data:`-section blob.
 //!
-//! The `AddSubgraph` (FLXA) blob produced here is byte-compatible with the
-//! kernel decoder `kernel::exec::scheduler::live::apply_add_encoded`:
-//! big-endian, fixed-width, PIC modules referenced by `name_hash` (FNV-1a of
-//! the type name). A boot config carries each resident workload's blob in its
-//! `WKLD` section (`fluxor_contracts::boot_config::WorkloadRecord`), under the
-//! blob's one checksum; the kernel admits each at boot via
-//! `apply_add_encoded` + `finalize_resident_graphs`.
-//!
-//! Scope: workloads are self-contained subgraphs — intra-workload edges only
-//! (`New → New`), and those edges must stay inside one domain, because a
-//! cross-domain edge needs the SPSC bridge that boot provisions for base
-//! edges and `apply_add` does not open. Module params are the inline TLV
-//! produced by `schema::build_params_from_schema`; a workload module cannot
-//! reference a `data:`-section blob.
-//!
-//! FLXA layout (big-endian):
-//!
-//! ```text
-//! header  magic u32 "FLXA" | version u16 = 1 | flags u16 = 0
-//!         owner_uid [16] | state_cap u32 | buffer_cap u32
-//!         module_count u8 | edge_count u8
-//! module  name_hash u32 | domain_id u8
-//!         step_deadline_us u32 | step_deadline_burst_us u32 | fault_policy u8
-//!         params_len u16 | params [params_len]
-//! edge    from_kind u8 | from_idx u16 | from_port u8
-//!         to_kind u8 | to_idx u16 | to_port u8 | buffer_bytes u32
-//! ```
-//!
-//! A workload composed here is its own authority: `flags` is always 0. Its
-//! one bit, `ADD_FLAG_CREATOR_AUTHORITY`, is honoured only from the
+//! A workload composed here is its own authority: its header's
+//! creator-authority flag is never set. That flag is honoured only from the
 //! `APPLY_ADD` of a module acting with the node's authority, and refused on
-//! both paths a blob composed here takes: a boot graph's resident workloads
+//! both paths a graph composed here takes: a node graph's resident workloads
 //! and a workload `CREATE`.
 //!
-//! The module record's step budget carries the module's YAML
-//! `step_deadline_us`, `step_deadline_burst_us` and `fault_policy`, as a
-//! base-graph module declares them (`0` deadline = the node's default, `0`
-//! burst = `deadline × BURST_MULTIPLIER`; the policy byte is numbered as the
-//! params TLV's tag `0xF1`). A workload's fault tags never ride in its params:
-//! the kernel takes a live-added module's budget from this record alone, and
-//! admits it only within the node's ceiling and with a policy confined to the
-//! module (see `config::builder::workload_step_budget`, which refuses at build
-//! time what the kernel would refuse at admission).
+//! Every module record carries its step budget: the YAML
+//! `step_deadline_us`, `step_deadline_burst_us` and `fault_policy` (`0`
+//! deadline = the node's default, `0` burst = `deadline ×
+//! BURST_MULTIPLIER`). The kernel takes a module's budget from its record
+//! alone, and admits a workload module's only within the node's ceiling and
+//! with a policy confined to the module (see
+//! `config::builder::workload_step_budget`, which refuses at build time what
+//! the kernel would refuse at admission).
 
-/// Wire magic for an `AddSubgraph` blob: "FLXA". Mirrors
-/// `kernel::exec::scheduler::live::ADD_MAGIC`.
-pub const ADD_MAGIC: u32 = 0x464C_5841;
-/// `AddSubgraph` wire version. Mirrors `kernel::exec::scheduler::live::ADD_VERSION`.
-pub const ADD_VERSION: u16 = 1;
-/// Bytes of a module record before its params. Mirrors
-/// `kernel::exec::scheduler::live::ADD_MODULE_FIXED_BYTES`.
-pub const ADD_MODULE_FIXED_BYTES: usize = 4 + 1 + 4 + 4 + 1 + 2;
+use fluxor_contracts::graph::plan::{
+    self, Fan, FanDir, PlanError, PlanModule, PlanPort, RingNode, RingPlatform,
+};
+use fluxor_contracts::graph::{self, EdgeRecord, Endpoint, GraphSpec, ModuleRecord};
 
-/// Fault-policy wire bytes, as the kernel's `FaultPolicy::from_wire` reads
-/// them (the params TLV tag `0xF1` uses the same numbering).
-pub const FAULT_POLICY_SKIP: u8 = 0;
-pub const FAULT_POLICY_RESTART: u8 = 1;
-pub const FAULT_POLICY_RESTART_GRAPH: u8 = 2;
-pub const FAULT_POLICY_TOLERATE: u8 = 3;
+pub use fluxor_contracts::graph::FaultPolicy;
+
+use crate::manifest::Manifest;
 
 /// Whether a params TLV tag is a node tag — mirrors the kernel's
-/// `scheduler::is_node_param_tag`: the fault tags (0xF0–0xF3, 0xF6), trust
-/// tier (0xF4), protection level (0xF5), quarantine partner (0xF7), ISR
-/// budget (0xFB), IRQ (0xFC) and device window (0xFD). Only the node's own
-/// graph grants them; a node refuses a workload module whose params carry
-/// one. The heap flags 0xF8–0xFA act on the module's own heap and are not
-/// node tags.
+/// `scheduler::is_node_param_tag`: 0xF0–0xF7 (the restart settings 0xF2 and
+/// 0xF3, the trust class (0xF4), protection level 0xF5, quarantine partner 0xF7),
+/// ISR budget (0xFB), IRQ (0xFC) and device window (0xFD). Only the node's
+/// own graph grants them; a node refuses a workload module whose params carry
+/// one. The heap flags 0xF8–0xFA and the heap cap 0xEF act on the module's
+/// own heap and are not node tags.
 pub const fn is_node_param_tag(tag: u8) -> bool {
     matches!(tag, 0xF0..=0xF7 | 0xFB..=0xFD)
 }
@@ -110,15 +89,14 @@ const BURST_MULTIPLIER: u32 = 8;
 /// `kernel::step_guard::DEFAULT_STEP_DEADLINE_US` (hardware figure).
 const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 
-/// A workload module's step budget, as its FLXA record carries it.
+/// A module's step budget, as its record carries it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct StepBudget {
     /// `step_deadline_us`; `0` = the node's default.
     pub deadline_us: u32,
     /// `step_deadline_burst_us`; `0` = `deadline × BURST_MULTIPLIER`.
     pub burst_us: u32,
-    /// `fault_policy` wire byte (`FAULT_POLICY_*`).
-    pub fault_policy: u8,
+    pub fault_policy: FaultPolicy,
 }
 
 impl StepBudget {
@@ -142,62 +120,331 @@ impl StepBudget {
         d.saturating_mul(BURST_MULTIPLIER)
     }
 }
-/// Largest subgraph one `apply_add` admits — mirrors
+
+/// Largest graph one `apply_add` admits, fans included — mirrors
 /// `kernel::exec::scheduler::live::MAX_ADD_MODULES`.
 pub const MAX_ADD_MODULES: usize = 64;
-/// Largest edge count one `apply_add` admits — mirrors
+/// Largest edge count one `apply_add` admits, fans' edges included — mirrors
 /// `kernel::exec::scheduler::live::MAX_ADD_EDGES`.
 pub const MAX_ADD_EDGES: usize = 192;
-/// One PIC module in a workload. `params` is the inline TLV blob (as
-/// `schema::build_params_from_schema` produces it for a base-graph module).
-pub struct WorkloadModule {
+
+/// The ports `manifest` declares, as composition reads them.
+pub fn plan_ports(manifest: &Manifest) -> Vec<PlanPort> {
+    manifest
+        .ports
+        .iter()
+        .map(|p| PlanPort {
+            direction: p.direction,
+            index: p.index,
+            buffer_size: p.buffer_size,
+            max_record: p.max_record,
+            frame: plan::port_frame(p.content_type, p.flags),
+        })
+        .collect()
+}
+
+/// A declared module: what its record carries and what composition reads of
+/// its manifest.
+#[derive(Clone, Debug, Default)]
+pub struct GraphModule {
+    /// Its instance name, for refusals.
+    pub name: String,
+    /// FNV-1a of its type, the `.fmod` (or built-in) it runs as.
     pub name_hash: u32,
-    pub domain_id: u8,
-    /// The module's declared step budget (FLXA module record).
+    pub domain: u8,
+    /// It runs in its domain's pre-pass (`pre_pass` in its manifest).
+    pub pre_pass: bool,
+    pub budget: StepBudget,
+    /// Its params TLV.
+    pub params: Vec<u8>,
+    /// Its manifest's ports; empty for a module the node runs built in.
+    pub ports: Vec<PlanPort>,
+    /// It may consume from an aliased mailbox.
+    pub mailbox_safe: bool,
+    /// The node keeps one channel per edge on its inputs and outputs rather
+    /// than a fan (the Linux network provider).
+    pub multi_channel: bool,
+}
+
+impl GraphModule {
+    fn plan(&self) -> PlanModule<'_> {
+        PlanModule {
+            ports: &self.ports,
+            mailbox_safe: self.mailbox_safe,
+            multi_inbound: self.multi_channel,
+            multi_outbound: self.multi_channel,
+            domain: self.domain,
+        }
+    }
+}
+
+/// A module of a composed graph: a declared module or a fan.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComposedModule {
+    pub name_hash: u32,
+    pub domain: u8,
+    pub pre_pass: bool,
     pub budget: StepBudget,
     pub params: Vec<u8>,
 }
 
-/// An end of a workload edge: one of the workload's own modules, or the
-/// node's network through a lane of the workload's (FLXA endpoint kind 3,
-/// the kernel's `Endpoint::Net`). A key names one lane: at most one edge into
-/// it (the module's net commands) and one out of it (its net events).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkloadEnd {
-    Local(u8),
-    Net(u8),
+/// A declared graph composed: its declared modules (indices `0..n`), then
+/// one module per fan; every edge, the fans' joining edges after the
+/// declared ones; and the stepping order.
+#[derive(Clone, Debug, Default)]
+pub struct Composition {
+    pub modules: Vec<ComposedModule>,
+    pub edges: Vec<EdgeRecord>,
+    pub order: Vec<u16>,
+    pub fans: Vec<Fan>,
 }
 
-/// One workload edge (producer → consumer).
-pub struct WorkloadEdge {
-    pub from: WorkloadEnd,
-    pub from_port: u8,
-    pub to: WorkloadEnd,
-    pub to_port: u8,
-    pub buffer_bytes: u32,
+impl Composition {
+    /// The module records, in index order.
+    pub fn records(&self) -> Vec<ModuleRecord<'_>> {
+        self.modules
+            .iter()
+            .map(|m| ModuleRecord {
+                name_hash: m.name_hash,
+                domain: m.domain,
+                pre_pass: m.pre_pass,
+                step_deadline_us: m.budget.deadline_us,
+                burst_us: m.budget.burst_us,
+                fault_policy: m.budget.fault_policy,
+                params: &m.params,
+            })
+            .collect()
+    }
+
+    /// The graph over `records` ([`Self::records`]), owned by the system: no
+    /// owner, no caps, no authority flag.
+    pub fn spec<'a>(&'a self, records: &'a [ModuleRecord<'a>]) -> GraphSpec<'a> {
+        GraphSpec {
+            creator_authority: false,
+            owner_uid: [0; 16],
+            state_cap: 0,
+            buffer_cap: 0,
+            order: &self.order,
+            modules: records,
+            edges: &self.edges,
+        }
+    }
+
+    /// The fan module types the graph runs (`tee`, `merge`), which its
+    /// image's module table must carry.
+    pub fn fan_types(&self) -> Vec<&'static str> {
+        fan_types(self.fans.iter().map(|f| f.dir))
+    }
+}
+
+/// `tee` when `dirs` has a fan-out, `merge` when it has a fan-in.
+pub fn fan_types(dirs: impl IntoIterator<Item = FanDir>) -> Vec<&'static str> {
+    let (mut tee, mut merge) = (false, false);
+    for d in dirs {
+        match d {
+            FanDir::Out => tee = true,
+            FanDir::In => merge = true,
+        }
+    }
+    let mut out = Vec::new();
+    if tee {
+        out.push("tee");
+    }
+    if merge {
+        out.push("merge");
+    }
+    out
+}
+
+/// What a graph is composed for.
+#[derive(Clone, Copy, Debug)]
+pub struct Placement<'a> {
+    /// The kernel's mailbox groups and domain bridging (`ring_demand::platform`).
+    pub platform: RingPlatform,
+    /// The graph steps its cycles' members in declaration order rather than
+    /// being refused (`scheduler: accept_cycles`).
+    pub accept_cycles: bool,
+    /// The execution domains' names, by id, for refusals.
+    pub domain_names: &'a [String],
+}
+
+/// A fan's params TLV for its scratch bytes (see [`Composer::fan_params`]).
+pub type FanParams<'a> = dyn Fn(&Fan, u32) -> Result<Vec<u8>, String> + 'a;
+
+/// What [`compose`] asks of its caller.
+pub struct Composer<'a> {
+    /// A refusal of the plan, said in the graph's own names.
+    pub describe: &'a dyn Fn(PlanError) -> String,
+    /// A fan's params TLV for `scratch` bytes of scratch: the frame kind,
+    /// frames per step and scratch (`plan::fan_params`), with the heap the
+    /// fan's module type derives for that scratch.
+    pub fan_params: &'a FanParams<'a>,
+}
+
+/// Compose `edges` between `modules`: refuse a domain whose pre-pass is over
+/// capacity, insert the fans, give record edges their mailboxes, order the
+/// nodes, and size each fan's scratch to the largest ring beside it.
+pub fn compose(
+    modules: &[GraphModule],
+    edges: &[EdgeRecord],
+    placement: Placement<'_>,
+    composer: &Composer<'_>,
+) -> Result<Composition, String> {
+    check_pre_pass(modules, placement.domain_names)?;
+    let plan_modules: Vec<PlanModule<'_>> = modules.iter().map(GraphModule::plan).collect();
+    let groups = placement.platform.buffer_groups;
+    let mut composed = match plan::compose(&plan_modules, edges, groups, placement.accept_cycles) {
+        Err(PlanError::Cycle { .. }) => {
+            return Err(cycle_refusal(modules, &plan_modules, edges, groups))
+        }
+        r => r.map_err(composer.describe)?,
+    };
+    plan::record_mailboxes(&plan_modules, &mut composed.edges, groups)
+        .map_err(composer.describe)?;
+    let rings = composed
+        .rings(&plan_modules, placement.platform)
+        .map_err(composer.describe)?;
+    let mut out: Vec<ComposedModule> = modules
+        .iter()
+        .map(|m| ComposedModule {
+            name_hash: m.name_hash,
+            domain: m.domain,
+            pre_pass: m.pre_pass,
+            budget: m.budget,
+            params: m.params.clone(),
+        })
+        .collect();
+    for fan in &composed.fans {
+        let node = match fan.dir {
+            FanDir::Out => RingNode::Tee {
+                of: fan.of,
+                port: fan.port,
+            },
+            FanDir::In => RingNode::Merge {
+                of: fan.of,
+                port: fan.port,
+            },
+        };
+        let params = (composer.fan_params)(fan, rings.largest_adjacent(node))?;
+        let r = fan.record(&params);
+        out.push(ComposedModule {
+            name_hash: r.name_hash,
+            domain: r.domain,
+            pre_pass: r.pre_pass,
+            budget: StepBudget::default(),
+            params,
+        });
+    }
+    Ok(Composition {
+        modules: out,
+        edges: composed.edges,
+        order: composed.order,
+        fans: composed.fans,
+    })
+}
+
+/// Refuse a domain with more pre-pass modules than its pre-pass holds,
+/// naming the domain and its pre-pass modules.
+fn check_pre_pass(modules: &[GraphModule], domain_names: &[String]) -> Result<(), String> {
+    let mut domains: Vec<u8> = modules
+        .iter()
+        .filter(|m| m.pre_pass)
+        .map(|m| m.domain)
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    for d in domains {
+        let names: Vec<&str> = modules
+            .iter()
+            .filter(|m| m.pre_pass && m.domain == d)
+            .map(|m| m.name.as_str())
+            .collect();
+        if names.len() <= graph::MAX_PRE_PASS_PER_DOMAIN {
+            continue;
+        }
+        let domain = domain_names
+            .get(usize::from(d))
+            .map_or_else(|| format!("domain {d}"), |n| format!("domain '{n}'"));
+        let over = &names[graph::MAX_PRE_PASS_PER_DOMAIN..];
+        return Err(format!(
+            "{domain} has {} pre_pass modules ({}), and a domain's pre-pass runs at most {} \
+             (MAX_PRE_PASS_PER_DOMAIN): place {} in another `tick` domain, or use a module \
+             that is not pre_pass",
+            names.len(),
+            names.join(", "),
+            graph::MAX_PRE_PASS_PER_DOMAIN,
+            over.join(", "),
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal of a graph with a cycle it does not accept, naming the nodes
+/// on the cycle.
+fn cycle_refusal(
+    modules: &[GraphModule],
+    plan_modules: &[PlanModule<'_>],
+    edges: &[EdgeRecord],
+    groups: usize,
+) -> String {
+    let members = match plan::compose(plan_modules, edges, groups, true) {
+        Ok(c) => {
+            let names: Vec<String> = c.order[c.order.len() - c.cycle_members..]
+                .iter()
+                .map(|&n| node_name(modules, &c.fans, usize::from(n)))
+                .collect();
+            names.join(", ")
+        }
+        Err(e) => format!("{e:?}"),
+    };
+    format!(
+        "the graph has a cycle through {members}: each waits on another's edge, and the \
+         kernel steps a cycle only in a graph that accepts one. Declare \
+         `scheduler: {{ accept_cycles: true }}` to step its members in declaration order, \
+         or break the cycle"
+    )
+}
+
+/// A node's name: a declared module's, or its fan's.
+fn node_name(modules: &[GraphModule], fans: &[Fan], node: usize) -> String {
+    if let Some(m) = modules.get(node) {
+        return m.name.clone();
+    }
+    match fans.get(node - modules.len()) {
+        Some(f) => {
+            let of = modules
+                .get(usize::from(f.of))
+                .map_or("?", |m| m.name.as_str());
+            match f.dir {
+                FanDir::Out => format!("tee({of}.out{})", f.port),
+                FanDir::In if f.port & plan::PORT_KEY_CTRL != 0 => {
+                    format!("merge({of}.ctrl{})", f.port & 0x0F)
+                }
+                FanDir::In => format!("merge({of}.in{})", f.port),
+            }
+        }
+        None => format!("node {node}"),
+    }
 }
 
 /// The kernel's lane rule (`net_keys_paired`): every net key names exactly
 /// one edge into the network (from a workload module) and one out of it (to
 /// a workload module); a lane joined to another lane is refused.
-pub fn check_net_lanes(edges: &[WorkloadEdge]) -> Result<(), String> {
+pub fn check_net_lanes(edges: &[EdgeRecord]) -> Result<(), String> {
     for e in edges {
         let key = match (e.from, e.to) {
-            (WorkloadEnd::Net(_), WorkloadEnd::Net(_)) => {
+            (Endpoint::Net(_), Endpoint::Net(_)) => {
                 return Err(
                     "a net lane connects to a module of the workload, not to another lane".into(),
                 )
             }
-            (WorkloadEnd::Net(k), _) | (_, WorkloadEnd::Net(k)) => k,
+            (Endpoint::Net(k), _) | (_, Endpoint::Net(k)) => k,
             _ => continue,
         };
-        let into = edges
-            .iter()
-            .filter(|x| x.to == WorkloadEnd::Net(key))
-            .count();
+        let into = edges.iter().filter(|x| x.to == Endpoint::Net(key)).count();
         let out = edges
             .iter()
-            .filter(|x| x.from == WorkloadEnd::Net(key))
+            .filter(|x| x.from == Endpoint::Net(key))
             .count();
         if into != 1 || out != 1 {
             return Err(format!(
@@ -209,22 +456,14 @@ pub fn check_net_lanes(edges: &[WorkloadEdge]) -> Result<(), String> {
     Ok(())
 }
 
-fn encode_end(b: &mut Vec<u8>, end: WorkloadEnd) {
-    let (kind, idx) = match end {
-        WorkloadEnd::Local(i) => (0u8, i),
-        WorkloadEnd::Net(k) => (3u8, k),
-    };
-    b.push(kind);
-    b.extend_from_slice(&(idx as u16).to_be_bytes());
-}
-
 /// One resident workload (a workload-owner subgraph admitted via `apply_add`).
+#[derive(Clone, Debug, Default)]
 pub struct Workload {
     pub workload_uid: [u8; 16],
     pub state_cap: u32,
     pub buffer_cap: u32,
-    pub modules: Vec<WorkloadModule>,
-    pub edges: Vec<WorkloadEdge>,
+    /// The workload's graph, composed.
+    pub graph: Composition,
     /// Idle-safe attestation (graph YAML `idle_safe: true` on the workload): the
     /// operator asserts every module in this workload is demand-driven — it makes
     /// progress only when an event or its own periodic schedule wakes it, and
@@ -236,127 +475,223 @@ pub struct Workload {
     pub idle_safe: bool,
 }
 
-/// Encode one workload as a big-endian `AddSubgraph` (FLXA) blob byte-compatible with
-/// `apply_add_encoded`.
-pub fn encode_add_subgraph(workload: &Workload) -> Result<Vec<u8>, String> {
-    if workload.modules.len() > MAX_ADD_MODULES {
+/// Encode one workload as the composed graph the kernel admits: owned by the
+/// workload, under its caps, with its own authority.
+pub fn encode_workload(workload: &Workload) -> Result<Vec<u8>, String> {
+    let g = &workload.graph;
+    if g.modules.len() > MAX_ADD_MODULES {
         return Err(format!(
-            "workload has {} modules, exceeds MAX_ADD_MODULES ({MAX_ADD_MODULES})",
-            workload.modules.len()
+            "workload has {} modules ({} of them fans), exceeds MAX_ADD_MODULES ({MAX_ADD_MODULES})",
+            g.modules.len(),
+            g.fans.len()
         ));
     }
-    if workload.edges.len() > MAX_ADD_EDGES {
+    if g.edges.len() > MAX_ADD_EDGES {
         return Err(format!(
-            "workload has {} edges, exceeds MAX_ADD_EDGES ({MAX_ADD_EDGES})",
-            workload.edges.len()
+            "workload has {} edges ({} of them joining fans), exceeds MAX_ADD_EDGES ({MAX_ADD_EDGES})",
+            g.edges.len(),
+            g.fans.len()
         ));
     }
-    let mut b = Vec::new();
-    b.extend_from_slice(&ADD_MAGIC.to_be_bytes());
-    b.extend_from_slice(&ADD_VERSION.to_be_bytes());
-    b.extend_from_slice(&0u16.to_be_bytes()); // flags: a workload's own authority
-    b.extend_from_slice(&workload.workload_uid);
-    b.extend_from_slice(&workload.state_cap.to_be_bytes());
-    b.extend_from_slice(&workload.buffer_cap.to_be_bytes());
-    b.push(workload.modules.len() as u8);
-    b.push(workload.edges.len() as u8);
-    for m in &workload.modules {
-        let record_start = b.len();
-        b.extend_from_slice(&m.name_hash.to_be_bytes());
-        b.push(m.domain_id);
-        b.extend_from_slice(&m.budget.deadline_us.to_be_bytes());
-        b.extend_from_slice(&m.budget.burst_us.to_be_bytes());
-        b.push(m.budget.fault_policy);
-        if m.params.len() > u16::MAX as usize {
-            return Err(format!(
-                "workload module params {} bytes exceed u16",
-                m.params.len()
-            ));
-        }
-        b.extend_from_slice(&(m.params.len() as u16).to_be_bytes());
-        debug_assert_eq!(b.len() - record_start, ADD_MODULE_FIXED_BYTES);
-        b.extend_from_slice(&m.params);
-    }
-    for e in &workload.edges {
-        // Endpoint kind 0 = New (workload-local), 3 = Net (a lane to the node's
-        // network).
-        encode_end(&mut b, e.from);
-        b.push(e.from_port);
-        encode_end(&mut b, e.to);
-        b.push(e.to_port);
-        b.extend_from_slice(&e.buffer_bytes.to_be_bytes());
-    }
-    Ok(b)
+    let records = g.records();
+    graph::encode(&GraphSpec {
+        creator_authority: false,
+        owner_uid: workload.workload_uid,
+        state_cap: workload.state_cap,
+        buffer_cap: workload.buffer_cap,
+        ..g.spec(&records)
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxor_contracts::graph::plan::{fan_params, FrameKind, FRAMES_PER_STEP_DEFAULT};
+    use fluxor_contracts::graph::{MERGE_NAME_HASH, TEE_NAME_HASH};
 
-    #[test]
-    fn add_subgraph_blob_matches_kernel_wire_layout() {
-        let workload = Workload {
+    const PLATFORM: RingPlatform = RingPlatform {
+        buffer_groups: 64,
+        split_cross_domain: false,
+    };
+
+    fn module(name: &str, hash: u32) -> GraphModule {
+        GraphModule {
+            name: name.into(),
+            name_hash: hash,
+            ..GraphModule::default()
+        }
+    }
+
+    fn edge(from: Endpoint, from_port: u8, to: Endpoint, to_port: u8) -> EdgeRecord {
+        EdgeRecord {
+            from,
+            from_port,
+            to,
+            to_port,
+            ..EdgeRecord::default()
+        }
+    }
+
+    fn fan_tlv(f: &Fan, scratch: u32) -> Result<Vec<u8>, String> {
+        Ok(fan_params(f.kind, FRAMES_PER_STEP_DEFAULT, scratch).to_vec())
+    }
+
+    fn describe(e: PlanError) -> String {
+        format!("{e:?}")
+    }
+
+    fn composed(
+        modules: &[GraphModule],
+        edges: &[EdgeRecord],
+        accept: bool,
+    ) -> Result<Composition, String> {
+        compose(
+            modules,
+            edges,
+            Placement {
+                platform: PLATFORM,
+                accept_cycles: accept,
+                domain_names: &[],
+            },
+            &Composer {
+                describe: &describe,
+                fan_params: &fan_tlv,
+            },
+        )
+    }
+
+    fn workload(modules: Vec<GraphModule>, edges: Vec<EdgeRecord>) -> Workload {
+        Workload {
             workload_uid: [7u8; 16],
-            state_cap: 0,
-            buffer_cap: 0,
-            modules: vec![WorkloadModule {
-                name_hash: 0x1234_5678,
-                domain_id: 0,
-                budget: StepBudget::default(),
-                params: vec![],
-            }],
-            edges: vec![],
+            state_cap: 4096,
+            buffer_cap: 8192,
+            graph: composed(&modules, &edges, true).expect("composes"),
             idle_safe: false,
-        };
-        let b = encode_add_subgraph(&workload).unwrap();
-        // magic (BE), version (BE), flags.
-        assert_eq!(&b[0..4], &ADD_MAGIC.to_be_bytes());
-        assert_eq!(&b[4..6], &ADD_VERSION.to_be_bytes());
-        assert_eq!(&b[6..8], &[0, 0]);
-        assert_eq!(&b[8..24], &[7u8; 16]); // workload_uid
-        assert_eq!(&b[24..28], &0u32.to_be_bytes()); // state_cap
-        assert_eq!(&b[28..32], &0u32.to_be_bytes()); // buffer_cap
-        assert_eq!(b[32], 1); // module_count
-        assert_eq!(b[33], 0); // edge_count
-                              // module 0: name_hash (BE), domain, step budget, params_len (BE) = 0
-        assert_eq!(&b[34..38], &0x1234_5678u32.to_be_bytes());
-        assert_eq!(b[38], 0); // domain_id
-        assert_eq!(&b[39..43], &0u32.to_be_bytes()); // step_deadline_us
-        assert_eq!(&b[43..47], &0u32.to_be_bytes()); // step_deadline_burst_us
-        assert_eq!(b[47], FAULT_POLICY_SKIP); // fault_policy
-        assert_eq!(&b[48..50], &0u16.to_be_bytes()); // params_len
-        assert_eq!(b.len(), 34 + ADD_MODULE_FIXED_BYTES);
+        }
     }
 
     #[test]
-    fn module_record_carries_its_step_budget() {
-        let workload = Workload {
-            workload_uid: [0u8; 16],
-            state_cap: 0,
-            buffer_cap: 0,
-            modules: vec![WorkloadModule {
-                name_hash: 0xAABB_CCDD,
-                domain_id: 1,
-                budget: StepBudget {
-                    deadline_us: 12_000,
-                    burst_us: 16_000,
-                    fault_policy: FAULT_POLICY_TOLERATE,
-                },
-                params: vec![0xFE, 0x01],
-            }],
-            edges: vec![],
-            idle_safe: false,
+    fn a_workload_encodes_as_a_composed_graph_it_owns() {
+        let mut m = module("a", 0xAABB_CCDD);
+        m.domain = 1;
+        m.budget = StepBudget {
+            deadline_us: 12_000,
+            burst_us: 16_000,
+            fault_policy: FaultPolicy::Tolerate,
         };
-        let b = encode_add_subgraph(&workload).unwrap();
-        let m = &b[34..];
-        assert_eq!(&m[0..4], &0xAABB_CCDDu32.to_be_bytes());
-        assert_eq!(m[4], 1);
-        assert_eq!(&m[5..9], &12_000u32.to_be_bytes());
-        assert_eq!(&m[9..13], &16_000u32.to_be_bytes());
-        assert_eq!(m[13], FAULT_POLICY_TOLERATE);
-        assert_eq!(&m[14..16], &2u16.to_be_bytes());
-        assert_eq!(&m[16..18], &[0xFE, 0x01]);
-        assert_eq!(b.len(), 34 + ADD_MODULE_FIXED_BYTES + 2);
+        m.params = vec![0xFE, 0x01];
+        let b = encode_workload(&workload(vec![m], vec![])).unwrap();
+        let g = graph::decode(&b).expect("the codec takes it");
+        let h = g.header();
+        assert_eq!(h.owner_uid, [7u8; 16]);
+        assert_eq!((h.state_cap, h.buffer_cap), (4096, 8192));
+        assert!(!h.creator_authority());
+        assert_eq!((g.module_count(), g.edge_count()), (1, 0));
+        let r = g.modules().next().unwrap();
+        assert_eq!((r.name_hash, r.domain), (0xAABB_CCDD, 1));
+        assert_eq!((r.step_deadline_us, r.burst_us), (12_000, 16_000));
+        assert_eq!(r.fault_policy, FaultPolicy::Tolerate);
+        assert_eq!(r.params, &[0xFE, 0x01]);
+        assert_eq!(g.order().collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn net_lane_edges_encode_as_net_endpoints() {
+        let edges = vec![
+            edge(Endpoint::Net(2), 0, Endpoint::New(0), 0),
+            EdgeRecord {
+                buffer_bytes: 4096,
+                ..edge(Endpoint::New(0), 0, Endpoint::Net(2), 0)
+            },
+        ];
+        assert!(check_net_lanes(&edges).is_ok());
+        let b = encode_workload(&workload(vec![module("a", 1)], edges)).unwrap();
+        let g = graph::decode(&b).unwrap();
+        let e: Vec<_> = g.edges().collect();
+        assert_eq!((e[0].from, e[0].to), (Endpoint::Net(2), Endpoint::New(0)));
+        assert_eq!((e[1].from, e[1].to), (Endpoint::New(0), Endpoint::Net(2)));
+        assert_eq!(e[1].buffer_bytes, 4096);
+    }
+
+    #[test]
+    fn a_fanned_output_gets_a_tee_module_and_its_scratch() {
+        // a.out0 -> b, a.out0 -> c: one tee, joined from a.
+        let modules = vec![module("a", 1), module("b", 2), module("c", 3)];
+        let edges = vec![
+            edge(Endpoint::New(0), 0, Endpoint::New(1), 0),
+            EdgeRecord {
+                buffer_bytes: 32 * 1024,
+                ..edge(Endpoint::New(0), 0, Endpoint::New(2), 0)
+            },
+        ];
+        let c = composed(&modules, &edges, false).unwrap();
+        assert_eq!(c.modules.len(), 4);
+        assert_eq!(c.fan_types(), ["tee"]);
+        let tee = &c.modules[3];
+        assert_eq!(tee.name_hash, TEE_NAME_HASH);
+        assert_eq!(
+            tee.params,
+            fan_params(FrameKind::Stream, FRAMES_PER_STEP_DEFAULT, 32 * 1024)
+        );
+        assert_eq!(c.edges.len(), 3);
+        assert_eq!(c.edges[2].from, Endpoint::New(0));
+        assert_eq!(c.edges[2].to, Endpoint::New(3));
+        assert_eq!(c.order, [0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn a_fanned_input_gets_a_merge_module() {
+        let modules = vec![module("a", 1), module("b", 2), module("c", 3)];
+        let edges = vec![
+            edge(Endpoint::New(0), 0, Endpoint::New(2), 0),
+            edge(Endpoint::New(1), 0, Endpoint::New(2), 0),
+        ];
+        let c = composed(&modules, &edges, false).unwrap();
+        assert_eq!(c.fan_types(), ["merge"]);
+        assert_eq!(c.modules[3].name_hash, MERGE_NAME_HASH);
+    }
+
+    #[test]
+    fn a_fifth_pre_pass_module_in_a_domain_is_refused_by_name() {
+        let modules: Vec<GraphModule> = (0..5)
+            .map(|i| GraphModule {
+                pre_pass: true,
+                ..module(&format!("drain{i}"), 1)
+            })
+            .collect();
+        assert!(composed(&modules[..4], &[], false).is_ok());
+        let e = compose(
+            &modules,
+            &[],
+            Placement {
+                platform: PLATFORM,
+                accept_cycles: false,
+                domain_names: &["fast".to_string()],
+            },
+            &Composer {
+                describe: &describe,
+                fan_params: &fan_tlv,
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("domain 'fast'") && e.contains("drain4"), "{e}");
+        assert!(e.contains("pre_pass"), "{e}");
+    }
+
+    #[test]
+    fn a_cycle_is_refused_unless_accepted() {
+        let modules = vec![module("a", 1), module("b", 2), module("src", 3)];
+        let edges = vec![
+            edge(Endpoint::New(2), 0, Endpoint::New(0), 0),
+            edge(Endpoint::New(0), 0, Endpoint::New(1), 0),
+            edge(Endpoint::New(1), 0, Endpoint::New(0), 1),
+        ];
+        let e = composed(&modules, &edges, false).unwrap_err();
+        assert!(e.contains("cycle through a, b"), "{e}");
+        assert!(e.contains("accept_cycles"), "{e}");
+        let c = composed(&modules, &edges, true).unwrap();
+        assert_eq!(c.order, [2, 0, 1]);
     }
 
     #[test]
@@ -368,13 +703,16 @@ mod tests {
             b.extend_from_slice(ext);
             b
         };
-        // Schema params and heap flags only.
+        // Schema params, heap flags and the heap cap only.
         assert_eq!(
-            params_node_tag(&tlv(&[1, 1, 7, 12, 2, 0, 0, 0xF8, 1, 1], &[])),
+            params_node_tag(&tlv(
+                &[1, 1, 7, 12, 2, 0, 0, 0xF8, 1, 1, 0xEF, 4, 0, 1, 0, 0],
+                &[]
+            )),
             None
         );
         // Each node tag, behind an ordinary entry.
-        for tag in [0xF0, 0xF1, 0xF4, 0xF5, 0xF7, 0xFB, 0xFC, 0xFD] {
+        for tag in [0xF2, 0xF3, 0xF4, 0xF5, 0xF7, 0xFB, 0xFC, 0xFD] {
             assert_eq!(params_node_tag(&tlv(&[1, 1, 0, tag, 1, 0], &[])), Some(tag));
         }
         // A wrong length still counts.
@@ -408,96 +746,28 @@ mod tests {
     }
 
     #[test]
-    fn net_lane_edges_encode_as_endpoint_kind_three() {
-        let workload = Workload {
-            workload_uid: [0u8; 16],
-            state_cap: 0,
-            buffer_cap: 0,
-            modules: vec![WorkloadModule {
-                name_hash: 1,
-                domain_id: 0,
-                budget: StepBudget::default(),
-                params: vec![],
-            }],
-            edges: vec![
-                WorkloadEdge {
-                    from: WorkloadEnd::Net(2),
-                    from_port: 0,
-                    to: WorkloadEnd::Local(0),
-                    to_port: 0,
-                    buffer_bytes: 0,
-                },
-                WorkloadEdge {
-                    from: WorkloadEnd::Local(0),
-                    from_port: 0,
-                    to: WorkloadEnd::Net(2),
-                    to_port: 0,
-                    buffer_bytes: 4096,
-                },
-            ],
-            idle_safe: false,
-        };
-        assert!(check_net_lanes(&workload.edges).is_ok());
-        let b = encode_add_subgraph(&workload).unwrap();
-        assert_eq!(b[33], 2); // edge_count
-        let e = &b[34 + ADD_MODULE_FIXED_BYTES..];
-        // from Net(2) port 0 -> to New(0) port 0, 0 bytes.
-        assert_eq!(&e[0..12], &[3, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // from New(0) port 0 -> to Net(2) port 0, 4096 bytes.
-        assert_eq!(&e[12..24], &[0, 0, 0, 0, 3, 0, 2, 0, 0, 0, 0x10, 0]);
-    }
-
-    #[test]
     fn net_lanes_are_refused_unless_paired() {
-        let edge = |from, to| WorkloadEdge {
-            from,
-            from_port: 0,
-            to,
-            to_port: 0,
-            buffer_bytes: 0,
-        };
+        let e = |from, to| edge(from, 0, to, 0);
+        let (l, n) = (Endpoint::New, Endpoint::Net);
         // Commands in, no events out.
-        let one_way = [edge(WorkloadEnd::Local(0), WorkloadEnd::Net(1))];
+        let one_way = [e(l(0), n(1))];
         assert!(check_net_lanes(&one_way)
             .unwrap_err()
             .contains("net lane 1"));
         // Two command edges into one lane.
-        let doubled = [
-            edge(WorkloadEnd::Local(0), WorkloadEnd::Net(1)),
-            edge(WorkloadEnd::Local(1), WorkloadEnd::Net(1)),
-            edge(WorkloadEnd::Net(1), WorkloadEnd::Local(0)),
-        ];
+        let doubled = [e(l(0), n(1)), e(l(1), n(1)), e(n(1), l(0))];
         assert!(check_net_lanes(&doubled).is_err());
         // A lane into a lane.
-        let net_net = [edge(WorkloadEnd::Net(1), WorkloadEnd::Net(2))];
-        assert!(check_net_lanes(&net_net).is_err());
+        assert!(check_net_lanes(&[e(n(1), n(2))]).is_err());
         // Two lanes, each paired.
-        let two = [
-            edge(WorkloadEnd::Local(0), WorkloadEnd::Net(1)),
-            edge(WorkloadEnd::Net(1), WorkloadEnd::Local(0)),
-            edge(WorkloadEnd::Local(1), WorkloadEnd::Net(2)),
-            edge(WorkloadEnd::Net(2), WorkloadEnd::Local(1)),
-        ];
+        let two = [e(l(0), n(1)), e(n(1), l(0)), e(l(1), n(2)), e(n(2), l(1))];
         assert!(check_net_lanes(&two).is_ok());
     }
 
     #[test]
     fn too_many_modules_rejected() {
-        let workload = Workload {
-            workload_uid: [0u8; 16],
-            state_cap: 0,
-            buffer_cap: 0,
-            modules: (0..(MAX_ADD_MODULES + 1))
-                .map(|_| WorkloadModule {
-                    name_hash: 0,
-                    domain_id: 0,
-                    budget: StepBudget::default(),
-                    params: vec![],
-                })
-                .collect(),
-            edges: vec![],
-            idle_safe: false,
-        };
-        assert!(encode_add_subgraph(&workload).is_err());
+        let modules: Vec<GraphModule> = (0..=MAX_ADD_MODULES).map(|_| module("m", 0)).collect();
+        let e = encode_workload(&workload(modules, vec![])).unwrap_err();
+        assert!(e.contains("exceeds MAX_ADD_MODULES"), "{e}");
     }
 }

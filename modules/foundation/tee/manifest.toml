@@ -1,0 +1,131 @@
+version = "1.0.0"
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "wasm", "uefi"]
+# Moves what is buffered when it is stepped; nothing here is timed.
+timer_class = "agnostic"
+mailbox_safe = true
+
+# One producer's output wired to several inputs: the composer puts a tee
+# on it (`fluxor_contracts::graph::plan::fan_pass`). The producer writes to
+# `in0`; each consumer reads one of `out0`..`out15`, numbered from 0 in the
+# order the composer joins them. Every output gets every unit, whole and in
+# order; a unit leaves `in0` only once every output can take it whole, so one
+# slow consumer holds the stream and back pressure reaches the producer.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name            | Type | Default | Description |
+# |-----|-----------------|------|---------|-------------|
+# | 1   | frame_kind      | u8   | 0       | `stream` 0, `eth` 1, `net` 2, `telemetry` 3, `record` 4: what one unit on the fanned port is. |
+# | 2   | frames_per_step | u16  | 64      | Whole frames or records moved per step, at most. |
+# | 3   | scratch_bytes   | u32  | 32768 on aarch64, 2048 on thumb, 8192 elsewhere | Bytes of scratch from the heap: the largest unit moved whole. The composer sets it to the largest ring beside the fan. |
+
+[[ports]]
+name = "in0"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "out0"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "out1"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out2"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out3"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out4"
+index = 4
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out5"
+index = 5
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out6"
+index = 6
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out7"
+index = 7
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out8"
+index = 8
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out9"
+index = 9
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out10"
+index = 10
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out11"
+index = 11
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out12"
+index = 12
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out13"
+index = 13
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out14"
+index = 14
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "out15"
+index = 15
+direction = "output"
+content_type = "OctetStream"
+
+[capacities]
+# The scratch, from the heap: one byte per `scratch_bytes` (params tag 3),
+# on top of the declared arena (the allocation header).
+heap_per_param = { base = 64, params = [
+    { tag = 3, default = { default = 8192, aarch64 = 32768, thumbv6m = 2048, thumbv8m = 2048 }, bytes_each = 1 },
+] }
+
+[observability]
+exempt = "a fan the composer inserts — the units it moves are observed at the modules on either side of it"

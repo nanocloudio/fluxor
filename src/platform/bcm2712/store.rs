@@ -32,7 +32,7 @@ use crate::abi::fence::{trailer, Fence};
 use crate::kernel::ipc::event::doorbell_ring;
 use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
-use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
+use crate::kernel::workload::owner::{OwnerHandle, OWNER_NODE};
 
 /// Objects the store can hold — one machine's worth of state, not a fleet's.
 /// No pool names them, so this is their size; the table is carved at boot
@@ -176,7 +176,7 @@ const SUB_EMPTY: Sub = Sub {
     prefix_len: 0,
     doorbell: -1,
     ring_owed: false,
-    opener: OWNER_SYSTEM,
+    opener: OWNER_NODE,
     module: 0,
     generation: 0,
 };
@@ -196,7 +196,7 @@ const READ_EMPTY: ReadSlot = ReadSlot {
     val: [0; MAX_VALUE],
     val_len: 0,
     revision: 0,
-    opener: OWNER_SYSTEM,
+    opener: OWNER_NODE,
 };
 
 /// The store itself. Its object table is sized once, at boot, and carved

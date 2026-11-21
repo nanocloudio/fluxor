@@ -1,8 +1,8 @@
 # Agent protocol
 
-One request and its answer between a controller and a target's node agent:
-which bundle a workload should run, against which revision of the target's
-descriptor, under which idempotency identity, and what the target observes,
+One request and its answer between a controller and a node's node agent:
+which workload package a workload should run, against which revision of the node's
+descriptor, under which idempotency identity, and what the node observes,
 under a fence.
 
 Source: `crates/fluxor-abi/src/contracts/agent.rs` (records), `tools/src/agent_protocol.rs`
@@ -11,7 +11,7 @@ Source: `crates/fluxor-abi/src/contracts/agent.rs` (records), `tools/src/agent_p
 `_lane` forms (the remote transport).
 
 The node agent's other verbs (`commit`, `remove`, `status`, `logs`, `policy`) are
-the local command surface of an orchestrator on the same host. They are not part
+the local command surface of an orchestrator on the same node. They are not part
 of this protocol and carry no fence.
 
 ## Records
@@ -26,9 +26,9 @@ Request, exactly 114 bytes:
 |---|---|---|
 | `op` | 1 | `APPLY` 1, `REMOVE` 2, `OBSERVE` 3 |
 | `flags` | 1 | none defined; must be zero |
-| `workload_uid` | 16 | zero on `APPLY` or `REMOVE` is a bad request; on `OBSERVE` it asks about the target alone |
+| `workload_uid` | 16 | zero on `APPLY` or `REMOVE` is a bad request; on `OBSERVE` it asks about the node alone |
 | `desired_bundle_digest` | 32 | the workload digest (below); zero on `OBSERVE` and `REMOVE` |
-| `descriptor_revision` | 32 | the sha256 of the target descriptor the controller validated against |
+| `descriptor_revision` | 32 | the sha256 of the node descriptor the controller validated against |
 | `idempotency_id` | 16 | this request's identity; zero on `APPLY` or `REMOVE` is a bad request |
 | `fence_epoch` | 8 | the controller's fence |
 | `fence_seq` | 8 | |
@@ -38,11 +38,11 @@ Response, 188 bytes and the diagnostic:
 | Field | Size | Meaning |
 |---|---|---|
 | `result` | 1 | below |
-| `target_id` | 32 | the target's key fingerprint |
+| `target_id` | 32 | the node's key fingerprint |
 | `workload_uid` | 16 | as asked |
-| `descriptor_revision` | 32 | the target's current one |
+| `descriptor_revision` | 32 | the node's current one |
 | `idempotency_id` | 16 | as asked |
-| `fence_epoch` | 8 | the fence the target holds |
+| `fence_epoch` | 8 | the fence the node holds |
 | `fence_seq` | 8 | |
 | `observed_activation_digest` | 32 | below; zero when nothing is active |
 | `desired_bundle_digest` | 32 | the workload digest as committed |
@@ -61,10 +61,10 @@ A request is taken in this order; the first that applies answers.
    must be a configured controller. The agent's Unix socket has no fingerprint:
    its peer is local whatever a client writes in the frame, and being able to
    open the socket (mode 0600) is the authorization. A stamped all-zero peer names
-   nobody. A refused peer reads, of the target, only the `target_id` its own
+   nobody. A refused peer reads, of the node, only the `target_id` its own
    handshake already showed it.
 2. **Malformed record.** `BAD_REQUEST`.
-3. **Fence.** The target holds one `(epoch, seq)`, durably, in its generation
+3. **Fence.** The node holds one `(epoch, seq)`, durably, in its generation
    store. A request below it, compared epoch first, is refused with the held value
    and changes nothing, `OBSERVE` included. A request above it has its fence
    durably recorded before anything else is done, whatever the request then comes
@@ -84,13 +84,13 @@ A request is taken in this order; the first that applies answers.
 6. **Descriptor** (`APPLY`). A revision other than the sha256 of the descriptor
    file the agent was given, read at each request, is refused with the current
    one, for the controller to validate against.
-7. **Bundle** (`APPLY`). The bundle is
+7. **Workload package** (`APPLY`). The package is
    `<bundles>/<hex desired_bundle_digest>/{workload.json,resources.json,graph.yaml}`.
    The digest is the workload digest: the sha256 of `workload.json`, the same value
    `fluxor agent commit --bundle` records. `workload.json` absent is
    `BUNDLE_MISSING`. A manifest that does not hash to its directory's name, one that
    fails validation, or an artifact that does not match the digest the manifest
-   pins is `REFUSED_ADMISSION`, as is a composition the target's capacity or
+   pins is `REFUSED_ADMISSION`, as is a composition the node's capacity or
    reserved ports refuse. `diag` is the diagnostic verbatim. Nothing changes.
 8. **Commit** (`APPLY`, `REMOVE`). The agent writes its intent, commits one
    generation through the same path as `fluxor agent commit`, publishes the plan
@@ -111,7 +111,7 @@ sha256("fluxor.agent.activation\0" || workload_uid || workload_digest
 (`plan_digest`). The digest is non-zero only when all of these hold: the status
 file's writer is the same live process that wrote it; it reports the committed
 generation; its `plan_digest` equals the committed plan's; the owner it reports
-under the committed workload UID, slot and owner generation has every planned
+under the committed owner uid, slot and owner generation has every planned
 module loaded and none terminated (`RUNNING` or `UNREADY`). A commit the runtime
 has not reached therefore reads zero, not the previous activation, and so does an
 owner that has ended.
@@ -123,13 +123,13 @@ It does not prove what code those modules are. A plan assigns an owner its slot,
 module range, caps and leases; it does not carry the workload digest, and on Linux
 the graph a runtime runs is the `--image` it was started with. The workload
 digest in the formula comes from the agent's committed desired state, joined to
-the runtime's report by workload UID. That the running graph was built from that
-bundle is what deployment of the runtime's graph image must ensure.
+the runtime's report by owner uid. That the running graph was built from that
+workload package is what deployment of the runtime's node image must ensure.
 
 ## Transports
 
-`fluxor agent serve` takes the store, publish path, bundles directory, descriptor,
-target identity and controllers, and one transport.
+`fluxor agent serve` takes the store, publish path, workload package directory (`--bundles`), descriptor,
+node identity (`--target-id`) and controllers, and one transport.
 
 | Transport | `serve` | `call` | Peer |
 |---|---|---|---|
@@ -155,7 +155,7 @@ so a refusal cannot read as success. A failed call prints no JSON.
 ### Remote
 
 The remote transport is `remote_channel` over mutual `tls`, with no transport code
-of its own: the `agent_listen` stack on a target, `agent_dial` on a controller. The
+of its own: the `agent_listen` stack on a node, `agent_dial` on a controller. The
 runtime carrying it takes frames on
 stdin and gives them on stdout, and the channel's `peer_tag` prefix is the frame's
 peer. On the local port `[len:u32][record]` is one `len32` record, channel table
@@ -180,17 +180,17 @@ include:
     as: agent
     params:
       port: 9310
-      cert_file: /etc/fluxor/agent/target.pem
-      key_file: /etc/fluxor/agent/target.key
+      cert_file: /etc/fluxor/agent/node.pem
+      key_file: /etc/fluxor/agent/node.key
       trust: /etc/fluxor/agent/controllers-ca.pem
       peer_uri: spiffe://fabric/controller/
 ```
 
-A controller or target that speaks the protocol from a module of its own, rather
+A controller or node that speaks the protocol from a module of its own, rather
 than through `fluxor agent`, includes `agent_dial_lane` or `agent_listen_lane`: the
 same stack, parameters included, with the channel exported as `frames_in` and
 `frames_out` in place of the two stdio modules. Each port carries the same
-`[peer:32][len:u32][record]` frame. A graph includes one per target, each under its
+`[peer:32][len:u32][record]` frame. A graph includes one per node, each under its
 own `as:`.
 
 The runtime carrying the transport is not the runtime carrying the workloads. A
@@ -212,7 +212,7 @@ call whose session another's has taken over gets no answer and is sent again.
 |---|---|---|
 | The peer's certificate chains to `trust`, proves possession of its key and carries `peer_uri` | `tls`, both ends | no handshake; the agent never sees the peer. A controller's call times out |
 | The session belongs to the key `tls` verified | `remote_channel` `require_peer` | no session |
-| The fingerprint is a controller of this target | the agent | `REFUSED_UNAUTHORIZED` |
+| The fingerprint is a controller of this node | the agent | `REFUSED_UNAUTHORIZED` |
 | The `target_id` a response states is the fingerprint the channel verified, and `--target-id` if given | `fluxor agent call` | the call fails; nothing is printed as an answer |
 
 A key fingerprint is the SHA-256 of the leaf's raw subjectPublicKey
@@ -225,7 +225,7 @@ disciplined. `clock_policy: unchecked` drops the check, and removing a controlle
 from the agent's `--controller` set is then what ends its authority.
 
 This protocol does not authenticate workload content beyond its digest and the
-bundle's own checks. The agent admits whatever bundle is in its bundles directory
+package's own checks. The agent admits whatever workload package is in its package directory
 under the digest a controller asks for; who placed it there, and who signed the
 workload, are outside it. Whole-workload authorization is a separate format and is
 not built here.
@@ -236,11 +236,11 @@ not built here.
 |---|---|---|---|
 | `OK` | done, or already done under this identity | one generation at most | reads `OBSERVE` for activation |
 | `REFUSED_FENCED` | below the held fence | nothing | is superseded; stops, or takes a newer fence |
-| `REFUSED_UNAUTHORIZED` | not a controller here | nothing | has the wrong target or no authority |
+| `REFUSED_UNAUTHORIZED` | not a controller here | nothing | has the wrong node or no authority |
 | `REFUSED_DESCRIPTOR` | another revision | the fence | revalidates against the revision answered, then sends again |
 | `REFUSED_CONFLICT` | this identity was another request | the fence | has a bug: an identity names one request |
-| `BUNDLE_MISSING` | nothing at that digest | the fence | delivers the bundle and sends the same request again |
+| `BUNDLE_MISSING` | nothing at that digest | the fence | delivers the workload package and sends the same request again |
 | `REFUSED_ADMISSION` | validation or composition refused | the fence | surfaces `diag`; a rejected diagnostic is never success |
 | `BAD_REQUEST` | malformed | nothing | has a bug |
-| `FAULT` | the target could not read or write its own state | possibly a landed commit | sends the same request again |
+| `FAULT` | the node could not read or write its own state | possibly a landed commit | sends the same request again |
 | no answer | no session, or one lost | unknown | sends the same request again |

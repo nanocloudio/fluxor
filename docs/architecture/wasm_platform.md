@@ -38,7 +38,7 @@ It does not define:
 
 ## 2. Platform position
 
-| Target    | Code architecture     | Module format | Bundle format |
+| Target    | Code architecture     | Module format | Image format  |
 |-----------|-----------------------|---------------|---------------|
 | `rp2350`  | thumbv8m PIC ELF      | `.fmod`       | `.uf2`        |
 | `bcm2712` | aarch64 PIC ELF       | `.fmod`       | `.img`        |
@@ -54,7 +54,8 @@ Three rules carry across:
    TLV parameter section, same manifest hash, same entry-point table
    shape. Only the code payload inside the envelope changes.
 3. The `fluxor build` tool selects modules and packages them with the
-   kernel into the target's bundle format.
+   kernel into the target's image format: a firmware image, a node
+   image (`graph.img`) on Linux, a wasm bundle on wasm.
 
 The WASM target follows all three. There is no parallel envelope, no
 parallel manifest, no parallel build tool.
@@ -277,8 +278,8 @@ kernel_step() -> u32      // hint: ms until the next useful tick; 0 = run again 
 ```
 
 The host calls `kernel_step` in a loop appropriate to its environment.
-The browser host pumps it from `requestAnimationFrame` in bounded
-synchronous bursts, optionally moving the whole pump into a Web
+The browser host calls it from `requestAnimationFrame` in bounded
+synchronous bursts, optionally moving the whole loop into a Web
 Worker; see `wasm_browser_host.md`.
 
 The kernel does not assume a specific tick rate. Modules use monotonic

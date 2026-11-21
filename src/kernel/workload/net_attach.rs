@@ -1,11 +1,11 @@
 //! Network attachment for a workload subgraph staged at runtime.
 //!
-//! A subgraph that `apply_add` stages after boot cannot join the node's
+//! A subgraph that the splice stages after boot cannot join the node's
 //! network by ordinary edges: the net provider reads its boot lanes once, and
 //! its `net_out` is one channel every boot consumer shares. Instead a
 //! subgraph names the provider as an endpoint (`Endpoint::Net(key)`), once as
 //! the consumer of a producer's commands and once as the producer of that
-//! consumer's events. `apply_add` opens both channels as for any edge, then
+//! consumer's events. the splice opens both channels as for any edge, then
 //! hands them to the provider as one lane of the workload's own:
 //!
 //! - commands on the lane run as the workload's owner, so binds are
@@ -36,34 +36,40 @@ struct Provider {
     /// The slot's generation when a module provider claimed the role (0 for
     /// a built-in provider, which is not a module occupancy).
     generation: u32,
+    /// The lanes the provider holds for every workload together.
+    lanes: usize,
     attach: AttachFn,
     detach: DetachFn,
 }
 
 static mut PROVIDER: Option<Provider> = None;
 
-/// Register the node's net provider: its module slot and its lane hooks.
-/// The last registration wins; a graph rebuild registers again.
-pub fn register(slot: usize, attach: AttachFn, detach: DetachFn) {
+/// Register the node's net provider: its module slot, the lanes it holds
+/// for every workload together, and its lane hooks. The last registration
+/// wins; a graph rebuild registers again.
+pub fn register(slot: usize, lanes: usize, attach: AttachFn, detach: DetachFn) {
     // SAFETY: written from the scheduler thread while the provider is
     // instantiated; read from the same thread.
     unsafe {
         *core::ptr::addr_of_mut!(PROVIDER) = Some(Provider {
             slot,
             generation: 0,
+            lanes,
             attach,
             detach,
         });
     }
 }
 
-/// Register the module provider at `slot`, in occupancy `generation`.
-fn register_module(slot: usize, generation: u32) {
+/// Register the module provider at `slot`, in occupancy `generation`,
+/// holding `lanes` lanes.
+fn register_module(slot: usize, generation: u32, lanes: usize) {
     // SAFETY: as `register`.
     unsafe {
         *core::ptr::addr_of_mut!(PROVIDER) = Some(Provider {
             slot,
             generation,
+            lanes,
             attach: queued_attach,
             detach: queued_detach,
         });
@@ -84,6 +90,12 @@ fn provider() -> Option<Provider> {
 /// The module slot a `Net` endpoint resolves to, if a provider is registered.
 pub fn provider_slot() -> Option<usize> {
     provider().map(|p| p.slot)
+}
+
+/// The lanes the registered provider holds for every workload together, as
+/// it stated them: 0 with no provider.
+pub fn provider_lanes() -> usize {
+    provider().map_or(0, |p| p.lanes)
 }
 
 /// Hand a lane to the provider. ENODEV when none is registered.
@@ -422,8 +434,8 @@ pub fn provide_queued(slot: usize, lanes: usize) -> i32 {
     if !provider().is_some_and(|p| is_queued(&p) && p.slot == slot && p.generation == generation) {
         // A stale module registration's lanes went with its graph.
         with_lanes(|l| l.clear());
-        register_module(slot, generation);
     }
+    register_module(slot, generation, lane_capacity());
     0
 }
 
@@ -431,6 +443,14 @@ pub fn provide_queued(slot: usize, lanes: usize) -> i32 {
 /// occupancy.
 fn is_queued_provider(slot: usize) -> bool {
     provider().is_some_and(|p| queued_current(&p) && p.slot == slot)
+}
+
+/// The slot of the node's lane provider while its registration is live: a
+/// built-in provider, or a module provider in its current occupancy.
+pub fn live_provider_slot() -> Option<usize> {
+    provider()
+        .filter(|p| !is_queued(p) || queued_current(p))
+        .map(|p| p.slot)
 }
 
 /// Whether the module at `slot` is the node's lane provider (in its current

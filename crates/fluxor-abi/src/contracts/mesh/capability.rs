@@ -99,7 +99,7 @@
 pub const TOKEN_LEN: usize = 96;
 /// Token bytes before the signature: every field the signature covers.
 pub const BODY_LEN: usize = 32;
-/// Domain tag every token signature is made under, so a signature over some
+/// Domain-separation tag every token signature is made under, so a signature over some
 /// other 32-byte message by the same key is not a token signature.
 pub const SIGN_DOMAIN: [u8; 16] = *b"fluxor.mesh.cap\0";
 /// Bytes the signature covers: [`SIGN_DOMAIN`] then the token's body.

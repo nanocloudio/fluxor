@@ -6,7 +6,7 @@ grants = ["workload.create"]
 # through the metal `workload` backend (0x1A), the way a node agent does, then
 # stages two faulting workloads.
 #
-# Each cycle: CREATE the FLXA workload churn_probe(source) -> churn_probe(relay) ->
+# Each cycle: CREATE the workload churn_probe(source) -> churn_probe(relay) ->
 # this module's lane (edges sized `chan_bytes`), START, read the lane until a
 # counter arrives (or `read_timeout_ms`), DESTROY. Every 25 cycles, and once
 # more when the loop ends:

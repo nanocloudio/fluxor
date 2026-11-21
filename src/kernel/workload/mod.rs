@@ -1,4 +1,4 @@
-//! Workload domain — owners, plans, per-owner logs, storage grants and costs, metal 0x1A
+//! Workloads — owners, plans, per-owner logs, storage grants and costs, metal 0x1A
 //! backend, bitmask, ext bridge.
 
 pub mod bitmask;

@@ -228,8 +228,8 @@ fn op_signals(op: u32) -> bool {
 /// Whether the calling module's owner may use route `r`: a routed handle is
 /// its minting module's, so its owner's alone. Logs a refusal.
 fn route_owner_ok(r: &Route, h: i32, syscall: &str) -> bool {
-    // An owner table of the system slot alone stamps every handle and every
-    // caller `OWNER_SYSTEM`: nothing can be another owner's. This is every
+    // An owner table of the node owner's slot alone stamps every handle and every
+    // caller `OWNER_NODE`: nothing can be another owner's. This is every
     // call on a node whose plan seats no workload, so it costs one load.
     if crate::kernel::exec::scheduler::owners().slot_count() <= 1 || r.minter == NO_MODULE {
         return true;
@@ -255,16 +255,16 @@ fn route_owner_ok(r: &Route, h: i32, syscall: &str) -> bool {
 /// `kernel::BIND` is answered here: it opens a handle bound to one provider
 /// of `contract` (see [`bind`]).
 pub fn provider_open(contract: ContractId, open_op: u32, config: &[u8]) -> i32 {
-    // ISR-tier modules must not touch the provider table.
-    // Bridge channels are the only legal cross-tier conduit.
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_open") {
+    // interrupt-mode modules must not touch the provider table.
+    // Bridge channels are the only legal conduit between execution modes.
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_open") {
         return errno::EACCES;
     }
     // Admission gate: opening a provider handle admits new work, which is
     // refused for a Draining owner. Handles it already holds keep working (`authorize_use`
     // semantics) so in-flight work can run dry, and an owner being added
     // opens for its modules' `module_new` (`authorize_own_admit`).
-    // System-owned modules are unaffected.
+    // Node-owned modules are unaffected.
     let owner = crate::kernel::exec::scheduler::caller_owner();
     if !owner.is_system()
         && !crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner)
@@ -302,13 +302,13 @@ pub fn provider_open(contract: ContractId, open_op: u32, config: &[u8]) -> i32 {
 ///   2. A handle: its route's provider, with the provider's own index.
 ///   3. `handle == -1`: the contract's default provider.
 pub fn provider_call(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i32 {
-    // Defense in depth: ISR-tier (Tier 1b/2) modules must not reach
+    // Defense in depth: interrupt-mode (`timer`/`irq`) modules must not reach
     // `provider_call` — the contract is "bridge-only I/O, no syscalls".
-    // EXCEPTION: the bridge ops and `SELF_BRIDGE` are the sanctioned ISR-tier
+    // EXCEPTION: the bridge ops and `SELF_BRIDGE` are the sanctioned interrupt-mode
     // I/O path (lock-free, allocation-free rings), so they are exempt here
     // too — matching the exemption in `syscall_provider_call`.
     if !crate::abi::internal::bridge::is_isr_safe(op)
-        && crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_call")
+        && crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_call")
     {
         return errno::EACCES;
     }
@@ -431,7 +431,7 @@ fn call_by_class(handle: i32, op: u32, arg: &mut [u8], data: UserSpan<'_>) -> i3
 
 /// Query handle state by key into `out`.
 pub fn provider_query(handle: i32, key: u32, out: &mut [u8]) -> i32 {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_query") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_query") {
         return errno::EACCES;
     }
     let Some(c) = contract_of(handle) else {
@@ -504,7 +504,7 @@ pub fn poll(h: i32, events: u32) -> i32 {
 /// write-back left to do finishes it in its own step. The answer is passed
 /// through for the caller to see, never as a reason to keep the handle.
 pub fn provider_close(handle: i32) -> i32 {
-    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_close") {
+    if crate::kernel::exec::scheduler::deny_interrupt_mode_syscall("provider_close") {
         return errno::EACCES;
     }
     let Some(c) = contract_of(handle) else {
@@ -1147,7 +1147,7 @@ pub fn clear_pool_sampler(module_idx: ModuleId) {
     }
 }
 
-/// The module serving `pool` for the node: the system owner's top-most
+/// The module serving `pool` for the node: the node owner's top-most
 /// unkeyed layer of the pool's contract (`resource::
 /// module_provided_pool_contract`), with its dispatch. `None` for a pool no
 /// module provides, or none registered. The borrow of `PROVIDERS` ends with
@@ -1514,7 +1514,7 @@ fn layer_visible(layer: &ProviderLayer) -> bool {
 }
 
 /// The node's own default layer of `contract`: the top-most unkeyed layer a
-/// system-owned module registered, whoever is calling. `None` when the node
+/// node-owned module registered, whoever is calling. `None` when the node
 /// has none.
 fn node_default_layer(entry: &ProviderEntry) -> Option<&ProviderLayer> {
     (0..entry.depth as usize).rev().find_map(|i| {

@@ -48,6 +48,17 @@ pub fn timer_freq() -> u64 {
     freq
 }
 
+/// `us` microseconds in counter ticks. A firmware that left `CNTFRQ_EL0`
+/// unprogrammed reads 0; the period is then taken at 62.5 MHz, the
+/// frequency the architecture's generic timer is most often clocked at.
+pub fn us_to_ticks(us: u32) -> u32 {
+    let freq = match timer_freq() {
+        0 => 62_500_000,
+        f => f,
+    };
+    (u64::from(us) * freq / 1_000_000) as u32
+}
+
 /// Read the timer counter for cycle-accurate timing (low 32 bits).
 #[inline(always)]
 pub fn read_timer_count() -> u32 {

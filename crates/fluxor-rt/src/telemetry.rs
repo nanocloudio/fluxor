@@ -41,7 +41,7 @@ pub unsafe fn dev_requester_tag(
 /// kernel-published flag. `true` when at least one telemetry consumer is
 /// subscribed, so a record is built only when something would consume it. A
 /// null pointer means "cannot check", not "disabled" — a table without the
-/// word (the wasm host, an isolated module whose protection domain does not
+/// word (the wasm host, an isolated module whose isolation region does not
 /// map kernel memory) emits unconditionally and the ring drops when no
 /// consumer is active.
 #[inline(always)]
@@ -85,8 +85,8 @@ pub unsafe fn dev_telemetry_metric(
 }
 
 /// Emit a scalar metric carrying a composite dimension index: the
-/// row-major index over the instrument's declared dimension domains.
-/// `DIM_OTHER` folds an out-of-domain tuple; the undimensioned path is
+/// row-major index over the instrument's declared dimension ranges.
+/// `DIM_OTHER` folds an out-of-range tuple; the undimensioned path is
 /// [`dev_telemetry_metric`]. Gated like every other emit helper.
 #[allow(
     clippy::too_many_arguments,

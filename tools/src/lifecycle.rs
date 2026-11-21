@@ -829,10 +829,10 @@ fn setup_line(s: &Shape) -> String {
 /// The applets this project ships: `packaging/applet/<name>/`.
 fn applet_names(project_root: &Path) -> Vec<String> {
     crate::packaging::discover(project_root)
-        .bundles
+        .packages
         .into_iter()
         .filter(|(k, _)| *k == crate::packaging::Kind::Applet)
-        .filter_map(|(_, p)| crate::packaging::read_bundle(&p).ok().map(|b| b.name))
+        .filter_map(|(_, p)| crate::packaging::read_package(&p).ok().map(|b| b.name))
         .collect()
 }
 
@@ -1313,7 +1313,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Makefile"),
-            "build:\n\tfluxor build\n\n             # stage the shadow tiers\n             #\n             # a second paragraph nobody wants in help\n             shadow-add:\n\t@git shadow add -f\n\n             install:\n\tcargo install\n",
+            "build:\n\tfluxor build\n\n             # stage the shadow files\n             #\n             # a second paragraph nobody wants in help\n             shadow-add:\n\t@git shadow add -f\n\n             install:\n\tcargo install\n",
         )
         .unwrap();
         let got = project_targets(dir.path());
@@ -1321,7 +1321,7 @@ mod tests {
             got,
             vec![(
                 "shadow-add".to_string(),
-                "stage the shadow tiers".to_string()
+                "stage the shadow files".to_string()
             )],
             "lifecycle and install are omitted; the extra keeps its first comment line"
         );

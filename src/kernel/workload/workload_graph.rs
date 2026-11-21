@@ -7,13 +7,13 @@
 // lease / live-graph primitives.
 // This is the metal twin of `platform::linux::workload` (the host-process
 // backend). It lives in `src/kernel` — not `src/platform/bcm2712` — because the
-// logic is kernel-generic: `apply_add`/`free_owner`/`owner_pause`
+// logic is kernel-generic: splice/`free_owner`/`owner_pause`
 // reach the run loop on **host-linux** too, so the harness drives this dispatch
 // end-to-end there (the metal registration in `bcm2712::bcm_init_providers` is a
 // thin wrapper that installs `workload_dispatch` as the 0x1A provider).
 //
 // Per-op mapping:
-//   CREATE  — decode the `source_ref` FLXA subgraph → `apply_add`; stage paused
+//   CREATE  — decode the `source_ref` composed graph → the splice; stage paused
 //             (the START barrier); lease-gate the header endpoints; allocate a
 //             `WorkloadSlot`; return its index (the kernel wraps it in a
 //             handle).
@@ -25,21 +25,21 @@
 //   CAPS    — the metal bitmap: SHARED posture, FMOD_GRAPH source, PAUSE
 //             op, own-address net identity.
 //
-// **Dispatch context invariant:** runtime `apply_add`/ `free_owner` must run
+// **Dispatch context invariant:** runtime splice/`free_owner` must run
 // on the primary domain / core 0 — `request_quiesce` (the peer-core quiesce
-// built into `apply_add`/`free_owner`) is primary-only. The
-// `workload` provider dispatches on the system graph, which lives on domain 0,
+// built into splice/`free_owner`) is primary-only. The
+// `workload` provider dispatches on the node graph, which lives on domain 0,
 // so this holds naturally; there is no secondary-core path into this backend.
 
 use crate::abi::contracts::workload as wl;
-use crate::kernel::exec::scheduler::live;
 use crate::kernel::exec::scheduler::{self, OwnerLiveStatus, OWNER_STATE_PAUSED};
+use crate::kernel::exec::scheduler::{live, splice};
 use crate::kernel::exec::step_guard::fault_type;
 use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
 use crate::kernel::workload::code_pack;
-use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM, OWNER_TABLE_SLOTS};
+use crate::kernel::workload::owner::{OwnerHandle, OWNER_NODE, OWNER_TABLE_SLOTS};
 use crate::kernel::workload::owner_plan::{lease_gate, LeaseGate};
 use crate::kernel::workload::storage::StorageGrant;
 
@@ -51,16 +51,16 @@ use crate::kernel::workload::storage::StorageGrant;
 // writes `ADDR_DEL`. The backend does NOT know which module the provider is,
 // what it is named, or how it stores addresses — the provider SELF-REGISTERS
 // at init via the `NET_IDENT_PROVIDER` syscall, declaring its module slot and
-// its control/ingress port indices, and the backend speaks the shared
+// its control port index, and the backend speaks the shared
 // `net::identity` contract (opcodes, framing, payload layout) to whatever
-// registered. Any base-graph module implementing the contract's `addr_ctl`
+// registered. Any node-graph module implementing the contract's `addr_ctl`
 // receiver is a valid provider; the foundation `ip` module is one.
 
 use crate::abi::contracts::net::identity as netid;
 use portable_atomic::{AtomicU64, Ordering};
 
 /// Registered net-identity provider, packed as
-/// `[slot: u16][addr_ctl_port: u8][net_in_port: u8][slot generation: u32]`
+/// `[slot: u16][addr_ctl_port: u8][0: u8][slot generation: u32]`
 /// (little-endian view), or [`NO_PROVIDER`] when none has registered. One
 /// atomic so a reader never sees a torn registration. The generation names
 /// one occupancy of the slot: a registration whose slot has since been
@@ -71,11 +71,10 @@ use portable_atomic::{AtomicU64, Ordering};
 static NET_IDENT_PROVIDER_REG: AtomicU64 = AtomicU64::new(NO_PROVIDER);
 const NO_PROVIDER: u64 = u64::MAX;
 
-fn unpack_provider(packed: u64) -> (usize, u8, u8, u32) {
+fn unpack_provider(packed: u64) -> (usize, u8, u32) {
     (
         (packed & 0xFFFF) as usize,
         ((packed >> 16) & 0xFF) as u8,
-        ((packed >> 24) & 0xFF) as u8,
         (packed >> 32) as u32,
     )
 }
@@ -85,22 +84,28 @@ fn provider_current(packed: u64) -> bool {
     if packed == NO_PROVIDER {
         return false;
     }
-    let (slot, _, _, gen) = unpack_provider(packed);
+    let (slot, _, gen) = unpack_provider(packed);
     scheduler::module_slot_generation(slot) == gen
 }
 
 /// Register `slot` (its current occupancy) as the node's net-identity
-/// provider with its declared control (`addr_ctl_port`) and ingress
-/// (`net_in_port`) input-port indices. First-wins while the registrant
+/// provider with its declared control (`addr_ctl_port`) input-port index.
+/// First-wins while the registrant
 /// lives: a second registration returns `EBUSY`, unless the registered
-/// occupancy is gone (stale), when it takes over. The syscall path gates
-/// callers to base-graph (system-owned) modules; tests register directly.
-pub fn register_net_identity_provider(slot: u16, addr_ctl_port: u8, net_in_port: u8) -> i32 {
+/// occupancy is gone (stale), when it takes over. One module is the node's
+/// network stack: with a live lane provider ([`crate::kernel::workload::net_attach`])
+/// in another slot the registration is `EACCES`, as `NET_PROVIDE` is from
+/// a slot other than the identity provider's, whichever registers first.
+/// The syscall path gates callers to node-graph (node-owned) modules; tests
+/// register directly.
+pub fn register_net_identity_provider(slot: u16, addr_ctl_port: u8) -> i32 {
+    if crate::kernel::workload::net_attach::live_provider_slot()
+        .is_some_and(|lane| lane != slot as usize)
+    {
+        return errno::EACCES;
+    }
     let gen = scheduler::module_slot_generation(slot as usize);
-    let packed = (slot as u64)
-        | ((addr_ctl_port as u64) << 16)
-        | ((net_in_port as u64) << 24)
-        | ((gen as u64) << 32);
+    let packed = (slot as u64) | ((addr_ctl_port as u64) << 16) | ((gen as u64) << 32);
     let cur = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
     if cur == packed {
         // Same registration repeated (module re-init) is a benign no-op.
@@ -149,15 +154,15 @@ pub fn reset_net_identity_provider() {
     NET_IDENT_PROVIDER_REG.store(NO_PROVIDER, Ordering::Release);
 }
 
-/// The registered provider as `(slot, addr_ctl_port, net_in_port)`, or `None`
-/// (none registered, or its occupancy is gone).
-fn net_identity_provider() -> Option<(usize, u8, u8)> {
+/// The registered provider as `(slot, addr_ctl_port)`, or `None` (none
+/// registered, or its occupancy is gone).
+fn net_identity_provider() -> Option<(usize, u8)> {
     let packed = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
     if !provider_current(packed) {
         return None;
     }
-    let (slot, ctl, net_in, _) = unpack_provider(packed);
-    Some((slot, ctl, net_in))
+    let (slot, ctl, _) = unpack_provider(packed);
+    Some((slot, ctl))
 }
 
 /// Whether `(slot, generation)` is the registered net-identity provider.
@@ -166,7 +171,7 @@ pub fn is_net_identity_provider(slot: usize, generation: u32) -> bool {
     if !provider_current(packed) {
         return false;
     }
-    let (s, _, _, g) = unpack_provider(packed);
+    let (s, _, g) = unpack_provider(packed);
     s == slot && g == generation
 }
 
@@ -178,7 +183,7 @@ pub fn net_identity_provider_present() -> bool {
 // ── Per-owner name-service context ───────────────────────────────
 //
 // A workload's CREATE may carry the name service its queries go to and its
-// search list (`wl::resolver`, a Tier-2 option). The kernel holds it per
+// search list (`wl::resolver`, an options entry). The kernel holds it per
 // owner, keyed by the owner's (slot, generation) so a context never outlives
 // the occupancy it was given for, and the net provider (`ip`) reads it with
 // `wl::NET_RESOLVER`. It is written on the creator's core and read on the
@@ -235,7 +240,7 @@ fn resolver_ctx_ok(v: &[u8]) -> bool {
     at == v.len()
 }
 
-/// One Tier-2 option entry: `[ns_len:u8][ns][key_len:u8][key][flags:u8]
+/// One options entry: `[ns_len:u8][ns][key_len:u8][key][flags:u8]
 /// [val_len:u16 LE][val]`.
 #[derive(Clone, Copy)]
 struct CreateOption<'a> {
@@ -245,7 +250,7 @@ struct CreateOption<'a> {
     val: &'a [u8],
 }
 
-/// The entries of a Tier-2 options envelope, in order; `Err(EINVAL)` at the
+/// The entries of a options envelope, in order; `Err(EINVAL)` at the
 /// first that overruns it.
 struct CreateOptionIter<'a> {
     opts: &'a [u8],
@@ -311,7 +316,7 @@ fn env_entry(val: &[u8]) -> Option<(&[u8], &[u8])> {
 /// resolves a workload's `fs` paths through a root it can bind beneath.
 const LENDS_VOLUMES: bool = cfg!(feature = "host-linux");
 
-/// What a CREATE's Tier-2 options ask of this backend, every entry checked.
+/// What a CREATE's options ask of this backend, every entry checked.
 struct CreateOptions<'a> {
     /// The owner's name-service context, when one was given.
     resolver: Option<&'a [u8]>,
@@ -320,7 +325,7 @@ struct CreateOptions<'a> {
     opts: &'a [u8],
 }
 
-/// Walk the CREATE's Tier-2 options: the resolver context is taken, the
+/// Walk the CREATE's Options: the resolver context is taken, the
 /// environment and the volumes are checked, every other entry is advisory
 /// unless required, and a required entry this backend does not realize
 /// fails admission (`ENOSYS`).
@@ -615,34 +620,32 @@ fn bind_params(p: &[u8], opts: &[u8], out: &mut BlobOut<'_>) -> Result<(), i32> 
     }
 }
 
-/// Copy an FLXA subgraph into `out` with each module's env bind records
+/// Copy a composed graph into `out` with each module's env bind records
 /// written out from the CREATE's `env`/`var` entries in `opts` (the
-/// contract's `wl::env`). The length written; `EINVAL` for a malformed
-/// subgraph or record, or a required name no entry gives; `E2BIG` when a
-/// module's params pass a `u16` or the subgraph `out`.
-pub fn bind_env(flxa: &[u8], opts: &[u8], out: &mut [u8]) -> Result<usize, i32> {
-    use crate::kernel::exec::scheduler::live::ADD_MODULE_FIXED_BYTES as FIXED;
-    if flxa.len() < FLXA_MIN_LEN {
-        return Err(errno::EINVAL);
-    }
+/// contract's `wl::env`). The length written; `EINVAL` for a graph the codec
+/// refuses or a malformed record, or a required name no entry gives; `E2BIG`
+/// when a module record passes a `u16` or the graph `out`.
+pub fn bind_env(src: &[u8], opts: &[u8], out: &mut [u8]) -> Result<usize, i32> {
+    use fluxor_contracts::graph::{self, MODULE_HEAD_LEN, RECORD_ALIGN};
+    let g = graph::decode(src).map_err(|_| errno::EINVAL)?;
     let mut o = BlobOut { buf: out, at: 0 };
-    o.put(&flxa[..FLXA_MIN_LEN])?;
-    let modules = flxa[FLXA_MIN_LEN - 2] as usize;
-    let mut at = FLXA_MIN_LEN;
-    for _ in 0..modules {
-        let fixed = flxa.get(at..at + FIXED).ok_or(errno::EINVAL)?;
-        let plen = u16::from_be_bytes([fixed[FIXED - 2], fixed[FIXED - 1]]) as usize;
-        let params = flxa
-            .get(at + FIXED..at + FIXED + plen)
-            .ok_or(errno::EINVAL)?;
+    let order_end =
+        (graph::HEADER_LEN + 2 * usize::from(g.module_count())).next_multiple_of(RECORD_ALIGN);
+    o.put(&src[..order_end])?;
+    let mut at = order_end;
+    for _ in 0..g.module_count() {
+        let len = usize::from(u16::from_le_bytes([src[at], src[at + 1]]));
         let record_at = o.at;
-        o.put(fixed)?;
-        bind_params(params, opts, &mut o)?;
-        let written = u16::try_from(o.at - record_at - FIXED).map_err(|_| errno::E2BIG)?;
-        o.buf[record_at + FIXED - 2..record_at + FIXED].copy_from_slice(&written.to_be_bytes());
-        at += FIXED + plen;
+        o.put(&src[at..at + MODULE_HEAD_LEN])?;
+        bind_params(&src[at + MODULE_HEAD_LEN..at + len], opts, &mut o)?;
+        let written = u16::try_from(o.at - record_at).map_err(|_| errno::E2BIG)?;
+        o.buf[record_at..record_at + 2].copy_from_slice(&written.to_le_bytes());
+        while !o.at.is_multiple_of(RECORD_ALIGN) {
+            o.put(&[0])?;
+        }
+        at += len.next_multiple_of(RECORD_ALIGN);
     }
-    o.put(&flxa[at..])?;
+    o.put(&src[at..])?;
     Ok(o.at)
 }
 
@@ -734,7 +737,7 @@ const NO_LANE: CallerLane = CallerLane {
 
 const WL_EMPTY: WorkloadSlot = WorkloadSlot {
     in_use: false,
-    owner: OWNER_SYSTEM,
+    owner: OWNER_NODE,
     net_addr: [0u8; 16],
     net_segment: 0,
     lanes: [NO_LANE; wl::MAX_CALLER_LANES],
@@ -755,7 +758,7 @@ static mut FMOD_WORKLOADS: crate::kernel::mem::table::Table<WorkloadSlot, MAX_WO
 /// created it. Only that owner, or a caller acting with the node's
 /// authority, acts on the workload ([`may_act_on`]).
 static mut FMOD_HOLDERS: crate::kernel::mem::table::Table<OwnerHandle, MAX_WORKLOADS> =
-    crate::boot_table!(MAX_WORKLOADS, OWNER_SYSTEM);
+    crate::boot_table!(MAX_WORKLOADS, OWNER_NODE);
 
 /// Size the workload slots to the owner table's `owners` slots.
 ///
@@ -768,7 +771,7 @@ pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::Table
     let h = &*core::ptr::addr_of!(FMOD_HOLDERS);
     h.reserve(owners)?;
     h.grow(owners)?;
-    let staging_slots = staging_for(live::workspaces_for(owners));
+    let staging_slots = staging_for(splice::workspaces_for(owners));
     let st = &*core::ptr::addr_of!(STAGING);
     st.reserve(staging_slots)?;
     st.grow(staging_slots)?;
@@ -783,12 +786,12 @@ pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::Table
 /// `DESTROY` by identity answer anyone else `EACCES`.
 unsafe fn may_act_on(widx: usize) -> bool {
     let holders = &*core::ptr::addr_of!(FMOD_HOLDERS);
-    may_act_as(holders.get(widx).copied().unwrap_or(OWNER_SYSTEM))
+    may_act_as(holders.get(widx).copied().unwrap_or(OWNER_NODE))
 }
 
 /// Whether the caller is `holder`, or acts with the node's authority.
 fn may_act_as(holder: OwnerHandle) -> bool {
-    scheduler::caller_authority() == OWNER_SYSTEM || scheduler::caller_owner() == holder
+    scheduler::caller_authority() == OWNER_NODE || scheduler::caller_owner() == holder
 }
 
 /// The owner staging the pending `CREATE`: only it (or a caller with the
@@ -804,9 +807,9 @@ struct PendingCreate {
     /// SHA-256 of the spec as the caller sent it: a continuation sends the
     /// same bytes.
     spec: [u8; 32],
-    staged: live::StagedAdd,
+    staged: splice::StagedAdd,
     pack: Option<code_pack::Staged>,
-    caller_edges: [live::CallerEdge; wl::MAX_CALLER_LANES * 2],
+    caller_edges: [splice::CallerEdge; wl::MAX_CALLER_LANES * 2],
     caller_edge_count: usize,
 }
 
@@ -825,7 +828,7 @@ impl Staging {
     };
 }
 
-/// An FLXA source is at most a `u16` long (the header's `source_ref_len`).
+/// A graph source is at most a `u16` long (the header's `source_ref_len`).
 const BLOB_BYTES: usize = u16::MAX as usize;
 
 /// Staging slots on a node that stages `adds` adds at once: one `CREATE` at
@@ -847,7 +850,7 @@ static mut STAGING: crate::kernel::mem::table::Table<Staging, STAGING_SLOTS> = {
     {
         crate::kernel::mem::table::Table::new_planned(
             |_| Staging::EMPTY,
-            || staging_for(live::add_capacity()),
+            || staging_for(splice::add_capacity()),
         )
     }
     #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
@@ -862,7 +865,7 @@ static mut PENDING_BLOB: crate::kernel::mem::table::Table<u8, { STAGING_SLOTS * 
     {
         crate::kernel::mem::table::Table::new_planned(
             |_| 0,
-            || staging_for(live::add_capacity()) * BLOB_BYTES,
+            || staging_for(splice::add_capacity()) * BLOB_BYTES,
         )
     }
     #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
@@ -903,7 +906,7 @@ pub fn reset_pending() {
 /// Roll the pending `CREATE` back: its add, and the pack it brought.
 unsafe fn abandon_pending() {
     if let Some(p) = staging().and_then(|st| st.pending.take()) {
-        live::abandon_staged(p.staged);
+        splice::abandon(p.staged);
         if let Some(s) = p.pack {
             code_pack::release(s);
         }
@@ -938,28 +941,24 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
-// FLXA subgraph blob layout (big-endian, `scheduler::live` codec): magic(4) +
-// version(2) + flags(2) + owner_uid(16) + state_cap(4) + buffer_cap(4) +
-// module_count(1) + edge_count(1) then the module/edge records.
-const FLXA_OWNER_UID_OFF: usize = 8;
-const FLXA_STATE_CAP_OFF: usize = 24;
-const FLXA_BUFFER_CAP_OFF: usize = 28;
-/// Minimum bytes for a well-formed FLXA header (through the two count bytes).
-const FLXA_MIN_LEN: usize = 34;
+// Composed-graph header fields (`fluxor_contracts::graph`, little-endian).
+const GRAPH_OWNER_UID_OFF: usize = 12;
+const GRAPH_STATE_CAP_OFF: usize = 28;
+const GRAPH_BUFFER_CAP_OFF: usize = 32;
 
 /// Clamp a blob cap field to the envelope memory ceiling, in place. `mem_ceil`
 /// is `None` for an unlimited envelope; a blob cap of 0 is also "unlimited", so
 /// the ceiling wins; otherwise the tighter of the two holds (caps, never a
 /// new meter).
 #[inline]
-fn clamp_cap_be(buf: &mut [u8], off: usize, mem_ceil: Option<u32>) {
-    let existing = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+fn clamp_cap(buf: &mut [u8], off: usize, mem_ceil: Option<u32>) {
+    let existing = rd_u32(buf, off);
     let clamped = match mem_ceil {
         None => existing,
         Some(m) if existing == 0 => m,
         Some(m) => existing.min(m),
     };
-    buf[off..off + 4].copy_from_slice(&clamped.to_be_bytes());
+    buf[off..off + 4].copy_from_slice(&clamped.to_le_bytes());
 }
 
 /// Resolve the net-identity provider's `addr_ctl` channel from the
@@ -967,37 +966,16 @@ fn clamp_cap_be(buf: &mut [u8], off: usize, mem_ceil: Option<u32>) {
 /// no network stack).
 fn addr_ctl_channel() -> i32 {
     match net_identity_provider() {
-        Some((slot, addr_ctl_port, _)) => {
+        Some((slot, addr_ctl_port)) => {
             scheduler::get_module_port(slot, 0 /* PORT_IN */, addr_ctl_port)
         }
         None => -1,
     }
 }
 
-/// Resolve the next FREE spare lane of the boot merge feeding the registered
-/// net-identity provider's declared ingress port. This is the
-/// channel a `net=own` workload's net-facing producer edges into so its egress
-/// reaches the shared provider through the merge. Returns the lane channel id,
-/// or `-1` when no provider registered, there is no boot merge on the
-/// provider's ingress (a node whose base graph provisioned no spare-lane
-/// merge), or every spare lane is already taken (exhaustion). A `-1` with a
-/// sentinel edge present makes CREATE fail `ENOMEM` cleanly (nothing
-/// allocated).
-fn provider_net_in_spare_lane() -> i32 {
-    let Some((slot, _, net_in_port)) = net_identity_provider() else {
-        return -1;
-    };
-    let ingress = scheduler::get_module_port(slot, 0 /* PORT_IN */, net_in_port);
-    let merge = scheduler::find_spare_lane_merge_for_channel(ingress);
-    if merge < 0 {
-        return -1;
-    }
-    scheduler::merge_next_free_lane(merge as usize)
-}
-
 /// Single-writer gate: the backend is the *sole* writer of `addr_ctl`, so
-/// the base graph must leave the channel producer-less (no module edged into
-/// it). `channel_producer_owner` returns `OWNER_SYSTEM` for a producer-less (or
+/// the node graph must leave the channel producer-less (no module edged into
+/// it). `channel_producer_owner` returns `OWNER_NODE` for a producer-less (or
 /// benign system-anchored) channel; a non-system producer means a mis-wired base
 /// graph — `channel_write` on an SPSC FIFO with a second producer violates the
 /// invariant, so we refuse rather than double-write.
@@ -1041,7 +1019,7 @@ unsafe fn write_addr_ctl_frame(ch: i32, msg_type: u8, payload: &[u8]) -> bool {
 ///     CREATE on a node with no network stack fails cleanly — never silently
 ///     dropped; a registered provider's unwired port is given its channel at
 ///     registration, [`provision_addr_ctl`]),
-///   * `EBUSY`  — the base graph wired a producer into addr_ctl (mis-wire),
+///   * `EBUSY`  — the node graph wired a producer into addr_ctl (mis-wire),
 ///   * `EAGAIN` — the low-rate control ring rejected the frame.
 ///
 /// # Safety
@@ -1091,87 +1069,108 @@ unsafe fn remove_identity(addr16: &[u8; 16]) {
 /// its owner with the storage the header admits. 0, or a negative errno with
 /// nothing left staged.
 ///
+/// Each step is its own frame, so the splice's admission runs under this
+/// one's few locals alone.
+///
 /// # Safety
 /// Scheduler thread; `buf` is the caller's whole spec.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the parsed header fields CREATE admits by; a struct would restate the header under a second name"
-)]
-unsafe fn begin_create(
-    buf: &[u8],
-    flxa_off: usize,
-    flxa_len: usize,
-    pack: Option<(&[u8], usize)>,
-    src_start: usize,
-    memory_bytes: u64,
-    storage_bytes: u64,
-    storage_grant: StorageGrant,
-    wants_identity: bool,
-    identity: [u8; 16],
-    spec: [u8; 32],
-    opts: &[u8],
-) -> i32 {
-    // ── A pack: the workload's own modules, staged as its code. Each must be
-    //    the module asked for — its bytes match a pin — or one the node's
-    //    signing root signed; then the region is made executable, and the
-    //    subgraph's names resolve in it first while the add instantiates.
-    let staged = match pack {
-        Some((bytes, pins)) => {
-            let staged = match code_pack::stage(bytes) {
-                Ok(s) => s,
-                Err(e) => return e,
-            };
-            let pin_bytes = &buf[src_start + wl::pack_ref::SIZE
-                ..src_start + wl::pack_ref::SIZE + pins * wl::pack_ref::PIN_SIZE];
-            let mut ok = true;
-            let ldr = code_pack::loader(staged);
-            code_pack::for_each_module(staged, |hash, fmod| {
-                let pinned = |p: &[u8; 32]| -> bool { pin_matches(pin_bytes, p) };
-                let module = ldr.find_by_name_hash(hash);
-                ok &= match module {
-                    Ok(m) => code_pack::admitted_with(fmod, &m, pinned),
-                    Err(_) => false,
-                };
-            });
-            if !ok {
-                code_pack::release(staged);
-                // ENOEXEC, not EACCES: the staged bytes are not the module
-                // they claim to be — nothing is being denied, the payload is
-                // wrong. A caller told this can fetch the code again, which
-                // is the only refusal here that fetching can mend.
-                return errno::ENOEXEC;
-            }
-            if !code_pack::seal(staged) {
-                code_pack::release(staged);
-                return errno::EFAULT;
-            }
-            Some(staged)
-        }
-        None => None,
-    };
-    let unstage = |staged: Option<code_pack::Staged>| {
-        code_pack::end_staging();
-        if let Some(s) = staged {
-            code_pack::release(s);
-        }
+unsafe fn begin_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
+    let staged = match stage_pack(buf, req) {
+        Ok(s) => s,
+        Err(e) => return e,
     };
     if let Some(s) = staged {
         code_pack::begin_staging(s);
     }
-    let flxa = &buf[flxa_off..flxa_off + flxa_len];
-    // A workload is a tenant of the node, not part of it: none of its
+    let blob = match own_subgraph(buf, req) {
+        Ok(b) => b,
+        Err(e) => {
+            code_pack::end_staging();
+            if let Some(s) = staged {
+                code_pack::release(s);
+            }
+            return e;
+        }
+    };
+
+    // ── Stage the subgraph: decode it, reserve the owner, assign slots and
+    //    open its channels. A workload's traffic reaches the node's network
+    //    over its own `Endpoint::Net` lanes; `net=own` adds only the
+    //    identity install.
+    live::set_caller(Some(scheduler::current_module_index()));
+    let begun = splice::begin_encoded(blob);
+    live::set_caller(None);
+    code_pack::end_staging();
+    match begun {
+        Ok(st) => seat_pending(buf, req, staged, st),
+        Err(e) => {
+            if let Some(s) = staged {
+                code_pack::release(s);
+            }
+            e
+        }
+    }
+}
+
+/// A pack: the workload's own modules, staged as its code. Each must be the
+/// module asked for — its bytes match a pin — or one the node's signing
+/// root signed; then the region is made executable, and the subgraph's
+/// names resolve in it first while the add instantiates.
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn stage_pack(buf: &[u8], req: &CreateSpec<'_>) -> Result<Option<code_pack::Staged>, i32> {
+    let Some((bytes, pins)) = req.pack else {
+        return Ok(None);
+    };
+    let staged = code_pack::stage(bytes)?;
+    let pin_bytes = &buf[req.src_start + wl::pack_ref::SIZE
+        ..req.src_start + wl::pack_ref::SIZE + pins * wl::pack_ref::PIN_SIZE];
+    let mut ok = true;
+    let ldr = code_pack::loader(staged);
+    code_pack::for_each_module(staged, |hash, fmod| {
+        let pinned = |p: &[u8; 32]| -> bool { pin_matches(pin_bytes, p) };
+        let module = ldr.find_by_name_hash(hash);
+        ok &= match module {
+            Ok(m) => code_pack::admitted_with(fmod, &m, pinned),
+            Err(_) => false,
+        };
+    });
+    if !ok {
+        code_pack::release(staged);
+        // ENOEXEC, not EACCES: the staged bytes are not the module they
+        // claim to be — nothing is being denied, the payload is wrong. A
+        // caller told this can fetch the code again, which is the only
+        // refusal here that fetching can mend.
+        return Err(errno::ENOEXEC);
+    }
+    if !code_pack::seal(staged) {
+        code_pack::release(staged);
+        return Err(errno::EFAULT);
+    }
+    Ok(Some(staged))
+}
+
+/// The backend's own copy of the subgraph: its modules' grants checked, its
+/// env binds written out from the CREATE's environment, carrying the
+/// header's identity (what the splice allocates the owner by) and the memory
+/// ceiling clamped onto the subgraph's caps.
+///
+/// # Safety
+/// Scheduler thread; the pack the subgraph names is staged.
+#[inline(never)]
+unsafe fn own_subgraph(buf: &[u8], req: &CreateSpec<'_>) -> Result<&'static mut [u8], i32> {
+    let src_graph = &buf[req.graph_off..req.graph_off + req.graph_len];
+    // A workload runs on the node for its owner and is not part of it: none of its
     // modules may hold a grant that reaches past the gateway, the ones that
     // act on the node itself (registers, DMA, PCIe, reconfiguration, other
     // workloads, the host). Checked before any owner is allocated, against
     // the modules the node would instantiate.
-    let Some(grants) = live::module_grants(flxa) else {
-        unstage(staged);
-        return errno::EINVAL;
-    };
+    let grants = splice::module_grants(src_graph).ok_or(errno::EINVAL)?;
     if grants[0] & crate::abi::registry::CONTRACT_REACH_KERNEL != 0
         || grants[1] & crate::abi::registry::grant::REACH_KERNEL != 0
     {
-        unstage(staged);
         // EACCES is this refusal's alone: of everything that can refuse a
         // create, this is the only one that is a permission. It is also the
         // only one nothing can mend — the pack would have to be built with
@@ -1180,88 +1179,75 @@ unsafe fn begin_create(
         // waiting. They shared this code once, and a caller that could not
         // tell them apart re-fetched a correct image for as long as it was
         // retried.
-        return errno::EACCES;
+        return Err(errno::EACCES);
     }
-    // The creator's own lanes (FLXA `Caller` edges): each lands at the add's
-    // first edge plus its position.
-    let mut caller_edges = [live::CallerEdge::default(); wl::MAX_CALLER_LANES * 2];
-    let Some(caller_edge_count) = live::caller_edges(flxa, &mut caller_edges) else {
-        unstage(staged);
-        return errno::EINVAL;
-    };
-
-    // ── The backend's own copy of the subgraph, its modules' env binds
-    //    written out from the CREATE's environment, carrying the header's
-    //    identity (what `apply_add` allocates the owner by) and the memory
-    //    ceiling clamped onto the subgraph's caps.
-    let Some(pending) = pending_blob() else {
-        unstage(staged);
-        return errno::ENOSPC;
-    };
-    let blob_len = match bind_env(flxa, opts, pending) {
-        Ok(n) => n,
-        Err(e) => {
-            unstage(staged);
-            return e;
-        }
-    };
+    let pending = pending_blob().ok_or(errno::ENOSPC)?;
+    let blob_len = bind_env(src_graph, req.opts, pending)?;
     let blob = &mut pending[..blob_len];
-    blob[FLXA_OWNER_UID_OFF..FLXA_OWNER_UID_OFF + 16].copy_from_slice(&identity);
-    let mem_ceil = if memory_bytes == 0 {
+    blob[GRAPH_OWNER_UID_OFF..GRAPH_OWNER_UID_OFF + 16].copy_from_slice(&req.identity);
+    let mem_ceil = if req.memory_bytes == 0 {
         None
     } else {
-        Some(memory_bytes.min(u32::MAX as u64) as u32)
+        Some(req.memory_bytes.min(u32::MAX as u64) as u32)
     };
-    clamp_cap_be(blob, FLXA_STATE_CAP_OFF, mem_ceil);
-    clamp_cap_be(blob, FLXA_BUFFER_CAP_OFF, mem_ceil);
+    clamp_cap(blob, GRAPH_STATE_CAP_OFF, mem_ceil);
+    clamp_cap(blob, GRAPH_BUFFER_CAP_OFF, mem_ceil);
+    Ok(blob)
+}
 
-    // ── Stage the subgraph: decode it, reserve the owner, assign slots and
-    //    open its channels. A `net=own` workload's net-facing producer names
-    //    `SPARE_LANE_SENTINEL` (the workload manager cannot name a kernel
-    //    channel off-node); it is wired into the boot merge's next free spare
-    //    lane on the net provider's ingress, and with no free lane the
-    //    CREATE is refused `ENOMEM` before anything is allocated.
-    live::set_caller(Some(scheduler::current_module_index()));
-    let spare_lane = wants_identity.then(provider_net_in_spare_lane);
-    let begun = live::begin_add_encoded(blob, spare_lane);
-    live::set_caller(None);
-    code_pack::end_staging();
-    let staged_add = match begun {
-        Ok(st) => st,
-        Err(e) => {
-            if let Some(s) = staged {
-                code_pack::release(s);
-            }
-            return e;
-        }
-    };
-    // What the owner may hold in the node's storage, and the volumes it is
-    // lent, set before any of its modules runs.
-    scheduler::owners_mut().set_storage_cap(staged_add.handle(), storage_bytes);
-    scheduler::owners_mut().set_storage_grant(staged_add.handle(), storage_grant);
-    if let Err(e) = lend_volumes(staged_add.handle(), opts) {
-        live::abandon_staged(staged_add);
+/// What `owner` may hold in the node's storage, and the volumes it is lent.
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn grant_storage(owner: OwnerHandle, req: &CreateSpec<'_>) -> Result<(), i32> {
+    scheduler::owners_mut().set_storage_cap(owner, req.storage_bytes);
+    scheduler::owners_mut().set_storage_grant(owner, req.storage_grant);
+    lend_volumes(owner, req.opts)
+}
+
+/// The staged add as the pending CREATE: its storage cap and grant and the
+/// volumes it is lent set before any of its modules runs, and the
+/// creator's own lanes (`Caller` edges) noted, each landing at the add's
+/// first edge plus its position. 0, or the negative errno with the add
+/// abandoned.
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn seat_pending(
+    buf: &[u8],
+    req: &CreateSpec<'_>,
+    staged: Option<code_pack::Staged>,
+    staged_add: splice::StagedAdd,
+) -> i32 {
+    let abandon = |staged_add: splice::StagedAdd, e: i32| {
+        splice::abandon(staged_add);
         if let Some(s) = staged {
             code_pack::release(s);
         }
-        return e;
+        e
+    };
+    if let Err(e) = grant_storage(staged_add.handle(), req) {
+        return abandon(staged_add, e);
     }
+    let src_graph = &buf[req.graph_off..req.graph_off + req.graph_len];
+    let mut caller_edges = [splice::CallerEdge::default(); wl::MAX_CALLER_LANES * 2];
+    let Some(caller_edge_count) = splice::caller_edges(src_graph, &mut caller_edges) else {
+        return abandon(staged_add, errno::EINVAL);
+    };
     log::info!(
         "[workload] graph workload {}.{}: storage_bytes={}",
         staged_add.handle().slot,
         staged_add.handle().generation,
-        storage_bytes
+        req.storage_bytes
     );
     let Some(st) = staging() else {
-        live::abandon_staged(staged_add);
-        if let Some(s) = staged {
-            code_pack::release(s);
-        }
-        return errno::ENOSPC;
+        return abandon(staged_add, errno::ENOSPC);
     };
     st.pending = Some(PendingCreate {
-        identity,
-        spec,
+        identity: req.identity,
+        spec: req.spec,
         staged: staged_add,
         pack: staged,
         caller_edges,
@@ -1270,16 +1256,61 @@ unsafe fn begin_create(
     0
 }
 
+/// A CREATE's spec: its sections located and its header checked against
+/// what this backend realizes.
+#[derive(Clone, Copy)]
+struct CreateSpec<'a> {
+    graph_off: usize,
+    graph_len: usize,
+    pack: Option<(&'a [u8], usize)>,
+    src_start: usize,
+    memory_bytes: u64,
+    storage_bytes: u64,
+    storage_grant: StorageGrant,
+    wants_identity: bool,
+    identity: [u8; 16],
+    spec: [u8; 32],
+    opts: &'a [u8],
+    resolver_ctx: Option<&'a [u8]>,
+    ep_start: usize,
+    endpoint_count: usize,
+    net_family: u8,
+    net_prefix_len: u8,
+    net_segment: u16,
+    net_addr: [u8; 16],
+}
+
 /// WORKLOAD_CREATE: stage a fmod-graph workload as a new owner subgraph from
 /// the spec in `buf` and, for a pack source, the module table in `pack`.
 /// Returns the workload slot's index, or a negative errno.
 ///
+/// Three phases, each its own frame so none is on the stack under another's
+/// deepest call: the spec read, the add begun, the add advanced and
+/// published.
+///
 /// # Safety
 /// Scheduler thread.
 unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
+    let req = match parse_create(buf, pack_bytes) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let rc = open_create(buf, &req);
+    if rc != 0 {
+        return rc;
+    }
+    advance_create(buf, &req)
+}
+
+/// The CREATE's spec read and checked, before anything is staged.
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn parse_create<'a>(buf: &'a [u8], pack_bytes: &'a [u8]) -> Result<CreateSpec<'a>, i32> {
     let arg_len = buf.len();
     if arg_len < wl::CREATE_HEADER_SIZE {
-        return errno::EINVAL;
+        return Err(errno::EINVAL);
     }
 
     let posture = buf[16];
@@ -1292,7 +1323,7 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
         buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
     ]);
     let Some(storage_grant) = StorageGrant::from_wire(buf[19]) else {
-        return errno::EINVAL;
+        return Err(errno::EINVAL);
     };
     let source_ref_len = rd_u16(buf, 40) as usize;
     let endpoint_count = rd_u16(buf, 42) as usize;
@@ -1312,20 +1343,20 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
     let opt_start = ep_start + endpoint_count * wl::NET_ENDPOINT_SIZE;
     let opt_end = opt_start + options_len;
     if opt_end > arg_len {
-        return errno::EINVAL;
+        return Err(errno::EINVAL);
     }
 
     // ── Header validation (cheap, before any owner is allocated). Honest,
     //    fail-closed: this backend realizes only what CAPS advertises.
     // Backend selection is by source kind: only the fmod-graph source resolves
-    // to the metal backend (a bundle → the Linux host-process backend).
+    // to the metal backend (a host-process source → the Linux host-process backend).
     if source_kind != wl::SOURCE_FMOD_GRAPH && source_kind != wl::SOURCE_FMOD_PACK {
-        return errno::ENOSYS;
+        return Err(errno::ENOSYS);
     }
     // Only POSTURE_SHARED is realized; this backend gives a workload no
-    // protection domain of its own, so ISOLATED and HARDENED are refused.
+    // isolation region of its own, so ISOLATED and HARDENED are refused.
     if posture != wl::POSTURE_SHARED {
-        return errno::ENOSYS;
+        return Err(errno::ENOSYS);
     }
     // Net identity admission. The realized identity is IPv4 own-domain —
     // `net_iso == OWN` together with `net_family == IPV4`. A bare
@@ -1341,45 +1372,43 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
     //     tables (its address is then one of that stack's), and is refused
     //     ENOSYS where none is registered.
     if net_iso > wl::NET_ISO_OWN {
-        return errno::EINVAL;
+        return Err(errno::EINVAL);
     }
     let wants_identity = net_iso == wl::NET_ISO_OWN || net_family != wl::NET_FAM_NONE;
     if wants_identity && (net_iso != wl::NET_ISO_OWN || net_family != wl::NET_FAM_IPV4) {
-        return errno::ENOSYS;
+        return Err(errno::ENOSYS);
     }
     if net_segment != 0 {
-        if let Err(e) = crate::kernel::net_route::validate_attach(
+        crate::kernel::net_route::validate_attach(
             net_family,
             &net_addr,
             net_segment,
             net_identity_provider_present(),
-        ) {
-            return e;
-        }
+        )?;
     }
     for i in 0..endpoint_count {
         let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
         let ep_iso = buf[e + 1];
         if ep_iso > wl::NET_ISO_OWN {
-            return errno::EINVAL;
+            return Err(errno::EINVAL);
         }
         if ep_iso == wl::NET_ISO_OWN {
-            return errno::ENOSYS; // own-domain endpoint is not realized here
+            return Err(errno::ENOSYS); // own-domain endpoint is not realized here
         }
     }
 
-    // Where the FLXA subgraph lies in the source section: all of it for a
+    // Where the composed graph lies in the source section: all of it for a
     // graph; past the pack reference and its pins for a pack.
-    let (flxa_off, flxa_len, pack) = if source_kind == wl::SOURCE_FMOD_PACK {
+    let (graph_off, graph_len, pack) = if source_kind == wl::SOURCE_FMOD_PACK {
         use wl::pack_ref;
         if source_ref_len < pack_ref::SIZE {
-            return errno::EINVAL;
+            return Err(errno::EINVAL);
         }
         let r = &buf[src_start..src_start + pack_ref::SIZE];
         let pins = rd_u16(r, pack_ref::PIN_COUNT) as usize;
         let head = pack_ref::SIZE + pins * pack_ref::PIN_SIZE;
         if pack_bytes.is_empty() || source_ref_len < head {
-            return errno::EINVAL;
+            return Err(errno::EINVAL);
         }
         (
             src_start + head,
@@ -1389,15 +1418,12 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
     } else {
         (src_start, source_ref_len, None)
     };
-    if flxa_len < FLXA_MIN_LEN {
-        return errno::EINVAL; // not a well-formed FLXA subgraph
+    if graph_len < fluxor_contracts::graph::HEADER_LEN {
+        return Err(errno::EINVAL); // not a composed graph
     }
-    // The Tier-2 options: the resolver context is this backend's; any other
+    // The options: the resolver context is this backend's; any other
     // required entry is refused before anything is staged.
-    let options = match create_options(&buf[opt_start..opt_end]) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
+    let options = create_options(&buf[opt_start..opt_end])?;
     let resolver_ctx = options.resolver;
 
     // ── Who the workload is, and what it may hold.
@@ -1407,12 +1433,47 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
     // null identity names no one — every workload created with it would be
     // the same owner to anything keyed on it — so it is refused.
     if buf[..16].iter().all(|&b| b == 0) {
-        return errno::EINVAL;
+        return Err(errno::EINVAL);
     }
     let mut identity = [0u8; 16];
     identity.copy_from_slice(&buf[..16]);
     let spec = spec_digest(&buf[..opt_end]);
 
+    Ok(CreateSpec {
+        graph_off,
+        graph_len,
+        pack,
+        src_start,
+        memory_bytes,
+        storage_bytes,
+        storage_grant,
+        wants_identity,
+        identity,
+        spec,
+        opts: options.opts,
+        resolver_ctx,
+        ep_start,
+        endpoint_count,
+        net_family,
+        net_prefix_len,
+        net_segment,
+        net_addr,
+    })
+}
+
+/// Begin the CREATE's add, or check a continuation names the one being
+/// staged. 0, or the negative errno.
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn open_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
+    let CreateSpec {
+        identity,
+        spec,
+        resolver_ctx,
+        ..
+    } = *req;
     // A node whose plan seats no workload owner stages no CREATE.
     if staging().is_none() {
         return errno::ENOSPC;
@@ -1432,20 +1493,7 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
         if scheduler::owners().find_by_uid(identity).is_some() {
             return errno::EEXIST;
         }
-        let rc = begin_create(
-            buf,
-            flxa_off,
-            flxa_len,
-            pack,
-            src_start,
-            memory_bytes,
-            storage_bytes,
-            storage_grant,
-            wants_identity,
-            identity,
-            spec,
-            options.opts,
-        );
+        let rc = begin_create(buf, req);
         if rc != 0 {
             return rc;
         }
@@ -1462,6 +1510,16 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
         }
     }
 
+    0
+}
+
+/// One batch of the pending add; once its last module is in, the add
+/// published ([`publish_create`]).
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn advance_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
     // ── One batch of the pending add; the rest of CREATE once its last
     //    module is in.
     let Some(p) = staging().and_then(|st| st.pending.as_mut()) else {
@@ -1470,7 +1528,7 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
     if let Some(s) = p.pack {
         code_pack::begin_staging(s);
     }
-    let batch = live::instantiate_batch(&mut p.staged, CREATE_MODULES_PER_CALL);
+    let batch = splice::instantiate_batch(&mut p.staged, CREATE_MODULES_PER_CALL);
     code_pack::end_staging();
     match batch {
         Ok(false) => return errno::EINPROGRESS,
@@ -1485,13 +1543,35 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
             return e.code();
         }
     }
+    publish_create(buf, req)
+}
+
+/// The pending add, every module in, published: the owner activated, its
+/// endpoints lease-gated, its identity installed, it paused for START and
+/// its workload slot allocated. The slot's index, or the negative errno
+/// with the owner rolled back.
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn publish_create(buf: &[u8], req: &CreateSpec<'_>) -> i32 {
+    let CreateSpec {
+        wants_identity,
+        ep_start,
+        endpoint_count,
+        net_family,
+        net_prefix_len,
+        net_segment,
+        net_addr,
+        ..
+    } = *req;
     let Some(p) = staging().and_then(|st| st.pending.take()) else {
         return errno::EINVAL;
     };
     let edge_base = p.staged.edge_base();
     let caller_edges = p.caller_edges;
     let caller_edge_count = p.caller_edge_count;
-    let owner = match live::finish_staged(p.staged) {
+    let owner = match splice::finish(p.staged) {
         Ok(owner) => owner,
         Err(e) => {
             if let Some(s) = p.pack {
@@ -1544,7 +1624,7 @@ unsafe fn workload_create(buf: &[u8], pack_bytes: &[u8]) -> i32 {
         }
     }
 
-    // ── START barrier: stage paused. `apply_add` set the owner Active;
+    // ── START barrier: stage paused. the splice set the owner Active;
     //    pause it now so it does not run until START resumes it.
     if live::owner_pause(owner).is_err() {
         remove_identity(&net_addr);
@@ -1703,7 +1783,7 @@ fn workload_caps() -> u32 {
     postures | sources | ops | net
 }
 
-/// `OPTIONS`: the Tier-2 entries the graph backend realizes — the owner's
+/// `OPTIONS`: the options entries the graph backend realizes — the owner's
 /// name-service context, read by the net provider for the owner's lanes;
 /// its environment, written into its modules' env binds; and, where the
 /// platform roots a workload's files, the volumes it is lent.
@@ -1714,7 +1794,7 @@ fn workload_options(out: &mut [u8]) -> i32 {
     }
 }
 
-/// The Tier-2 `(namespace, keys)` the graph backend realizes.
+/// The options `(namespace, keys)` the graph backend realizes.
 const GRAPH_OPTIONS: &[(&[u8], &[&[u8]])] = if LENDS_VOLUMES {
     &[
         (wl::resolver::NS, &[wl::resolver::KEY]),
@@ -1778,7 +1858,13 @@ pub unsafe fn workload_dispatch(
     } else {
         0
     };
-    let rc = dispatch_op(handle, opcode, arg, data);
+    // CREATE runs under this frame alone: its admission is the deepest path
+    // a live add takes.
+    let rc = if opcode == wl::CREATE {
+        create_op(arg, data.as_slice())
+    } else {
+        dispatch_op(handle, opcode, arg, data)
+    };
     if timed {
         live_stats_record(
             opcode,
@@ -1869,45 +1955,52 @@ unsafe fn live_stats_record(opcode: u32, rc: i32, us: u64) {
     );
 }
 
-unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
-    if opcode == wl::CREATE {
-        let pending_holder = &mut *core::ptr::addr_of_mut!(PENDING_HOLDER);
-        let pending = pending_identity();
-        if pending.is_none() {
-            *pending_holder = None;
-        }
-        if let Some(h) = *pending_holder {
-            if !may_act_as(h) {
-                // Another owner's staged CREATE: continuing it is refused;
-                // any other spec waits for it, as the holder's own would.
-                let names_it = arg
-                    .get(..16)
-                    .is_some_and(|a| pending.is_some_and(|id| a == id));
-                return if names_it {
-                    errno::EACCES
-                } else {
-                    errno::EBUSY
-                };
-            }
-        }
-        // The owner that began a staged CREATE holds the workload it ends
-        // in, whoever sends the call that finishes it.
-        let holder = pending_holder.unwrap_or_else(scheduler::caller_owner);
-        // `arg` = the spec; `data` = a pack source's module table.
-        let rc = workload_create(arg, data.as_slice());
-        if rc == errno::EINPROGRESS {
-            *pending_holder = Some(holder);
-        } else {
-            *pending_holder = None;
-        }
-        if rc >= 0 {
-            let holders = &mut *core::ptr::addr_of_mut!(FMOD_HOLDERS);
-            if let Some(h) = holders.get_mut(rc as usize) {
-                *h = holder;
-            }
-        }
-        return rc;
+/// `CREATE`: `arg` the spec, `data` a pack source's module table. The owner
+/// that began a staged CREATE holds the workload it ends in.
+///
+/// # Safety
+/// Scheduler thread.
+#[inline(never)]
+unsafe fn create_op(arg: &mut [u8], data: &[u8]) -> i32 {
+    let pending_holder = &mut *core::ptr::addr_of_mut!(PENDING_HOLDER);
+    let pending = pending_identity();
+    if pending.is_none() {
+        *pending_holder = None;
     }
+    if let Some(h) = *pending_holder {
+        if !may_act_as(h) {
+            // Another owner's staged CREATE: continuing it is refused;
+            // any other spec waits for it, as the holder's own would.
+            let names_it = arg
+                .get(..16)
+                .is_some_and(|a| pending.is_some_and(|id| a == id));
+            return if names_it {
+                errno::EACCES
+            } else {
+                errno::EBUSY
+            };
+        }
+    }
+    // The owner that began a staged CREATE holds the workload it ends
+    // in, whoever sends the call that finishes it.
+    let holder = pending_holder.unwrap_or_else(scheduler::caller_owner);
+    // `arg` = the spec; `data` = a pack source's module table.
+    let rc = workload_create(arg, data);
+    if rc == errno::EINPROGRESS {
+        *pending_holder = Some(holder);
+    } else {
+        *pending_holder = None;
+    }
+    if rc >= 0 {
+        let holders = &mut *core::ptr::addr_of_mut!(FMOD_HOLDERS);
+        if let Some(h) = holders.get_mut(rc as usize) {
+            *h = holder;
+        }
+    }
+    rc
+}
+
+unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>) -> i32 {
     if opcode == wl::MODULE_DIGESTS {
         return code_pack::node_digests(scheduler::static_loader(), data.as_mut());
     }
@@ -1929,7 +2022,7 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSp
         // One registration names the node's network stack: the lane
         // provider is the registered net-identity provider, in the same
         // occupancy (`net_attach` keys it by slot and generation too).
-        if let Some((reg, _, _)) = net_identity_provider() {
+        if let Some((reg, _)) = net_identity_provider() {
             if reg != slot {
                 return errno::EACCES;
             }

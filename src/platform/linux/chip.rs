@@ -5,3 +5,47 @@
 
 /// Default step deadline: 2 ms.
 pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
+
+/// Default budget of one interrupt-mode step, in this target's cycle
+/// counter (`hal::read_cycle_count`), which on a host counts microseconds:
+/// 2 ms.
+pub const DEFAULT_ISR_BUDGET_CYCLES: u32 = 2000;
+
+/// Size the kernel's tables from the boot plan (`size`), then the host's:
+/// sandboxes, host-process workloads, TTY sessions and the control-plane
+/// store.
+///
+/// A host-process sandbox is a workload with an owner of its own: the owner
+/// table's workload slots are the sandbox pool's derived part, so every
+/// workload owner the table seats has a sandbox slot. The reserve on top
+/// seats finished sandboxes held until destroyed; by default it takes only
+/// what the sandbox-index range leaves, so an owner table near its own
+/// domain leaves the sandboxes little headroom, and a workload that keeps
+/// finished sandboxes past it is refused its next spawn. TTY sessions have
+/// no structural source.
+///
+/// # Safety
+/// Graph preparation: no module runs and nothing holds a reference into
+/// any of the tables.
+pub unsafe fn plan_tables(
+    size: impl FnOnce() -> Result<(), crate::kernel::sys::resource_ledger::Refused>,
+) -> Result<(), crate::kernel::sys::resource_ledger::Refused> {
+    use crate::abi::contracts::resource as res;
+    use crate::kernel::sys::resource_ledger as ledger;
+    size()?;
+    let owners = ledger::ceiling(res::POOL_OWNERS);
+    ledger::set_derived(res::POOL_SANDBOXES, owners.saturating_sub(1));
+    let sandboxes = ledger::ceiling(res::POOL_SANDBOXES) as usize;
+    let ttys = ledger::ceiling(res::POOL_TTY_SESSIONS) as usize;
+    // SAFETY: the caller's contract, forwarded.
+    unsafe {
+        crate::platform::linux::host_backend::size_sandboxes(sandboxes)
+            .map_err(|e| ledger::refuse_table(res::POOL_SANDBOXES, e))?;
+        crate::platform::linux::workload::size_workloads(sandboxes)
+            .map_err(|e| ledger::refuse_table(res::POOL_SANDBOXES, e))?;
+        crate::platform::linux::host_backend::size_tty_sessions(ttys)
+            .map_err(|e| ledger::refuse_table(res::POOL_TTY_SESSIONS, e))?;
+        crate::platform::linux::store::size_from_plan();
+    }
+    Ok(())
+}

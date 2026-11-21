@@ -1,0 +1,16 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350", "linux"]
+grants = ["reconfigure"]
+
+# Live-rebuild driver: after `after_ticks` of its own steps it asks the
+# kernel to rebuild the graph from its boot configuration
+# (`reconfigure::TRIGGER_REBUILD`) and logs
+#
+#   [rdrv] rebuild tick=<steps> rc=<rc>
+#
+# The rebuild instantiates it afresh, so it asks again `after_ticks` later:
+# a graph that carries it rebuilds on that period for as long as it runs.
+timer_class = "tick_counted"
+
+[observability]
+exempt = "rebuild driver fixture; its '[rdrv]' line and the kernel's '[reconfigure]' lines are the observable"

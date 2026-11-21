@@ -75,7 +75,7 @@ const CANONICAL_RUNTIME_HTML_RAW: &str =
     include_str!("../../../src/platform/wasm/host/runtime.html");
 const CANONICAL_HOST_SHIMS_JS_RAW: &str =
     include_str!("../../../src/platform/wasm/host/host_shims.js");
-/// Emulation Worker (?worker=1): runs the kernel + step pump off the main thread.
+/// Emulation Worker (?worker=1): runs the kernel and its domain loop off the main thread.
 /// importScripts'es the canonical host_shims.js; reused across every scenario.
 const CANONICAL_WORKER_JS_RAW: &str =
     include_str!("../../../src/platform/wasm/host/fluxor-worker.js");
@@ -663,7 +663,7 @@ pub fn render_merged_component(
 /// working directory. The host graph written there belongs to that
 /// project, so its `@file_server` resolves against that project's
 /// `fluxor.toml` and `fluxor.lock`; scenarios do not trample each other's
-/// host graph, document root or graph image.
+/// host graph, document root or node image.
 pub fn scenario_work_dir(scenario: &Scenario, scenario_path: &Path) -> PathBuf {
     crate::project::root_for_config(scenario_path)
         .join("target/scenarios")
@@ -815,10 +815,10 @@ fn target_aliases(target: &str) -> Vec<String> {
     }
 }
 
-/// Standard module-search directories: the one tier list
-/// (`manifest::MODULE_TIERS`), so the scenario validator sees exactly
+/// Standard module-search directories: the one layer list
+/// (`manifest::MODULE_LAYERS`), so the scenario validator sees exactly
 /// the manifests the builder and config resolution see.
-const STANDARD_MANIFEST_DIRS: &[&str] = crate::manifest::MODULE_TIERS;
+const STANDARD_MANIFEST_DIRS: &[&str] = crate::manifest::MODULE_LAYERS;
 
 /// Slim toml schema for `validate_module_targets`. We re-parse the
 /// manifest here (rather than going through `tools::manifest::Manifest`)

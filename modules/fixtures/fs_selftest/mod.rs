@@ -359,7 +359,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
         PH_CAPS => {
             // The capability bitmap is not readable until the volume is
             // mounted, and a consumer that latches an unread answer runs its
-            // degraded tier forever. Ask until there is an answer.
+            // degraded surface forever. Ask until there is an answer.
             let mut caps = [0u8; 4];
             let rc =
                 (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4, core::ptr::null_mut(), 0);

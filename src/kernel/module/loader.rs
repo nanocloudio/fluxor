@@ -82,7 +82,7 @@ pub const EXPECTED_MANIFEST_VERSION: u8 = 1;
 /// Errors that can occur during module loading and instantiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderError {
-    /// No graph image was admitted
+    /// No node image was admitted
     NoLayout,
     /// No modules embedded in flash
     NoModules,
@@ -137,7 +137,7 @@ pub enum LoaderError {
     /// A gated module does something the gateway cannot mediate (provides a
     /// contract, owns an interrupt).
     GatedRefused(&'static str),
-    /// The platform could not build the gated module's protection domain.
+    /// The platform could not build the gated module's isolation region.
     ProtectionUnavailable,
     /// The module's signed manifest does not name this kernel's runtime:
     /// it shares the module ABI, not the contracts.
@@ -147,7 +147,7 @@ impl LoaderError {
     /// Log the error with appropriate level.
     pub fn log(&self, context: &str) {
         match self {
-            Self::NoLayout => log::warn!("[loader] {context}: no graph image"),
+            Self::NoLayout => log::warn!("[loader] {context}: no node image"),
             Self::NoModules => log::info!("[loader] {context}: no modules"),
             Self::InvalidTableMagic => log::warn!("[loader] {context}: bad table magic"),
             Self::InvalidModuleMagic => log::warn!("[loader] {context}: bad module magic"),
@@ -200,7 +200,7 @@ impl LoaderError {
                 log::error!("[loader] {context}: cannot be gated: {why}")
             }
             Self::ProtectionUnavailable => log::error!(
-                "[loader] {context}: gated, and its protection domain could not be built \
+                "[loader] {context}: gated, and its isolation region could not be built \
                  (no free slot, or its memory cannot be covered) — not run privileged instead"
             ),
         }
@@ -493,7 +493,7 @@ unsafe fn call_post_tick_flush(f: ModulePostTickFlushFn, state: *mut u8) -> i32 
 }
 /// Function pointer type for module_drain export
 pub type ModuleDrainFn = unsafe extern "C" fn(*mut u8) -> i32;
-/// Function pointer type for module_isr_entry export (Tier 2 ISR modules).
+/// Function pointer type for module_isr_entry export (`irq` ISR modules).
 /// Called from the IRQ handler. Returns i32 status (0 = ok, <0 = error).
 pub type ModuleIsrEntryFn = unsafe extern "C" fn(*mut u8) -> i32;
 /// Call module_drain export.
@@ -1842,10 +1842,21 @@ impl LoadedModule {
         // SAFETY: base is valid flash pointer, SIZE is constant offset
         unsafe { offset_ptr(self.base, fmod_header::SIZE) }
     }
-    /// Get module name as string slice
-    pub fn name_str(&self) -> &str {
-        let end = self.header.name.iter().position(|&b| b == 0).unwrap_or(32);
-        core::str::from_utf8(&self.header.name[..end]).unwrap_or("")
+    /// The module's type name as its image holds it. The image stays
+    /// mapped while any instance of the module runs, as its code does, so
+    /// the name lives as long as the instance that is handed it.
+    pub fn image_name(&self) -> &'static str {
+        // SAFETY: `base` is the module's validated image, whose header holds
+        // `NAME_LEN` name bytes at `NAME`; the image is never unmapped while
+        // an instance of the module exists.
+        let bytes: &'static [u8] = unsafe {
+            core::slice::from_raw_parts(
+                offset_ptr(self.base, fmod_header::NAME),
+                fmod_header::NAME_LEN,
+            )
+        };
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        core::str::from_utf8(&bytes[..end]).unwrap_or("")
     }
     /// Get export table pointer (used internally and by scheduler for export resolution)
     pub fn export_table_ptr(&self) -> *const u8 {
@@ -2150,13 +2161,13 @@ pub struct ModuleLoader {
     /// (matches the bare-metal `init` path); `init_from_blob` sets
     /// it to `Embedded`. Read-only after init.
     source: LoadSource,
-    /// How far past `table_base` the mapped bundle is known to extend: the
-    /// module region the graph image header states, or the blob's length.
+    /// How far past `table_base` the mapped node image is known to extend: the
+    /// module region the node image header states, or the blob's length.
     /// Bounds the program section as it bounds the table.
     blob_bound: usize,
 }
 
-/// One program the bundle carries for a module instance
+/// One program the node image carries for a module instance
 /// (`kernel_abi::program`).
 #[derive(Debug, Clone, Copy)]
 pub struct ProgramRef {
@@ -2180,7 +2191,7 @@ impl ModuleLoader {
             table_base: core::ptr::null(),
             header: None,
             // Default to Flash; `init_from_blob` overrides to Embedded.
-            // Platforms whose primary load path is the graph image in
+            // Platforms whose primary load path is the node image in
             // memory (RP, Pi 5) never re-set this; hosted targets calling
             // `init_from_blob` get the right value automatically.
             source: LoadSource::Flash,
@@ -2324,12 +2335,12 @@ impl ModuleLoader {
     pub fn source(&self) -> LoadSource {
         self.source
     }
-    /// Initialize the loader from the admitted graph image's module table.
+    /// Initialize the loader from the admitted node image's module table.
     pub fn init(&mut self) -> Result<(), LoaderError> {
         let layout = read_layout().ok_or(LoaderError::NoLayout)?;
         self.table_base = layout.modules_addr as *const u8;
         // SAFETY: the admitted image's module region is mapped and at least
-        // the table's 16-byte header long (`wire::graph_image::MIN_MODULES_SIZE`).
+        // the table's 16-byte header long (`wire::node_image::MIN_MODULES_SIZE`).
         let header = unsafe { read_table_header(self.table_base) };
         if header.magic != MODULE_TABLE_MAGIC {
             log::warn!("[loader] bad table magic=0x{:08x}", header.magic);
@@ -2472,7 +2483,7 @@ impl ModuleLoader {
     }
 
     /// The single bounded table validator shared by every load source
-    /// (embedded blob, graph image). Given a mapped
+    /// (embedded blob, node image). Given a mapped
     /// `blob` of at most `blob_len` bytes and its already-magic-checked
     /// `header`, it proves the table version, the declared `total_size`,
     /// and every entry's offset/size/footprint are in bounds BEFORE any
@@ -2639,6 +2650,99 @@ pub const OWN_RUNTIME_BIT: u16 = 0;
 /// signature establishes.
 pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, LoaderError> {
     let mut signing = Signing::Unverified;
+    check_header(module, name)?;
+    // Verify integrity hash from manifest section. Every short- or
+    // bad-magic manifest is refused before any byte is read.
+    let manifest_size = module.header.manifest_size as usize;
+    if manifest_size < 48 {
+        // Manifest is absent or too small to carry an ABI-surface
+        // attestation (the smallest attested manifest is its head, the stack
+        // and arena blocks and the 32-byte attestation). Every module must
+        // attest, signed or not.
+        let e = LoaderError::Unattested;
+        e.log(name);
+        return Err(e);
+    }
+    {
+        let code_size = module.header.code_size as usize;
+        let data_size = module.header.data_size as usize;
+        let export_size = module.header.export_count as usize * 8;
+        let schema_size = module.header.schema_size as usize;
+        let manifest_offset = fmod_header::SIZE + code_size + data_size + export_size + schema_size;
+        // SAFETY: `manifest_offset + manifest_size` is the slot footprint
+        // validated at table load; manifest lies within the .fmod mapping.
+        let manifest_ptr = unsafe { offset_ptr(module.base, manifest_offset) };
+        // SAFETY: `manifest_ptr` covers `manifest_size` bytes inside the
+        // mapping (per the entry-size check at load time).
+        let manifest_data = unsafe { core::slice::from_raw_parts(manifest_ptr, manifest_size) };
+        // The head is in bounds (`manifest_size >= 48` was checked above);
+        // every block offset below comes from this one layout.
+        let Some(manifest_layout) = ManifestLayout::read(manifest_data) else {
+            let e = LoaderError::Unattested;
+            e.log(name);
+            return Err(e);
+        };
+        // A manifest with another magic or version carries nothing this
+        // loader can read, its attestation included.
+        {
+            let magic = u32::from_le_bytes([
+                manifest_data[0],
+                manifest_data[1],
+                manifest_data[2],
+                manifest_data[3],
+            ]);
+            if magic != MANIFEST_MAGIC {
+                let e = LoaderError::Unattested;
+                e.log(name);
+                return Err(e);
+            }
+            {
+                // Manifest-format envelope version. The offsets below are
+                // those of the one layout this loader reads.
+                let manifest_version = manifest_data[4];
+                if manifest_version != EXPECTED_MANIFEST_VERSION {
+                    // A layout this loader cannot read has no attestation
+                    // it can find.
+                    let e = LoaderError::Unattested;
+                    e.log(name);
+                    return Err(e);
+                }
+                let flags = manifest_data[crate::abi::wire::fmod::MANIFEST_FLAGS_AT];
+                let has_integrity = (flags & 0x01) != 0;
+                // Signature presence is signalled by flag bit 1, not by a
+                // manifest-version split — mirroring the tool serializer
+                // (`tools/src/manifest.rs::to_bytes`, which keeps signed and
+                // unsigned manifests both at MANIFEST_VERSION = 1).
+                let has_signature = (flags & 0x02) != 0;
+                if has_integrity {
+                    check_integrity(module, manifest_data, manifest_layout.hash, name)?;
+                }
+                // Signature verification. The feature flag gates enforcement;
+                // when off, we still verify if a signature is present (to
+                // surface mismatches in test builds) but do not reject on
+                // missing signatures.
+                if has_signature {
+                    signing = check_signature(
+                        module,
+                        manifest_data,
+                        manifest_offset,
+                        manifest_layout.hash,
+                        name,
+                    )?;
+                }
+                check_attestation(manifest_data, &manifest_layout, flags, name)?;
+            }
+        }
+    }
+    Ok(signing)
+}
+
+/// The module's header against this kernel: its base, ABI and header
+/// versions, the runtimes its manifest names, its code size and bounds. Its
+/// own frame, so its refusals' locals are off the stack while the manifest
+/// is hashed.
+#[inline(never)]
+fn check_header(module: &LoadedModule, name: &str) -> Result<(), LoaderError> {
     // Check base is in valid memory range
     if !hal::validate_module_base(module.base as usize) {
         log::error!(
@@ -2708,219 +2812,186 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
             return Err(LoaderError::CodeOutOfBounds);
         }
     }
-    // Verify integrity hash from manifest section. Every short- or
-    // bad-magic manifest is refused before any byte is read.
-    let manifest_size = module.header.manifest_size as usize;
-    if manifest_size < 48 {
-        // Manifest is absent or too small to carry an ABI-surface
-        // attestation (the smallest attested manifest is its head, the stack
-        // and arena blocks and the 32-byte attestation). Every module must
-        // attest, signed or not.
+    Ok(())
+}
+
+/// The manifest's ABI-surface attestation, at its canonical offset, against
+/// this kernel's own surface digest. Its own frame, as [`check_header`].
+#[inline(never)]
+fn check_attestation(
+    manifest_data: &[u8],
+    manifest_layout: &ManifestLayout,
+    flags: u8,
+    name: &str,
+) -> Result<(), LoaderError> {
+    let manifest_size = manifest_data.len();
+    // ABI-surface attestation, for EVERY module, signed or not:
+    // a module built against a different surface than this
+    // kernel's carries another substrate's opcode, errno and
+    // flag numbers, and signing it does not make them right.
+    // The attestation sits at its CANONICAL offset — after the
+    // integrity hash and the signature block, each where
+    // present — and the manifest ends exactly there. Reading
+    // "the last 32 bytes" instead would let an inflated manifest
+    // carry a second copy at the end while parsers read a
+    // substituted value at the canonical offset. Compared to the
+    // kernel's OWN surface digest, from the same canonical stream
+    // the tools hash.
+    if flags & 0x10 == 0 {
         let e = LoaderError::Unattested;
         e.log(name);
         return Err(e);
     }
-    {
-        let code_size = module.header.code_size as usize;
-        let data_size = module.header.data_size as usize;
-        let export_size = module.header.export_count as usize * 8;
-        let schema_size = module.header.schema_size as usize;
-        let manifest_offset = fmod_header::SIZE + code_size + data_size + export_size + schema_size;
-        // SAFETY: `manifest_offset + manifest_size` is the slot footprint
-        // validated at table load; manifest lies within the .fmod mapping.
-        let manifest_ptr = unsafe { offset_ptr(module.base, manifest_offset) };
-        // SAFETY: `manifest_ptr` covers `manifest_size` bytes inside the
-        // mapping (per the entry-size check at load time).
-        let manifest_data = unsafe { core::slice::from_raw_parts(manifest_ptr, manifest_size) };
-        // The head is in bounds (`manifest_size >= 48` was checked above);
-        // every block offset below comes from this one layout.
-        let Some(manifest_layout) = ManifestLayout::read(manifest_data) else {
-            let e = LoaderError::Unattested;
-            e.log(name);
-            return Err(e);
-        };
-        // A manifest with another magic or version carries nothing this
-        // loader can read, its attestation included.
-        {
-            let magic = u32::from_le_bytes([
-                manifest_data[0],
-                manifest_data[1],
-                manifest_data[2],
-                manifest_data[3],
-            ]);
-            if magic != MANIFEST_MAGIC {
-                let e = LoaderError::Unattested;
-                e.log(name);
-                return Err(e);
-            }
-            {
-                // Manifest-format envelope version. The offsets below are
-                // those of the one layout this loader reads.
-                let manifest_version = manifest_data[4];
-                if manifest_version != EXPECTED_MANIFEST_VERSION {
-                    // A layout this loader cannot read has no attestation
-                    // it can find.
-                    let e = LoaderError::Unattested;
-                    e.log(name);
-                    return Err(e);
-                }
-                let flags = manifest_data[crate::abi::wire::fmod::MANIFEST_FLAGS_AT];
-                let has_integrity = (flags & 0x01) != 0;
-                // Signature presence is signalled by flag bit 1, not by a
-                // manifest-version split — mirroring the tool serializer
-                // (`tools/src/manifest.rs::to_bytes`, which keeps signed and
-                // unsigned manifests both at MANIFEST_VERSION = 1).
-                let has_signature = (flags & 0x02) != 0;
-                if has_integrity {
-                    // Stored hash sits after ports/resources/dependencies; its
-                    // offset depends on those counts. If signature follows,
-                    // the hash is still first (signature is appended after).
-                    let hash_offset = manifest_layout.hash;
-                    if hash_offset + 32 > manifest_size {
-                        log::error!("[loader] {name}: manifest hash out of range");
-                        return Err(LoaderError::IntegrityMismatch);
-                    }
-                    let stored_hash = &manifest_data[hash_offset..hash_offset + 32];
-                    use crate::kernel::security::crypto::sha256::Sha256;
-                    let mut hasher = Sha256::new();
-                    // The stored integrity hash covers code||data — a corruption
-                    // check (recomputable by anyone, so no authenticity on its
-                    // own). AUTHENTICITY over the full security envelope (header,
-                    // export table, schema, manifest capability metadata) is the
-                    // SIGNATURE's job — see the `signing_envelope` hash in
-                    // the signature-verification block below, which the Ed25519
-                    // signature is taken over. Keeping integrity as code||data
-                    // keeps unsigned/dev modules loadable (pack stamps the same).
-                    let code_ptr = module.code_base();
-                    // SAFETY: code section is `code_size` bytes from code_base(),
-                    // inside the validated entry footprint.
-                    let code_data = unsafe { core::slice::from_raw_parts(code_ptr, code_size) };
-                    hasher.update(code_data);
-                    if data_size > 0 {
-                        // SAFETY: data section follows code; inside footprint.
-                        let data_ptr = unsafe { offset_ptr(code_ptr, code_size) };
-                        // SAFETY: `data_size` bytes from data_ptr, inside footprint.
-                        let data_section =
-                            unsafe { core::slice::from_raw_parts(data_ptr, data_size) };
-                        hasher.update(data_section);
-                    }
-                    let computed = hasher.finalize();
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&computed);
-                    if !hal::verify_integrity(&h, stored_hash) {
-                        log::error!("[loader] {name}: integrity mismatch");
-                        return Err(LoaderError::IntegrityMismatch);
-                    }
-                }
-                // Signature verification. The feature flag gates enforcement;
-                // when off, we still verify if a signature is present (to
-                // surface mismatches in test builds) but do not reject on
-                // missing signatures.
-                if has_signature {
-                    let hash_offset = manifest_layout.hash;
-                    let sig_offset = hash_offset + 32;
-                    if sig_offset + 96 > manifest_size {
-                        return Err(LoaderError::SignatureInvalid);
-                    }
-                    let mut sig = [0u8; 64];
-                    sig.copy_from_slice(&manifest_data[sig_offset..sig_offset + 64]);
-                    let mut _signer_fp = [0u8; 32];
-                    _signer_fp.copy_from_slice(&manifest_data[sig_offset + 64..sig_offset + 96]);
-                    // The signature is taken over the signing envelope
-                    // (`abi::wire::fmod::signing_envelope`), the same bytes
-                    // the signer hashes: header, code, data, exports, schema,
-                    // the manifest before its hash, and the attestation.
-                    let hash = {
-                        use crate::kernel::security::crypto::sha256::Sha256;
-                        let mut eh = Sha256::new();
-                        // SAFETY: [module.base, +manifest_offset) is the
-                        // header+code+data+exports+schema region, inside the
-                        // validated entry footprint; manifest_offset >=
-                        // fmod_header::SIZE.
-                        let pre =
-                            unsafe { core::slice::from_raw_parts(module.base, manifest_offset) };
-                        if signing_envelope(pre, manifest_data, |b| eh.update(b)).is_err() {
-                            log::error!(
-                                "[loader] {name}: signed manifest is truncated or non-canonical"
-                            );
-                            return Err(LoaderError::SignatureInvalid);
-                        }
-                        let d = eh.finalize();
-                        let mut h = [0u8; 32];
-                        h.copy_from_slice(&d);
-                        h
-                    };
-                    // Without a root nothing is verified; with one, a
-                    // signature is either the root's or refused.
-                    if let Some(pubkey) = crate::kernel::security::root::signing_root() {
-                        if !crate::kernel::security::crypto::ed25519::ed25519_verify(
-                            &pubkey, &hash, &sig,
-                        ) {
-                            log::error!("[loader] {name}: signature invalid");
-                            return Err(LoaderError::SignatureInvalid);
-                        }
-                        signing = Signing::RootVerified;
-                    }
-                }
-                // ABI-surface attestation, for EVERY module, signed or not:
-                // a module built against a different surface than this
-                // kernel's carries another substrate's opcode, errno and
-                // flag numbers, and signing it does not make them right.
-                // The attestation sits at its CANONICAL offset — after the
-                // integrity hash and the signature block, each where
-                // present — and the manifest ends exactly there. Reading
-                // "the last 32 bytes" instead would let an inflated manifest
-                // carry a second copy at the end while parsers read a
-                // substituted value at the canonical offset. Compared to the
-                // kernel's OWN surface digest, from the same canonical stream
-                // the tools hash.
-                if flags & 0x10 == 0 {
-                    let e = LoaderError::Unattested;
-                    e.log(name);
-                    return Err(e);
-                }
-                let attn_offset = manifest_layout.attestation;
-                // The conditional-grant block follows the attestation, so
-                // the canonical size includes it. Its length is walked from
-                // its own count, which keeps this an EXACT check: anything
-                // appended past the block's end leaves the manifest the
-                // wrong size and is refused here, as a second attestation
-                // copy would be.
-                let cond_len = if flags & crate::abi::wire::fmod::FLAG_COND_GRANTS != 0 {
-                    let block = manifest_data.get(manifest_layout.cond_grants..);
-                    match block.and_then(crate::abi::wire::fmod::cond_grants_block_len) {
-                        Some(n) => n,
-                        None => {
-                            log::error!(
-                                "[loader] {name}: conditional-grant flag with no whole block"
-                            );
-                            return Err(LoaderError::Unattested);
-                        }
-                    }
-                } else {
-                    0
-                };
-                if manifest_size != attn_offset + 32 + cond_len {
-                    log::error!(
-                        "[loader] {name}: attestation flag with non-canonical manifest size"
-                    );
-                    return Err(LoaderError::Unattested);
-                }
-                let attn = &manifest_data[attn_offset..attn_offset + 32];
-                use crate::kernel::security::crypto::sha256::Sha256;
-                let mut ks = Sha256::new();
-                crate::abi::abi_surface::write_surface(&mut |b| ks.update(b));
-                let kd = ks.finalize();
-                if attn != kd.as_slice() {
-                    let e = LoaderError::SurfaceMismatch;
-                    e.log(name);
-                    return Err(e);
-                }
+    let attn_offset = manifest_layout.attestation;
+    // The conditional-grant block follows the attestation, so
+    // the canonical size includes it. Its length is walked from
+    // its own count, which keeps this an EXACT check: anything
+    // appended past the block's end leaves the manifest the
+    // wrong size and is refused here, as a second attestation
+    // copy would be.
+    let cond_len = if flags & crate::abi::wire::fmod::FLAG_COND_GRANTS != 0 {
+        let block = manifest_data.get(manifest_layout.cond_grants..);
+        match block.and_then(crate::abi::wire::fmod::cond_grants_block_len) {
+            Some(n) => n,
+            None => {
+                log::error!("[loader] {name}: conditional-grant flag with no whole block");
+                return Err(LoaderError::Unattested);
             }
         }
+    } else {
+        0
+    };
+    if manifest_size != attn_offset + 32 + cond_len {
+        log::error!("[loader] {name}: attestation flag with non-canonical manifest size");
+        return Err(LoaderError::Unattested);
+    }
+    let attn = &manifest_data[attn_offset..attn_offset + 32];
+    let kd = surface_digest();
+    if attn != kd.as_slice() {
+        let e = LoaderError::SurfaceMismatch;
+        e.log(name);
+        return Err(e);
+    }
+    Ok(())
+}
+/// The integrity hash a manifest stores, against code‖data recomputed: a
+/// corruption check. Its own frame, so the hasher is on the stack only
+/// while it runs.
+#[inline(never)]
+fn check_integrity(
+    module: &LoadedModule,
+    manifest_data: &[u8],
+    hash_offset: usize,
+    name: &str,
+) -> Result<(), LoaderError> {
+    let manifest_size = manifest_data.len();
+    let code_size = module.header.code_size as usize;
+    let data_size = module.header.data_size as usize;
+    // Stored hash sits after ports/resources/dependencies; its
+    // offset depends on those counts. If signature follows,
+    // the hash is still first (signature is appended after).
+    if hash_offset + 32 > manifest_size {
+        log::error!("[loader] {name}: manifest hash out of range");
+        return Err(LoaderError::IntegrityMismatch);
+    }
+    let stored_hash = &manifest_data[hash_offset..hash_offset + 32];
+    use crate::kernel::security::crypto::sha256::Sha256;
+    let mut hasher = Sha256::new();
+    // The stored integrity hash covers code||data — a corruption
+    // check (recomputable by anyone, so no authenticity on its
+    // own). AUTHENTICITY over the full security envelope (header,
+    // export table, schema, manifest capability metadata) is the
+    // SIGNATURE's job — see the `signing_envelope` hash in
+    // the signature-verification block below, which the Ed25519
+    // signature is taken over. Keeping integrity as code||data
+    // keeps unsigned/dev modules loadable (pack stamps the same).
+    let code_ptr = module.code_base();
+    // SAFETY: code section is `code_size` bytes from code_base(),
+    // inside the validated entry footprint.
+    let code_data = unsafe { core::slice::from_raw_parts(code_ptr, code_size) };
+    hasher.update(code_data);
+    if data_size > 0 {
+        // SAFETY: data section follows code; inside footprint.
+        let data_ptr = unsafe { offset_ptr(code_ptr, code_size) };
+        // SAFETY: `data_size` bytes from data_ptr, inside footprint.
+        let data_section = unsafe { core::slice::from_raw_parts(data_ptr, data_size) };
+        hasher.update(data_section);
+    }
+    let computed = hasher.finalize();
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&computed);
+    if !hal::verify_integrity(&h, stored_hash) {
+        log::error!("[loader] {name}: integrity mismatch");
+        return Err(LoaderError::IntegrityMismatch);
+    }
+    Ok(())
+}
+
+/// A signed manifest's signature over the signing envelope, against the
+/// image's signing root: `RootVerified` when it verifies, `Unverified`
+/// with no root to verify against. Its own frame, as [`check_integrity`].
+#[inline(never)]
+fn check_signature(
+    module: &LoadedModule,
+    manifest_data: &[u8],
+    manifest_offset: usize,
+    hash_offset: usize,
+    name: &str,
+) -> Result<Signing, LoaderError> {
+    let manifest_size = manifest_data.len();
+    let mut signing = Signing::Unverified;
+    let sig_offset = hash_offset + 32;
+    if sig_offset + 96 > manifest_size {
+        return Err(LoaderError::SignatureInvalid);
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&manifest_data[sig_offset..sig_offset + 64]);
+    let mut _signer_fp = [0u8; 32];
+    _signer_fp.copy_from_slice(&manifest_data[sig_offset + 64..sig_offset + 96]);
+    // The signature is taken over the signing envelope
+    // (`abi::wire::fmod::signing_envelope`), the same bytes
+    // the signer hashes: header, code, data, exports, schema,
+    // the manifest before its hash, and the attestation.
+    let hash = {
+        use crate::kernel::security::crypto::sha256::Sha256;
+        let mut eh = Sha256::new();
+        // SAFETY: [module.base, +manifest_offset) is the
+        // header+code+data+exports+schema region, inside the
+        // validated entry footprint; manifest_offset >=
+        // fmod_header::SIZE.
+        let pre = unsafe { core::slice::from_raw_parts(module.base, manifest_offset) };
+        if signing_envelope(pre, manifest_data, |b| eh.update(b)).is_err() {
+            log::error!("[loader] {name}: signed manifest is truncated or non-canonical");
+            return Err(LoaderError::SignatureInvalid);
+        }
+        let d = eh.finalize();
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&d);
+        h
+    };
+    // Without a root nothing is verified; with one, a
+    // signature is either the root's or refused.
+    if let Some(pubkey) = crate::kernel::security::root::signing_root() {
+        if !crate::kernel::security::crypto::ed25519::ed25519_verify(&pubkey, &hash, &sig) {
+            log::error!("[loader] {name}: signature invalid");
+            return Err(LoaderError::SignatureInvalid);
+        }
+        signing = Signing::RootVerified;
     }
     Ok(signing)
 }
+
+/// This kernel's ABI-surface digest, as a module's attestation carries it.
+#[inline(never)]
+fn surface_digest() -> [u8; 32] {
+    use crate::kernel::security::crypto::sha256::Sha256;
+    let mut ks = Sha256::new();
+    crate::abi::abi_surface::write_surface(&mut |b| ks.update(b));
+    let mut d = [0u8; 32];
+    d.copy_from_slice(&ks.finalize());
+    d
+}
+
 /// Check if function address is within module's code section.
 fn validate_fn_in_code(
     addr: usize,
@@ -2946,10 +3017,10 @@ pub struct ModuleExports {
     pub pipeline_refill_fn: Option<ModulePipelineRefillFn>,
     /// Optional output-only hook called once after graph execution.
     pub post_tick_flush_fn: Option<ModulePostTickFlushFn>,
-    /// Optional `module_isr_entry` export — present only for Tier 2
+    /// Optional `module_isr_entry` export — present only for `irq`
     /// (IRQ-owned) modules. `None` for ordinary cooperative modules.
     /// The ISR dispatcher calls this from IRQ context instead of
-    /// `step_fn`; see `scheduler::register_isr_tier_modules_from_graph`.
+    /// `step_fn`; see `scheduler::register_isr_module`.
     pub isr_entry_fn: Option<ModuleIsrEntryFn>,
 }
 /// Lookup and validate all required exports from a module (safe - no FFI calls)
@@ -2985,7 +3056,7 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
     // Optional ISR entry — present only when the module exported
     // `module_isr_entry` (the packer sets the isr_module header bit and
     // emits the export). Validate it the same way as the mandatory
-    // exports so a Tier 2 module dispatched from IRQ context never jumps
+    // exports so an `irq` module dispatched from IRQ context never jumps
     // to an address outside the module's code region.
     let isr_entry_fn = match module.get_export_addr(export_hashes::MODULE_ISR_ENTRY) {
         Ok(addr) => {
@@ -3047,7 +3118,7 @@ fn invoke_init_protected(module: &LoadedModule, module_idx: usize) -> Result<(),
     let table = crate::kernel::sys::hal::protection_gateway_table() as usize;
     let args = [table, 0, 0, 0, 0, 0, 0, 0];
     // SAFETY: init_addr validated inside the module's code; the module's
-    // protection domain was built by `protection_register_module`.
+    // isolation region was built by `protection_register_module`.
     let rc = unsafe {
         crate::kernel::sys::hal::protected_call(
             module_idx,
@@ -3166,9 +3237,9 @@ pub struct DynamicModule {
     /// on BCM2712, unprivileged on RP); a privileged one is called
     /// directly.
     level: fluxor_contracts::isolation::Level,
-    /// Optional `module_isr_entry` export (Tier 2 IRQ-owned modules).
-    /// `None` for cooperative modules. The scheduler's Tier 2 admission
-    /// path forwards this to `isr_tier::register_tier2_module` so the
+    /// Optional `module_isr_entry` export (`irq` modules).
+    /// `None` for cooperative modules. The scheduler's `irq` admission
+    /// path forwards this to `irq::register_module` so the
     /// hardware IRQ dispatches into the module's ISR entry rather than
     /// its cooperative `module_step`.
     isr_entry_fn: Option<ModuleIsrEntryFn>,
@@ -3197,8 +3268,6 @@ pub struct DynamicModulePending {
     pipeline_refill_fn: Option<ModulePipelineRefillFn>,
     post_tick_flush_fn: Option<ModulePostTickFlushFn>,
     new_fn: ModuleNewFn,
-    state_ptr: *mut u8,
-    state_size: usize,
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
@@ -3210,11 +3279,14 @@ pub struct DynamicModulePending {
     auto_register: Option<ProviderAutoRegister>,
     module_idx: ModuleId,
     /// Carried through from `ModuleExports` so the completed
-    /// `DynamicModule` exposes the Tier 2 ISR entry. See
+    /// `DynamicModule` exposes the `irq` ISR entry. See
     /// `DynamicModule::isr_entry_fn`.
     isr_entry_fn: Option<ModuleIsrEntryFn>,
     /// Declared worst-case stack depth in bytes, from the manifest.
     stack_bytes: u32,
+    /// What the construction holds (its state among it) until the module
+    /// is in; released with this handle unless the module completes.
+    construction: Construction,
 }
 impl DynamicModulePending {
     /// Get step function pointer (for force-completing a pending module).
@@ -3223,41 +3295,7 @@ impl DynamicModulePending {
     }
     /// Get state pointer (for force-completing a pending module).
     pub fn state_ptr(&self) -> *mut u8 {
-        self.state_ptr
-    }
-    /// Create from pre-validated parts (for debug stepping through instantiation).
-    ///
-    /// # Safety
-    /// `args.params` must remain valid for the lifetime of the returned
-    /// pending state; `args.state_ptr` must point to `args.state_size`
-    /// writable bytes.
-    pub fn new(
-        step_fn: ModuleStepFn,
-        new_fn: ModuleNewFn,
-        syscalls: &SyscallTable,
-        args: &ModuleInitArgs,
-        name: &'static str,
-    ) -> Self {
-        Self {
-            step_fn,
-            pipeline_refill_fn: None,
-            post_tick_flush_fn: None,
-            new_fn,
-            state_ptr: args.state_ptr,
-            state_size: args.state_size,
-            syscalls: syscalls as *const _,
-            in_chan: args.in_chan,
-            out_chan: args.out_chan,
-            ctrl_chan: args.ctrl_chan,
-            params_ptr: args.params,
-            params_len: args.params_len,
-            name,
-            drain_fn: None,
-            auto_register: None,
-            module_idx: 0,
-            isr_entry_fn: None,
-            stack_bytes: 0,
-        }
+        self.construction.state
     }
     /// Try to complete initialization by calling module_new again.
     ///
@@ -3278,8 +3316,8 @@ impl DynamicModulePending {
             ctrl_chan: self.ctrl_chan,
             params: self.params_ptr,
             params_len: self.params_len,
-            state_ptr: self.state_ptr,
-            state_size: self.state_size,
+            state_ptr: self.construction.state,
+            state_size: self.construction.state_size as usize,
         };
         let idx = self.module_idx as usize;
         let status = if crate::kernel::module::gateway::is_registered(idx) {
@@ -3297,15 +3335,17 @@ impl DynamicModulePending {
         match status? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {}", self.name);
+                self.construction.commit();
+                let state_ptr = self.construction.state;
                 if let Some(ar) = self.auto_register.as_ref() {
-                    ar.register(self.module_idx, self.state_ptr, self.name);
+                    ar.register(self.module_idx, state_ptr, self.name);
                 }
                 Ok(Some(DynamicModule {
                     step_fn: self.step_fn,
                     pipeline_refill_fn: self.pipeline_refill_fn,
                     post_tick_flush_fn: self.post_tick_flush_fn,
-                    state_ptr: self.state_ptr,
-                    state_size: self.state_size as u32,
+                    state_ptr,
+                    state_size: self.construction.state_size,
                     drain_fn: self.drain_fn,
                     level: crate::kernel::exec::scheduler::module_level(self.module_idx as usize),
                     isr_entry_fn: self.isr_entry_fn,
@@ -3316,16 +3356,16 @@ impl DynamicModulePending {
             NewStatus::Pending => Ok(None),
         }
     }
-    /// Release this pending module's state buffer back to the pool.
-    /// Consumes the pending state. Use when dropping without completing.
+    /// Give up on this module: everything its construction holds goes
+    /// back (its memory, its heap, its isolation region). Dropping the
+    /// handle does the same; this names the intent.
     ///
     /// # Safety
-    /// The state buffer must not be referenced anywhere after this call
-    /// — `module_new` must not have stashed `state_ptr` into a global
-    /// (e.g. via a successful provider registration). Aborting only
-    /// makes sense for a `Pending` that has not transitioned to Ready.
+    /// Nothing references the module's memory any more — `module_new` must
+    /// not have stashed `state_ptr` into a global (e.g. via a successful
+    /// provider registration). Only a `Pending` that has not completed.
     pub unsafe fn abort(self) {
-        free_state_range(self.state_ptr, self.state_size);
+        drop(self);
     }
 }
 /// Result of starting module creation
@@ -3342,19 +3382,19 @@ impl DynamicModule {
     }
 
     /// Get the module's step function pointer. Used by the
-    /// scheduler's Tier 1b admission path to forward the function
-    /// pointer to `isr_tier::register_tier1b_module` so the polled
+    /// scheduler's `timer` admission path to forward the function
+    /// pointer to `timer::register_module` so the polled
     /// timer ISR dispatches into it directly, bypassing the
-    /// cooperative `step_modules` loop.
+    /// cooperative pass.
     pub fn step_fn(&self) -> ModuleStepFn {
         self.step_fn
     }
     /// Get the module's `module_isr_entry` export, if it declared one.
-    /// `Some` only for Tier 2 (IRQ-owned) modules; the scheduler's Tier 2
-    /// admission path forwards it to `isr_tier::register_tier2_module` so
+    /// `Some` only for `irq` modules; the scheduler's `irq`
+    /// admission path forwards it to `irq::register_module` so
     /// the hardware IRQ dispatches into the ISR entry rather than the
     /// cooperative `module_step`. `None` modules cannot be admitted to a
-    /// Tier 2 domain (admission fails, defending against a graph that
+    /// `irq` domain (admission fails, defending against a graph that
     /// slipped past the build-time validator).
     pub fn isr_entry_fn(&self) -> Option<ModuleIsrEntryFn> {
         self.isr_entry_fn
@@ -3374,8 +3414,8 @@ impl DynamicModule {
             stack_bytes: 0,
         }
     }
-    /// Like `from_parts`, but injects a Tier 2 `module_isr_entry`
-    /// pointer. Used by the scheduler's Tier 2 admission tests to stand
+    /// Like `from_parts`, but injects an `irq` `module_isr_entry`
+    /// pointer. Used by the scheduler's `irq` admission tests to stand
     /// up a `DynamicModule` carrying an ISR entry without running the
     /// full PIC instantiation path. Production code populates
     /// `isr_entry_fn` exclusively from `lookup_exports`.
@@ -3452,13 +3492,13 @@ impl DynamicModule {
     /// This is the synchronous version - it will fail if the module
     /// Start creating a module, supporting async initialization.
     ///
-    /// Sequence:
-    /// 1. Validate module header
-    /// 2. Lookup and validate all exports
-    /// 3. Read the required state size from the manifest
-    /// 4. Allocate state from kernel pool
-    /// 5. Call module_init() with syscall table
-    /// 6. Call module_new() - may return pending
+    /// The module was validated when its graph was admitted
+    /// (`validate_module`); `signing` is what that established. Sequence:
+    /// 1. Lookup and validate all exports
+    /// 2. Read the required state size from the manifest
+    /// 3. Allocate state from kernel pool
+    /// 4. Call module_init() with syscall table
+    /// 5. Call module_new() - may return pending
     ///
     /// If module_new returns pending (>0), returns `StartNewResult::Pending`.
     /// Caller should yield to executor and call `try_complete()` on the
@@ -3470,14 +3510,13 @@ impl DynamicModule {
     #[inline(never)]
     pub unsafe fn start_new(
         module: &LoadedModule,
+        signing: Signing,
         syscalls: &SyscallTable,
         channels: ChannelHandles,
         params: ParamSlice,
         name: &'static str,
     ) -> Result<StartNewResult, LoaderError> {
-        // 1. Validate module header (safe)
-        let signing = validate_module(module, name)?;
-        // 2. Lookup and validate exports (safe)
+        // 1. Lookup and validate exports (safe)
         module.log_header_info();
         let exports = lookup_exports(module, name)?;
         let params_slice = if params.ptr.is_null() || params.len == 0 {
@@ -3529,7 +3568,7 @@ impl DynamicModule {
         // tag 0xEF) when it gives one, else the manifest's.
         let arena_size = crate::kernel::exec::scheduler::params_heap_arena_bytes(params_slice)
             .unwrap_or_else(|| module.manifest_arena_bytes());
-        // 3. Required state size: the manifest's figure. No module code runs
+        // 2. Required state size: the manifest's figure. No module code runs
         // to learn a fact; a module whose manifest states none is refused,
         // gated or not.
         let Some(required_size) = module.manifest_state_bytes() else {
@@ -3553,7 +3592,7 @@ impl DynamicModule {
                 });
             }
         }
-        // 4. Allocate state. `state_map_size` is the footprint the MMU maps
+        // 3. Allocate state. `state_map_size` is the footprint the MMU maps
         // (page-padded for isolated modules so it owns whole pages); the module
         // and its canary still use `required_size`.
         // On an MPU target a gated module's stack, state and heap are one
@@ -3607,8 +3646,6 @@ impl DynamicModule {
         #[cfg(feature = "kernel-mpu")]
         let private_region = mpu_private.map(|(_, base, size, _)| (base as *mut u8, size));
         #[cfg(not(feature = "kernel-mpu"))]
-        let private_region: Option<(*mut u8, usize)> = None;
-        #[cfg(not(feature = "kernel-mpu"))]
         let (state_ptr, state_map_size) = if iso_requested {
             #[cfg(feature = "kernel-vm")]
             {
@@ -3624,6 +3661,22 @@ impl DynamicModule {
         // Set instantiation state so syscalls made from module_new can
         // locate the module by index → state pointer.
         let inst_idx = crate::kernel::exec::scheduler::current_module_index();
+        // Everything allocated from here on is the construction's, released
+        // on any refusal below and handed to the module once it is in.
+        #[cfg(feature = "kernel-mpu")]
+        let (private, private_size) = private_region.unwrap_or((core::ptr::null_mut(), 0));
+        #[cfg(not(feature = "kernel-mpu"))]
+        let (private, private_size) = (core::ptr::null_mut::<u8>(), 0usize);
+        let mut built = Construction {
+            state: state_ptr,
+            private,
+            private_size: private_size as u32,
+            state_size: required_size as u32,
+            idx: inst_idx as ModuleId,
+            gateway: false,
+            protection: false,
+            held: true,
+        };
         crate::kernel::exec::scheduler::set_instantiation_state(inst_idx, state_ptr);
         // 4b. The heap. Failing to carve a committed heap is a hard load
         // error, logged with the arena's occupancy: a module that asked for
@@ -3720,7 +3773,6 @@ impl DynamicModule {
                             arena_usage().0,
                             arena_usage().1,
                         );
-                        free_state_range(state_ptr, required_size);
                         return Err(e);
                     }
                 }
@@ -3741,7 +3793,7 @@ impl DynamicModule {
         // the top of this fn for the early isolation peek; reuse it here.)
         crate::kernel::exec::scheduler::parse_protection_config(inst_idx, params_slice);
 
-        // A gated module's protection domain exists before any of its code
+        // A gated module's isolation region exists before any of its code
         // runs: the gateway learns its memory, the platform builds its regions.
         // Either failing refuses the load; the module is never run privileged
         // in its place.
@@ -3771,6 +3823,7 @@ impl DynamicModule {
             if !registered {
                 gateway::register(inst_idx, code, heap, &[state, heap]);
             }
+            built.gateway = true;
             if !crate::kernel::sys::hal::protection_register_module(
                 inst_idx,
                 module.code_base() as usize,
@@ -3780,36 +3833,24 @@ impl DynamicModule {
                 iso_heap_ptr,
                 iso_heap_map_size,
             ) {
-                gateway::release(inst_idx);
-                // SAFETY: the allocation this call made, referenced by
-                // nothing yet.
-                unsafe { free_allocation(state_ptr, required_size, private_region) };
                 return Err(LoaderError::ProtectionUnavailable);
             }
+            built.protection = true;
         }
         let _ = (iso_heap_size, state_map_size, iso_heap_map_size);
-        // 5. Initialize module (FFI call, but validated)
+        // 4. Initialize module (FFI call, but validated)
         let init = if gated {
             invoke_init_protected(module, inst_idx)
         } else {
             invoke_init(module, syscalls, name)
         };
-        if let Err(e) = init {
-            if gated {
-                crate::kernel::sys::hal::protection_release_module(inst_idx);
-                crate::kernel::module::gateway::release(inst_idx);
-            }
-            // SAFETY: the allocation this call made; the module never ran
-            // past its failed init and nothing else references it.
-            unsafe { free_allocation(state_ptr, required_size, private_region) };
-            return Err(e);
-        }
+        init?;
         // 5b. Resolve optional module_drain export
         let drain_fn: Option<ModuleDrainFn> = module
             .get_export_addr(export_hashes::MODULE_DRAIN)
             .ok()
             .map(|addr| fn_ptr_from_addr(addr));
-        // 6. Try to create instance (may return pending)
+        // 5. Try to create instance (may return pending)
         let init_args = ModuleInitArgs {
             in_chan: channels.in_chan,
             out_chan: channels.out_chan,
@@ -3827,6 +3868,7 @@ impl DynamicModule {
         match status? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {name}");
+                built.commit();
                 if let Some(ar) = auto_register.as_ref() {
                     ar.register(inst_idx as ModuleId, state_ptr, name);
                 }
@@ -3852,8 +3894,6 @@ impl DynamicModule {
                     pipeline_refill_fn: exports.pipeline_refill_fn,
                     post_tick_flush_fn: exports.post_tick_flush_fn,
                     new_fn: exports.new_fn,
-                    state_ptr,
-                    state_size: required_size,
                     syscalls: syscalls as *const _,
                     in_chan: channels.in_chan,
                     out_chan: channels.out_chan,
@@ -3866,6 +3906,7 @@ impl DynamicModule {
                     module_idx: inst_idx as ModuleId,
                     isr_entry_fn: exports.isr_entry_fn,
                     stack_bytes: module.manifest_stack_bytes(),
+                    construction: built,
                 };
                 log::info!("[inst] pending {name}");
                 Ok(StartNewResult::Pending(pending))
@@ -3873,30 +3914,67 @@ impl DynamicModule {
         }
     }
 }
-/// Hand back what `start_new` allocated for a module whose load failed:
-/// its private region when it has one, else its state buffer.
-///
-/// # Safety
-/// `state` and `private` are what this load allocated, and nothing
-/// references them any more.
-unsafe fn free_allocation(state: *mut u8, state_size: usize, private: Option<(*mut u8, usize)>) {
-    // Whatever the module's elastic heap carved while its init ran.
-    let heap = crate::kernel::mem::heap::detach_module_heap(
-        crate::kernel::exec::scheduler::current_module_index(),
-    );
-    for (ptr, size) in heap.iter() {
-        // SAFETY: a segment the heap carved with `alloc_state`; the module
-        // never ran past its failed load, so nothing references it.
-        unsafe { free_state_range(ptr, size) };
+/// What a module's construction holds until the module is in: its state
+/// (or, for a gated module on an MPU target, the private region holding its
+/// stack, state and heap), the heap arena recorded for its slot, the
+/// segments its elastic heap carved, and its isolation region. Dropped, it
+/// gives every one of them back; [`Construction::commit`] hands them to the
+/// running module, whose teardown releases them.
+struct Construction {
+    state: *mut u8,
+    /// A gated module's private region on an MPU target; null otherwise.
+    private: *mut u8,
+    private_size: u32,
+    state_size: u32,
+    idx: ModuleId,
+    /// The gateway knows the module.
+    gateway: bool,
+    /// The platform built the module's protection regions.
+    protection: bool,
+    /// Still the construction's: not yet handed to the module.
+    held: bool,
+}
+
+impl Construction {
+    /// The module is in: what it holds is its own now.
+    fn commit(&mut self) {
+        self.held = false;
     }
-    match private {
-        // SAFETY: the caller's contract, forwarded.
-        #[cfg(feature = "kernel-mpu")]
-        Some((base, size)) => unsafe { free_private(base, size) },
-        #[cfg(not(feature = "kernel-mpu"))]
-        Some(_) => {}
-        // SAFETY: the caller's contract, forwarded.
-        None => unsafe { free_state_range(state, state_size) },
+}
+
+impl Drop for Construction {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let idx = usize::from(self.idx);
+        if self.protection {
+            crate::kernel::sys::hal::protection_release_module(idx);
+        }
+        if self.gateway {
+            crate::kernel::module::gateway::release(idx);
+        }
+        // SAFETY: instantiation context, the slot this construction filled;
+        // the module never ran past its failed construction, so nothing
+        // references any of its memory.
+        unsafe {
+            let (arena, arena_size) = crate::kernel::exec::scheduler::take_module_arena(idx);
+            for (ptr, size) in crate::kernel::mem::heap::detach_module_heap(idx).iter() {
+                free_state_range(ptr, size);
+            }
+            if self.private.is_null() {
+                if !arena.is_null() {
+                    free_state_range(arena, arena_size);
+                }
+                free_state_range(self.state, self.state_size as usize);
+            } else {
+                // The heap and the state lie inside the region.
+                #[cfg(feature = "kernel-mpu")]
+                free_private(self.private, self.private_size as usize);
+                #[cfg(not(feature = "kernel-mpu"))]
+                let _ = self.private_size;
+            }
+        }
     }
 }
 
@@ -3942,7 +4020,7 @@ impl Module for DynamicModule {
         };
         let result = if self.level.is_gated() {
             // SAFETY: flush_fn is a validated module export run under the
-            // module's protection domain (direct dispatch where none exists).
+            // module's isolation region (direct dispatch where none exists).
             unsafe { gated_entry(flush_fn as usize, self.state_ptr) }
         } else {
             // SAFETY: flush_fn is a validated module export; state_ptr is the
@@ -3962,7 +4040,7 @@ impl Module for DynamicModule {
         };
         let result = if self.level.is_gated() {
             // SAFETY: refill_fn is a validated module export run under the
-            // module's protection domain (direct dispatch where none exists).
+            // module's isolation region (direct dispatch where none exists).
             unsafe { gated_entry(refill_fn as usize, self.state_ptr) }
         } else {
             // SAFETY: refill_fn is a validated module export; state_ptr is the

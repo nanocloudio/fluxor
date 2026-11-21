@@ -10,7 +10,7 @@
 //!
 //! Three things about it are easy to get wrong and produce no diagnostic:
 //!
-//! - **Tier 1 is the lowest nibble.** The tiers read outward from the root
+//! - **The first hub tier is the lowest nibble.** The tiers read outward from the root
 //!   hub, so a device two tiers deep has its *first* hop in bits 0..3. Built
 //!   the other way round the string is a valid route to somewhere else.
 //! - **Port numbers are 1-based**, and zero in a nibble means "no more
@@ -96,7 +96,7 @@ impl RouteString {
 
     /// How many hub tiers this route traverses.
     ///
-    /// Counts up from tier 1 and stops at the first empty nibble, because a
+    /// Counts up from the first tier and stops at the first empty nibble, because a
     /// zero means "no more tiers" — scanning from the top would misread a
     /// route whose deeper tiers are empty.
     pub const fn depth(&self) -> usize {

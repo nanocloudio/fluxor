@@ -55,4 +55,4 @@ required = false
 
 # Module-scope observability — exempt.
 [observability]
-exempt = "connection-level fan-out — per-connection bytes are observed at the ip and tls modules; this module's domain metric is route/drop counts only"
+exempt = "connection-level fan-out — per-connection bytes are observed at the ip and tls modules; this module's metric is route/drop counts only"

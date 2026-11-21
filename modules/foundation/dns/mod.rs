@@ -152,7 +152,7 @@
 //! | 2   | host     | str  | (none)     | "hostname=ip" (repeatable)     |
 //! | 3   | ttl      | u32  | 300        | TTL for local responses (sec)  |
 //! | 4   | port     | u16  | 53         | Listen port                    |
-//! | 5   | trace_sample_permille | u16 | tier | `dns.query` head-sampling rate |
+//! | 5   | trace_sample_permille | u16 | per-target | `dns.query` head-sampling rate |
 //! | 6   | upstream_port | u16 | 53    | Upstream destination port      |
 //! | 7   | dns64_prefix | str | (none) | DNS64 prefix, `"<ipv6>/<len>"` text or 16 prefix bytes + length byte; only RFC 6052 lengths (32, 40, 48, 56, 64, 96) with no bits past the length and a zero `u` octet are admitted, anything else refuses construction |
 //! | 8   | dns64_exclude | str | non-global | IPv4 range never translated, `"a.b.c.d/n"` (repeatable, `MAX_DNS64_EXCLUDES`); when absent every non-global range is excluded |
@@ -452,7 +452,7 @@ mod params_def {
 
         // Head-sampling rate (per-mille, 0..=1000) for `dns.query` spans. The
         // default is the sentinel `0xFFFF` ("unset") so `module_new` can apply
-        // the target-tier default (aarch64 50‰ / MCU 0‰) only when no explicit
+        // the per-target default (aarch64 50‰ / MCU 0‰) only when no explicit
         // value was supplied — set_defaults would otherwise clobber it.
         5, trace_sample_permille, u16, 0xFFFF
             => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 0xFFFF); };
@@ -924,7 +924,7 @@ struct DnsState {
     // ── Dynamic update ──
     update_enabled: u8,
     update_durability: u8,
-    /// `1` once the storage provider answered `CAPS` with the write tier and
+    /// `1` once the storage provider answered `CAPS` with the write surface and
     /// the committed generation was loaded; durable updates before that are
     /// refused SERVFAIL.
     durable_ready: u8,
@@ -978,7 +978,7 @@ struct DnsState {
     // (cadence gated on the wallclock since dns has no per-step counter).
     tlm: TlmCounters,
     tlm_last_ms: u64,
-    /// Head-sampling rate (per-mille) for `dns.query` spans. Target-tier
+    /// Head-sampling rate (per-mille) for `dns.query` spans. Per-target
     /// default: 50‰ on aarch64 (pi5-class), 0‰ on MCUs. Decided per query
     /// from its minted trace id.
     sample_permille: u16,
@@ -5285,7 +5285,7 @@ unsafe fn zone_commit_finish(s: &mut DnsState, committed: bool) {
     send_server_reply(state, s.pend_ip, s.pend_port, tx as *const u8, len);
 }
 
-/// Probe the storage provider's write tier. `None` while it has no answer
+/// Probe the storage provider's write surface. `None` while it has no answer
 /// yet (`EAGAIN`), `Some(false)` when it lacks a capability the commit
 /// needs.
 unsafe fn zone_storage_ready(s: &DnsState) -> Option<bool> {
@@ -5839,7 +5839,7 @@ pub unsafe extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        // Resolve the target-tier head-sampling default only when the
+        // Resolve the per-target head-sampling default only when the
         // `trace_sample_permille` param was not explicitly supplied (still the
         // `0xFFFF` sentinel): aarch64 (pi5-class) 50‰, MCUs 0‰. An explicit
         // value (including 0) is honoured as-is.
@@ -5960,7 +5960,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         maybe_emit_telemetry(s);
 
         // Durable mode serves updates only once the storage provider has
-        // answered for its write tier and the committed generation is loaded.
+        // answered for its write surface and the committed generation is loaded.
         if s.update_enabled != 0
             && s.update_durability == DURABILITY_DURABLE
             && s.durable_ready == 0
@@ -5971,7 +5971,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     Some(false) => {
                         log_info(
                             s,
-                            b"[dns] zone: storage lacks the write tier, durable updates refused",
+                            b"[dns] zone: storage lacks the write surface, durable updates refused",
                         );
                         // Asked again each step; the answer is per provider
                         // and does not change, so the log line is the

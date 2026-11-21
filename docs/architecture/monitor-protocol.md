@@ -100,14 +100,14 @@ MON_STATE mod=<idx> name=<s> state=<s> ready=<0|1> finished=<0|1> restarts=<n> d
   [module_isolation.md](module_isolation.md)). This is what the target
   provides, which can be stronger than what the graph asked for.
 
-Trust tier is not reported: the scheduler does not keep it per module, so
+Trust class is not reported: the scheduler does not keep it per module, so
 there is nothing to report it from. A field synthesised at the emitter would
 be a reading nobody could trust, which is worse than an absent column.
 
 ### `MON_HEAVY_STEP`
 
 Emitted (rate-limited) by the scheduler when a single module step exceeds
-the heavy-step threshold (`src/kernel/exec/scheduler/domain_budget.rs`):
+the heavy-step threshold (`src/kernel/exec/scheduler/pass.rs`):
 
 ```
 MON_HEAVY_STEP module=<idx> domain=<d> elapsed_us=<n> tick=<t> suppressed=<n>
@@ -116,7 +116,7 @@ MON_HEAVY_STEP module=<idx> domain=<d> elapsed_us=<n> tick=<t> suppressed=<n>
 ### `MON_BUDGET_OVERRUN`
 
 Emitted (rate-limited) by the scheduler when an execution domain exhausts
-its per-tick step budget (`src/kernel/exec/scheduler/domain_budget.rs`):
+its per-pass step budget (`src/kernel/exec/scheduler/pass.rs`):
 
 ```
 MON_BUDGET_OVERRUN domain=<d> consumed_us=<n> limit_us=<n> last_mod=<idx> top=<idx>:<us>/<steps>,<idx>:<us>/<steps>,<idx>:<us>/<steps> overrun_count=<n> tick=<t> suppressed=<n>
@@ -126,6 +126,9 @@ MON_BUDGET_OVERRUN domain=<d> consumed_us=<n> limit_us=<n> last_mod=<idx> top=<i
 the three modules of the domain that consumed the most of that pass, each
 with its microseconds and the number of times it was stepped (a bursting
 module is stepped many times in one pass). Unused slots read `0:0/0`.
+
+In both lines `tick` is the domain's pass count (`pass_count(domain)`): the
+number of tick passes that domain has run.
 
 ### `MON_SESSION`
 

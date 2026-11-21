@@ -2,14 +2,14 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
     let content = std::fs::read(file)?;
     let memory = parse_uf2(&content)?;
 
-    // The config the graph image after the kernel names.
-    let (at, header) = find_graph_image(&memory)?;
+    // The config the node image after the kernel names.
+    let (at, header) = find_node_image(&memory)?;
     let config_data = uf2::extract_region(
         &memory,
         at + header.config_offset,
         header.config_size as usize,
     )
-    .ok_or_else(|| error::Error::Config("the graph image's config is not in the file".into()))?;
+    .ok_or_else(|| error::Error::Config("the node image's config is not in the file".into()))?;
 
     let config = decode_config(&config_data)?;
 
@@ -21,13 +21,13 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
     Ok(())
 }
 
-/// The graph image a firmware image carries after the kernel: the first
+/// The node image a firmware image carries after the kernel: the first
 /// 256-byte aligned address holding a header the codec reads whose regions
 /// the file holds. Answers its address and header.
-fn find_graph_image(
+fn find_node_image(
     memory: &std::collections::BTreeMap<u32, u8>,
-) -> Result<(u32, fluxor_abi::wire::graph_image::Header)> {
-    use fluxor_abi::wire::graph_image::{Header, HEADER_SIZE, MAGIC};
+) -> Result<(u32, fluxor_abi::wire::node_image::Header)> {
+    use fluxor_abi::wire::node_image::{Header, HEADER_SIZE, MAGIC};
     let min_addr = *memory
         .keys()
         .min()
@@ -50,7 +50,7 @@ fn find_graph_image(
         }
         addr += 256;
     }
-    Err(error::Error::Config("No graph image found".into()))
+    Err(error::Error::Config("No node image found".into()))
 }
 
 fn cmd_info_fmod(file: &Path) -> Result<()> {
@@ -126,16 +126,16 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
         println!("  [{i}] 0x{start:08x} - 0x{end:08x} ({size} bytes)");
     }
 
-    // The graph image after the kernel.
+    // The node image after the kernel.
     println!();
-    if let Ok((image_addr, header)) = find_graph_image(&memory) {
+    if let Ok((image_addr, header)) = find_node_image(&memory) {
         let modules_addr = image_addr + header.modules_offset;
         let config_addr = image_addr + header.config_offset;
         println!(
-            "Graph image: header at 0x{image_addr:08x}, epoch {}, {}",
+            "Node image: header at 0x{image_addr:08x}, epoch {}, {}",
             header.epoch,
-            if fluxor_abi::wire::graph_image::signature(
-                &uf2::extract_region(&memory, image_addr, fluxor_abi::wire::graph_image::HEADER_SIZE)
+            if fluxor_abi::wire::node_image::signature(
+                &uf2::extract_region(&memory, image_addr, fluxor_abi::wire::node_image::HEADER_SIZE)
                     .unwrap_or_default()
             )
             .is_some()
@@ -254,7 +254,7 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
             }
         }
     } else {
-        println!("Graph image: Not present");
+        println!("Node image: Not present");
     }
 
     Ok(())
@@ -366,7 +366,7 @@ fn cmd_generate(
 ) -> Result<()> {
     let binary_data = generate_config_bytes(config_path, module_root)?;
     eprintln!("Config size: {} bytes", binary_data.len());
-    eprintln!("Note: Use 'combine' command to create a complete UF2 with the graph image");
+    eprintln!("Note: Use 'combine' command to create a complete UF2 with the node image");
 
     if let Some(output_path) = output {
         if binary {
@@ -692,14 +692,14 @@ fn check_ring_demand(
 }
 
 /// The 16 MiB alignment `.bss` starts on in a RAM-loaded aarch64 image
-/// (`linker/memory-bcm2712.x`, `linker/memory-uefi.x`): the graph image's
+/// (`linker/memory-bcm2712.x`, `linker/memory-uefi.x`): the node image's
 /// header, module table and config sit between the end of its file-backed
 /// sections and that boundary, which `_start` zeroes from.
 const AARCH64_BSS_ALIGN: u32 = 0x0100_0000;
 
 /// Where the payload window of a RAM-loaded aarch64 image ends: `__bss_start`,
 /// the first 16 MiB boundary at or past the image's file-backed end. The
-/// kernel bounds the graph image by the same address
+/// kernel bounds the node image by the same address
 /// (`kernel::boot::config::firmware_image_window`), so an image that reaches
 /// it is refused here, by name, rather than erased in part by the boot's
 /// `.bss` clear and refused before the logger runs.
@@ -707,7 +707,7 @@ fn aarch64_payload_window_end(firmware_end: u32) -> u64 {
     (firmware_end as u64).div_ceil(AARCH64_BSS_ALIGN as u64) * AARCH64_BSS_ALIGN as u64
 }
 
-/// Refuse a graph image whose config, the last of its regions, is placed at
+/// Refuse a node image whose config, the last of its regions, is placed at
 /// `config_addr` in a RAM-loaded aarch64 image whose file-backed sections end
 /// at `firmware_end`, unless the whole blob, `total_len` bytes as its header
 /// states, ends below `__bss_start`: the header, module table and config then
@@ -720,8 +720,8 @@ fn check_aarch64_payload_window(config_addr: u32, config: &[u8], firmware_end: u
     let config_end = u64::from(config_addr) + cfg.total_len() as u64;
     if config_end >= window_end {
         return Err(error::Error::Config(format!(
-            "Combined image payload ends at {config_end:#x}, reaching the payload window's end \
-             at {window_end:#x} where the kernel's .bss begins (the graph image's header, module \
+            "Firmware image payload ends at {config_end:#x}, reaching the payload window's end \
+             at {window_end:#x} where the kernel's .bss begins (the node image's header, module \
              table and config must all end below it). Shrink the module set or config."
         )));
     }
@@ -1068,7 +1068,7 @@ fn cmd_combine(
         target_desc.module_abi(),
         None,
     );
-    let modules = parse_modules_from_config_multi(
+    let mut modules = parse_modules_from_config_multi(
         &config,
         modules_dir,
         &extra_dirs,
@@ -1099,6 +1099,13 @@ fn cmd_combine(
         Some(&target_desc.id),
         &crate::project::root_for_config(config_path),
     )?;
+    crate::modules::add_fan_modules(
+        &mut modules,
+        &config::fan_types(&config_data)?,
+        modules_dir,
+        &extra_dirs,
+        store_fb.as_deref().map(|f| f as _),
+    )?;
 
     check_code_ceiling(&modules, &target_desc)?;
     check_state_budget(&modules, &config, &config_data, &target_desc)?;
@@ -1127,12 +1134,12 @@ fn cmd_combine(
     }
     let modules_data = crate::modules::build_module_table_with_programs(&modules, &programs)?;
 
-    // The graph image goes right after the firmware: its header on the next
+    // The node image goes right after the firmware: its header on the next
     // 256-byte boundary (a UF2 block's payload), where the kernel looks for
-    // it, and the module table and config where `graph_image::place` puts
+    // it, and the module table and config where `node_image::place` puts
     // them from there.
     let image_addr = firmware_max_addr.div_ceil(256) * 256;
-    let header = crate::graph_image::header(
+    let header = crate::node_image::header(
         u64::from(image_addr),
         &modules_data,
         &config_data,
@@ -1142,13 +1149,13 @@ fn cmd_combine(
     let config_addr = image_addr + header.config_offset;
     let image_end = u64::from(image_addr) + header.end();
 
-    // A RAM-loaded aarch64 image carries its graph image below `.bss`: past
+    // A RAM-loaded aarch64 image carries its node image below `.bss`: past
     // that boundary `_start` zeroes it before the kernel reads it.
     if is_aarch64 {
         check_aarch64_payload_window(config_addr, &config_data, firmware_max_addr)?;
     }
 
-    // Ensure the combined image ends below the regions the board's flash is
+    // Ensure the firmware image ends below the regions the board's flash is
     // partitioned into above it: the two graph slots, the data store and the
     // parameter store, which start at slot A (`flash_layout::graph_flash`,
     // from the board's flash size). Only applies to flash-based targets.
@@ -1156,13 +1163,13 @@ fn cmd_combine(
         let slot_a_addr = u64::from(XIP_BASE + layout.slot_a);
         if image_end > slot_a_addr {
             return Err(error::Error::Config(format!(
-                "Combined image end ({image_end:#010x}) overlaps the graph slots and parameter store from {slot_a_addr:#010x} (a {} KiB flash). Reduce firmware/config size.",
+                "Firmware image end ({image_end:#010x}) overlaps the graph slots and parameter store from {slot_a_addr:#010x} (a {} KiB flash). Reduce firmware/config size.",
                 layout.flash_size / 1024
             )));
         }
     }
 
-    // A kernel image with a signing root admits only a graph image signed by
+    // A kernel image with a signing root admits only a node image signed by
     // it, so the header is signed with the key whose public key the root is.
     // A root this workspace holds no key for would leave the image unable to
     // boot its own graph: refused here.
@@ -1176,7 +1183,7 @@ fn cmd_combine(
             )));
         }
     }
-    let header_bytes = crate::graph_image::header_bytes(&header, seed.as_ref());
+    let header_bytes = crate::node_image::header_bytes(&header, seed.as_ref());
 
     if verbose {
         let base_str = if is_aarch64 {
@@ -1199,7 +1206,7 @@ fn cmd_combine(
         );
     }
 
-    // Build the combined image.
+    // Build the firmware image.
     // aarch64: raw binary (firmware + padding + header + modules + config)
     // RP:      UF2 container with blocks for each section
     let (combined, firmware_size) = if is_aarch64 {
@@ -1352,7 +1359,7 @@ fn build_packaged_blobs(
     // `project_root` is config-anchored by the caller: fmod packaging and
     // pinned-manifest resolution must consult the same fluxor.lock.
     let store_fb = store_cli::lock_store_resolver(project_root, target_desc.module_abi(), None);
-    let modules = parse_modules_from_config_multi(
+    let mut modules = parse_modules_from_config_multi(
         config,
         modules_dir,
         extra_dirs,
@@ -1380,6 +1387,13 @@ fn build_packaged_blobs(
         target_desc.pio_count,
         Some(&target_desc.id),
         project_root,
+    )?;
+    crate::modules::add_fan_modules(
+        &mut modules,
+        &config::fan_types(&config_data)?,
+        modules_dir,
+        extra_dirs,
+        store_fb.as_deref().map(|f| f as _),
     )?;
 
     check_code_ceiling(&modules, target_desc)?;
@@ -1423,14 +1437,16 @@ fn build_packaged_blobs(
 /// a workload that brings its own modules (`SOURCE_FMOD_PACK`):
 ///
 /// ```text
-/// <dir>/graph.flxa            the subgraph (FLXA), as the kernel admits it
-/// <dir>/modules/<name>.fmod   every module it names, byte for byte
+/// <dir>/graph.flxa            the workload's composed graph, as the kernel
+///                             admits it
+/// <dir>/modules/<name>.fmod   every module it runs, its fans' tee and merge
+///                             included, byte for byte
 /// <dir>/workload-image.json   name, target, module ABI, ABI-surface pin,
 ///                             each module's name_hash and sha256, and the
 ///                             environment its params are bound to
 /// ```
 ///
-/// The workload's modules and `wiring:` are written as a base graph's:
+/// The workload's modules and `wiring:` are written as a node graph's:
 /// `module.port` ends resolved against the manifests, and the platform's
 /// `linux_net` (undeclared) for the node's network, each module wired to it
 /// a lane of its own (`config::workload_edges`). A graph's modules and
@@ -1440,7 +1456,7 @@ fn build_packaged_blobs(
 /// `required: false`) is packed as an env bind record (`schema::env_bind`):
 /// the node fills it from the CREATE's `env`/`var` entries. `env` in the
 /// json lists each binding — `name`, `module`, `param`, `required` — so the
-/// orchestrator can refuse a pod that does not give a required name before
+/// orchestrator can refuse a workload that does not give a required name before
 /// it asks the node.
 ///
 /// A module's sha256 is the pin the kernel admits it by, and the digest the
@@ -1471,7 +1487,7 @@ pub fn cmd_workload_image(
             workloads_yaml.len()
         )));
     }
-    // Only the workload: the base graph's modules are the node's, not this
+    // Only the workload: the node graph's modules are the node's, not this
     // workload's.
     let mut only = config.clone();
     only["modules"] = serde_json::Value::Array(Vec::new());
@@ -1484,11 +1500,17 @@ pub fn cmd_workload_image(
         crate::config::build_workloads(&only, loc, &[], &target_desc.id)
     });
     let workloads = workloads?;
-    let flxa =
-        crate::add_subgraph::encode_add_subgraph(&workloads[0]).map_err(error::Error::Config)?;
+    let graph = crate::add_subgraph::encode_workload(&workloads[0]).map_err(error::Error::Config)?;
     let store_fb = store_cli::lock_store_resolver(&project_root, abi, None);
-    let modules = parse_modules_from_config_multi(
+    let mut modules = parse_modules_from_config_multi(
         &only,
+        &module_root,
+        &[],
+        store_fb.as_deref().map(|f| f as _),
+    )?;
+    crate::modules::add_fan_modules(
+        &mut modules,
+        &workloads[0].graph.fan_types(),
         &module_root,
         &[],
         store_fb.as_deref().map(|f| f as _),
@@ -1501,7 +1523,7 @@ pub fn cmd_workload_image(
 
     let mods_dir = output_dir.join("modules");
     std::fs::create_dir_all(&mods_dir)?;
-    std::fs::write(output_dir.join("graph.flxa"), &flxa)?;
+    std::fs::write(output_dir.join("graph.flxa"), &graph)?;
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let sha = |b: &[u8]| {
         use sha2::Digest;
@@ -1533,7 +1555,7 @@ pub fn cmd_workload_image(
         "target": target_desc.id,
         "module_abi": abi,
         "abi_surface": hex(&hash::abi_surface_digest()),
-        "flxa_sha256": sha(&flxa),
+        "flxa_sha256": sha(&graph),
         "modules": entries,
         "env": env_binds
             .iter()
@@ -1551,20 +1573,20 @@ pub fn cmd_workload_image(
     )?;
     if verbose {
         println!(
-            "workload image {name}: {} module(s), FLXA {} bytes",
+            "workload image {name}: {} module(s), graph {} bytes",
             modules.len(),
-            flxa.len()
+            graph.len()
         );
     }
     println!("{}", output_dir.display());
     Ok(())
 }
 
-/// Emit a graph image: a 256-byte header, the module table (with the
+/// Emit a node image: a 256-byte header, the module table (with the
 /// graph's program section after it) from the first 4 KiB boundary, and the
 /// static config from the next 256-byte boundary. An RP image ends on a
 /// whole flash page; any other is as long as its payload. The header is
-/// `wire::graph_image`'s, written by `graph_image::compose`.
+/// `wire::node_image`'s, written by `node_image::compose`.
 ///
 /// The header records the epoch, the in-image offsets and sizes of the
 /// modules and config regions, a SHA-256 over their concatenation, and the
@@ -1572,7 +1594,7 @@ pub fn cmd_workload_image(
 /// `graph_slot`'s ACTIVATE and the OTA staging commit recompute the digest
 /// before they accept the image, and the RP boot selector does too on a
 /// kernel image with a signing root.
-fn cmd_graph_image(
+fn cmd_node_image(
     config_path: &Path,
     output_path: &PathBuf,
     target_override: Option<&str>,
@@ -1635,7 +1657,7 @@ fn cmd_graph_image(
         &crate::project::root_for_config(config_path),
     )?;
     let modules_data = modules_data
-        .ok_or_else(|| error::Error::Config("A graph image requires at least one module".into()))?;
+        .ok_or_else(|| error::Error::Config("A node image requires at least one module".into()))?;
 
     // Image geometry is per-target: an RP image is bounded by the board's
     // graph slot (`flash_layout::graph_flash`, from its flash size), and
@@ -1661,12 +1683,12 @@ fn cmd_graph_image(
     // image is unsigned, which only a device with a rootless kernel image
     // accepts.
     let seed = sign_key.map(read_signing_seed).transpose()?;
-    let mut out = crate::graph_image::compose(&modules_data, &config_data, epoch, seed.as_ref())?;
-    let header = crate::graph_image::read(&out, "the graph image")?;
+    let mut out = crate::node_image::compose(&modules_data, &config_data, epoch, seed.as_ref())?;
+    let header = crate::node_image::read(&out, "the node image")?;
     let (modules_offset, config_offset) = (header.modules_offset, header.config_offset);
     if out.len() > image_size {
         return Err(error::Error::Config(format!(
-            "Graph image ({} bytes) exceeds the size ceiling ({image_size} bytes). Reduce modules/config.",
+            "Node image ({} bytes) exceeds the size ceiling ({image_size} bytes). Reduce modules/config.",
             out.len()
         )));
     }
@@ -1681,7 +1703,7 @@ fn cmd_graph_image(
     std::fs::write(output_path, &out)?;
     if verbose {
         eprintln!(
-            "graph image: modules_off=0x{:x} ({} bytes), config_off=0x{:x} ({} bytes), epoch={}",
+            "node image: modules_off=0x{:x} ({} bytes), config_off=0x{:x} ({} bytes), epoch={}",
             modules_offset,
             modules_data.len(),
             config_offset,
@@ -1737,20 +1759,23 @@ mod state_budget_tests {
     /// A built config holding one module record per instance:
     /// `(type, params TLV)`.
     fn image(instances: &[(&str, &[u8])]) -> Vec<u8> {
-        use fluxor_contracts::boot_config::{encode, BootConfigSpec, DomainRecord, ModuleRecord};
+        use fluxor_contracts::boot_config::{encode, BootConfigSpec, DomainRecord};
+        use fluxor_contracts::graph::{GraphSpec, ModuleRecord};
         let modules: Vec<ModuleRecord<'_>> = instances
             .iter()
-            .zip(0u16..)
-            .map(|(&(ty, params), id)| ModuleRecord {
+            .map(|&(ty, params)| ModuleRecord {
                 name_hash: crate::hash::fnv1a_hash(ty.as_bytes()),
-                id,
-                domain: 0,
-                pre_pass: false,
                 params,
+                ..ModuleRecord::default()
             })
             .collect();
+        let order: Vec<u16> = (0..modules.len() as u16).collect();
         encode(&BootConfigSpec {
-            modules: &modules,
+            graph: GraphSpec {
+                order: &order,
+                modules: &modules,
+                ..GraphSpec::default()
+            },
             domains: &[DomainRecord::default()],
             ..BootConfigSpec::default()
         })

@@ -687,9 +687,9 @@ const ADDR_EVT_PORT: u8 = 5;
 /// The VIP authority's verdicts (in[5]) and the token checks to it (out[7]).
 const AUTH_RSP_PORT: u8 = 5;
 const AUTH_REQ_PORT: u8 = 7;
-/// THIS module's input-port indices, declared to the kernel at init via the
-/// `NET_IDENT_PROVIDER` self-registration (module-local facts, matching
-/// `manifest.toml`).
+/// THIS module's input-port indices (module-local facts, matching
+/// `manifest.toml`); `addr_ctl`'s is declared to the kernel at init via the
+/// `NET_IDENT_PROVIDER` self-registration.
 const NET_IN_PORT: u8 = 1;
 const ADDR_CTL_PORT: u8 = 2;
 /// Pre-transport decision-seam ports of the packet contract
@@ -2691,7 +2691,7 @@ fn is_local_addr(s: &IpState, ip: u32) -> bool {
 }
 
 /// Owner tag of a local-address slot. Slot 0 (host), the wildcard sentinel,
-/// out-of-range, and inactive slots all report 0 (host/system owner). Used by
+/// out-of-range, and inactive slots all report 0 (node owner). Used by
 /// the bind-admission and demux gates.
 #[inline]
 fn owner_tag_for_slot(s: &IpState, slot: u16) -> u16 {
@@ -4751,7 +4751,7 @@ pub unsafe extern "C" fn module_new(
         s.ctrl_chan = ctrl_chan;
 
         s.use_dhcp = 1;
-        // Target-tier head-sampling default,
+        // Per-target head-sampling default,
         // overridable by the `trace_sample_permille` param. The bcm2712 (aarch64)
         // module artefact is the pi5-class rig → 50‰; MCU silicon (rp2350/rp2040,
         // thumbv8m/v6m) → 0‰ so tiny targets pay no tracing cost by default.
@@ -4912,11 +4912,11 @@ pub unsafe extern "C" fn module_new(
         // declared tables below.
 
         // Self-register as the node's net-identity provider (the kernel-side
-        // workload backend resolves addr_ctl / ingress through this — no name
-        // convention). Declares OUR port indices; best-effort: on a
-        // single-tenant kernel this is ENOSYS, in a bare harness a stub — the
+        // workload backend resolves addr_ctl through this — no name
+        // convention). Declares OUR port index; best-effort: on a
+        // kernel without a workload backend this is ENOSYS, in a bare harness a stub — the
         // single-address path is byte-identical either way.
-        let mut reg = [ADDR_CTL_PORT, NET_IN_PORT];
+        let mut reg = [ADDR_CTL_PORT];
         let _ = (sys.provider_call)(
             -1,
             abi::kernel_abi::NET_IDENT_PROVIDER,
@@ -13181,6 +13181,8 @@ pub mod test_helpers {
         pub is_datagram: bool,
         pub local_slot: u16,
         pub owner_tag: u16,
+        /// The lane the connection's events go to (0 = the node's).
+        pub lane: u8,
         /// The sidebands granted (`net_proto::flag`).
         pub flags: u8,
         /// Bytes this module keeps of what the connection sent.
@@ -13337,6 +13339,7 @@ pub mod test_helpers {
             is_datagram: c.is_datagram,
             local_slot: c.local_slot,
             owner_tag: c.owner_tag,
+            lane: c.lane,
             flags: c.flags,
             sbuf_len: if c.sbuf == tcp::SBUF_NONE {
                 0
@@ -13394,6 +13397,7 @@ pub mod test_helpers {
             is_datagram: c.is_datagram,
             local_slot: c.local_slot,
             owner_tag: c.owner_tag,
+            lane: c.lane,
             flags: c.flags,
             sbuf_len: if c.sbuf == tcp::SBUF_NONE {
                 0

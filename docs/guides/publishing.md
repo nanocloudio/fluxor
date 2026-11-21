@@ -46,7 +46,7 @@ project index (`fluxor/meta`) lists:
 |---|---|---|
 | Module crate source trees | canonical tars of `crates/fluxor-abi/**`, `crates/fluxor-sdk/**` and `crates/fluxor-rt/**`, unprefixed; `fluxor sync` extracts each to `target/fluxor/<name>/`, where `fluxor modules build` compiles it to the rlib every module links | `fluxor/src/fluxor-abi:<ver>`, `fluxor/src/fluxor-sdk:<ver>`, `fluxor/src/fluxor-rt:<ver>` |
 | Contracts source tree | canonical tar of `contracts/src/**` mapped under a `src/` path prefix | `fluxor/src/fluxor-contracts:<ver>` |
-| fmod palette | compiled `.fmod` + manifest for every module this repo owns (every tier under `modules/`), per declared module ABI shelf | `<abi>/<name>:<ver>` |
+| fmod palette | compiled `.fmod` + manifest for every module this repo owns (every layer under `modules/`), per declared module ABI shelf | `<abi>/<name>:<ver>` |
 | Runtimes | `fluxor-linux` and the `fluxor` CLI itself, one binary layer per host triple | `fluxor/run/<name>-<triple>:<ver>` |
 | Project index | standard OCI index over the artefact manifests above; annotations carry fluxor's dependency declarations | `fluxor/meta:<ver>` |
 
@@ -59,7 +59,7 @@ what it depends on:
 2. fmods and runtimes (with the sources, one transaction);
 3. stacks — `packaging/stack/<name>.yaml` — each recording the module
    artifacts it composes, so after the modules;
-4. bundles — `packaging/service/<name>/workload.toml` and
+4. workload packages — `packaging/service/<name>/workload.toml` and
    `packaging/applet/<name>/workload.toml` — which may include stacks, so
    after the stacks.
 
@@ -70,28 +70,29 @@ publishes what it ships. Platform stacks (`stacks/*.toml`) are fluxor's
 catalog and are never swept, and example and test graphs are never
 published.
 
-Every stack and bundle is checked before anything is written. A stack that
+Every stack and workload package is checked before anything is written. A stack that
 does not parse, declares no `version`, is not at
 `packaging/stack/<name>.yaml`, or composes a module that is neither the
-project's own, nor pinned, nor a kernel built-in, and a bundle whose source
+project's own, nor pinned, nor a kernel built-in, and a workload package whose source
 manifest or graph does not check, refuse the publish with the reason; none
 is skipped. `fluxor publish --dry-run` prints the displacement report and
-lists every stack and bundle the sweep would publish, and writes nothing.
+lists every stack and workload package the sweep would publish, and writes nothing.
 `--store <dir>` publishes the sweep into another store.
 
 `fluxor publish --only <kind>` scopes the publish to a subset of
-artefact kinds (`source`, `fmod`, `runtime`, `stack`, `bundle`). Only the
+artefact kinds (`source`, `fmod`, `runtime`, `stack`, `bundle` for workload
+packages). Only the
 chosen kinds' tags move; the project index is rewritten over them plus the
 project's other artefacts already in the store.
 
 Only fluxor publishes runtimes; the `fluxor/run/` namespace is
 reserved. A sibling "runtime" is a graph on `fluxor-linux`.
 
-One bundle publishes on its own with
+One workload package publishes on its own with
 `fluxor publish bundle <packaging/…/workload.toml | dir>`: it emits the
-bundle, carries the `.fmod` of every module it pins, and adds it to the
-project index in one transaction. Bundles and their params are covered in
-[service-bundles.md](service-bundles.md).
+package, carries the `.fmod` of every module it pins, and adds it to the
+project index in one transaction. Workload packages and their params are
+covered in [workload-packages.md](workload-packages.md).
 
 One stack publishes on its own with `fluxor publish stack <file>`: it
 checks the document, records the module artifacts it composes (the
@@ -99,8 +100,8 @@ project's own published modules, else its `fluxor.lock` pins) and adds it
 to the project index as `stack/<name>:<version>`. See
 [../architecture/stacks.md](../architecture/stacks.md).
 
-A consumer never pins a stack or a bundle by hand: a graph that includes a
-stack by name, and a bundle listed under `[uses] bundles`, are references,
+A consumer never pins a stack or a workload package by hand: a graph that includes a
+stack by name, and a workload package listed under `[uses] bundles`, are references,
 and `fluxor update` pins each from the dependency that publishes it (with a
 stack's module references); a stack bound under `[uses.stacks]` is pinned
 from whichever project index publishes it; an update pins exactly the
@@ -108,7 +109,7 @@ references the project makes.
 
 A workload that brings its own modules is published the same way, on its
 own. `fluxor build <graph> --emit=workload --output <dir>` takes the graph's
-one `workloads:` entry — its modules and wiring written as a base graph's,
+one `workloads:` entry — its modules and wiring written as a node graph's,
 `module.port` ends and the platform's `linux_net` for the node's network (see
 [Lanes for a workload staged at runtime](../architecture/network.md#lanes-for-a-workload-staged-at-runtime))
 — and writes `graph.flxa` (the subgraph as the kernel
@@ -118,19 +119,20 @@ each module's `name_hash` and SHA-256, and under `env` every param bound to
 the workload's environment with `{env: NAME}` — see
 [A workload's environment](../architecture/scheduler.md#a-workloads-environment)).
 Each module's `step_deadline_us`,
-`step_deadline_burst_us` and `fault_policy` go in its FLXA record, and the
+`step_deadline_burst_us` and `fault_policy` go in its module record, and the
 node admits them within its own ceiling (see
 [Workload step budgets](../architecture/scheduler.md#workload-step-budgets)).
 `fluxor publish workload <dir>`
 tags it in the local store as `<name>:latest` (or `--tag`): an OCI
-artifact whose first layer is the FLXA and whose other layers are the
+artifact whose first layer is the composed graph and whose other layers are the
 modules, one each. A module layer's digest is the SHA-256 of its bytes,
 which is exactly the pin the node's kernel admits it by, so a node pins
 what the manifest names. Its config blob
 (`application/vnd.nanocloud.fluxor.workload-image.config.v1+json`) is
 `{"env": [...]}`, the `env` list of `workload-image.json` (`name`,
-`module`, `param`, `required`), so a puller reads the names a pod must give
-from the manifest and one blob and refuses a pod missing a required one
+`module`, `param`, `required`), so a puller reads the names a workload must be
+given from the manifest and one blob and refuses a workload missing a
+required one
 before it asks a node; `fluxor inspect <ref>` lists them (`--json`:
 `workload.env`, `workload.required_env`). `fluxor store push` serves it onward like any
 other tag.
@@ -301,7 +303,7 @@ make build && make publish  # fluxor build, then fluxor publish
   lockfile diff. An artefact fluxor publishes for the first time
   arrives with `fluxor update`.
 - **Pinned checkouts** stay on their digests until they run
-  `fluxor update`, which also pins every stack and bundle the project
+  `fluxor update`, which also pins every stack and workload package the project
   references by name.
 - **SDK edits flow the same way.** Source trees are artefacts:
   editing `crates/fluxor-abi/src/lib.rs` and publishing repoints
@@ -312,7 +314,7 @@ make build && make publish  # fluxor build, then fluxor publish
 
 Every command that loads `.fmod` artefacts (`fluxor run`, including
 `--replicas`, `fluxor build`, `fluxor flash`, `fluxor modules resolve`,
-bundle staging) takes its module root from one rule, first match wins:
+workload package staging) takes its module root from one rule, first match wins:
 
 1. `--module-root <dir>`;
 2. `$FLUXOR_MODULE_ROOT` (an empty value counts as unset);
@@ -490,4 +492,4 @@ the digest a tag pull reports.
 
 ## Related reading
 
-- [`../architecture/abi_layers.md`](../architecture/abi_layers.md) — what's actually in the ABI tier
+- [`../architecture/abi_layers.md`](../architecture/abi_layers.md) — what's actually in the ABI layer

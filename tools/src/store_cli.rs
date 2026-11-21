@@ -18,8 +18,8 @@ use crate::error::{Error, Result};
 // Bin-root helper (cli/commands_c.rs, flat `include!` scope).
 use crate::resolve_project_root;
 use fluxor_tools::oci_store::{
-    self, git_source_rev, sha256_hex_prefixed, ArtifactMeta, BundleArtifact, ImageManifest,
-    OciStore, StackArtifact, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL,
+    self, git_source_rev, sha256_hex_prefixed, ArtifactMeta, ImageManifest, OciStore,
+    PackageArtifact, StackArtifact, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL,
     PROVENANCE_PUBLISHED,
 };
 use fluxor_tools::store_remote;
@@ -169,27 +169,27 @@ fn provenance_flag(published: bool) -> &'static str {
 ///
 /// A source manifest is checked where the sweep finds it
 /// (`packaging/<service|applet>/<name>/workload.toml`) and emitted first.
-/// The bundle directory may be an
+/// The package directory may be an
 /// emitted root (`target/fluxor/<name>/`, documents under its target
-/// subdir), a flat target dir, or a materialised bundle (documents plus
-/// `modules/`). The module bytes come from the bundle's own `modules/` when
+/// subdir), a flat target dir, or a materialised package (documents plus
+/// `modules/`). The module bytes come from the package's own `modules/` when
 /// it has one, else from the publishing project's built modules; either way
-/// each must hash to the digest `workload.json` pins. The bundle is
+/// each must hash to the digest `workload.json` pins. The package is
 /// published under its project (`[project]` of the tree it lives in) and
 /// joins that project's index in one transaction.
-pub fn cmd_bundle_publish(
-    bundle: &Path,
+pub fn cmd_package_publish(
+    package: &Path,
     store_dir: Option<&Path>,
     tag: Option<&str>,
     published: bool,
     verbose: bool,
 ) -> Result<()> {
-    let dir = if crate::workload_src::is_source_manifest(bundle) {
-        let project_root = crate::project::root_for_config(bundle);
-        fluxor_tools::packaging::check_bundle(bundle, &project_root).map_err(Error::Config)?;
-        crate::workload_src::emit_bundle(bundle, None, verbose)?
+    let dir = if crate::workload_src::is_source_manifest(package) {
+        let project_root = crate::project::root_for_config(package);
+        fluxor_tools::packaging::check_package(package, &project_root).map_err(Error::Config)?;
+        crate::workload_src::emit_package(package, None, verbose)?
     } else {
-        bundle.to_path_buf()
+        package.to_path_buf()
     };
     let docs = if dir.join("graph.yaml").is_file() {
         dir.clone()
@@ -198,7 +198,7 @@ pub fn cmd_bundle_publish(
     };
     let read = |name: &str| -> Result<Vec<u8>> {
         fs::read(docs.join(name))
-            .map_err(|e| Error::Config(format!("bundle {}: {name}: {e}", docs.display())))
+            .map_err(|e| Error::Config(format!("package {}: {name}: {e}", docs.display())))
     };
     let workload_json = String::from_utf8(read("workload.json")?)
         .map_err(|e| Error::Config(format!("workload.json: {e}")))?;
@@ -208,7 +208,7 @@ pub fn cmd_bundle_publish(
     let report = fluxor_tools::workload::validate(&manifest);
     if !report.is_ok() {
         return Err(Error::Config(format!(
-            "bundle '{}' failed validation: {}",
+            "workload package '{}' failed validation: {}",
             manifest.name,
             report.errors.join("; ")
         )));
@@ -219,7 +219,7 @@ pub fn cmd_bundle_publish(
         .map_err(Error::Config)?
         .ok_or_else(|| {
             Error::Config(format!(
-                "no [project] table in {}/fluxor.toml — a bundle is published under its project",
+                "no [project] table in {}/fluxor.toml — a package is published under its project",
                 project_root.display()
             ))
         })?;
@@ -282,8 +282,8 @@ pub fn cmd_bundle_publish(
         .begin_publish()
         .map_err(|e| Error::Config(e.to_string()))?;
     let prepared = store
-        .prepare_bundle(
-            &BundleArtifact {
+        .prepare_package(
+            &PackageArtifact {
                 workload_json: &workload_json,
                 resources_json: &resources_json,
                 graph_yaml: &graph_yaml,
@@ -441,8 +441,8 @@ pub fn cmd_stack_publish(
 
 // ── fluxor publish image|firmware ─────────────────────────────────────
 
-/// Publish a device artifact (graph image / firmware image). For a
-/// graph image the FXSL header supplies epoch + ABI pin, mirrored into
+/// Publish a device artifact (node image / firmware image). For a
+/// node image the FXSL header supplies epoch + ABI pin, mirrored into
 /// annotations so a consumer can admit or reject from the manifest
 /// alone.
 pub fn cmd_device_artifact_publish(
@@ -463,7 +463,7 @@ pub fn cmd_device_artifact_publish(
         })
         .ok_or_else(|| Error::Config("cannot derive a name from the file path".into()))?;
 
-    // Graph images carry their own truth in the FXSL header.
+    // Node images carry their own truth in the FXSL header.
     const FXSL_MAGIC: u32 = 0x4C53_5846;
     let image_kind = kind.starts_with("image");
     let (epoch, abi_hex) = if image_kind {
@@ -471,7 +471,7 @@ pub fn cmd_device_artifact_publish(
             || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != FXSL_MAGIC
         {
             return Err(Error::Config(format!(
-                "{} is not a graph image (missing FXSL header) — build it with `fluxor build <config> --emit=image`",
+                "{} is not a node image (missing FXSL header) — build it with `fluxor build <config> --emit=image`",
                 file.display()
             )));
         }
@@ -501,7 +501,7 @@ pub fn cmd_device_artifact_publish(
         source_rev: source_rev.as_deref(),
         ref_name: &ref_name,
     };
-    // Layered (exploded) is the default graph-image form;
+    // Layered (exploded) is the default node-image form;
     // `image-packed` and firmware stay single-blob.
     let desc = if kind == "image" {
         oci_store::publish_layered_image(&store, &publish)
@@ -533,7 +533,7 @@ pub fn cmd_workload_image_publish(
     let target = field("target")?;
     let module_abi = field("module_abi")?;
     let abi_surface = field("abi_surface")?;
-    let flxa = read(&dir.join("graph.flxa"))?;
+    let graph = read(&dir.join("graph.flxa"))?;
     // Every module the image lists, read back and checked against the
     // digest the image recorded for it: the layer digest is the pin a node
     // admits the module by, so a module that changed since the image was
@@ -595,7 +595,7 @@ pub fn cmd_workload_image_publish(
             target: &target,
             module_abi: &module_abi,
             abi_surface_hex: &abi_surface,
-            flxa: &flxa,
+            graph: &graph,
             modules: &modules,
             env: &env,
             provenance: PROVENANCE_LOCAL,
@@ -612,7 +612,7 @@ pub fn cmd_workload_image_publish(
 /// workload's environment, each `name`, `module`, `param` and `required`.
 /// None listed is an image that binds none; an entry missing a field, or
 /// with an empty or malformed name, is refused, since the image's config
-/// would otherwise tell a puller less than its FLXA binds.
+/// would otherwise tell a puller less than its graph binds.
 fn workload_image_env(doc: &serde_json::Value) -> Result<Vec<oci_store::WorkloadEnvBinding>> {
     let Some(listed) = doc.get("env") else {
         return Ok(Vec::new());
@@ -1018,7 +1018,7 @@ pub fn lock_store_resolver(
 ///      unambiguous — every pin for that name shares one digest;
 ///   3. differing digests and no match for a HOST target (`linux`,
 ///      `wasm`) is `NotPinned`. A pin binds the target it names, and a
-///      host graph loads modules built from source into its graph image,
+///      host graph loads modules built from source into its node image,
 ///      never store bytes — so no pin here binds anything, and the
 ///      on-disk manifest is authoritative;
 ///   4. differing digests and no match for a SILICON is `Failed`:
@@ -1173,7 +1173,7 @@ mod tests {
 
     /// `workload-image.json`'s `env` becomes the image config's bindings;
     /// none listed is none bound; an entry that would tell a puller less
-    /// than the FLXA binds is refused.
+    /// than the graph binds is refused.
     #[test]
     fn a_workload_image_env_list_is_read_whole_or_refused() {
         let doc = serde_json::json!({"env": [

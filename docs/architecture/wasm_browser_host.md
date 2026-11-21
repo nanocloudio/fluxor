@@ -16,7 +16,7 @@ kernel-side halves of the built-ins live in `src/platform/wasm/`.
 ## 1. Position in the architecture
 
 ```
-Fluxor application graph (target-agnostic)
+Fluxor node graph (target-agnostic)
       |
       | AudioSample / VideoRaster / KeyEvents / PointerEvents / OctetStream / ...
       v
@@ -50,7 +50,7 @@ Source: `src/platform/wasm/host/runtime.html`,
    player / terminal surfaces);
 2. loads `fluxor.wasm` and instantiates it with the import object
    built by `host_shims.js`;
-3. calls `kernel_init()`, then pumps `kernel_step()` from a
+3. calls `kernel_init()`, then calls `kernel_step()` from a
    `requestAnimationFrame` loop in bounded synchronous bursts, so a
    busy graph cannot starve the page's own event handling.
 
@@ -143,7 +143,7 @@ include, so an unbound name is refused there, naming the line to add.
 With `?worker=1` on the page URL, the kernel runs off the main thread:
 `fluxor-worker.js` loads `host_shims.js` inside a Web Worker (with a
 minimal `window` / `document` stub) and runs `kernel_init` plus the
-step pump there. The page keeps the `AudioContext` and input capture;
+`kernel_step` loop there. The page keeps the `AudioContext` and input capture;
 the canvas is transferred to the worker as an `OffscreenCanvas`, so
 WebGPU present happens worker-side. PCM crosses to the page by
 `postMessage`, and the page pushes the live audio-clock lead back to
@@ -400,7 +400,7 @@ naming pipelines, targets or buffers until the app sends them again.
 The browser backend is WebGPU. The compute surface's contract is the
 same one the native (`linux_gpu`) and replay (`gpu_replay`)
 providers implement, so a graph wired to it runs unchanged on any of
-them, shipping the program pack the target accepts. Domain-specific
+them, shipping the program pack the target accepts. Application-specific
 GPU pipelines (a console rasteriser, a scientific kernel) are
 applications that consume these surfaces; they live out of tree.
 
@@ -527,19 +527,19 @@ bare metal. `FS_OPEN` returns a slot immediately with the fetch in
 flight; `FS_READ` maps the shim's four-state return to bytes / EAGAIN
 / EOF / error; `FS_STAT` maps `host_fetch_size` per the §3 table.
 `FS_WRITE` stages its `data` against the handle and publishes the bytes
-as one file at `FS_CLOSE`, in the persistent tier `storage.object` reads.
+as one file at `FS_CLOSE`, in the persistent layer `storage.object` reads.
 `FS_SEEK` and `FS_FSYNC` return `ENOSYS`; the streaming fetch model has no
 equivalent.
 
 ### `storage.object` provider — `src/platform/wasm/object.rs`
 
 Adds the bounded-range reads that demand-paging needs, plus a write
-tier:
+layer:
 
-- **Read tier.** `HEAD` / `RANGE_GET` over `fetch()` with byte
+- **Read layer.** `HEAD` / `RANGE_GET` over `fetch()` with byte
   ranges, serving shipped, immutable content from the page origin and
   the in-bundle `asset://` map.
-- **Write tier.** `PUT` stages the blob in the shim's in-memory
+- **Write layer.** `PUT` stages the blob in the shim's in-memory
   object store, so an immediately following `GET` / `HEAD` /
   `RANGE_GET` of the same key sees it, and persists it in the
   background to OPFS (Origin Private File System), with an IndexedDB
@@ -547,13 +547,13 @@ tier:
   browsers). The store is re-hydrated from persistent storage at
   boot, so a key written in a prior session reads back after a
   reload. This is what lets user-written data (save states, imported
-  assets) survive in the browser. `DELETE` removes a key from this tier
-  only (`host_object_delete`); a key served by the read tier is not the
+  assets) survive in the browser. `DELETE` removes a key from this layer
+  only (`host_object_delete`); a key served by the read layer is not the
   provider's to delete.
 
-`LIST` answers `ENOSYS`: the read tier falls through to `fetch()` against
+`LIST` answers `ENOSYS`: the read layer falls through to `fetch()` against
 the page origin, which cannot be enumerated, and a listing of the written
-tier alone would omit objects `GET` serves. Enumeration is the
+layer alone would omit objects `GET` serves. Enumeration is the
 `storage.namespace` provider's.
 
 Reads consult the written store before falling through to `fetch()`.
@@ -564,7 +564,7 @@ the endpoint surface's best-effort cache role.
 ### `storage.namespace` provider — `src/platform/wasm/namespace.rs`
 
 The browser has no `readdir`, so directory-style discovery derives a
-tree from the same flat key space the object tier writes. `/` is the
+tree from the same flat key space the object layer writes. `/` is the
 hierarchy separator over the union of the written object store and a
 fetched manifest of shipped content (`manifestUrl`, default
 `fluxor-manifest.json`: a JSON array of `{key, size, mtime?, etag?}`).
@@ -599,7 +599,7 @@ storage-backed asset bank: enumerate a prefix via `storage.namespace`
 `LIST`, stream each entry via `storage.object` `GET` / `RANGE_GET`.
 Wired as `button → gesture → object_bank → codec → audio_out`, a
 browser plays media from a user-populatable library (imported through
-the object write tier, or listed in `fluxor-manifest.json`) rather
+the object write layer, or listed in `fluxor-manifest.json`) rather
 than only bundle-baked `asset://` tracks.
 
 ---
@@ -647,7 +647,7 @@ A browser-host integration is healthy when:
 - Audio scheduling is implemented once in the shim's worklet ring; no
   application code touches WebAudio.
 - Input identity is preserved end-to-end; the input built-ins emit
-  source-domain records with no application mapping.
+  source-side records with no application mapping.
 - Every kernel-side wasm extern has a matching `host_*` shim entry,
   and the shims behave as the built-ins above rely on when driven from
   a fake linear memory under `node` — the `wasm-host-shims (node)`

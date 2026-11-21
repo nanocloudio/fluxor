@@ -12,7 +12,7 @@
 //     address of every S-box load is secret-dependent. An adversary
 //     who can observe the data-cache footprint of this code (shared
 //     cache, co-located hyperthread, or any local process on a
-//     multi-tenant host) can recover the key by the standard
+//     host shared with other parties) can recover the key by the standard
 //     cache-timing attack on table-driven AES. The table living in
 //     `.rodata` bounds nothing here: read-only memory is cached like
 //     any other.
@@ -569,7 +569,7 @@ pub const AES_IS_CONSTANT_TIME: bool = cfg!(all(target_arch = "aarch64", target_
 ///     mitigation there.
 ///   - Every other target: on. On the aarch64 builds the block cipher is
 ///     data-independent. A build without the extension (an x86-64 host)
-///     runs it on the secret-indexed S-box: such a host is multi-tenant
+///     runs it on the secret-indexed S-box: such a host is shared,
 ///     with hardware data caches and possible co-resident untrusted
 ///     workloads, but it must also interoperate with arbitrary peers, and a
 ///     node that cannot speak `TLS_AES_128_GCM_SHA256` is not a TLS 1.3

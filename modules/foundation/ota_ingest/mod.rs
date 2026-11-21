@@ -1,4 +1,4 @@
-//! OTA ingest — stream a graph bundle into the inactive slot.
+//! OTA ingest — stream a node image into the inactive slot.
 //!
 //! Reads a raw byte stream from `in_chan[0]` (normally wired from an
 //! HTTP or net-tap source), accumulates it into 256-byte pages, and
@@ -16,7 +16,7 @@
 //!
 //! ```yaml
 //! wiring:
-//!   - from: stream_intake.bytes  # or whatever feeds the bundle bytes
+//!   - from: stream_intake.bytes  # or whatever feeds the node image bytes
 //!     to:   ota_ingest.stream
 //!   - from: ota_ingest.status    # optional status records
 //!     to:   log.in
@@ -59,7 +59,7 @@ use abi::contracts::storage::graph_slot::channel::{
     FRAME_HDR, REQ_ACTIVATE, REQ_ERASE, REQ_WRITE, RESP_FRAME_LEN, RESP_PAYLOAD, RESP_RESULT,
 };
 use abi::platform::rp::flash_layout::{GraphFlash, GRAPH_FLASH_LEN};
-use abi::wire::graph_image;
+use abi::wire::node_image;
 use abi::SyscallTable;
 use fluxor_abi as abi;
 
@@ -70,8 +70,8 @@ use fluxor_rt::*;
 // ============================================================================
 
 const PAGE_SIZE: usize = 256;
-/// A graph image's first four bytes, "FXSL".
-const MAGIC: [u8; 4] = graph_image::MAGIC.to_le_bytes();
+/// A node image's first four bytes, "FXSL".
+const MAGIC: [u8; 4] = node_image::MAGIC.to_le_bytes();
 
 // Extra port indices (primary in/out are index 0).
 const PORT_IN_GS_RESP: u32 = 1; // graph_slot response channel
@@ -136,9 +136,9 @@ struct State {
 
 /// Where an image ends, from its header page: its payload's end, rounded up
 /// to a whole page. `None` for a header the codec refuses for a slot of
-/// this board's size (`wire::graph_image::Header::decode`).
+/// this board's size (`wire::node_image::Header::decode`).
 fn declared_end(header: &[u8; PAGE_SIZE], slot_size: u32) -> Option<u32> {
-    let h = graph_image::Header::decode(header, u64::from(slot_size)).ok()?;
+    let h = node_image::Header::decode(header, u64::from(slot_size)).ok()?;
     let end = h.end().div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
     if end > u64::from(slot_size) {
         return None;

@@ -32,10 +32,9 @@
 #[cfg(feature = "host-window")]
 pub(crate) static SURFACE_WINDOW_GEOM: AtomicU32 = AtomicU32::new(0);
 
-const LINUX_SURFACE_TRAITS_HASH: u32 = 0x9772_C0F3; // fnv1a32("linux_surface_traits")
 
-use fluxor::platform::builtin_param_tags::linux_surface_traits as surface_traits_tags;
-use fluxor::platform::builtin_param_tags::linux_surface_traits::{
+use fluxor::abi::platform::native::linux::linux_surface_traits as surface_traits_tags;
+use fluxor::abi::platform::native::linux::linux_surface_traits::{
     TAG_HEIGHT as ST_TAG_HEIGHT, TAG_WIDTH as ST_TAG_WIDTH,
 };
 
@@ -125,9 +124,9 @@ fn encode(
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_surface_traits_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn linux_surface_traits_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-owned per-instance arena for this module;
     // size-matched to `LinuxSurfaceTraitsState` by the loader.
     let st = unsafe { instance_state::<LinuxSurfaceTraitsState>(state) };
@@ -211,7 +210,7 @@ unsafe fn linux_surface_traits_step(state: *mut u8) -> i32 {
     0
 }
 
-fn build_linux_surface_traits(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_linux_surface_traits(module_idx: usize, params: &[u8]) -> Result<Box<LinuxSurfaceTraitsState>, i32> {
     let mut width: u16 = 0;
     let mut height: u16 = 0;
     walk_tlv(params, |tag, value| match tag {
@@ -219,12 +218,8 @@ fn build_linux_surface_traits(module_idx: usize, params: &[u8]) -> scheduler::Bu
         ST_TAG_HEIGHT => height = tlv_u32(value) as u16,
         _ => {}
     });
-    scheduler::set_current_module(module_idx);
     let out_chan = scheduler::module_port(module_idx, surface_traits_tags::PORT_EVENTS);
-    let mut m = scheduler::BuiltInModule::new("linux_surface_traits", linux_surface_traits_step);
-    install_state(
-        &mut m,
-        Box::new(LinuxSurfaceTraitsState {
+    let st = Box::new(LinuxSurfaceTraitsState {
             out_chan,
             cfg_width: width,
             cfg_height: height,
@@ -240,13 +235,21 @@ fn build_linux_surface_traits(module_idx: usize, params: &[u8]) -> scheduler::Bu
             emitted: false,
             epoch: 0,
             ticks: 0,
-        }),
-    );
+        });
     log::info!(
         "[linux_surface_traits] authority cfg {width}x{height} \
          (geometry: live window when host-window else config; modalities + gamepad \
          count from /proc/bus/input/devices re-scanned every {RESCAN_TICKS} ticks; \
          audio from linux_audio), out_chan={out_chan}"
     );
-    m
+    Ok(st)
 }
+
+impl HostNative for LinuxSurfaceTraitsState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_surface_traits(slot, params)
+    }
+}
+
+/// The `linux_surface_traits` native module.
+pub static LINUX_SURFACE_TRAITS: NativeVtable = host_vtable::<LinuxSurfaceTraitsState>(linux_surface_traits_step);

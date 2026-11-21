@@ -2,8 +2,8 @@
 //!
 //! Owns the two OTA slots, which lie where the kernel partitioned this
 //! board's flash (`FLASH_LAYOUT`): their size is the board's, a third each
-//! of what the kernel leaves. Each slot holds a graph image: its 256-byte
-//! header (`abi::wire::graph_image`), then the module table (with its
+//! of what the kernel leaves. Each slot holds a node image: its 256-byte
+//! header (`abi::wire::node_image`), then the module table (with its
 //! program section) and the static config. Of the slots the boot selector admits,
 //! the one with the higher epoch is the one the next boot selects.
 //!
@@ -195,7 +195,7 @@ struct State {
 // Header decoding
 // ============================================================================
 
-use abi::wire::graph_image::{self, Header as HeaderFields};
+use abi::wire::node_image::{self, Header as HeaderFields};
 
 unsafe fn read_u32_le(p: *const u8) -> u32 {
     (core::ptr::read(p) as u32)
@@ -205,9 +205,9 @@ unsafe fn read_u32_le(p: *const u8) -> u32 {
 }
 
 /// The header at `base_xip`, in a slot of `slot_size` bytes, read as the
-/// kernel's boot selector reads it (`wire::graph_image::Header::decode`).
+/// kernel's boot selector reads it (`wire::node_image::Header::decode`).
 unsafe fn decode_header(base_xip: *const u8, slot_size: u32) -> Option<HeaderFields> {
-    let bytes = core::slice::from_raw_parts(base_xip, graph_image::HEADER_SIZE);
+    let bytes = core::slice::from_raw_parts(base_xip, node_image::HEADER_SIZE);
     HeaderFields::decode(bytes, u64::from(slot_size)).ok()
 }
 
@@ -482,7 +482,7 @@ unsafe fn slot_pin_admits(base_xip: *const u8, own: &[u8; 32]) -> bool {
     let mut pin = [0u8; 32];
     let mut i = 0;
     while i < 32 {
-        pin[i] = core::ptr::read(base_xip.add(graph_image::ABI_PIN_AT + i));
+        pin[i] = core::ptr::read(base_xip.add(node_image::ABI_PIN_AT + i));
         i += 1;
     }
     ct_eq32(&pin, own)
@@ -619,14 +619,14 @@ const E_ACCES: i32 = -13;
 /// signature whose `S` is not below the group order.
 fn signature_job(s: &State) -> Option<Ed25519VerifyJob> {
     let h = &s.header;
-    let record = graph_image::signature(h)?;
+    let record = node_image::signature(h)?;
     let id = sha256(&s.root);
     if record.key_id != id[..4] {
         return None;
     }
     ed25519_verify_init(
         &s.root,
-        &h[..graph_image::SIGNED_LEN],
+        &h[..node_image::SIGNED_LEN],
         &record.signature,
         SIG_BITS_PER_STEP,
     )

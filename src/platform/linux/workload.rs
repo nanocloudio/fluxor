@@ -4,8 +4,8 @@
 // ============================================================================
 //
 // This provider is the platform-neutral front for isolated workloads. It parses
-// the Tier-1 spec header, resolves the identity to a plan-allocated owner,
-// lease-gates admission, enforces the Tier-2 options envelope FAIL-CLOSED
+// the spec header, resolves the identity to a plan-allocated owner,
+// lease-gates admission, enforces the options envelope FAIL-CLOSED
 // against the resolved backend's advertised capabilities, then delegates to the
 // backend. On Linux the only backend is the host-process backend — the
 // owner-bound `host_backend.rs` mechanism (namespaces/cgroups); an fmod-graph source has
@@ -48,7 +48,7 @@ use crate::kernel::workload::owner::OwnerHandle;
 // * `TTY_CLOSE` — kill+reap+free a session. `arg` = `[sid:u32]`;
 //   return = exit code.
 
-/// The workload-index domain: one workload per sandbox. The table is sized
+/// The workload-index range: one workload per sandbox. The table is sized
 /// at boot with the sandbox table ([`size_workloads`]).
 const MAX_WORKLOADS: usize = MAX_SANDBOXES;
 const _: () = assert!(
@@ -74,17 +74,17 @@ struct WorkloadSlot {
 
 const WORKLOAD_EMPTY: WorkloadSlot = WorkloadSlot {
     in_use: false,
-    owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+    owner: crate::kernel::workload::owner::OWNER_NODE,
     backend_idx: -1,
     allocated: false,
-    holder: crate::kernel::workload::owner::OWNER_SYSTEM,
+    holder: crate::kernel::workload::owner::OWNER_NODE,
 };
 
 /// Whether the calling module may act on a workload `slot` holds: its
 /// owner created it, or it acts with the node's authority (the node agent).
 fn may_use(slot: &WorkloadSlot) -> bool {
     use crate::kernel::exec::scheduler;
-    scheduler::caller_authority() == crate::kernel::workload::owner::OWNER_SYSTEM
+    scheduler::caller_authority() == crate::kernel::workload::owner::OWNER_NODE
         || scheduler::caller_owner() == slot.holder
 }
 
@@ -165,7 +165,7 @@ fn host_backend_postures() -> u32 {
     }
     p
 }
-/// Tier-2 options this backend realizes. `mount`/`bind` is a volume
+/// Options entries this backend realizes. `mount`/`bind` is a volume
 /// (`wl::volume`): the value is `<host path>\0<path in the workload>\0<ro:
 /// 1|0>`, bind-mounted into the rootfs before the pivot
 /// (`host_backend::hp_spawn_with_binds`). `env`/`var` (`wl::env`) is one
@@ -174,7 +174,7 @@ fn host_backend_honors_option(ns: &[u8], key: &[u8]) -> bool {
     (ns == wl::volume::NS && key == wl::volume::KEY) || (ns == wl::env::NS && key == wl::env::KEY)
 }
 
-/// The Tier-2 directory [`CAPS`](wl::CAPS) lists: what both backends
+/// The options directory [`CAPS`](wl::CAPS) lists: what both backends
 /// realize. The graph backend realizes the same two
 /// (`workload_graph::GRAPH_OPTIONS`): a volume as its modules' `fs` root,
 /// the environment as their env binds.
@@ -259,7 +259,7 @@ fn host_backend_can_freeze() -> bool {
     })
 }
 
-/// Validate the Tier-2 TLV options envelope. Advisory entries a backend does not
+/// Validate the TLV options envelope. Advisory entries a backend does not
 /// understand are ignored; a REQUIRED entry it does not advertise fails
 /// admission. Returns `Ok(())` or a negative errno. TLV entry:
 /// `[ns_len:u8][ns][key_len:u8][key][flags:u8][val_len:u16 LE][val]`.
@@ -424,7 +424,7 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
 }
 
 /// `CREATE` on the host-process backend: admit + instantiate a workload from
-/// the Tier-1 header + the variable-length source-ref / endpoint / options
+/// the header + the variable-length source-ref / endpoint / options
 /// sections. Returns the workload slot's index or a negative errno.
 /// An owner this call allocates is freed again when the call refuses, so a
 /// refused CREATE leaves nothing.
@@ -469,7 +469,7 @@ unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) ->
     let source_ref_len = rd_u16(buf, 40) as usize;
     let endpoint_count = rd_u16(buf, 42) as usize;
     let options_len = rd_u32(buf, 44) as usize;
-    // Tier-1 network identity: an input computed by the
+    // Header network identity: an input computed by the
     // orchestrator's address policy; the backend realizes it.
     let net_family = buf[48];
     let net_prefix_len = buf[49];
@@ -627,7 +627,7 @@ unsafe fn workload_create_as(buf: &[u8], allocated: &mut Option<OwnerHandle>) ->
         return errno::ENOSYS;
     }
 
-    // Tier-2 options: fail-closed against the backend's advertised capabilities.
+    // Options: fail-closed against the backend's advertised capabilities.
     let mut binds = std::vec::Vec::new();
     if let Err(e) = validate_options(&buf[opt_start..opt_end], &mut binds) {
         return e;

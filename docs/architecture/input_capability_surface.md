@@ -4,7 +4,7 @@ Fluxor's input architecture rests on two layered concepts:
 
 1. a **surface family** — typed channel content the graph carries, one
    content type per input class;
-2. a **role discipline** — sources emit source-domain events, mapper
+2. a **role discipline** — sources emit raw source events, mapper
    modules own application meaning, and consumers read the resolved
    surface only.
 
@@ -25,7 +25,7 @@ Input pipelines move data on channels typed by `content_type`. One
 content type exists per input class, so a consumer reads the same wire
 shape regardless of which producer is on the other end:
 
-| Surface             | Domain                                       | Typical producers                                              |
+| Surface             | Carries                                      | Typical producers                                              |
 |---------------------|----------------------------------------------|----------------------------------------------------------------|
 | `KeyEvents`         | Keyboard transitions (logical + physical key) | `wasm_browser_keyboard`, hardware scan-code readers            |
 | `PointerEvents`     | Unified mouse / touch / stylus events        | `wasm_browser_pointer`, `linux_pointer`, touchscreen drivers   |
@@ -137,7 +137,7 @@ match, canonicalised to lowercase).
 
 The registry's input-side names:
 
-- `input.mapper` — module translates source-domain input into another
+- `input.mapper` — module translates raw source input into another
   input surface or semantic commands
 - `input.gamepad` — gamepad source
 - `input.virtual` — software-synthesised source (no physical sensor)
@@ -155,13 +155,13 @@ content type alone and declare no capability names.
 
 Three input roles sit above the surface family:
 
-- **Source** — captures source-domain events or state and encodes no
+- **Source** — captures raw source events or state and encodes no
   application semantics. A button driver emits debounced transitions;
   it does not emit `play` or `pause`. Per-platform drivers expose the
   same wire shape (`wasm_browser_keyboard` and a hardware scan-code
   reader both emit `KeyEvents`), so downstream modules are
   platform-agnostic.
-- **Mapper** — translates source-domain input into consumer-domain
+- **Mapper** — translates raw source input into consumer-facing
   input or semantic commands, and owns all timing and binding
   knowledge. `modules/foundation/gesture` consumes button bytes and
   emits FMP commands (`next`, `prev`, `toggle`, `select`,

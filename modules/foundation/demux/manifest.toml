@@ -21,4 +21,4 @@ required = true
 
 # Module-scope observability — exempt.
 [observability]
-exempt = "L2 pass-through filter/fan-out — frame bytes are observed at the ip module; its domain metric is pass/drop counts"
+exempt = "L2 pass-through filter/fan-out — frame bytes are observed at the ip module; its metric is pass/drop counts"

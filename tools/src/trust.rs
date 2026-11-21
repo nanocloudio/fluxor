@@ -73,7 +73,7 @@ impl TrustPolicy {
         }
     }
 
-    /// True if every signer in `signers` admits for its role — i.e. the bundle
+    /// True if every signer in `signers` admits for its role — i.e. the package
     /// and all referenced artifacts are covered by trusted, non-revoked keys.
     pub fn admits_all(&self, signers: &[(KeyId, SignerRole)]) -> bool {
         signers
@@ -154,7 +154,7 @@ mod tests {
             (key(1), SignerRole::System),
             (key(2), SignerRole::Publisher)
         ]));
-        // one revoked → whole bundle fails
+        // one revoked → whole package fails
         p.revoke(key(2));
         assert!(!p.admits_all(&[
             (key(1), SignerRole::System),

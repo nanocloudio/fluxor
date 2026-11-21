@@ -24,6 +24,7 @@ mod abi_registry;
 mod add_subgraph;
 mod agent_cli;
 mod asset_bank;
+mod native_params;
 // The binary reaches for the decode half only (PEM trust anchors); the lib
 // uses both. One source, two crates, so the unused half is dead here and
 // not there.
@@ -42,7 +43,6 @@ mod error;
 mod gpu_contract;
 mod gpu_pack;
 mod graph_assets;
-mod graph_image;
 mod hash;
 mod hygiene;
 mod identity_key;
@@ -50,6 +50,7 @@ mod manifest;
 mod modules;
 mod modules_build;
 mod monitor;
+mod node_image;
 // `ci.rs` is shared between the lib and this bin; it refers to the
 // observability lint as `crate::observability`. Re-export the lib's single
 // copy here so the bin doesn't recompile the (mostly bin-dead) id-table
@@ -82,7 +83,7 @@ pub(crate) use fluxor_tools::store_sync;
 // `lifecycle`), so re-export the lib's single copies.
 pub(crate) use fluxor_tools::ci_schema;
 pub(crate) use fluxor_tools::makefile_lint;
-// `ci.rs` checks stacks and bundles through `crate::packaging` and
+// `ci.rs` checks stacks and packages through `crate::packaging` and
 // `crate::stack`, which are lib-only; the bin reaches the lib's single
 // copies.
 pub(crate) use fluxor_tools::packaging;
@@ -92,7 +93,6 @@ pub mod reconfigure;
 mod render_template;
 pub mod rig;
 mod ring_demand;
-mod ring_plan;
 mod runtime_abi;
 mod scenario;
 mod schema;
@@ -232,7 +232,7 @@ fn main() {
             };
             if !params.is_empty() && replicas.is_some() {
                 return Err(Error::Config(
-                    "run --param/--params apply to a service bundle, not --replicas templates"
+                    "run --param/--params apply to a service workload package, not --replicas templates"
                         .into(),
                 ));
             }
@@ -279,9 +279,11 @@ fn main() {
         Commands::Applet { action } => match action {
             AppletAction::Logs { name, tail, all } => workload_src::applet_logs(&name, tail, all),
         },
-        Commands::Install { bundle, name, link } => {
-            workload_src::install_applet(&bundle, name.as_deref(), link.as_deref(), verbose)
-        }
+        Commands::Install {
+            package,
+            name,
+            link,
+        } => workload_src::install_applet(&package, name.as_deref(), link.as_deref(), verbose),
         Commands::Flash {
             config,
             module_root,
@@ -534,11 +536,11 @@ fn lifted(r: std::result::Result<(), fluxor_tools::error::Error>) -> Result<()> 
 /// `fluxor publish` — the single store-write verb. The optional
 /// subcommand (`abi|sdk|common|fmod|runtime`) and the `--only` flag
 /// both narrow the artifact kinds; `publish bundle <dir>` publishes one
-/// workload bundle, `publish stack <file>` one stack. Bare `publish`
+/// workload package, `publish stack <file>` one stack. Bare `publish`
 /// sweeps everything the project ships, in dependency order: sources;
 /// built fmods and `[project].runtimes` binaries (and, in the fluxor repo,
 /// the CLI itself); stacks, which record the module digests they compose;
-/// bundles, which may include those stacks.
+/// packages, which may include those stacks.
 fn cmd_publish(
     action: Option<PublishAction>,
     only: &[String],
@@ -563,14 +565,14 @@ fn cmd_publish(
         ));
     }
     if let Some(PublishAction::Bundle {
-        bundle,
+        package,
         store,
         tag,
         published,
     }) = action
     {
-        return store_cli::cmd_bundle_publish(
-            &bundle,
+        return store_cli::cmd_package_publish(
+            &package,
             store.as_deref(),
             tag.as_deref(),
             published,
@@ -630,7 +632,7 @@ fn cmd_publish(
         );
     }
     let (kinds, sub_root): (Vec<&str>, Option<PathBuf>) = match action {
-        // abi/sdk/common all name the source tier — the store publisher
+        // abi/sdk/common all name the source kind — the store publisher
         // sweeps every source artifact the project owns.
         Some(
             PublishAction::Abi { project_root: r }
@@ -680,10 +682,10 @@ fn cmd_publish(
 /// The publish sweep over `kinds` (empty = everything), in dependency
 /// order: sources, fmods and runtimes in one transaction; then each stack
 /// under `packaging/stack/`, whose module references resolve through the
-/// modules just published; then each bundle under `packaging/service/` and
+/// modules just published; then each package under `packaging/service/` and
 /// `packaging/applet/`, whose graph may include those stacks. What it
 /// publishes is [`fluxor_tools::packaging::discover`]'s, the list `fluxor ci`
-/// checks. Every stack and bundle is checked before anything is written, so
+/// checks. Every stack and package is checked before anything is written, so
 /// one that cannot be published fails the sweep rather than being skipped.
 fn publish_sweep(
     pr: &Path,
@@ -701,7 +703,7 @@ fn publish_sweep(
     let sweep_project = kinds.is_empty() || !project_kinds.is_empty();
     let rel = |p: &Path| p.strip_prefix(pr).unwrap_or(p).display().to_string();
 
-    // Checked up front, so a broken stack or bundle refuses the whole
+    // Checked up front, so a broken stack or package refuses the whole
     // sweep before its modules are published.
     let shippables = fluxor_tools::packaging::discover(pr);
     let mut stacks: Vec<(PathBuf, String)> = Vec::new();
@@ -721,20 +723,20 @@ fn publish_sweep(
             )));
         }
     }
-    let mut bundles: Vec<(PathBuf, String)> = Vec::new();
+    let mut packages: Vec<(PathBuf, String)> = Vec::new();
     if want("bundle") {
         let mut errors = Vec::new();
-        for (_, manifest) in shippables.bundles {
-            match fluxor_tools::packaging::check_bundle(&manifest, pr)
-                .and_then(|_| fluxor_tools::packaging::read_bundle(&manifest).map(|s| s.name))
+        for (_, manifest) in shippables.packages {
+            match fluxor_tools::packaging::check_package(&manifest, pr)
+                .and_then(|_| fluxor_tools::packaging::read_package(&manifest).map(|s| s.name))
             {
-                Ok(name) => bundles.push((manifest, name)),
-                Err(e) => errors.push(format!("bundle {}: {e}", rel(&manifest))),
+                Ok(name) => packages.push((manifest, name)),
+                Err(e) => errors.push(format!("package {}: {e}", rel(&manifest))),
             }
         }
         if !errors.is_empty() {
             return Err(Error::Config(format!(
-                "publish refused: {} bundle(s) cannot be published, and nothing was written:\n  {}",
+                "publish refused: {} package(s) cannot be published, and nothing was written:\n  {}",
                 errors.len(),
                 errors.join("\n  ")
             )));
@@ -762,7 +764,7 @@ fn publish_sweep(
         for (path, reference) in &stacks {
             println!("would publish stack {reference} ({})", rel(path));
         }
-        for (manifest, name) in &bundles {
+        for (manifest, name) in &packages {
             println!("would publish bundle {name} ({})", rel(manifest));
         }
         println!("\ndry run: nothing was written.");
@@ -772,8 +774,8 @@ fn publish_sweep(
         store_cli::cmd_stack_publish(path, store, None, false)
             .map_err(|e| Error::Config(format!("publish stack {}: {}", rel(path), bare(e))))?;
     }
-    for (manifest, _) in &bundles {
-        store_cli::cmd_bundle_publish(manifest, store, None, false, verbose)
+    for (manifest, _) in &packages {
+        store_cli::cmd_package_publish(manifest, store, None, false, verbose)
             .map_err(|e| Error::Config(format!("publish bundle {}: {}", rel(manifest), bare(e))))?;
     }
     Ok(())

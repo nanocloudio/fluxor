@@ -10,11 +10,11 @@
 // Each built-in walks the blob with `walk_tlv` and dispatches by tag.
 // Tags are declared per parameter in the module's `manifest.toml` and are
 // permanent, so the wire meaning of a field survives any reordering of the
-// `[[params]]` table; the constants to match on are generated from those
-// manifests into `crate::platform::builtin_param_tags`. Tags 0xF0..0xFF are
-// reserved for protection / fault policy and are silently ignored here.
+// `[[params]]` table. Tags 0xF0..0xFF are reserved for protection / fault
+// policy and are silently ignored here.
 
-use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
+use crate::kernel::module::loader::ModuleStepFn;
 
 /// Iterate the TLV payload of a module entry, calling `f(tag, value)`
 /// for each entry. No-op on a blob that lacks the magic+version
@@ -43,42 +43,54 @@ pub fn tlv_str(value: &[u8]) -> &str {
     core::str::from_utf8(value).unwrap_or("")
 }
 
-/// Per-instance built-in state: stash a `Box<T>` in the 64-byte
-/// bootstrap buffer (`BuiltInModule.state`) so each instance has its
-/// own heap-allocated state. The Box is intentionally leaked — module
-/// teardown isn't a thing on the host harness, and the alternative
-/// (resurrecting the Box on drop) would require carrying a destructor
-/// pointer through the `Module` trait.
-///
-/// Pair with `instance_state<T>` in the step function to read the
-/// pointer back.
-pub fn install_state<T>(m: &mut scheduler::BuiltInModule, state: Box<T>) {
-    let raw = Box::into_raw(state);
-    // pointer fits — even 16-byte Box pointers leave plenty of slack
-    // in the 64-byte buffer.
-    debug_assert!(core::mem::size_of::<*mut T>() <= m.state.len());
-    // SAFETY: `m.state` is a 64-byte stack buffer owned by the module;
-    // the debug_assert above confirms `sizeof::<*mut T>() <= state.len()`.
-    unsafe {
-        core::ptr::write(m.state.as_mut_ptr() as *mut *mut T, raw);
+/// A host native module: its instance is a host value, built from its slot
+/// (ports wired, owner stamped) and its params, and dropped when the slot is
+/// vacated or the graph rebuilt.
+pub trait HostNative: Sized + 'static {
+    /// Build the instance, or the negative errno that refuses it.
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32>;
+}
+
+/// The vtable of host native `T` whose step is `step`: its arena state is
+/// the instance's heap pointer, its drop the instance's.
+pub const fn host_vtable<T: HostNative>(step: ModuleStepFn) -> NativeVtable {
+    NativeVtable {
+        new: host_new::<T>,
+        step,
+        refill: None,
+        flush: None,
+        isr_entry: None,
+        drop: Some(host_drop::<T>),
+        state_size: core::mem::size_of::<*mut T>() as u32,
     }
 }
 
-/// Recover the per-instance state from the bootstrap buffer. Each call
-/// produces a fresh `&mut T` borrowed from the same heap slot — caller
-/// must not call this twice in nested scope.
+/// # Safety
+/// `state` is the instance's arena state, `size_of::<*mut T>()` bytes.
+unsafe fn host_new<T: HostNative>(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    match T::build(init.slot, init.params) {
+        Ok(b) => {
+            // SAFETY: the arena state holds one pointer; 8-byte aligned.
+            unsafe { core::ptr::write(state.cast::<*mut T>(), Box::into_raw(b)) };
+            0
+        }
+        Err(rc) => rc,
+    }
+}
+
+/// # Safety
+/// `state` holds the pointer [`host_new`] wrote; this is its one release.
+unsafe fn host_drop<T: HostNative>(state: *mut u8) {
+    // SAFETY: the pointer `Box::into_raw` produced in `host_new`.
+    drop(unsafe { Box::from_raw(core::ptr::read(state.cast::<*mut T>())) });
+}
+
+/// The instance a host native's step is handed.
 ///
 /// # Safety
-/// `state` must point to a buffer previously initialized by
-/// [`install_state`] of matching `T`. Built-in dispatch in
-/// `src/platform/linux.rs` matches by `name_hash`, which encodes the
-/// type uniquely.
-pub unsafe fn instance_state<T>(state: *mut u8) -> &'static mut T {
-    // SAFETY: caller upholds the `# Safety` invariant above — `state`
-    // was previously initialised by `install_state::<T>`.
-    let ptr = unsafe { core::ptr::read(state as *const *mut T) };
-    // SAFETY: `ptr` was produced by `Box::into_raw(Box::new(state))`
-    // in `install_state`; the heap allocation outlives the module
-    // instance per the linux platform's lifecycle.
-    unsafe { &mut *ptr }
+/// `state` is the arena state of a [`host_vtable::<T>`] instance, borrowed
+/// exclusively for the step.
+pub unsafe fn instance_state<'a, T>(state: *mut u8) -> &'a mut T {
+    // SAFETY: the caller's contract: `state` holds the instance's pointer.
+    unsafe { &mut *core::ptr::read(state.cast::<*mut T>()) }
 }

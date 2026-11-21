@@ -2,9 +2,9 @@ name = "fs_async_seed"
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
 
-# Writes `count` files through the fs contract's ASYNC fence tier —
+# Writes `count` files through the fs contract's ASYNC fence surface —
 # OPEN_CREATE, WRITE, FSYNC_SUBMIT, FSYNC_POLL until Durable, CLOSE — the
-# tier a store's flush uses, and logs each name once its fence has landed.
+# surface a store's flush uses, and logs each name once its fence has landed.
 # A scenario cuts the power after `DONE`; a second boot with `verify = 1`
 # reads every file back and logs `verify ok=<n> bad=<m>`: every name logged
 # durable must be there, whole, with the last pass's bytes. The host suite

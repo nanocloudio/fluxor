@@ -8,8 +8,8 @@
 //! deterministic plan, encode it to the bounded binary form the kernel consumes,
 //! stage it (plan blob in the content-addressed store), verify, and atomically
 //! commit. `load_committed_plan` reads it back — the same bytes a device fetches
-//! to apply at boot. This is the real delivery path the `FLUXOR_PLAN` /
-//! `test-plan` stand-ins emulate.
+//! to apply at boot. This is the real delivery path the `FLUXOR_PLAN`
+//! stand-in emulates.
 
 use sha2::{Digest, Sha256};
 
@@ -779,32 +779,32 @@ fn proc_start_ticks(pid: u32) -> Option<u64> {
     fields.nth(18)?.parse().ok()
 }
 
-/// What a bundle directory says of the workload once it has passed admission.
+/// What a package directory says of the workload once it has passed admission.
 #[derive(Clone, Debug)]
-pub struct ResolvedBundle {
+pub struct ResolvedPackage {
     pub name: String,
     pub profile: crate::compose::ResourceProfile,
-    /// The workload digest: the sha256 of the bundle's `workload.json`, which
+    /// The workload digest: the sha256 of the package's `workload.json`, which
     /// pins `resources.json` and `graph.yaml` by their own digests.
     pub workload_digest: [u8; 32],
     pub exports: Vec<crate::compose::ExportDecl>,
 }
 
 /// Verify an on-disk artifact's content hashes to the manifest's pinned digest.
-/// A bundle whose artifact bytes don't match the declared digest is rejected —
+/// A package whose artifact bytes don't match the declared digest is rejected —
 /// modified artifacts must never be admitted.
 fn verify_artifact(bytes: &[u8], declared: &str, what: &str) -> Result<(), String> {
     let actual = format!("sha256:{}", crate::hash::hex(&sha256(bytes)));
     if actual != declared {
         return Err(format!(
-            "bundle {what}: content digest mismatch (manifest pins {declared}, artifact is {actual})"
+            "package {what}: content digest mismatch (manifest pins {declared}, artifact is {actual})"
         ));
     }
     Ok(())
 }
 
-/// Validate a bundle dir and extract the workload's resource profile + workload
-/// digest from it. Admission-gates the manifest: a bundle that fails
+/// Validate a package dir and extract the workload's resource profile + workload
+/// digest from it. Admission-gates the manifest: a package that fails
 /// validation, lacks a linux implementation, or whose artifacts don't match the
 /// manifest's pinned digests is rejected before anything is committed. The
 /// error is the diagnostic, verbatim.
@@ -813,40 +813,40 @@ fn verify_artifact(bytes: &[u8], declared: &str, what: &str) -> Result<(), Strin
 /// (`resources.json`, `graph.yaml`) are verified against the digests it pins, so
 /// a modified artifact fails. A signature over the manifest itself is not part
 /// of this format.
-pub fn resolve_bundle(dir: &std::path::Path) -> Result<ResolvedBundle, String> {
+pub fn resolve_package(dir: &std::path::Path) -> Result<ResolvedPackage, String> {
     use crate::workload::{
         parse_manifest, parse_resource_profile, select_implementation, validate,
     };
 
     let manifest_json = std::fs::read_to_string(dir.join("workload.json"))
-        .map_err(|e| format!("bundle {}: workload.json: {e}", dir.display()))?;
+        .map_err(|e| format!("package {}: workload.json: {e}", dir.display()))?;
     let manifest = parse_manifest(&manifest_json)?;
     let report = validate(&manifest);
     if !report.is_ok() {
         return Err(format!(
-            "bundle '{}' failed validation: {}",
+            "workload package '{}' failed validation: {}",
             manifest.name,
             report.errors.join("; ")
         ));
     }
     let imp = select_implementation(&manifest, "linux", "aarch64", 1).ok_or_else(|| {
         format!(
-            "bundle '{}' has no linux/aarch64/abi-1 implementation",
+            "workload package '{}' has no linux/aarch64/abi-1 implementation",
             manifest.name
         )
     })?;
 
-    // Verify the bundle's artifacts against the digests the manifest pins.
+    // Verify the package's artifacts against the digests the manifest pins.
     let resources_json = std::fs::read(dir.join("resources.json"))
-        .map_err(|e| format!("bundle {}: resources.json: {e}", dir.display()))?;
+        .map_err(|e| format!("package {}: resources.json: {e}", dir.display()))?;
     verify_artifact(&resources_json, &imp.resources.digest, "resources.json")?;
     let graph_yaml = std::fs::read(dir.join("graph.yaml"))
-        .map_err(|e| format!("bundle {}: graph.yaml: {e}", dir.display()))?;
+        .map_err(|e| format!("package {}: graph.yaml: {e}", dir.display()))?;
     verify_artifact(&graph_yaml, &imp.graph.digest, "graph.yaml")?;
 
     let doc = parse_resource_profile(
         &String::from_utf8(resources_json)
-            .map_err(|e| format!("bundle {}: resources.json: {e}", dir.display()))?,
+            .map_err(|e| format!("package {}: resources.json: {e}", dir.display()))?,
     )?;
 
     // Declared exports travel with the desired workload so `agent status` can join
@@ -860,7 +860,7 @@ pub fn resolve_bundle(dir: &std::path::Path) -> Result<ResolvedBundle, String> {
             port: e.port,
         })
         .collect();
-    Ok(ResolvedBundle {
+    Ok(ResolvedPackage {
         name: manifest.name.clone(),
         profile: doc.to_compose(),
         workload_digest: sha256(manifest_json.as_bytes()),

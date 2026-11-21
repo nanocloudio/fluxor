@@ -1,5 +1,5 @@
-//! Security domain — crypto primitives, key vault, and the signing root
-//! modules and graph images are verified against.
+//! Security — crypto primitives, key vault, and the signing root
+//! modules and node images are verified against.
 
 pub mod crypto;
 pub mod custody_wrap;

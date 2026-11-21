@@ -18,7 +18,7 @@ timer_class = "agnostic"
 # this instance lives, and a sealing key it hands out is the vault's. It is
 # what lets a graph in this repository be composed and its fence exercised
 # on a rig without a consensus cluster beside it; a deployment brings its
-# quorum-backed directory in its place. A fixture never ships in a bundle.
+# quorum-backed directory in its place. A fixture never ships in a workload package.
 #
 # Log lines:
 #

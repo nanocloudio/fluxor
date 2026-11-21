@@ -12,13 +12,13 @@
 // HOW to isolate it or ON WHICH PLATFORM. Consistency rule: the same spec must
 // yield the same isolation guarantee on both backends.
 //
-// ─── Surface tiers: native core vs host-backend extensions ─────────────
+// ─── Surface layers: native core vs host-backend extensions ────────────
 //
-// The op surface is two tiers, and the tier is part of the contract:
+// The op surface is two layers, and the layer is part of the contract:
 //
 //   NATIVE CORE (every backend implements; the Fluxor lifecycle model):
 //     CREATE / START / WAIT / SIGNAL(portable subset) / DESTROY / PAUSE /
-//     RESUME / CAPS / OPTIONS, plus the Tier-1 CREATE header (identity, posture,
+//     RESUME / CAPS / OPTIONS, plus the CREATE header (identity, posture,
 //     resource envelope, network identity/endpoints). Native semantics: a
 //     workload is an owned execution context with a reversible frozen
 //     state; "exit" means the owner is gone; SIG_TERM means drain, SIG_KILL
@@ -34,18 +34,18 @@
 //     (`SOURCE_FMOD_GRAPH = 0`, `SOURCE_FMOD_PACK = 2`); other kinds are
 //     backend-defined.
 //
-// Two tiers:
-//   * Tier 1 — typed portable fields (the CREATE header): identity, posture,
+// A CREATE has two parts:
+//   * the header — typed portable fields: identity, posture,
 //     resource envelope, network endpoints. Every backend maps them.
-//   * Tier 2 — a backend-opaque options envelope (the trailing TLV section):
+//   * the options — a backend-opaque envelope (the trailing TLV section):
 //     hardening knobs with no portable meaning. fluxor defines only the
 //     envelope MECHANISM — it validates shape and routes a namespace to the
 //     matching backend, and never enumerates keys. So this contract names zero
 //     platform concepts (`seccomp`/`caps`/`selinux` are vocabulary in the Linux
 //     backend's own docs, not here).
 //
-// Load-bearing invariant: Tier 1 alone must fully establish the isolation
-// guarantee; the Tier-2 envelope may only refine WITHIN the declared posture.
+// Load-bearing invariant: the header alone must fully establish the isolation
+// guarantee; the options envelope may only refine WITHIN the declared posture.
 // A backend that ignores the entire envelope still yields a correctly-isolated
 // workload at the requested posture.
 //
@@ -102,7 +102,7 @@ pub use super::super::registry::workload::WAIT;
 pub use super::super::registry::workload::SIGNAL;
 
 /// `DESTROY` — stop (graceful → forced), reap, release the owner/lease and any
-/// backend resources (isolation domain, arena). Idempotent. Returns `0`.
+/// backend resources (isolation region, arena). Idempotent. Returns `0`.
 ///
 /// With `handle = -1` and `arg` = the 16-byte identity, destroys by identity:
 /// a live workload as above, or a `CREATE` still being staged, which is rolled
@@ -113,7 +113,8 @@ pub use super::super::registry::workload::DESTROY;
 // contract, `abi::platform::linux::host_process`.
 
 /// `LANE` — one of the caller's own lanes into a workload it staged from an
-/// fmod graph: an edge whose FLXA endpoint is the caller (kind 4).
+/// fmod graph: an edge of its composed graph whose endpoint is the caller
+/// (kind 4).
 /// `handle` = the workload; `arg` = `[key:u8][dir:u8]` ([`lane::ARG_LEN`]):
 /// the edge's `Endpoint` key and [`lane::TO_CALLER`] (the channel the caller
 /// reads for the key's edge into it) or [`lane::FROM_CALLER`] (the one it
@@ -191,7 +192,7 @@ pub use super::super::registry::workload::NET_PROVIDE;
 /// `workload.net`, not `workload.create`.
 pub use super::super::registry::workload::NET_RESOLVER;
 
-/// The per-owner name-service context: a Tier-2 option on [`CREATE`],
+/// The per-owner name-service context: an options entry on [`CREATE`],
 /// namespace [`resolver::NS`], key [`resolver::KEY`], whose value is
 /// `[family:u8][server:16][n_search:u8]` then `n_search × ([len:u8][name])`
 /// — the server the owner's queries go to (`NET_FAM_IPV4`, the address in
@@ -206,7 +207,7 @@ pub mod resolver {
     pub const MAX: usize = 256;
 }
 
-/// The workload's environment: a Tier-2 option on [`CREATE`], namespace
+/// The workload's environment: an options entry on [`CREATE`], namespace
 /// [`env::NS`], key [`env::KEY`], value `NAME=VALUE` (the name up to the
 /// first `=`, never empty; the value may be empty), repeatable, a later
 /// entry for a name replacing an earlier one. A backend that realizes it
@@ -238,7 +239,7 @@ pub mod resolver {
 /// takes the default; with none and `FLAG_REQUIRED` the `CREATE` fails
 /// `EINVAL`, and an optional one leaves the param out (the module's own
 /// default). A subgraph the values do not fit (a module's params past a
-/// `u16`, the subgraph past an FLXA source's `u16`) fails `E2BIG`; a
+/// `u16`, the graph past a source's `u16`) fails `E2BIG`; a
 /// malformed record `EINVAL`. A bind record never reaches a module: an add
 /// that still carries one is refused `EINVAL`.
 pub mod env {
@@ -262,7 +263,7 @@ pub mod env {
     pub const FLAG_DEFAULT: u8 = 0x02;
 }
 
-/// A volume lent to a workload: a Tier-2 option on [`CREATE`], namespace
+/// A volume lent to a workload: an options entry on [`CREATE`], namespace
 /// [`volume::NS`], key [`volume::KEY`], value `<src>\0<dst>\0<ro>` — `src`
 /// an absolute host directory, `dst` the path the workload names it by, `ro`
 /// `1` (read-only) or `0` (left out with its `\0`: writable). Repeatable, at
@@ -285,7 +286,7 @@ pub mod volume {
     pub const MAX: usize = 16;
 }
 
-/// A workload's own vault: a Tier-2 option on [`CREATE`], namespace
+/// A workload's own vault: an options entry on [`CREATE`], namespace
 /// [`vault::NS`], key [`vault::KEY`], value `<dir>\0<seal_key>` — `dir` a
 /// path the workload names (at or beneath the `dst` of one of the CREATE's
 /// writable [`volume`]s; made when absent), `seal_key` 64 hex digits, the 32
@@ -349,7 +350,7 @@ pub mod net_lane {
 /// is no backend.
 pub use super::super::registry::workload::CAPS;
 
-/// `OPTIONS` — the Tier-2 `(namespace, key)` entries the backend realizes,
+/// `OPTIONS` — the options `(namespace, key)` entries the backend realizes,
 /// which a caller consults *before* flagging an entry required. `handle =
 /// -1`; no `arg`; `data` out receives the directory
 ///   `[ns_count:u16] then ns_count × ([ns_len:u8][ns bytes][key_count:u16]
@@ -357,7 +358,7 @@ pub use super::super::registry::workload::CAPS;
 /// Returns its length, or `ERANGE` when `data` cannot hold it.
 pub use super::super::registry::workload::OPTIONS;
 
-// ---- posture ladder — Tier-1 `posture` field values ----
+// ---- posture ladder — header `posture` field values ----
 
 // The posture is the isolation: a backend whose source also says whether
 // the workload is isolated (a backend-defined source kind may) refuses
@@ -371,23 +372,23 @@ pub const POSTURE_SHARED: u8 = 0;
 /// available protection mechanism.
 pub const POSTURE_ISOLATED: u8 = 1;
 /// `isolated` + reduced attack surface (Linux: reduced syscall + privilege
-/// surface; metal: strongest protection-domain config). Backend refinements
-/// are Tier-2. A backend advertises it in [`CAPS`] only where it realizes
+/// surface; metal: strongest isolation-region config). Backend refinements
+/// are options entries. A backend advertises it in [`CAPS`] only where it realizes
 /// it; a request that widens the reduced surface back out (an opt-out a
 /// backend's source offers for a privileged workload) is `EINVAL` at this
 /// posture.
 pub const POSTURE_HARDENED: u8 = 2;
 
-// ---- source kind — Tier-1 `source_kind`; backend is placement-resolved ----
+// ---- source kind — header `source_kind`; backend is placement-resolved ----
 
 /// A fluxor graph/fmod artifact — resolves to the MPU/EL0 backend on a metal
 /// node.
 pub const SOURCE_FMOD_GRAPH: u8 = 0;
 
-/// A fluxor graph that brings its own modules: `.fmod`s the node's boot image
+/// A fluxor graph that brings its own modules: `.fmod`s the node's firmware image
 /// does not hold, staged as the workload's own code for as long as it lives.
 /// The source section is a [`PackRef`] header, `pin_count` 32-byte SHA-256
-/// pins, then the FLXA subgraph whose modules resolve in the pack first and
+/// pins, then the composed graph whose modules resolve in the pack first and
 /// the node's image second.
 ///
 /// The pack is an FXMT module table (`fluxor build`'s modules blob), the
@@ -406,7 +407,7 @@ pub const SOURCE_FMOD_PACK: u8 = 2;
 ///   0    2   pin_count   SHA-256 pins that follow, 32 bytes each
 ///   2    2   0
 /// ```
-/// Then `pin_count * 32` pin bytes, then the FLXA subgraph. The module table
+/// Then `pin_count * 32` pin bytes, then the composed graph. The module table
 /// itself is the CREATE call's `data`.
 pub mod pack_ref {
     pub const SIZE: usize = 4;
@@ -429,7 +430,7 @@ pub use super::super::registry::workload::LOOKUP;
 pub use super::super::registry::workload::MODULE_DIGESTS;
 /// One [`MODULE_DIGESTS`] record.
 pub const MODULE_DIGEST_RECORD: usize = 36;
-// Every other source kind is backend-defined (the linux host bundle kind is
+// Every other source kind is backend-defined (the linux host-process source kind is
 // `abi::platform::linux::host_process::SOURCE_HOST_PROCESS`).
 
 // ---- WAIT state byte ----
@@ -469,7 +470,7 @@ pub const SIG_KILL: u32 = 2;
 ///  38     2  _reserved
 ///  40     2  source_ref_len  bytes of source-ref section that follows
 ///  42     2  endpoint_count  number of NetEndpoint entries after source-ref
-///  44     4  options_len     bytes of the Tier-2 TLV envelope (last section)
+///  44     4  options_len     bytes of the TLV options envelope (last section)
 ///  48     1  net_family      NET_FAM_* — network identity; NONE = unassigned
 ///  49     1  net_prefix_len  address prefix length in bits (family-scoped)
 ///  50     2  net_segment     segment/lane id the identity belongs to (0 = default)
@@ -481,12 +482,12 @@ pub const SIG_KILL: u32 = 2;
 /// Then: `source_ref[source_ref_len]`, `endpoints[endpoint_count]` (each
 /// [`NET_ENDPOINT_SIZE`] bytes), `options[options_len]` (the TLV envelope, [`opt`]).
 ///
-/// The network identity is a Tier-1 *input*: the orchestrator's address
+/// The network identity is a header *input*: the orchestrator's address
 /// policy (IPAM on Linux, lane addressing on metal) computes it upstream and
 /// the backend realizes it — the field names an address, never the host
 /// mechanism that carries it. `NET_FAM_NONE` means no identity was assigned;
 /// combined with every endpoint at [`NET_ISO_SHARED`] the workload shares the
-/// host/system network domain.
+/// host/system network namespace.
 pub const CREATE_HEADER_SIZE: usize = 76;
 
 /// Storage grant values (`storage`). A workload reaches the node's storage
@@ -506,7 +507,7 @@ pub const NET_FAM_NONE: u8 = 0;
 pub const NET_FAM_IPV4: u8 = 4;
 pub const NET_FAM_IPV6: u8 = 6;
 
-/// One Tier-1 network endpoint the workload exports: `[proto:u8]
+/// One header network endpoint the workload exports: `[proto:u8]
 /// [net_iso:u8][port:u16 LE]`. `proto` is a `NET_PROTO_*`; `net_iso` selects
 /// [`NET_ISO_SHARED`]/[`NET_ISO_OWN`]. Realized by the owner endpoint-lease
 /// machinery (metal → NIC-ring; Linux → host-process network machinery).
@@ -515,12 +516,12 @@ pub const NET_ENDPOINT_SIZE: usize = 4;
 pub const NET_PROTO_TCP: u8 = 6;
 pub const NET_PROTO_UDP: u8 = 17;
 
-/// Endpoint shares the host/system network domain.
+/// Endpoint shares the host/system network namespace.
 pub const NET_ISO_SHARED: u8 = 0;
-/// Endpoint gets its own network domain/identity (metal lane; Linux network domain).
+/// Endpoint gets its own network identity (metal lane; Linux network namespace).
 pub const NET_ISO_OWN: u8 = 1;
 
-/// Tier-2 TLV envelope. fluxor validates this shape and routes a whole
+/// TLV options envelope. fluxor validates this shape and routes a whole
 /// namespace to the matching backend **without interpreting keys**. Entry:
 /// ```text
 /// [ns_len:u8][ns bytes][key_len:u8][key bytes][flags:u8][val_len:u16 LE][val bytes]
@@ -537,7 +538,7 @@ pub mod opt {
 /// [`CAPS`] bits. One `u32` of four bytes: the postures realized (bits
 /// 0..=7, bit `p` for posture `p`), the source kinds accepted (bits 8..=15,
 /// bit `8 + k` for kind `k`; kinds past the native ones are backend-defined),
-/// the optional ops (bits 16..=23) and the Tier-1 network fields realized
+/// the optional ops (bits 16..=23) and the header network fields realized
 /// (bits 24..=31).
 pub mod caps {
     /// The bit for posture `p` ([`super::POSTURE_SHARED`] …).
@@ -578,10 +579,10 @@ pub mod caps {
     /// and its `CREATE` may answer `EINPROGRESS` between batches.
     pub const LOOKUP: u32 = 1 << 18;
 
-    // Tier-1 network fields. A CREATE that asks for an unadvertised bit
+    // header network fields. A CREATE that asks for an unadvertised bit
     // fails admission (`ENOSYS`), never runs with silently-weaker network
     // isolation.
-    /// Backend realizes `NET_ISO_OWN` (own network domain per workload).
+    /// Backend realizes `NET_ISO_OWN` (own network identity per workload).
     pub const NET_ISO_OWN: u32 = 1 << 24;
     /// Backend realizes a `NET_FAM_*` network identity (address/segment).
     pub const NET_IDENTITY: u32 = 1 << 25;

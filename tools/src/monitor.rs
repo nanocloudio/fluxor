@@ -16,20 +16,20 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
-// Fault type codes (must match src/kernel/step_guard.rs::fault_type).
+// Fault type codes (must match src/kernel/exec/step_guard.rs::fault_type).
 const FAULT_NONE: u8 = 0;
 const FAULT_TIMEOUT: u8 = 1;
 const FAULT_STEP_ERROR: u8 = 2;
-const FAULT_HARD: u8 = 3;
 const FAULT_MPU: u8 = 4;
+const FAULT_DRAIN_TIMEOUT: u8 = 5;
 
 fn fault_kind_str(k: u8) -> &'static str {
     match k {
         FAULT_NONE => "-",
         FAULT_TIMEOUT => "timeout",
         FAULT_STEP_ERROR => "step_err",
-        FAULT_HARD => "hard",
         FAULT_MPU => "mpu",
+        FAULT_DRAIN_TIMEOUT => "drain",
         _ => "?",
     }
 }

@@ -8,13 +8,13 @@
 //! `CONTENT_TYPES` byte table (crate root) is a separate, append-only concern.
 
 /// Canonical capability registry accepted in a manifest's top-level
-/// `capabilities = [...]` list. Two tiers share one registry: hardware-facing
+/// `capabilities = [...]` list. Two kinds share one registry: hardware-facing
 /// roles (the role a module plays — paced scanout, group clock, protected
 /// output, mapper) and service-level surfaces (the substitutable data a
 /// producer or consumer carries). Unknown names are rejected at parse time so
 /// `display.scaneout` and friends fail the build.
 ///
-/// Grammar is domain-leading lowercase dotted, with the role noun before any
+/// Grammar is subject-leading lowercase dotted, with the role noun before any
 /// refinement (`display.scanout.protected`). Quantities and limits are
 /// capability facts, not name segments.
 ///
@@ -126,7 +126,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // ── Effect surfaces ────────────────────────────────────────────────
     // Substitutable application-effect providers: what a graph binds when a
     // stage publishes, subscribes, or calls out, as opposed to the transport
-    // it rides. Named domain-leading like every other entry (`stream.*`,
+    // it rides. Named subject-leading like every other entry (`stream.*`,
     // `request.*`) — there is no `effect.` meta-prefix, because every name in
     // this registry already denotes one.
     //

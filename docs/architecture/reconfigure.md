@@ -7,12 +7,16 @@ Source: `src/kernel/exec/scheduler/live_reconfig.rs`,
 ## Overview
 
 Live graph reconfigure updates a running Fluxor graph by gracefully draining
-admitted work before reset, subject to a bounded timeout. The scheduler
-transitions through phases:
+admitted work before reset, subject to a bounded timeout. The `reconfigure`
+module steps through phases:
 
 ```
 RUNNING -> DRAINING -> MIGRATING -> RUNNING
 ```
+
+The kernel holds two of them (`SET_PHASE`): `Draining`, which arms the drain
+ceiling, and `Running`. Migrating is the module's own step, which the kernel
+runs as `Running`.
 
 ## Configuration
 
@@ -145,7 +149,7 @@ samples_pool = true
 As with the owner-release fact, the loader acts on it after provider
 registration succeeds, refuses it from a module that registers no contract,
 and drops it with the module's provider layers. The node's server of the pool
-is the system owner's top-most unkeyed layer of its contract.
+is the node owner's top-most unkeyed layer of its contract.
 
 In each PSTATUS round (`resource_ledger::emit_all`) the kernel calls that
 provider's `module_provider_dispatch` with `resource::POOL_SAMPLE` (`0x1125`),
@@ -196,7 +200,7 @@ The rule, enforced by the decoder and the add:
   pass on what it does not hold nor gain it through an add of its own.
 - Every other path that decodes an `AddSubgraph` names no creator and refuses
   the flag `EINVAL`: a workload `CREATE` (whose blob comes from off the node)
-  and a boot graph's resident workloads.
+  and the node graph's resident workloads.
 - Every undefined flag bit is refused `EINVAL` on every path.
 
 The owner holds no storage grant (no root is ever made for it), and its
@@ -222,7 +226,7 @@ workload_modules:
 
 An entry is a type name, or `{ type: <name>, variant: <variant> }` to pick a
 build. Resident workloads' types are packed the same way. One image carries one
-build of a type, so a variant must agree with the base graph's and every
+build of a type, so a variant must agree with the node graph's and every
 workload's.
 
 ## Drain-Then-Reset Model
@@ -302,6 +306,6 @@ modules would see under an atomic reconfigure.
 | 1 | in_place_writer | Uses the channel's `ACQUIRE_INPLACE` |
 | 2 | deferred_ready | Needs init time before downstream runs |
 | 3 | drain_capable | Exports module_drain for live reconfigure |
-| 4 | isr_module | Defines module_isr_entry (Tier 2) |
+| 4 | isr_module | Defines module_isr_entry (`irq` mode) |
 | 5 | wasm_payload | Module body is a wasm payload (set by `pack_fmod_wasm`, read by `src/platform/wasm.rs`) |
 | 6-7 | reserved | Must be 0 |

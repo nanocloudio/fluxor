@@ -96,10 +96,10 @@ fn cmd_build(
     verbose: bool,
 ) -> Result<()> {
     // A workload source manifest — a `.toml` with a `[workload]` table —
-    // emits the committed bundle + per-target blobs instead of a single
+    // emits the committed package + per-target blobs instead of a single
     // image. Any other `.toml` falls through.
     if workload_src::is_source_manifest(path) {
-        workload_src::emit_bundle(path, module_root, verbose)?;
+        workload_src::emit_package(path, module_root, verbose)?;
         return Ok(());
     }
     if path.is_dir() {
@@ -284,14 +284,14 @@ struct RunFlags {
     list: Option<PathBuf>,
     open: bool,
     /// `--ca <PEM>`: operator anchors for client-mode tls/quic instances.
-    /// A linux graph or a bundle only.
+    /// A linux graph or a package only.
     ca: Option<PathBuf>,
     /// `--module-root <DIR>`: where the graph's `.fmod` modules are read
-    /// from. A graph or a source manifest's build; a built bundle loads
+    /// from. A graph or a source manifest's build; a built package loads
     /// its own pinned modules and a scenario's components load different
     /// silicons' modules.
     module_root: Option<PathBuf>,
-    /// `--param` / `--params`: a service bundle's run-time values.
+    /// `--param` / `--params`: a service workload package's run-time values.
     params: workload_src::RunParams,
     /// Program argv after `--`, forwarded to the graph's `cli_in`.
     args: Vec<String>,
@@ -332,34 +332,35 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
         Error::Config("fluxor run: missing <CONFIG> argument (omit only with --list)".into())
     })?;
 
-    // A workload bundle — source manifest, bundle root, target subdir, or
-    // the name of a bundle `fluxor.lock` pins: resolve an implementation
+    // A workload package — source manifest, package root, target subdir, or
+    // the name of a package `fluxor.lock` pins: resolve an implementation
     // with the agent's own resolver and run it.
     let pinned = if config_path.exists() {
         None
     } else {
-        Some(workload_src::bundle_by_name(
+        Some(workload_src::package_by_name(
             &config_path.to_string_lossy(),
         )?)
     };
-    if let Some(bundle) = pinned
+    if let Some(package) = pinned
         .as_deref()
-        .or_else(|| workload_src::is_bundle_path(config_path).then_some(config_path.as_path()))
+        .or_else(|| workload_src::is_package_path(config_path).then_some(config_path.as_path()))
     {
         if flags.any_scenario_flag() {
             return Err(Error::Config(
-                "fluxor run <bundle>: scenario-only flags do not apply to a workload bundle".into(),
+                "fluxor run <package>: scenario-only flags do not apply to a workload package"
+                    .into(),
             ));
         }
-        return workload_src::run_bundle(bundle, &flags.params, flags.ca.as_deref(), verbose);
+        return workload_src::run_package(package, &flags.params, flags.ca.as_deref(), verbose);
     }
-    // A graph renders with the run's values, as a bundle does: the graph's
+    // A graph renders with the run's values, as a package does: the graph's
     // own `params:` declares what it takes. A graph carrying an inline
     // `scenario:` block is still that graph; a scenario file composes
     // graphs and takes none.
     if !flags.params.is_empty() && scenario::is_scenario_file(config_path) {
         return Err(Error::Config(
-            "fluxor run --param/--params apply to a graph or a bundle, not a scenario file".into(),
+            "fluxor run --param/--params apply to a graph or a package, not a scenario file".into(),
         ));
     }
     fluxor_tools::params::set_values(flags.params.values()?);
@@ -369,7 +370,7 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
             || scenario::synthesize_from_graph(config_path)?.is_some())
     {
         return Err(Error::Config(
-            "fluxor run --ca applies to a graph or a bundle, not a scenario".into(),
+            "fluxor run --ca applies to a graph or a package, not a scenario".into(),
         ));
     }
 
@@ -513,7 +514,7 @@ fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> R
     spawn_scenario(&s, scenario_path, flags, _verbose)
 }
 
-/// Spawn a scenario: build every wasm component (passive — its bundle is
+/// Spawn a scenario: build every wasm component (passive — its wasm bundle is
 /// served from the document root) and every other component (active —
 /// one `fluxor-linux` process each), plus the synthesised host if
 /// `host:` is declared. Then:
@@ -555,7 +556,7 @@ fn spawn_scenario(
     for (comp_name, comp) in &scenario.components {
         let target = scenario::effective_target(scenario_path, comp);
         if target == "wasm" {
-            // Passive: build the bundle where the document root's
+            // Passive: build the wasm bundle where the document root's
             // `fluxor.wasm` link points.
             let graph_rel = comp
                 .graph
@@ -648,12 +649,12 @@ fn spawn_scenario(
 
 /// One active (= spawned-as-a-kernel-process) component in a
 /// scenario. Built ahead of the spawn loop; the spawn loop just
-/// invokes `fluxor-linux` with the graph image.
+/// invokes `fluxor-linux` with the node image.
 struct ActiveComponent {
     /// Display name — the scenario component name, or `"host"` for
     /// the synthesised host.
     display: String,
-    /// The graph image the component's build wrote.
+    /// The node image the component's build wrote.
     image: PathBuf,
     /// The port the component listens on: its scenario `port:`, or the
     /// host's. `None` for a headless component — the readiness probe
@@ -1504,7 +1505,7 @@ fn cmd_flash(config_path: &Path, module_root: Option<&Path>, verbose: bool) -> R
 /// seed exists at `key_path` (generated 0600 from the OS RNG if absent, or
 /// `--force`d), then prints the matching 64-hex-char PUBLIC key to stdout —
 /// the value a kernel image carries as its signing root (`fluxor build
-/// --root`), which verifies module and graph-image signatures. Human
+/// --root`), which verifies module and node-image signatures. Human
 /// notes go to stderr so stdout is exactly the pubkey (capturable in
 /// `$(...)`).
 fn cmd_keygen(key_path: &PathBuf, force: bool) -> Result<()> {
@@ -2173,8 +2174,8 @@ fn cmd_help(make: bool, project_root: Option<&Path>, command: Option<&str>) -> R
 
 // ── Polymorphic `fluxor build` ───────────────────────────────────────
 
-/// Flag bundle for `fluxor build` — the absorbed
-/// generate/combine/graph-image/mktable-config/validate forms route to
+/// Flag set for `fluxor build` — the absorbed
+/// generate/combine/node-image/mktable-config/validate forms route to
 /// their original implementations unchanged (byte-identity by
 /// construction).
 struct BuildFlags {
@@ -2214,11 +2215,11 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             verbose,
         ));
     };
-    // Only a graph image carries a signature: asking to sign anything else
+    // Only a node image carries a signature: asking to sign anything else
     // is refused rather than answered with an unsigned artifact.
     if flags.sign_key.is_some() && flags.emit.as_deref() != Some("image") {
         return Err(Error::Config(
-            "--sign-key signs a graph image; use it with --emit=image".into(),
+            "--sign-key signs a node image; use it with --emit=image".into(),
         ));
     }
     if flags.check {
@@ -2282,7 +2283,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
         }
         Some("image") => {
             let output = require_output("image")?;
-            cmd_graph_image(
+            cmd_node_image(
                 path,
                 &output,
                 flags.target.as_deref(),

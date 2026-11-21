@@ -4,7 +4,7 @@
 // Every kernel service lives under one domain directory.
 pub mod boot; // config + device tree
 pub mod config; // single capacity seam onto platform::chip
-pub mod exec; // scheduler run loop, ISR tiers, step guard
+pub mod exec; // scheduler run loop, interrupt modes, step guard
 pub mod ipc; // channels, ring buffers, buffer pool, events, fd
 pub mod mem; // heap, arenas
 pub mod module; // loader, provider, syscalls, el0 gateway
@@ -31,14 +31,3 @@ pub fn boot(ops: &'static sys::hal::HalOps) {
     module::syscalls::init_providers();
     security::root::log_signing_root();
 }
-
-/// Kernel-private service registries and orchestration. Mirrors the
-/// `abi::internal::*` layer on the module side — these are the kernel's
-/// implementation of the registration hooks that pic modules invoke.
-pub mod internal {
-    pub mod bridge;
-}
-
-// Top-level alias — call sites reach `crate::kernel::bridge::*`. It remains
-// kernel-private; the public ABI does not surface it.
-pub use internal::bridge;

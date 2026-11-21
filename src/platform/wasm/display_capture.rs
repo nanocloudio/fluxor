@@ -1,4 +1,4 @@
-//! `wasm_browser_display_capture` built-in: frames of a surface the user chose
+//! `wasm_browser_display_capture` native module: frames of a surface the user chose
 //! to share. Pulls the newest frame from the host shim's `getDisplayMedia`
 //! capture loop and forwards it on the output channel as an `SRF1`-headered
 //! RGB565-LE raster — the format `linux_display`, `st7701s`, and
@@ -24,7 +24,9 @@
 //! under the person's control. A new capture is a new module instance, which
 //! means a new decision.
 
+use crate::abi::platform::native::wasm::wasm_browser_display_capture as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -125,12 +127,12 @@ unsafe fn alloc_state(
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn display_capture_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn display_capture_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this
     // module instance; cast back to the module-private type allocated by
-    // `build`.
+    // the constructor.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut DisplayCaptureState);
         if st_ptr.is_null() {
@@ -185,14 +187,29 @@ unsafe fn display_capture_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(
-    width: u16,
-    height: u16,
-    header: bool,
-    out_chan: i32,
-) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_display_capture", display_capture_step);
-    let raw = alloc_state(out_chan, width, height, header);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut DisplayCaptureState, raw);
-    m
+/// The `wasm_browser_display_capture` native module.
+pub static WASM_BROWSER_DISPLAY_CAPTURE: NativeVtable =
+    super::heap_native(new, display_capture_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut width = 0u16;
+    let mut height = 0u16;
+    let mut header = true;
+    super::walk_tlv(init.params, |tag, value| match tag {
+        tags::TAG_WIDTH => width = super::tlv_u32(value) as u16,
+        tags::TAG_HEIGHT => height = super::tlv_u32(value) as u16,
+        tags::TAG_HEADER => header = super::tlv_u32(value) != 0,
+        _ => {}
+    });
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_PIXELS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, heap_size_for(width, height), || {
+            alloc_state(out_chan, width, height, header).cast()
+        })
+    }
 }

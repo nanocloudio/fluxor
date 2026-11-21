@@ -87,15 +87,15 @@ pub const METRIC_HISTOGRAM: u8 = 3;
 pub const METRIC_HISTOGRAM_16: u8 = 4;
 
 // ── Metric dimension (bytes 14..16 of a metric body) ───── The row-major
-// composite index over an instrument's DECLARED dimension domains (product
+// composite index over an instrument's DECLARED dimension ranges (product
 // ≤ 65534, enforced at build, so every index stays clear of the reserved
 // `0xFFFF`). `0` is what an undimensioned instrument writes, and `0xFFFF` =
 // `__other__`, the fold target for any tuple with a component outside its
-// declared domain (folded and counted, never dropped, so totals stay
+// declared range (folded and counted, never dropped, so totals stay
 // correct).
 pub const DIM_NONE: u16 = 0;
 pub const DIM_OTHER: u16 = 0xFFFF;
-/// Ceiling on the product of an instrument's declared domain sizes, so the
+/// Ceiling on the product of an instrument's declared range sizes, so the
 /// largest index it can produce stays below the reserved `DIM_OTHER`
 /// (`DIM_NONE` overlaps index 0 of
 /// an undimensioned instrument by construction).
@@ -344,7 +344,7 @@ pub fn write_metric_scalar(
 
 /// Encode a scalar metric record carrying a composite dimension
 /// index. `dim` is the row-major index over the instrument's declared
-/// domains; `DIM_NONE` for an undimensioned instrument, `DIM_OTHER`
+/// ranges; `DIM_NONE` for an undimensioned instrument, `DIM_OTHER`
 /// for a tuple that fell outside them.
 pub fn write_metric_scalar_dim(
     buf: &mut [u8],

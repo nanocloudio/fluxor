@@ -141,7 +141,7 @@ pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
 
     // media_profile is an APP-SUPPLIED hint, not a Fluxor taxonomy —
     // a resolver/renderer may use it to tune layout, but the substrate does
-    // not enumerate app domains. Any non-empty string is accepted;
+    // not enumerate app kinds. Any non-empty string is accepted;
     // `MEDIA_PROFILES` lists the well-known values a media app is likely to
     // use (kept for docs/tooling hints, not as a gate). Context IS a
     // Fluxor concept and stays validated below.

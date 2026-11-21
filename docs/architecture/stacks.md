@@ -22,7 +22,7 @@ in whole instead of writing out. There are two ways a stack enters a graph:
 
 A platform stack answers "what substrate does this board need": the `net`
 stack is `virtio_net + ip` on qemu-virt and `rp1_gem + conn_guard + ip` on
-a Pi 5, under one unchanged application graph. A published stack answers
+a Pi 5, under one unchanged node graph. A published stack answers
 "how is this subsystem composed": a storage node, a store replica, a
 broker, shaped once by the project that owns it and instantiated by any
 graph that wants one.
@@ -49,7 +49,7 @@ A selected variant injects concrete modules, wiring, params, and services
 into the config before the ordinary generation pipeline runs. The `net`
 stack, for example, injects `virtio_net + ip` on qemu-virt,
 `cyw43 + wifi + ip` on pico2w, and `rp1_gem + conn_guard + ip` on pi5 —
-three different substrate stacks under one unchanged application graph.
+three different substrate stacks under one unchanged node graph.
 Board defaults (e.g. `net → {phy: wifi, nic: cyw43}`) come from the target
 descriptor, so most configs need only name the stack.
 
@@ -154,7 +154,7 @@ most 128 bytes, and is never `latest`, which every publish moves.
 ### Params
 
 Params are declared exactly as every graph's
-([service-bundles.md](../guides/service-bundles.md#the-graph-and-its-params)),
+([workload-packages.md](../guides/workload-packages.md#the-graph-and-its-params)),
 with the same rules:
 
 | Field | Meaning |
@@ -267,7 +267,7 @@ An include entry carries `stack`, `as`, and optionally `params` and
   integer's declared range lies inside the stack's, and it stays a
   placeholder the graph's values render. A value with a placeholder inside
   other text is a string. The forward is checked when the graph is read and
-  when a bundle carrying it is emitted.
+  when a workload package carrying it is emitted.
 - **`node`** places the whole include (see [Placement](#placement)).
 
 ### Bound names
@@ -366,7 +366,7 @@ It resolves by the graph's target family, on the parsed graph, after
 
 | Family | `${asset:<name>}` is |
 |---|---|
-| `wasm` | `asset://<name>`, served from the bundle's `fluxor.assets` section through the FS contract |
+| `wasm` | `asset://<name>`, served from the wasm bundle's `fluxor.assets` section through the FS contract |
 | `linux` | the absolute path of the asset's file: a path entry's file, or a built asset's `target/assets/<name>` under the graph's project |
 | any other | refused: a bare-metal image carries no asset area a module could open an asset from by name |
 
@@ -494,7 +494,7 @@ the outside are checked by the graphs that include it.
 
 A `workloads:` entry is a graph of its own: its module names are its own,
 and its wiring names its own modules and the node's network (`linux_net`,
-or `ip` on metal), never the base graph's. It takes an `include:` of its
+or `ip` on metal), never the node graph's. It takes an `include:` of its
 own, which expands into the workload's `modules:` and `wiring:` by the
 rules above, scoped to the workload:
 
@@ -520,7 +520,7 @@ workloads:
 
 - The stack's modules become `<as>_<name>` among the workload's modules,
   after the workload's own. A collision is with the workload's own modules
-  and its other includes only: the base graph and other workloads may use
+  and its other includes only: the node graph and other workloads may use
   the same names.
 - The workload's edges to `<as>.<export>` are rewritten onto the export's
   internal ports, and the stack's internal edges follow the workload's own.
@@ -532,7 +532,7 @@ workloads:
 - Errors name the workload (`workload 0: include 'sd' …`). An include by
   name is a reference `fluxor update` pins ([References](#references)),
   whether the graph or one of its workloads makes it, and a workload image
-  (`fluxor build --emit=workload`) or bundle carries the workload expanded.
+  (`fluxor build --emit=workload`) or workload package carries the workload expanded.
 
 ## Placement
 
@@ -546,20 +546,20 @@ include's export is refused: its members run on another node and are
 reached over a remote channel, as any placed member is. Placement is
 whole-include. A stack cannot split its own modules across nodes.
 
-## Bundles
+## Workload packages
 
-A workload bundle ([service-bundles.md](../guides/service-bundles.md)) carries
-its graph with every include expanded. When the bundle is emitted, the graph
-file is read as the build reads it — its includes resolved against the graph
-file's own location and the project's pins — and the expanded graph, its
-`params:` kept, is what `graph.yaml` holds and its digest pins. A bundle is
+A workload package ([workload-packages.md](../guides/workload-packages.md))
+carries its graph with every include expanded. When the package is emitted,
+the graph file is read as the build reads it — its includes resolved
+against the graph file's own location and the project's pins — and the
+expanded graph, its `params:` kept, is what `graph.yaml` holds and its digest pins. A package is
 therefore whole without the stack files and pins its source tree held.
 
-Everything read from the bundle reads the expanded graph: the module
+Everything read from the package reads the expanded graph: the module
 references `workload.json` pins and the state sum `resources.json` carries
 include the modules the includes contribute, and a run checks every module
 the rendered graph loads against those references, so a stack's module
-the bundle does not pin is refused rather than loaded unverified. A bundle
+the package does not pin is refused rather than loaded unverified. A package
 graph that still carries `include:` is refused. A placeholder the graph
 forwards into an include survives the expansion for a run to render. A
 graph without includes is carried as written.
@@ -571,13 +571,13 @@ stack it holds, and publish with everything else it ships
 ([project-layout.md](../guides/project-layout.md)):
 
 ```sh
-fluxor publish                    # sources, fmods, runtimes, stacks, bundles
+fluxor publish                    # sources, fmods, runtimes, stacks, workload packages
 fluxor publish --only stack       # just the stacks
 fluxor publish --dry-run          # list what the sweep would publish
 ```
 
 Stacks publish after the project's modules, whose digests they record, and
-before its bundles, which may include them. `fluxor ci`'s `packaging` phase
+before its workload packages, which may include them. `fluxor ci`'s `packaging` phase
 checks each one as the publish does. A stack document anywhere else is not
 published; a graph may still include it by path. Each stack is checked
 before anything is written: a document that does not parse, declares no
@@ -614,10 +614,10 @@ The publish:
 | `stack.yaml` | `application/vnd.nanocloud.fluxor.stack.v1+yaml` | the document, byte for byte |
 | `modules.json` | `application/vnd.nanocloud.fluxor.stack.modules.v1+json` | the module references, as `fluxor.lock` `[[artifact]]` entries |
 
-A bundle carries the `.fmod` of every module it pins. A stack carries
+A workload package carries the `.fmod` of every module it pins. A stack carries
 references to the exact module artifacts, per target, it was composed
 against. A stack is target-independent and is included by graphs for
-any target, while a bundle is built for one. The modules are artifacts in
+any target, while a workload package is built for one. The modules are artifacts in
 their own right, already in the store.
 
 ## References

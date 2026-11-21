@@ -8,7 +8,6 @@
 // and packed into the kernel's TLV stream by the config tool.
 
 #[cfg(feature = "host-image")]
-const HOST_IMAGE_CODEC_HASH: u32 = 0xF09D5D98; // fnv1a32("host_image_codec")
 
 #[cfg(feature = "host-image")]
 const EOF_TICKS: u32 = 200;
@@ -20,11 +19,11 @@ const EOF_TICKS: u32 = 200;
 const WRITE_CHUNK: usize = 1024;
 
 // Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
-// generated into `builtin_param_tags`. `scale_mode` selects fit=0, stretch=1.
+// generated into `abi::platform::native`. `scale_mode` selects fit=0, stretch=1.
 #[cfg(feature = "host-image")]
-use fluxor::platform::builtin_param_tags::host_image_codec as image_codec_tags;
+use fluxor::abi::platform::native::linux::host_image_codec as image_codec_tags;
 #[cfg(feature = "host-image")]
-use fluxor::platform::builtin_param_tags::host_image_codec::{
+use fluxor::abi::platform::native::linux::host_image_codec::{
     TAG_HEIGHT as IMG_TAG_HEIGHT, TAG_MAX_BYTES as IMG_TAG_MAX_BYTES,
     TAG_SCALE_MODE as IMG_TAG_SCALE_MODE, TAG_WIDTH as IMG_TAG_WIDTH,
 };
@@ -141,10 +140,10 @@ fn decode_to_rgb565(
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
 #[cfg(feature = "host-image")]
-unsafe fn host_image_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn host_image_step(state: *mut u8) -> i32 {
     let st = unsafe { instance_state::<HostImageState>(state) };
 
     if st.failed {
@@ -227,7 +226,7 @@ unsafe fn host_image_step(state: *mut u8) -> i32 {
 }
 
 #[cfg(feature = "host-image")]
-fn build_host_image_codec(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_host_image_codec(module_idx: usize, params: &[u8]) -> Result<Box<HostImageState>, i32> {
     // Manifest declares a default for every param; the tool packs them
     // all into the TLV stream so each tag matches one walker arm.
     let mut width: usize = 0;
@@ -242,14 +241,9 @@ fn build_host_image_codec(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
         _ => {}
     });
     let scale_mode = resolve_scale_mode(scale_raw);
-
-    scheduler::set_current_module(module_idx);
     let in_ch = scheduler::module_port(module_idx, image_codec_tags::PORT_ENCODED);
     let out_ch = scheduler::module_port(module_idx, image_codec_tags::PORT_PIXELS);
-    let mut m = scheduler::BuiltInModule::new("host_image_codec", host_image_step);
-    install_state(
-        &mut m,
-        Box::new(HostImageState {
+    let st = Box::new(HostImageState {
             in_chan: in_ch,
             out_chan: out_ch,
             decoded: false,
@@ -262,8 +256,7 @@ fn build_host_image_codec(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
             quiet_ticks: 0,
             pending: Vec::new(),
             pending_pos: 0,
-        }),
-    );
+        });
     log::info!(
         "[inst] module {} = host_image_codec (built-in) in={} out={} {}x{} mode={} max_bytes={}",
         module_idx,
@@ -277,5 +270,16 @@ fn build_host_image_codec(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
         },
         max_bytes,
     );
-    m
+    Ok(st)
 }
+
+#[cfg(feature = "host-image")]
+impl HostNative for HostImageState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_host_image_codec(slot, params)
+    }
+}
+
+/// The `host_image_codec` native module.
+#[cfg(feature = "host-image")]
+pub static HOST_IMAGE_CODEC: NativeVtable = host_vtable::<HostImageState>(host_image_step);

@@ -13,18 +13,18 @@
 //!   - `host_object_range_open` — issue a ranged `GET`, return a stream
 //!   - `host_object_recv`       — drain bytes / metadata from a stream
 //!   - `host_object_close`      — cancel + release a stream handle
-//!   - `host_object_put`        — write a blob to the persistent tier
-//!   - `host_object_delete`     — remove a blob from the persistent tier
+//!   - `host_object_put`        — write a blob to the persistent layer
+//!   - `host_object_delete`     — remove a blob from the persistent layer
 //!
-//! ## Read tier vs. write tier (OPFS)
+//! ## Read layer vs. write layer (OPFS)
 //!
-//! The four read bindings front a *read-only* tier: `fetch()` over the
+//! The four read bindings front a *read-only* layer: `fetch()` over the
 //! page origin (and the in-bundle `asset://` map), which serves shipped,
 //! immutable content. There is no way to `PUT` to an HTTP origin from the
-//! browser, so on its own this tier cannot persist user-generated data
+//! browser, so on its own this layer cannot persist user-generated data
 //! (save-state derivatives, imported ROMs, caches).
 //!
-//! `host_object_put` is the write tier, backed by **OPFS** (Origin
+//! `host_object_put` is the write layer, backed by **OPFS** (Origin
 //! Private File System) on the host side — see
 //! `docs/architecture/wasm_browser_host.md` §5. Writes are
 //! synchronously *accepted* into an in-memory store (so an immediately
@@ -39,7 +39,7 @@
 //!
 //! `LIST` answers `ENOSYS`: reads fall through to `fetch()` against the
 //! page origin, which cannot be enumerated, and a listing of the written
-//! tier alone would omit objects `GET` serves.
+//! layer alone would omit objects `GET` serves.
 //!
 //! All windowing math (clamping a request to the object tail, encoding
 //! the `HEAD` record) lives in the host-neutral, unit-tested
@@ -122,7 +122,7 @@ extern "C" {
     /// Cancel any in-flight reader and release the handle. Idempotent.
     fn host_object_close(handle: i32) -> i32;
 
-    /// Write `body_ptr[..body_len]` to the persistent (OPFS) tier under
+    /// Write `body_ptr[..body_len]` to the persistent (OPFS) layer under
     /// `key_ptr[..key_len]`. Returns `0` once the write is *accepted*
     /// (staged in the host's in-memory store and queued for OPFS
     /// persistence), or a negative errno. The acceptance is synchronous —
@@ -138,8 +138,8 @@ extern "C" {
     ) -> i32;
 
     /// Remove `key_ptr[..key_len]` from the persistent (OPFS/IDB) write
-    /// tier. Returns `0` when the key is gone, `-2 ENOENT` when this
-    /// tier never held it — a key served only by the read tier
+    /// layer. Returns `0` when the key is gone, `-2 ENOENT` when this
+    /// layer never held it — a key served only by the read layer
     /// (shipped content behind `fetch`) is not this provider's to
     /// delete. Acceptance is synchronous; the backing removal is
     /// queued behind the same chain as `host_object_put`, so a delete
@@ -164,7 +164,7 @@ fn wasm_object_dispatch(handle: i32, opcode: u32, arg: &mut [u8], mut data: User
     // `data` and the slot table, each valid for the call.
     unsafe {
         // Per-handle fence: the browser fetch model is volatile (no
-        // durability tier), so every open handle advertises Volatile.
+        // durability layer), so every open handle advertises Volatile.
         if opcode == dev_fence::QUERY_OP {
             let objs = &*core::ptr::addr_of!(OBJECTS);
             if !objs.get(handle as usize).is_some_and(|s| s.in_use) {
@@ -182,7 +182,7 @@ fn wasm_object_dispatch(handle: i32, opcode: u32, arg: &mut [u8], mut data: User
             dev_obj::RANGE_GET => obj_range_get(handle, arg, data.as_mut()),
             dev_obj::DELETE => obj_delete(arg),
             dev_obj::CLOSE => obj_close(handle),
-            // Unconditional writes to the persistent tier; no listing, no
+            // Unconditional writes to the persistent layer; no listing, no
             // condition, no kept field, no streamed put, no grants.
             dev_obj::CAPS => crate::abi::kernel_abi::caps_word::answer(arg, dev_obj::caps::WRITE),
             // See the module docs: the origin cannot be enumerated.
@@ -220,14 +220,14 @@ unsafe fn alloc_slot(key: &[u8]) -> i32 {
     slot_idx as i32
 }
 
-/// `PUT` — single-shot write to the persistent (OPFS) tier: `arg` is the
+/// `PUT` — single-shot write to the persistent (OPFS) layer: `arg` is the
 /// `object::PUT` record and its fence trailer, `data` the body.
 ///
 /// We forward `key` and `body` to `host_object_put` (which stages then
 /// background-persists to OPFS) and write a `Volatile` fence into the
 /// trailer on success. `content_type` is parsed for layout but not kept
 /// (no etag store). A precondition other than `ANY`, or any field for the
-/// store to keep, asks for a guarantee this tier cannot make, so it is
+/// store to keep, asks for a guarantee this layer cannot make, so it is
 /// REFUSED with `ENOSYS` rather than silently downgraded — the contract
 /// requires that, because downgrading a conditional write to an
 /// unconditional one turns a refusal into a lost update, and a retained
@@ -251,7 +251,7 @@ unsafe fn obj_put(arg: &mut [u8], body: &[u8]) -> i32 {
         return errno::ENODEV;
     }
     // PUT acceptance carries the strongest fence the commit achieved;
-    // the browser write tier is best-effort, so that is Volatile.
+    // the browser write layer is best-effort, so that is Volatile.
     let _ = dev_fence::trailer::put(arg, &dev_fence::Fence::Volatile);
     errno::OK
 }
@@ -373,10 +373,10 @@ unsafe fn obj_head(arg: &mut [u8]) -> i32 {
     written as i32
 }
 
-/// `DELETE` — remove a key from the write tier. `arg` is the
+/// `DELETE` — remove a key from the write layer. `arg` is the
 /// `object::DELETE` request and its fence trailer.
 ///
-/// Preconditions are REFUSED rather than ignored. This tier keys bytes
+/// Preconditions are REFUSED rather than ignored. This layer keys bytes
 /// and holds no etag to compare, and the contract is explicit that a
 /// provider which cannot offer a condition must refuse it with `ENOSYS`
 /// — silently downgrading a conditional delete to an unconditional one

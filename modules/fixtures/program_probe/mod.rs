@@ -1,4 +1,4 @@
-//! program_probe — reads the program the bundle carries for it.
+//! program_probe — reads the program the node image carries for it.
 //!
 //! A buffer of work a step: `PROGRAM_INFO` for slot 0, the whole program
 //! through `PROGRAM_READ` hashed, and the same bytes read in place when the
@@ -166,7 +166,7 @@ unsafe fn probe_step(s: &mut State) {
             s.at += got as u32;
         }
         2 => {
-            // In place: flash on a board, the mapped bundle on a host.
+            // In place: flash on a board, the mapped node image on a host.
             if addr == 0 || s.at >= size {
                 s.phase = 3;
                 return;

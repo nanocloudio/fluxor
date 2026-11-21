@@ -1,4 +1,4 @@
-//! `wasm_browser_canvas` built-in: VideoRaster sink that presents
+//! `wasm_browser_canvas` native module: VideoRaster sink that presents
 //! frames to an HTML `<canvas>` through the host shim's
 //! `host_canvas_present` import.
 //!
@@ -8,11 +8,13 @@
 //! those to RGB565 on the way to a canvas that will widen them again throws
 //! away three bits of red and blue for nothing.
 //!
-//! State is heap-allocated (the 154 KiB QVGA RGB565 frame buffer
-//! does not fit in BuiltInModule's 64-byte inline state). The kernel
-//! state holds a `*mut CanvasState` pointer in bytes 0..4.
+//! State is heap-allocated on the module's own heap (with the frame
+//! buffer, 154 KiB at QVGA RGB565). Its arena state holds the
+//! `*mut CanvasState` pointer.
 
+use crate::abi::platform::native::wasm::wasm_browser_canvas as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -77,7 +79,7 @@ pub(crate) struct CanvasState {
     pub format: u8,
 }
 
-/// Public — used by `wasm.rs` to size the per-module heap.
+/// The per-module heap the constructor seats.
 ///
 /// Sized for the widest format, because a self-describing stream chooses its
 /// format per frame and a buffer that only fits RGB565 would refuse an RGBA8
@@ -89,8 +91,8 @@ pub(crate) fn heap_size_for(width: u16, height: u16) -> usize {
 }
 
 /// Allocate a `CanvasState` on the kernel heap and return its raw
-/// pointer. Caller stashes the pointer in the BuiltInModule's state
-/// buffer; `step` recovers it via pointer-deref.
+/// pointer. The constructor stashes the pointer in the arena state;
+/// `step` recovers it via pointer-deref.
 unsafe fn alloc_state(
     in_chan: i32,
     width: u16,
@@ -127,17 +129,17 @@ unsafe fn alloc_state(
     raw
 }
 
-/// BuiltInModule step function. Reads any pending bytes from the
+/// Step function. Reads any pending bytes from the
 /// input channel into the frame buffer; once the buffer holds a full
 /// frame's worth (`width * height * 2`), presents it and resets.
 ///
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn canvas_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn canvas_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut CanvasState);
         if st_ptr.is_null() {
@@ -226,17 +228,28 @@ unsafe fn canvas_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Construct a `wasm_browser_canvas` BuiltInModule. The kernel-side
-/// loader calls this when a module table entry's name matches
-/// `wasm_browser_canvas`.
-pub(crate) unsafe fn build(
-    width: u16,
-    height: u16,
-    header_mode: bool,
-    in_chan: i32,
-) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_canvas", canvas_step);
-    let raw = alloc_state(in_chan, width, height, header_mode);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut CanvasState, raw);
-    m
+/// The `wasm_browser_canvas` native module.
+pub static WASM_BROWSER_CANVAS: NativeVtable = super::heap_native(new, canvas_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut width = 0u16;
+    let mut height = 0u16;
+    let mut header = false;
+    super::walk_tlv(init.params, |tag, value| match tag {
+        tags::TAG_WIDTH => width = super::tlv_u32(value) as u16,
+        tags::TAG_HEIGHT => height = super::tlv_u32(value) as u16,
+        tags::TAG_HEADER => header = super::tlv_u32(value) != 0,
+        _ => {}
+    });
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_PIXELS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, heap_size_for(width, height), || {
+            alloc_state(in_chan, width, height, header).cast()
+        })
+    }
 }

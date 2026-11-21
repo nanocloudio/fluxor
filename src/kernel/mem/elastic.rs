@@ -1,4 +1,4 @@
-//! Tier B elastic region — kernel-owned chunk grants for runtime pool
+//! elastic region — kernel-owned chunk grants for runtime pool
 //! growth ( `resource::ELASTIC_ALLOC`).
 //!
 //! Module state and heap arenas are committed whole at load, so a pool

@@ -178,7 +178,7 @@ pub fn set_flusher(on: bool) {
 /// installed there. A reinstall of the same triple — which every routine
 /// whole-graph rebuild performs — keeps the ring, its buffer, and its `seq`
 /// counter, preserving seq monotonicity across commits.
-/// A genuinely new tenant starts at `seq` 0. Scheduler thread only.
+/// A genuinely new owner starts at `seq` 0. Scheduler thread only.
 pub fn install_slot(slot: usize, uid: [u8; 16], generation: u32) {
     let Some(entry) = rings().get_mut(slot) else {
         return;
@@ -186,16 +186,16 @@ pub fn install_slot(slot: usize, uid: [u8; 16], generation: u32) {
     match entry {
         Some(r) if r.installed == (uid, generation) => {}
         Some(_) if FLUSHER.load(Ordering::Relaxed) => {
-            // A new tenant over a ring its predecessor never released: the
+            // A new owner over a ring its predecessor never released: the
             // predecessor's records wait for their flush, detached, and the
-            // new tenant starts its own.
+            // new owner starts its own.
             if let Some(old) = entry.take() {
                 detach(slot, old);
             }
             *entry = Some(Box::new(Ring::new(uid, generation)));
         }
         Some(r) => {
-            // A new tenant, no flusher to keep the old records for: fresh
+            // A new owner, no flusher to keep the old records for: fresh
             // state over the same bytes. They need no zeroing: a fresh
             // RingState reports `used` 0, so stale bytes are never read.
             r.state = RingState::new(CAP);

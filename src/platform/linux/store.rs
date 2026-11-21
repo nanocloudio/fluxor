@@ -705,7 +705,7 @@ use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
 use crate::abi::fence::{trailer, Fence, QUERY_OP, WIRE_MAX_LEN};
 use crate::kernel::module::user_span::UserSpan;
 use crate::kernel::sys::errno;
-use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
+use crate::kernel::workload::owner::{OwnerHandle, OWNER_NODE};
 use crate::kernel::workload::storage::store_entry_cost;
 
 /// A fixed 16-byte source id for this store's fences (ObjectId).
@@ -748,7 +748,7 @@ const SUB_EMPTY: Sub = Sub {
     prefix: String::new(),
     doorbell: -1,
     owed: false,
-    opener: OWNER_SYSTEM,
+    opener: OWNER_NODE,
 };
 
 /// Ring `s`'s doorbell. One whose handle closed rings nothing, and the
@@ -781,7 +781,7 @@ const READ_EMPTY: ReadSlot = ReadSlot {
     value: Vec::new(),
     revision: 0,
     grant: None,
-    opener: OWNER_SYSTEM,
+    opener: OWNER_NODE,
 };
 
 /// A `PUT_STREAMED_OPEN`-opened write slot: the bytes staged so far, and the
@@ -814,7 +814,7 @@ const WRITE_EMPTY: WriteSlot = WriteSlot {
     staged: Vec::new(),
     precondition: Precondition::Any,
     grant: None,
-    opener: OWNER_SYSTEM,
+    opener: OWNER_NODE,
 };
 
 /// A store and the handles its callers hold on it: the `GET` reads, streamed
@@ -896,7 +896,7 @@ impl Served {
         Self::with_tables(store, NODE_POOLS, STORE_STAGE_MAX)
     }
 
-    /// A workload's own store, with tables sized for one tenant.
+    /// A workload's own store, with tables sized for one owner.
     pub fn owner(store: Store) -> Self {
         Self::with_tables(store, OWNER_POOLS, OWNER_STAGE_MAX)
     }

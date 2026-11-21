@@ -85,9 +85,9 @@ pub fn extract_module_search_paths(
 
 /// any additional search paths (e.g., relative to the config file).
 /// Standard fluxor module subdirectories, relative to a root: the one
-/// tier list (`manifest::MODULE_TIERS`). Built-ins live under
+/// layer list (`manifest::MODULE_LAYERS`). Built-ins live under
 /// `modules/platform/<platform>/<name>/`.
-const STANDARD_MODULE_SUBDIRS: &[&str] = crate::manifest::MODULE_TIERS;
+const STANDARD_MODULE_SUBDIRS: &[&str] = crate::manifest::MODULE_LAYERS;
 
 /// Build the prioritized list of module search roots. Order:
 ///   1. `<project_root>/<standard subdirs>` — user's overrides
@@ -147,8 +147,8 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
 ///
 /// Returns the first hit (`<dir>/<type_name>` whose directory
 /// exists). Centralising the lookup keeps the manifest loader
-/// (`load_module_manifests_with_extra`) and the ISR-tier source checks
-/// in `validate_isr_tier_admission` aligned: if a config-declared
+/// (`load_module_manifests_with_extra`) and the interrupt-mode source checks
+/// in `validate_interrupt_admission` aligned: if a config-declared
 /// `module_search_paths:` entry collides with a bundled module of
 /// the same `type:` name, both readers must agree on which one
 /// wins. Were the order to differ between them, the checks would clear
@@ -317,7 +317,7 @@ pub fn load_module_manifests_with_extra_for_target(
         // shadowing a bundled module of the same type:name was
         // documented to win — searching standard first violated
         // that and could load the wrong `manifest.toml` for
-        // ISR-tier admission.
+        // interrupt-mode admission.
         let Some(root) = resolve_module_root(type_name, extra_dirs) else {
             continue;
         };
@@ -709,8 +709,7 @@ fn edge_framed_type(
 /// Per-edge capacity + rate-class validation.
 ///
 /// The runtime `open_channels` enforcement over each wiring entry as
-/// written, by the kernel's ring rule (`ring_plan`, which mounts
-/// `fluxor_contracts::ring_size`) and the manifests' port capacities: for
+/// written, by the kernel's ring rule (`fluxor_contracts::ring_size`) and the manifests' port capacities: for
 /// every FIFO edge, take the ring the kernel grants and check
 ///   1. producer `max_record` fits it (wedge exclusion — an
 ///      all-or-nothing write larger than the ring can never succeed);
@@ -834,16 +833,16 @@ fn validate_wiring_capacity(
         // The runtime grant, by the kernel's rule.
         let prod_size = from_port.map(|p| p.buffer_size).unwrap_or(0);
         let cons_size = to_port_spec.map(|p| p.buffer_size).unwrap_or(0);
-        let request = crate::ring_plan::edge_request(prod_size, cons_size, buffer_bytes);
+        let request = fluxor_contracts::ring_size::edge_request(prod_size, cons_size, buffer_bytes);
         // (2) ceiling.
-        let Some(granted) = crate::ring_plan::ring_for(request) else {
+        let Some(granted) = fluxor_contracts::ring_size::ring_for(request) else {
             return Err(Error::Config(format!(
                 "wiring[{i}] ({} → {}): requested buffer {} exceeds the channel \
                  ceiling {} — lower the request or split the stream.",
                 from_specs[i],
                 to_specs[i],
                 request,
-                crate::ring_plan::MAX_RING_BYTES
+                fluxor_contracts::ring_size::MAX_RING_BYTES
             )));
         };
 

@@ -1,9 +1,9 @@
 //! Liveness watchdog: a wedged RP board falls back to BOOTSEL.
 //!
-//! A module that never returns, stepped privileged, stops the main loop —
-//! and the main loop is what services USB, so the board stops enumerating and
+//! A module that never returns, stepped privileged, stops the domain loop —
+//! and the domain loop is what services USB, so the board stops enumerating and
 //! nothing on the host can reach it again: no console, no reset interface, no
-//! picotool. The watchdog closes that hole. The main loop feeds it; if it
+//! picotool. The watchdog closes that hole. The domain loop feeds it; if it
 //! starves, the chip resets, and the next boot, finding a watchdog reset the
 //! kernel armed, enters BOOTSEL instead of running the same image into the
 //! same wedge, so picotool can reflash the board unattended.
@@ -24,7 +24,7 @@ const SCRATCH0: usize = WATCHDOG_CTRL as usize + 0x0C;
 /// last wedged boot died in (high half). Watchdog scratch registers survive
 /// a watchdog reset and the BOOTSEL round trip that follows, so the next
 /// boot can say where its predecessor hung — which no log can, since a
-/// wedge before the main loop never pumps USB and the log ring does not
+/// wedge before the domain loop never pumps USB and the log ring does not
 /// survive the reset. One register holds both: the RP2350 bootrom's reboot
 /// writes scratch 2 and 3.
 const SCRATCH1: usize = WATCHDOG_CTRL as usize + 0x10;
@@ -37,7 +37,7 @@ const REASON_TIMER: u32 = 1 << 0;
 /// "FLXW": the kernel's liveness watchdog was armed.
 const MARKER: u32 = 0x464C_5857;
 
-/// How long the main loop may go without feeding before the board is
+/// How long the domain loop may go without feeding before the board is
 /// declared wedged. Far above any legitimate step (the step guard bounds
 /// those in milliseconds) and short enough that a wedged rig recovers
 /// quickly.
@@ -56,7 +56,7 @@ pub mod stage {
     pub const USB: u32 = 2;
     /// Building the graph; the low byte is the module being instantiated.
     pub const GRAPH: u32 = 1 << 8;
-    pub const MAIN_LOOP: u32 = 3;
+    pub const DOMAIN_LOOP: u32 = 3;
 }
 
 /// Record where the boot has got to.
@@ -124,17 +124,17 @@ fn start_tick() {
 }
 
 /// The longest the counter holds: its 24-bit load value at this chip's
-/// tick rate. Bounds the boot, from clock bring-up to the main loop.
+/// tick rate. Bounds the boot, from clock bring-up to the domain loop.
 pub const BOOT_TIMEOUT_US: u32 = 0x00FF_FFFF / TICKS_PER_US;
 
-/// Arm the watchdog: a whole-chip reset if the main loop stops feeding it
+/// Arm the watchdog: a whole-chip reset if the domain loop stops feeding it
 /// for [`TIMEOUT_US`].
 pub fn arm() {
     arm_for(TIMEOUT_US);
 }
 
 /// Arm the watchdog for a boot or a graph build, which nothing feeds until
-/// the main loop starts: a hang anywhere in it — the device stack, a
+/// the domain loop starts: a hang anywhere in it — the device stack, a
 /// module's construction — still ends in BOOTSEL, after
 /// [`BOOT_TIMEOUT_US`].
 pub fn arm_for_boot() {
@@ -152,7 +152,7 @@ fn arm_for(timeout_us: u32) {
     }
 }
 
-/// Feed the watchdog from the main loop.
+/// Feed the watchdog from the domain loop.
 #[inline]
 pub fn feed() {
     // SAFETY: a write to LOAD reloads the countdown; no other effect.

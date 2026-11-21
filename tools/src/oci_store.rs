@@ -1,5 +1,5 @@
 //! Local OCI image-layout content store for `.fmod` modules and workload
-//! bundles.
+//! packages.
 //!
 //! Layout is the standard OCI image layout: `oci-layout` marker,
 //! `blobs/sha256/<hex>` content-addressed blobs, and `index.json` holding one
@@ -62,34 +62,35 @@ pub const MT_FLUXOR_STACK: &str = "application/vnd.nanocloud.fluxor.stack.v1+yam
 pub const MT_FLUXOR_STACK_MODULES: &str = "application/vnd.nanocloud.fluxor.stack.modules.v1+json";
 /// Module manifest.toml metadata carried alongside the `.fmod` layer.
 pub const MT_FLUXOR_MODULE_META: &str = "application/vnd.nanocloud.fluxor.module.manifest.v1+toml";
-/// A GRAPH IMAGE (`fluxor build --emit=image`): FXSL header + modules
+/// A NODE IMAGE (`fluxor build --emit=image`): FXSL header + modules
 /// blob + config blob — the packaged deployable graph, the sanctioned
 /// OTA delivery unit (on RP it is what a flash A/B graph slot holds).
 /// The header's own sha256/ABI-pin/epoch travel inside the layer; the
 /// annotations mirror target/epoch so admission can happen from the
 /// manifest alone, before the layer is fetched.
 pub const MT_FLUXOR_IMAGE: &str = "application/vnd.nanocloud.fluxor.image.v1";
-/// A workload that brings its own modules: the artifact type, and its FLXA
-/// subgraph layer. Each module is a `MT_FLUXOR_MODULE` layer.
+/// A workload that brings its own modules: the artifact type, and its graph
+/// layer, the workload's composed graph (`fluxor_contracts::graph`). Each
+/// module is a `MT_FLUXOR_MODULE` layer.
 pub const MT_FLUXOR_WORKLOAD_IMAGE: &str = "application/vnd.nanocloud.fluxor.workload-image.v1";
 pub const MT_FLUXOR_FLXA: &str = "application/vnd.nanocloud.fluxor.flxa.v1";
 /// A workload image's config blob: what a puller needs to know before it
 /// asks a node to run the image, as JSON — `env`, every param the image's
 /// graph binds to the workload's environment ([`WorkloadEnvBinding`]), so an
-/// orchestrator can refuse a pod that does not give a required name before
+/// orchestrator can refuse a workload that does not give a required name before
 /// the node's `CREATE` would. Content-addressed with the manifest, and read
 /// with one blob fetch after it ([`workload_image_config`]).
 pub const MT_FLUXOR_WORKLOAD_IMAGE_CONFIG: &str =
     "application/vnd.nanocloud.fluxor.workload-image.config.v1+json";
-/// A workload-image module layer's FNV-1a name hash, as the FLXA names it.
+/// A workload-image module layer's FNV-1a name hash, as the graph names it.
 pub const ANN_MODULE_NAME_HASH: &str = "io.fluxor.module.name-hash";
 /// A workload image's module ABI (`aarch64`, …).
 pub const ANN_MODULE_ABI: &str = "io.fluxor.module.abi";
-/// A complete boot image (e.g. Pi 5 `kernel_2712.img`): kernel +
+/// A complete firmware image (e.g. Pi 5 `kernel_2712.img`): kernel +
 /// embedded graph, delivered to a staging host (TFTP root, SD writer),
 /// never consumed by a running device directly.
 pub const MT_FLUXOR_FIRMWARE: &str = "application/vnd.nanocloud.fluxor.firmware.v1";
-/// The non-payload prefix of a graph image (FXSL header + module-table
+/// The non-payload prefix of a node image (FXSL header + module-table
 /// header + entry array): the first layer of a LAYERED image manifest.
 /// The remaining layers are the raw fmods (`MT_FLUXOR_MODULE`) and the
 /// compiled config (`MT_FLUXOR_CONFIG_BIN`), each carrying an
@@ -99,10 +100,10 @@ pub const MT_FLUXOR_FIRMWARE: &str = "application/vnd.nanocloud.fluxor.firmware.
 pub const MT_FLUXOR_IMAGE_SKELETON: &str = "application/vnd.nanocloud.fluxor.image.skeleton.v1";
 /// Compiled binary graph config.
 pub const MT_FLUXOR_CONFIG_BIN: &str = "application/vnd.nanocloud.fluxor.config.v1+bin";
-/// The program section of a graph image: per-module program blobs after
+/// The program section of a node image: per-module program blobs after
 /// the module table (`kernel_abi::program`).
 pub const MT_FLUXOR_PROGRAMS: &str = "application/vnd.nanocloud.fluxor.programs.v1";
-/// Byte offset of a layer within its reassembled graph image (decimal).
+/// Byte offset of a layer within its reassembled node image (decimal).
 pub const ANN_IMAGE_OFFSET: &str = "io.fluxor.image.offset";
 /// Staged source tree (canonical uncompressed tar) — the SDK /
 /// `<project>-common` trees that consumers `#[path]`/`include!` after
@@ -817,9 +818,9 @@ impl OciStore {
         // errors, the index is untouched and the command is safely
         // retryable.
         let mut probe = BTreeSet::new();
-        let mut probe_tiers = BTreeMap::new();
+        let mut probe_kinds = BTreeMap::new();
         for d in index.manifests.iter().filter(|d| survives(d)) {
-            self.add_closure(d, &mut probe, &mut probe_tiers)
+            self.add_closure(d, &mut probe, &mut probe_kinds)
                 .map_err(|e| {
                     Error::Config(format!(
                         "refusing to remove: live manifest {} is unreadable ({e})",
@@ -906,7 +907,7 @@ pub fn publish_module(store: &OciStore, m: &ModulePublish<'_>) -> Result<Descrip
     }
 }
 
-/// Everything needed to publish a device artifact (graph image or
+/// Everything needed to publish a device artifact (node image or
 /// firmware image) into the store. `epoch` is the image header's epoch
 /// (image kind only); `abi_surface_hex` is the surface digest the
 /// artifact was built against, mirrored from the image header pin so a
@@ -928,7 +929,7 @@ pub struct DeviceArtifactPublish<'a> {
 /// Image-header epoch annotation (`io.fluxor.image.epoch`, decimal).
 pub const ANN_IMAGE_EPOCH: &str = "io.fluxor.image.epoch";
 
-/// One layer of an exploded graph image: the blob plus where it sits in
+/// One layer of an exploded node image: the blob plus where it sits in
 /// the reassembled image.
 pub struct ImageLayer<'a> {
     pub media_type: &'a str,
@@ -938,7 +939,7 @@ pub struct ImageLayer<'a> {
     pub title: &'a str,
 }
 
-/// Explode a packed graph image into its layered form: skeleton (all
+/// Explode a packed node image into its layered form: skeleton (all
 /// bytes before the first fmod or the program section), one layer per
 /// fmod, the program section when there is one, and one config layer.
 /// Pure function over the FXSL/FXMT formats — returns borrowed slices
@@ -952,7 +953,7 @@ pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
         ENTRY_OFFSET, ENTRY_SIZE, ENTRY_SIZE_AT, HEADER_SIZE as TABLE_HEADER_SIZE, MODULE_COUNT,
     };
     if image.len() < 96 || u32::from_le_bytes(image[0..4].try_into().unwrap()) != FXSL_MAGIC {
-        return Err(Error::Config("not a graph image (no FXSL header)".into()));
+        return Err(Error::Config("not a node image (no FXSL header)".into()));
     }
     let modules_offset = u32::from_le_bytes(image[16..20].try_into().unwrap()) as usize;
     let modules_size = u32::from_le_bytes(image[20..24].try_into().unwrap()) as usize;
@@ -1053,7 +1054,7 @@ pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
     Ok(layers)
 }
 
-/// Publish a LAYERED graph image: skeleton + per-fmod + program section +
+/// Publish a LAYERED node image: skeleton + per-fmod + program section +
 /// config layers, each layer annotated with its byte offset in the
 /// reassembled image so a consumer can rebuild the exact bytes. Fmod
 /// layer blobs are byte-identical to individually published module
@@ -1141,7 +1142,7 @@ pub struct WorkloadImageConfig {
 }
 
 impl WorkloadImageConfig {
-    /// The names a pod must give, each once, in first-listed order.
+    /// The names a workload must give, each once, in first-listed order.
     pub fn required_env(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
         for b in self.env.iter().filter(|b| b.required) {
@@ -1176,7 +1177,8 @@ pub struct WorkloadImagePublish<'a> {
     pub target: &'a str,
     pub module_abi: &'a str,
     pub abi_surface_hex: &'a str,
-    pub flxa: &'a [u8],
+    /// The workload's composed graph.
+    pub graph: &'a [u8],
     pub modules: &'a [WorkloadModule],
     /// The image's env bindings, carried in its config blob.
     pub env: &'a [WorkloadEnvBinding],
@@ -1185,13 +1187,13 @@ pub struct WorkloadImagePublish<'a> {
     pub ref_name: &'a str,
 }
 
-/// Publish a workload image: the FLXA subgraph, then one layer per module in
+/// Publish a workload image: its composed graph, then one layer per module in
 /// the order the image lists them. A module layer's digest is the sha256 of
 /// its `.fmod` bytes, which is the pin a node's kernel admits it by — so a
 /// node pins exactly what the manifest names, and a registry stores a module
 /// shared by many images once. The config is a [`WorkloadImageConfig`]
 /// ([`MT_FLUXOR_WORKLOAD_IMAGE_CONFIG`]): the image's env bindings, so a
-/// puller learns the names a pod must give from the manifest and one blob,
+/// puller learns the names a workload must give from the manifest and one blob,
 /// before it asks a node.
 pub fn publish_workload_image(
     store: &OciStore,
@@ -1204,7 +1206,7 @@ pub fn publish_workload_image(
     .map_err(|e| Error::Config(format!("workload image config: {e}")))?;
     let (config_digest, config_size) = store.put_blob(&config)?;
     let mut layers = Vec::with_capacity(a.modules.len() + 1);
-    let (fd, fsz) = store.put_blob(a.flxa)?;
+    let (fd, fsz) = store.put_blob(a.graph)?;
     layers.push(Descriptor {
         media_type: MT_FLUXOR_FLXA.into(),
         digest: fd,
@@ -1250,9 +1252,9 @@ pub fn publish_workload_image(
     Ok(desc)
 }
 
-/// Publish a device artifact (graph image / firmware image) as a
+/// Publish a device artifact (node image / firmware image) as a
 /// one-layer OCI artifact. Unlike project artifacts these are
-/// *deployment encodings*: they exist so a device (graph image) or a
+/// *deployment encodings*: they exist so a device (node image) or a
 /// staging host (firmware) can pull them from a registry — the
 /// store-side consume paths never read them.
 pub fn publish_device_artifact(
@@ -1446,8 +1448,8 @@ pub fn render_displacement(report: &[DisplacedPin]) -> String {
     s
 }
 
-/// Everything a workload-bundle publish stages.
-pub struct BundleArtifact<'a> {
+/// Everything a workload-package publish stages.
+pub struct PackageArtifact<'a> {
     pub workload_json: &'a str,
     pub resources_json: &'a [u8],
     pub graph_yaml: &'a [u8],
@@ -1698,28 +1700,28 @@ impl OciStore {
         })
     }
 
-    /// Stage a workload bundle: `workload.json`, `resources.json`,
+    /// Stage a workload package: `workload.json`, `resources.json`,
     /// `graph.yaml`, and one module layer per module the manifest pins.
     ///
-    /// A bundle is self-contained: it carries the `.fmod` bytes it pins
+    /// A package is self-contained: it carries the `.fmod` bytes it pins
     /// rather than pointing at module artifacts that must be published
-    /// first, so pinning a bundle pins everything one run of it loads. Each
+    /// first, so pinning a package pins everything one run of it loads. Each
     /// module's bytes must hash to the digest `workload.json` pins for it,
     /// and the graph and resource profile must be bytes some implementation
-    /// pins; a bundle whose parts disagree with its own manifest is refused
-    /// rather than published. Bundle names carry no project namespace, so a
-    /// name another project already publishes a bundle under is refused,
+    /// pins; a package whose parts disagree with its own manifest is refused
+    /// rather than published. Package names carry no project namespace, so a
+    /// name another project already publishes a package under is refused,
     /// naming both owners.
-    pub fn prepare_bundle(
+    pub fn prepare_package(
         &self,
-        b: &BundleArtifact<'_>,
+        b: &PackageArtifact<'_>,
         meta: &ArtifactMeta<'_>,
     ) -> Result<Prepared> {
         let manifest = crate::workload::parse_manifest(b.workload_json).map_err(Error::Config)?;
         let report = crate::workload::validate(&manifest);
         if !report.is_ok() {
             return Err(Error::Config(format!(
-                "bundle '{}' failed validation: {}",
+                "workload package '{}' failed validation: {}",
                 manifest.name,
                 report.errors.join("; ")
             )));
@@ -1750,17 +1752,17 @@ impl OciStore {
             .rsplit_once(':')
             .map_or(b.ref_name, |(body, _)| body);
         for d in &self.read_index()?.manifests {
-            let is_bundle = d.annotations.get(ANN_KIND).map(String::as_str) == Some("bundle");
+            let is_package = d.annotations.get(ANN_KIND).map(String::as_str) == Some("bundle");
             let same_name = d
                 .annotations
                 .get(ANN_REF_NAME)
                 .and_then(|r| r.rsplit_once(':'))
                 .is_some_and(|(rb, _)| rb == body);
             let owner = d.annotations.get(ANN_PROJECT).map(String::as_str);
-            if is_bundle && same_name && owner != Some(meta.project) {
+            if is_package && same_name && owner != Some(meta.project) {
                 return Err(Error::Config(format!(
-                    "bundle name '{body}' is already published by project '{}'; refusing to \
-                     publish it from '{}' (bundle names are ecosystem-unique)",
+                    "package name '{body}' is already published by project '{}'; refusing to \
+                     publish it from '{}' (package names are ecosystem-unique)",
                     owner.unwrap_or("<unannotated>"),
                     meta.project
                 )));
@@ -1787,7 +1789,7 @@ impl OciStore {
                 if actual != mr.digest {
                     problems.push(format!(
                         "module '{}': the .fmod is {actual} but workload.json pins {} — \
-                         re-emit the bundle from the modules it should carry",
+                         re-emit the package from the modules it should carry",
                         mr.name, mr.digest
                     ));
                     continue;
@@ -1803,7 +1805,7 @@ impl OciStore {
         }
         if !problems.is_empty() {
             return Err(Error::Config(format!(
-                "bundle '{}': {}",
+                "workload package '{}': {}",
                 manifest.name,
                 problems.join("; ")
             )));
@@ -1857,7 +1859,7 @@ impl OciStore {
     }
 
     /// Stage a published stack: the document and its module references,
-    /// each a layer. A stack name is ecosystem-unique, as a bundle's is:
+    /// each a layer. A stack name is ecosystem-unique, as a package's is:
     /// a consumer includes it by name.
     pub fn prepare_stack(
         &self,
@@ -2270,22 +2272,22 @@ impl OciStore {
 
     /// Closure-add one descriptor's reachable digests into `live`,
     /// traversing both image manifests and image indexes (project
-    /// indexes, snapshots). Every digest visited is filed in `tiers` by
+    /// indexes, snapshots). Every digest visited is filed in `kinds` by
     /// its descriptor media type, which is the only place that
     /// classification is available without re-reading the blob.
     fn add_closure(
         &self,
         d: &Descriptor,
         live: &mut BTreeSet<String>,
-        tiers: &mut BTreeMap<String, BlobTier>,
+        kinds: &mut BTreeMap<String, BlobKind>,
     ) -> Result<()> {
-        record_tier(
-            tiers,
+        record_kind(
+            kinds,
             &d.digest,
             if d.media_type == MT_OCI_INDEX {
-                BlobTier::Index
+                BlobKind::Index
             } else {
-                BlobTier::Manifest
+                BlobKind::Manifest
             },
         );
         if !live.insert(d.digest.clone()) {
@@ -2295,16 +2297,16 @@ impl OciStore {
             let bytes = self.read_blob(&d.digest)?;
             let idx: ImageIndex = serde_json::from_slice(&bytes)?;
             for child in &idx.manifests {
-                self.add_closure(child, live, tiers)?;
+                self.add_closure(child, live, kinds)?;
             }
             return Ok(());
         }
         let m = self.read_manifest(d)?;
         live.insert(m.config.digest.clone());
-        record_tier(tiers, &m.config.digest, tier_of(&m.config.media_type));
+        record_kind(kinds, &m.config.digest, kind_of(&m.config.media_type));
         for l in &m.layers {
             live.insert(l.digest.clone());
-            record_tier(tiers, &l.digest, tier_of(&l.media_type));
+            record_kind(kinds, &l.digest, kind_of(&l.media_type));
         }
         Ok(())
     }
@@ -2326,7 +2328,7 @@ impl OciStore {
         &self,
         digest: &str,
         live: &mut BTreeSet<String>,
-        tiers: &mut BTreeMap<String, BlobTier>,
+        kinds: &mut BTreeMap<String, BlobKind>,
     ) -> Result<()> {
         if !live.insert(digest.to_string()) {
             return Ok(());
@@ -2339,20 +2341,20 @@ impl OciStore {
         // index lacks; `ImageIndex.manifests` defaults, so the index
         // parse must come second and gate on its media type.
         if let Ok(m) = serde_json::from_slice::<ImageManifest>(&bytes) {
-            record_tier(tiers, digest, BlobTier::Manifest);
+            record_kind(kinds, digest, BlobKind::Manifest);
             live.insert(m.config.digest.clone());
-            record_tier(tiers, &m.config.digest, tier_of(&m.config.media_type));
+            record_kind(kinds, &m.config.digest, kind_of(&m.config.media_type));
             for l in &m.layers {
                 live.insert(l.digest.clone());
-                record_tier(tiers, &l.digest, tier_of(&l.media_type));
+                record_kind(kinds, &l.digest, kind_of(&l.media_type));
             }
             return Ok(());
         }
         if let Ok(idx) = serde_json::from_slice::<ImageIndex>(&bytes) {
             if idx.media_type == MT_OCI_INDEX {
-                record_tier(tiers, digest, BlobTier::Index);
+                record_kind(kinds, digest, BlobKind::Index);
                 for child in &idx.manifests {
-                    self.add_closure_by_digest(&child.digest, live, tiers)?;
+                    self.add_closure_by_digest(&child.digest, live, kinds)?;
                 }
             }
         }
@@ -2384,32 +2386,32 @@ impl OciStore {
     ///
     /// Invariant: no blob referenced by any manifest still present in
     /// the store is ever quarantined, and quarantining runs strictly in
-    /// tier order — indexes, then the manifests they list, then leaves.
+    /// kind order — indexes, then the manifests they list, then leaves.
     /// An interrupted sweep therefore leaves orphaned bytes, never a
     /// referent-missing index or manifest.
     fn sweep_with_roots(&self, index: &ImageIndex, victims: &[Descriptor]) -> Result<Vec<String>> {
         let mut live: BTreeSet<String> = BTreeSet::new();
-        let mut tiers: BTreeMap<String, BlobTier> = BTreeMap::new();
+        let mut kinds: BTreeMap<String, BlobKind> = BTreeMap::new();
         for d in &index.manifests {
-            self.add_closure(d, &mut live, &mut tiers).map_err(|e| {
+            self.add_closure(d, &mut live, &mut kinds).map_err(|e| {
                 Error::Config(format!("live manifest {} is unreadable ({e})", d.digest))
             })?;
         }
         for digest in crate::store_pins::root_digests(&self.root)? {
-            self.add_closure_by_digest(&digest, &mut live, &mut tiers)
+            self.add_closure_by_digest(&digest, &mut live, &mut kinds)
                 .map_err(|e| Error::Config(format!("pinned blob {digest} is unreadable ({e})")))?;
         }
         let mut candidates: BTreeSet<String> = BTreeSet::new();
         for v in victims {
             candidates.insert(v.digest.clone());
             let mut c = BTreeSet::new();
-            if self.add_closure(v, &mut c, &mut tiers).is_ok() {
+            if self.add_closure(v, &mut c, &mut kinds).is_ok() {
                 candidates.extend(c);
             }
         }
         let mut doomed: Vec<&String> = candidates.difference(&live).collect();
-        // Stable by tier: a referent always outlives its referrer.
-        doomed.sort_by_key(|d| tiers.get(*d).copied().unwrap_or(BlobTier::Leaf));
+        // Stable by kind: a referent always outlives its referrer.
+        doomed.sort_by_key(|d| kinds.get(*d).copied().unwrap_or(BlobKind::Leaf));
         let quarantine = self.quarantine_dir();
         if !doomed.is_empty() {
             fs::create_dir_all(&quarantine)?;
@@ -2603,27 +2605,27 @@ impl OciStore {
 /// deletion order: an index is deleted before the manifests it lists,
 /// a manifest before the leaves it references.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum BlobTier {
+enum BlobKind {
     Index,
     Manifest,
     Leaf,
 }
 
-fn tier_of(media_type: &str) -> BlobTier {
+fn kind_of(media_type: &str) -> BlobKind {
     match media_type {
-        MT_OCI_INDEX => BlobTier::Index,
-        MT_OCI_MANIFEST => BlobTier::Manifest,
-        _ => BlobTier::Leaf,
+        MT_OCI_INDEX => BlobKind::Index,
+        MT_OCI_MANIFEST => BlobKind::Manifest,
+        _ => BlobKind::Leaf,
     }
 }
 
-/// File a digest's tier, keeping the strongest classification seen: one
+/// File a digest's kind, keeping the strongest classification seen: one
 /// digest may be reached both as a manifest descriptor and as some
-/// other manifest's layer, and the referrer tier is what deletion order
+/// other manifest's layer, and the referrer kind is what deletion order
 /// must respect.
-fn record_tier(tiers: &mut BTreeMap<String, BlobTier>, digest: &str, tier: BlobTier) {
-    let slot = tiers.entry(digest.to_string()).or_insert(tier);
-    *slot = (*slot).min(tier);
+fn record_kind(kinds: &mut BTreeMap<String, BlobKind>, digest: &str, kind: BlobKind) {
+    let slot = kinds.entry(digest.to_string()).or_insert(kind);
+    *slot = (*slot).min(kind);
 }
 
 // ── Canonical tar ─────────────────────────────────────────────────────
@@ -2833,7 +2835,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Build a minimal synthetic graph image (FXSL header + FXMT table
+    /// Build a minimal synthetic node image (FXSL header + FXMT table
     /// with two fmods + config), explode it, and reassemble from the
     /// layers with zero-filled gaps — the hashed regions must be
     /// byte-identical, which is exactly the device-side contract.
@@ -3026,7 +3028,7 @@ mod tests {
     }
 
     /// A workload image's config blob carries its env bindings, so a puller
-    /// reads the names a pod must give from the manifest and one blob; an
+    /// reads the names a workload must give from the manifest and one blob; an
     /// image that binds none carries an empty list, and a manifest that is
     /// not a workload image's has no workload config.
     #[test]
@@ -3056,7 +3058,7 @@ mod tests {
                     target: "linux",
                     module_abi: "aarch64",
                     abi_surface_hex: "00",
-                    flxa: b"FLXA",
+                    graph: b"FLXG",
                     modules: &modules,
                     env,
                     provenance: PROVENANCE_LOCAL,
@@ -3320,7 +3322,7 @@ mod tests {
         }
     }
 
-    /// A sweep deletes strictly in tier order — index, then the
+    /// A sweep deletes strictly in kind order — index, then the
     /// manifests it lists, then leaves — so an interrupted sweep can
     /// only ever leave orphaned bytes, never a structural blob pointing
     /// at a deleted referent.
@@ -3421,14 +3423,14 @@ mod tests {
         );
     }
 
-    struct BundleFixture {
+    struct PackageFixture {
         workload: String,
         resources: Vec<u8>,
         graph: Vec<u8>,
         modules: Vec<(String, Vec<u8>)>,
     }
 
-    fn bundle_fixture() -> BundleFixture {
+    fn package_fixture() -> PackageFixture {
         let resources = br#"{"modules":1,"edges":0,"stateBytes":1024,"bufferBytes":0}"#.to_vec();
         let graph = b"modules: []\n".to_vec();
         let fmod = b"router-fmod".to_vec();
@@ -3455,7 +3457,7 @@ mod tests {
             res_d = sha256_hex_prefixed(&resources),
             fmod_d = sha256_hex_prefixed(&fmod),
         );
-        BundleFixture {
+        PackageFixture {
             workload,
             resources,
             graph,
@@ -3463,7 +3465,7 @@ mod tests {
         }
     }
 
-    fn bundle_meta(project: &str) -> ArtifactMeta<'_> {
+    fn package_meta(project: &str) -> ArtifactMeta<'_> {
         ArtifactMeta {
             project,
             provenance: PROVENANCE_PUBLISHED,
@@ -3474,35 +3476,35 @@ mod tests {
         }
     }
 
-    fn prepare(store: &OciStore, f: &BundleFixture, project: &str) -> Result<Prepared> {
-        store.prepare_bundle(
-            &BundleArtifact {
+    fn prepare(store: &OciStore, f: &PackageFixture, project: &str) -> Result<Prepared> {
+        store.prepare_package(
+            &PackageArtifact {
                 workload_json: &f.workload,
                 resources_json: &f.resources,
                 graph_yaml: &f.graph,
                 modules: &f.modules,
                 ref_name: "demo:1.0.0",
             },
-            &bundle_meta(project),
+            &package_meta(project),
         )
     }
 
-    fn refusal(store: &OciStore, f: &BundleFixture, project: &str) -> String {
+    fn refusal(store: &OciStore, f: &PackageFixture, project: &str) -> String {
         match prepare(store, f, project) {
-            Ok(_) => panic!("expected the bundle to be refused"),
+            Ok(_) => panic!("expected the package to be refused"),
             Err(e) => e.to_string(),
         }
     }
 
     #[test]
-    fn bundle_publish_is_self_contained_and_joins_the_project_index() {
+    fn package_publish_is_self_contained_and_joins_the_project_index() {
         let (_dir, store) = temp_store();
-        let f = bundle_fixture();
+        let f = package_fixture();
         let txn = store.begin_publish().unwrap();
-        let prepared = prepare(&store, &f, "proj").expect("prepare bundle");
+        let prepared = prepare(&store, &f, "proj").expect("prepare package");
         store
             .commit_publish(&txn, "proj", "0.1.0", vec![prepared], None)
-            .expect("commit bundle");
+            .expect("commit package");
         drop(txn);
 
         let desc = store.resolve("demo:latest").unwrap();
@@ -3534,7 +3536,7 @@ mod tests {
             serde_json::from_slice(&store.read_blob(&meta.digest).unwrap()).unwrap();
         assert!(
             idx.manifests.iter().any(|c| c.digest == desc.digest),
-            "the bundle is a child of its project's index"
+            "the package is a child of its project's index"
         );
         let row = store
             .latest_provenance(&desc.digest)
@@ -3543,9 +3545,9 @@ mod tests {
     }
 
     #[test]
-    fn bundle_publish_refuses_module_bytes_that_are_not_the_pinned_ones() {
+    fn package_publish_refuses_module_bytes_that_are_not_the_pinned_ones() {
         let (_dir, store) = temp_store();
-        let mut f = bundle_fixture();
+        let mut f = package_fixture();
         f.modules = vec![("router".to_string(), b"rebuilt-since".to_vec())];
         let _txn = store.begin_publish().unwrap();
         let err = refusal(&store, &f, "proj");
@@ -3556,9 +3558,9 @@ mod tests {
     }
 
     #[test]
-    fn bundle_publish_rejects_unpinned_artifacts() {
+    fn package_publish_rejects_unpinned_artifacts() {
         let (_dir, store) = temp_store();
-        let mut f = bundle_fixture();
+        let mut f = package_fixture();
         f.graph = b"tampered: true\n".to_vec();
         let _txn = store.begin_publish().unwrap();
         let err = refusal(&store, &f, "proj");
@@ -3566,9 +3568,9 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_name_belongs_to_one_project() {
+    fn a_package_name_belongs_to_one_project() {
         let (_dir, store) = temp_store();
-        let f = bundle_fixture();
+        let f = package_fixture();
         let txn = store.begin_publish().unwrap();
         let prepared = prepare(&store, &f, "first").unwrap();
         store

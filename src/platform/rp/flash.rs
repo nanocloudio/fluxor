@@ -387,7 +387,7 @@ pub mod store {
             return true;
         }
 
-        // Graph slots A and B — OTA-writable bundles, as this board's flash
+        // Graph slots A and B — OTA-writable node images, as this board's flash
         // is partitioned. A board with no room for slots has none.
         if LAYOUT.slot_size == 0 {
             return false;

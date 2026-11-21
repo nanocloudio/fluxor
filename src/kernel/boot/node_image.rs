@@ -1,16 +1,16 @@
-//! Graph-image admission: the one check every graph image passes before the
+//! Node-image admission: the one check every node image passes before the
 //! kernel runs anything from it, wherever it came from (an RP flash slot, the
 //! payload a firmware image carries after the kernel, an OTA image staged in
 //! RAM, a Linux runtime's graph file).
 //!
-//! An image is admitted when its header (`abi::wire::graph_image`) is well
+//! An image is admitted when its header (`abi::wire::node_image`) is well
 //! formed for the bytes that hold it, its ABI-surface pin equals this
 //! kernel's own, and, when the kernel image carries a signing root, its
 //! signature verifies against that root (`security::image_signature`) and its
 //! payload hashes to the digest the signature covers. Without a root nothing
 //! vouches for the digest, so the payload is not hashed.
 
-use crate::abi::wire::graph_image::{Header, Malformed};
+use crate::abi::wire::node_image::{Header, Malformed};
 use crate::kernel::security::image_signature;
 
 /// Why an image was refused.
@@ -31,7 +31,7 @@ impl Refusal {
     pub fn reason(self) -> &'static str {
         match self {
             Refusal::Malformed(Malformed::Short) => "shorter than a header",
-            Refusal::Malformed(Malformed::Magic) => "no graph image header",
+            Refusal::Malformed(Malformed::Magic) => "no node image header",
             Refusal::Malformed(Malformed::Version) => "header version",
             Refusal::Malformed(Malformed::Regions) => "regions do not fit",
             Refusal::Pin => "built against another ABI surface",
@@ -55,7 +55,7 @@ pub fn own_abi_pin() -> [u8; 32] {
     out
 }
 
-/// Admit the graph image `image`, header first, as long as what holds it:
+/// Admit the node image `image`, header first, as long as what holds it:
 /// shape, then pin, then (under the kernel image's signing root) signature and
 /// payload digest. Answers the header, whose regions lie inside `image`.
 pub fn admit(image: &[u8], own_pin: &[u8; 32]) -> Result<Header, Refusal> {

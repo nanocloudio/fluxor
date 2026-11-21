@@ -275,7 +275,7 @@ silicon-oblivious:
   ships a real comparison; the loader relies on it for module
   admission.
 - `signing_root() -> Option<[u8; 32]>` — the Ed25519 public key the
-  loader verifies modules and graph images against. Every platform
+  loader verifies modules and node images against. Every platform
   answers with the root the packager wrote into its kernel image
   (`security::root::image_root`); the test HAL answers with one a test
   sets.
@@ -491,7 +491,7 @@ else:
 
 1. **`HalOps`** (`src/kernel/sys/hal.rs`) — the function-pointer table each
    platform installs at boot. All platform *behaviour* the kernel invokes goes
-   through it: timing, interrupts, step-guard, ISR tiers, SMP quiesce, and the module
+   through it: timing, interrupts, step-guard, the module timer (`module_timer_init`/`start`/`stop`/`poll`), SMP quiesce, and the module
    protection surface: `protection_register_module`/`_release_module`,
    `protection_gateway_table` and `protected_call`, which run a gated module
    unprivileged (EL0 under the MMU on aarch64, the MPU on RP; see
@@ -577,7 +577,7 @@ modules. No `driver` match keys exist in any stack; midi/pointer match on
 ## Related Documentation
 
 - [abi_layers.md](abi_layers.md) — ABI layers, contract inventory, provider dispatch
-- [pipeline.md](pipeline.md) — graph runner, channel mechanics, scheduler
+- [pipeline.md](pipeline.md) — domain loop, channel mechanics, scheduler
 - [events.md](events.md) — IRQ binding and interrupt-driven driver pattern
 - [pin_allocation.md](pin_allocation.md) — config-driven pin and bus assignment
 - [network.md](network.md) — networking stack built on bus primitives

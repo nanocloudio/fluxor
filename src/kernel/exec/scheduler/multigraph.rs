@@ -3,15 +3,15 @@
 use super::*;
 
 // ===========================================================================
-// Multi-graph runtime (the resident-graph runner)
+// Multi-graph runtime (resident graphs in the domain loop)
 // ===========================================================================
 //
 // The graph-local pacer surface above is keyed by `(graph_slot, generation,
 // domain)`. This section is the runtime that admits and concurrently runs MORE
 // THAN ONE resident graph, so that pacer surface is live: each resident graph is
-// an `owner::OwnerHandle{slot, generation}` (the system graph is `OWNER_SYSTEM`,
-// slot 0; workload graphs are admitted as owners 1..N via `live::apply_add`). On
-// a shared cooperative runner the runner steps each owner's modules
+// an `owner::OwnerHandle{slot, generation}` (the node graph is `OWNER_NODE`,
+// slot 0; workload graphs are admitted as owners 1..N via the splice (`splice::admit`)). On
+// a shared domain loop the pass steps each owner's modules
 // independently, skips an idle owner, and arms the physical sleep as the
 // deadline-merge minimum.
 //
@@ -22,35 +22,33 @@ use super::*;
 // slot and domain (`size_resident_graphs`), so every resident graph the owner
 // table seats is indexed.
 
-/// One resident `(graph, domain)` the runner multiplexes. `mask` is the cached
+/// One resident `(graph, domain)` the domain loop multiplexes. `mask` is the cached
 /// set of module slots this graph owns *in this domain* (built at finalize so
 /// `take_wake_in_mask` is an `EVENT_WAKE ∩ mask` intersection, never a scan).
 /// `primed` forces the first pass after (re)build to step the graph at least
 /// once so the steady-state runnable predicate has prior-pass signals to read.
 #[derive(Clone, Copy)]
-struct ResidentGraph {
-    slot: u16,
-    generation: u32,
-    domain: u8,
-    mask: ModuleMask,
-    primed: bool,
+pub(crate) struct ResidentGraph {
+    pub(crate) slot: u16,
+    pub(crate) generation: u32,
+    pub(crate) domain: u8,
+    pub(crate) mask: ModuleMask,
+    pub(crate) primed: bool,
     /// The graph's `MON_GRAPH_PACER` line: its last idle/busy state and the
     /// rate limit on reporting it.
     pacer_line: PacerLine,
-    /// Modules with `step_period > 1`. Each carries its OWN absolute next-due in
-    /// `SchedulerState::module_next_due_us` and its own period
-    /// (`step_period × NOMINAL tick`), so distinct periods AND phase offsets are
-    /// preserved — the runner fires only the individually-due members (via
-    /// `event_wake`), never the whole set at the shortest period.
-    periodic_mask: ModuleMask,
+    /// Modules with `step_period > 1`, each on its own wall-clock schedule
+    /// (`SchedulerState::module_next_due_us`): a due one makes the graph
+    /// runnable, and the soonest bounds the domain's sleep.
+    pub(crate) periodic_mask: ModuleMask,
     /// True iff EVERY owned module is idle-safe attested — the precondition for
     /// fully parking the graph when idle. When false the graph is
     /// fail-closed: never parked, only relaxed to the `tick_max` backstop.
-    idle_safe: bool,
+    pub(crate) idle_safe: bool,
     /// Absolute wall-clock deadline (µs) for the next backstop liveness step of a
     /// NON-idle-safe graph (advanced by `tick_max` each backstop step). Unused
     /// when `idle_safe` (the graph may park outright).
-    backstop_next_due_us: u64,
+    pub(crate) backstop_next_due_us: u64,
 }
 
 impl ResidentGraph {
@@ -99,16 +97,19 @@ pub(crate) unsafe fn size_resident_graphs(
     }
 }
 
-/// Rebuild the bounded resident-graph index from the live module set. Called at
-/// boot after all admission `apply_add`s and on every reconfigure / `free_owner`
-/// (a reused slot is a *new* generation, so its pacer is reset and its
-/// `primed` flag re-armed). One bounded pass over module slots — never on the
-/// hot path.
+/// Whether slot `idx` belongs to a resident graph: an occupied slot.
+pub(crate) fn slot_resident(sched: &SchedulerState, idx: usize) -> bool {
+    !matches!(sched.modules[idx], ModuleSlot::Empty)
+}
+
+/// Rebuild the resident-graph index from the resident module set. Runs when
+/// a graph is prepared, admitted or freed (a reused slot is a new
+/// generation, so its pacer starts fresh and its `primed` flag re-arms);
+/// with every other domain parked on a multicore target. One bounded pass
+/// over module slots, never on the hot path.
 pub fn rebuild_resident_graph_index() {
-    // SAFETY: scheduler-thread-exclusive; runs at boot finalize / reconfigure,
-    // never concurrently with a stepping pass. Mutable: re-anchors each
-    // periodic module's `module_next_due_us`.
-    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
+    // SAFETY: scheduler-thread-exclusive; never concurrent with a pass.
+    let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
     // SAFETY: same single-mutator context as `sched` above.
     let table = unsafe { &mut *core::ptr::addr_of_mut!(RESIDENT_GRAPHS) };
     let mut count = 0usize;
@@ -116,25 +117,20 @@ pub fn rebuild_resident_graph_index() {
         *entry = ResidentGraph::EMPTY;
     }
     for idx in 0..module_slots() {
-        if matches!(sched.modules[idx], ModuleSlot::Empty) {
+        if !slot_resident(sched, idx) {
             continue;
         }
         let owner = sched.module_owner[idx];
         let domain = (sched.domain_id[idx] as usize).min(MAX_DOMAINS - 1) as u8;
-        // Find or append the (owner.slot, owner.generation, domain) entry.
-        let mut found = None;
-        for (i, e) in table.iter().take(count).enumerate() {
-            if e.slot == owner.slot && e.generation == owner.generation && e.domain == domain {
-                found = Some(i);
-                break;
-            }
-        }
+        let found = table.iter().take(count).position(|e| {
+            e.slot == owner.slot && e.generation == owner.generation && e.domain == domain
+        });
         let i = match found {
             Some(i) => i,
             None => {
-                // The index commits entries as it fills. Its ceiling
-                // is an entry per owner slot and domain, which no set of
-                // live owners exceeds; fail closed if it ever does.
+                // The index commits entries as it fills; its ceiling is an
+                // entry per owner slot and domain, which no set of live
+                // owners exceeds. Fail closed if it ever does.
                 if count >= table.len() && table.grow(count + 1).is_err() {
                     log::error!(
                         "[multigraph] resident-graph index full ({}); module {idx} owner \
@@ -145,101 +141,68 @@ pub fn rebuild_resident_graph_index() {
                     continue;
                 }
                 let i = count;
-                table[i].slot = owner.slot;
-                table[i].generation = owner.generation;
-                table[i].domain = domain;
-                table[i].mask = ModuleMask::EMPTY;
-                table[i].primed = false;
-                table[i].periodic_mask = ModuleMask::EMPTY;
-                // Fresh entry: assume idle-safe and AND each owned module's
-                // attestation in below (an empty graph stays the EMPTY default).
-                table[i].idle_safe = true;
-                table[i].backstop_next_due_us = 0;
+                table[i] = ResidentGraph {
+                    slot: owner.slot,
+                    generation: owner.generation,
+                    domain,
+                    // Idle-safe until a module without the attestation joins.
+                    idle_safe: true,
+                    ..ResidentGraph::EMPTY
+                };
                 count += 1;
                 i
             }
         };
         table[i].mask.set(idx);
-        // Each multi-tick period-gated module keeps its OWN absolute schedule
-        // (per-module `module_next_due_us`), preserving distinct periods and
-        // phases. Reset its next-due so it (re)primes on the next pass.
         if sched.step_period[idx] > 1 {
             table[i].periodic_mask.set(idx);
-            sched.module_next_due_us[idx] = 0;
         }
-        // A graph is idle-safe only if EVERY owned module attests it.
         if !sched.module_idle_safe[idx] {
             table[i].idle_safe = false;
         }
     }
-    // Reconcile the graph-local pacer table (`GRAPH_PACERS`) against the rebuilt
-    // resident keys. A pacer whose (slot, generation, domain) no longer
-    // appears belongs to a freed / reconfigured owner and is released, so a
-    // reused slot's new graph starts from a fresh instance. Rebuild-time
-    // only — never on the hot path.
-    // SAFETY: same single-mutator (scheduler-thread-exclusive) context.
-    let pacers = unsafe { &mut *core::ptr::addr_of_mut!(GRAPH_PACERS) };
-    for p in pacers.iter_mut() {
-        if !p.active {
-            continue;
-        }
-        let live = table.iter().take(count).any(|e| {
-            e.slot == p.graph_slot && e.generation == p.generation && e.domain == p.domain
-        });
-        if !live {
-            *p = GraphPacer::new();
-        }
-    }
+    // A pacer whose key no longer appears belongs to a freed or rebuilt
+    // graph; release it so a reused slot starts fresh.
+    graph_pacer_retain(|slot, generation, domain| {
+        table
+            .iter()
+            .take(count)
+            .any(|e| e.slot == slot && e.generation == generation && e.domain == domain)
+    });
     // SAFETY: scheduler-thread-exclusive write.
     unsafe {
         RESIDENT_GRAPH_COUNT = count;
     }
 }
 
-/// Finalize the domain dispatch tables over the *current* live module set, then
-/// rebuild the resident-graph index. Call ONCE after all boot-time `apply_add`
-/// admissions, before the per-domain run loops start: `live::apply_add` splices
-/// only the flat `exec_order` (splicing `domain_exec_order` would need a
-/// multicore quiesce), so a per-domain cooperative runner
-/// (BCM2712) would otherwise never see a boot-admitted module. Rebuilds
-/// `domain_module_mask`, `domain_count`, and `domain_exec_order` from the flat
-/// order, exactly as `prepare_graph` does for the base graph.
-///
-/// Boot-time only (cores not yet stepping) or single-threaded host — NOT safe to
-/// call while a BCM domain loop is mid-pass over `domain_exec_order`.
-pub fn finalize_resident_graphs() {
-    // SAFETY: scheduler-thread-exclusive; boot finalize / single-threaded host.
-    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
-    for m in sched.domain_module_mask.iter_mut() {
-        *m = ModuleMask::EMPTY;
+/// A copy of resident-graph entry `gi`.
+pub(crate) fn resident_graph(gi: usize) -> Option<ResidentGraph> {
+    // SAFETY: an entry's identity changes only at a rebuild (other domains
+    // parked); its pass state only by its own domain's loop, the caller.
+    let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
+    // SAFETY: as above.
+    if gi >= unsafe { RESIDENT_GRAPH_COUNT } {
+        return None;
     }
-    let mut max_domain: u8 = 0;
-    for i in 0..module_slots() {
-        if matches!(sched.modules[i], ModuleSlot::Empty) {
-            continue;
-        }
-        let did = sched.domain_id[i];
-        let d = (did as usize).min(MAX_DOMAINS - 1);
-        sched.domain_module_mask[d].set(i);
-        if did > max_domain {
-            max_domain = did;
-        }
+    table.get(gi).copied()
+}
+
+/// Record that the pass stepped graph `gi`: it is primed, and its next
+/// backstop liveness step is due at `backstop_us`.
+pub(crate) fn mark_graph_stepped(gi: usize, backstop_us: u64) {
+    // SAFETY: this domain's loop writes its own entry.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(RESIDENT_GRAPHS) };
+    if let Some(e) = table.get_mut(gi) {
+        e.primed = true;
+        e.backstop_next_due_us = backstop_us;
     }
-    let want_count = (max_domain as usize + 1).min(MAX_DOMAINS) as u8;
-    if want_count > sched.domain_count {
-        sched.domain_count = want_count;
-    }
-    let mc = sched.active_module_count;
-    compute_domain_exec_orders_static(mc);
-    rebuild_resident_graph_index();
 }
 
 /// Boot path: admit every resident workload the config declares (its `WKLD`
 /// section: the `combine <two-graph.yaml>` / `workloads:` mechanism) as a
-/// workload owner via `apply_add`, then finalize the domain dispatch tables.
-/// Call ONCE after `prepare_graph` + instantiation and BEFORE the per-domain
-/// run loops start (same constraint as `finalize_resident_graphs`). No-op
-/// when the config declares no workloads.
+/// workload owner via the splice. Call ONCE after the node's graph is
+/// published and BEFORE the per-domain run loops start. No-op when the
+/// config declares no workloads.
 pub fn admit_resident_workloads_from_config() {
     // SAFETY: boot context — single-threaded, sole reader of STATIC_CONFIG.
     let cfg = unsafe { static_config() };
@@ -249,7 +212,7 @@ pub fn admit_resident_workloads_from_config() {
         return;
     };
     // Each workload's blob is applied where it lies in the config image:
-    // the add borrows the blob's params in place, as the base graph's
+    // the add borrows the blob's params in place, as the node graph's
     // modules borrow theirs, and the image stays mapped for the kernel's
     // life. Nothing is copied, so no blob is too large for a buffer.
     //
@@ -270,17 +233,16 @@ pub fn admit_resident_workloads_from_config() {
             break;
         }
         // SAFETY: `workload.blob` lies in the config image, which stays
-        // mapped and unchanged for the kernel's life; `apply_add_borrowed`
-        // validates the FLXA blob structure and bounds.
-        match unsafe { live::apply_add_borrowed(workload.blob) } {
+        // mapped and unchanged for the kernel's life; the splice validates
+        // the composed graph before anything is allocated.
+        match unsafe { super::splice::apply_borrowed(workload.blob) } {
             Ok(handle) => {
                 let slot = handle.slot as usize;
                 admitted_slots[slot / 64] |= 1 << (slot % 64);
                 admitted += 1;
                 // The workload's idle-safe attestation goes on its
-                // modules before finalize, which rebuilds each graph's
-                // `idle_safe` from them. Unattested workloads stay
-                // fail-closed (backstop cadence).
+                // modules; the index is rebuilt from them below. Unattested
+                // workloads stay fail-closed (backstop cadence).
                 set_owner_idle_safe(handle, workload.idle_safe);
             }
             Err(rc) => {
@@ -310,179 +272,15 @@ pub fn admit_resident_workloads_from_config() {
     }
     if admitted > 0 {
         log::info!("[multigraph] admitted {admitted} resident workload(s) from config");
-        finalize_resident_graphs();
+        rebuild_resident_graph_index();
     }
 }
 
-/// Number of distinct resident `(graph, domain)` instances the runner is
+/// Number of distinct resident `(graph, domain)` instances the domain loop is
 /// multiplexing. `<= 1` selects the single-graph fast path.
 pub fn resident_graph_count() -> usize {
     // SAFETY: scheduler-thread read of a bounded counter.
     unsafe { RESIDENT_GRAPH_COUNT }
-}
-
-/// Count resident `(graph, domain)` instances whose domain is `domain`.
-fn resident_graph_count_in_domain(domain: usize) -> usize {
-    // SAFETY: scheduler-thread read of the bounded resident-graph table/counter.
-    let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
-    // SAFETY: scheduler-thread read of a bounded counter.
-    let count = unsafe { RESIDENT_GRAPH_COUNT };
-    table
-        .iter()
-        .take(count)
-        .filter(|e| e.domain as usize == domain)
-        .count()
-}
-
-/// Step exactly ONE resident graph's modules in `domain` for this tick, reusing
-/// the shared `step_one_module` body and the bounded burst multi-pass. Only
-/// modules whose owner matches `(slot, generation)` run; siblings are skipped so
-/// a hot graph's burst loop cannot run an idle graph's modules. Returns this
-/// graph's per-sub-pass `(work, burst)` signals, read back from the per-domain
-/// `PACER_WORK_TICK` / `PACER_BURST_TICK` accumulators (reset here, so they
-/// reflect only this graph's modules — every module in `domain` for this owner).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors step_one_module's threaded (modules, sched, not_ready, \
-              active_count) plus the owner key and the shared overrun latch; \
-              bundling them into a struct would obscure the step call site"
-)]
-fn step_graph_owner(
-    modules: &mut [ModuleSlot],
-    sched: &mut SchedulerState,
-    slot: u16,
-    generation: u32,
-    domain: usize,
-    not_ready: &ModuleMask,
-    active_count: &mut usize,
-    overrun_logged_this_pass: &mut bool,
-    woken: &ModuleMask,
-    periodic: &ModuleMask,
-) -> (bool, bool) {
-    use crate::kernel::workload::owner::OwnerHandle;
-    let want = OwnerHandle { slot, generation };
-    // Reset this graph's signal accumulators so the read-back is owner-scoped.
-    PACER_BURST_TICK[domain].store(false, Ordering::Relaxed);
-    PACER_WORK_TICK[domain].store(false, Ordering::Relaxed);
-
-    let count = sched.active_module_count;
-    // Iterate the FLAT topological `exec_order` (the universal module list —
-    // `live::apply_add` splices it, whereas `domain_exec_order` is only rebuilt
-    // at boot finalize), filtering to this graph's modules IN this domain. That
-    // makes per-owner stepping correct whether the owner was admitted at boot or
-    // live, on any platform.
-    let n = sched.exec_order_count;
-    // Apply the cyclic-shift fairness rotation: a hard budget overrun bumps
-    // `domain_exec_order_offset[domain]` (below), and starting each pass at that
-    // offset gives every position equal exposure across passes — otherwise the
-    // modules after a repeat-overrunner would be deterministically starved.
-    // Computed once per pass (the increment takes effect next tick), mirroring
-    // `step_domain_modules`.
-    let dom_offset = if n > 0 {
-        (sched.domain_exec_order_offset[domain] as usize) % n
-    } else {
-        0
-    };
-    let mut tick_pass = 0u32;
-    let mut hard_break = false;
-    loop {
-        BURST_SEEN_THIS_PASS[domain].store(false, Ordering::Relaxed);
-        let pass_start_us = sched.domain_budget_us_consumed[domain];
-        for i in 0..n {
-            let pos = if n > 0 { (i + dom_offset) % n } else { i };
-            let module_idx = sched.exec_order[pos] as usize;
-            if module_idx >= count {
-                continue;
-            }
-            // Domain + owner filter — the heart of cross-graph isolation: a
-            // graph's pass only ever steps its own modules in its own domain.
-            if (sched.domain_id[module_idx] as usize) != domain {
-                continue;
-            }
-            if sched.module_owner[module_idx] != want {
-                continue;
-            }
-            // Skip Tier-1c pre-tick-drain modules: the flat `exec_order` includes
-            // them, but they are run exactly once per tick by `step_domain_pre_tick`
-            // (the runner calls it once, domain-global). Stepping them again here
-            // would double-execute RX drains and break the run-exactly-once
-            // contract (the same reason `step_domain_modules` iterates
-            // `domain_exec_order`, which excludes them, not the flat order).
-            if sched.pre_tick_drain[module_idx] {
-                continue;
-            }
-            // Event-wake: a module woken this pass steps with `event_wake =
-            // true`, which bypasses step-period gating (the wake overrides the
-            // period) exactly as `step_woken_modules` does — so a targeted wake is
-            // honoured even when the module's period is not due this tick.
-            let event_wake = woken.test(module_idx);
-            // Absolute periodic scheduling: a period-gated module fires ONLY on
-            // its own next-due (signalled via `woken`/`event_wake` by the runner)
-            // or a direct event wake. Otherwise it is SUPPRESSED here — not run and
-            // its tick counter NOT advanced — so a pass triggered by a sibling's
-            // work/wake cannot advance its counter and fire it before its absolute
-            // deadline. (The tick-counter path in `step_one_module` stays the
-            // single-graph behaviour; this confines absolute scheduling to the
-            // multi-graph runner.)
-            if periodic.test(module_idx) && !event_wake {
-                continue;
-            }
-            step_one_module(
-                modules,
-                sched,
-                module_idx,
-                not_ready,
-                active_count,
-                event_wake,
-            );
-
-            let soft = domain_budget_exhausted(sched, domain);
-            let hard = soft && domain_budget_hard_overrun(sched, domain);
-            if soft && !*overrun_logged_this_pass {
-                record_domain_budget_overrun(sched, domain, module_idx);
-                sched.domain_exec_order_offset[domain] =
-                    sched.domain_exec_order_offset[domain].wrapping_add(1);
-                *overrun_logged_this_pass = true;
-            }
-            if hard {
-                hard_break = true;
-                break;
-            }
-        }
-        tick_pass += 1;
-        if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
-            break;
-        }
-        if !domain_budget_admits_repass(sched, domain, pass_start_us) {
-            break;
-        }
-        // Device input may have arrived while this graph pass ran. Refill only
-        // for the system owner; other resident owners consume the resulting
-        // system-graph output through their normal scheduled pass.
-        let refilled =
-            slot == 0 && step_domain_pipeline_refill(modules, sched, domain, active_count);
-        // Same forced-pass override as the single-graph loop in
-        // domain_budget.rs, via the shared predicate.
-        if !BURST_SEEN_THIS_PASS[domain].load(Ordering::Relaxed)
-            && !refilled
-            && !super::stepping::forced_pass_pending(tick_pass)
-        {
-            break;
-        }
-    }
-    let work = PACER_WORK_TICK[domain].load(Ordering::Relaxed);
-    let burst = PACER_BURST_TICK[domain].load(Ordering::Relaxed);
-    (work, burst)
-}
-
-/// Timer-due predicate for a resident graph. v1: wall-clock timers signal
-/// through the event path, so a due timer surfaces as a targeted wake
-/// (`owner_wake_pending`); this returns `false` and the wake carries it. A
-/// future per-owner timer wheel can make this precise; until then a graph with
-/// no targeted wake and no prior-pass work is treated idle.
-#[inline]
-fn owner_timer_due(_slot: u16, _generation: u32, _domain: usize) -> bool {
-    false
 }
 
 /// Pause predicate for a resident graph: true iff the owning slot is
@@ -490,7 +288,7 @@ fn owner_timer_due(_slot: u16, _generation: u32, _domain: usize) -> bool {
 /// `event::paused_owners_present()` so the unused path stays a single
 /// relaxed load (default-off discipline).
 #[inline]
-fn owner_graph_paused(sched: &SchedulerState, slot: u16, generation: u32) -> bool {
+pub(crate) fn owner_graph_paused(sched: &SchedulerState, slot: u16, generation: u32) -> bool {
     slot != 0
         && sched.owners.entry_at(slot as usize).is_some_and(|e| {
             e.generation == generation
@@ -498,33 +296,14 @@ fn owner_graph_paused(sched: &SchedulerState, slot: u16, generation: u32) -> boo
         })
 }
 
-/// True iff any resident graph in `domain` belongs to a paused owner. Used
-/// by `step_resident_graphs_domain` to route a single-paused-graph domain
-/// through the multi-graph runner (whose pause skip is the only paused-aware
-/// stepping path) instead of the pause-blind fast path. Bounded scan of the
-/// resident-graph index; callers short-circuit behind
-/// `event::paused_owners_present()`.
-fn domain_has_paused_graph(domain: usize) -> bool {
-    // SAFETY: scheduler-thread read; the table is only mutated at rebuild.
-    let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
-    // SAFETY: scheduler-thread read of a bounded counter.
-    let rc = unsafe { RESIDENT_GRAPH_COUNT };
-    // SAFETY: scheduler-thread read of the owner table.
-    let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
-    table
-        .iter()
-        .take(rc)
-        .any(|e| e.domain as usize == domain && owner_graph_paused(sched, e.slot, e.generation))
-}
-
 /// Readable-channel term: does any edge whose CONSUMER belongs to
 /// this graph — and whose PRODUCER does not — hold readable bytes? Without
 /// this term, data written into a skipped graph's inbound channel (a
-/// cross-owner `apply_add` edge, or a system-graph producer) waits for the
+/// cross-owner the splice edge, or a node graph producer) waits for the
 /// graph's backstop cadence: under demand-driven idle that is
-/// `tick_max_us` per hop — the multi-workload latency term this runner
+/// `tick_max_us` per hop — the multi-workload latency term this domain loop
 /// exists to remove. The check adds a wake REASON evaluated at the
-/// runner's existing cadence — not a wake source — so there is no storm
+/// domain loop's existing cadence — not a wake source — so there is no storm
 /// surface and no ordering change.
 ///
 /// Cost: O(edges) per otherwise-idle graph per pass, one lock-guarded
@@ -540,12 +319,16 @@ fn domain_has_paused_graph(domain: usize) -> bool {
 /// bytes it is itself draining at its own pace.
 ///
 /// Fills `out` with the CONSUMER modules that have readable inbound data;
-/// the runner adds them to the woken set so they step with
+/// the domain loop adds them to the woken set so they step with
 /// `event_wake = true` (bypassing step-period gating) — cross-graph
 /// channel data thereby carries exactly the semantics of a targeted
 /// `event_signal`, which is what mechanism (a) means by a "channel
 /// write" wake. Returns `true` if any were found.
-fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut ModuleMask) -> bool {
+pub(crate) fn graph_inbound_readable(
+    sched: &SchedulerState,
+    mask: &ModuleMask,
+    out: &mut ModuleMask,
+) -> bool {
     let mut any = false;
     for e in sched.edges.iter().take(sched.edge_count) {
         if !mask.test(e.to_module) || mask.test(e.from_module) {
@@ -570,338 +353,6 @@ fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut M
         }
     }
     any
-}
-
-/// The shared-cooperative-runner core. Steps every resident graph in `domain`
-/// independently, skips idle graphs, and returns the merged
-/// physical-sleep deadline (µs). Mirrors the once-per-tick housekeeping of
-/// `step_domain_modules` (tick advance, drain timeout, budget reset,
-/// worst-step decay, Tier-1c pre-tick, ISR-bridge pump) but runs the
-/// exec-order rotation once PER resident graph so each graph's burst/budget
-/// fairness and pacer state stay independent.
-fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult, u32) {
-    // SAFETY: scheduler-thread context — sole stepper for this domain (mirrors
-    // `step_domain_modules`).
-    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
-    if sched.prepare_in_progress {
-        return (StepResult::Done, domain_tick_max_us(domain));
-    }
-    // Canonical tick advance — domain 0 only (BCM convention; see
-    // `step_domain_modules`).
-    if domain == 0 {
-        // SAFETY: domain 0 is the canonical tick advancer.
-        unsafe {
-            DBG_TICK = DBG_TICK.wrapping_add(1);
-        }
-    }
-    let count = sched.active_module_count;
-    if enforce_drain_timeout(sched, modules, count) {
-        return (StepResult::Done, domain_tick_max_us(domain));
-    }
-
-    let mut active_count: usize = 0;
-    for i in 0..count {
-        if !sched.finished[i] {
-            active_count += 1;
-        }
-    }
-    let mut not_ready = ModuleMask::new();
-    // Fail-closed "must tick" set: modules that MUST be stepped regardless of
-    // work/wake or the idle predicate, because skipping them stalls forward
-    // progress — a deferred-ready module still initialising (never reaches Ready)
-    // or a faulting/recovering module whose restart backoff only decrements when
-    // stepped. A graph owning any such module is not idle-skip eligible until it
-    // clears. Built once per pass (same bounded 0..count walk as `not_ready`),
-    // never a per-graph scan of all modules.
-    let mut must_tick_mask = ModuleMask::new();
-    for i in 0..count {
-        if !sched.ready[i] {
-            not_ready.set(i);
-        }
-        if sched.finished[i] {
-            continue;
-        }
-        let initialising = sched.deferred_ready[i] && !sched.ready[i];
-        let recovering = matches!(
-            sched.fault_info[i].state,
-            FaultState::Faulted | FaultState::Recovering
-        );
-        if initialising || recovering {
-            must_tick_mask.set(i);
-        }
-    }
-    if domain == 0 {
-        super::domain_budget::readiness_starvation_sweep(sched, modules, count, &not_ready);
-    }
-    // Once-per-tick budget reset + adaptive-tick worst-step decay for this domain.
-    sched.domain_budget_us_consumed[domain] = 0;
-    let w = sched.domain_worst_step_us[domain];
-    if w > 0 {
-        sched.domain_worst_step_us[domain] = w - (w >> WORST_STEP_DECAY_SHIFT).max(1);
-    }
-    let mut overrun_logged_this_pass = false;
-
-    // Tier-1c pre-tick drain — domain-global, runs once (not per graph).
-    step_domain_pre_tick(modules, sched, domain, &not_ready, &mut active_count);
-
-    let flags = domain_adaptive_flags(domain);
-    let adaptive = flags != 0;
-    // Idle-skip is gated SPECIFICALLY on mechanism (a). A cadence-only or
-    // thermal domain (e.g. `ADAPTIVE_FLAG_CADENCE` without `ADAPTIVE_FLAG_IDLE`)
-    // adjusts the tick RATE but must still step every resident graph every pass —
-    // skipping there would freeze a workload's period-gated step counters and
-    // park it permanently. Only mechanism (a) makes a workload skip-idle eligible.
-    let idle_skip = (flags & ADAPTIVE_FLAG_IDLE) != 0;
-    let tmin = domain_tick_min_us(domain);
-    let tmax = domain_tick_max_us(domain);
-    let floor = pacer_domain_floor_us(domain);
-    let now = crate::kernel::sys::hal::now_micros();
-
-    // SAFETY: scheduler-thread read of a bounded counter.
-    let rc = unsafe { RESIDENT_GRAPH_COUNT };
-    // Deadline merge, computed INLINE (no `keys` array) so the runner's
-    // stack frame stays small — it runs on top of the deepest module-step call
-    // chain (the system net stack) on a bounded bare-metal per-core stack.
-    let mut min_runnable = u32::MAX;
-    let mut min_backstop = u32::MAX;
-    let mut any_runnable = false;
-
-    let nominal = domain_tick_us(domain);
-    for gi in 0..rc {
-        // Snapshot the entry's fields before borrowing `sched` mutably in the
-        // step pass. An entry's domain is written only when the index is
-        // rebuilt; its pass state (`primed`, the backstop, the pacer line)
-        // only by the runner of that domain. So the domain is
-        // read first and another domain's entry is left alone: on bcm2712
-        // its runner, on another core, may be writing it.
-        let (slot, generation, mask, primed, periodic_mask, idle_safe, snap_backstop);
-        {
-            // SAFETY: a read of this domain's own entry (see above).
-            let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
-            let e = &table[gi];
-            if e.domain as usize != domain {
-                continue;
-            }
-            slot = e.slot;
-            generation = e.generation;
-            mask = e.mask;
-            primed = e.primed;
-            periodic_mask = e.periodic_mask;
-            idle_safe = e.idle_safe;
-            snap_backstop = e.backstop_next_due_us;
-        }
-        // Pause skip: a paused owner's
-        // graph is not-runnable REGARDLESS of wakes, due periodic modules,
-        // backstop, must-tick, or readable inbound — evaluated before every
-        // runnable term so none of them can step it. Wake bits that latched
-        // before the pause mask became visible (the mask-then-check race)
-        // are swept into the deferred store here, pass by pass, so a paused
-        // owner's stragglers can't keep `domain_wake_pending` asserted and
-        // pin the domain out of idle sleep. Guarded by the default-off
-        // paused-owner count: with no owner paused this is one relaxed load
-        // per graph per pass, and stepping proceeds as the pause-free path.
-        if crate::kernel::ipc::event::paused_owners_present()
-            && owner_graph_paused(sched, slot, generation)
-        {
-            let stragglers = crate::kernel::ipc::event::take_wake_in_mask(&mask);
-            crate::kernel::ipc::event::defer_masked_wakes(&stragglers);
-            continue;
-        }
-        // Atomically read-and-clear this owner's wake bits. The returned snapshot
-        // (a) gives `wake` for the runnable/deadline decision, and (b) is threaded
-        // into `step_graph_owner` so the *specifically woken* modules step with
-        // `event_wake = true` (bypassing step-period gating) before the bit is
-        // gone — preserving normal event-wake semantics. Taking (not peeking) also
-        // makes the wake one-shot, so it can't stay sticky (bcm2712's domain loop
-        // has no global `take_wake_pending` drain); a later wake re-latches.
-        let woken = crate::kernel::ipc::event::take_wake_in_mask(&mask);
-        let wake = !woken.is_empty();
-        let timer_due = owner_timer_due(slot, generation, domain);
-        let is_system = slot == 0;
-
-        // PER-MODULE absolute schedule: each period-gated module fires exactly
-        // when wall-clock reaches ITS OWN `module_next_due_us`, so distinct periods
-        // and phase offsets are preserved and a sibling's pass rate never advances
-        // it. Build the individually-due set and track the soonest pending due (for
-        // the deadline merge). Bounded by the periodic module count, not all
-        // modules.
-        let mut due_mask = ModuleMask::new();
-        let mut min_due_us = u32::MAX;
-        for idx in periodic_mask.iter_set() {
-            let nd = sched.module_next_due_us[idx];
-            if nd == 0 || now >= nd {
-                due_mask.set(idx);
-            } else {
-                min_due_us = min_due_us.min(nd.saturating_sub(now).min(tmax as u64) as u32);
-            }
-        }
-        let any_due = !due_mask.is_empty();
-
-        // Runnable predicate. The SYSTEM graph (slot 0) is NEVER skipped (it
-        // owns polled device I/O + telemetry — "platform maintenance work assigned
-        // to that graph"). `any_due` is the per-module periodic schedule; `wake` a
-        // targeted event; `must_tick` the fail-closed init/fault-recovery term;
-        // `backstop_due` the fail-closed liveness for a NON-idle-safe workload
-        // (never parked, only relaxed to `tick_max`). Idle-skip is gated on
-        // mechanism (a) via `idle_skip`, so cadence-only/thermal domains never
-        // skip. A graph is fully parkable only when it is idle_safe-attested.
-        let prior_runnable = graph_pacer_instance_runnable(slot, generation, domain as u8);
-        let must_tick = mask.intersects(&must_tick_mask);
-        let backstop_due = !is_system && !idle_safe && (snap_backstop == 0 || now >= snap_backstop);
-        let base_runnable = is_system
-            || !idle_skip
-            || !primed
-            || prior_runnable
-            || wake
-            || timer_due
-            || any_due
-            || must_tick
-            || backstop_due;
-        // Readable-channel term: an otherwise-idle graph with readable
-        // bytes on a cross-graph inbound edge is runnable NOW — not at its
-        // backstop. Evaluated last so the edge scan runs only for graphs
-        // every cheaper term already declared idle. The consumers found
-        // join the woken set below, stepping with `event_wake = true` so a
-        // period-gated consumer cannot leave the data sitting (which would
-        // re-fire this term every pass). In the normal case this fires once
-        // per arrival episode: the consuming step reports work to the
-        // pacer, so `prior_runnable` short-circuits the scan afterwards.
-        let mut inbound_mask = ModuleMask::new();
-        let inbound_ready =
-            !base_runnable && graph_inbound_readable(sched, &mask, &mut inbound_mask);
-        if inbound_ready {
-            // Once per arrival episode in the consuming case (see above);
-            // a repeat indicates a consumer sitting on readable data —
-            // visibility wanted, but debug-level so a wedged consumer
-            // can't flood the log ring at pass rate.
-            log::debug!("MON_GRAPH_INBOUND slot={slot} gen={generation} domain={domain}");
-        }
-        let runnable = base_runnable || inbound_ready;
-
-        // Fire ONLY the individually-due periodic modules (plus genuine wakes
-        // and inbound-data consumers); `step_graph_owner` suppresses every
-        // other periodic module so the per-pass tick counter can't fire one
-        // early.
-        let mut eff_woken = woken;
-        eff_woken.or_assign(&due_mask);
-        eff_woken.or_assign(&inbound_mask);
-
-        let mut eff_backstop = snap_backstop;
-        let (work, burst) = if runnable {
-            let r = step_graph_owner(
-                modules,
-                sched,
-                slot,
-                generation,
-                domain,
-                &not_ready,
-                &mut active_count,
-                &mut overrun_logged_this_pass,
-                &eff_woken,
-                &periodic_mask,
-            );
-            // SAFETY: scheduler-thread-exclusive write of a bounded entry.
-            let table = unsafe { &mut *core::ptr::addr_of_mut!(RESIDENT_GRAPHS) };
-            table[gi].primed = true;
-            // Advance each fired module's OWN absolute schedule by its OWN period
-            // (`step_period × nominal tick`). Bounded catch-up, then resync if it
-            // fell many periods behind (avoid a catch-up storm after a long stall).
-            for idx in due_mask.iter_set() {
-                let period = (sched.step_period[idx] as u64)
-                    .saturating_mul(nominal as u64)
-                    .max(1);
-                let prev = sched.module_next_due_us[idx];
-                let mut nd = if prev == 0 { now } else { prev };
-                let mut guard = 0u32;
-                loop {
-                    nd = nd.wrapping_add(period);
-                    guard += 1;
-                    if nd > now || guard >= 64 {
-                        break;
-                    }
-                }
-                if nd <= now {
-                    nd = now.wrapping_add(period);
-                }
-                sched.module_next_due_us[idx] = nd;
-                min_due_us = min_due_us.min(nd.saturating_sub(now).min(tmax as u64) as u32);
-            }
-            // Re-arm the non-idle-safe backstop one `tmax` out.
-            if !is_system && !idle_safe {
-                eff_backstop = now.wrapping_add(tmax as u64);
-                table[gi].backstop_next_due_us = eff_backstop;
-            }
-            r
-        } else {
-            (false, false)
-        };
-
-        // Feed the graph-local pacer instance: this drives both next-tick runnability and
-        // the deadline-merge below.
-        graph_pacer_set_signals(slot, generation, domain as u8, work, burst, wake, timer_due);
-
-        // Observability: `MON_GRAPH_PACER` reports the graph's idle↔busy
-        // transitions, at most one line per `PACER_LOG_INTERVAL_US`. `busy`
-        // here is the post-step pacer signal.
-        let busy = work || burst || wake || timer_due;
-        log_pacer_line(gi, now, busy, runnable, slot, generation, domain);
-
-        // Deadline merge, inline: an idle instance still bounds the wait via its
-        // relaxed deadline if nothing is runnable, but only runnable instances
-        // tighten it.
-        let d = graph_pacer_deadline(slot, generation, domain as u8, tmin, tmax, floor, now);
-        min_backstop = min_backstop.min(d);
-        if busy {
-            any_runnable = true;
-            min_runnable = min_runnable.min(d);
-        }
-        // A periodic module tightens the runner's wake to ITS OWN soonest next-due
-        // (clamped to `tmax`). This decouples cadence from sibling load: an idle
-        // sibling can't relax past the due time, and a busy sibling waking early
-        // won't STEP the module until due — it fires on its absolute schedule.
-        if min_due_us != u32::MAX {
-            any_runnable = true;
-            min_runnable = min_runnable.min(min_due_us);
-        }
-        // A must-tick graph (init / fault recovery) keeps the runner on the
-        // nominal cadence until it clears, so progress isn't stalled at `tmax`.
-        if must_tick {
-            any_runnable = true;
-            min_runnable = min_runnable.min(nominal);
-        }
-        // A non-idle-safe workload runs at least every `tmax` (fail-closed).
-        if !is_system && !idle_safe {
-            any_runnable = true;
-            min_runnable =
-                min_runnable.min(eff_backstop.saturating_sub(now).min(tmax as u64) as u32);
-        }
-    }
-
-    // Output-only flush — domain-global, once after all resident graphs.
-    step_domain_post_tick_flush(modules, sched, domain, &mut active_count);
-
-    // ISR-bridge drain — domain-global, once per tick.
-    pump_isr_bridges();
-    // Reap the completions of torn-down modules' lent buffers.
-    crate::kernel::ipc::lend::pump();
-
-    let result = if active_count == 0 {
-        StepResult::Done
-    } else {
-        StepResult::Continue
-    };
-    if !adaptive {
-        // Fixed-tick multi-graph: isolation by per-owner stepping, no idle-skip.
-        return (result, domain_tick_us(domain));
-    }
-    let deadline = if any_runnable {
-        min_runnable
-    } else if min_backstop == u32::MAX {
-        domain_tick_us(domain)
-    } else {
-        min_backstop
-    };
-    (result, deadline)
 }
 
 /// The least time between two `MON_GRAPH_PACER` lines of one graph (µs).
@@ -960,7 +411,7 @@ impl PacerLine {
 /// Feed resident-graph entry `gi`'s state at `now` to its [`PacerLine`] and
 /// log the `MON_GRAPH_PACER` line when one is due. `stepped` is whether this
 /// pass stepped the graph.
-fn log_pacer_line(
+pub(crate) fn log_pacer_line(
     gi: usize,
     now: u64,
     busy: bool,
@@ -974,8 +425,7 @@ fn log_pacer_line(
     let Some(transitions) = table[gi].pacer_line.observe(busy, now) else {
         return;
     };
-    // SAFETY: DBG_TICK aligned u32 read.
-    let tick = unsafe { DBG_TICK };
+    let tick = pass_count(domain);
     log::info!(
         "MON_GRAPH_PACER slot={slot} gen={generation} domain={domain} state={} stepped={} \
          tick={tick} transitions={transitions}",
@@ -984,117 +434,22 @@ fn log_pacer_line(
     );
 }
 
-/// Read a graph-local pacer instance's stored runnability without mutating it (the
-/// merge/deadline path re-reads it; this is the pre-step "did the prior pass
-/// leave it runnable?" query).
-fn graph_pacer_instance_runnable(graph_slot: u16, generation: u32, domain: u8) -> bool {
-    let Some(idx) = graph_pacer_index(graph_slot, generation, domain) else {
-        return true; // fail-closed: no instance yet ⇒ run it
-    };
-    let gp = &raw const GRAPH_PACERS;
-    // SAFETY: scheduler-thread-exclusive read; idx in bounds.
-    let p = unsafe { &(&*gp)[idx] };
-    graph_pacer_runnable(p)
-}
-
-/// Multi-graph entry point for a FLAT single-domain cooperative runner (Linux /
-/// wasm): step all resident graphs in domain 0 and return the next pacing
-/// deadline (µs). The single-graph fast path (`resident_graph_count() <= 1`)
-/// is exactly `step_modules` + `pacer_next_deadline_us(0)`.
-pub fn step_resident_graphs_flat(modules: &mut [ModuleSlot], count: usize) -> (StepResult, u32) {
-    if resident_graph_count() > 1 {
-        return multi_graph_runner(modules, 0);
-    }
-    let result = step_modules(modules, count);
-    (result, pacer_next_deadline_us(0))
-}
-
-/// Multi-graph entry point for a PER-DOMAIN cooperative runner (BCM2712 core
-/// loops): step all resident graphs that live in `domain` and return that
-/// domain's next pacing deadline (µs). Single-graph-in-domain fast path is the
-/// existing `step_domain_modules(domain)` + `pacer_next_deadline_us(domain)`.
-pub fn step_resident_graphs_domain(modules: &mut [ModuleSlot], domain: usize) -> (StepResult, u32) {
-    // A domain whose ONLY resident graph belongs to a paused owner must
-    // also take the runner path: the fast path below is pause-blind and
-    // would keep stepping the paused modules. Default-off — with no owner
-    // paused the second term is never evaluated and the predicate reduces
-    // to the `> 1` rule.
-    if resident_graph_count_in_domain(domain) > 1
-        || (crate::kernel::ipc::event::paused_owners_present() && domain_has_paused_graph(domain))
-    {
-        return multi_graph_runner(modules, domain);
-    }
-    let result = step_domain_modules(modules, domain);
-    // Event-wake drain for the single-graph domain path. Every consumer
-    // of latched wake bits must sit on some drain: the rp/linux platform
-    // loops drain `EVENT_WAKE_PENDING` around their sleeps, the >1-graph
-    // runner consumes wakes via `take_wake_in_mask`, and this path (the
-    // bcm2712 per-domain loop with one resident graph) drains here —
-    // otherwise a latched software wake (`event_signal`, wake-on-write)
-    // never reaches a period-gated module and the module waits out its
-    // full period with the bit stranded. Domain-scoped take so one
-    // domain's drain can't consume a sibling domain's wakes;
-    // `step_woken_modules` applies the woken-path budget bound. The
-    // WFI-latency caveat is unchanged: a software wake is serviced on
-    // the next timer pass, not mid-sleep — this drain is
-    // what performs that service.
-    {
-        // SAFETY: scheduler-thread context — sole stepper for this domain.
-        let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
-        let count = sched.active_module_count;
-        let mut dmask = ModuleMask::new();
-        for i in 0..count {
-            if !sched.finished[i] && (sched.domain_id[i] as usize) == domain {
-                dmask.set(i);
-            }
-        }
-        let woken = crate::kernel::ipc::event::take_wake_in_mask(&dmask);
-        if !woken.is_empty() {
-            step_woken_modules(modules, count, &woken);
-        }
-    }
-    (result, pacer_next_deadline_us(domain))
-}
-
-/// Domain execution-mode bytes: the boot-config domain record's
-/// `exec_mode` (`fluxor_contracts::boot_config::ExecMode`), read by
-/// `prepare_graph` into `SCHED.domain_exec_mode`.
-pub mod exec_mode {
-    use fluxor_contracts::boot_config::ExecMode;
-    /// Cooperative, one pass per tick.
-    pub const TICK: u8 = ExecMode::Tick as u8;
-    /// Cooperative, passes back to back, waiting for an event when idle.
-    pub const POLL: u8 = ExecMode::Poll as u8;
-    /// Stepped at the domain's fixed cadence under the interrupt contract.
-    pub const TIMER: u8 = ExecMode::Timer as u8;
-    /// Each module's entry runs from its own interrupt.
-    pub const IRQ: u8 = ExecMode::Irq as u8;
-}
-
-/// Return the execution mode byte for a domain (see [`exec_mode`]).
-pub fn domain_exec_mode(domain_id: usize) -> u8 {
+/// A domain's execution mode, as `prepare_graph` read it from the
+/// boot-config domain record; `Tick` past the last domain.
+pub fn domain_exec_mode(domain_id: usize) -> ExecMode {
     if domain_id < MAX_DOMAINS {
         // SAFETY: scheduler-thread-only read; domain_id bounded.
-        unsafe { SCHED.domain_exec_mode[domain_id] }
+        unsafe { SCHED.domains[domain_id].exec_mode }
     } else {
-        0
+        ExecMode::Tick
     }
 }
 
-/// `true` if `mode` is an interrupt mode (`TIMER` or `IRQ`). The
-/// cooperative modes (`TICK`, `POLL`) do not require bridge-only
-/// channels or the `interrupt_safe` attestation.
+/// `true` if `module_idx`'s assigned domain runs an interrupt mode
+/// (`timer` or `irq`). A pass skips stepping such modules because they
+/// run from a timer or IRQ handler.
 #[inline]
-pub fn is_isr_tier_exec_mode(mode: u8) -> bool {
-    mode == exec_mode::TIMER || mode == exec_mode::IRQ
-}
-
-/// `true` if `module_idx`'s assigned domain is an ISR-tier
-/// (Tier 1b or Tier 2) domain. The cooperative scheduler skips
-/// stepping ISR-tier modules because they run from a timer/IRQ
-/// handler, not from `step_modules`.
-#[inline]
-pub fn module_is_isr_tier(module_idx: usize) -> bool {
+pub fn module_is_interrupt_mode(module_idx: usize) -> bool {
     if module_idx >= module_slots() {
         return false;
     }
@@ -1104,41 +459,40 @@ pub fn module_is_isr_tier(module_idx: usize) -> bool {
         return false;
     }
     // SAFETY: as above; d bounded by the check just above.
-    let m = unsafe { SCHED.domain_exec_mode[d] };
-    is_isr_tier_exec_mode(m)
+    let m = unsafe { SCHED.domains[d].exec_mode };
+    m.is_interrupt()
 }
 
-/// Reject syscall `op` when the calling module sits in an ISR-tier
-/// (Tier 1b or Tier 2) domain. Emits a single `MON_PERM_DENIED` log
-/// line per rejection and returns `true` so the caller can bail with
-/// the standard `errno::EACCES`. Cooperative callers (Tier 0/1a/1c)
-/// and out-of-bounds `module_idx` return `false`.
+/// Reject syscall `op` when the calling module sits in an interrupt-mode
+/// (`timer` or `irq`) domain. Emits a single `MON_PERM_DENIED` log line per
+/// rejection and returns `true` so the caller can bail with the standard
+/// `errno::EACCES`. Cooperative callers (`tick`, `poll`, pre-pass) and
+/// out-of-bounds `module_idx` return `false`.
 ///
 /// The runtime gate is defense in depth — the build-time validator
-/// (`tools/src/config.rs::validate_isr_tier_admission`) already
+/// (`tools/src/config.rs::validate_interrupt_admission`) already
 /// rejects malformed graphs; this catches hand-rolled binaries that
 /// bypass the tools pipeline.
 #[inline]
-pub fn deny_isr_tier_syscall(op: &'static str) -> bool {
+pub fn deny_interrupt_mode_syscall(op: &'static str) -> bool {
     let module_idx = current_module_index();
     if module_idx >= module_slots() {
         return false;
     }
-    if !module_is_isr_tier(module_idx) {
+    if !module_is_interrupt_mode(module_idx) {
         return false;
     }
     // SAFETY: scheduler-thread read; module_idx already bounded.
     let domain = unsafe { SCHED.domain_id[module_idx] };
     log::warn!(
         "MON_PERM_DENIED domain={domain} mod={module_idx} op={op} tick={tick}",
-        // SAFETY: DBG_TICK is an aligned u32 read.
-        tick = unsafe { DBG_TICK },
+        tick = pass_count(domain as usize),
     );
     true
 }
 
 /// The module making a channel call: its id (`NO_MODULE` in kernel context),
-/// or `EACCES` for an ISR-tier module, which reads and writes bridge rings
+/// or `EACCES` for an interrupt-mode module, which reads and writes bridge rings
 /// and never a channel (`op` names the call for the log). One lookup of the
 /// stepping module serves both questions on the channel's hot path.
 #[inline(never)]
@@ -1147,7 +501,7 @@ pub fn channel_caller(op: &'static str) -> Result<ModuleId, i32> {
     if module_idx >= module_slots() {
         return Ok(NO_MODULE);
     }
-    if deny_isr_tier_syscall(op) {
+    if deny_interrupt_mode_syscall(op) {
         return Err(crate::kernel::sys::errno::EACCES);
     }
     Ok(module_idx as ModuleId)
@@ -1163,9 +517,15 @@ pub fn set_module_domain(module_idx: usize, domain: u8) {
         return;
     }
     // SAFETY: scheduler-thread mutation; module_idx bounded.
-    unsafe {
-        SCHED.domain_id[module_idx] = domain;
-    }
+    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
+    let from = (sched.domain_id[module_idx] as usize).min(MAX_DOMAINS - 1);
+    let mut gone = ModuleMask::new();
+    gone.set(module_idx);
+    unsplice_from_orders(&gone, 1u32 << from);
+    sched.domain_id[module_idx] = domain;
+    let to = splice_into_order(module_idx);
+    refresh_domains((1u32 << from) | to);
+    rebuild_resident_graph_index();
 }
 
 /// Test-facing setter — assigns `exec_mode` to `domain_id`. Used by
@@ -1173,13 +533,13 @@ pub fn set_module_domain(module_idx: usize, domain: u8) {
 /// without going through a full `prepare_graph` cycle. Production
 /// callers should source `exec_mode` from `prepare_graph` reading
 /// the config blob.
-pub fn set_domain_exec_mode(domain_id: usize, exec_mode: u8) {
+pub fn set_domain_exec_mode(domain_id: usize, exec_mode: ExecMode) {
     if domain_id >= MAX_DOMAINS {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; domain_id bounded.
     unsafe {
-        SCHED.domain_exec_mode[domain_id] = exec_mode;
+        SCHED.domains[domain_id].exec_mode = exec_mode;
     }
 }
 
@@ -1198,7 +558,7 @@ pub fn domain_count() -> usize {
 pub fn domain_module_count(domain_id: usize) -> usize {
     if domain_id < MAX_DOMAINS {
         // SAFETY: scheduler-thread-only read; domain_id bounded.
-        unsafe { SCHED.domain_module_count[domain_id] as usize }
+        unsafe { SCHED.domains[domain_id].module_count as usize }
     } else {
         0
     }
@@ -1213,7 +573,7 @@ pub fn domain_exec_order_at(domain_id: usize, i: usize) -> Option<usize> {
         return None;
     }
     // SAFETY: domain_id bounded above.
-    let count = unsafe { SCHED.domain_module_count[domain_id] as usize };
+    let count = unsafe { SCHED.domains[domain_id].module_count as usize };
     if i >= count {
         return None;
     }
@@ -1396,8 +756,8 @@ pub fn get_fault_stats(module_idx: usize) -> FaultStats {
     }
     // SAFETY: scheduler-thread-only read; module_idx bounded above.
     unsafe {
-        let tick = DBG_TICK;
-        SCHED.fault_info[module_idx].to_stats(tick)
+        let pass = pass_count(SCHED.domain_id[module_idx] as usize);
+        SCHED.fault_info[module_idx].to_stats(pass)
     }
 }
 
@@ -1471,13 +831,10 @@ pub fn set_module_quarantine_partner(module_idx: usize, partner: ModuleId) {
     }
 }
 
-/// Set the module's step-period phase offset. The phase is applied
-/// to the step counter as `step_counter[idx] = phase %
-/// step_period[idx]`, so the module's first eligible tick happens at
-/// `period - phase` ticks rather than `period`. Lets graph authors
-/// stagger coarse-period modules so they don't all fire on the same
-/// tick (convoy mitigation). Mirrors what `instantiate_one_module`
-/// does from the manifest's `ModuleHeader::step_phase` byte.
+/// Set the module's phase within its period: its first due falls
+/// `period - phase - 1` nominal ticks after its first pass, so modules of one
+/// period can be staggered (what `instantiate_one_module` does from the
+/// manifest's `ModuleHeader::step_phase`).
 pub fn set_module_step_phase(module_idx: usize, phase: u8) {
     if module_idx >= module_slots() {
         return;
@@ -1485,13 +842,13 @@ pub fn set_module_step_phase(module_idx: usize, phase: u8) {
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         let period = SCHED.step_period[module_idx];
-        SCHED.step_counter[module_idx] = if period > 0 { phase % period } else { 0 };
+        SCHED.step_phase[module_idx] = if period > 0 { phase % period } else { 0 };
+        SCHED.module_next_due_us[module_idx] = 0;
     }
 }
 
-/// Set per-module step period (every N ticks). `0` = step every tick.
-/// Used by the loader's manifest-driven setup and by conformance tests
-/// that exercise the period-gating path in `step_one_module`.
+/// Set a module's step period in nominal ticks of its domain (`0` or `1` =
+/// every pass); its schedule re-anchors on its next pass.
 pub fn set_module_step_period(module_idx: usize, period: u8) {
     if module_idx >= module_slots() {
         return;
@@ -1499,10 +856,10 @@ pub fn set_module_step_period(module_idx: usize, period: u8) {
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.step_period[module_idx] = period;
-        // Resetting the counter keeps period semantics predictable: the
-        // next tick is the first measured tick of the new period.
-        SCHED.step_counter[module_idx] = 0;
+        SCHED.step_phase[module_idx] = 0;
+        SCHED.module_next_due_us[module_idx] = 0;
     }
+    rebuild_resident_graph_index();
 }
 
 /// Read the current fault state of a module. Test-facing query so

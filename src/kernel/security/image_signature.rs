@@ -1,5 +1,5 @@
-//! Graph-image signatures: the check every reader of a graph-image header
-//! (`abi::wire::graph_image`) makes against the kernel image's signing root.
+//! Node-image signatures: the check every reader of a node-image header
+//! (`abi::wire::node_image`) makes against the kernel image's signing root.
 //!
 //! A header is signed over its first `SIGNED_LEN` bytes: magic, version,
 //! epoch, both regions' offsets and sizes, the payload's SHA-256 and the
@@ -21,7 +21,7 @@
 //! selector and ACTIVATE reach the same verdict on every image. The public
 //! key is the root, never read from the image.
 
-use crate::abi::wire::graph_image;
+use crate::abi::wire::node_image;
 
 /// Why a header was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub fn admits(header: &[u8], root: Option<&[u8; 32]>) -> Result<(), Refusal> {
     let Some(root) = root else {
         return Ok(());
     };
-    let record = graph_image::signature(header).ok_or(Refusal::Unsigned)?;
+    let record = node_image::signature(header).ok_or(Refusal::Unsigned)?;
     let id = {
         let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
         h.update(root);
@@ -53,7 +53,7 @@ pub fn admits(header: &[u8], root: Option<&[u8; 32]>) -> Result<(), Refusal> {
     }
     if crate::kernel::security::crypto::ed25519::ed25519_verify(
         root,
-        &header[..graph_image::SIGNED_LEN],
+        &header[..node_image::SIGNED_LEN],
         &record.signature,
     ) {
         Ok(())

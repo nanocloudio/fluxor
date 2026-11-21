@@ -1,0 +1,90 @@
+# Raspberry Pi 5, rig validation of the adaptive tick's wake mechanisms
+# BCM2712 bare-metal with RP1 peripherals via PCIe. The same board as
+# `pi5.toml` with `[kernel.tick]` turning on the SGI wake doorbell and the
+# absolute timer re-arm, which production boards leave off.
+#
+# Build: make firmware TARGET=pi5-adaptive
+# Boot:  Copy kernel8.img to SD card /boot/firmware/ alongside GPU firmware
+#
+# Required config.txt:
+#   arm_64bit=1
+#   kernel=kernel8.img
+#   enable_uart=1
+#   pciex4_reset=0
+
+[board]
+id = "pi5-adaptive"
+silicon = "bcm2712"
+description = "Raspberry Pi 5 (bare-metal), adaptive-tick wake mechanisms on"
+
+# `board-pi5` selects the RAM-origin, UART base, and RP1 init that the VPU
+# firmware leaves for a real Pi 5. Without it, the same silicon builds for
+# QEMU virt. Inherits rust_target + module_target from silicon.
+[build]
+cargo_features = ["board-pi5"]
+
+# GPIO 14/15 reserved for UART console, activity LED on GPIO 25 (active low via RP1)
+# The bcm2712 tick's optional wake mechanisms (both default false): a wake
+# also raises the doorbell SGI, so a core parked in WFI wakes at once; the
+# per-core timer re-arms to an absolute `cntp_cval` deadline.
+[kernel.tick]
+wake_doorbell = true
+absolute_rearm = true
+
+[gpio]
+reserved_pins = [14, 15]
+
+[gpio.reserved_reasons]
+14 = "UART0 TX (console)"
+15 = "UART0 RX (console)"
+
+[platform.net]
+phy = "ethernet"
+nic = "rp1-gem"
+
+# PCIe device topology (board fact): stable alias → root complex + expected
+# PCI (bus, dev, func). Drivers and user YAML reference the alias names; the
+# binder matches the exact BDF on the named root (stable across enumeration
+# reorders). Only PCIe1 is brought up by the bare-metal kernel.
+#   m2_primary — external x1 slot (NVMe HAT+, M.2 HAT) on PCIe1
+#   rp1        — internal x4 link to RP1 (GEM, UART/…) on PCIe2
+[platform.pcie]
+aliases = [
+    { name = "m2_primary", root = "pcie1", bus = 1, dev = 0, func = 0 },
+    { name = "rp1", root = "pcie2", bus = 1, dev = 0, func = 0 },
+]
+
+# Public hardware-rig contract.
+# Board-level facts only — bench-specific bindings live in private rig
+# profiles under ~/.config/fluxor/labs/. Capability strings are the fully
+# qualified vocabulary and are matched exactly (no aliases).
+[rig]
+artifact = "kernel8_img"
+deploy = ["deploy.netboot_tftp", "deploy.bootfs_copy", "deploy.sd_image_writer"]
+preferred_deploy = "deploy.netboot_tftp"
+console = ["console.serial"]
+preferred_console = "console.serial"
+# `telemetry.monitor_udp` reads the `platform.debug.to: net` UDP
+# broadcast — the kernel's `log_ring` contents on ethernet rather
+# than the wire UART. Graphs that enable `debug.to: net` can validate
+# `[nvme] / [fat32] / [ip] / [sched]` markers without a serial cable.
+telemetry = ["telemetry.monitor_udp"]
+preferred_telemetry = "telemetry.monitor_udp"
+# `observe.proto_load` is the protocol-agnostic load probe: same
+# NIC and same DHCP-assigned address as observe.https_load, but the backend
+# picks the protocol from its binding instead of being HTTPS-only. Listed here
+# because it is the same physical capability — a host driving traffic at the
+# board over the network — not a new one.
+# `observe.quic_mux` is the TRANSPORT probe (fluxor's own): same NIC and same
+# DHCP-assigned address, but it drives QUIC streams against a `mux_echo` and
+# carries no protocol at all. It is listed separately from `proto_load`
+# because the two answer different questions — when an h3 scenario fails,
+# only a transport-only run can say which half is at fault.
+# `observe.tls_load` is the tls anchor's probe on the same NIC: TLS 1.3
+# handshakes and an echo, so a server identity (P-256, RSA) is measured as
+# the handshake it changes.
+observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load", "observe.proto_load", "observe.quic_mux", "observe.tls_load"]
+# `power.off` / `power.on` are the halves of the cycle: an out-of-band fence
+# agent cuts the board with `off` and a bench restores it with `on`.
+power = ["power.cycle", "power.off", "power.on"]
+default_timeout_s = 30

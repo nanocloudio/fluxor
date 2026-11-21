@@ -1926,7 +1926,7 @@ pub const PROFILE_CA_DNS: u8 = 2;
 pub const PROFILE_CA_URI: u8 = 3;
 pub const PROFILE_INSECURE_NO_VERIFY: u8 = 255;
 
-/// Most anchors one policy carries. A private domain has one; a rotation
+/// Most anchors one policy carries. A private PKI has one; a rotation
 /// has two. The bound is what keeps the anchor table a fixed-size field of
 /// module state, and it is mirrored by the build tool, which refuses a
 /// larger bundle before it reaches a module.

@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::kernel::boot::config::EdgeClass;
 use crate::kernel::exec::scheduler::{self, MAX_DOMAINS};
 
-/// The cross-domain channel index DOMAIN, not a table size: a
+/// The cross-domain channel index RANGE, not a table size: a
 /// `CrossDomainEdge` names its ring in a `u8`. The ring and edge tables are
 /// sized from the graph when it is bridged ([`size_cross`]), one per edge
 /// that crosses domains.
@@ -248,11 +248,7 @@ impl CrossDomainChannel {
 
         // Ends a consumer's wait in WFE; one idling in WFI takes the frame on
         // its next pass.
-        // SAFETY: DMB + SEV are architectural hints; no memory effects.
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("dmb ish", "sev", options(nomem, nostack));
-        }
+        crate::arch::aarch64::cpu::signal_cores();
 
         true
     }
@@ -361,7 +357,7 @@ pub fn get_cross_channel(idx: usize) -> Option<&'static CrossDomainChannel> {
 
 /// Size the ring and edge tables for `n` cross-domain edges: the graph's
 /// count, at boot or a rebuild, before any is registered. A table already
-/// larger keeps its slots. `Err(Ceiling)` past the ring-index domain.
+/// larger keeps its slots. `Err(Ceiling)` past the ring-index range.
 ///
 /// # Safety
 /// Graph preparation (boot) or a rebuild under full quiesce: no pump walks

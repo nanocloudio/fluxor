@@ -1,5 +1,5 @@
 // Contract: agent — one request and its answer between a controller and a
-// target's node agent: desired bundle, target descriptor revision, idempotency
+// node agent: desired workload package, node descriptor revision, idempotency
 // identity, observed activation and fenced status.
 //
 // Layer: contracts (public, stable).
@@ -46,9 +46,9 @@ pub const CHANNEL_TABLE: &str = "OctetStream:len32:8196";
 
 /// What a request asks.
 pub mod op {
-    /// Make the desired bundle the workload's committed one.
+    /// Make the desired workload package the workload's committed one.
     pub const APPLY: u8 = 1;
-    /// Remove the workload from the target's desired state.
+    /// Remove the workload from the node's desired state.
     pub const REMOVE: u8 = 2;
     /// Report phase, generation and activation. Changes nothing but the fence.
     pub const OBSERVE: u8 = 3;
@@ -58,28 +58,28 @@ pub mod op {
 pub mod result {
     /// Done, or already done under this idempotency identity.
     pub const OK: u8 = 0;
-    /// The request's fence is below the one the target holds.
+    /// The request's fence is below the one the node holds.
     pub const REFUSED_FENCED: u8 = 1;
-    /// The peer is not a controller of this target.
+    /// The peer is not a controller of this node.
     pub const REFUSED_UNAUTHORIZED: u8 = 2;
-    /// The request names another descriptor revision than the target's.
+    /// The request names another descriptor revision than the node's.
     pub const REFUSED_DESCRIPTOR: u8 = 3;
     /// This idempotency identity was used by a different request.
     pub const REFUSED_CONFLICT: u8 = 4;
-    /// The target holds no bundle at the desired digest.
+    /// The node holds no workload package at the desired digest.
     pub const BUNDLE_MISSING: u8 = 5;
     /// Validation or composition refused; `diag` is its diagnostic.
     pub const REFUSED_ADMISSION: u8 = 6;
     /// The record is malformed.
     pub const BAD_REQUEST: u8 = 7;
-    /// The target could not read or write its own state. Nothing is reported
+    /// The node could not read or write its own state. Nothing is reported
     /// as done; the same request may be sent again.
     pub const FAULT: u8 = 8;
     /// Highest assigned value.
     pub const LAST: u8 = FAULT;
 }
 
-/// What the target observes of the workload.
+/// What the node observes of the workload.
 pub mod phase {
     /// Neither desired nor committed here.
     pub const ABSENT: u8 = 0;
@@ -110,7 +110,7 @@ pub enum DecodeError {
     BadOp,
     /// A flag this protocol does not define is set.
     BadFlags,
-    /// OBSERVE or REMOVE carries a desired bundle digest.
+    /// OBSERVE or REMOVE carries a desired package digest.
     UnexpectedDigest,
     /// `result` names no result.
     BadResult,

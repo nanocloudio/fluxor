@@ -10,3 +10,19 @@
 
 /// Default step deadline: 2 ms.
 pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
+
+/// Default budget of one interrupt-mode step, in this target's cycle
+/// counter (`hal::read_cycle_count`).
+pub const DEFAULT_ISR_BUDGET_CYCLES: u32 = 2000;
+
+/// Size the kernel's tables from the boot plan (`size`): this platform keeps
+/// no tables of its own and plans no memory around them.
+///
+/// # Safety
+/// Graph preparation: no module runs and nothing holds a reference into
+/// any of the tables.
+pub unsafe fn plan_tables(
+    size: impl FnOnce() -> Result<(), crate::kernel::sys::resource_ledger::Refused>,
+) -> Result<(), crate::kernel::sys::resource_ledger::Refused> {
+    size()
+}

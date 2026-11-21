@@ -8,7 +8,7 @@
 //!
 //! - **aarch64 bare metal**: one stretch of DRAM the platform reads from the
 //!   machine at boot — on bcm2712 what the device tree describes above the
-//!   boot image (`platform/bcm2712/memmap.rs`), on uefi the largest free
+//!   firmware image (`platform/bcm2712/memmap.rs`), on uefi the largest free
 //!   stretch of the firmware's memory map (`platform/uefi.rs`). Carves come
 //!   off its top and the module state arena (`kernel::module::loader`) owns
 //!   the rest from the bottom up.

@@ -126,7 +126,7 @@ pub mod entry_point {
     pub const MODULE_POST_TICK_FLUSH: u32 = 0x85d25b69;
     /// Drain an instance before a live reconfiguration removes it.
     pub const MODULE_DRAIN: u32 = 0xc4c5636c;
-    /// The interrupt-tier entry of an ISR module.
+    /// The interrupt entry of an `irq` module.
     pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743;
     /// Serve one call on a contract the manifest says the module provides.
     pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76;
@@ -632,7 +632,7 @@ pub mod monitor {
     pub const MODULE_STATE_QUERY: u32 = 0x2157;
     pub const FAULT_RAISE: u32 = 0x2156;
     pub const ARENA_USAGE: u32 = 0x2132;
-    pub const ISR_METRICS: u32 = 0x21e8;
+    pub const INTERRUPT_METRICS: u32 = 0x21e8;
 }
 
 pub mod bridge {
@@ -1942,7 +1942,7 @@ pub mod gate {
             0x004c => Some(OpRule {
                 handle: HandleUse::Global,
                 arg: Dir::In,
-                arg_max: 2,
+                arg_max: 1,
                 data: Dir::None,
                 data_max: Bound::Bytes(0),
                 closes: false,

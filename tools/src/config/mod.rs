@@ -11,6 +11,9 @@ use fluxor_contracts::boot_config;
 use fluxor_contracts::vocabulary::capability_and_parents;
 
 use crate::error::{Error, Result};
+use fluxor_contracts::graph::{self, plan};
+
+use crate::add_subgraph::FaultPolicy;
 use crate::hash::fnv1a_hash;
 use crate::manifest::{self, Manifest, TimerClass};
 use crate::schema;
@@ -27,11 +30,23 @@ fn decode_blob(data: &[u8]) -> Result<boot_config::BootConfig<'_>> {
     boot_config::decode(data).map_err(|e| Error::Config(format!("boot config refused: {e}")))
 }
 
+/// An edge end as `fluxor decode` shows it: a module of the graph by
+/// index, or an end outside it by kind.
+fn end_json(end: graph::Endpoint) -> Value {
+    match end {
+        graph::Endpoint::New(i) => json!(i),
+        graph::Endpoint::Existing(i) => json!({ "existing": i }),
+        graph::Endpoint::Tap(i) => json!({ "tap": i }),
+        graph::Endpoint::Net(k) => json!({ "net": k }),
+        graph::Endpoint::Caller(k) => json!({ "caller": k }),
+    }
+}
+
 /// An edge record as `fluxor decode` shows it.
-fn edge_json(e: &boot_config::EdgeRecord) -> Value {
+fn edge_json(e: &graph::EdgeRecord) -> Value {
     let mut edge = Map::new();
-    edge.insert("from_id".into(), json!(e.from));
-    edge.insert("to_id".into(), json!(e.to));
+    edge.insert("from".into(), end_json(e.from));
+    edge.insert("to".into(), end_json(e.to));
     edge.insert(
         "to_port".into(),
         json!(if e.to_ctrl { "ctrl" } else { "in" }),
@@ -44,10 +59,10 @@ fn edge_json(e: &boot_config::EdgeRecord) -> Value {
         edge.insert("to_port_index".into(), json!(e.to_port));
     }
     let class = match e.class {
-        boot_config::EdgeClass::Local => None,
-        boot_config::EdgeClass::DmaOwned => Some("dma_owned"),
-        boot_config::EdgeClass::CrossCore => Some("cross_core"),
-        boot_config::EdgeClass::NicRing => Some("nic_ring"),
+        graph::EdgeClass::Local => None,
+        graph::EdgeClass::DmaOwned => Some("dma_owned"),
+        graph::EdgeClass::CrossCore => Some("cross_core"),
+        graph::EdgeClass::NicRing => Some("nic_ring"),
     };
     if let Some(class) = class {
         edge.insert("edge_class".into(), json!(class));
@@ -75,21 +90,93 @@ fn edge_json(e: &boot_config::EdgeRecord) -> Value {
     Value::Object(edge)
 }
 
-/// The module records of a config blob, in slot order: each one's
-/// `name_hash` (FNV-1a of its type) and its params TLV.
+/// A composed graph's module records, edges and stepping order as
+/// `fluxor decode` shows them: each module by index, a fan named as one.
+pub fn composed_json(g: &graph::ComposedGraph<'_>) -> Map<String, Value> {
+    let mut out = Map::new();
+    let modules: Vec<Value> = g
+        .modules()
+        .enumerate()
+        .map(|(i, m)| {
+            let mut v = Map::new();
+            v.insert("id".into(), json!(i));
+            v.insert("name_hash".into(), json!(format!("0x{:08x}", m.name_hash)));
+            if m.name_hash == graph::TEE_NAME_HASH {
+                v.insert("fan".into(), json!("tee"));
+            } else if m.name_hash == graph::MERGE_NAME_HASH {
+                v.insert("fan".into(), json!("merge"));
+            }
+            v.insert("domain_id".into(), json!(m.domain));
+            if m.pre_pass {
+                v.insert("pre_pass".into(), json!(true));
+            }
+            if m.step_deadline_us != 0 {
+                v.insert("step_deadline_us".into(), json!(m.step_deadline_us));
+            }
+            if m.burst_us != 0 {
+                v.insert("step_deadline_burst_us".into(), json!(m.burst_us));
+            }
+            let policy = match m.fault_policy {
+                FaultPolicy::Skip => None,
+                FaultPolicy::Restart => Some("restart"),
+                FaultPolicy::Tolerate => Some("tolerate"),
+            };
+            if let Some(policy) = policy {
+                v.insert("fault_policy".into(), json!(policy));
+            }
+            v.insert("param_bytes".into(), json!(m.params.len()));
+            Value::Object(v)
+        })
+        .collect();
+    out.insert("modules".into(), json!(modules));
+    let edges: Vec<Value> = g.edges().map(|e| edge_json(&e)).collect();
+    out.insert("graph".into(), json!(edges));
+    out.insert("order".into(), json!(g.order().collect::<Vec<_>>()));
+    out
+}
+
+/// The module records of a config blob, in slot order, fans included: each
+/// one's `name_hash` (FNV-1a of its type) and its params TLV.
 pub fn module_entries(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
     let cfg = decode_blob(data)?;
     Ok(cfg
         .graph()
+        .composed()
         .modules()
         .map(|m| (m.name_hash, m.params))
         .collect())
 }
 
-/// Decode a config blob: the graph's header, each module record (identity
-/// and parameter size), its edges and domains, and the counts of the other
-/// sections it carries. The blob is read by the codec the kernel boots
-/// with, so a blob it decodes is one the kernel accepts as well-formed.
+/// The fan module types a config's graphs run (`tee`, `merge`) — its base
+/// graph's and its resident workloads' — which its image's module table must
+/// carry.
+pub fn fan_types(data: &[u8]) -> Result<Vec<&'static str>> {
+    let cfg = decode_blob(data)?;
+    let mut hashes: Vec<u32> = cfg
+        .graph()
+        .composed()
+        .modules()
+        .map(|m| m.name_hash)
+        .collect();
+    for w in cfg.workloads().into_iter().flat_map(|w| w.iter()) {
+        let g = graph::decode(w.blob)
+            .map_err(|e| Error::Config(format!("resident workload refused: {e}")))?;
+        hashes.extend(g.modules().map(|m| m.name_hash));
+    }
+    Ok(crate::add_subgraph::fan_types(
+        hashes.into_iter().filter_map(|h| match h {
+            graph::TEE_NAME_HASH => Some(plan::FanDir::Out),
+            graph::MERGE_NAME_HASH => Some(plan::FanDir::In),
+            _ => None,
+        }),
+    ))
+}
+
+/// Decode a config blob: the graph's header, each module record (identity,
+/// step budget and parameter size), its edges, stepping order and domains,
+/// and the counts of the other sections it carries. The blob is read by the
+/// codec the kernel boots with, so a blob it decodes is one the kernel
+/// accepts as well-formed.
 pub fn decode_config(data: &[u8]) -> Result<Value> {
     let cfg = decode_blob(data)?;
     let graph = cfg.graph();
@@ -101,27 +188,7 @@ pub fn decode_config(data: &[u8]) -> Result<Value> {
     );
     out.insert("tick_us".into(), json!(graph.tick_us));
     out.insert("graph_sample_rate".into(), json!(graph.graph_sample_rate));
-    out.insert(
-        "accept_cycles".into(),
-        json!(graph.graph_flags & boot_config::GRAPH_FLAG_ACCEPT_CYCLES != 0),
-    );
-    let modules: Vec<Value> = graph
-        .modules()
-        .map(|m| {
-            let mut v = Map::new();
-            v.insert("id".into(), json!(m.id));
-            v.insert("name_hash".into(), json!(format!("0x{:08x}", m.name_hash)));
-            v.insert("domain_id".into(), json!(m.domain));
-            if m.pre_pass {
-                v.insert("pre_pass".into(), json!(true));
-            }
-            v.insert("param_bytes".into(), json!(m.params.len()));
-            Value::Object(v)
-        })
-        .collect();
-    out.insert("modules".into(), json!(modules));
-    let edges: Vec<Value> = graph.edges().map(|e| edge_json(&e)).collect();
-    out.insert("graph".into(), json!(edges));
+    out.extend(composed_json(&graph.composed()));
     let domains: Vec<Value> = graph
         .domains()
         .map(|d| {

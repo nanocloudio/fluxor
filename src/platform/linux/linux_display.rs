@@ -240,16 +240,15 @@ mod window_backend {
 use std::io::Write;
 use std::path::Path;
 
-const LINUX_DISPLAY_HASH: u32 = 0xEE7453F4; // fnv1a32("linux_display")
 
 // Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
-// generated into `builtin_param_tags`. `mode` selects file=0, null=1, window=2.
+// generated into `abi::platform::native`. `mode` selects file=0, null=1, window=2.
 // `header`, when set, prefixes each frame on `pixels` with a self-describing
 // header and takes geometry from the STREAM rather than the width/height
 // config — so a producer can resize without the two ends agreeing on a config.
 // See sector/modules/common/sector_raster.rs (`SRF1`).
-use fluxor::platform::builtin_param_tags::linux_display as display_tags;
-use fluxor::platform::builtin_param_tags::linux_display::{
+use fluxor::abi::platform::native::linux::linux_display as display_tags;
+use fluxor::abi::platform::native::linux::linux_display::{
     TAG_HEADER as DISPLAY_TAG_HEADER, TAG_HEIGHT as DISPLAY_TAG_HEIGHT,
     TAG_MODE as DISPLAY_TAG_MODE, TAG_PATH as DISPLAY_TAG_PATH, TAG_SCALE as DISPLAY_TAG_SCALE,
     TAG_WIDTH as DISPLAY_TAG_WIDTH,
@@ -361,9 +360,9 @@ fn write_ppm(path: &str, width: usize, height: usize, rgb565: &[u8]) -> std::io:
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_display_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn linux_display_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxDisplayState` by the loader.
     let st = unsafe { instance_state::<LinuxDisplayState>(state) };
 
@@ -461,7 +460,7 @@ unsafe fn linux_display_step(state: *mut u8) -> i32 {
     0
 }
 
-fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_linux_display(module_idx: usize, params: &[u8]) -> Result<Box<LinuxDisplayState>, i32> {
     // Manifest declares a default for every param; the tool packs them
     // all into the TLV stream so each tag matches one walker arm.
     let mut mode_raw: u8 = DISPLAY_MODE_FILE;
@@ -501,13 +500,8 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
     } else {
         None
     };
-
-    scheduler::set_current_module(module_idx);
     let in_chan = scheduler::module_port(module_idx, display_tags::PORT_PIXELS);
-    let mut m = scheduler::BuiltInModule::new("linux_display", linux_display_step);
-    install_state(
-        &mut m,
-        Box::new(LinuxDisplayState {
+    let st = Box::new(LinuxDisplayState {
             in_chan,
             failed: false,
             mode,
@@ -523,8 +517,16 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
             hdr_pos: 0,
             #[cfg(feature = "host-window")]
             window,
-        }),
-    );
+        });
     log::info!("[inst] module {module_idx} = linux_display (built-in) in={in_chan}");
-    m
+    Ok(st)
 }
+
+impl HostNative for LinuxDisplayState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_display(slot, params)
+    }
+}
+
+/// The `linux_display` native module.
+pub static LINUX_DISPLAY: NativeVtable = host_vtable::<LinuxDisplayState>(linux_display_step);

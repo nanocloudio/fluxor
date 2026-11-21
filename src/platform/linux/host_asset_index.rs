@@ -13,16 +13,15 @@
 //          Index in the list is the source_index a HANDLER_FILE route
 //          declares to select that asset.
 // Its TLV tag is declared there too, and generated into
-// `builtin_param_tags`.
+// `abi::platform::native`.
 
 // `File`, `Read`, and `CHUNK_SIZE` are pulled in via the sibling
 // `host_asset_source.rs` `include!()` in `linux.rs`; both files share
 // the parent module's namespace.
 
-const HOST_ASSET_INDEX_HASH: u32 = 0xFB4428B3; // fnv1a32("host_asset_index")
 
-use fluxor::platform::builtin_param_tags::host_asset_index as asset_index_tags;
-use fluxor::platform::builtin_param_tags::host_asset_index::TAG_PATHS as ASSET_INDEX_TAG_PATHS;
+use fluxor::abi::platform::native::linux::host_asset_index as asset_index_tags;
+use fluxor::abi::platform::native::linux::host_asset_index::TAG_PATHS as ASSET_INDEX_TAG_PATHS;
 
 struct HostAssetIndexState {
     out_chan: i32,
@@ -38,9 +37,9 @@ struct HostAssetIndexState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn host_asset_index_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn host_asset_index_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `HostAssetIndexState` by the loader.
     let st = unsafe { instance_state::<HostAssetIndexState>(state) };
 
@@ -176,11 +175,11 @@ unsafe extern "C" fn host_asset_index_select(
     }
 }
 
-/// Construct a `host_asset_index` BuiltInModule. Resolves params,
+/// Construct a `host_asset_index` instance. Resolves params,
 /// splits the newline-separated paths string, and stashes per-instance
 /// state so multiple `host_asset_index` modules in the same graph keep
 /// separate state.
-fn build_host_asset_index(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_host_asset_index(module_idx: usize, params: &[u8]) -> Result<Box<HostAssetIndexState>, i32> {
     let mut paths_str = String::new();
     walk_tlv(params, |tag, value| {
         if tag == ASSET_INDEX_TAG_PATHS {
@@ -195,11 +194,7 @@ fn build_host_asset_index(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
         .filter(|s| !s.is_empty())
         .collect();
     debug_assert!(!paths.is_empty(), "host_asset_index: empty paths");
-
-    scheduler::set_current_module(module_idx);
     let out_chan = scheduler::module_port(module_idx, asset_index_tags::PORT_STREAM);
-
-    let mut m = scheduler::BuiltInModule::new("host_asset_index", host_asset_index_step);
     let mut st = Box::new(HostAssetIndexState {
         out_chan,
         paths: paths.clone(),
@@ -208,10 +203,10 @@ fn build_host_asset_index(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
         pending: Vec::new(),
         pending_pos: 0,
     });
-    // The heap block stays put for the module's life (`install_state`
-    // leaks it), so the edge server's state pointer stays valid.
+    // The heap block stays put for the instance's life (the slot's release
+    // drops it after the graph's provider layers are reset), so the edge
+    // server's state pointer stays valid.
     let state = (&mut *st as *mut HostAssetIndexState).cast::<u8>();
-    install_state(&mut m, st);
     let rc = fluxor::kernel::module::provider::register_builtin_edge_server(
         fluxor::abi::registry::stream_select::ID,
         module_idx as scheduler::ModuleId,
@@ -224,5 +219,14 @@ fn build_host_asset_index(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
     log::info!(
         "[inst] module {module_idx} = host_asset_index (built-in) out={out_chan} paths={paths:?}"
     );
-    m
+    Ok(st)
 }
+
+impl HostNative for HostAssetIndexState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_host_asset_index(slot, params)
+    }
+}
+
+/// The `host_asset_index` native module.
+pub static HOST_ASSET_INDEX: NativeVtable = host_vtable::<HostAssetIndexState>(host_asset_index_step);

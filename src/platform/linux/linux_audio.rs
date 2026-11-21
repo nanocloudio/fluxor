@@ -104,7 +104,6 @@ mod playback_backend {
 
 use std::io::{Seek, SeekFrom};
 
-const LINUX_AUDIO_HASH: u32 = 0xF62EA500; // fnv1a32("linux_audio")
 use fluxor::abi::registry::stream_clock::QUERY as STREAM_CLOCK_QUERY;
 
 struct LinuxAudioClock {
@@ -150,10 +149,10 @@ struct LinuxAudioState {
 }
 
 // Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
-// generated into `builtin_param_tags`. `mode` selects wav=0, raw=1, null=2,
+// generated into `abi::platform::native`. `mode` selects wav=0, raw=1, null=2,
 // playback=3.
-use fluxor::platform::builtin_param_tags::linux_audio as audio_tags;
-use fluxor::platform::builtin_param_tags::linux_audio::{
+use fluxor::abi::platform::native::linux::linux_audio as audio_tags;
+use fluxor::abi::platform::native::linux::linux_audio::{
     TAG_CHANNELS as AUDIO_TAG_CHANNELS, TAG_MODE as AUDIO_TAG_MODE, TAG_PATH as AUDIO_TAG_PATH,
     TAG_SAMPLE_RATE as AUDIO_TAG_SAMPLE_RATE,
 };
@@ -271,9 +270,9 @@ fn linux_audio_due_bytes(st: &LinuxAudioState) -> usize {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_audio_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn linux_audio_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxAudioState` by the loader.
     let st = unsafe { instance_state::<LinuxAudioState>(state) };
 
@@ -354,7 +353,7 @@ unsafe fn linux_audio_step(state: *mut u8) -> i32 {
     0
 }
 
-fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_linux_audio(module_idx: usize, params: &[u8]) -> Result<Box<LinuxAudioState>, i32> {
     // Manifest declares a default for every param; the tool packs them
     // all into the TLV stream so each tag matches one walker arm.
     let mut mode_raw: u8 = AUDIO_MODE_WAV;
@@ -443,13 +442,8 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
     } else {
         (None, 0)
     };
-
-    scheduler::set_current_module(module_idx);
     let in_chan = scheduler::module_port(module_idx, audio_tags::PORT_AUDIO);
-    let mut m = scheduler::BuiltInModule::new("linux_audio", linux_audio_step);
-    install_state(
-        &mut m,
-        Box::new(LinuxAudioState {
+    let st = Box::new(LinuxAudioState {
             in_chan,
             failed,
             mode,
@@ -464,8 +458,16 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
             playback,
             #[cfg(feature = "host-playback")]
             playback_cap_samples,
-        }),
-    );
+        });
     log::info!("[inst] module {module_idx} = linux_audio (built-in) in={in_chan}");
-    m
+    Ok(st)
 }
+
+impl HostNative for LinuxAudioState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_audio(slot, params)
+    }
+}
+
+/// The `linux_audio` native module.
+pub static LINUX_AUDIO: NativeVtable = host_vtable::<LinuxAudioState>(linux_audio_step);

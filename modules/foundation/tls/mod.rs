@@ -139,7 +139,7 @@ impl PassthroughConn {
     };
 }
 
-// ── Tier B session storage ────────────
+// ── Elastic-region session storage ────
 //
 // Sessions grow at runtime in whole chunks: the first chunk lives inline
 // in module state (always available — the pool's `min`), and further
@@ -327,7 +327,7 @@ const DGRAM_MAX: usize = 1500;
 /// TARGET-SPECIFIC (same split as `MAX_SESSIONS`): a TLS peer may send
 /// application records up to the protocol maximum (2^14 plaintext +
 /// header/tag), and a CLIENT-mode session pulling bulk data (e.g.
-/// `ota_registry` downloading a graph-image blob from a Go registry, which
+/// `ota_registry` downloading a node-image blob from a Go registry, which
 /// sends 16 KiB records) must be able to buffer one full record or no
 /// record ever decrypts. aarch64 (bcm2712 firmware + host-linux) sizes
 /// for the full record; the small-SRAM targets keep the 4 KiB buffer —
@@ -1359,7 +1359,7 @@ struct TlsState {
     /// out[4]: the label identity's certificate requests.
     identity_req_out: i32,
 
-    // Sessions — Tier B chunked pool (see `SessionArena`).
+    // Sessions — elastic-region chunked pool (see `SessionArena`).
     sessions: SessionArena,
 
     // ------------------------------------------------------------------
@@ -3783,7 +3783,7 @@ fn alloc_session_for_conn(s: &mut TlsState, conn_id: u16) -> Option<usize> {
             }
             i += 1;
         }
-        // Every live slot busy: grow by one chunk (Tier B) and rescan.
+        // Every live slot busy: grow by one elastic-region chunk and rescan.
         // `grow` is false at MAX_SESSIONS or on an elastic denial — the
         // pool is full; the caller refuses the conn (never wedges).
         // SAFETY: `s.syscalls` is the kernel table installed at module_new.
@@ -4949,7 +4949,7 @@ unsafe fn x25519_keygen_step(
 }
 
 /// Post-handshake key-material cleanup. Zeroes the ECDH private
-/// scalar and the handshake-tier secrets once application keys
+/// scalar and the handshake-stage secrets once application keys
 /// are derived. Neither piece of material is recoverable from
 /// the on-wire transcript (forward secrecy holds against a passive
 /// observer regardless of what we wipe), but leaving these
@@ -4957,7 +4957,7 @@ unsafe fn x25519_keygen_step(
 /// later reads our memory recovers the handshake secrets and
 /// from them the application traffic keys, breaking confidentiality
 /// of every record we've sent or will send under this session.
-/// Scrubbing them as soon as the next-tier keys exist bounds that
+/// Scrubbing them as soon as the next-stage keys exist bounds that
 /// window to the lifetime of `application_traffic_secret_N` itself.
 ///
 /// Called by both the TCP-TLS and DTLS app-keys-derivation paths

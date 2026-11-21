@@ -301,7 +301,7 @@ fn parse_args() -> CliArgs {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!(
-                    "  -i, --image <path>    The graph image `fluxor build` writes (graph.img)"
+                    "  -i, --image <path>    The node image `fluxor build` writes (graph.img)"
                 );
                 eprintln!("      --print-features  Print compiled-in host-* features and exit");
                 eprintln!("  -h, --help            Show this help");
@@ -353,18 +353,9 @@ fn parse_args() -> CliArgs {
 // test harness can exercise them directly. Bring the binary-facing entry points
 // into scope so the flat registration (`runtime.rs`) and boot/watch sites
 // (`linux.rs` body) resolve them by name.
-use fluxor::platform::builtin_param_tags::linux_net::{
-    PORT_NET_IN, PORT_NET_OUT, TAG_LISTEN_BACKLOG as NET_TAG_LISTEN_BACKLOG,
-    TAG_MAX_CONNS as NET_TAG_MAX_CONNS, TAG_WRITE_BUF_KIB as NET_TAG_WRITE_BUF_KIB,
-};
 use fluxor::platform::linux::owner_drain::{arm_drain, drain_tick, synthesize_restart_terminals};
 use fluxor::platform::linux::owner_status::OwnerStatusWriter;
-use fluxor::platform::linux::providers::{
-    linux_fs_dispatch, linux_net_attach, linux_net_close_all_and_clear_registry, linux_net_detach,
-    linux_net_register_state, linux_net_step, linux_proc_dispatch, LinuxNetState, LINUX_NET_HASH,
-    LINUX_NET_LISTEN_BACKLOG_DEFAULT, LINUX_NET_MAX_CONNS_DEFAULT, LINUX_NET_MAX_INBOUND,
-    LINUX_NET_WRITE_BUF_DEFAULT,
-};
+use fluxor::platform::linux::providers::{linux_fs_dispatch, linux_proc_dispatch, LINUX_NET};
 include!("linux/object.rs");
 include!("linux/namespace.rs");
 // The `workload` provider (class `workload`) and its host-process backend (the
@@ -377,6 +368,7 @@ use fluxor::platform::linux::workload::linux_workload_dispatch;
 // TLV param walkers + per-instance state helpers, in the library so the
 // library provider modules can reach them; glob-imported so the flat
 // built-in modules here resolve them by bare name.
+use fluxor::kernel::exec::scheduler::NativeVtable;
 use fluxor::platform::linux::builtin_params::*;
 include!("linux/cli_io.rs");
 include!("linux/stop.rs");
@@ -429,296 +421,72 @@ pub mod trust_provider {
 // Graph construction (shared by boot and live rebuild)
 // ============================================================================
 
-/// Compile the installed `STATIC_CONFIG` and instantiate every module, including
-/// the hosted built-ins (`linux_net`, asset/display/audio/etc.). Returns
-/// `(compiled_count, loaded_count)`. Shared by first boot and the live-rebuild
-/// path in the main loop; both call `prepare_graph()` (which does the
-/// destructive arena/scheduler reset) then this.
-fn build_graph_linux() -> (usize, usize) {
-    // Close the previous graph's linux_net fds BEFORE the destructive reset
-    // drops their state: a leaked listener fd would keep its port bound and
-    // every re-issued CMD_BIND after the rebuild would die on EADDRINUSE.
-    // The endpoint report shows a bounded transient bound:false across the
-    // rebuild window; pure-drain removals never rebuild, so co-residents'
-    // reports don't flap on ordinary deletes.
-    linux_net_close_all_and_clear_registry();
+use fluxor::abi::platform::native::linux as native;
 
-    // linux_net drains one inbound lane per wired edge (priority by
-    // wiring order) — tell graph prep not to merge its fan-in.
-    scheduler::register_multi_inbound(LINUX_NET_HASH);
-    // …and keeps one events channel per consumer when those consumers are
-    // its producers, so each lane's events reach only the module that asked.
-    scheduler::register_multi_outbound(LINUX_NET_HASH);
-    let (module_list, module_count) = match scheduler::prepare_graph() {
-        Ok(v) => v,
+/// The Linux platform's native modules, registered once at boot before the
+/// first graph is prepared: a graph names each by its name hash, and the
+/// splice resolves it here when the loader does not.
+static NATIVE_MODULES: &[(u32, &scheduler::NativeVtable)] = &[
+    (native::linux_net::NAME_HASH, &LINUX_NET),
+    (native::cli_in::NAME_HASH, &CLI_IN),
+    (native::cli_out::NAME_HASH, &CLI_OUT),
+    (native::host_asset_source::NAME_HASH, &HOST_ASSET_SOURCE),
+    (native::host_asset_index::NAME_HASH, &HOST_ASSET_INDEX),
+    (native::linux_gpu::NAME_HASH, &LINUX_GPU),
+    (native::linux_display::NAME_HASH, &LINUX_DISPLAY),
+    (native::linux_audio::NAME_HASH, &LINUX_AUDIO),
+    #[cfg(feature = "host-image")]
+    (native::host_image_codec::NAME_HASH, &HOST_IMAGE_CODEC),
+    (native::linux_alsa_midi::NAME_HASH, &LINUX_ALSA_MIDI),
+    (
+        native::linux_surface_traits::NAME_HASH,
+        &LINUX_SURFACE_TRAITS,
+    ),
+    (
+        native::linux_surface_traits_probe::NAME_HASH,
+        &LINUX_SURFACE_TRAITS_PROBE,
+    ),
+    (native::linux_pointer::NAME_HASH, &LINUX_POINTER),
+    (native::linux_eth::NAME_HASH, &LINUX_ETH),
+];
+
+/// Prepare and instantiate the installed `STATIC_CONFIG`: the splice stages
+/// it, the owner plan is applied, every module instantiates (a load that
+/// completes later is polled within the shared budget, the thread yielding
+/// between polls) and the graph is published. Shared by first boot and the
+/// live-rebuild path. The module count; a graph the node refuses ends the
+/// process, naming why.
+fn build_graph_linux() -> usize {
+    let staged = match scheduler::prepare_graph() {
+        Ok(st) => st,
         Err(rc) => {
-            eprintln!("error: prepare_graph failed (rc={rc})");
+            eprintln!("error: graph refused at preparation (rc={rc})");
             process::exit(1);
         }
     };
-    log::info!("[graph] compiled: {module_count} modules");
 
-    // Establish plan ownership BEFORE instantiation: prepare_graph above reset
-    // every module to the system owner, and module_new (in the loop below) opens
-    // provider handles that are recorded under the module's owner at open time —
-    // so ownership must be live first, or those handles are permanently
-    // system-owned and bypass tenant isolation. Also re-applies the retained
-    // plan on a rebuild (an ordinary rebuild must not drop isolation). Fail
-    // closed: a staged-but-invalid plan rejects the graph rather than running it
-    // system-owned (which would disable ownership isolation).
+    // Ownership must be live before any module runs: `module_new` opens
+    // provider handles under the module's owner at open time, and the
+    // preparation reset every module to the node owner. Also re-applies
+    // the retained plan on a rebuild (an ordinary rebuild must not drop
+    // isolation). Fail closed: a staged-but-invalid plan refuses the graph
+    // rather than running it node-owned.
     if let Err(e) = fluxor::kernel::workload::owner_plan::apply_staged() {
         eprintln!("error: staged owner plan invalid ({e:?}); refusing to run the graph with ownership isolation disabled");
         process::exit(1);
     }
 
-    // SAFETY: `static_loader` returns a reference into the static loader arena.
-    let loader_ref = unsafe { scheduler::static_loader() };
-    // SAFETY: single-threaded; `sched_mut` exposes scheduler state during
-    // instantiation, before/between worker stepping.
-    let sched = unsafe { scheduler::sched_mut() };
-    let mut loaded_count = 0usize;
-    // The first linux_net instance is the node's net provider: the one a
-    // workload staged at runtime attaches its lanes to.
-    let mut net_provider_registered = false;
-
-    for (module_idx, entry) in module_list.iter().enumerate().take(module_count) {
-        let entry = match entry {
-            Some(e) => e,
-            None => continue,
-        };
-
-        if entry.name_hash == LINUX_NET_HASH {
-            scheduler::set_current_module(module_idx);
-            // Collect EVERY inbound command channel (priority lanes: one per
-            // `to: linux_net.net_in` edge, in wiring order), and resolve
-            // each lane's COMMANDING owner from its producing edge — the
-            // carried-attribution source for endpoint-lease stamps. Owner
-            // stamps are live here: the plan applied before instantiation
-            // (see apply_staged above).
-            let mut net_ins = [-1i32; LINUX_NET_MAX_INBOUND];
-            let mut lane_owners =
-                [fluxor::kernel::workload::owner::OWNER_SYSTEM; LINUX_NET_MAX_INBOUND];
-            let mut lane_count = 0usize;
-            for (k, slot) in net_ins.iter_mut().enumerate() {
-                let ch =
-                    scheduler::module_port(module_idx, (PORT_NET_IN.0, PORT_NET_IN.1 + k as u8));
-                *slot = ch;
-                if ch >= 0 {
-                    lane_owners[k] = scheduler::channel_producer_owner(ch);
-                    lane_count = k + 1;
-                }
-            }
-            // One events channel per `from: linux_net.net_out` edge (or the
-            // single teed one), and each lane's: the one its producer reads.
-            let mut net_outs = [-1i32; LINUX_NET_MAX_INBOUND];
-            for (k, slot) in net_outs.iter_mut().enumerate() {
-                *slot =
-                    scheduler::module_port(module_idx, (PORT_NET_OUT.0, PORT_NET_OUT.1 + k as u8));
-            }
-            let mut lane_out = [0u8; LINUX_NET_MAX_INBOUND];
-            for (k, out) in lane_out.iter_mut().enumerate() {
-                let producer = scheduler::channel_producer_module(net_ins[k]);
-                if let Some(j) = net_outs.iter().position(|&ch| {
-                    ch >= 0
-                        && producer.is_some()
-                        && scheduler::channel_consumer_module(ch) == producer
-                }) {
-                    *out = j as u8;
-                }
-            }
-            // Table and backlog sizing from the graph (`platform: net:`
-            // fields); the manifest defaults apply when absent.
-            let mut max_conns = LINUX_NET_MAX_CONNS_DEFAULT as u32;
-            let mut write_buf_kib = (LINUX_NET_WRITE_BUF_DEFAULT / 1024) as u32;
-            let mut listen_backlog = LINUX_NET_LISTEN_BACKLOG_DEFAULT as u32;
-            walk_tlv(entry.params(), |tag, value| match tag {
-                NET_TAG_MAX_CONNS => max_conns = tlv_u32(value),
-                NET_TAG_WRITE_BUF_KIB => write_buf_kib = tlv_u32(value),
-                NET_TAG_LISTEN_BACKLOG => listen_backlog = tlv_u32(value),
-                _ => {}
-            });
-            let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            let state = match LinuxNetState::new(
-                net_ins,
-                lane_owners,
-                net_outs,
-                lane_out,
-                max_conns as usize,
-                write_buf_kib as usize * 1024,
-                listen_backlog.min(i32::MAX as u32) as i32,
-            ) {
-                Ok(state) => state,
-                Err(why) => {
-                    // A graph whose table cannot be what it states is refused,
-                    // not run at a size it did not ask for.
-                    log::error!("[inst] module {module_idx} = linux_net refused: {why}");
-                    continue;
-                }
-            };
-            // Register for the platform-side endpoint report, the owner
-            // teardown hook, and the rebuild fd close-out.
-            linux_net_register_state(&*state as *const LinuxNetState as *mut LinuxNetState);
-            if !net_provider_registered {
-                fluxor::kernel::workload::net_attach::register(
-                    module_idx,
-                    linux_net_attach,
-                    linux_net_detach,
-                );
-                net_provider_registered = true;
-            }
-            install_state(&mut m, state);
-            scheduler::store_builtin_module(module_idx, m);
-            log::info!(
-                "[inst] module {module_idx} = linux_net (built-in) net_in_lanes={lane_count} net_outs={} lane_out={:?}",
-                net_outs.iter().filter(|&&c| c >= 0).count(),
-                &lane_out[..lane_count]
-            );
-            loaded_count += 1;
-            continue;
+    let count = match scheduler::instantiate_graph(staged, &mut thread::yield_now, &mut |_| {}) {
+        Ok(n) => n,
+        Err(rc) => {
+            eprintln!("error: graph refused at instantiation (rc={rc}); the log names the module");
+            restore_terminal();
+            process::exit(1);
         }
-
-        if entry.name_hash == CLI_IN_HASH {
-            let m = build_cli_in(module_idx);
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == CLI_OUT_HASH {
-            let m = build_cli_out(module_idx);
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == HOST_ASSET_SOURCE_HASH {
-            let m = build_host_asset_source(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == HOST_ASSET_INDEX_HASH {
-            let m = build_host_asset_index(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_GPU_HASH {
-            let m = build_linux_gpu(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_DISPLAY_HASH {
-            let m = build_linux_display(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_AUDIO_HASH {
-            let m = build_linux_audio(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        #[cfg(feature = "host-image")]
-        if entry.name_hash == HOST_IMAGE_CODEC_HASH {
-            let m = build_host_image_codec(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_ALSA_MIDI_HASH {
-            let m = build_linux_alsa_midi(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_SURFACE_TRAITS_HASH {
-            let m = build_linux_surface_traits(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_SURFACE_TRAITS_PROBE_HASH {
-            let m = build_linux_surface_traits_probe(module_idx);
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_POINTER_HASH {
-            let m = build_linux_pointer(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_ETH_HASH {
-            let m = build_linux_eth(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        scheduler::set_current_module(module_idx);
-        let result = scheduler::instantiate_one_module(
-            loader_ref,
-            entry,
-            module_idx,
-            module_idx,
-            &mut sched.edges,
-            &mut sched.modules,
-            &mut sched.ports,
-        );
-        match result {
-            scheduler::InstantiateResult::Done => {
-                log::info!("[inst] module {module_idx} ready");
-                loaded_count += 1;
-            }
-            scheduler::InstantiateResult::Pending(mut pending) => {
-                let mut loaded = false;
-                for _ in 0..100 {
-                    thread::sleep(Duration::from_millis(10));
-                    // SAFETY: `pending` is the scheduler-allocated handle from
-                    // `instantiate_one_module`; `try_complete` polls the loader.
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dm)) => {
-                            log::info!("[inst] module {module_idx} ready (pending)");
-                            scheduler::store_dynamic_module(module_idx, dm);
-                            loaded_count += 1;
-                            loaded = true;
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::error!("[inst] module {module_idx} failed: {e:?}");
-                            loaded = true;
-                            break;
-                        }
-                    }
-                }
-                if !loaded {
-                    log::error!("[inst] module {module_idx} timeout");
-                }
-            }
-            scheduler::InstantiateResult::Error(rc) => {
-                log::error!("[inst] module {module_idx} error rc={rc}");
-            }
-        }
-    }
-
-    log::info!("[inst] {loaded_count} of {module_count} modules loaded");
-    scheduler::finalize_instantiation_accounting();
-    (module_count, loaded_count)
+    };
+    log::info!("[inst] {count} modules");
+    scheduler::log_arena_usage();
+    count
 }
 
 // ============================================================================
@@ -730,19 +498,28 @@ fn plan_mtime(path: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Read + stage the plan blob at `path`. The bytes are intentionally leaked:
-/// the staged-plan contract requires them valid until the (asynchronous)
-/// apply consumes them, and reloads happen at workload-lifecycle frequency — a few
-/// dozen bytes per workload churn, not a growth path.
+/// The plan buffers the kernel may still read: the staged plan, and the
+/// applied plan it retains (a view over the bytes staged for it).
+static mut PLAN_BUFFERS: Vec<Box<[u8]>> = Vec::new();
+
+/// Read + stage the plan blob at `path`. The staged-plan contract keeps the
+/// bytes valid until the plan is applied, and the applied plan is retained
+/// over the bytes it was staged from; every other buffer is freed here, so
+/// at most two are held.
 fn stage_plan_from(path: &str) {
     match std::fs::read(path) {
         Ok(bytes) => {
             log::info!("[owner] staging plan from {path} ({} bytes)", bytes.len());
-            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-            // SAFETY: 'static bytes satisfy the validity contract.
+            let bytes = bytes.into_boxed_slice();
+            // SAFETY: the main thread alone stages plans; the kernel reads
+            // the staged bytes on this thread too.
             unsafe {
-                fluxor::kernel::workload::owner_plan::set_staged_plan(leaked.as_ptr(), leaked.len())
-            };
+                fluxor::kernel::workload::owner_plan::set_staged_plan(bytes.as_ptr(), bytes.len());
+                let retained = fluxor::kernel::workload::owner_plan::retained_plan_bytes();
+                let buffers = &mut *core::ptr::addr_of_mut!(PLAN_BUFFERS);
+                buffers.retain(|b| Some(b.as_ptr()) == retained);
+                buffers.push(bytes);
+            }
         }
         Err(e) => log::error!("[owner] plan reload from {path} failed: {e}"),
     }
@@ -798,7 +575,7 @@ fn main() {
 
     let args = parse_args();
 
-    // The graph image is mapped whole, PROT_READ | PROT_EXEC: the module
+    // The node image is mapped whole, PROT_READ | PROT_EXEC: the module
     // table holds PIC code, which a heap copy could not run. The mapping is
     // never unmapped, so the config the kernel parses borrows its module
     // params from it in place for the life of the process, as on every
@@ -833,20 +610,20 @@ fn main() {
     let image: &'static [u8] =
         unsafe { core::slice::from_raw_parts(image_ptr as *const u8, image_len) };
 
-    // HAL ops, syscall table, providers, then the step guard.
+    // HAL ops, syscall table, providers, then the step guard and the
+    // platform's native modules.
     fluxor::kernel::boot(&LINUX_HAL_OPS);
     step_guard::init();
+    scheduler::native::register_all(NATIVE_MODULES);
 
     // Admit the image as every target admits its graph (shape, ABI pin,
     // and, under the runtime's signing root, signature and payload digest), then
     // populate the kernel's static config + loader from its regions and
-    // compile the graph. `scheduler::prepare_graph` decodes edges, inserts
-    // `_tee` / `_merge` for fan groups, allocates channels, and populates
-    // port tables.
-    let own_pin = fluxor::kernel::boot::graph_image::own_abi_pin();
-    let header = fluxor::kernel::boot::graph_image::admit(image, &own_pin).unwrap_or_else(|why| {
+    // build the graph.
+    let own_pin = fluxor::kernel::boot::node_image::own_abi_pin();
+    let header = fluxor::kernel::boot::node_image::admit(image, &own_pin).unwrap_or_else(|why| {
         eprintln!(
-            "error: graph image {} refused: {}",
+            "error: node image {} refused: {}",
             args.image_path,
             why.reason()
         );
@@ -913,31 +690,11 @@ fn main() {
     });
 
     // Compile + instantiate the graph (shared with the live-rebuild path).
-    let (mut module_count, loaded_count) = build_graph_linux();
-    if loaded_count == 0 {
-        log::warn!("[sched] no modules loaded, nothing to do");
-        process::exit(0);
-    }
-    // An applet is one program: with a module missing it cannot finish, and
-    // running the rest would wait for output that never comes. A service
-    // keeps serving with what loaded; an applet stops and says why, on the
-    // terminal, since its log goes to the applet's log directory.
-    if let Ok(applet) = env::var("FLUXOR_EXEC") {
-        if loaded_count < module_count {
-            eprintln!(
-                "error: applet '{applet}': {} of {module_count} modules failed to load \
-                 (the applet's log says which and why; a module built for another runtime \
-                 means the applet needs reinstalling)",
-                module_count - loaded_count
-            );
-            restore_terminal();
-            process::exit(1);
-        }
-    }
+    build_graph_linux();
 
     // Admit resident workloads declared in the config's `WKLD` section
     // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via
-    // `apply_add`, then the multi-graph runner multiplexes them with the base
+    // the splice, then the domain loop multiplexes them with the node
     // graph. Boot-only (not re-run on live rebuild). No-op without workloads.
     scheduler::admit_resident_workloads_from_config();
 
@@ -970,17 +727,12 @@ fn main() {
     // Scheduler + HAL are up: log records may now resolve their owning module.
     enable_owner_log_attribution();
 
-    log::info!("[sched] starting main loop, tick_us={tick_us}");
-    // The per-iteration deadline is chosen by the adaptive-tick pacer
-    // (`scheduler::pacer_next_deadline_us`) inside the loop; there is no fixed
-    // `tick_duration` any more. With no adaptive flag set the pacer returns the
-    // nominal tick every iteration, so pacing is byte-identical to before.
+    log::info!("[sched] starting domain loop, tick_us={tick_us}");
+    // The per-iteration deadline is the pass engine's (`pass::tick_all`);
+    // with no adaptive flag set it is the nominal tick.
     let mut tick: u64 = 0;
     let mut stop: Option<StopDrain> = None;
     install_stop_signals();
-    // Test hook: when FLUXOR_TEST_REBUILD_EVERY=N is set,
-    // self-trigger a graph rebuild every N loop iterations to exercise the
-    // live-rebuild loop without a full reconfigure graph. No-op when unset.
     // FLUXOR_FORCED_PASSES=K makes the scheduler run at least K exec-order
     // passes per tick (clamped to MAX_PIPELINE_PASSES), so a reply path that
     // flows against exec order can complete within a tick without any module
@@ -993,14 +745,6 @@ fn main() {
         fluxor::kernel::exec::scheduler::set_forced_pipeline_passes(k);
         eprintln!("[fluxor-linux] forced pipeline passes = {k}");
     }
-    let test_rebuild_every: u64 = std::env::var("FLUXOR_TEST_REBUILD_EVERY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    // Always-incrementing iteration counter (unlike `tick`, it advances even on
-    // rebuild iterations that `continue` before the tick bump), so the periodic
-    // trigger fires exactly once per period.
-    let mut iter: u64 = 0;
     // Throttle oversleep warnings to once every ~1 s of expected
     // wall-clock so a chronic oversleep doesn't flood the log.
     let mut last_oversleep_log_tick: u64 = 0;
@@ -1019,7 +763,6 @@ fn main() {
 
     loop {
         let t0 = Instant::now();
-        iter = iter.wrapping_add(1);
 
         // A stop signal drains the graph, then exits; see `linux/stop.rs`.
         if stop.is_none() && stop_requested() {
@@ -1027,12 +770,6 @@ fn main() {
         }
         if stop.as_ref().is_some_and(StopDrain::over) {
             finish_stop(owner_status.as_mut(), logs_dir.as_deref());
-        }
-
-        // Test hook: periodic self-trigger (no-op unless FLUXOR_TEST_REBUILD_EVERY set).
-        if test_rebuild_every > 0 && iter.is_multiple_of(test_rebuild_every) {
-            log::info!("[test] auto-triggering rebuild at iter {iter}");
-            scheduler::request_rebuild();
         }
 
         // Node-agent generation update: the agent recommits + republishes the
@@ -1101,10 +838,9 @@ fn main() {
         // and is fail-safe on error.
         if scheduler::take_rebuild_request() {
             log::info!("[reconfigure] rebuild requested; rebuilding graph");
-            let (mc, lc) = build_graph_linux();
-            module_count = mc;
+            let count = build_graph_linux();
             scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
-            log::info!("[reconfigure] rebuilt graph: {lc} of {mc} modules");
+            log::info!("[reconfigure] rebuilt graph: {count} modules");
             // Observe re-activation NOW, before the rebuilt modules step: a
             // previously-terminated owner that faults again within the 100 ms
             // status cadence would otherwise re-terminate unobserved and its
@@ -1118,22 +854,11 @@ fn main() {
             continue;
         }
 
-        // Use the shared scheduler stepping path — same one RP and BCM
-        // (via its per-domain wrapper) call. Centralises topological
-        // execution order, `StepOutcome::{Continue, Ready, Done, Burst}`,
-        // burst-cap enforcement, deferred-ready gating, step-period
-        // counters, fault transitions, and diagnostics.
-        //
-        // SAFETY: linux platform is single-threaded; the main loop is the
-        // sole scheduler user after instantiation.
-        let sched = unsafe { scheduler::sched_mut() };
-        // Multi-graph runtime: when more than one resident graph is admitted
-        // this steps each owner independently, skips idle owners, and returns
-        // the merged sleep deadline. With one resident graph it is
-        // byte-identical to `step_modules` + `pacer_next_deadline_us(0)` (the
-        // fast path inside the call).
-        let (result, sleep_us) =
-            scheduler::step_resident_graphs_flat(&mut sched.modules, module_count);
+        // The one pass engine, every domain in order (`pass::tick_all`): each
+        // resident graph stepped independently, idle ones skipped, and the
+        // merged sleep deadline returned.
+        let pass = scheduler::pass::tick_all();
+        let (result, sleep_us) = (pass.result, pass.deadline_us);
 
         // A plain run ends when every module is done, or when the CLI sink
         // has retired with its output flushed. The second is what lets an
@@ -1165,17 +890,10 @@ fn main() {
             process::exit(code);
         }
 
-        // Event-wake parity with RP: drain any wake bits that latched
-        // during step_modules (modules signaling their own events) and
-        // run the affected modules through the same `step_one_module`
-        // body with `event_wake = true`. Without this, events signaled
-        // mid-tick on Linux waited until the next full tick to run —
-        // an interrupt-driven module would observe its event arbitrarily
-        // late depending on `tick_us`.
-        let wake = fluxor::kernel::ipc::event::take_wake_pending();
-        if !wake.is_empty() {
-            scheduler::step_woken_modules(&mut sched.modules, module_count, &wake);
-        }
+        // Wakes latched during the pass (modules signalling their own
+        // events) are stepped now, each domain's from its own mask, rather
+        // than waiting out the next tick.
+        scheduler::pass::wake_all();
 
         tick += 1;
 
@@ -1194,13 +912,12 @@ fn main() {
         //                       `unpark` from `linux_wake_scheduler`
         //                       returns immediately so the next
         //                       iteration's drain runs the woken module.
-        // `sleep_us` was chosen above by the resident-graph runner. With no
+        // `sleep_us` was chosen above by the pass engine. With no
         // adaptive flag set it returns the domain's nominal tick, so `sleep_us == tick_us`
         // every iteration and the bands below are byte-identical to the
         // fixed-tick loop. With mechanism (a) enabled and an idle pass it returns
         // `tick_max_us`; `park_timeout` stays interruptible by `unpark` from
-        // `linux_wake_scheduler`, so a wake returns immediately. Linux is a flat
-        // single-domain runner → domain 0.
+        // `linux_wake_scheduler`, so a wake returns immediately.
         let sleep_duration = Duration::from_micros(sleep_us as u64);
         let elapsed = t0.elapsed();
         if sleep_us == 0 {
@@ -1224,16 +941,10 @@ fn main() {
             thread::park_timeout(sleep_duration - elapsed);
         }
 
-        // Second drain after the wait: an event signaled during the
-        // park_timeout (or between the first drain and entering the
-        // spin) reaches `step_woken_modules` before the next full
-        // step pass, matching RP's two-drain wake path.
-        let wake = fluxor::kernel::ipc::event::take_wake_pending();
-        if !wake.is_empty() {
-            // SAFETY: single-threaded linux main loop — sole scheduler user.
-            let sched = unsafe { scheduler::sched_mut() };
-            scheduler::step_woken_modules(&mut sched.modules, module_count, &wake);
-        }
+        // Second drain after the wait: an event signalled during the park
+        // (or between the first drain and the spin) is stepped before the
+        // next tick.
+        scheduler::pass::wake_all();
 
         // Detect chronic host oversleep. `thread::park_timeout`
         // contracts with the OS scheduler; under `CONFIG_HZ=100` or

@@ -53,4 +53,4 @@ max_record = 1514
 
 # Module-scope observability — exempt.
 [observability]
-exempt = "L2 filter in the frame path — frame bytes are observed at the ip module; its domain metric is pass/drop counts"
+exempt = "L2 filter in the frame path — frame bytes are observed at the ip module; its metric is pass/drop counts"

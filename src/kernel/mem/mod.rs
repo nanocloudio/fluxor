@@ -1,4 +1,4 @@
-//! Memory domain — allocation.
+//! Memory — allocation.
 
 #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
 pub mod carve;

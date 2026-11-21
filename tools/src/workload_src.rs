@@ -1,23 +1,23 @@
-//! Workload bundle source, emission and launch.
+//! Workload package source, emission and launch.
 //!
 //! A thin TOML source manifest — non-derivable fields only — from which
-//! `fluxor build <workload.toml>` emits the bundle format the agent
+//! `fluxor build <workload.toml>` emits the package format the agent
 //! consumes (`workload.json` + `resources.json` + `graph.yaml`), plus the
-//! per-target graph image (`graph.img`) the run path consumes. Emitting a
-//! bundle calls the same `build_one` a plain `fluxor build <graph>` calls,
-//! so a bundle's blobs are byte-for-byte what building the graph directly
+//! per-target node image (`graph.img`) the run path consumes. Emitting a
+//! package calls the same `build_one` a plain `fluxor build <graph>` calls,
+//! so a package's blobs are byte-for-byte what building the graph directly
 //! produces.
 //!
-//! Bundle-layout rule: the source manifest REFERENCES a whole per-target
+//! Package-layout rule: the source manifest REFERENCES a whole per-target
 //! graph file, one per implementation. It never merges, patches or
 //! synthesises graphs — a target's graph is the file checked in for it, so
 //! what shipped can be read as-is. A graph that includes stacks
 //! (`include:`) ships expanded: the includes resolve against the graph's own
-//! location when the bundle is emitted, so the bundle is whole without the
+//! location when the package is emitted, so the package is whole without the
 //! files and pins its source tree held, and everything read from it — its
 //! module references, its state sum, a run's module check — sees the
-//! stacks' modules. The source manifest is identity only; the bundle's
-//! params are its graph's `params:`, carried in the bundle's graph and in
+//! stacks' modules. The source manifest is identity only; the package's
+//! params are its graph's `params:`, carried in the package's graph and in
 //! `workload.json`.
 //!
 //! Layout emitted under `target/fluxor/<name>/`:
@@ -31,7 +31,7 @@
 //!
 //! `workload.json` is duplicated into each target dir so that dir is
 //! directly consumable by `fluxor agent commit --bundle`, which expects the
-//! flat triple in one directory. The bundle pins each artifact by sha256 in
+//! flat triple in one directory. The package pins each artifact by sha256 in
 //! `workload.json`, and every consumer re-hashes the files it reads and
 //! refuses a mismatch.
 //!
@@ -49,7 +49,7 @@ use fluxor_tools::workload::{
     ResourceProfileDoc, Target, UpdatePolicy, WorkloadManifest,
 };
 
-/// The bundle source manifest, read by the one reader `fluxor ci` and the
+/// The package source manifest, read by the one reader `fluxor ci` and the
 /// publish sweep check with ([`fluxor_tools::packaging::parse_source_manifest`]).
 fn parse_source_manifest(text: &str) -> Result<SourceManifest> {
     fluxor_tools::packaging::parse_source_manifest(text).map_err(Error::Config)
@@ -59,7 +59,7 @@ fn parse_source_manifest(text: &str) -> Result<SourceManifest> {
 // Graph facts (derived, never declared)
 // ============================================================================
 
-/// The graph facts a bundle derives rather than declares: module types in
+/// The graph facts a package derives rather than declares: module types in
 /// declaration order and the module/edge counts that seed the resource
 /// profile. Platform-stack modules are NOT counted — they are node substrate,
 /// not workload footprint.
@@ -95,16 +95,16 @@ fn sum_module_state_bytes(modules_dir: &Path, module_types: &[String]) -> (u64, 
     (total, unknown)
 }
 
-/// The facts of a bundle graph. The graph is the expanded one
-/// ([`bundle_graph`]): facts read from a graph that still includes stacks
+/// The facts of a package graph. The graph is the expanded one
+/// ([`package_graph`]): facts read from a graph that still includes stacks
 /// would miss their modules, so one is refused. `module_types` leaves out
-/// kernel built-ins, which every runtime carries and no bundle pins.
+/// kernel built-ins, which every runtime carries and no package pins.
 fn graph_facts(template: &str) -> Result<GraphFacts> {
     let doc = params::parse_graph(template).map_err(Error::Config)?.doc;
     if includes_stacks(&doc) {
         return Err(Error::Config(
-            "the graph still includes stacks; a bundle carries its graph with every \
-             include expanded — emit the bundle again"
+            "the graph still includes stacks; a package carries its graph with every \
+             include expanded — emit the package again"
                 .into(),
         ));
     }
@@ -164,16 +164,16 @@ fn includes_stacks(doc: &serde_yaml::Value) -> bool {
             .is_some_and(|w| w.iter().any(|x| x.get(INCLUDE_KEY).is_some()))
 }
 
-/// The graph a bundle carries for the graph file at `graph_path`, whose text
+/// The graph a package carries for the graph file at `graph_path`, whose text
 /// is `written`, and the graph's params: the text as written when it
 /// includes no stack, else the graph with every include expanded against
 /// the graph's own location and `project_root`'s pins, its `params:` kept.
 ///
-/// The expansion reads the graph as the build does, so a bundle's graph is
+/// The expansion reads the graph as the build does, so a package's graph is
 /// what building the source graph would have built, and its
 /// `${param:<name>}` placeholders — the graph's own, and those it forwards
 /// into its includes — stay for a run to render.
-fn bundle_graph(
+fn package_graph(
     graph_path: &Path,
     written: String,
     project_root: &Path,
@@ -228,9 +228,9 @@ fn sha256_ref(bytes: &[u8]) -> String {
 // Emission
 // ============================================================================
 
-/// Emit the committed bundle (+ per-target blobs) from a thin source
-/// manifest. Returns the bundle root (`target/fluxor/<name>/`).
-pub fn emit_bundle(
+/// Emit the committed package (+ per-target blobs) from a thin source
+/// manifest. Returns the package root (`target/fluxor/<name>/`).
+pub fn emit_package(
     manifest_path: &Path,
     module_root: Option<&Path>,
     verbose: bool,
@@ -240,7 +240,7 @@ pub fn emit_bundle(
     let src = parse_source_manifest(&text)?;
     let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
     let project_root = crate::project::root_for_config(manifest_path);
-    let bundle_root = project_root.join("target/fluxor").join(&src.workload.name);
+    let package_root = project_root.join("target/fluxor").join(&src.workload.name);
 
     let exports: Vec<Export> = src
         .exports
@@ -275,16 +275,16 @@ pub fn emit_bundle(
         let graph_path = manifest_dir.join(&imp.graph);
         let written = std::fs::read_to_string(&graph_path)
             .map_err(|e| Error::Config(format!("read graph {}: {e}", graph_path.display())))?;
-        let (template, declared) = bundle_graph(&graph_path, written, &project_root)?;
+        let (template, declared) = package_graph(&graph_path, written, &project_root)?;
         graphs.push((imp, graph_path, template, declared));
     }
-    let identity = fluxor_tools::packaging::BundleSource {
+    let identity = fluxor_tools::packaging::PackageSource {
         name: src.workload.name.clone(),
         role: src.workload.role.clone(),
         implementations: Vec::new(),
     };
     let declared: Vec<_> = graphs.iter().map(|(_, _, _, d)| d.clone()).collect();
-    let params = fluxor_tools::packaging::bundle_params(&identity, &declared)
+    let params = fluxor_tools::packaging::package_params(&identity, &declared)
         .map_err(|e| Error::Config(format!("{}: {e}", manifest_path.display())))?;
 
     for (imp, graph_path, template, _) in graphs {
@@ -295,7 +295,7 @@ pub fn emit_bundle(
             first_module_for_health = facts.first_module.clone();
         }
 
-        let target_dir = bundle_root.join(&imp.target);
+        let target_dir = package_root.join(&imp.target);
         std::fs::create_dir_all(&target_dir)?;
 
         std::fs::write(target_dir.join("graph.yaml"), &graph_bytes)?;
@@ -339,13 +339,13 @@ pub fn emit_bundle(
         std::fs::write(target_dir.join("resources.json"), &resources_bytes)?;
 
         // Per-target blobs: the run path's artifacts, built by the same
-        // `build_one` a plain `fluxor build <graph>` calls, so a bundle's
+        // `build_one` a plain `fluxor build <graph>` calls, so a package's
         // blobs are identical to building the graph on its own.
         //
         // A graph with parameters has no blobs of its own: what it builds
         // depends on the values a run supplies. It is still built here,
         // rendered with its defaults and examples, so a template the
-        // builder refuses never becomes a bundle, and any blobs an earlier
+        // builder refuses never becomes a package, and any blobs an earlier
         // emit left behind are removed so nothing can launch them.
         if params.is_empty() {
             crate::build_one_from(
@@ -389,7 +389,7 @@ pub fn emit_bundle(
         let mut module_refs = Vec::new();
         for ty in &facts.module_types {
             // fixtures/ modules are test instruments, never part of a
-            // shipped workload bundle.
+            // shipped workload package.
             if project_root
                 .join("modules/fixtures")
                 .join(ty.as_str())
@@ -397,8 +397,8 @@ pub fn emit_bundle(
                 .is_file()
             {
                 return Err(Error::Config(format!(
-                    "module '{ty}' is a fixtures-tier test instrument and cannot be \
-                     referenced by a workload bundle"
+                    "module '{ty}' is a fixtures-layer test instrument and cannot be \
+                     referenced by a workload package"
                 )));
             }
             let fmod = modules_dir.join(format!("{ty}.fmod"));
@@ -501,7 +501,7 @@ pub fn emit_bundle(
     };
 
     // The emitted manifest must pass the same validation the agent applies
-    // at commit, so a bundle the agent would refuse fails here.
+    // at commit, so a package the agent would refuse fails here.
     let report = validate(&manifest);
     if !report.is_ok() {
         return Err(Error::Config(format!(
@@ -512,8 +512,8 @@ pub fn emit_bundle(
 
     let manifest_bytes =
         serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Config(e.to_string()))?;
-    std::fs::create_dir_all(&bundle_root)?;
-    std::fs::write(bundle_root.join("workload.json"), &manifest_bytes)?;
+    std::fs::create_dir_all(&package_root)?;
+    std::fs::write(package_root.join("workload.json"), &manifest_bytes)?;
     // Duplicate into each target dir: the agent consumes a FLAT triple
     // (workload.json beside graph.yaml + resources.json) from one directory.
     for (_, dir) in &emitted_targets {
@@ -521,25 +521,25 @@ pub fn emit_bundle(
     }
 
     println!(
-        "Emitted workload bundle '{}' v{} ({} target(s)) -> {}",
+        "Emitted workload package '{}' v{} ({} target(s)) -> {}",
         manifest.name,
         manifest.version,
         emitted_targets.len(),
-        bundle_root.display()
+        package_root.display()
     );
-    Ok(bundle_root)
+    Ok(package_root)
 }
 
 // ============================================================================
 // Resolve + run
 // ============================================================================
 
-/// Is `path` something the bundle runner understands? A workload source
-/// manifest — a `.toml` carrying a `[workload]` table — or a bundle root / target
+/// Is `path` something the package runner understands? A workload source
+/// manifest — a `.toml` carrying a `[workload]` table — or a package root / target
 /// subdir (a dir carrying `workload.json`). Any other `.toml` (stack profiles,
 /// module manifests, board configs, `Cargo.toml`) is not a workload manifest and
 /// is left to the regular run dispatch, as are graph YAMLs and scenario files.
-pub fn is_bundle_path(path: &Path) -> bool {
+pub fn is_package_path(path: &Path) -> bool {
     if path.is_dir() {
         return path.join("workload.json").is_file();
     }
@@ -568,7 +568,7 @@ pub struct RunParams {
     pub flags: Vec<String>,
     pub file: Option<PathBuf>,
     /// `--module-root`: where a source manifest's build reads `.fmod`s from.
-    /// A built bundle's own pinned `modules/` always wins over it.
+    /// A built package's own pinned `modules/` always wins over it.
     pub module_root: Option<PathBuf>,
 }
 
@@ -604,22 +604,29 @@ impl RunParams {
     /// reported before anything is built or started.
     fn resolve(
         &self,
-        bundle: &str,
+        package: &str,
         schema: &BTreeMap<String, ParamSpec>,
     ) -> Result<BTreeMap<String, ParamValue>> {
-        self.values()?
-            .resolve(schema, Path::new("."))
-            .map_err(|e| Error::Config(format!("bundle '{bundle}' refuses this run:\n{e}")))
+        self.values()?.resolve(schema, Path::new(".")).map_err(|e| {
+            Error::Config(format!(
+                "workload package '{package}' refuses this run:\n{e}"
+            ))
+        })
     }
 }
 
-/// `fluxor run <bundle>`: run a workload bundle, with the operator's
+/// `fluxor run <package>`: run a workload package, with the operator's
 /// `--ca` anchors appended to its client-mode tls/quic instances for this
-/// run when given. `<bundle>` is a source manifest or a bundle directory;
-/// a name resolves through [`bundle_by_name`]. `fluxor exec` is the applet form, see
+/// run when given. `<package>` is a source manifest or a package directory;
+/// a name resolves through [`package_by_name`]. `fluxor exec` is the applet form, see
 /// [`exec_applet`].
-pub fn run_bundle(path: &Path, params: &RunParams, ca: Option<&Path>, verbose: bool) -> Result<()> {
-    launch_bundle(
+pub fn run_package(
+    path: &Path,
+    params: &RunParams,
+    ca: Option<&Path>,
+    verbose: bool,
+) -> Result<()> {
+    launch_package(
         path,
         &[],
         None,
@@ -630,24 +637,24 @@ pub fn run_bundle(path: &Path, params: &RunParams, ca: Option<&Path>, verbose: b
     )
 }
 
-/// The bundle `fluxor run <name>` runs: the project's own
-/// `packaging/<service|applet>/<name>/workload.toml`, else the bundle its
+/// The package `fluxor run <name>` runs: the project's own
+/// `packaging/<service|applet>/<name>/workload.toml`, else the package its
 /// `fluxor.lock` pins under `name` (materialised as `fluxor sync` would), or
 /// a refusal naming both.
-pub fn bundle_by_name(name: &str) -> Result<PathBuf> {
+pub fn package_by_name(name: &str) -> Result<PathBuf> {
     let project_root = crate::project::root();
-    if let Some(own) = fluxor_tools::packaging::bundle_path(&project_root, name) {
+    if let Some(own) = fluxor_tools::packaging::package_path(&project_root, name) {
         return Ok(own);
     }
-    if let Some(dir) = crate::store_sync::ensure_bundle(&project_root, name)
+    if let Some(dir) = crate::store_sync::ensure_package(&project_root, name)
         .map_err(|e| Error::Config(e.to_string()))?
     {
         return Ok(dir);
     }
-    let pinned = crate::store_sync::pinned_bundles(&project_root);
+    let pinned = crate::store_sync::pinned_packages(&project_root);
     Err(Error::Config(format!(
-        "'{name}' is neither a path, this project's own bundle (packaging/service/{name}/ or \
-         packaging/applet/{name}/), nor a bundle pinned in {} (pinned bundles: {}) — list it \
+        "'{name}' is neither a path, this project's own package (packaging/service/{name}/ or \
+         packaging/applet/{name}/), nor a package pinned in {} (pinned packages: {}) — list it \
          in fluxor.toml `[uses] bundles` and run `fluxor update` to pin it from the \
          dependency that publishes it",
         fluxor_tools::store_resolve::lockfile_path(&project_root).display(),
@@ -663,7 +670,7 @@ pub fn bundle_by_name(name: &str) -> Result<PathBuf> {
 /// — without building anything, so a run's values are refused before the
 /// emit that precedes it.
 fn source_params(path: &Path) -> Result<(String, BTreeMap<String, ParamSpec>)> {
-    let src = fluxor_tools::packaging::read_bundle(path).map_err(Error::Config)?;
+    let src = fluxor_tools::packaging::read_package(path).map_err(Error::Config)?;
     let mut declared = Vec::new();
     for (target, graph) in &src.implementations {
         if target != "linux" {
@@ -675,11 +682,11 @@ fn source_params(path: &Path) -> Result<(String, BTreeMap<String, ParamSpec>)> {
             .map_err(|e| Error::Config(format!("{}: {e}", graph.display())))?;
         declared.push(g.params);
     }
-    let params = fluxor_tools::packaging::bundle_params(&src, &declared).map_err(Error::Config)?;
+    let params = fluxor_tools::packaging::package_params(&src, &declared).map_err(Error::Config)?;
     Ok((src.name, params))
 }
 
-/// Write the graph image `image` to `out` with the certificates of `pem`
+/// Write the node image `image` to `out` with the certificates of `pem`
 /// appended to every client-mode tls/quic instance of its config, re-signed
 /// with `seed`, and say what was widened. The
 /// operator channel reads PEM only (the build-time `trust` parameter is
@@ -706,13 +713,13 @@ pub fn write_widened_image(
     }
     let img = std::fs::read(image)?;
     let what = image.display().to_string();
-    let header = crate::graph_image::read(&img, &what)?;
+    let header = crate::node_image::read(&img, &what)?;
     let (widened, report) =
         crate::trust_anchors::append_operator_anchors(header.config(&img), &anchors)
             .map_err(|e| Error::Config(format!("--ca: {e}")))?;
     std::fs::write(
         out,
-        crate::graph_image::with_config(&img, &widened, seed, &what)?,
+        crate::node_image::with_config(&img, &widened, seed, &what)?,
     )?;
     if report.instances.is_empty() {
         eprintln!(
@@ -731,7 +738,7 @@ pub fn write_widened_image(
     Ok(())
 }
 
-/// What the operator brings to one run, beside the bundle: trust anchors to
+/// What the operator brings to one run, beside the package: trust anchors to
 /// widen client instances with (`--ca`), and a client identity (`--identity`).
 #[derive(Clone, Copy)]
 struct Operator<'a> {
@@ -759,7 +766,7 @@ fn operator_identity(name: &str, given: Option<&str>) -> Result<Option<(PathBuf,
     Ok((cert.is_file() && key.is_file()).then_some((cert, key)))
 }
 
-/// Write the graph image `image` to `out` with the operator's identity given
+/// Write the node image `image` to `out` with the operator's identity given
 /// to every client-mode tls instance of its config that names none,
 /// re-signed with `seed`, and say so when asked.
 fn write_identity_image(
@@ -778,13 +785,13 @@ fn write_identity_image(
     let (cert_der, key_der) = (read(cert)?, read(key)?);
     let img = std::fs::read(image)?;
     let what = image.display().to_string();
-    let header = crate::graph_image::read(&img, &what)?;
+    let header = crate::node_image::read(&img, &what)?;
     let (given, report) =
         crate::trust_anchors::append_operator_identity(header.config(&img), &cert_der, &key_der)
             .map_err(|e| Error::Config(format!("--identity: {e}")))?;
     write_private(
         out,
-        &crate::graph_image::with_config(&img, &given, seed, &what)?,
+        &crate::node_image::with_config(&img, &given, seed, &what)?,
     )?;
     if verbose {
         eprintln!(
@@ -796,14 +803,14 @@ fn write_identity_image(
     Ok(())
 }
 
-/// A bundle's `workload.json`, parsed and held to the same validation the
+/// A package's `workload.json`, parsed and held to the same validation the
 /// agent applies at commit.
 fn load_manifest(text: &str) -> Result<WorkloadManifest> {
     let manifest = fluxor_tools::workload::parse_manifest(text).map_err(Error::Config)?;
     let report = validate(&manifest);
     if !report.is_ok() {
         return Err(Error::Config(format!(
-            "bundle '{}' failed validation: {}",
+            "workload package '{}' failed validation: {}",
             manifest.name,
             report.errors.join("; ")
         )));
@@ -931,20 +938,20 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Launch a bundle's linux implementation. `runtime` names the binary to
+/// Launch a package's linux implementation. `runtime` names the binary to
 /// run, else the project's staged one. `applet` marks an applet run: the
 /// runtime keeps its own log records out of the program's stderr — fd 2 is
 /// the program's alone — and files them under the applet's name instead, so
-/// a CLI bundle's output is only what the program itself wrote.
+/// a CLI package's output is only what the program itself wrote.
 ///
-/// A bundle with built blobs and no parameters runs them as they are. A
-/// bundle that declares parameters, or that carries no blobs (a pinned
-/// bundle materialised by sync), is built for this run: its template is
-/// rendered with the run's checked values and built against the bundle's
-/// own pinned modules — `modules/` when the bundle carries them, else the
+/// A package with built blobs and no parameters runs them as they are. A
+/// package that declares parameters, or that carries no blobs (a pinned
+/// package materialised by sync), is built for this run: its template is
+/// rendered with the run's checked values and built against the package's
+/// own pinned modules — `modules/` when the package carries them, else the
 /// emitting project's built modules — each verified against the digest
 /// `workload.json` pins.
-fn launch_bundle(
+fn launch_package(
     path: &Path,
     app_args: &[String],
     runtime: Option<&Path>,
@@ -957,16 +964,16 @@ fn launch_bundle(
     let Operator { ca, identity } = operator;
 
     // A source manifest builds first; running is then resolving the fresh
-    // bundle it emitted. Its values are checked before that build.
+    // package it emitted. Its values are checked before that build.
     let dir = if path.extension().is_some_and(|e| e == "toml") {
         let (name, schema) = source_params(path)?;
         params.resolve(&name, &schema)?;
-        emit_bundle(path, params.module_root.as_deref(), verbose)?
+        emit_package(path, params.module_root.as_deref(), verbose)?
     } else {
         path.to_path_buf()
     };
 
-    // The documents: a flat dir (materialised bundle or target subdir)
+    // The documents: a flat dir (materialised package or target subdir)
     // carries them itself; an emitted root carries them per target.
     let manifest_dir = if dir.join("workload.json").is_file() {
         dir.clone()
@@ -978,7 +985,7 @@ fn launch_bundle(
     let manifest = load_manifest(&manifest_text)?;
     let imp = select_implementation(&manifest, "linux", "aarch64", 1).ok_or_else(|| {
         Error::Config(format!(
-            "bundle '{}' has no linux/aarch64/abi-1 implementation to run",
+            "workload package '{}' has no linux/aarch64/abi-1 implementation to run",
             manifest.name
         ))
     })?;
@@ -1004,7 +1011,7 @@ fn launch_bundle(
         let actual = sha256_ref(&bytes);
         if &actual != pinned {
             return Err(Error::Config(format!(
-                "bundle {file}: digest mismatch (manifest pins {pinned}, artifact is {actual})"
+                "package {file}: digest mismatch (manifest pins {pinned}, artifact is {actual})"
             )));
         }
     }
@@ -1033,7 +1040,7 @@ fn launch_bundle(
                 let fmod = module_root.join(format!("{}.fmod", m.name));
                 let bytes = std::fs::read(&fmod).map_err(|e| {
                     Error::Config(format!(
-                        "bundle module '{}': {} ({e})",
+                        "package module '{}': {} ({e})",
                         m.name,
                         fmod.display()
                     ))
@@ -1041,8 +1048,8 @@ fn launch_bundle(
                 let actual = sha256_ref(&bytes);
                 if actual != m.digest {
                     return Err(Error::Config(format!(
-                        "bundle module '{}': {} is {actual} but the bundle pins {} — \
-                         re-emit the bundle or re-sync it",
+                        "package module '{}': {} is {actual} but the package pins {} — \
+                         re-emit the package or re-sync it",
                         m.name,
                         fmod.display(),
                         m.digest
@@ -1061,7 +1068,7 @@ fn launch_bundle(
                 .find(|ty| !imp.modules.iter().any(|m| &m.name == *ty))
             {
                 return Err(Error::Config(format!(
-                    "the rendered graph loads module '{ty}', which bundle '{}' does not pin",
+                    "the rendered graph loads module '{ty}', which package '{}' does not pin",
                     manifest.name
                 )));
             }
@@ -1078,14 +1085,14 @@ fn launch_bundle(
     };
     if !image.is_file() {
         return Err(Error::Config(format!(
-            "{} missing — rebuild the bundle (`fluxor build <workload.toml>`)",
+            "{} missing — rebuild the package (`fluxor build <workload.toml>`)",
             image.display()
         )));
     }
     // A changed config is re-signed with this workspace's key, as the build
     // signed it.
     let seed = crate::signing::seed(None, &project_root)?;
-    // `--ca` widens a copy for this run only; the cached bundle is the
+    // `--ca` widens a copy for this run only; the cached package is the
     // publisher's and stays byte-identical.
     if let (Some(pem), Some(scratch)) = (ca, &scratch) {
         let widened = scratch.dir.join("graph.operator.img");
@@ -1103,8 +1110,8 @@ fn launch_bundle(
         write_identity_image(&image, &given, cert, key, seed.as_ref(), verbose)?;
         image = given;
     }
-    // A recorded runtime is the one this bundle's modules were packed
-    // against. If it has gone, say so and name it: running the bundle
+    // A recorded runtime is the one this package's modules were packed
+    // against. If it has gone, say so and name it: running the package
     // against whatever binary the current directory resolves to would
     // substitute a different ABI, and the mismatch would surface as a
     // module refusing to load rather than as the missing binary.
@@ -1155,8 +1162,8 @@ fn launch_bundle(
     }
     // A workload that declares where its store lives gets that store,
     // whatever the caller exported, so the same applet run from two shells
-    // reaches the same state. Relative paths resolve against the bundle, so
-    // a bundle carries its own state with it.
+    // reaches the same state. Relative paths resolve against the package, so
+    // a package carries its own state with it.
     if let Some(store_dir) = manifest.store_dir.as_deref() {
         let resolved = {
             let p = Path::new(store_dir);
@@ -1183,7 +1190,7 @@ fn launch_bundle(
     drop(secret);
     let status = status?;
     crate::exit_if_signalled(&status);
-    // A CLI bundle's exit code IS the deliverable: propagate it verbatim
+    // A CLI package's exit code IS the deliverable: propagate it verbatim
     // rather than wrapping a non-zero status in a tool error, so a shell
     // sees what the program returned.
     std::process::exit(status.code().unwrap_or(1));
@@ -1193,10 +1200,10 @@ fn launch_bundle(
 // Applet registry + exec
 // ============================================================================
 
-/// The on-disk applet catalogue: `[applets]` name → absolute bundle path.
+/// The on-disk applet catalogue: `[applets]` name → absolute package path.
 /// Deliberately separate from the `cli` stack: the stack is the harness a
-/// CLI bundle is built against, the catalogue is the per-user record of
-/// which built bundles are installed under which names. Installing or
+/// CLI package is built against, the catalogue is the per-user record of
+/// which built packages are installed under which names. Installing or
 /// removing an applet must never edit a stack. Same root discipline as the
 /// OCI store:
 /// `$FLUXOR_APPLETS` override, else `$XDG_DATA_HOME/fluxor/applets.toml`,
@@ -1214,11 +1221,11 @@ fn registry_path() -> PathBuf {
     PathBuf::from("applets.toml")
 }
 
-/// One catalogue entry: the cached bundle, and the runtime it was built
+/// One catalogue entry: the cached package, and the runtime it was built
 /// against when the installing project had one staged.
 #[derive(Clone, Debug)]
 pub struct AppletEntry {
-    pub bundle: PathBuf,
+    pub package: PathBuf,
     pub runtime: Option<PathBuf>,
 }
 
@@ -1232,11 +1239,11 @@ fn load_registry() -> Result<BTreeMap<String, AppletEntry>> {
     let mut out = BTreeMap::new();
     if let Some(t) = doc.get("applets").and_then(|v| v.as_table()) {
         for (k, v) in t {
-            if let Some(bundle) = v.get("bundle").and_then(|b| b.as_str()) {
+            if let Some(package) = v.get("package").and_then(|b| b.as_str()) {
                 out.insert(
                     k.clone(),
                     AppletEntry {
-                        bundle: PathBuf::from(bundle),
+                        package: PathBuf::from(package),
                         runtime: v.get("runtime").and_then(|r| r.as_str()).map(PathBuf::from),
                     },
                 );
@@ -1251,19 +1258,19 @@ fn save_registry(reg: &BTreeMap<String, AppletEntry>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut text = String::from("# fluxor applet registry: name -> installed bundle\n[applets]\n");
+    let mut text = String::from("# fluxor applet registry: name -> installed package\n[applets]\n");
     for (k, v) in reg {
         match &v.runtime {
             Some(runtime) => text.push_str(&format!(
-                "{} = {{ bundle = {:?}, runtime = {:?} }}\n",
+                "{} = {{ package = {:?}, runtime = {:?} }}\n",
                 k,
-                v.bundle.display().to_string(),
+                v.package.display().to_string(),
                 runtime.display().to_string()
             )),
             None => text.push_str(&format!(
-                "{} = {{ bundle = {:?} }}\n",
+                "{} = {{ package = {:?} }}\n",
                 k,
-                v.bundle.display().to_string()
+                v.package.display().to_string()
             )),
         }
     }
@@ -1271,30 +1278,30 @@ fn save_registry(reg: &BTreeMap<String, AppletEntry>) -> Result<()> {
     Ok(())
 }
 
-/// `fluxor install <bundle>`: register an applet name → cached bundle path.
-/// Accepts a source manifest (emits first) or a bundle dir; the name defaults
-/// to the bundle's `workload.json` name. `--link <dir>` drops a busybox
+/// `fluxor install <package>`: register an applet name → cached package path.
+/// Accepts a source manifest (emits first) or a package dir; the name defaults
+/// to the package's `workload.json` name. `--link <dir>` drops a busybox
 /// symlink `<dir>/<name> → fluxor` so `<name> args…` dispatches via argv[0].
 pub fn install_applet(
-    bundle: &Path,
+    package: &Path,
     name: Option<&str>,
     link: Option<&Path>,
     verbose: bool,
 ) -> Result<()> {
-    let dir = if bundle.extension().is_some_and(|e| e == "toml") {
-        emit_bundle(bundle, None, verbose)?
-    } else if !bundle.exists() {
-        // Not a path: a name. The project's own bundle is emitted from its
+    let dir = if package.extension().is_some_and(|e| e == "toml") {
+        emit_package(package, None, verbose)?
+    } else if !package.exists() {
+        // Not a path: a name. The project's own package is emitted from its
         // packaging/; a sibling's CLI is consumed as the published artifact
         // this project pins, never as a checkout, materialised into the
         // applet cache.
-        let name = bundle.to_string_lossy();
-        match fluxor_tools::packaging::bundle_path(&crate::project::root(), &name) {
-            Some(own) => emit_bundle(&own, None, verbose)?,
-            None => materialize_pinned_bundle(&name, verbose)?,
+        let name = package.to_string_lossy();
+        match fluxor_tools::packaging::package_path(&crate::project::root(), &name) {
+            Some(own) => emit_package(&own, None, verbose)?,
+            None => materialize_pinned_package(&name, verbose)?,
         }
     } else {
-        bundle.to_path_buf()
+        package.to_path_buf()
     };
     let dir = dir
         .canonicalize()
@@ -1304,14 +1311,14 @@ pub fn install_applet(
     let manifest = load_manifest(&manifest_text)?;
     if !manifest.params.is_empty() {
         return Err(Error::Config(format!(
-            "bundle '{}' is a service with parameters; an applet takes argv — run it with \
+            "workload package '{}' is a service with parameters; an applet takes argv — run it with \
              `fluxor run {} --param name=value`",
             manifest.name, manifest.name
         )));
     }
     let applet = name.unwrap_or(&manifest.name).to_string();
 
-    // The runtime the bundle was built against: the installing project's
+    // The runtime the package was built against: the installing project's
     // staged binary, recorded so `exec` runs it from any directory. What the
     // lockfile names is materialised first: `fluxor update` rewrites the lock
     // without touching the tree, so the staged binary can otherwise be an
@@ -1328,7 +1335,7 @@ pub fn install_applet(
     reg.insert(
         applet.clone(),
         AppletEntry {
-            bundle: dir.clone(),
+            package: dir.clone(),
             runtime,
         },
     );
@@ -1358,9 +1365,9 @@ pub fn install_applet(
 }
 
 /// `fluxor exec <name> [-- args…]`. Resolution order, first match wins:
-/// an exact name in the applet registry, then a bundle built in this
+/// an exact name in the applet registry, then a package built in this
 /// project (`target/fluxor/<name>/`), else an error listing the applets
-/// that ARE known. No compilation on the hot path: the cached bundle
+/// that ARE known. No compilation on the hot path: the cached package
 /// execs as-is.
 pub fn exec_applet(
     name: &str,
@@ -1373,9 +1380,9 @@ pub fn exec_applet(
     let identity = identity.as_ref();
     let reg = load_registry()?;
     if let Some(entry) = reg.get(name) {
-        if entry.bundle.join("workload.json").is_file() {
-            return launch_bundle(
-                &entry.bundle,
+        if entry.package.join("workload.json").is_file() {
+            return launch_package(
+                &entry.package,
                 args,
                 entry.runtime.as_deref(),
                 Some(name),
@@ -1385,14 +1392,14 @@ pub fn exec_applet(
             );
         }
         return Err(Error::Config(format!(
-            "applet '{name}' points at {} but no bundle is there — re-run `fluxor install`",
-            entry.bundle.display()
+            "applet '{name}' points at {} but no package is there — re-run `fluxor install`",
+            entry.package.display()
         )));
     }
-    // Project-local fallback: a bundle built in this tree.
+    // Project-local fallback: a package built in this tree.
     let project = crate::project::root().join("target/fluxor").join(name);
     if project.join("workload.json").is_file() {
-        return launch_bundle(
+        return launch_package(
             &project,
             args,
             None,
@@ -1474,13 +1481,13 @@ pub fn applet_logs(name: &str, tail: usize, all: bool) -> Result<()> {
     Ok(())
 }
 
-/// Materialise the bundle this project pins under `name` as a runnable
-/// bundle dir under the applet cache (`$XDG_DATA_HOME/fluxor/applets/<name>/`):
+/// Materialise the package this project pins under `name` as a runnable
+/// package dir under the applet cache (`$XDG_DATA_HOME/fluxor/applets/<name>/`):
 /// the same digest-verified flat layout `fluxor sync` writes (documents +
-/// the bundle's own `modules/`), plus the graph image (`graph.img`) built
+/// the package's own `modules/`), plus the node image (`graph.img`) built
 /// once from those pinned modules, so `exec` runs
 /// without compiling anything.
-fn materialize_pinned_bundle(name: &str, verbose: bool) -> Result<PathBuf> {
+fn materialize_pinned_package(name: &str, verbose: bool) -> Result<PathBuf> {
     use fluxor_tools::oci_store::{self, OciStore};
     let project_root = crate::project::root();
     let artifact = fluxor_tools::store_resolve::read_store_lock(&project_root)
@@ -1492,7 +1499,7 @@ fn materialize_pinned_bundle(name: &str, verbose: bool) -> Result<PathBuf> {
         })
         .ok_or_else(|| {
             Error::Config(format!(
-                "'{name}' is neither a path, this project's own bundle, nor a bundle pinned in \
+                "'{name}' is neither a path, this project's own package, nor a package pinned in \
                  {} — list it in fluxor.toml `[uses] bundles` and run `fluxor update`",
                 fluxor_tools::store_resolve::lockfile_path(&project_root).display()
             ))
@@ -1505,13 +1512,13 @@ fn materialize_pinned_bundle(name: &str, verbose: bool) -> Result<PathBuf> {
     }
     .join("fluxor/applets")
     .join(&artifact.name);
-    crate::store_sync::materialize_bundle(&store, &artifact, &cache_root)
+    crate::store_sync::materialize_package(&store, &artifact, &cache_root)
         .map_err(|e| Error::Config(e.to_string()))?;
     let manifest_text = std::fs::read_to_string(cache_root.join("workload.json"))?;
     let manifest = load_manifest(&manifest_text)?;
     if !manifest.params.is_empty() {
         return Err(Error::Config(format!(
-            "bundle '{}' is a service with parameters; an applet takes argv — run it with \
+            "workload package '{}' is a service with parameters; an applet takes argv — run it with \
              `fluxor run {} --param name=value`",
             manifest.name, manifest.name
         )));
@@ -1524,7 +1531,7 @@ fn materialize_pinned_bundle(name: &str, verbose: bool) -> Result<PathBuf> {
     )?;
     if verbose {
         println!(
-            "materialised pinned bundle {} ({}) -> {}",
+            "materialised pinned package {} ({}) -> {}",
             artifact.reference,
             artifact.digest,
             cache_root.display()
@@ -1675,7 +1682,7 @@ buffer_bytes = 32768
     }
 
     #[test]
-    fn a_bundle_graph_carries_a_workloads_include_expanded() {
+    fn a_package_graph_carries_a_workloads_include_expanded() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("s.yaml"),
@@ -1687,7 +1694,7 @@ buffer_bytes = 32768
             "target: linux\nmodules: []\nworkloads:\n  - include:\n      - stack: s.yaml\n        \
                     as: s\n    modules: []\n";
         std::fs::write(&graph, text).unwrap();
-        let (carried, _) = bundle_graph(&graph, text.to_string(), dir.path()).unwrap();
+        let (carried, _) = package_graph(&graph, text.to_string(), dir.path()).unwrap();
         let doc: serde_yaml::Value = serde_yaml::from_str(&carried).unwrap();
         let w = &doc["workloads"][0];
         assert!(w.get("include").is_none(), "{carried}");
@@ -1703,7 +1710,7 @@ buffer_bytes = 32768
         clippy::undocumented_unsafe_blocks,
         reason = "env mutation serialised by project::tests::ENV_LOCK, as in project.rs"
     )]
-    fn a_bundle_name_resolves_in_the_working_directorys_project() {
+    fn a_package_name_resolves_in_the_working_directorys_project() {
         let _g = crate::project::tests::ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1720,8 +1727,8 @@ buffer_bytes = 32768
         std::fs::write(&own, "[workload]\nname = \"tool\"\n").unwrap();
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(&inner).unwrap();
-        let refused = bundle_by_name("absent_bundle");
-        let found = bundle_by_name("tool");
+        let refused = package_by_name("absent_package");
+        let found = package_by_name("tool");
         std::env::set_current_dir(&cwd).unwrap();
         if let Some(v) = saved {
             unsafe { std::env::set_var(crate::project::ENV_PROJECT_ROOT, v) };
@@ -1729,7 +1736,7 @@ buffer_bytes = 32768
         assert_eq!(
             found.unwrap(),
             own,
-            "the project's own bundle, no pin needed"
+            "the project's own package, no pin needed"
         );
         let e = refused.err().unwrap().to_string();
         let lock = inner.join("fluxor.lock");

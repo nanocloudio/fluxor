@@ -23,13 +23,16 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-/// FLXA magic ("FLXA") and wire version.
-const FLXA_MAGIC: u32 = 0x464C_5841;
-const FLXA_VERSION: u16 = 1;
+/// The composed graph's magic ("FLXG" as a little-endian u32), as
+/// `fluxor_contracts::graph::MAGIC` defines it. The graph is written here by
+/// hand, little-endian, to the layout `fluxor_contracts::graph` documents.
+const GRAPH_MAGIC: u32 = u32::from_le_bytes(*b"FLXG");
+/// Bytes of a module record before its params.
+const MODULE_HEAD_LEN: u16 = 20;
 const EP_NEW: u8 = 0;
 const EP_CALLER: u8 = 4;
 
-/// CREATE header + an FLXA blob of at most two modules and two edges.
+/// CREATE header + a composed graph of at most two modules and two edges.
 const ARG_BYTES: usize = 256;
 /// The largest module pack `pack_hex` carries (pack mode).
 const PACK_MAX: usize = 16 * 1024;
@@ -204,14 +207,21 @@ impl Out<'_> {
             None => self.ok = false,
         }
     }
-    fn be16(&mut self, v: u16) {
-        for b in v.to_be_bytes() {
+    fn le16(&mut self, v: u16) {
+        for b in v.to_le_bytes() {
             self.u8(b);
         }
     }
-    fn be32(&mut self, v: u32) {
-        for b in v.to_be_bytes() {
+    fn le32(&mut self, v: u32) {
+        for b in v.to_le_bytes() {
             self.u8(b);
+        }
+    }
+    /// Zeros up to the next 4-byte boundary of the graph, which starts at
+    /// `start`.
+    fn pad4(&mut self, start: usize) {
+        while !(self.n - start).is_multiple_of(4) {
+            self.u8(0);
         }
     }
 }
@@ -226,32 +236,46 @@ fn type_hash(name: &[u8]) -> u32 {
     h
 }
 
-/// One FLXA module whose params are a single u8 entry (tag 1).
-fn module_u8(o: &mut Out<'_>, name: &[u8], tag1: u8) {
-    o.be32(type_hash(name));
+/// One module record whose params are a single u8 entry (tag 1), in domain
+/// 0, on the node's default step budget, padded to 4 bytes from `start`.
+fn module_u8(o: &mut Out<'_>, start: usize, name: &[u8], tag1: u8) {
+    // SDK TLV: [FE 01][payload_len LE] [tag][len][value] [FF 00]
+    let params = [0xFE, 0x01, 5, 0, 1, 1, tag1, 0xFF, 0x00];
+    o.le16(MODULE_HEAD_LEN + params.len() as u16); // entry_len
+    o.u8(0); // flags: not pre-pass
     o.u8(0); // domain
-    o.be32(0); // step_deadline_us: the node's default
-    o.be32(0); // step_deadline_burst_us: deadline × BURST_MULTIPLIER
+    o.le32(type_hash(name));
+    o.le32(0); // step_deadline_us: the node's default
+    o.le32(0); // burst_us: deadline × BURST_MULTIPLIER
     o.u8(0); // fault_policy: skip
-             // SDK TLV: [FE 01][payload_len LE] [tag][len][value] [FF 00]
-    o.be16(9);
-    for b in [0xFE, 0x01, 5, 0, 1, 1, tag1, 0xFF, 0x00] {
+    o.u8(0);
+    o.u8(0);
+    o.u8(0);
+    for b in params {
         o.u8(b);
     }
+    o.pad4(start);
 }
 
-fn edge(o: &mut Out<'_>, from: (u8, u16, u8), to: (u8, u16, u8), bytes: u32) {
+/// One edge record: `(kind, port, index)` at each end, a local stream edge
+/// asking for `bytes` of ring.
+fn edge(o: &mut Out<'_>, from: (u8, u8, u16), to: (u8, u8, u16), bytes: u32) {
     o.u8(from.0);
-    o.be16(from.1);
-    o.u8(from.2);
+    o.u8(from.1);
+    o.le16(from.2);
     o.u8(to.0);
-    o.be16(to.1);
-    o.u8(to.2);
-    o.be32(bytes);
+    o.u8(to.1);
+    o.le16(to.2);
+    o.u8(0); // class: local
+    o.u8(0); // buffer_group: none
+    o.u8(0); // rate_class
+    o.u8(0); // flags
+    o.le32(bytes);
 }
 
-/// Lay the CREATE header and FLXA blob for workload `id` into `s.arg`; returns the
-/// total length, or 0 on overflow. `fault_mode` None = the churn workload.
+/// Lay the CREATE header and composed graph for workload `id` into `s.arg`;
+/// returns the total length, or 0 on overflow. `fault_mode` None = the churn
+/// workload.
 fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
     let chan = s.chan_bytes;
     for b in s.arg.iter_mut() {
@@ -267,7 +291,7 @@ fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
         s.arg[12 + i] = c;
     }
     // Pack mode: the churn workload brings its modules — the pack reference
-    // and its pin come first in the source section, the FLXA after them.
+    // and its pin come first in the source section, the graph after them.
     let pack = fault_mode.is_none() && s.pack_len > 0 && s.pin_set != 0;
     let pin = s.pin;
     if pack {
@@ -289,27 +313,36 @@ fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
             o.u8(b);
         }
     }
-    o.be32(FLXA_MAGIC);
-    o.be16(FLXA_VERSION);
-    o.be16(0);
+    let start = o.n;
+    let (modules, edges): (u16, u16) = match fault_mode {
+        None => (2, 2),
+        Some(_) => (1, 0),
+    };
+    o.le32(GRAPH_MAGIC);
+    o.le16(0); // flags: the workload's own authority
+    o.le16(modules);
+    o.le16(edges);
+    o.le16(0);
     for _ in 0..16 {
         o.u8(0); // owner_uid: the kernel copies the header identity in
     }
-    o.be32(0); // state_cap
-    o.be32(0); // buffer_cap
+    o.le32(0); // state_cap
+    o.le32(0); // buffer_cap
+
+    // The stepping order: declaration order, upstream first.
+    for k in 0..modules {
+        o.le16(k);
+    }
+    o.pad4(start);
     match fault_mode {
         None => {
-            o.u8(2);
-            o.u8(2);
-            module_u8(&mut o, b"churn_probe", 0); // source
-            module_u8(&mut o, b"churn_probe", 1); // relay
-            edge(&mut o, (EP_NEW, 0, 0), (EP_NEW, 1, 0), chan);
-            edge(&mut o, (EP_NEW, 1, 0), (EP_CALLER, 0, 0), chan);
+            module_u8(&mut o, start, b"churn_probe", 0); // source
+            module_u8(&mut o, start, b"churn_probe", 1); // relay
+            edge(&mut o, (EP_NEW, 0, 0), (EP_NEW, 0, 1), chan);
+            edge(&mut o, (EP_NEW, 0, 1), (EP_CALLER, 0, 0), chan);
         }
         Some(mode) => {
-            o.u8(1);
-            o.u8(0);
-            module_u8(&mut o, b"test_fault", mode);
+            module_u8(&mut o, start, b"test_fault", mode);
         }
     }
     if !o.ok {

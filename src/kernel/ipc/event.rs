@@ -14,7 +14,7 @@
 //! slot's handle word; ringing one whose handle closed rings nothing.
 //!
 //! The scheduler checks `EVENT_WAKE_PENDING` and steps only the affected
-//! modules via `step_woken_modules()`, providing intra-tick wake response.
+//! modules via a wake pass (`pass::run`), providing intra-tick wake response.
 
 use portable_atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
@@ -133,7 +133,7 @@ static EVENT_WAKE_PENDING: [AtomicU64; MODULE_MASK_WORDS] =
 // Lost-wakeup discipline is mask-then-check: `owner_pause` sets the
 // PAUSED_MODULES bits FIRST, then sweeps already-latched bits into the
 // deferred store; a signaller that raced past the mask read latches
-// `EVENT_WAKE_PENDING`, where the runner's per-pass sweep (or the
+// `EVENT_WAKE_PENDING`, where the domain loop's per-pass sweep (or the
 // woken-step guard) defers it. `owner_resume` clears the mask FIRST, then
 // drains the deferred store — a concurrent signal lands in whichever
 // store is live and is delivered either way.
@@ -173,7 +173,7 @@ pub fn defer_masked_wake(module_idx: usize) {
     }
 }
 
-/// Divert an already-taken wake set into the deferred store (the runner's
+/// Divert an already-taken wake set into the deferred store (the domain loop's
 /// per-pass straggler sweep for a paused graph).
 pub fn defer_masked_wakes(mask: &ModuleMask) {
     for (atomic, w) in PAUSED_DEFERRED_WAKES.iter().zip(mask.as_words().iter()) {
@@ -443,21 +443,11 @@ pub fn doorbell_release(doorbell: i32) {
 // Scheduler interface
 // ============================================================================
 
-/// Atomically read and clear the wake-pending bitmask.
-/// Returns a `ModuleMask` where bit N is set if module N has pending events.
-pub fn take_wake_pending() -> ModuleMask {
-    let mut words = [0u64; MODULE_MASK_WORDS];
-    for (w, atomic) in words.iter_mut().zip(EVENT_WAKE_PENDING.iter()) {
-        *w = atomic.swap(0, Ordering::AcqRel);
-    }
-    ModuleMask::from_words(words)
-}
-
 /// Non-clearing peek at the wake-pending bitmask. Used by platforms
 /// that pace with a spin loop (Linux `tick_us <= 200` path) to yield
 /// the spin budget early when an event fires, without consuming the
-/// bits — the next iteration's `take_wake_pending` still observes them
-/// and runs the woken modules.
+/// bits — the next iteration's wake pass still takes them and runs the
+/// woken modules.
 #[inline]
 pub fn wake_pending_nonzero() -> bool {
     EVENT_WAKE_PENDING
@@ -469,7 +459,7 @@ pub fn wake_pending_nonzero() -> bool {
 /// modules (a domain's modules). True iff any module in `mask` has a pending
 /// event. The adaptive-tick pacer uses this so one domain's idle decision is
 /// not coupled to a sibling domain's wake. Like `wake_pending_nonzero`, it
-/// does NOT consume the bits — the next `take_wake_pending` still observes
+/// does NOT consume the bits — the next `take_wake_in_mask` still takes
 /// them.
 #[inline]
 pub fn wake_pending_in_mask(mask: &ModuleMask) -> bool {
@@ -488,7 +478,7 @@ pub fn wake_pending_in_mask(mask: &ModuleMask) -> bool {
 ///   sleep short;
 /// - the woken-step budget bound restores a
 ///   deferred module's bit — already consumed by the caller's
-///   `take_wake_pending` — so the wake is not lost, and deliberately does
+///   `take_wake_in_mask` — so the wake is not lost, and deliberately does
 ///   NOT ring the doorbell: the deferral exists because the domain is
 ///   over budget NOW, and the next pass drains the bit without an
 ///   immediate re-wake storm.
@@ -518,24 +508,21 @@ pub fn latch_module_wake(module_idx: usize) -> bool {
 }
 
 /// Test-only: latch a module's wake bit directly, as if an event owned by it
-/// fired. Lets the multi-graph runner tests exercise the woken-idle-graph
+/// fired. Lets the multi-graph pass tests exercise the woken-idle-graph
 /// resumption path without registering a real event. Mirrors the
-/// wake-latch `event_signal` performs; a later `take_wake_pending` consumes it
+/// wake-latch `event_signal` performs; a later `take_wake_in_mask` consumes it
 /// identically.
 pub fn signal_module_wake_for_test(module_idx: usize) {
     relatch_module_wake(module_idx);
 }
 
 /// Atomically read-and-clear the wake-pending bits for the modules in `mask`,
-/// returning the cleared bits as a `ModuleMask`. The domain/owner-scoped
-/// counterpart to `take_wake_pending` (which clears everything): a per-`(graph,
-/// domain)` cooperative runner consumes only its own owners' wakes, so a one-shot
-/// event wake is acted on exactly once and does not stay "sticky" (which would
-/// pin an idle graph busy forever — notably on bcm2712, whose domain loop has no
-/// global `take_wake_pending` drain). The returned mask lets the runner pass
-/// `event_wake = true` for the *specific* modules that were woken (so a woken
-/// module steps even when its step-period is not due), preserving normal
-/// event-wake semantics. Bits outside `mask` are untouched.
+/// returning the cleared bits as a `ModuleMask`: the only way wakes are taken.
+/// A pass consumes only its own graph's or domain's wakes, so a one-shot event
+/// wake is acted on exactly once, never by another domain's core, and does not
+/// stay "sticky" (which would pin an idle graph busy). The returned mask lets
+/// the pass give `event_wake = true` to the specific modules woken (a woken
+/// module steps even when its period is not due). Bits outside `mask` are untouched.
 pub fn take_wake_in_mask(mask: &ModuleMask) -> ModuleMask {
     let mw = mask.as_words();
     let mut out = [0u64; MODULE_MASK_WORDS];

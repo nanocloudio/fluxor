@@ -1,17 +1,18 @@
-# Service bundles
+# Workload packages
 
-A service bundle is a published `role = "service"` workload: a graph, the
-`.fmod` of every module it loads, and the graph's typed params. A consumer
-references it by name, and runs it with values, without wiring or reading
-its graph. An applet bundle (`role = "cli"`) is the same artifact for a
+A workload package is the source form of a workload, published from
+`packaging/`. A service package is a published `role = "service"`
+workload: a graph, the `.fmod` of every module it loads, and the graph's
+typed params. A consumer references it by name, and runs it with values,
+without wiring or reading its graph. An applet package (`role = "cli"`) is the same artifact for a
 program that takes argv instead of params.
 
 Source: `tools/src/packaging.rs`, `tools/src/params.rs`,
 `tools/src/workload_src.rs`, `tools/src/store_sync.rs`.
 
-## Where a bundle lives
+## Where a package lives
 
-A project ships each bundle from its own directory under `packaging/`
+A project ships each package from its own directory under `packaging/`
 ([project-layout.md](project-layout.md)):
 
 ```text
@@ -19,13 +20,13 @@ packaging/service/<name>/workload.toml   role = "service"
 packaging/applet/<name>/workload.toml    role = "cli"
 ```
 
-The directory is named for the bundle, and its role matches the directory
+The directory is named for the package, and its role matches the directory
 it sits in. `fluxor publish` publishes exactly these and `fluxor ci`
 checks exactly these.
 
 ## The source manifest
 
-`workload.toml` carries identity only: the bundle's name, version and
+`workload.toml` carries identity only: the package's name, version and
 role, and one `[[implementation]]` per target naming the graph beside it.
 
 ```toml
@@ -42,11 +43,11 @@ graph = "linux.yaml"
 The workload name is ASCII letters, digits, `.`, `_` and `-`, starting
 with a letter or digit, at most 64 bytes: it becomes a directory name and a
 store tag. `[workload] store_dir` names where the workload's control-plane
-store lives, relative to the installed bundle unless absolute.
+store lives, relative to the installed package unless absolute.
 `[[export]]`, `[resources]` and `[health]` declare what the graph cannot:
 an endpoint's binding, a capacity override, the health signals. Unknown
 keys anywhere in the manifest are refused. A `[params]` table is refused
-too: a bundle's params are its graph's.
+too: a package's params are its graph's.
 
 ## The graph and its params
 
@@ -91,7 +92,7 @@ file is the caller's. Its `example` names a sample relative to the graph,
 and the checks build with that sample. It renders as the file's absolute
 path and goes where a module takes a path (`cert_file: ${param:cert}`,
 `trust: ${param:ca}`; on a target that embeds credentials at build,
-`trust: "${file:${param:ca}}"`). A `file` param is checked on the host
+`trust: "${file:${param:ca}}"`). A `file` param is checked on the build host
 that renders the graph; a credential a Linux module reads where it runs —
 from a volume lent to a workload, say — is a `string` param holding its absolute path, or
 an `{env: NAME}` binding in a workload image.
@@ -115,15 +116,15 @@ An applet's graph declares no params: an applet takes argv.
 is carried with its includes expanded, its `params:` kept and every
 placeholder it forwards into an include left for a run to render, so its
 module references and state sum cover the stacks' modules
-([stacks.md](../architecture/stacks.md#bundles)). A kernel built-in the
+([stacks.md](../architecture/stacks.md#workload-packages)). A kernel built-in the
 graph names (`cli_in`, `cli_out`, `linux_net`, …) is carried by every
-runtime: the bundle pins no `.fmod` for it.
+runtime: the package pins no `.fmod` for it.
 
 ## Publish, reference, run
 
 ```sh
 # producer
-fluxor publish                    # every bundle under packaging/, with the rest
+fluxor publish                    # every package under packaging/, with the rest
 fluxor publish bundle packaging/service/dns_service/workload.toml
 
 # consumer: fluxor.toml
@@ -136,12 +137,12 @@ fluxor run dns_service --param port=15353 --param answer=10.1.2.3
 fluxor run dns_service --params dns.toml --param port=15400
 ```
 
-A bundle a project runs by name from a script — which no graph names — is
+A package a project runs by name from a script — which no graph names — is
 declared under `[uses] bundles` in `fluxor.toml`. That name is a reference:
-`fluxor update` pins the bundle from the dependency in `[dependencies]` that
+`fluxor update` pins the package from the dependency in `[dependencies]` that
 publishes it; a name the list does not hold has no pin after the next update. A name
 two dependencies publish is refused as ambiguous. `fluxor sync` materialises
-a pinned bundle, digest-verified, to:
+a pinned package, digest-verified, to:
 
 ```text
 target/fluxor/bundles/<name>/
@@ -150,14 +151,14 @@ target/fluxor/bundles/<name>/
   .fluxor-sync-stamp
 ```
 
-`fluxor run <name>` runs the project's own `packaging/` bundle of that name
-when it ships one, else the bundle its `fluxor.lock` pins (materialising it
-if `sync` has not). It also takes a bundle directory or a source manifest
+`fluxor run <name>` runs the project's own `packaging/` package of that name
+when it ships one, else the package its `fluxor.lock` pins (materialising it
+if `sync` has not). It also takes a package directory or a source manifest
 path. The graph is rendered with the run's values and built against the
-bundle's own `modules/` when it has them (a pinned, materialised bundle),
-else the project's module directory; every module the bundle pins is
+package's own `modules/` when it has them (a pinned, materialised package),
+else the project's module directory; every module the package pins is
 checked against its digest first, and a rendered graph that loads a module
-the bundle does not pin is refused. The rendered graph and blobs live in a
+the package does not pin is refused. The rendered graph and blobs live in a
 private scratch directory under `target/fluxor/run/` that is removed when
 the run ends. Its exit code is the run's.
 
@@ -185,10 +186,10 @@ with its default, else its example, and takes no values.
 
 ## The ci gate
 
-`fluxor ci`'s `packaging` phase checks every bundle where the publish finds
+`fluxor ci`'s `packaging` phase checks every package where the publish finds
 it: its whole source manifest and its place, and each linux graph read as
 the publish reads it — includes expanded, rendered with its params' defaults and examples —
 through `fluxor build --check`. A project shipping services can list a
 service e2e script in `[ci.test] scripts` that publishes, references, syncs
-and runs the bundle against an isolated store and asserts the refusals;
+and runs the package against an isolated store and asserts the refusals;
 `fluxor ci` hands every such script the CLI under test as `$FLUXOR_BIN`.

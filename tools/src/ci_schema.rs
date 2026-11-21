@@ -17,7 +17,7 @@
 //!   2. **Conditional** — required or forbidden according to the shape
 //!      of the checkout, never according to which repo it is:
 //!      `[ci] targets` iff the repo has module manifests under the
-//!      standard tiers; `[ci.cargo] host_tools_crate` iff the cargo
+//!      standard layers; `[ci.cargo] host_tools_crate` iff the cargo
 //!      phase runs in a sub-crate rather than at the root. The shape is
 //!      read through [`crate::lifecycle::shape`], the same reader the
 //!      lifecycle verbs use, so the gate and `fluxor build`/`test` can
@@ -183,12 +183,12 @@ fn check_project(doc: &Value, out: &mut Vec<String>) {
 
 // ── conditional on the shape of the checkout ────────────────────────────
 
-/// `manifest.toml` files under the standard tiers, counted the way
+/// `manifest.toml` files under the standard layers, counted the way
 /// `fluxor modules build` discovers them.
-fn tiered_manifest_count(project_root: &Path) -> usize {
+fn layered_manifest_count(project_root: &Path) -> usize {
     let mut n = 0;
-    for tier in crate::manifest::MODULE_TIERS {
-        let root = project_root.join(tier);
+    for layer in crate::manifest::MODULE_LAYERS {
+        let root = project_root.join(layer);
         if !root.is_dir() {
             continue;
         }
@@ -208,19 +208,19 @@ fn ci_targets(doc: &Value) -> Option<&Vec<Value>> {
 }
 
 fn check_targets(project_root: &Path, doc: &Value, out: &mut Vec<String>) {
-    let modules = tiered_manifest_count(project_root);
+    let modules = layered_manifest_count(project_root);
     let declared = ci_targets(doc);
     match (modules, declared) {
         (0, Some(_)) => out.push(
             "`[ci] targets` declares a module build matrix, but no `manifest.toml` exists under \
-             the standard tiers (modules/foundation, modules/drivers, modules/platform/*, \
+             the standard layers (modules/foundation, modules/drivers, modules/platform/*, \
              modules/fixtures, modules/app, modules/common) — remove the key. A repo whose \
              modules sit in a flat `modules/<name>/` layout is unmigrated: move each module \
-             into a tier, and the key becomes required"
+             into a layer, and the key becomes required"
                 .to_string(),
         ),
         (n, None) if n > 0 => out.push(format!(
-            "`[ci] targets` is required: {n} module manifest(s) live under the standard tiers \
+            "`[ci] targets` is required: {n} module manifest(s) live under the standard layers \
              and nothing says which silicon to build them for — add e.g. \
              `[ci]` / `targets = [\"bcm2712\"]`"
         )),
@@ -309,19 +309,19 @@ fn check_inline_test_dirs(project_root: &Path, doc: &Value, out: &mut Vec<String
         if e.contains('/') || e.contains('\\') {
             out.push(format!(
                 "`[ci.hygiene] forbid_inline_tests` entry {e:?} is a path; entries are top-level \
-                 directory names (the scanner bans the whole tier)"
+                 directory names (the scanner bans the whole directory)"
             ));
             continue;
         }
         if !project_root.join(e).is_dir() {
             out.push(format!(
                 "`[ci.hygiene] forbid_inline_tests` names {e:?}, which is not a directory in \
-                 this repo — a ban over an absent tier enforces nothing; remove it"
+                 this repo — a ban over an absent directory enforces nothing; remove it"
             ));
         }
     }
 
-    if tiered_manifest_count(project_root) > 0 && !entries.iter().any(|e| e == "modules") {
+    if layered_manifest_count(project_root) > 0 && !entries.iter().any(|e| e == "modules") {
         out.push(
             "`[ci.hygiene] forbid_inline_tests` must list \"modules\": every PIC module is \
              `no_std` and an inline `#[cfg(test)]` block there compiles away silently, so the \
@@ -612,7 +612,7 @@ mod tests {
         );
         let e = without.err();
         assert!(
-            e.contains("no `manifest.toml` exists under the standard tiers"),
+            e.contains("no `manifest.toml` exists under the standard layers"),
             "{e}"
         );
         // The flat-layout repo is told what its real problem is.
@@ -628,7 +628,7 @@ mod tests {
         )
         .write("modules/thing/manifest.toml", MODULE_MANIFEST);
         let e = f.err();
-        assert!(e.contains("move each module into a tier"), "{e}");
+        assert!(e.contains("move each module into a layer"), "{e}");
     }
 
     #[test]

@@ -92,7 +92,7 @@ impl Family {
 
 /// Resolution table: `(module_index, family, local_id) -> name`, plus the
 /// per-instrument metadata rows (`[[observability.instrument]]`): kind,
-/// declared histogram bounds, and dimension domains. Bounds and dimensions
+/// declared histogram bounds, and dimension ranges. Bounds and dimensions
 /// are metadata a consumer resolves — they never ride a sample.
 #[derive(Default, Debug)]
 pub struct IdTable {

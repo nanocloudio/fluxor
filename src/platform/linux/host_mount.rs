@@ -277,7 +277,7 @@ static TABLE: JobTable = JobTable::new(MAX_JOBS, MAX_JOBS_PER_CALLER, RESULT_TTL
 
 /// Identity of the calling module, stable across its retries: the module
 /// slot together with the owner generation, so a module slot reused by a
-/// later tenant does not inherit its predecessor's jobs.
+/// later owner does not inherit its predecessor's jobs.
 fn caller_key() -> u64 {
     use crate::kernel::exec::scheduler;
     let owner = scheduler::caller_owner();

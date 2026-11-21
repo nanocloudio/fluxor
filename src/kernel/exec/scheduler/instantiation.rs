@@ -7,191 +7,18 @@ use fluxor_contracts::isolation::Level;
 // Module Instantiation
 // ============================================================================
 
-/// Internal module hashes (fnv1a32)
-pub const INTERNAL_TEE_HASH: u32 = 0x607f045c; // "_tee"
-pub const INTERNAL_MERGE_HASH: u32 = 0x8a6bcd3e; // "_merge"
-
-/// Consumers registered here drain EVERY inbound edge to a data port as
-/// its own channel (priority lanes: lane index = the edge's position in
-/// the graph wiring), so `insert_fan_in` must NOT collapse their fan
-/// groups into a single merged FIFO. A merge would serialise latency-
-/// critical producers behind bulk ones in one queue — a web-stream
-/// flood stalling Raft peer heartbeats past their election timeout.
-/// Platforms register their multi-inbound built-ins before
-/// `prepare_graph` (e.g. linux_net).
-static mut MULTI_INBOUND_HASHES: [u32; 8] = [0; 8];
-
-/// Register a module name-hash whose data inputs support one channel
-/// per edge (see [`MULTI_INBOUND_HASHES`]). Call before `prepare_graph`.
-pub fn register_multi_inbound(name_hash: u32) {
-    // SAFETY: called single-threaded during platform bring-up, before
-    // the scheduler starts stepping.
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(MULTI_INBOUND_HASHES) };
-    for slot in table.iter_mut() {
-        if *slot == name_hash {
-            return;
-        }
-        if *slot == 0 {
-            *slot = name_hash;
-            return;
-        }
-    }
-    log::error!("[graph] multi-inbound table full; {name_hash:#x} not registered");
-}
-
-pub(crate) fn is_multi_inbound(name_hash: u32) -> bool {
-    // SAFETY: read-only after bring-up registration.
-    let table = unsafe { &*core::ptr::addr_of!(MULTI_INBOUND_HASHES) };
-    table.iter().any(|&h| h != 0 && h == name_hash)
-}
-
-/// Name-hashes of built-ins whose data output keeps one channel per edge when
-/// every consumer of it is also one of its producers: each consumer then
-/// reads only its own events, so one that falls behind holds up nobody else.
-/// A fan whose consumers and producers differ keeps the tee, as the module
-/// cannot tell which consumer an event is for. Platforms register these
-/// before `prepare_graph` (e.g. linux_net).
-static mut MULTI_OUTBOUND_HASHES: [u32; 8] = [0; 8];
-
-/// Register a module name-hash whose data output may keep one channel per
-/// edge (see [`MULTI_OUTBOUND_HASHES`]). Call before `prepare_graph`.
-pub fn register_multi_outbound(name_hash: u32) {
-    // SAFETY: called single-threaded during platform bring-up, before
-    // the scheduler starts stepping.
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(MULTI_OUTBOUND_HASHES) };
-    for slot in table.iter_mut() {
-        if *slot == name_hash {
-            return;
-        }
-        if *slot == 0 {
-            *slot = name_hash;
-            return;
-        }
-    }
-    log::error!("[graph] multi-outbound table full; {name_hash:#x} not registered");
-}
-
-pub(crate) fn is_multi_outbound(name_hash: u32) -> bool {
-    // SAFETY: read-only after bring-up registration.
-    let table = unsafe { &*core::ptr::addr_of!(MULTI_OUTBOUND_HASHES) };
-    table.iter().any(|&h| h != 0 && h == name_hash)
-}
-
-/// Build the dense module list from the validated config.
-///
-/// Fail-closed on every malformation:
-///   * Modules with `id >= MAX_MODULES` → `Err(EINVAL)`.
-///   * Duplicate ids → `Err(EINVAL)`.
-///   * Modules exceeding the per-graph `MAX_MODULES` ceiling →
-///     `Err(EINVAL)`.
-///
-/// The error code is the bare `i32` negative-errno that
-/// `prepare_graph` already propagates.
-type BuiltModuleList = (ModuleList, usize, [i16; MAX_MODULES]);
-
-pub(crate) fn build_module_list(config: &Config) -> Result<BuiltModuleList, i32> {
-    let mut module_list = ModuleList::new(None);
-    module_list.reserve_entries(config.module_count as usize);
-    // i16, not i8: a slot index reaches MAX_MODULES - 1 (191 on the host
-    // profile), and an i8 wraps the 129th module to a negative "unknown".
-    let mut id_to_slot: [i16; MAX_MODULES] = [-1; MAX_MODULES];
-    let mut count = 0;
-
-    for entry in config.modules.iter().flatten() {
-        if count >= MAX_MODULES {
-            log::error!("[graph] module count exceeds MAX_MODULES={MAX_MODULES} — graph rejected");
-            return Err(crate::kernel::sys::errno::EINVAL);
-        }
-
-        let id = entry.id as usize;
-        if id >= MAX_MODULES {
-            log::error!(
-                "[graph] module id={} out of range (MAX_MODULES={}) — graph rejected",
-                entry.id,
-                MAX_MODULES
-            );
-            return Err(crate::kernel::sys::errno::EINVAL);
-        }
-
-        if id_to_slot[id] >= 0 {
-            log::error!("[graph] duplicate module id={} — graph rejected", entry.id);
-            return Err(crate::kernel::sys::errno::EINVAL);
-        }
-
-        id_to_slot[id] = count as i16;
-        module_list[count] = Some(*entry);
-        count += 1;
-    }
-
-    Ok((module_list, count, id_to_slot))
-}
-
-/// Pre-pass: record the level of every module whose config params request a
-/// gated one (TLV tag 0xF5: contained or isolated), BEFORE the graph's
-/// edges are validated, so the zero-copy check in `prepare_graph` can refuse a
-/// gated module on a mailbox or in-place edge. The full protection TLV (fault
-/// policy, deadlines, …) is still parsed at instantiation via
-/// `parse_protection_config`; this only peeks the level.
-pub(crate) fn mark_isolated_from_params(module_list: &ModuleList, module_count: usize) {
-    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
-        let entry = match slot {
-            Some(e) => e,
-            None => continue,
-        };
-        if is_internal_module(entry) {
-            continue;
-        }
-        let level = params_level(entry.params());
-        if !level.is_gated() {
-            continue;
-        }
-        // SAFETY: prepare_graph context — single mutator of SCHED.
-        unsafe {
-            let p = &raw mut SCHED;
-            (&mut (*p).protection)[module_idx] = level;
-        }
-        crate::kernel::sys::hal::protection_set_enabled(true);
-    }
-}
-
-/// Record every listed module's manifest port capacities (and its
-/// buffer-group flags) before its channels are opened.
-pub(crate) fn collect_module_hints(
-    loader: &ModuleLoader,
-    module_list: &ModuleList,
-    module_count: usize,
-) {
-    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
-        if let Some(entry) = slot {
-            collect_one_module_hints(loader, entry, module_idx);
-        }
-    }
-}
-
 /// Record one module's manifest port capacities and buffer-group flags
-/// into `SCHED` slot `module_idx`. Reads only the signed manifest; no
-/// module code runs.
+/// into `SCHED` slot `module_idx`. Reads only the manifest admission
+/// validated; no module code runs.
 pub(crate) fn collect_one_module_hints(
     loader: &ModuleLoader,
     entry: &ModuleEntry,
     module_idx: usize,
 ) {
-    // Internal modules (tee, merge) have no manifest.
-    if is_internal_module(entry) {
-        return;
-    }
-
     let loaded = match loader.find_by_name_hash(entry.name_hash) {
         Ok(m) => m,
         Err(_) => return, // Will be caught during instantiation
     };
-
-    // Validate integrity/signature before trusting anything the image
-    // says. A module that fails here is skipped now and hard-rejected
-    // when instantiation re-validates it.
-    if crate::kernel::module::loader::validate_module(&loaded, "hints").is_err() {
-        return;
-    }
 
     // Extract mailbox_safe / in_place_writer flags early so open_channels
     // can use them for buffer-group aliasing decisions.
@@ -208,61 +35,6 @@ pub(crate) fn collect_one_module_hints(
     }
 }
 
-pub(crate) fn push_internal_module(
-    module_list: &mut ModuleList,
-    module_count: &mut usize,
-    name_hash: u32,
-    domain_id: u8,
-    frame_kind: u8,
-) -> Option<usize> {
-    if *module_count >= module_slots()
-        || !crate::kernel::sys::resource_ledger::enforced_allows(
-            crate::abi::contracts::resource::POOL_MODULE_SLOTS,
-            *module_count as u32 + 1,
-        )
-    {
-        log::error!("No room for internal module");
-        crate::kernel::sys::resource_ledger::deny(
-            crate::abi::contracts::resource::POOL_MODULE_SLOTS,
-        );
-        return None;
-    }
-
-    let idx = *module_count;
-    module_list[idx] = Some(ModuleEntry {
-        name_hash,
-        id: idx as ModuleId,
-        domain_id,
-        pre_tick_drain: false,
-        frame_kind,
-        params_ptr: core::ptr::null(),
-        params_len: 0,
-    });
-    // Mirror the domain assignment into SCHED so the per-domain
-    // exec-order partitioner sees the inserted slot.
-    if idx < module_slots() {
-        // SAFETY: prepare_graph context — single mutator; idx bounded.
-        let sched = unsafe {
-            let p = &raw mut SCHED;
-            &mut *p
-        };
-        sched.domain_id[idx] = domain_id;
-    }
-    *module_count += 1;
-    Some(idx)
-}
-
-pub(crate) fn is_internal_module(entry: &ModuleEntry) -> bool {
-    entry.name_hash == INTERNAL_TEE_HASH || entry.name_hash == INTERNAL_MERGE_HASH
-}
-
-/// Direction for fan-in/fan-out insertion
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FanDirection {
-    Out,
-    In,
-}
-
 /// Finalize a module after it reports done or error.
 ///
 /// Sets POLL_HUP (done) or POLL_ERR (error) on all output channels,
@@ -274,7 +46,7 @@ pub(crate) fn finalize_module(
     type_name: &str,
     context: &str,
 ) {
-    // SAFETY: scheduler-thread context (called from step_modules teardown).
+    // SAFETY: scheduler-thread context (a pass's teardown of the module).
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -309,55 +81,6 @@ pub(crate) fn finalize_module(
     }
     syscalls::release_module_handles(module_idx as ModuleId);
     sched.finished[module_idx] = true;
-}
-
-#[no_mangle]
-pub static mut DBG_TICK: u32 = 0;
-
-/// Rate-limit for the per-step budget monitors (`MON_HEAVY_STEP`,
-/// `MON_BUDGET_OVERRUN`, `MON_BURST_BUDGET_ABORT`). On a coarse-timer host
-/// these are meaningless per-step: the browser's `now_micros` floor is
-/// ~1–2 ms, far above the 50 µs heavy threshold and the ~1 ms domain
-/// budget, so every step trips all three and drowns the log (tens of
-/// thousands of lines/sec). Emit at most one line per monitor per
-/// `MON_LOG_THROTTLE_TICKS`, carrying the number suppressed since the last
-/// line — a genuine (rare) native overrun is still surfaced, while the
-/// wasm flood collapses to a periodic summary. Monitoring/counters are
-/// unaffected; only the log emission is throttled.
-const MON_LOG_THROTTLE_TICKS: u32 = 2000;
-pub(crate) static mut MON_HEAVY_LAST: u32 = 0;
-pub(crate) static mut MON_HEAVY_SUP: u32 = 0;
-pub(crate) static mut MON_OVERRUN_LAST: u32 = 0;
-pub(crate) static mut MON_OVERRUN_SUP: u32 = 0;
-pub(crate) static mut MON_BURST_LAST: u32 = 0;
-pub(crate) static mut MON_BURST_SUP: u32 = 0;
-pub(crate) static mut MON_WAKE_DEFER_LAST: u32 = 0;
-pub(crate) static mut MON_WAKE_DEFER_SUP: u32 = 0;
-pub(crate) static mut MON_HOTSTART_LAST: u32 = 0;
-pub(crate) static mut MON_HOTSTART_SUP: u32 = 0;
-
-/// Returns `Some(suppressed_since_last)` when the throttle window has
-/// elapsed (and opens a new window); else `None`, bumping the suppressed
-/// counter. Raw pointers (not `&mut` to statics) keep clear of the
-/// `static_mut_refs` lint; scheduler-thread only, so no races.
-#[inline]
-pub(crate) unsafe fn mon_throttle(last: *mut u32, sup: *mut u32) -> Option<u32> {
-    let now = DBG_TICK;
-    if now.wrapping_sub(*last) >= MON_LOG_THROTTLE_TICKS {
-        let n = *sup;
-        *sup = 0;
-        *last = now;
-        Some(n)
-    } else {
-        *sup = (*sup).wrapping_add(1);
-        None
-    }
-}
-
-/// Current tick count (milliseconds since boot). Used by timer FDs on aarch64.
-pub fn tick_count() -> u32 {
-    // SAFETY: DBG_TICK is a u32 static; aligned read.
-    unsafe { DBG_TICK }
 }
 
 /// Wallclock-paced scheduler heartbeat. Platforms call this once per
@@ -593,25 +316,6 @@ const ALIVE_INTERVAL_MS: u64 = 30_000;
 #[no_mangle]
 pub static mut DBG_STEP_MODULE: ModuleId = NO_MODULE;
 
-/// Crash data buffer in .uninit section — NOT zeroed at startup,
-/// survives SYSRESETREQ software resets. Written by HardFault handler, read at tick 500.
-/// Layout: [0]=magic, [1]=PC, [2]=LR, [3]=module, [4]=tick, [5]=R0
-#[link_section = ".uninit.CRASH_DATA"]
-#[no_mangle]
-pub static mut CRASH_DATA: core::mem::MaybeUninit<[u32; 8]> = core::mem::MaybeUninit::uninit();
-
-/// Magic marker for valid crash data
-pub const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
-
-/// One-shot latch for the post-boot crash-info read (`step_modules`). Set once
-/// per boot so the prior-run `.uninit CRASH_DATA` is read exactly once, gated
-/// on a wall-clock delay rather than a `30_000_000 / tick_us` tick threshold
-/// that mis-scales / can be skipped under variable or idle pacing
-/// (shot-correctness class).
-pub(crate) static CRASH_CHECKED: AtomicBool = AtomicBool::new(false);
-/// Wall-clock delay after boot before the crash-info read (USB serial up).
-pub(crate) const CRASH_CHECK_DELAY_MS: u64 = 30_000;
-
 /// The protection level a module's params TLV asks for (tag 0xF5), without
 /// mutating any scheduler state; privileged when the tag is absent.
 pub fn params_level(params: &[u8]) -> Level {
@@ -752,10 +456,9 @@ pub fn params_raw_arena(params: &[u8]) -> bool {
 /// may give a module, because what it sets is a grant of the node's or
 /// reaches past the module.
 ///
-/// - 0xF0–0xF3, 0xF6: step deadline, fault policy, restart count and backoff,
-///   burst deadline. A workload declares these in its FLXA module record,
-///   where they are admitted against the node's ceiling.
-/// - 0xF4: trust tier. The loader's signature check decides it.
+/// - 0xF2, 0xF3: restart count and backoff.
+/// - 0xF4: reserved for the trust class, which the loader's signature check
+///   decides; a workload cannot claim one.
 /// - 0xF5: protection level. Gating a module switches the platform's
 ///   protection regime on for the whole node, and an isolated module takes
 ///   its private region from the shared allocator.
@@ -769,7 +472,7 @@ pub fn params_raw_arena(params: &[u8]) -> bool {
 /// the module's own heap behaves and how large it may grow, and that heap is
 /// charged, at its cap, to its owner's state cap.
 pub const fn is_node_param_tag(tag: u8) -> bool {
-    matches!(tag, 0xF0..=0xF7 | 0xFB..=0xFD)
+    matches!(tag, 0xF2..=0xF5 | 0xF7 | 0xFB..=0xFD)
 }
 
 /// The first node tag ([`is_node_param_tag`]) in a params TLV, found by
@@ -824,13 +527,9 @@ pub fn params_carry_tag(params: &[u8], tag: u8) -> bool {
 /// Parse protection configuration from module params TLV.
 ///
 /// Recognised tags in the schema-packed params blob:
-/// - 0xF0: step_deadline_us (u32 LE)
-/// - 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph, 3=tolerate)
 /// - 0xF2: max_restarts (u16 LE)
 /// - 0xF3: restart_backoff_ms (u16 LE)
-/// - 0xF4: trust_tier (u8)
 /// - 0xF5: protection (u8)
-/// - 0xF6: step_deadline_burst_us (u32 LE)
 /// - 0xF7: quarantine_partner (u16 LE module index)
 /// - 0xF8: heap_zero_on_free (u8 bool)
 /// - 0xF9: heap_fault_on_alloc_failure (u8 bool)
@@ -838,10 +537,11 @@ pub fn params_carry_tag(params: &[u8], tag: u8) -> bool {
 /// - 0xFC: irq (u16 LE)
 /// - 0xFD: device window (u64 base LE, u32 size LE)
 ///
-/// A module a live add instantiates never reaches this with a node tag
-/// ([`is_node_param_tag`]): the add refuses such params before anything is
-/// allocated, and takes the module's step budget from its FLXA record. What
-/// this can still set for it is the heap flags (0xF8–0xFA), which act on the
+/// A module's step budget is its graph's module record, seated before it
+/// instantiates; the params carry none of it. A module a live add
+/// instantiates never reaches this with a node tag ([`is_node_param_tag`]):
+/// the splice refuses such params before anything is allocated. What this
+/// can still set for it is the heap flags (0xF8–0xFA), which act on the
 /// module's own heap only.
 pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
     if params.len() < 4 {
@@ -879,20 +579,6 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
         }
 
         match tag {
-            0xF0 if len == 4 => {
-                // step_deadline_us (u32 LE)
-                let val = u32::from_le_bytes([
-                    params[pos],
-                    params[pos + 1],
-                    params[pos + 2],
-                    params[pos + 3],
-                ]);
-                fi.step_deadline_us = val;
-            }
-            0xF1 if len >= 1 => {
-                // fault_policy
-                fi.policy = FaultPolicy::from_wire(params[pos]).unwrap_or(FaultPolicy::Skip);
-            }
             0xF2 if len == 2 => {
                 // max_restarts (u16 LE)
                 fi.max_restarts = u16::from_le_bytes([params[pos], params[pos + 1]]);
@@ -900,14 +586,6 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
             0xF3 if len == 2 => {
                 // restart_backoff_ms (u16 LE)
                 fi.restart_backoff_ms = u16::from_le_bytes([params[pos], params[pos + 1]]);
-            }
-            0xF4 if len == 1 => {
-                // trust_tier: 0=platform, 1=verified, 2=community, 3=unsigned.
-                // Signature verification happens in the loader; this tag only
-                // surfaces the outcome for telemetry.
-                if params[pos] == 3 {
-                    log::warn!("[trust] module {module_idx} is unsigned");
-                }
             }
             0xF5 if len == 1 => {
                 // The protection level. A gated one opts the graph into the
@@ -918,16 +596,6 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 if level.is_gated() {
                     crate::kernel::sys::hal::protection_set_enabled(true);
                 }
-            }
-            0xF6 if len == 4 => {
-                // step_deadline_burst_us (u32 LE)
-                let val = u32::from_le_bytes([
-                    params[pos],
-                    params[pos + 1],
-                    params[pos + 2],
-                    params[pos + 3],
-                ]);
-                fi.step_deadline_burst_us = val;
             }
             0xF7 if len == 2 => {
                 // quarantine_partner (u16 LE module index)
@@ -948,12 +616,11 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 crate::kernel::mem::heap::set_canary_enabled(module_idx, params[pos] != 0);
             }
             0xFB if len == 4 => {
-                // isr_budget_cycles (u32 LE). Per-module Tier 1b/2
+                // isr_budget_cycles (u32 LE). Per-module `timer`/`irq`
                 // cycle budget; `0` falls back to
-                // `DEFAULT_ISR_BUDGET_CYCLES`. Set BEFORE the
-                // post-instantiation `register_isr_tier_modules_from_graph`
-                // helper reads it (parse_protection_config runs
-                // per-module right after `module_new`).
+                // `DEFAULT_ISR_BUDGET_CYCLES`. Set before the splice
+                // registers the module with its dispatcher at publication
+                // (`register_isr_module`).
                 let val = u32::from_le_bytes([
                     params[pos],
                     params[pos + 1],
@@ -963,16 +630,16 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 set_module_isr_budget_cycles(module_idx, val);
             }
             0xFC if len == 2 => {
-                // irq (u16 LE). Per-module hardware IRQ for Tier 2
+                // irq (u16 LE). Per-module hardware IRQ for `irq`
                 // admission. The admission helper later passes this
-                // to `register_tier2_module`.
+                // to `irq::register_module`.
                 let val = u16::from_le_bytes([params[pos], params[pos + 1]]);
                 set_module_irq(module_idx, val);
             }
             0xFD if len == 12 => {
                 // device window (u64 base LE, u32 size LE): registers a gated
                 // driver may reach directly. The platform maps it into the
-                // module's protection domain at registration.
+                // module's isolation region at registration.
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&params[pos..pos + 8]);
                 let mut z = [0u8; 4];

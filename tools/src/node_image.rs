@@ -1,12 +1,12 @@
-//! Graph images as the tools write them: the `wire::graph_image` header, the
-//! module table and the config, laid out by `graph_image::place`, hashed,
+//! Node images as the tools write them: the `wire::node_image` header, the
+//! module table and the config, laid out by `node_image::place`, hashed,
 //! pinned to this tree's ABI surface and, with a key, signed.
 //!
 //! One writer for every image a build emits: an RP flash slot or an OTA image
 //! (`fluxor build --emit=image`), the payload `combine` appends after a
 //! kernel, and the Linux graph file (`graph.img`).
 
-use fluxor_abi::wire::graph_image::{self, Header, Signature};
+use fluxor_abi::wire::node_image::{self, Header, Signature};
 use sha2::Digest as _;
 
 use crate::error::{Error, Result};
@@ -15,10 +15,10 @@ use crate::error::{Error, Result};
 /// `modules` then `config`: offsets from `place`, the payload digest and this
 /// tree's ABI-surface pin. Unsigned.
 pub fn header(base: u64, modules: &[u8], config: &[u8], epoch: u64) -> Result<Header> {
-    let (modules_offset, config_offset) = graph_image::place(base, modules.len() as u64);
+    let (modules_offset, config_offset) = node_image::place(base, modules.len() as u64);
     let narrow = |v: u64, what: &str| {
         u32::try_from(v)
-            .map_err(|_| Error::Config(format!("graph image {what} {v} does not fit 32 bits")))
+            .map_err(|_| Error::Config(format!("node image {what} {v} does not fit 32 bits")))
     };
     let mut h = sha2::Sha256::new();
     h.update(modules);
@@ -39,16 +39,16 @@ pub fn header(base: u64, modules: &[u8], config: &[u8], epoch: u64) -> Result<He
 pub fn sign(header: &mut [u8], seed: &[u8; 32]) -> [u8; 32] {
     use fluxor_sdk::crypto::ed25519::{ed25519_public_key, ed25519_sign};
     let pk = ed25519_public_key(seed);
-    let signature = ed25519_sign(seed, &header[..graph_image::SIGNED_LEN]);
+    let signature = ed25519_sign(seed, &header[..node_image::SIGNED_LEN]);
     let id = sha2::Sha256::digest(pk);
     let mut key_id = [0u8; 4];
     key_id.copy_from_slice(&id[..4]);
-    graph_image::put_signature(header, &Signature { key_id, signature });
+    node_image::put_signature(header, &Signature { key_id, signature });
     pk
 }
 
 /// The header's bytes, signed with `seed` when given.
-pub fn header_bytes(header: &Header, seed: Option<&[u8; 32]>) -> [u8; graph_image::HEADER_SIZE] {
+pub fn header_bytes(header: &Header, seed: Option<&[u8; 32]>) -> [u8; node_image::HEADER_SIZE] {
     let mut out = header.encode();
     if let Some(seed) = seed {
         sign(&mut out, seed);
@@ -66,7 +66,7 @@ pub fn compose(
 ) -> Result<Vec<u8>> {
     let h = header(0, modules, config, epoch)?;
     let mut out = vec![0xFFu8; h.end() as usize];
-    out[..graph_image::HEADER_SIZE].copy_from_slice(&header_bytes(&h, seed));
+    out[..node_image::HEADER_SIZE].copy_from_slice(&header_bytes(&h, seed));
     let m = h.modules_offset as usize;
     out[m..m + modules.len()].copy_from_slice(modules);
     let c = h.config_offset as usize;
@@ -78,7 +78,7 @@ pub fn compose(
 /// bounded by the file's length. `what` names the file in errors.
 pub fn read(image: &[u8], what: &str) -> Result<Header> {
     Header::decode(image, image.len() as u64)
-        .map_err(|e| Error::Config(format!("{what} is not a graph image ({e:?})")))
+        .map_err(|e| Error::Config(format!("{what} is not a node image ({e:?})")))
 }
 
 /// `image` with its config replaced by `config`: the same module table and
@@ -92,7 +92,7 @@ pub fn with_config(
     what: &str,
 ) -> Result<Vec<u8>> {
     let h = read(image, what)?;
-    if seed.is_none() && graph_image::signature(image).is_some() {
+    if seed.is_none() && node_image::signature(image).is_some() {
         return Err(Error::Config(format!(
             "{what} is signed, and no signing key is configured to re-sign it with a changed \
              config (`$FLUXOR_SIGNING_KEY`, `[signing] key`)"
@@ -126,17 +126,18 @@ mod tests {
         d.update(&modules);
         d.update(&config);
         assert_eq!(h.digest, <[u8; 32]>::from(d.finalize()));
-        let rec = graph_image::signature(&img).expect("signed");
+        let rec = node_image::signature(&img).expect("signed");
         let pk = fluxor_sdk::crypto::ed25519::ed25519_public_key(&seed);
         assert!(fluxor_sdk::crypto::ed25519::ed25519_verify(
             &pk,
-            &img[..graph_image::SIGNED_LEN],
+            &img[..node_image::SIGNED_LEN],
             &rec.signature
         ));
-        assert!(img
-            [graph_image::SIGNATURE_AT + graph_image::SIGNATURE_LEN..graph_image::HEADER_SIZE]
-            .iter()
-            .all(|&b| b == 0xFF));
+        assert!(
+            img[node_image::SIGNATURE_AT + node_image::SIGNATURE_LEN..node_image::HEADER_SIZE]
+                .iter()
+                .all(|&b| b == 0xFF)
+        );
     }
 
     /// Replacing the config keeps the module table and epoch, moves the

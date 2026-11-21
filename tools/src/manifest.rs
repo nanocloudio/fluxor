@@ -16,22 +16,22 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::hash::fnv1a_hash;
 
-/// The module tiers, in tier-table order. A module lives in exactly one
-/// of these directories; the tier is its ownership/portability
+/// The module layers, in layer-table order. A module lives in exactly one
+/// of these directories; the layer is its ownership/portability
 /// statement, never its delivery (`builtin = true` is a manifest key).
 ///
 /// This is the ONE list. Every consumer — the builder, manifest
 /// source-tree lookup, config module search roots, scenario
-/// validation, module tests — walks these and only these, so a tier
-/// that resolves is a tier that builds and is tested. There is no
+/// validation, module tests — walks these and only these, so a layer
+/// that resolves is a layer that builds and is tested. There is no
 /// flat `modules/<name>/` entry: a project with a flat layout has no
-/// resolvable modules until it places them in tiers.
+/// resolvable modules until it places them in layers.
 ///
 /// `modules/common/` holds shared sources rather than modules; it
 /// carries no `manifest.toml`, and every consumer keys discovery off
 /// manifest presence, so listing it here is inert until a sibling
 /// project puts a real module there.
-pub const MODULE_TIERS: &[&str] = &[
+pub const MODULE_LAYERS: &[&str] = &[
     "modules/foundation",
     "modules/drivers",
     "modules/platform/linux",
@@ -2007,7 +2007,7 @@ pub struct Observability {
     /// stated reason (data-moving modules only).
     pub exempt: Option<String>,
     /// Per-instrument metadata (`[[observability.instrument]]`): kind,
-    /// declared histogram bounds, and declared dimension domains. Optional
+    /// declared histogram bounds, and declared dimension ranges. Optional
     /// per instrument — a name in `metrics` with no row here is a plain
     /// dimensionless counter, which is what a name with no row declares
     /// implicitly.
@@ -2015,7 +2015,7 @@ pub struct Observability {
 }
 
 /// One `[[observability.instrument]]` row: build-time metadata for a name in
-/// the `metrics` list. Bounds and dimension domains are id-table metadata —
+/// the `metrics` list. Bounds and dimension ranges are id-table metadata —
 /// they ship to consumers out-of-band and never ride a sample record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentDecl {
@@ -2059,8 +2059,8 @@ impl InstrumentKind {
     }
 }
 
-/// One dimension key with its bounded value domain. The product of an
-/// instrument's domain sizes is capped at 65534 (`DIM_MAX_PRODUCT`) so the
+/// One dimension key with its bounded value range. The product of an
+/// instrument's range sizes is capped at 65534 (`DIM_MAX_PRODUCT`) so the
 /// composite index always fits the record's u16 with `0xFFFF` left for
 /// `__other__`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2089,7 +2089,7 @@ impl DimDomain {
     }
 }
 
-/// Ceiling on the product of one instrument's declared domain sizes — mirror
+/// Ceiling on the product of one instrument's declared range sizes — mirror
 /// of `contracts/telemetry.rs::DIM_MAX_PRODUCT`, which keeps every composite
 /// index below the reserved `__other__` (`0xFFFF`).
 pub const DIM_MAX_PRODUCT: u32 = 65534;
@@ -2220,10 +2220,10 @@ fn validate_instruments(obs: &Observability) -> Result<()> {
 }
 
 /// Scan a module source tree for an actual `module_isr_entry` **export**
-/// — the IRQ-context entry point a Tier 2 (IRQ-owned) module must
+/// — the IRQ-context entry point a `irq` module must
 /// provide. Returns `Ok(())` if any `.rs` file under `src_root` defines
 /// the symbol with an exportable signature, `Err` otherwise. Used by the
-/// Tier 2 admission validator so a module placed in an `exec: irq`
+/// `irq` admission validator so a module placed in an `exec: irq`
 /// domain that forgot to export `module_isr_entry` fails the graph build
 /// rather than failing registration on the rig.
 ///
@@ -2485,7 +2485,7 @@ impl Manifest {
     /// process — each module type is parsed at most once per
     /// invocation, including negative lookups.
     ///
-    /// Search paths are the tier list (`MODULE_TIERS`), covering both
+    /// Search paths are the layer list (`MODULE_LAYERS`), covering both
     /// PIC modules and kernel-resident built-ins (under
     /// `modules/platform/<platform>/<name>/`). See
     /// `docs/architecture/abi_layers.md` for what each tree is for.
@@ -2502,7 +2502,7 @@ impl Manifest {
         // the install-root / sibling-checkout search roots below — the
         // published crate source artifacts ship no per-platform
         // manifests.
-        const SOURCE_TREE_DIRS: &[&str] = MODULE_TIERS;
+        const SOURCE_TREE_DIRS: &[&str] = MODULE_LAYERS;
 
         // Search roots are walked in order:
         //   1. Project root (CWD-relative discovery via marker walk, or
@@ -3578,7 +3578,7 @@ impl Manifest {
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
         // byte 12 (`MANIFEST_FLAGS_AT`): bit 0 = has_integrity, bit 1 = has_signature,
         //          bit 2 = interrupt_safe (author attestation; the
-        //                  **build-time** `validate_isr_tier_admission`
+        //                  **build-time** `validate_interrupt_admission`
         //                  in `tools/src/config/builder.rs` is the gate
         //                  for this flag, for `timer` and `irq` alike
         //                  (`irq` additionally requires an `irq:` field
@@ -3587,11 +3587,11 @@ impl Manifest {
         //                  loader's `isr_entry_fn`). The kernel does not
         //                  read the bit: its runtime gate is the EACCES
         //                  check on every gated syscall
-        //                  (`scheduler::deny_isr_tier_syscall`).
+        //                  (`scheduler::deny_interrupt_mode_syscall`).
         //          bit 3 = pre_pass (pre-pass opt-in). The
         //                  build carries it into the module's config
         //                  entry, which `prepare_graph` reads to
-        //                  populate `domain_pre_tick_order` and exclude
+        //                  populate `domain_pre_pass_order` and exclude
         //                  the module from `domain_exec_order`.
         //          bit 4 = ABI-surface attestation block present.
         //          bit 5 = port-capacity block present.
@@ -6732,8 +6732,8 @@ store_subscriptions = 1
         assert!(
             offenders.is_empty(),
             "hand-written parameter tag constant(s) in src/platform — take the \
-             value from `platform::builtin_param_tags`, which build.rs generates \
-             from the manifests:\n{}",
+             value from `abi::platform::native`, which `fluxor abi-regen` \
+             generates from the manifests:\n{}",
             offenders.join("\n"),
         );
     }

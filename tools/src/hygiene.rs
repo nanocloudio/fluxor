@@ -2,7 +2,7 @@
 //!
 //!   1. Parse Rust as AST via `syn`.
 //!   2. Per-file checks:
-//!      - Inline-test ban for tiers listed in
+//!      - Inline-test ban for layers listed in
 //!        `fluxor.toml::[ci.hygiene].forbid_inline_tests`. Strict
 //!        mode bans every form; permissive mode allows a bottom-of-
 //!        file `#[cfg(test)] mod tests { … }` block sized to
@@ -25,7 +25,7 @@
 //!        every spawned `Command` sweeps inherited descriptors.
 //!   3. Whole-repo checks:
 //!      - Module-structure rules over `modules/**`.
-//!      - Shadow-guard rules over the shadow-tracked test tiers.
+//!      - Shadow-guard rules over the shadow-tracked test layers.
 //!      - Repo-file conformance (files a standard mandates at root).
 //!   4. Skip directories named `generated/`, `target/`, `.git/`,
 //!      `node_modules/`, `.context/`; skip files starting with
@@ -57,6 +57,7 @@ pub enum Rule {
     CrateRootAllow,
     PendingWrite,
     TenancyVocabulary,
+    RetiredVocabulary,
     DescriptorHygiene,
     AbiLiteral,
 }
@@ -111,6 +112,7 @@ impl Rule {
             Rule::ConsumerNaming,
             Rule::PendingWrite,
             Rule::TenancyVocabulary,
+            Rule::RetiredVocabulary,
             Rule::DescriptorHygiene,
             Rule::AbiLiteral,
         ]
@@ -130,6 +132,7 @@ impl Rule {
             Rule::ConsumerNaming => "consumer-naming",
             Rule::PendingWrite => "pending-write",
             Rule::TenancyVocabulary => "tenancy-vocabulary",
+            Rule::RetiredVocabulary => "retired-vocabulary",
             Rule::DescriptorHygiene => "descriptor-hygiene",
             Rule::AbiLiteral => "abi-literal",
         }
@@ -396,12 +399,15 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         if ext == Some("md") {
             // Prose is held to the vocabulary rule only, and only in the
             // repo that owns the surface it describes.
-            if sdk_owner && is_architecture_doc(&rel) {
+            if sdk_owner && is_retired_vocabulary_scope(&rel) {
                 if let Ok(content) = fs::read_to_string(path) {
                     report.files_scanned += 1;
                     report
                         .violations
                         .extend(scan_tenancy_vocabulary(&rel, &content));
+                    report
+                        .violations
+                        .extend(scan_retired_vocabulary(&rel, &content));
                 }
             }
             continue;
@@ -415,18 +421,19 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         }
         report.files_scanned += 1;
 
-        let tier = classify_tier(&rel);
-        let tier = if host_compiled.contains(&rel) {
-            Tier::Tests // host-compiled: inline tests run, so the rule is moot
+        let layer = classify_layer(&rel);
+        let layer = if host_compiled.contains(&rel) {
+            Layer::Tests // host-compiled: inline tests run, so the rule is moot
         } else {
-            tier
+            layer
         };
-        let mut file_violations = scan_file(&rel, &content, tier, config);
+        let mut file_violations = scan_file(&rel, &content, layer, config);
         // Only in the repo that OWNS the SDK: a consumer's vendored copy
         // is not its to rename.
         if sdk_owner {
             file_violations.extend(scan_consumer_naming(&rel, &content, &consumers));
             file_violations.extend(scan_tenancy_vocabulary(&rel, &content));
+            file_violations.extend(scan_retired_vocabulary(&rel, &content));
         }
         file_violations.extend(scan_sdk_mounts(&rel, &content));
         file_violations.extend(scan_pending_writes(&rel, &content, &write_consts));
@@ -496,7 +503,7 @@ fn apply_ratchets(report: &mut Report, ratchets: &[Ratchet]) {
     }
 }
 
-/// Structure rules for the `modules/` tree: a module is a directory, never a crate; tier placement
+/// Structure rules for the `modules/` tree: a module is a directory, never a crate; layer placement
 /// must agree with the manifest; in-module `tests/` must be declared.
 /// All findings report under `Rule::ModuleStructure`.
 fn scan_module_structure(project_root: &Path, report: &mut Report) {
@@ -606,7 +613,7 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
             );
         }
 
-        // Tier placement must agree with hardware_targets.
+        // Layer placement must agree with hardware_targets.
         let targets_line = manifest
             .lines()
             .map(str::trim)
@@ -661,11 +668,11 @@ fn push_repo_violation(report: &mut Report, rel: PathBuf, rule: Rule, message: S
     });
 }
 
-/// The tree tiers the test-tracking standard shadow-tracks. `fuzz/` and
+/// The tree layers the test-tracking standard shadow-tracks. `fuzz/` and
 /// `fixtures/` are listed by the standard and by the projects that use
 /// them; `tools/rig/` is the standard's named extra tree — the rig
 /// mechanism backends and bench tooling, which describe benches the way
-/// `tests/hardware/` does. A tier only participates when it exists on
+/// `tests/hardware/` does. A layer only participates when it exists on
 /// disk.
 const SHADOW_TIERS: [&str; 6] = [
     "tests",
@@ -678,14 +685,14 @@ const SHADOW_TIERS: [&str; 6] = [
 
 /// Shadow-tracking conformance —
 /// the native replacement for the per-repo `tools/ci-shadow-guard.sh`
-/// copies. For every tier that exists on disk:
+/// copies. For every layer that exists on disk:
 ///
-/// - a repo with a shadow repo (`.git-shadow/`) must exclude the tier
+/// - a repo with a shadow repo (`.git-shadow/`) must exclude the layer
 ///   from the primary repo, un-exclude it in `.git-shadow/info/exclude`,
 ///   and actually have it committed there (an initialised-but-unborn
 ///   shadow repo versions nothing);
-/// - a repo with no shadow repo must not gitignore the tier — a
-///   gitignored-only tier exists on exactly one machine and has no
+/// - a repo with no shadow repo must not gitignore the layer — a
+///   gitignored-only layer exists on exactly one machine and has no
 ///   recovery path (the explicit failure mode of shadow tracking).
 fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
     let shadow_dir = project_root.join(".git-shadow");
@@ -701,19 +708,19 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
         .collect();
 
     if !has_shadow {
-        for tier in present {
-            if !ignore_file_lists_tier(&gitignore, tier, false) {
+        for layer in present {
+            if !ignore_file_lists_layer(&gitignore, layer, false) {
                 continue;
             }
             push_repo_violation(
                 report,
-                PathBuf::from(tier),
+                PathBuf::from(layer),
                 Rule::ShadowGuard,
                 format!(
-                    "`{tier}/` is gitignored in the primary repo and there is no `.git-shadow/` \
+                    "`{layer}/` is gitignored in the primary repo and there is no `.git-shadow/` \
                      — its contents are versioned nowhere and exist only on this machine. \
                      Set up shadow tracking (init `.git-shadow`, invert the \
-                     excludes, `git shadow add -A && git shadow commit`), or drop `{tier}/` from \
+                     excludes, `git shadow add -A && git shadow commit`), or drop `{layer}/` from \
                      .gitignore and track it in the primary repo"
                 ),
             );
@@ -727,67 +734,67 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
             report,
             PathBuf::from(".git-shadow"),
             Rule::ShadowGuard,
-            "`.git-shadow/` is initialised but has no commits — the shadow-tracked tiers are \
+            "`.git-shadow/` is initialised but has no commits — the shadow-tracked layers are \
              versioned nowhere, which is compliance shape without compliance. Run \
              `git shadow add -A && git shadow commit -m \"Initial shadow-tracked tests/benches\"`"
                 .to_string(),
         );
     }
 
-    for tier in present {
-        // A tier the primary repo tracks is primary-tracked by choice —
+    for layer in present {
+        // A layer the primary repo tracks is primary-tracked by choice —
         // fluxor's `examples/` is the onboarding catalog the docs link
         // to, and demanding `/examples/` in .gitignore would untrack it
-        // to satisfy a rule about where tests live. The tier-wide
+        // to satisfy a rule about where tests live. The layer-wide
         // exclusion checks below do not apply to it; the per-file check
-        // still does, because a tier can be tracked in PART.
-        if primary_tracks_tier(project_root, tier) {
-            report_unversioned(project_root, tier, &shadow_dir, report);
+        // still does, because a layer can be tracked in PART.
+        if primary_tracks_layer(project_root, layer) {
+            report_unversioned(project_root, layer, &shadow_dir, report);
             continue;
         }
-        if !ignore_file_lists_tier(&gitignore, tier, false) {
+        if !ignore_file_lists_layer(&gitignore, layer, false) {
             push_repo_violation(
                 report,
-                PathBuf::from(tier),
+                PathBuf::from(layer),
                 Rule::ShadowGuard,
                 format!(
-                    "`{tier}/` is a shadow-tracked tier but is not excluded from the primary \
-                     repo — add `/{tier}/` to .gitignore, or it reaches the shared remote"
+                    "`{layer}/` is a shadow-tracked layer but is not excluded from the primary \
+                     repo — add `/{layer}/` to .gitignore, or it reaches the shared remote"
                 ),
             );
         }
-        if !ignore_file_lists_tier(&shadow_exclude, tier, true) {
+        if !ignore_file_lists_layer(&shadow_exclude, layer, true) {
             push_repo_violation(
                 report,
-                PathBuf::from(tier),
+                PathBuf::from(layer),
                 Rule::ShadowGuard,
                 format!(
-                    "`{tier}/` is not un-excluded in .git-shadow/info/exclude — the shadow repo \
-                     tracks nothing under it, so the tier is versioned nowhere. Add `!/{tier}/` \
+                    "`{layer}/` is not un-excluded in .git-shadow/info/exclude — the shadow repo \
+                     tracks nothing under it, so the layer is versioned nowhere. Add `!/{layer}/` \
                      there"
                 ),
             );
             continue;
         }
-        if born && shadow_tier_is_empty(&shadow_dir, project_root, tier) {
+        if born && shadow_layer_is_empty(&shadow_dir, project_root, layer) {
             push_repo_violation(
                 report,
-                PathBuf::from(tier),
+                PathBuf::from(layer),
                 Rule::ShadowGuard,
                 format!(
-                    "`{tier}/` exists on disk and is un-excluded in .git-shadow/info/exclude, but \
+                    "`{layer}/` exists on disk and is un-excluded in .git-shadow/info/exclude, but \
                      no file under it is committed in the shadow repo — run \
-                     `git shadow add -A {tier} && git shadow commit`"
+                     `git shadow add -A {layer} && git shadow commit`"
                 ),
             );
         }
     }
 }
 
-/// Does an exclude file list `tier`? `negated` selects the shadow
+/// Does an exclude file list `layer`? `negated` selects the shadow
 /// repo's inverted form (`!/tests/`) over the primary form (`/tests/`).
 /// All four anchoring spellings git accepts are recognised.
-fn ignore_file_lists_tier(contents: &str, tier: &str, negated: bool) -> bool {
+fn ignore_file_lists_layer(contents: &str, layer: &str, negated: bool) -> bool {
     contents.lines().any(|line| {
         let line = line.trim();
         let Some(rest) = (if negated {
@@ -800,25 +807,25 @@ fn ignore_file_lists_tier(contents: &str, tier: &str, negated: bool) -> bool {
             return false;
         };
         let rest = rest.trim_start_matches('/').trim_end_matches('/');
-        rest == tier
+        rest == layer
     })
 }
 
 /// A git repository is "born" once a branch ref exists — loose under
 /// `refs/heads/` or in `packed-refs`. Read from the git-dir directly so
 /// the check works without invoking git.
-/// Files under a tier that are versioned NOWHERE — not in the primary
+/// Files under a layer that are versioned NOWHERE — not in the primary
 /// repo, not in the shadow repo, not ignored.
 ///
-/// A tier is not all-or-nothing: tracked files can sit beside files that
-/// are in neither repo and not ignored. A tier-level predicate sees the
+/// A layer is not all-or-nothing: tracked files can sit beside files that
+/// are in neither repo and not ignored. A layer-level predicate sees the
 /// tracked ones and says nothing about the rest, so the check is per
 /// file.
 ///
 /// `git ls-files --others --exclude-standard` is the repo's own answer
 /// for "untracked and not ignored"; subtracting what the shadow repo
 /// tracks leaves exactly the files that would vanish with the directory.
-fn report_unversioned(project_root: &Path, tier: &str, shadow_dir: &Path, report: &mut Report) {
+fn report_unversioned(project_root: &Path, layer: &str, shadow_dir: &Path, report: &mut Report) {
     let list = |dir: Option<&Path>, args: &[&str]| -> Vec<String> {
         let mut c = std::process::Command::new("git");
         if let Some(d) = dir {
@@ -827,7 +834,7 @@ fn report_unversioned(project_root: &Path, tier: &str, shadow_dir: &Path, report
                 .arg("--work-tree")
                 .arg(project_root);
         }
-        c.args(args).arg("--").arg(tier).current_dir(project_root);
+        c.args(args).arg("--").arg(layer).current_dir(project_root);
         c.output()
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout)
@@ -853,10 +860,10 @@ fn report_unversioned(project_root: &Path, tier: &str, shadow_dir: &Path, report
     let sample: Vec<&str> = nowhere.iter().take(3).map(String::as_str).collect();
     push_repo_violation(
         report,
-        PathBuf::from(tier),
+        PathBuf::from(layer),
         Rule::ShadowGuard,
         format!(
-            "{} file(s) under `{tier}/` are versioned nowhere — untracked in the primary \
+            "{} file(s) under `{layer}/` are versioned nowhere — untracked in the primary \
              repo, absent from the shadow repo, and not ignored (e.g. {}). Track them, \
              shadow-add them, or ignore them; leaving them is losing them",
             nowhere.len(),
@@ -865,13 +872,13 @@ fn report_unversioned(project_root: &Path, tier: &str, shadow_dir: &Path, report
     );
 }
 
-/// Does the primary repo track anything under this tier? A non-empty
-/// `git ls-files <tier>` is the only signal that settles it, and it is
+/// Does the primary repo track anything under this layer? A non-empty
+/// `git ls-files <layer>` is the only signal that settles it, and it is
 /// the repo's own answer rather than a list this rule would have to
 /// keep.
-fn primary_tracks_tier(project_root: &Path, tier: &str) -> bool {
+fn primary_tracks_layer(project_root: &Path, layer: &str) -> bool {
     std::process::Command::new("git")
-        .args(["ls-files", "--", tier])
+        .args(["ls-files", "--", layer])
         .current_dir(project_root)
         .output()
         .is_ok_and(|o| !o.stdout.is_empty())
@@ -891,17 +898,17 @@ fn shadow_repo_is_born(shadow_dir: &Path) -> bool {
         .is_ok_and(|s| s.lines().any(|l| l.contains("refs/heads/")))
 }
 
-/// Is `tier` absent from the shadow repo's committed tree? Needs git
+/// Is `layer` absent from the shadow repo's committed tree? Needs git
 /// itself (the tree is packed); if git can't be run the check is
 /// skipped rather than guessed at, so it never reports a false
 /// violation on a machine without git.
-fn shadow_tier_is_empty(shadow_dir: &Path, project_root: &Path, tier: &str) -> bool {
+fn shadow_layer_is_empty(shadow_dir: &Path, project_root: &Path, layer: &str) -> bool {
     let out = std::process::Command::new("git")
         .arg("--git-dir")
         .arg(shadow_dir)
         .arg("--work-tree")
         .arg(project_root)
-        .args(["ls-tree", "-r", "--name-only", "HEAD", "--", tier])
+        .args(["ls-tree", "-r", "--name-only", "HEAD", "--", layer])
         .output();
     match out {
         Ok(o) if o.status.success() => o.stdout.is_empty(),
@@ -1358,7 +1365,7 @@ const UNIX_CREDENTIAL_WORDS: &[&str] = &[
 /// An orchestrator's nouns: they belong to the orchestrator built on the
 /// portable surface, not to the surface itself, which says workload, owner
 /// and node agent.
-const ORCHESTRATOR_WORDS: &[&str] = &["pod", "pods", "kubelet", "kubernetes", "k8s"];
+const ORCHESTRATOR_WORDS: &[&str] = &["kubelet", "kubernetes", "k8s"];
 
 /// Host mechanisms: how one platform realizes a portable concept. They belong
 /// to that platform (`src/platform/<p>/`, `crates/fluxor-abi/src/platform/<p>/`); a
@@ -1537,6 +1544,160 @@ fn scan_tenancy_vocabulary(rel: &Path, src: &str) -> Vec<Violation> {
             at,
             format!("exempt block never closed with `{VOCABULARY_EXEMPT_END}`"),
         ));
+    }
+    out
+}
+
+/// The retired synonyms of the runtime vocabulary, each with the one term
+/// that replaces it (`docs/architecture/vocabulary.md`). Matched as words
+/// (an identifier part counts: `install_base_graph` holds `base_graph`) on
+/// the lowercased line, except `pod`, matched as written so the
+/// plain-old-data `POD` stays a word of its own.
+const RETIRED_WORDS: &[(&str, &str)] = &[
+    ("tenant", "owner"),
+    ("tenants", "owners"),
+    ("base graph", "node graph"),
+    ("boot graph", "node graph"),
+    ("system graph", "node graph"),
+    ("root graph", "node graph"),
+    ("application graph", "node graph"),
+    ("base_graph", "node_graph"),
+    ("boot_graph", "node_graph"),
+    ("system_graph", "node_graph"),
+    ("root_graph", "node_graph"),
+    ("application_graph", "node_graph"),
+    ("system owner", "node owner"),
+    ("owner_system", "`OWNER_NODE`"),
+    ("workload_uid", "owner uid (`owner_uid`)"),
+    ("graph image", "node image"),
+    ("graph images", "node images"),
+    ("boot image", "firmware image"),
+    ("boot images", "firmware images"),
+    ("combined image", "firmware image"),
+    ("service bundle", "workload package"),
+    ("service bundles", "workload packages"),
+    ("applet bundle", "workload package"),
+    ("protection domain", "isolation region"),
+    ("isolation domain", "isolation region"),
+    ("index domain", "index range"),
+    ("id domain", "id range"),
+    ("slot domain", "slot range"),
+    ("dimdomain", "`DimValues`"),
+];
+
+/// `tier` in any sense but the USB hub tier: an execution mode is `tick`,
+/// `poll`, `timer` or `irq`, and every other tier the tree once named has a
+/// name of its own (elastic region, trust class, module layer, surface,
+/// custody). The USB hub tier is the USB specification's word and is
+/// allowed in the one file that speaks it; the retired `tier:` key the
+/// composer refuses is allowed where it is quoted as a key.
+const TIER_WORDS: &[&str] = &["tier", "tiers", "tiered"];
+
+/// Files that speak the USB hub tier.
+const USB_HUB_TIER_FILES: &[&str] = &["src/kernel/usb/xhci_topology.rs"];
+
+/// The retired `tier` key, quoted where the composer refuses it by name.
+const QUOTED_TIER_KEY: &[&str] = &["`tier`", "\"tier\"", "`tier:`"];
+
+/// `pod` and its forms, matched case-sensitively.
+const RETIRED_POD: &[&str] = &["pod", "pods", "Pod", "Pods"];
+
+/// Whether `rel` is held to the retired-vocabulary rule: the kernel and its
+/// platforms, the tools, the crates, the contracts and the docs. This file
+/// is where the words are defined, so it is not.
+fn is_retired_vocabulary_scope(rel: &Path) -> bool {
+    let p = rel.to_string_lossy().replace('\\', "/");
+    p != "tools/src/hygiene.rs"
+        && (p.starts_with("src/")
+            || p.starts_with("tools/src/")
+            || p.starts_with("crates/")
+            || p.starts_with("contracts/")
+            || p.starts_with("docs/"))
+}
+
+/// The first numbered execution tier on `line` (`Tier 2`, `tier1b`,
+/// `isr_tier2_…`): `tier` not inside a longer word's tail, then an optional
+/// space, `_` or `-`, then a digit.
+fn numbered_tier(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("tier") {
+        let at = from + rel;
+        let before_ok = at == 0 || !b[at - 1].is_ascii_alphabetic();
+        let mut end = at + 4;
+        if end < b.len() && matches!(b[end], b' ' | b'_' | b'-') {
+            end += 1;
+        }
+        if before_ok && end < b.len() && b[end].is_ascii_digit() {
+            return true;
+        }
+        from = at + 4;
+    }
+    false
+}
+
+/// One term per concept: a retired synonym of the runtime vocabulary (an
+/// owner is not a tenant, the graph a node boots is its node graph, an
+/// execution mode is not a numbered tier) is refused with the term that
+/// replaced it. A page that must name the retired words — the vocabulary's
+/// own table of them — sits in a reasoned `vocabulary-exempt` block.
+fn scan_retired_vocabulary(rel: &Path, src: &str) -> Vec<Violation> {
+    if !is_retired_vocabulary_scope(rel) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut exempt = false;
+    let path = rel.to_string_lossy().replace('\\', "/");
+    let usb_hub = USB_HUB_TIER_FILES.contains(&path.as_str());
+    for (i, line) in src.lines().enumerate() {
+        if line.contains(VOCABULARY_EXEMPT_END) {
+            exempt = false;
+            continue;
+        }
+        if line.contains(VOCABULARY_EXEMPT_BEGIN) {
+            exempt = true;
+            continue;
+        }
+        if exempt {
+            continue;
+        }
+        let mut refuse = |word: &str, instead: &str| {
+            out.push(Violation {
+                path: rel.to_path_buf(),
+                line: i + 1,
+                rule: Rule::RetiredVocabulary,
+                message: format!("`{word}` is a retired word: say {instead}"),
+            });
+        };
+        let lower = line.to_ascii_lowercase();
+        for (word, instead) in RETIRED_WORDS {
+            if word_appears(&lower, word) {
+                refuse(word, instead);
+            }
+        }
+        if RETIRED_POD.iter().any(|w| word_appears(line, w)) {
+            refuse("pod", "workload, owner or node agent");
+        }
+        if numbered_tier(line) {
+            refuse(
+                "a numbered tier",
+                "the execution mode (`tick`, `poll`, `timer`, `irq`) or pre-pass; a workload \
+                 CREATE's parts are its header and its options",
+            );
+        } else if !usb_hub {
+            let mut bare = lower.clone();
+            for key in QUOTED_TIER_KEY {
+                bare = bare.replace(key, "");
+            }
+            if TIER_WORDS.iter().any(|w| word_appears(&bare, w)) {
+                refuse(
+                    "tier",
+                    "the execution mode, or the thing's own name: elastic region, trust class, \
+                     module layer, surface, custody",
+                );
+            }
+        }
     }
     out
 }
@@ -1870,7 +2031,7 @@ fn is_generated_marker(content: &str) -> bool {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Tier {
+enum Layer {
     /// `modules/**` — raw `rustc` PIC build; inline tests compile
     /// silently away on the no_std target.
     Modules,
@@ -1882,9 +2043,9 @@ enum Tier {
     Tests,
 }
 
-fn classify_tier(rel: &Path) -> Tier {
+fn classify_layer(rel: &Path) -> Layer {
     // Any directory component named tests/benches/examples/fuzz puts
-    // the file in the tests tier — covers root `tests/`, workspace
+    // the file in the tests layer — covers root `tests/`, workspace
     // member `tools/tests/`, and nested module test dirs like
     // `modules/foundation/tls/tests/`.
     let comps: Vec<String> = rel
@@ -1895,12 +2056,12 @@ fn classify_tier(rel: &Path) -> Tier {
         .iter()
         .any(|c| matches!(c.as_str(), "tests" | "benches" | "examples" | "fuzz"))
     {
-        return Tier::Tests;
+        return Layer::Tests;
     }
     if comps.first().is_some_and(|c| c == "modules") {
-        return Tier::Modules;
+        return Layer::Modules;
     }
-    Tier::Src
+    Layer::Src
 }
 
 /// Every file reachable by `#[path]` from a host-compiled root.
@@ -1935,7 +2096,7 @@ fn host_compiled_closure(project_root: &Path) -> HashSet<PathBuf> {
             continue;
         };
         // A product root: cargo compiles it, so what it mounts is host code.
-        if path.extension().is_some_and(|e| e == "rs") && classify_tier(rel) == Tier::Src {
+        if path.extension().is_some_and(|e| e == "rs") && classify_layer(rel) == Layer::Src {
             queue.push(rel.to_path_buf());
         }
     }
@@ -1988,15 +2149,15 @@ pub fn lexical_join(base: &Path, rel: &str) -> PathBuf {
     out
 }
 
-fn tier_forbids_inline_tests(tier: Tier, config: &Config) -> bool {
-    match tier {
-        Tier::Modules => config.forbid_inline_tests.iter().any(|s| s == "modules"),
-        Tier::Src => config.forbid_inline_tests.iter().any(|s| s == "src"),
-        Tier::Tests => false,
+fn layer_forbids_inline_tests(layer: Layer, config: &Config) -> bool {
+    match layer {
+        Layer::Modules => config.forbid_inline_tests.iter().any(|s| s == "modules"),
+        Layer::Src => config.forbid_inline_tests.iter().any(|s| s == "src"),
+        Layer::Tests => false,
     }
 }
 
-fn scan_file(rel: &Path, src: &str, tier: Tier, config: &Config) -> Vec<Violation> {
+fn scan_file(rel: &Path, src: &str, layer: Layer, config: &Config) -> Vec<Violation> {
     let mut out = Vec::new();
     let parsed = match syn::parse_file(src) {
         Ok(p) => p,
@@ -2020,7 +2181,7 @@ fn scan_file(rel: &Path, src: &str, tier: Tier, config: &Config) -> Vec<Violatio
     // outer `#[cfg(test)]` on the block itself is still reported via
     // an explicit size diagnostic at the file root.
     let permitted_trailing_id: Option<*const ItemMod> =
-        if tier == Tier::Src && config.mode == Mode::Permissive {
+        if layer == Layer::Src && config.mode == Mode::Permissive {
             file_trailing_permitted_mod(&parsed).map(|m| m as *const ItemMod)
         } else {
             None
@@ -2029,8 +2190,8 @@ fn scan_file(rel: &Path, src: &str, tier: Tier, config: &Config) -> Vec<Violatio
     let mut visitor = HygieneVisitor {
         rel,
         violations: &mut out,
-        inline_test_forbidden: tier_forbids_inline_tests(tier, config),
-        permissive_src: tier == Tier::Src && config.mode == Mode::Permissive,
+        inline_test_forbidden: layer_forbids_inline_tests(layer, config),
+        permissive_src: layer == Layer::Src && config.mode == Mode::Permissive,
         max_inline_lines: config.max_inline_lines,
         permitted_trailing: permitted_trailing_id,
         in_permitted_depth: 0,
@@ -2347,8 +2508,8 @@ fn trailing_mod_exceeds(m: &ItemMod, cap: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn scan_str(src: &str, tier: Tier, config: &Config) -> Vec<Violation> {
-        scan_file(Path::new("dummy.rs"), src, tier, config)
+    fn scan_str(src: &str, layer: Layer, config: &Config) -> Vec<Violation> {
+        scan_file(Path::new("dummy.rs"), src, layer, config)
     }
 
     #[test]
@@ -2360,9 +2521,8 @@ mod tests {
             src,
         );
         let words: Vec<_> = v.iter().map(|v| (v.line, v.message.clone())).collect();
-        assert_eq!(v.len(), 2, "{words:?}");
+        assert_eq!(v.len(), 1, "{words:?}");
         assert!(v[0].line == 1 && v[0].message.contains("`gid`"));
-        assert!(v[1].line == 2 && v[1].message.contains("`pod`"));
         assert!(
             scan_tenancy_vocabulary(
                 Path::new("crates/fluxor-abi/src/platform/linux/host_process.rs"),
@@ -2388,15 +2548,51 @@ mod tests {
             v.iter().map(|v| &v.message).collect::<Vec<_>>()
         );
         assert!(v[0].line == 1 && v[0].message.contains("`nftables` in the portable kernel"));
-        let md = "A plain old data struct (POD).\n<!-- vocabulary-exempt-begin: Linux ruling -->\ncgroup v2\n<!-- vocabulary-exempt-end -->\n";
+        let md = "Driven by kubernetes.\n<!-- vocabulary-exempt-begin: Linux ruling -->\ncgroup v2\n<!-- vocabulary-exempt-end -->\n";
         let v = scan_tenancy_vocabulary(Path::new("docs/architecture/x.md"), md);
         assert_eq!(v.len(), 1);
-        assert!(v[0].line == 1 && v[0].message.contains("`pod` in an architecture doc"));
+        assert!(v[0].line == 1 && v[0].message.contains("`kubernetes` in an architecture doc"));
         assert!(
             scan_tenancy_vocabulary(Path::new("src/platform/linux/net_policy.rs"), src).is_empty(),
             "a platform names its own mechanisms"
         );
         assert!(scan_tenancy_vocabulary(Path::new("docs/guides/x.md"), md).is_empty());
+    }
+
+    #[test]
+    fn retired_words_are_refused_with_their_replacement() {
+        let src = "/// a Pod's state\n/// a plain old data struct (POD)\n/// one tenant per slot\n\
+                   fn install_base_graph() {}\n/// the Tier 1b handler, isr_tier2_entry\n\
+                   /// workload_uid: u64\n/// Tier B elastic, frontier1, maintenance\n";
+        let v = scan_retired_vocabulary(Path::new("tools/src/agent_cli.rs"), src);
+        let lines: Vec<_> = v.iter().map(|v| (v.line, v.message.clone())).collect();
+        assert_eq!(
+            v.iter().map(|v| v.line).collect::<Vec<_>>(),
+            vec![1, 3, 4, 5, 6, 7],
+            "{lines:?}"
+        );
+        assert!(v[0].message.contains("workload, owner or node agent"));
+        assert!(v[1].message.contains("say owner"));
+        assert!(v[2].message.contains("say node_graph"));
+        assert!(v[3].message.contains("`tick`, `poll`, `timer`, `irq`"));
+        assert!(v[4].message.contains("`owner_uid`"));
+        assert!(v[5].message.contains("elastic region"));
+        for out_of_scope in ["tests/harness/tests/a.rs", "modules/foundation/a/mod.rs"] {
+            assert!(scan_retired_vocabulary(Path::new(out_of_scope), src).is_empty());
+        }
+        let v = scan_retired_vocabulary(
+            Path::new("src/kernel/a.rs"),
+            "// the vault tier\n// unknown key `tier`\n// the graph image\n// a frontier\n",
+        );
+        assert_eq!(v.iter().map(|v| v.line).collect::<Vec<_>>(), vec![1, 3]);
+        assert!(scan_retired_vocabulary(
+            Path::new("src/kernel/usb/xhci_topology.rs"),
+            "// five hub tiers\n"
+        )
+        .is_empty());
+        let md = "A tenant.\n<!-- vocabulary-exempt-begin: the retired words -->\n| tenant | owner |\n<!-- vocabulary-exempt-end -->\n";
+        let v = scan_retired_vocabulary(Path::new("docs/guides/x.md"), md);
+        assert_eq!(v.iter().map(|v| v.line).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
@@ -2491,7 +2687,7 @@ mod tests {
     #[test]
     fn flags_bare_test_attribute() {
         let src = "#[test]\nfn t() {}\n";
-        let v = scan_str(src, Tier::Modules, &strict());
+        let v = scan_str(src, Layer::Modules, &strict());
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, Rule::InlineTests);
     }
@@ -2499,14 +2695,14 @@ mod tests {
     #[test]
     fn flags_path_qualified_test_attribute() {
         let src = "#[tokio::test]\nasync fn t() {}\n";
-        let v = scan_str(src, Tier::Modules, &strict());
+        let v = scan_str(src, Layer::Modules, &strict());
         assert!(v.iter().any(|v| v.rule == Rule::InlineTests));
     }
 
     #[test]
     fn flags_cfg_test() {
         let src = "#[cfg(test)]\nmod tests {}\n";
-        let v = scan_str(src, Tier::Modules, &strict());
+        let v = scan_str(src, Layer::Modules, &strict());
         assert!(v
             .iter()
             .any(|v| v.rule == Rule::InlineTests && v.message.contains("cfg(test)")));
@@ -2515,23 +2711,23 @@ mod tests {
     #[test]
     fn flags_cfg_attr_test() {
         let src = "#[cfg_attr(test, derive(Debug))]\nstruct S;\n";
-        let v = scan_str(src, Tier::Modules, &strict());
+        let v = scan_str(src, Layer::Modules, &strict());
         assert!(v.iter().any(|v| v.rule == Rule::InlineTests));
     }
 
     #[test]
     fn flags_mod_tests_item() {
         let src = "mod tests { fn t() {} }\n";
-        let v = scan_str(src, Tier::Modules, &strict());
+        let v = scan_str(src, Layer::Modules, &strict());
         assert!(v
             .iter()
             .any(|v| v.rule == Rule::InlineTests && v.message.contains("mod tests")));
     }
 
     #[test]
-    fn tests_tier_skips_inline_test_ban() {
+    fn tests_layer_skips_inline_test_ban() {
         let src = "#[test]\nfn t() {}\n";
-        let v = scan_str(src, Tier::Tests, &strict());
+        let v = scan_str(src, Layer::Tests, &strict());
         assert!(v.iter().all(|v| v.rule != Rule::InlineTests));
     }
 
@@ -2547,7 +2743,7 @@ mod tests {
     fn t() {}
 }
 "#;
-        let v = scan_str(src, Tier::Src, &permissive(80));
+        let v = scan_str(src, Layer::Src, &permissive(80));
         assert_eq!(v.len(), 0, "got: {v:?}");
     }
 
@@ -2560,7 +2756,7 @@ mod tests {
         let src = format!(
             "fn prod() {{}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n{body}    }}\n}}\n"
         );
-        let v = scan_str(&src, Tier::Src, &permissive(80));
+        let v = scan_str(&src, Layer::Src, &permissive(80));
         assert!(
             v.iter()
                 .any(|v| v.rule == Rule::InlineTests
@@ -2579,7 +2775,7 @@ mod tests {
 
 fn prod_after() {}
 "#;
-        let v = scan_str(src, Tier::Src, &permissive(80));
+        let v = scan_str(src, Layer::Src, &permissive(80));
         assert!(v.iter().any(|v| v.rule == Rule::InlineTests));
     }
 
@@ -2589,14 +2785,14 @@ fn prod_after() {}
 #[allow(dead_code, reason = "needed for ABI")]
 fn f() {}
 "#;
-        let v = scan_str(src, Tier::Tests, &strict());
+        let v = scan_str(src, Layer::Tests, &strict());
         assert!(v.iter().all(|v| v.rule != Rule::AllowWithoutReason));
     }
 
     #[test]
     fn allow_without_reason_is_flagged() {
         let src = "#[allow(dead_code)]\nfn f() {}\n";
-        let v = scan_str(src, Tier::Tests, &strict());
+        let v = scan_str(src, Layer::Tests, &strict());
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, Rule::AllowWithoutReason);
     }
@@ -2604,7 +2800,7 @@ fn f() {}
     #[test]
     fn inner_allow_without_reason_is_flagged() {
         let src = "#![allow(dead_code)]\n";
-        let v = scan_str(src, Tier::Tests, &strict());
+        let v = scan_str(src, Layer::Tests, &strict());
         // Two rules fire, and both are right: the attribute carries no
         // reason, AND it is a crate-root allow with no declared prefix.
         assert_eq!(v.len(), 2, "{v:?}");
@@ -2620,37 +2816,40 @@ fn f() {}
         let src = "#![allow(dead_code, reason = \"mounted SDK surface\")]\n";
         let mut cfg = strict();
         assert_eq!(
-            scan_str(src, Tier::Modules, &cfg).len(),
+            scan_str(src, Layer::Modules, &cfg).len(),
             1,
             "undeclared: the crate-root rule fires"
         );
         cfg.allow_crate_root = vec![("dummy.rs".into(), "the test's own file".into())];
         assert!(
-            scan_str(src, Tier::Modules, &cfg).is_empty(),
+            scan_str(src, Layer::Modules, &cfg).is_empty(),
             "declared: nothing fires"
         );
     }
 
     #[test]
-    fn classify_tier_resolves_workspace_member_tests() {
+    fn classify_layer_resolves_workspace_member_tests() {
         assert_eq!(
-            classify_tier(Path::new("modules/foo/mod.rs")),
-            Tier::Modules
+            classify_layer(Path::new("modules/foo/mod.rs")),
+            Layer::Modules
         );
-        assert_eq!(classify_tier(Path::new("tests/foo.rs")), Tier::Tests);
-        assert_eq!(classify_tier(Path::new("tools/tests/foo.rs")), Tier::Tests);
-        assert_eq!(classify_tier(Path::new("tools/src/foo.rs")), Tier::Src);
-        assert_eq!(classify_tier(Path::new("src/lib.rs")), Tier::Src);
-        // Nested test dirs anywhere in the path land in the tests tier —
+        assert_eq!(classify_layer(Path::new("tests/foo.rs")), Layer::Tests);
+        assert_eq!(
+            classify_layer(Path::new("tools/tests/foo.rs")),
+            Layer::Tests
+        );
+        assert_eq!(classify_layer(Path::new("tools/src/foo.rs")), Layer::Src);
+        assert_eq!(classify_layer(Path::new("src/lib.rs")), Layer::Src);
+        // Nested test dirs anywhere in the path land in the tests layer —
         // a per-module test suite under `modules/foo/tests/` should not
         // be treated as no_std PIC code.
         assert_eq!(
-            classify_tier(Path::new("modules/foundation/tls/tests/crypto_kat.rs")),
-            Tier::Tests
+            classify_layer(Path::new("modules/foundation/tls/tests/crypto_kat.rs")),
+            Layer::Tests
         );
         assert_eq!(
-            classify_tier(Path::new("modules/foundation/http/benches/decode.rs")),
-            Tier::Tests
+            classify_layer(Path::new("modules/foundation/http/benches/decode.rs")),
+            Layer::Tests
         );
     }
 
@@ -2667,7 +2866,7 @@ fn f() {}
         // Lint named `reasonable_thing` shouldn't satisfy the reason
         // requirement — there's no `=` following the prefix.
         let src = "#[allow(clippy::reasonable_thing)]\nfn f() {}\n";
-        let v = scan_str(src, Tier::Tests, &strict());
+        let v = scan_str(src, Layer::Tests, &strict());
         assert_eq!(v.len(), 1, "should still be flagged: {v:?}");
         assert_eq!(v[0].rule, Rule::AllowWithoutReason);
     }
@@ -2686,7 +2885,7 @@ fn f() {}
 #[cfg_attr(not(feature = "host-test"), no_std)]
 extern crate alloc;
 "#;
-        let v = scan_str(src, Tier::Modules, &strict());
+        let v = scan_str(src, Layer::Modules, &strict());
         assert!(
             v.iter().all(|v| v.rule != Rule::InlineTests),
             "host-test feature gate should not be flagged: {v:?}"
@@ -2744,25 +2943,25 @@ extern crate alloc;
         report.violations
     }
 
-    /// `tools/rig/` is a nested tier: its ignore lines are
+    /// `tools/rig/` is a nested layer: its ignore lines are
     /// `/tools/rig/` and `!/tools/rig/`, and both spellings resolve.
     #[test]
-    fn shadow_guard_reads_a_nested_tier() {
-        assert!(ignore_file_lists_tier(
+    fn shadow_guard_reads_a_nested_layer() {
+        assert!(ignore_file_lists_layer(
             "/tests/\n/tools/rig/\n",
             "tools/rig",
             false
         ));
-        assert!(ignore_file_lists_tier(
+        assert!(ignore_file_lists_layer(
             "/*\n!/tools/rig/\n",
             "tools/rig",
             true
         ));
-        assert!(!ignore_file_lists_tier("/tools/\n", "tools/rig", false));
+        assert!(!ignore_file_lists_layer("/tools/\n", "tools/rig", false));
     }
 
     #[test]
-    fn shadow_guard_flags_gitignored_tier_with_no_shadow_repo() {
+    fn shadow_guard_flags_gitignored_layer_with_no_shadow_repo() {
         let root = TempRoot::new("noshadow");
         root.dir("tests").file(".gitignore", "target/\n/tests/\n");
         let v = shadow_report(&root, &strict());
@@ -2773,7 +2972,7 @@ extern crate alloc;
     }
 
     #[test]
-    fn shadow_guard_ignores_primary_tracked_tier() {
+    fn shadow_guard_ignores_primary_tracked_layer() {
         // Not gitignored, no shadow repo: the primary repo tracks it.
         // Converging that state is a separate decision, not this rule's.
         let root = TempRoot::new("tracked");
@@ -2795,7 +2994,7 @@ extern crate alloc;
     }
 
     #[test]
-    fn shadow_guard_flags_tier_missing_from_shadow_exclude() {
+    fn shadow_guard_flags_layer_missing_from_shadow_exclude() {
         // lattice's silent hole: benches/ shadow-tracked in the comment,
         // absent from the exclude file, so the shadow repo tracks none
         // of it.
@@ -2812,7 +3011,7 @@ extern crate alloc;
     }
 
     #[test]
-    fn shadow_guard_flags_tier_not_excluded_from_primary() {
+    fn shadow_guard_flags_layer_not_excluded_from_primary() {
         let root = TempRoot::new("leak");
         root.dir("examples")
             .file(".git-shadow/refs/heads/main", "0".repeat(40).as_str())
@@ -2834,7 +3033,7 @@ extern crate alloc;
                 ".git-shadow/info/exclude",
                 "/*\n!/tests/\n!/examples/\n!/.gitignore\n",
             );
-        // `shadow_tier_is_empty` needs a real git object store; the
+        // `shadow_layer_is_empty` needs a real git object store; the
         // fixture has none, so the check declines rather than guesses.
         assert!(shadow_report(&root, &strict()).is_empty());
     }
@@ -2843,19 +3042,19 @@ extern crate alloc;
     fn ignore_spellings_all_match() {
         for spelling in ["/tests/", "/tests", "tests/", "tests"] {
             assert!(
-                ignore_file_lists_tier(spelling, "tests", false),
+                ignore_file_lists_layer(spelling, "tests", false),
                 "{spelling}"
             );
             assert!(
-                ignore_file_lists_tier(&format!("!{spelling}"), "tests", true),
+                ignore_file_lists_layer(&format!("!{spelling}"), "tests", true),
                 "!{spelling}"
             );
         }
         // A negation is not an exclusion, a comment is not a rule, and
-        // a longer path is not the tier.
-        assert!(!ignore_file_lists_tier("!/tests/", "tests", false));
-        assert!(!ignore_file_lists_tier("#/tests/", "tests", false));
-        assert!(!ignore_file_lists_tier("/tests/fixtures/", "tests", false));
+        // a longer path is not the layer.
+        assert!(!ignore_file_lists_layer("!/tests/", "tests", false));
+        assert!(!ignore_file_lists_layer("#/tests/", "tests", false));
+        assert!(!ignore_file_lists_layer("/tests/fixtures/", "tests", false));
     }
 
     #[test]
@@ -2960,7 +3159,7 @@ extern crate alloc;
         // letters `test` as a prefix) must not match the bare `test`
         // ident.
         let src = "#[cfg(test_runner)]\nfn f() {}\n";
-        let v = scan_str(src, Tier::Modules, &strict());
+        let v = scan_str(src, Layer::Modules, &strict());
         assert!(v.iter().all(|v| v.rule != Rule::InlineTests));
     }
 

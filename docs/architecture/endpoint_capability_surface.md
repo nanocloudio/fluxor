@@ -95,7 +95,7 @@ whether typed messages do (endpoint).
 External-facing code is divided into five layers, host-agnostic:
 
 ```text
-Fluxor application graph
+Fluxor node graph
       |
       | AudioSample / AudioEncoded / VideoRaster / VideoDraw / Input*
       v
@@ -410,8 +410,8 @@ Generic responsibilities:
 Application code provides profile descriptors:
 
 - layout
-- domain-specific controls
-- domain-specific renderers
+- application-specific controls
+- application-specific renderers
 - binding tables
 - branding or styling
 - application-specific command vocabulary
@@ -540,7 +540,7 @@ visible.
 - Host-side runtime files mirror the same split:
   `endpoint_runtime.<ext>` (generic core) plus
   `<host>_endpoint_runtime.<ext>` (profile-specific extensions).
-- Application profiles take their domain as a prefix and the host as a
+- Application profiles take their application name as a prefix and the host as a
   suffix: `<app>_<host>_profile`.
 
 The application profile is application-specific. The runtime and gateway

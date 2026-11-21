@@ -9,7 +9,7 @@
 //!
 //! That is why the arithmetic lives in [`crate::arch::vector`] where it is
 //! tested, why the layout is checked in the built image by
-//! `tools/img/verify_boot_image.py`, and why this file contains as little
+//! `tools/img/verify_firmware_image.py`, and why this file contains as little
 //! decision-making as possible — it is a sequence, not a policy.
 
 #[cfg(feature = "rp")]
@@ -41,7 +41,7 @@ unsafe extern "C" {
 /// nothing of ours has run to report it.
 ///
 /// `w25q080` is the part the Pico family fits. The blob carries the
-/// bootrom's own checksum, which `tools/img/verify_boot_image.py` recomputes
+/// bootrom's own checksum, which `tools/img/verify_firmware_image.py` recomputes
 /// on every build; a wrong blob or a wrong part is caught there rather than
 /// by a board that does nothing.
 ///
@@ -451,8 +451,8 @@ const fn exception_slot(slot: usize) -> Vector {
 
 /// Any external interrupt without a handler of its own.
 ///
-/// Routes to the Tier 2 trampoline by IRQ number, which is what
-/// `irq_bind` promises a Tier 2 module. `isr_tier2_trampoline` returns -1
+/// Routes to the `irq` trampoline by IRQ number, which is what
+/// `irq_bind` promises an `irq` module. `irq_trampoline` returns -1
 /// when no module owns the line; left pending, such an interrupt would
 /// re-fire for ever, so the line is masked. A module that owns the IRQ
 /// clears its own peripheral source inside `module_isr_entry`.
@@ -473,7 +473,7 @@ pub unsafe extern "C" fn DefaultInterruptHandler() {
     let active = unsafe { core::ptr::read_volatile(SCB_ICSR as *const u32) } & 0x1ff;
     if active >= 16 {
         let irq = (active - 16) as u16;
-        if crate::kernel::exec::isr_tier::isr_tier2_trampoline(irq) < 0 {
+        if crate::kernel::exec::irq::irq_trampoline(irq) < 0 {
             crate::arch::cortex_m::nvic_mask(irq);
         }
     }
@@ -491,7 +491,7 @@ pub unsafe extern "C" fn DefaultInterruptHandler() {
 /// is wide. `IRQ_COUNT` is that width, declared per silicon.
 ///
 /// Everything not named is [`DefaultInterruptHandler`], which hands the IRQ
-/// to the Tier 2 dispatcher and masks any line no module owns.
+/// to the `irq` dispatcher and masks any line no module owns.
 #[cfg(feature = "rp")]
 #[unsafe(link_section = ".vector_table.interrupts")]
 #[used]
@@ -500,7 +500,9 @@ pub static __INTERRUPTS: [Vector; crate::platform::chip::IRQ_COUNT] = interrupt_
 
 #[cfg(feature = "rp")]
 const fn interrupt_table() -> [Vector; crate::platform::chip::IRQ_COUNT] {
-    use crate::platform::chip::{TIMER_IRQ_SCHEDULER, TIMER_IRQ_STEP_GUARD, TIMER_IRQ_TIER1B};
+    use crate::platform::chip::{
+        TIMER_IRQ_MODULE_TIMER, TIMER_IRQ_SCHEDULER, TIMER_IRQ_STEP_GUARD,
+    };
 
     let mut t = [Vector::isr(DefaultInterruptHandler); crate::platform::chip::IRQ_COUNT];
 
@@ -512,13 +514,15 @@ const fn interrupt_table() -> [Vector; crate::platform::chip::IRQ_COUNT] {
     {
         t[TIMER_IRQ_STEP_GUARD as usize] =
             Vector::isr(crate::platform::rp_step_guard::TIMER1_IRQ_0);
-        t[TIMER_IRQ_TIER1B as usize] = Vector::isr(crate::platform::rp_step_guard::TIMER1_IRQ_1);
+        t[TIMER_IRQ_MODULE_TIMER as usize] =
+            Vector::isr(crate::platform::rp_step_guard::TIMER1_IRQ_1);
         t[TIMER_IRQ_SCHEDULER as usize] = Vector::isr(crate::platform::rp_timer::TIMER1_IRQ_2);
     }
     #[cfg(feature = "chip-rp2040")]
     {
         t[TIMER_IRQ_STEP_GUARD as usize] = Vector::isr(crate::platform::rp_step_guard::TIMER_IRQ_3);
-        t[TIMER_IRQ_TIER1B as usize] = Vector::isr(crate::platform::rp_step_guard::TIMER_IRQ_2);
+        t[TIMER_IRQ_MODULE_TIMER as usize] =
+            Vector::isr(crate::platform::rp_step_guard::TIMER_IRQ_2);
         t[TIMER_IRQ_SCHEDULER as usize] = Vector::isr(crate::platform::rp_timer::TIMER_IRQ_1);
     }
 

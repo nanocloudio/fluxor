@@ -63,11 +63,34 @@ struct MemoryToml {
     flash_program_size: Option<String>,
 }
 
-// Board TOML — only the [platform.pcie] topology this script generates.
+// Board TOML — the board facts this script generates.
 #[derive(Deserialize)]
 struct BoardToml {
     platform: Option<BoardPlatform>,
     hardware: Option<BoardHardware>,
+    kernel: Option<BoardKernel>,
+}
+
+/// `[kernel]` in a board TOML: kernel behaviour the board fixes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardKernel {
+    tick: Option<BoardTick>,
+}
+
+/// `[kernel.tick]`: the bcm2712 tick's optional wake mechanisms, both off
+/// unless the board turns them on.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct BoardTick {
+    /// A wake also raises the doorbell SGI, so a core parked in WFI wakes
+    /// at once rather than at its next tick.
+    #[serde(default)]
+    wake_doorbell: bool,
+    /// The per-core timer re-arms to an absolute `cval` deadline rather
+    /// than a relative `tval`.
+    #[serde(default)]
+    absolute_rearm: bool,
 }
 
 #[derive(Deserialize)]
@@ -1136,174 +1159,15 @@ fn main() {
     }
 
     match platform {
-        Platform::HostLinux => {
-            // Hosted targets: kernel capacity comes from `kernel::config`
-            // (per platform, selected by the platform feature). No linker
-            // script, no chip_generated.rs.
-            emit_builtin_param_tags(out, "modules/platform/linux");
-        }
-        Platform::HostWasm => emit_builtin_param_tags(out, "modules/platform/wasm"),
+        // Hosted targets: kernel capacity comes from `kernel::config` (per
+        // platform, selected by the platform feature). No linker script, no
+        // chip_generated.rs.
+        Platform::HostLinux | Platform::HostWasm => {}
         Platform::HostUefi => emit_uefi(out),
         Platform::Bcm2712 => emit_bcm2712(out),
         Platform::Rp2040 => emit_rp(out, Rp::Rp2040),
         Platform::Rp2350 => emit_rp(out, Rp::Rp2350),
     }
-}
-
-// ============================================================================
-// Built-in parameter tags
-// ============================================================================
-
-/// A built-in `manifest.toml`, reduced to the `[[params]]` tag table and
-/// the `[[ports]]` the platform binds by index.
-#[derive(Deserialize)]
-struct BuiltinManifestToml {
-    #[serde(default)]
-    builtin: bool,
-    #[serde(default)]
-    params: Vec<BuiltinParamToml>,
-    #[serde(default)]
-    ports: Vec<BuiltinPortToml>,
-}
-
-#[derive(Deserialize)]
-struct BuiltinParamToml {
-    name: String,
-    tag: u8,
-}
-
-/// One `[[ports]]` entry as the platform needs it: a direction and, when
-/// the manifest pins one, an explicit index. The content type and buffer
-/// sizing are the config tool's concern; the kernel only has to bind the
-/// right channel.
-#[derive(Deserialize)]
-struct BuiltinPortToml {
-    name: String,
-    direction: String,
-    #[serde(default)]
-    index: Option<u8>,
-}
-
-/// The port-type byte a direction string resolves to, exactly as the
-/// config tool resolves it (`tools/src/manifest.rs`), so a constant emitted
-/// here binds the channel the packer wired.
-fn builtin_port_type(direction: &str, manifest: &Path) -> u8 {
-    match direction {
-        "input" | "in" => 0,
-        "output" | "out" => 1,
-        "ctrl" | "ctrl_input" => 2,
-        other => panic!(
-            "{}: port direction '{other}' is not one the platform can bind",
-            manifest.display()
-        ),
-    }
-}
-
-/// One built-in's generated module: its param tags and the `(direction,
-/// index)` the packer binds each of its ports at.
-struct BuiltinTable {
-    name: String,
-    params: Vec<BuiltinParamToml>,
-    ports: Vec<(String, u8, u8)>,
-}
-
-/// Generate the platform-side tag and port constants from the built-in
-/// manifests under `dir`, one `pub mod <module_name>` per manifest.
-///
-/// The manifest is the single source of truth for a built-in's wire layout
-/// and its port bindings. Generating the constants the platform matches on
-/// and binds by means a hand-typed number cannot disagree with the declared
-/// one: there is only one number.
-fn emit_builtin_param_tags(out: &Path, dir: &str) {
-    println!("cargo:rerun-if-changed={dir}");
-
-    let mut modules: Vec<BuiltinTable> = Vec::new();
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        // The manifest tree is absent in a consumer checkout that vendors only
-        // the crate; emit an empty table rather than failing the build.
-        Err(_) => {
-            fs::write(out.join("builtin_param_tags.rs"), "").unwrap();
-            return;
-        }
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    paths.sort();
-
-    for p in paths {
-        let manifest_path = p.join("manifest.toml");
-        if !manifest_path.exists() {
-            continue;
-        }
-        println!("cargo:rerun-if-changed={}", manifest_path.display());
-        let content = fs::read_to_string(&manifest_path).unwrap();
-        let parsed: BuiltinManifestToml = toml::from_str(&content).unwrap_or_else(|e| {
-            panic!(
-                "{}: cannot read [[params]] and [[ports]]: {e}",
-                manifest_path.display()
-            )
-        });
-        if !parsed.builtin {
-            continue;
-        }
-        // Resolve each port to the `(direction, index)` the packer wires it
-        // at, by the packer's own rule: one auto-index counter per
-        // direction, and an explicit `index` advances that counter past
-        // itself. A built-in with ports but no params still gets a module,
-        // because the ports are what the platform binds by number.
-        let mut next_index = [0u8; 3];
-        let mut ports: Vec<(String, u8, u8)> = Vec::new();
-        for port in &parsed.ports {
-            let dir = builtin_port_type(&port.direction, &manifest_path);
-            let slot = dir as usize;
-            let index = match port.index {
-                Some(idx) => {
-                    if idx >= next_index[slot] {
-                        next_index[slot] = idx + 1;
-                    }
-                    idx
-                }
-                None => {
-                    let idx = next_index[slot];
-                    next_index[slot] = idx + 1;
-                    idx
-                }
-            };
-            ports.push((port.name.clone(), dir, index));
-        }
-        let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        modules.push(BuiltinTable {
-            name,
-            params: parsed.params,
-            ports,
-        });
-    }
-
-    let mut g = String::from(
-        "// Auto-generated by build.rs from the built-in manifest [[params]] and [[ports]] tables — do not edit.\n",
-    );
-    for module in &modules {
-        g.push_str(&format!("pub mod {} {{\n", module.name));
-        for param in &module.params {
-            g.push_str(&format!(
-                "    pub const TAG_{}: u8 = {};\n",
-                param.name.to_uppercase(),
-                param.tag,
-            ));
-        }
-        for (name, dir, index) in &module.ports {
-            g.push_str(&format!(
-                "    pub const PORT_{}: (u8, u8) = ({dir}, {index});\n",
-                name.to_uppercase(),
-            ));
-        }
-        g.push_str("}\n");
-    }
-    fs::write(out.join("builtin_param_tags.rs"), g).unwrap();
 }
 
 fn emit_uefi(out: &Path) {
@@ -1374,13 +1238,31 @@ fn emit_bcm2712(out: &Path) {
     // PCIe device topology is a board fact: generate the alias table from the
     // active board TOML (Pi 5 has the NVMe/RP1 topology; QEMU virt declares
     // none). `src/platform/bcm2712/pcie_aliases.rs` includes the result.
-    let board_toml = if is_pi5 {
-        "targets/boards/pi5.toml"
-    } else {
-        "targets/boards/qemu-virt.toml"
-    };
+    // The board is the one the firmware build names (`FLUXOR_BOARD`), when
+    // it is a bcm2712 board; a build that names none is the Pi 5 or QEMU
+    // virt by its cargo feature.
+    let named = env::var("FLUXOR_BOARD")
+        .ok()
+        .map(|b| format!("targets/boards/{b}.toml"))
+        .filter(|path| {
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
+                .and_then(|v| v.get("board")?.get("silicon")?.as_str().map(str::to_owned))
+                .is_some_and(|s| s == "bcm2712")
+        });
+    let board_toml = named.unwrap_or_else(|| {
+        if is_pi5 {
+            "targets/boards/pi5.toml".to_owned()
+        } else {
+            "targets/boards/qemu-virt.toml".to_owned()
+        }
+    });
+    let board_toml = board_toml.as_str();
     emit_board_pcie_aliases(out, board_toml);
+    emit_board_tick(out, board_toml);
     println!("cargo:rerun-if-changed={board_toml}");
+    println!("cargo:rerun-if-env-changed=FLUXOR_BOARD");
 
     // The isolation facts the MMU backend compiles against: the blocks a
     // device window may be granted in. `src/arch/aarch64/isolation.rs`
@@ -1396,6 +1278,20 @@ fn emit_bcm2712(out: &Path) {
     let mut generated = String::new();
     emit_device_ranges(&mut generated, silicon.isolation.as_ref());
     fs::write(out.join("isolation_generated.rs"), generated).unwrap();
+}
+
+/// `[kernel.tick]` of the board TOML as consts the bcm2712 boot applies.
+fn emit_board_tick(out: &Path, board_toml: &str) {
+    let text = fs::read_to_string(board_toml).unwrap_or_else(|e| panic!("{board_toml}: {e}"));
+    let board: BoardToml = toml::from_str(&text).unwrap_or_else(|e| panic!("{board_toml}: {e}"));
+    let tick = board.kernel.and_then(|k| k.tick).unwrap_or_default();
+    let g = format!(
+        "// Auto-generated by build.rs from the active board TOML [kernel.tick] — do not edit.\n\
+         pub const WAKE_DOORBELL: bool = {};\n\
+         pub const ABSOLUTE_REARM: bool = {};\n",
+        tick.wake_doorbell, tick.absolute_rearm
+    );
+    fs::write(out.join("board_tick.rs"), g).unwrap();
 }
 
 fn emit_board_pcie_aliases(out: &Path, board_toml: &str) {

@@ -185,15 +185,15 @@ fn generate_config_impl(
     }
 
     // Resident-workload modules are admitted into REAL
-    // execution domains and share their domain's runner, budget, and timing/ISR
-    // constraints, so they must pass the SAME admission checks as base modules —
-    // not a weaker workload-only path. Build an augmented list (base + every workload's
+    // execution domains and share their domain's loop, budget, and timing/ISR
+    // constraints, so they must pass the SAME admission checks as node-graph modules —
+    // not a weaker workload-only path. Build an augmented list (node graph + every workload's
     // modules) and run the budget / interrupt-mode / pre-pass / adaptive-timer-class /
     // hardware validators over it. The config-EMIT path is unchanged: base
     // entries from `modules`, workloads from `build_workload_section`. With no `workloads:` the
     // augmented list is the base list (byte-identical validation).
     // Workload module local names are scoped to their workload, so two workloads (or a workload and
-    // the base graph) may legitimately reuse a name. The manifest map
+    // the node graph) may legitimately reuse a name. The manifest map
     // (`load_module_manifests_with_extra`) is keyed by `name` ALONE and silently
     // overwrites on collision — so a flat base+workload list could resolve a module to
     // the WRONG manifest (wrong ISR safety / timer class / hardware / pre_pass
@@ -285,7 +285,7 @@ fn generate_config_impl(
     // touching it cannot use an edge class incompatible with bridge
     // routing. This build-time gate is one half of the contract; the
     // runtime routing in `channel_open` is the other.
-    validate_isr_tier_admission(
+    validate_interrupt_admission(
         config,
         validation_list,
         modules_dir,
@@ -334,9 +334,9 @@ fn generate_config_impl(
     // of doing a second, narrower lookup that may miss modules
     // outside the hard-coded `Manifest::from_source_tree` search
     // list (e.g. modules in the install root or in extras).
-    // Manifests for the AUGMENTED set (base + workload modules) so the adaptive
+    // Manifests for the AUGMENTED set (node graph + workload modules) so the adaptive
     // timer-class gate below resolves workload modules too; `parse_modules_map` (emit,
-    // base-only) just ignores the extra workload entries keyed by type.
+    // node-graph-only) just ignores the extra workload entries keyed by type.
     let manifest_src = Value::Array(validation_modules.clone());
     let manifests = load_module_manifests_with_extra_for_target(
         &manifest_src,
@@ -884,28 +884,23 @@ fn generate_config_impl(
         .and_then(|s| s.get("accept_cycles"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let graph_flags = if accept_cycles {
-        boot_config::GRAPH_FLAG_ACCEPT_CYCLES
-    } else {
-        0
-    };
 
     // One record per edge, in wiring order: its index is its channel id.
-    let edge_records: Vec<boot_config::EdgeRecord> = edges
+    let edge_records: Vec<graph::EdgeRecord> = edges
         .iter()
         .enumerate()
         .map(
-            |(i, &(from, to, to_port, from_port, to_port_index))| boot_config::EdgeRecord {
-                from,
-                to,
+            |(i, &(from, to, to_port, from_port, to_port_index))| graph::EdgeRecord {
+                from: graph::Endpoint::New(from),
                 from_port,
+                to: graph::Endpoint::New(to),
                 to_port: to_port_index,
                 to_ctrl: to_port == 1,
                 class: match edge_classes.get(i).copied().unwrap_or(0) {
-                    1 => boot_config::EdgeClass::DmaOwned,
-                    2 => boot_config::EdgeClass::CrossCore,
-                    3 => boot_config::EdgeClass::NicRing,
-                    _ => boot_config::EdgeClass::Local,
+                    1 => graph::EdgeClass::DmaOwned,
+                    2 => graph::EdgeClass::CrossCore,
+                    3 => graph::EdgeClass::NicRing,
+                    _ => graph::EdgeClass::Local,
                 },
                 buffer_group: buffer_groups.get(i).copied().unwrap_or(0),
                 rate_class: edge_rate_classes.get(i).copied().unwrap_or(0),
@@ -915,6 +910,35 @@ fn generate_config_impl(
             },
         )
         .collect();
+
+    // The composed graph: the declared modules are nodes `0..n` in config
+    // order (a module's index is its id), its fans after them.
+    let runtime = runtime_owned.as_deref().unwrap_or("linux");
+    let fan_manifests = load_module_manifests_with_extra_for_target(
+        &fan_entries(),
+        extra_module_dirs,
+        resolved_target,
+        project_root,
+    );
+    let graph_modules: Vec<crate::add_subgraph::GraphModule> = module_entries
+        .iter()
+        .zip(&module_names)
+        .map(|(e, name)| graph_module(e, name, manifests.get(name), runtime))
+        .collect();
+    let composition = crate::add_subgraph::compose(
+        &graph_modules,
+        &edge_records,
+        crate::add_subgraph::Placement {
+            platform: crate::ring_demand::platform_of(runtime),
+            accept_cycles,
+            domain_names: &domain_names,
+        },
+        &crate::add_subgraph::Composer {
+            describe: &|e| crate::ring_demand::refusal(e, &module_names, &manifests, runtime),
+            fan_params: &|fan, scratch| fan_module_params(fan, scratch, &fan_manifests),
+        },
+    )
+    .map_err(Error::Config)?;
 
     // One record per declared domain, at least one. A domain's tick of 0
     // takes the graph's; tick_min_us/tick_max_us of 0 take the domain's
@@ -967,11 +991,10 @@ fn generate_config_impl(
     };
 
     // Resident workloads: each top-level `workloads:` entry is a
-    // self-contained `AddSubgraph` (FLXA) blob the kernel admits at boot via
-    // `apply_add`.
+    // self-contained composed graph the kernel admits at boot.
     let workload_blobs: Vec<(bool, Vec<u8>)> = workloads
         .iter()
-        .map(|w| crate::add_subgraph::encode_add_subgraph(w).map(|b| (w.idle_safe, b)))
+        .map(|w| crate::add_subgraph::encode_workload(w).map(|b| (w.idle_safe, b)))
         .collect::<std::result::Result<_, String>>()
         .map_err(Error::Config)?;
     let workload_records: Vec<boot_config::WorkloadRecord<'_>> = workload_blobs
@@ -1004,21 +1027,25 @@ fn generate_config_impl(
     // naming the pool, instead of at boot.
     let (workload_count, workload_modules, workload_edges) =
         crate::capacity::resident_demand(&workload_records);
-    // Each module's domain by its config id.
-    let domains: HashMap<u16, u8> = module_entries.iter().map(|e| (e.id, e.domain)).collect();
-    let crossings = crate::capacity::crossing_count(edges.iter().enumerate().map(
-        |(i, &(from_id, to_id, ..))| {
-            (
-                domains.get(&from_id).copied(),
-                domains.get(&to_id).copied(),
-                edge_classes.get(i).copied() == Some(2),
-            )
-        },
-    ));
+    // The composed graph's shape: its fans are modules, their joining
+    // edges edges.
+    let composed_edges = composed_edge_tuples(&composition.edges);
+    let crossings = crate::capacity::crossing_count(composition.edges.iter().map(|e| {
+        let domain = |end: graph::Endpoint| {
+            end.new_index()
+                .and_then(|i| composition.modules.get(i))
+                .map(|m| m.domain)
+        };
+        (
+            domain(e.from),
+            domain(e.to),
+            e.class == graph::EdgeClass::CrossCore,
+        )
+    }));
     let shape = crate::capacity::GraphShape {
-        modules: module_entries.len() as u64,
-        edges: edges.len() as u64,
-        fans: crate::capacity::fan_count(&edges),
+        modules: composition.modules.len() as u64,
+        edges: composition.edges.len() as u64,
+        fans: crate::capacity::fan_count(&composed_edges),
         workloads: workload_count,
         workload_modules,
         workload_edges,
@@ -1036,21 +1063,93 @@ fn generate_config_impl(
         .map_err(Error::Config)?;
     println!("{summary}");
 
-    let module_records: Vec<boot_config::ModuleRecord<'_>> =
-        module_entries.iter().map(ModuleEntry::record).collect();
+    let records = composition.records();
     boot_config::encode(&boot_config::BootConfigSpec {
         tick_us,
         graph_sample_rate,
-        graph_flags,
-        modules: &module_records,
-        edges: &edge_records,
         domains: &domain_records,
+        graph: composition.spec(&records),
         hardware,
         workloads: (!workload_records.is_empty()).then_some(workload_records.as_slice()),
         envelope: (!envelope_records.is_empty()).then_some(envelope_records.as_slice()),
         demand: (!demand_records.is_empty()).then_some(demand_records.as_slice()),
     })
     .map_err(|e| Error::Config(e.to_string()))
+}
+
+/// The fan module types as manifest entries, for the resolver every other
+/// module is resolved by.
+fn fan_entries() -> Value {
+    json!([{ "name": "tee" }, { "name": "merge" }])
+}
+
+/// A declared module as composition sees it: its record's fields, and what
+/// its manifest says of its ports. A module the node runs built in declares
+/// no ports to the composer (the kernel holds no manifest for it), and the
+/// Linux network provider keeps one channel per edge
+/// (`ring_demand::multi_channel`).
+fn graph_module(
+    entry: &ModuleEntry,
+    name: &str,
+    manifest: Option<&Manifest>,
+    runtime: &str,
+) -> crate::add_subgraph::GraphModule {
+    let loaded = manifest.filter(|m| !m.builtin);
+    crate::add_subgraph::GraphModule {
+        name: name.to_string(),
+        name_hash: entry.name_hash,
+        domain: entry.domain,
+        pre_pass: entry.pre_pass,
+        budget: entry.budget,
+        params: entry.params.clone(),
+        ports: loaded.map(crate::add_subgraph::plan_ports).unwrap_or_default(),
+        mailbox_safe: loaded.is_some_and(|m| m.facts.mailbox_safe),
+        multi_channel: crate::ring_demand::multi_channel(runtime, entry.name_hash),
+    }
+}
+
+/// A fan's params TLV: its frame kind, frames per step and scratch
+/// (`plan::fan_params`), with the heap cap its module type derives for that
+/// scratch (`[capacities] heap_per_param`, params tag 0xEF) as for any
+/// instance of the type. `manifests` holds the fan types' manifests by type.
+fn fan_module_params(
+    fan: &plan::Fan,
+    scratch: u32,
+    manifests: &HashMap<String, Manifest>,
+) -> std::result::Result<Vec<u8>, String> {
+    let ty = match fan.dir {
+        plan::FanDir::Out => "tee",
+        plan::FanDir::In => "merge",
+    };
+    let manifest = manifests.get(ty).ok_or_else(|| {
+        format!(
+            "the graph wires one port to several, which a `{ty}` module joins, and no `{ty}` \
+             manifest resolves: build the foundation modules (`fluxor modules build`), or pin \
+             `{ty}` from a dependency"
+        )
+    })?;
+    let tlv = plan::fan_params(fan.kind, plan::FRAMES_PER_STEP_DEFAULT, scratch).to_vec();
+    insert_heap_tags(tlv, &json!({}), ty, Some(manifest), &HeapPlan::default())
+        .map_err(|e| e.to_string())
+}
+
+/// A composed graph's edges as `capacity::fan_count` reads them:
+/// `(from, to, to_port, from_port_index, to_port_index)`, by node index, an
+/// end outside the graph as `u16::MAX`.
+fn composed_edge_tuples(edges: &[graph::EdgeRecord]) -> Vec<(u16, u16, u8, u8, u8)> {
+    let node = |end: graph::Endpoint| end.new_index().map_or(u16::MAX, |i| i as u16);
+    edges
+        .iter()
+        .map(|e| {
+            (
+                node(e.from),
+                node(e.to),
+                u8::from(e.to_ctrl),
+                e.from_port,
+                e.to_port,
+            )
+        })
+        .collect()
 }
 
 /// Bytes of the hardware section's counts header (spi, i2c, gpio, pio,
@@ -1160,7 +1259,7 @@ pub(crate) struct InstanceDemand {
     pub(crate) heap_per_demand: Option<crate::manifest::HeapPerDemand>,
 }
 
-/// Where an instance's params TLV sits: a base-graph module entry (from its
+/// Where an instance's params TLV sits: a node-graph module entry (from its
 /// header on), or a workload module's params.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParamsAt {
@@ -1179,7 +1278,7 @@ pub(crate) struct PlannedHeap {
     pub(crate) manifest: Manifest,
 }
 
-/// The base graph's `heap_per_demand` instances, by entry index.
+/// The node graph's `heap_per_demand` instances, by entry index.
 fn base_planned_heaps(
     modules: &Value,
     names: &[String],
@@ -1216,7 +1315,7 @@ fn apply_heap_plan(
             ParamsAt::Base(i) => entries.get_mut(i).map(|e| e.params.as_mut_slice()),
             ParamsAt::Workload(w, m) => workloads
                 .get_mut(w)
-                .and_then(|w| w.modules.get_mut(m))
+                .and_then(|w| w.graph.modules.get_mut(m))
                 .map(|m| m.params.as_mut_slice()),
         };
         let tlv = tlv.ok_or_else(|| {
@@ -1312,7 +1411,7 @@ fn integer_params(schema: Option<&schema::ParamSchema>) -> Vec<(u8, u32)> {
         .unwrap_or_default()
 }
 
-/// The base graph's per-instance demand: each module entry's params (its TLV
+/// The node graph's per-instance demand: each module entry's params (its TLV
 /// from the entry header on) read with its YAML entry, its manifest and, for
 /// a type with a `demand_from_params` rule, its param schema from `loc`.
 fn base_demand(
@@ -1342,12 +1441,12 @@ fn base_demand(
     Ok(out)
 }
 
-/// Refuse `fault_policy: restart` to a base-graph instance that declares
+/// Refuse `fault_policy: restart` to a node-graph instance that declares
 /// store subscriptions or the events they ring (`store_subs`, `events`), by
 /// its type's rule, constant or its own `demand:`. The restart releases the
 /// module's kernel events and moves its slot generation, so the store drops
 /// every subscription it made, and the module resumes believing it is
-/// subscribed — never woken by a change again. `demand` is the base graph's,
+/// subscribed — never woken by a change again. `demand` is the node graph's,
 /// one per entry of `modules` in order ([`base_demand`]).
 fn refuse_restart_of_subscribers(modules: &Value, demand: &[InstanceDemand]) -> Result<()> {
     let list = modules.as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -1366,8 +1465,7 @@ fn refuse_restart_of_subscribers(modules: &Value, demand: &[InstanceDemand]) -> 
                  events its subscriptions ring and moves its slot generation, so the store \
                  drops every subscription it made, and the module resumes believing it is \
                  subscribed — never woken by a change again. Configure it to subscribe to \
-                 nothing, or choose `fault_policy: \"skip\"` or \
-                 `fault_policy: \"restart_graph\"`, which re-instantiates it.",
+                 nothing, or choose `fault_policy: \"skip\"`.",
                 d.name
             )));
         }
@@ -1427,7 +1525,7 @@ fn heap_plan(target: &str, config: &Value, demand: &[InstanceDemand]) -> HeapPla
     plan
 }
 
-/// The unkeyed module provider of `contract` in the base graph, if any: a
+/// The unkeyed module provider of `contract` in the node graph, if any: a
 /// module whose manifest `provides` it with no `volume:` selector, so it is
 /// the layer class-byte calls reach.
 fn unkeyed_module_provider<'a>(
@@ -1448,14 +1546,14 @@ fn unkeyed_module_provider<'a>(
 }
 
 /// The graph's declared demand on the kernel's tables, `(pool, id, n)`: per
-/// pool, what its instances declare ([`instance_demand`]), base graph and
+/// pool, what its instances declare ([`instance_demand`]), node graph and
 /// resident workloads summed. The kernel adds it to the pool's derived size,
 /// so a pool sized by its consumers — the store's subscription table — grows
 /// with the graph that boots. The `DMND` section carries it; empty when
 /// nothing declares.
 ///
 /// A pool a module provider serves from its own heap
-/// (`capacity::MODULE_PROVIDED_POOLS`) is left out when the base graph has an
+/// (`capacity::MODULE_PROVIDED_POOLS`) is left out when the node graph has an
 /// unkeyed module provider of its contract: the consumers call that module,
 /// not the host table, and the demand is spent once — on the provider's
 /// `heap_per_demand` figure — rather than twice.
@@ -1555,11 +1653,11 @@ fn heap_per_demand_report(
     ))
 }
 
-/// The graph's resident workloads as the FLXA blobs a config's `WKLD`
+/// The graph's resident workloads as the composed graphs a config's `WKLD`
 /// section carries, from the optional top-level `workloads:` list. Each
 /// workload is a self-contained subgraph: modules referenced by `name_hash`
 /// (FNV-1a of type) with inline-TLV params (the same
-/// `build_params_from_schema` packing base modules use), and optional
+/// `build_params_from_schema` packing node-graph modules use), and optional
 /// intra-workload `wiring:` (`module.port` ends among the workload's modules,
 /// the node's network as `linux_net`, see [`workload_edges`]). Cross-workload
 /// edges are refused (strict isolation). Empty with no workloads.
@@ -1571,11 +1669,9 @@ fn build_workload_section(
 ) -> Result<Vec<Vec<u8>>> {
     build_workloads(config, loc, extra_module_dirs, "linux")?
         .iter()
-        .map(|w| crate::add_subgraph::encode_add_subgraph(w).map_err(Error::Config))
+        .map(|w| crate::add_subgraph::encode_workload(w).map_err(Error::Config))
         .collect()
 }
-
-use crate::add_subgraph::{WorkloadEdge, WorkloadEnd};
 
 /// The manifests as the provider checks read them: each instance's claims
 /// limited to the ones its build and its params exercise. A claim naming
@@ -1740,7 +1836,7 @@ pub(crate) fn refuse_credential_forms(
 /// The workloads [`build_workloads`] builds, packed under a counting
 /// [`HeapPlan`], with each workload module's declared demand
 /// ([`instance_demand`]) and its `heap_per_demand` instances: resident
-/// workloads are counted in the graph's plan as its base modules are.
+/// workloads are counted in the graph's plan as its node-graph modules are.
 fn build_workloads_counted(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
@@ -1771,14 +1867,25 @@ fn build_workloads_counted(
         v
     };
     // Per-domain execution mode, so workloads can be refused from interrupt-mode
-    // domains. The FLXA workload codec carries NO exec-mode / `interrupt_safe` /
-    // `pre_pass` metadata, and workload admission runs AFTER the platform registers
-    // ISR handlers (bcm2712.rs) — so an interrupt-mode workload would be admitted yet
-    // never dispatched (the cooperative runner skips interrupt-mode domains) and a
-    // `pre_pass` workload would silently lose its pre-pass semantics. Both are refused.
+    // domains. A workload's graph carries NO exec-mode / `interrupt_safe`
+    // metadata, and workload admission runs AFTER the platform registers ISR
+    // handlers (bcm2712.rs) — so an interrupt-mode workload would be admitted
+    // yet never dispatched (a cooperative domain loop skips interrupt-mode
+    // domains). It is refused.
     let domain_exec_mode: Vec<boot_config::ExecMode> = parse_domain_execs(config)?
         .into_iter()
         .map(|(_, exec)| exec.mode)
+        .collect();
+    // The fan types, resolved as the workload's own modules are: a fan a
+    // workload's wiring needs runs as one of its modules.
+    let fan_manifests: HashMap<String, Manifest> = ["tee", "merge"]
+        .into_iter()
+        .filter_map(|ty| {
+            let root = resolve_module_root(ty, &manifest_search)?;
+            let abi = (!loc.abi.is_empty()).then_some(loc.abi);
+            let man = Manifest::from_toml_for_target(&root.join("manifest.toml"), abi).ok()?;
+            Some((ty.to_string(), man))
+        })
         .collect();
     let mut workloads = Vec::new();
     for (pi, workload_yaml) in workloads_yaml.iter().enumerate() {
@@ -1787,7 +1894,7 @@ fn build_workloads_counted(
             .and_then(|m| m.as_array())
             .ok_or_else(|| Error::Config(format!("workload {pi}: missing `modules:` array")))?;
         // Deterministic workload_uid: 0xD0 marker + index (host composer / kernel both
-        // treat the UID as opaque identity; uniqueness within the bundle suffices).
+        // treat the UID as opaque identity; uniqueness within the graph suffices).
         let mut workload_uid = [0u8; 16];
         workload_uid[0] = 0xD0;
         workload_uid[1] = pi as u8;
@@ -1816,8 +1923,8 @@ fn build_workloads_counted(
                 runtime.is_some_and(|r| fs_reachable(r, ProviderCaller::Workload)),
                 &format!("workload {pi} module '{mname}'"),
             )?;
-            // PIC-only: the FLXA workload codec admits modules via the loader by
-            // name_hash; a built-in has no .fmod and apply_add cannot decode it.
+            // PIC-only: a workload's modules are admitted via the loader by
+            // name_hash; a built-in has no .fmod for apply_add to load.
             if crate::modules::is_builtin_module(mtype) {
                 if WORKLOAD_NET_ENDS.contains(&mtype) {
                     return Err(Error::Config(format!(
@@ -1828,7 +1935,7 @@ fn build_workloads_counted(
                 }
                 return Err(Error::Config(format!(
                     "workload {pi} module '{mtype}' is a kernel built-in; resident workloads are PIC-only \
-                     (no .fmod for apply_add to load). Use a PIC module, or place it in the base graph."
+                     (no .fmod for apply_add to load). Use a PIC module, or place it in the node graph."
                 )));
             }
             // Reject duplicate local names within a workload: `name_to_local` resolves
@@ -1844,11 +1951,11 @@ fn build_workloads_counted(
             }
             let name_hash = crate::hash::fnv1a_hash(mtype.as_bytes());
             // Domain is a NAME resolved against execution.domains (same namespace
-            // as base modules), so workload modules share their domain's runner/budget
+            // as node-graph modules), so workload modules share their domain's loop and budget
             // and the admission validators resolve them identically.
             let domain_id = resolve_domain_id(m, config)?;
             // Reject interrupt-mode workload placement — the codec cannot represent it
-            // and the cooperative runner would never dispatch it.
+            // and no cooperative domain loop would ever dispatch it.
             let exec_mode = domain_exec_mode
                 .get(domain_id as usize)
                 .copied()
@@ -1856,7 +1963,7 @@ fn build_workloads_counted(
             if exec_mode.is_interrupt() {
                 return Err(Error::Config(format!(
                     "workload {pi} module '{mtype}' targets an `exec: {}` domain. Resident \
-                     workloads are cooperative: the FLXA codec carries no interrupt-mode \
+                     workloads are cooperative: a workload's graph carries no interrupt-mode \
                      metadata and workload admission runs after ISR registration, so such a \
                      workload would never execute. Place interrupt-mode modules in the base \
                      graph.",
@@ -1864,7 +1971,7 @@ fn build_workloads_counted(
                 )));
             }
             // Resolved for the target's module ABI and the instance's
-            // variant, as base-graph manifests are: the heap rule below
+            // variant, as node-graph manifests are: the heap rule below
             // reads per-ABI, per-variant figures.
             let manifest = resolve_module_root(mtype, &manifest_search)
                 .map(|root| root.join("manifest.toml"))
@@ -1886,19 +1993,19 @@ fn build_workloads_counted(
             if let Some(man) = manifest.as_ref() {
                 local_manifests.insert(mname.to_string(), man.clone());
             }
-            // Reject `pre_pass` workload modules — the codec drops the flag, so a
-            // workload module would silently run as an ordinary cooperative module,
-            // losing its pre-pass semantics.
+            // Reject `pre_pass` workload modules: a domain's pre-pass is
+            // the node's graph's, and a workload built apart from the node
+            // cannot know how many of its domain's places the node fills.
             if manifest.as_ref().is_some_and(|man| man.pre_pass) {
                 return Err(Error::Config(format!(
                     "workload {pi} module '{mtype}' is a pre_pass module, \
-                     which resident workloads do not support: the FLXA codec carries \
-                     no pre_pass flag, so the module would silently run as an \
-                     ordinary cooperative module. Place pre_pass modules in the \
-                     base graph."
+                     which resident workloads do not run: a domain's pre-pass holds \
+                     at most {} modules and belongs to the node's own graph. Place \
+                     pre_pass modules in the node graph.",
+                    graph::MAX_PRE_PASS_PER_DOMAIN
                 )));
             }
-            // Inline-TLV params — identical packing to base modules, so the kernel
+            // Inline-TLV params — identical packing to node-graph modules, so the kernel
             // reads them via `params_ptr` exactly the same way.
             let param_schema = schema::load_schema_for_entry(m, mtype, loc)?;
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
@@ -1914,7 +2021,7 @@ fn build_workloads_counted(
                 Vec::new()
             };
             // The heap flags act on the module's own heap: a workload module
-            // takes them as a base-graph module does, in its params TLV.
+            // takes them as a node-graph module does, in its params TLV.
             demand.push(InstanceDemand {
                 name: format!("workload {pi} module '{mname}'"),
                 figures: instance_demand(m, mname, manifest.as_ref(), &params, &integers)?,
@@ -1928,7 +2035,7 @@ fn build_workloads_counted(
                     manifest: man.clone(),
                 });
             }
-            let params = insert_workload_heap_tags(params, m, mname, manifest.as_ref(), &plan)?;
+            let params = insert_heap_tags(params, m, mname, manifest.as_ref(), &plan)?;
             // What the kernel refuses in a workload's params, refused here by
             // the bytes it would read.
             if let Some(tag) = crate::add_subgraph::params_node_tag(&params) {
@@ -1937,17 +2044,25 @@ fn build_workloads_counted(
                      which a node refuses in a workload (see `is_node_param_tag`)"
                 )));
             }
-            // The step budget rides the FLXA module record, never the params
+            // The step budget rides the module record, never the params
             // TLV: the kernel takes a live-added module's deadline and fault
             // policy from the record alone, and refuses one outside what it
             // admits a workload — refused here first, with the reason.
             let budget =
                 workload_step_budget(m, config, &format!("workload {pi} module '{mname}'"))?;
-            modules.push(crate::add_subgraph::WorkloadModule {
+            modules.push(crate::add_subgraph::GraphModule {
+                name: mname.to_string(),
                 name_hash,
-                domain_id,
+                domain: domain_id,
+                pre_pass: false,
                 budget,
                 params,
+                ports: manifest
+                    .as_ref()
+                    .map(crate::add_subgraph::plan_ports)
+                    .unwrap_or_default(),
+                mailbox_safe: manifest.as_ref().is_some_and(|m| m.facts.mailbox_safe),
+                multi_channel: false,
             });
         }
         let local_claims = exercised_claims(
@@ -1991,7 +2106,7 @@ fn build_workloads_counted(
         // `wiring:` is the graph syntax: `module.port` (a bare `module` is
         // its first output in `from:`, its first input in `to:`), resolved
         // against the module's manifest. The node's network is the platform
-        // provider a base graph names, `linux_net` (or `ip`), which a
+        // provider a node graph names, `linux_net` (or `ip`), which a
         // workload does not declare: each module wired to it gets a lane of
         // its own, keyed in the order the wiring first names the module —
         // its edge from `linux_net.net_out` is the lane's events, its edge
@@ -2010,20 +2125,19 @@ fn build_workloads_counted(
             // The domain check applies between two of the workload's
             // modules; a lane has no domain of its own.
             let (from_local, to_local) = match (e.from, e.to) {
-                (WorkloadEnd::Local(f), WorkloadEnd::Local(t)) => (f, t),
-                (WorkloadEnd::Local(l), WorkloadEnd::Net(_))
-                | (WorkloadEnd::Net(_), WorkloadEnd::Local(l)) => (l, l),
+                (graph::Endpoint::New(f), graph::Endpoint::New(t)) => (f, t),
+                (graph::Endpoint::New(l), _) | (_, graph::Endpoint::New(l)) => (l, l),
                 // Refused by `workload_edges`.
-                (WorkloadEnd::Net(_), WorkloadEnd::Net(_)) => continue,
+                _ => continue,
             };
             // Reject cross-domain workload edges. On bcm2712 a cross-domain
-            // edge needs the SPSC bridge provisioned at boot (base edges get
+            // edge needs the SPSC bridge provisioned at boot (node-graph edges get
             // it before workload admission, bcm2712.rs); `apply_add` opens an
             // ordinary channel, so a cross-domain workload edge would silently lose
             // the bridge. Workload admission provisions none, so workload wiring
             // is intra-domain on every target (self-contained workloads).
-            let from_dom = modules[from_local as usize].domain_id;
-            let to_dom = modules[to_local as usize].domain_id;
+            let from_dom = modules[from_local as usize].domain;
+            let to_dom = modules[to_local as usize].domain;
             if from_dom != to_dom {
                 return Err(Error::Config(format!(
                     "workload {pi}: edge {} -> {}: cross-domain edge (domain {from_dom} → {to_dom}) is \
@@ -2053,12 +2167,35 @@ fn build_workloads_counted(
             .get("idle_safe")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Composed as a node graph is, over the workload's own modules. A
+        // node steps a workload's cycles in declaration order: a live add
+        // carries no `accept_cycles`.
+        let graph = crate::add_subgraph::compose(
+            &modules,
+            &edges,
+            crate::add_subgraph::Placement {
+                platform: crate::ring_demand::platform_of(runtime.unwrap_or("linux")),
+                accept_cycles: true,
+                domain_names: &[],
+            },
+            &crate::add_subgraph::Composer {
+                describe: &|e| {
+                    crate::ring_demand::refusal(
+                        e,
+                        &local_names,
+                        &local_manifests,
+                        runtime.unwrap_or("linux"),
+                    )
+                },
+                fan_params: &|fan, scratch| fan_module_params(fan, scratch, &fan_manifests),
+            },
+        )
+        .map_err(|why| Error::Config(format!("workload {pi}: {why}")))?;
         workloads.push(crate::add_subgraph::Workload {
             workload_uid,
             state_cap,
             buffer_cap,
-            modules,
-            edges,
+            graph,
             idle_safe,
         });
     }
@@ -2072,18 +2209,14 @@ const WORKLOAD_NET_ENDS: &[&str] = fluxor_tools::stack::WORKLOAD_NET_ENDS;
 
 /// One end of a workload wire as written.
 enum WireEnd {
-    /// One of the workload's modules and the port byte FLXA carries for it
-    /// (an input's index; a control input's with `CTRL_PORT_BIT`).
-    Module(u8, u8),
+    /// One of the workload's modules, the port's index, and whether the
+    /// port is a control input.
+    Module(u8, u8, bool),
     /// The node's network.
     Net,
 }
 
-/// The FLXA control-input bit on an edge's `to_port`
-/// (`kernel::exec::scheduler::live::CTRL_PORT_BIT`).
-const WORKLOAD_CTRL_PORT_BIT: u8 = 0x80;
-
-/// A workload's `wiring:` as the edges FLXA carries. Ends are written as a
+/// A workload's `wiring:` as the edges its graph carries. Ends are written as a
 /// graph writes them — `module.port`, resolved against the module's
 /// manifest, or a bare `module` (its first output in `from:`, first input
 /// in `to:`). An end naming the node's network ([`WORKLOAD_NET_ENDS`]) is a
@@ -2097,7 +2230,7 @@ fn workload_edges(
     name_to_local: &HashMap<String, u8>,
     local_names: &[String],
     manifests: &HashMap<String, Manifest>,
-) -> Result<Vec<WorkloadEdge>> {
+) -> Result<Vec<graph::EdgeRecord>> {
     let mut lanes: Vec<u8> = Vec::new();
     let mut edges = Vec::new();
     for (ei, e) in wiring.iter().enumerate() {
@@ -2127,17 +2260,12 @@ fn workload_edges(
                 let (_, direction, index) =
                     resolve_port_spec(spec, is_from, manifests, local_names)
                         .map_err(|why| at(format!("{key} `{spec}`: {why}")))?;
-                if index >= WORKLOAD_CTRL_PORT_BIT {
+                if index > graph::MAX_PORT_INDEX {
                     return Err(at(format!(
                         "{key} `{spec}`: port index {index} is past what an edge carries"
                     )));
                 }
-                let port = if !is_from && direction == 2 {
-                    index | WORKLOAD_CTRL_PORT_BIT
-                } else {
-                    index
-                };
-                return Ok(WireEnd::Module(local, port));
+                return Ok(WireEnd::Module(local, index, !is_from && direction == 2));
             }
             if WORKLOAD_NET_ENDS.contains(&module) {
                 let port = spec.split_once('.').map(|(_, p)| p.trim());
@@ -2172,15 +2300,16 @@ fn workload_edges(
             u8::try_from(key)
                 .map_err(|_| at("more than 256 modules are wired to the node's network".into()))
         };
-        let (from, from_port, to, to_port) = match (from, to) {
-            (WireEnd::Module(f, fp), WireEnd::Module(t, tp)) => {
-                (WorkloadEnd::Local(f), fp, WorkloadEnd::Local(t), tp)
+        let local = |i: u8| graph::Endpoint::New(u16::from(i));
+        let (from, from_port, to, to_port, to_ctrl) = match (from, to) {
+            (WireEnd::Module(f, fp, _), WireEnd::Module(t, tp, ctrl)) => {
+                (local(f), fp, local(t), tp, ctrl)
             }
-            (WireEnd::Net, WireEnd::Module(t, tp)) => {
-                (WorkloadEnd::Net(lane(t)?), 0, WorkloadEnd::Local(t), tp)
+            (WireEnd::Net, WireEnd::Module(t, tp, ctrl)) => {
+                (graph::Endpoint::Net(lane(t)?), 0, local(t), tp, ctrl)
             }
-            (WireEnd::Module(f, fp), WireEnd::Net) => {
-                (WorkloadEnd::Local(f), fp, WorkloadEnd::Net(lane(f)?), 0)
+            (WireEnd::Module(f, fp, _), WireEnd::Net) => {
+                (local(f), fp, graph::Endpoint::Net(lane(f)?), 0, false)
             }
             (WireEnd::Net, WireEnd::Net) => {
                 return Err(at(
@@ -2188,18 +2317,20 @@ fn workload_edges(
                 ))
             }
         };
-        edges.push(WorkloadEdge {
+        edges.push(graph::EdgeRecord {
             from,
             from_port,
             to,
             to_port,
+            to_ctrl,
             buffer_bytes: e.get("buffer_bytes").and_then(Value::as_u64).unwrap_or(0) as u32,
+            ..graph::EdgeRecord::default()
         });
     }
     // The kernel's lane rule, said of the module it binds: one edge each
     // way between a module and the network.
     for (key, &local) in lanes.iter().enumerate() {
-        let k = WorkloadEnd::Net(key as u8);
+        let k = graph::Endpoint::Net(key as u8);
         let into = edges.iter().filter(|x| x.to == k).count();
         let out = edges.iter().filter(|x| x.from == k).count();
         if into != 1 || out != 1 {
@@ -2213,15 +2344,15 @@ fn workload_edges(
     }
     Ok(edges)
 }
-/// YAML keys a base-graph module turns into node tags (the params TLV's
-/// trust tier, protection level, device window, ISR budget, IRQ, quarantine
+/// YAML keys a node-graph module turns into node tags (the params TLV's
+/// trust class, protection level, device window, ISR budget, IRQ, quarantine
 /// partner and restart settings), or that would emit one (`voices:` packs
-/// each voice under tag 0xFD, the device-window tag). A workload module is
-/// a tenant of the node: these grants are the node's to make, and a node
+/// each voice under tag 0xFD, the device-window tag). A workload module runs
+/// for its own owner: these grants are the node's to make, and a node
 /// refuses a workload module whose params carry any of them. `irq` is a
 /// node key only when the module's schema has no `irq` param of its own.
 const WORKLOAD_NODE_KEYS: &[&str] = &[
-    "trust_tier",
+    "trust_class",
     "protection",
     "device_window",
     "isr_budget_cycles",
@@ -2233,14 +2364,15 @@ const WORKLOAD_NODE_KEYS: &[&str] = &[
     "voices",
 ];
 
-/// A workload module's `heap:` keys as params TLV entries (0xF8 zero on
-/// free, 0xF9 fault on alloc failure, 0xFA canary, 0xEF the instance's heap
-/// cap, 0xEE raw arena use), with the base graph's
+/// A workload module's or a fan's `heap:` keys as params TLV entries (0xF8
+/// zero on free, 0xF9 fault on alloc failure, 0xFA canary, 0xEF the
+/// instance's heap cap, 0xEE raw arena use), with the node graph's
 /// validation and encoding, inserted before the TLV's end marker. A module
 /// with no schema params gets a TLV of its own for them. The heap cap is the
-/// base graph's too: `heap.arena_bytes`, else what the type's `[capacities]
-/// heap_from_params` and `heap_per_demand` rules derive (`instance_heap_cap`).
-fn insert_workload_heap_tags(
+/// node graph's too: `heap.arena_bytes`, else what the type's `[capacities]
+/// heap_from_params`, `heap_per_demand` and `heap_per_param` rules derive
+/// (`instance_heap_cap`).
+fn insert_heap_tags(
     params: Vec<u8>,
     module: &Value,
     mname: &str,
@@ -2278,7 +2410,7 @@ fn insert_workload_heap_tags(
     // The end marker: the first `0xFF` tag of the TLV walk.
     let Some(pos) = schema::tlv_basic_end(&params).map(|end| end - 2) else {
         return Err(Error::Config(format!(
-            "workload module '{mname}': its params are not a TLV the heap flags can join"
+            "module '{mname}': its params are not a TLV the heap flags can join"
         )));
     };
     // The header's length runs to the byte past the end marker, saturating

@@ -6,7 +6,8 @@
 //! same way:
 //!
 //! - owner-plan application, before any provider handle is opened;
-//! - bounded pending-module completion, under one budget.
+//! - bounded pending-module completion, under one budget
+//!   (`graph_build::GraphWalk` counts polls against it).
 //!
 //! The rest of the boot sequence is still platform-owned. It is expressed as
 //! shared functions rather than a platform trait because the steps that
@@ -18,10 +19,10 @@ use crate::kernel::workload::owner_plan;
 /// Apply the staged owner plan, or re-apply the retained one.
 ///
 /// **Ordering is the whole point.** `prepare_graph` resets every module to
-/// the system owner, and `module_new` records provider handles under the
+/// the node owner, and `module_new` records provider handles under the
 /// module's owner *at open time*. So ownership must be live before the
-/// instantiation loop runs, or those handles are permanently system-owned
-/// and silently bypass tenant isolation. On a rebuild this also re-applies
+/// instantiation loop runs, or those handles are permanently node-owned
+/// and silently bypass owner isolation. On a rebuild this also re-applies
 /// the retained plan, so an ordinary rebuild cannot drop isolation.
 ///
 /// Fails closed: a staged-but-invalid plan must reject the graph rather than
@@ -45,7 +46,10 @@ pub fn apply_owner_plan() -> Result<usize, owner_plan::PlanError> {
 ///
 /// # The error policy
 ///
-/// See [`instantiation_is_fail_closed`].
+/// A module that does not instantiate within the budget refuses the whole
+/// graph (`scheduler::instantiate_graph`, the one instantiation path): a
+/// graph with a module's ports unwired is not a degraded version of the
+/// graph asked for but a different one, failing far from the cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingBudget {
     /// Polls before the module is declared timed out.
@@ -181,23 +185,4 @@ pub fn wait_for_wake(
         }
         wait();
     }
-}
-
-/// Whether a module that fails to instantiate refuses the whole graph.
-///
-/// **True, on every bare-metal platform.** A module that did not instantiate
-/// has unwired ports: its consumers block forever and its producers write
-/// into nothing. A graph running in that state is not a degraded version of
-/// the requested graph, it is a different one that nobody asked for — and it
-/// fails at the point of use, far from the cause.
-///
-/// This matches the rest of the kernel: the owner plan refuses rather than
-/// running a graph unowned, for the same reason.
-///
-/// The cost is worth stating. A deployment carrying a module that fails to
-/// instantiate does not boot, where it might otherwise have run degraded.
-/// That is the intent — it turns a silent, permanent misconfiguration into a
-/// loud one at the point where it can still be diagnosed.
-pub const fn instantiation_is_fail_closed() -> bool {
-    true
 }

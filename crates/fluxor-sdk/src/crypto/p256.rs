@@ -16,7 +16,7 @@
 //      subtraction, and `fn_reduce_wide` folds a fixed sixteen passes.
 //      A field multiply therefore costs the same whatever it
 //      multiplies. Field elements in the point layer are held in the
-//      Montgomery domain; they enter it in `from_affine` and
+//      Montgomery form; they enter it in `from_affine` and
 //      `is_on_curve` and leave it in `to_affine_with`.
 //   2. Point arithmetic — constant-time. `double` has no exceptional
 //      case to branch on, and `add_jacobian`/`add_affine` compute the
@@ -26,7 +26,7 @@
 //   3. Inversion — constant-time. `fp_inv` and `fn_inv` are
 //      square-and-multiply over the public exponents p-2 and n-2, so
 //      the schedule is public, and each multiply is fixed-cost per (1)
-//      (`fn_inv` multiplies in the Montgomery domain, `mont_mul`). `fn_inv` is applied to
+//      (`fn_inv` multiplies in the Montgomery form, `mont_mul`). `fn_inv` is applied to
 //      the ECDSA nonce `k`.
 //
 // Three scalar-multiplication shapes, all constant-time in the scalar:
@@ -75,7 +75,7 @@
 // signatures to low-s form. Intermediate secrets are zeroised via
 // volatile writes before returning from each primitive.
 //
-// The Montgomery-domain constants (`FP_*`) are plain `const`s and the
+// The Montgomery-form constants (`FP_*`) are plain `const`s and the
 // base-point comb `G_COMB` a scalar table, which position-independent
 // code reads relative to the PC; the other curve constants are assembled
 // on the stack from u32 immediates by `pic_u256`, one `load_*` call per
@@ -120,10 +120,10 @@ pub type U256 = [u64; 4];
 pub const ZERO: U256 = [0, 0, 0, 0];
 pub const ONE: U256 = [1, 0, 0, 0];
 
-// The point layer holds field elements in the Montgomery domain, `x·R mod p`
+// The point layer holds field elements in the Montgomery form, `x·R mod p`
 // with `R = 2^256` (`fp_mul`). These are the constants it needs there, and
 // the two that convert in and out of it.
-/// `R mod p`: one, in the Montgomery domain.
+/// `R mod p`: one, in the Montgomery form.
 pub const FP_ONE_MONT: U256 = [
     0x0000000000000001,
     0xffffffff00000000,
@@ -144,7 +144,7 @@ pub const FP_P: U256 = [
     0x0000000000000000,
     0xffffffff00000001,
 ];
-/// The curve constant b, in the Montgomery domain.
+/// The curve constant b, in the Montgomery form.
 pub const FP_B_MONT: U256 = [
     0xd89cdf6229c4bddf,
     0xacf005cd78843090,
@@ -405,18 +405,18 @@ pub fn fp_sqr(a: &U256) -> U256 {
     mont_mul(a, a, &FP_P, 1)
 }
 
-/// Into the Montgomery domain: `a·R mod p`, for `a < p`.
+/// Into the Montgomery form: `a·R mod p`, for `a < p`.
 pub fn fp_to_mont(a: &U256) -> U256 {
     fp_mul(a, &FP_R2)
 }
 
-/// Out of the Montgomery domain: `a·R⁻¹ mod p`.
+/// Out of the Montgomery form: `a·R⁻¹ mod p`.
 pub fn fp_from_mont(a: &U256) -> U256 {
     fp_mul(a, &ONE)
 }
 
 /// Modular inversion using Fermat's little theorem: a^(p-2) mod p, in the
-/// Montgomery domain (the result is `a⁻¹·R` for an input `a·R`).
+/// Montgomery form (the result is `a⁻¹·R` for an input `a·R`).
 ///
 /// The exponent is the public constant p-2, so the square-and-multiply
 /// schedule is fixed and reveals nothing, and each multiply is fixed-cost.
@@ -446,7 +446,7 @@ pub fn fp_inv(a: &U256) -> U256 {
 }
 
 /// `fp_inv` for a public coordinate; see `u256_inv_vartime`. Leaves and
-/// re-enters the Montgomery domain around the binary inverse.
+/// re-enters the Montgomery form around the binary inverse.
 pub fn fp_inv_vartime(a: &U256) -> U256 {
     fp_to_mont(&u256_inv_vartime(&fp_from_mont(a), &FP_P))
 }
@@ -594,12 +594,12 @@ pub fn mont_mul(a: &U256, b: &U256, m: &U256, m0inv: u64) -> U256 {
 ///
 /// The exponent n-2 is public, so the schedule is fixed, and each step
 /// is a fixed-cost Montgomery multiplication. The value enters the
-/// Montgomery domain through one `fn_reduce_wide` (`a·R mod n`) and
+/// Montgomery form through one `fn_reduce_wide` (`a·R mod n`) and
 /// leaves through a multiplication by one.
 pub fn fn_inv(a: &U256) -> U256 {
     let n = load_n();
     let n0inv = pic_u64(0xEE00BC4F, 0xCCD1C8AA);
-    // R mod n = 2^256 - n, which is also 1 in the Montgomery domain.
+    // R mod n = 2^256 - n, which is also 1 in the Montgomery form.
     let (r_mod_n, _) = u256_sub(&ZERO, &n);
     let mut base = fn_reduce_wide(&u256_mul_wide(a, &r_mod_n));
     let mut result = r_mod_n;
@@ -691,12 +691,12 @@ impl JacobianPoint {
     }
 
     /// The point `(x, y)` given in ordinary form (a decoded coordinate
-    /// pair), lifted into the Montgomery domain with `Z = 1`.
+    /// pair), lifted into the Montgomery form with `Z = 1`.
     pub fn from_affine(x: &U256, y: &U256) -> Self {
         Self::from_affine_mont(&fp_to_mont(x), &fp_to_mont(y))
     }
 
-    /// The point `(x, y)` given already in the Montgomery domain.
+    /// The point `(x, y)` given already in the Montgomery form.
     pub fn from_affine_mont(x: &U256, y: &U256) -> Self {
         Self {
             x: *x,
@@ -721,7 +721,7 @@ impl JacobianPoint {
     }
 
     /// Affine coordinates, in ordinary form, given `z^-1` in the
-    /// Montgomery domain, however it was computed.
+    /// Montgomery form, however it was computed.
     pub fn to_affine_with(&self, z_inv: &U256) -> (U256, U256) {
         let z_inv = *z_inv;
         let z_inv2 = fp_sqr(&z_inv);
@@ -773,8 +773,8 @@ impl JacobianPoint {
         }
     }
 
-    /// Point addition (mixed: Q is affine with Z=1, in the Montgomery
-    /// domain).
+    /// Point addition (mixed: Q is affine with Z=1, in Montgomery
+    /// form).
     ///
     /// Exception-free by evaluation rather than by formula: the generic
     /// add and the doubling are both computed unconditionally, and the
@@ -1052,7 +1052,7 @@ pub fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
 
 /// The four-tooth comb for `k·G`: entry `idx` is the affine point
 /// `sum of 2^(64t)·G over the set bits t of idx`, as x limbs then y
-/// limbs, little-endian, in the Montgomery domain. Entry 0 would be the
+/// limbs, little-endian, in the Montgomery form. Entry 0 would be the
 /// identity; the comb never adds it.
 static G_COMB: [[u64; 8]; 16] = [
     [0, 0, 0, 0, 0, 0, 0, 0],
@@ -1804,7 +1804,7 @@ pub fn ecdh_keygen_finalise(state: &ScalarMulState) -> Option<[u8; 65]> {
 /// `key_vault`-signed identity key is reusable, and a follow-on
 /// CertificateVerify with a leaked component is catastrophic.
 pub fn is_on_curve(x: &U256, y: &U256) -> bool {
-    // Evaluated in the Montgomery domain, where `fp_mul` works.
+    // Evaluated in the Montgomery form, where `fp_mul` works.
     let x = &fp_to_mont(x);
     let y = &fp_to_mont(y);
     // y² mod p

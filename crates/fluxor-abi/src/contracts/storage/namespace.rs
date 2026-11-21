@@ -464,7 +464,7 @@ pub use super::super::super::registry::storage_namespace::CHANGES;
 /// `fs::OPEN_CREATE` is normatively `BIND(kind=object) + file.data::OPEN`
 /// fused into one round trip, and `fs::MKDIR` is `BIND(kind=namespace)`;
 /// a filesystem provider whose directory entries live inside the byte
-/// tier keeps the fused forms, a split provider (index without bytes)
+/// surface keeps the fused forms, a split provider (index without bytes)
 /// implements BIND alone. The fused and split paths are the same
 /// operation, with the same outcome and the same fence.
 pub use super::super::super::registry::storage_namespace::BIND;

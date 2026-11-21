@@ -276,7 +276,7 @@ fn boot_hardware() -> Option<HardwareConfig> {
 // Graph flash slots
 // ============================================================================
 
-/// Bytes the graph image after the kernel may occupy from `at`: the flash
+/// Bytes the node image after the kernel may occupy from `at`: the flash
 /// below the graph slots, or, on a flash with no room for slots, below the
 /// data store.
 pub fn firmware_image_window(at: u32) -> u32 {
@@ -301,8 +301,8 @@ pub fn admitted_slots() -> u8 {
 }
 
 /// The graph slot this boot runs: of the slots whose image is admitted
-/// (`boot::graph_image::admit`), the higher epoch. `None` when the board has
-/// no slots or neither is admissible, and the kernel boots the graph image
+/// (`boot::node_image::admit`), the higher epoch. `None` when the board has
+/// no slots or neither is admissible, and the kernel boots the node image
 /// after itself. Called once per boot, by `boot::config::read_layout`.
 pub fn choose_slot(own_pin: &[u8; 32]) -> Option<FlashLayout> {
     use crate::abi::platform::rp::flash_layout;
@@ -317,10 +317,10 @@ pub fn choose_slot(own_pin: &[u8; 32]) -> Option<FlashLayout> {
         let slot = unsafe {
             core::slice::from_raw_parts(base as usize as *const u8, layout.slot_size as usize)
         };
-        match crate::kernel::boot::graph_image::admit(slot, own_pin) {
+        match crate::kernel::boot::node_image::admit(slot, own_pin) {
             Ok(header) => Some((base, header)),
-            Err(crate::kernel::boot::graph_image::Refusal::Malformed(
-                crate::abi::wire::graph_image::Malformed::Magic,
+            Err(crate::kernel::boot::node_image::Refusal::Malformed(
+                crate::abi::wire::node_image::Malformed::Magic,
             )) => None,
             Err(why) => {
                 log::warn!("[boot] slot at 0x{base:08x} refused: {}", why.reason());
@@ -755,17 +755,6 @@ impl Hardware {
     /// Get SPI bus number.
     pub fn spi_bus(&self) -> u8 {
         self.spi().bus
-    }
-
-    /// Get CS pin number (first output GPIO).
-    pub fn cs_pin(&self) -> u8 {
-        self.config
-            .gpio
-            .iter()
-            .flatten()
-            .find(|g| g.direction == GpioDirection::Output)
-            .map(|g| g.pin)
-            .unwrap_or(17)
     }
 
     /// Get I2C configuration (first configured bus or default).

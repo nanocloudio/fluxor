@@ -34,8 +34,8 @@ limit_register_coverage = "fail"
 # configuration to a declared package ceiling, so that the external dependency
 # count moves when someone decides it should rather than drifting; the
 # script's header says why it is not a limit-register family.
-# `tests/host/service_bundle_e2e.sh` has a scratch producer publish a
-# fixture service bundle into an isolated store (fluxor publishes none),
+# `tests/host/workload_package_e2e.sh` has a scratch producer publish a
+# fixture workload package into an isolated store (fluxor publishes none),
 # pins and syncs it in a scratch consumer, runs it with parameters and
 # asserts the refusals.
 # `tests/host/program_section.sh` builds a graph whose modules own programs
@@ -99,7 +99,7 @@ limit_register_coverage = "fail"
 # `tests/host/agent_remote.sh` runs the agent protocol between two runtimes over
 # mutual TLS: apply, activation, replay across a restart, fence, descriptor,
 # admission and identity refusals.
-scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh", "tests/host/transport_continuity_move.sh", "tests/host/transport_continuity_crash.sh", "tests/host/transport_continuity_horizon.sh", "tests/host/transport_continuity_halfclose.sh", "tests/host/transport_continuity_crash_halfclose.sh", "tests/host/packet_seam_v6.sh", "tests/host/packet_seam_sharded.sh", "tests/host/quic_v6.sh", "tests/host/transport_continuity_own_close.sh", "tests/host/transport_continuity_v6.sh", "tests/host/transport_continuity_unconsumed.sh", "tests/host/transport_continuity_resumed.sh", "tests/host/transport_continuity_pipelined.sh", "tests/host/transport_continuity_capsfull.sh", "tests/host/transport_continuity_smallrecords.sh", "tests/host/transport_continuity_owed_key_update.sh", "tests/host/transport_continuity_client.sh", "tests/host/transport_continuity_rst_in.sh", "tests/host/transport_continuity_rst_out.sh", "tests/host/transport_continuity_timewait.sh", "tests/host/transport_continuity_timers.sh", "tests/host/quic_continuity_move.sh", "tests/host/rescue_tunnel.sh", "tests/host/remote_channel_mux.sh", "tests/host/cli_out_drain.sh", "tests/host/agent_remote.sh"]
+scripts = ["tools/ci/deps_budget.sh", "tests/host/workload_package_e2e.sh", "tests/host/program_section.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh", "tests/host/transport_continuity_move.sh", "tests/host/transport_continuity_crash.sh", "tests/host/transport_continuity_horizon.sh", "tests/host/transport_continuity_halfclose.sh", "tests/host/transport_continuity_crash_halfclose.sh", "tests/host/packet_seam_v6.sh", "tests/host/packet_seam_sharded.sh", "tests/host/quic_v6.sh", "tests/host/transport_continuity_own_close.sh", "tests/host/transport_continuity_v6.sh", "tests/host/transport_continuity_unconsumed.sh", "tests/host/transport_continuity_resumed.sh", "tests/host/transport_continuity_pipelined.sh", "tests/host/transport_continuity_capsfull.sh", "tests/host/transport_continuity_smallrecords.sh", "tests/host/transport_continuity_owed_key_update.sh", "tests/host/transport_continuity_client.sh", "tests/host/transport_continuity_rst_in.sh", "tests/host/transport_continuity_rst_out.sh", "tests/host/transport_continuity_timewait.sh", "tests/host/transport_continuity_timers.sh", "tests/host/quic_continuity_move.sh", "tests/host/rescue_tunnel.sh", "tests/host/remote_channel_mux.sh", "tests/host/cli_out_drain.sh", "tests/host/agent_remote.sh"]
 
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal
@@ -209,3 +209,167 @@ mode                = "permissive"
 forbid_inline_tests = ["modules"]
 max_inline_lines    = 1000
 
+# Retired words still spelled in names siblings read (the agent contract's
+# `workload_uid`, the key vault's tier, the metric dimension `domain`). The
+# next ABI epoch renames them with the siblings and drives each row to zero.
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "crates/fluxor-abi/src/contracts/agent.rs"
+count  = 10
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "crates/fluxor-abi/src/contracts/key_vault.rs"
+count  = 20
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "crates/fluxor-abi/src/contracts/net/transport_continuity.rs"
+count  = 2
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "docs/architecture/abi_layers.md"
+count  = 1
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "docs/architecture/agent_protocol.md"
+count  = 4
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "docs/architecture/security.md"
+count  = 8
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/kernel/exec/scheduler/attest.rs"
+count  = 6
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/kernel/module/syscalls.rs"
+count  = 1
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/kernel/security/key_vault_router.rs"
+count  = 7
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/kernel/security/key_vault.rs"
+count  = 28
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/kernel/sys/hal.rs"
+count  = 1
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/kernel/sys/seal_provenance.rs"
+count  = 8
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/platform/bcm2712.rs"
+count  = 2
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/platform/linux/hsm_key_vault.rs"
+count  = 7
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/platform/linux/runtime.rs"
+count  = 3
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "src/platform/wasm/hal.rs"
+count  = 1
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/add_subgraph.rs"
+count  = 3
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/agent_cli.rs"
+count  = 12
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/agent_protocol.rs"
+count  = 34
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/compose.rs"
+count  = 33
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/config/generate.rs"
+count  = 5
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/config/tests.rs"
+count  = 1
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/manifest.rs"
+count  = 9
+reason = "the metric dimension key `domain =` and `DimDomain` are read by sibling manifests; they become `kind` / `DimValues` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/node_agent.rs"
+count  = 27
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/observability.rs"
+count  = 3
+reason = "the metric dimension key `domain =` and `DimDomain` are read by sibling manifests; they become `kind` / `DimValues` in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/target_facts.rs"
+count  = 10
+reason = "the key vault's `TIER` op, `vault_tier` and its tier ladder are sibling-visible; they become custody in the next epoch"
+
+[[ci.hygiene.ratchet]]
+rule   = "retired-vocabulary"
+path   = "tools/src/workload.rs"
+count  = 4
+reason = "`workload_uid` is the agent contract field siblings read; it becomes `owner_uid` in the next epoch"

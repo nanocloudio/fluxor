@@ -35,7 +35,7 @@ pub use super::super::registry::reconfigure::MODULE_INFO;
 /// word.
 pub use super::super::registry::reconfigure::MODULE_UPSTREAM;
 /// Set the current reconfigure phase.
-/// handle=-1, arg=[phase:u8]. 0=Running, 1=Draining, 2=Migrating.
+/// handle=-1, arg=[phase:u8]. 0=Running, 1=Draining.
 pub use super::super::registry::reconfigure::SET_PHASE;
 /// Query the kernel's module-slot capacity: one past the highest module
 /// index this kernel can hold. handle=-1, arg=NULL. Returns the count
@@ -46,7 +46,7 @@ pub use super::super::registry::reconfigure::SET_PHASE;
 /// state sizes it from this answer at runtime and never from a compiled
 /// constant. Gated by the `reconfigure` permission.
 pub use super::super::registry::reconfigure::SLOT_CAPACITY;
-/// Request a graph rebuild. The main loop consumes this after the
+/// Request a graph rebuild. The domain loop consumes this after the
 /// current step_modules returns.
 /// handle=-1, arg=[config_ptr:usize, config_len:usize] (platform pointer size).
 /// Returns 0.
@@ -60,9 +60,10 @@ pub use super::super::registry::reconfigure::TRIGGER_REBUILD;
 // They need the `reconfigure.owner` grant.
 
 /// Add a new owner's subgraph to the running graph.
-/// handle=-1, `data` = bounded binary `AddSubgraph` (magic `FLXA`, version,
-/// flags, body; validated for structure and bounds — the channel, not the
-/// blob, is authenticated), read in place for the call; `arg` (6 bytes) is
+/// handle=-1, `data` = a composed graph (`fluxor_contracts::graph`, magic
+/// `FLXG`: header, stepping order, module and edge records; validated for
+/// structure and bounds — the channel, not the blob, is authenticated), read
+/// in place for the call; `arg` (6 bytes) is
 /// the answer: on success the kernel writes the `OwnerHandle`
 /// (`slot:u16 LE, generation:u32 LE`) there. Returns 0 on success, a
 /// negative errno otherwise. The on-wire form
@@ -71,19 +72,19 @@ pub use super::super::registry::reconfigure::TRIGGER_REBUILD;
 /// `EAGAIN`. In-process callers use `scheduler::apply_add` directly (built-in
 /// or already-resident modules).
 pub use super::super::registry::reconfigure::APPLY_ADD;
-/// `AddSubgraph` header flag: the new owner acts with its creator's
+/// Composed-graph header flag: the new owner acts with its creator's
 /// authority. Honoured only from the module syscall, and only when the
 /// calling module acts with the node's authority: the owner then reaches the
 /// node's provider layers and the platform's storage as the node does, while
 /// it is still freed, paused, charged and released as an owner of its own.
-/// A workload caller is refused `EACCES`; any other path that decodes an
-/// `AddSubgraph` (a workload `CREATE`, a boot graph) refuses the flag
+/// A workload caller is refused `EACCES`; any other path that admits a
+/// composed graph (a workload `CREATE`, a node graph) refuses the flag
 /// `EINVAL`, as it refuses every undefined flag bit.
 pub const ADD_FLAG_CREATOR_AUTHORITY: u16 = 0x0001;
 /// Free an owner: stop its modules, close its edges, reclaim its state, and
 /// revoke the handle (the generation guard rejects it thereafter).
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
-/// -1 for the system owner, -2 for a handle that no longer resolves, and -3
+/// -1 for the node owner, -2 for a handle that no longer resolves, and -3
 /// for an owner still being added (its add publishes or rolls it back).
 pub use super::super::registry::reconfigure::FREE_OWNER;
 
@@ -95,7 +96,7 @@ pub use super::super::registry::reconfigure::FREE_OWNER;
 /// Pause an owner (reversible quiesce): close admission for its subgraph,
 /// let in-flight steps complete (no preemption), and mask its wake sources
 /// (event signals, wake-on-write latches, cross-domain doorbells) so its
-/// graphs stop being stepped. Idempotent; the system owner is refused.
+/// graphs stop being stepped. Idempotent; the node owner is refused.
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
 /// negative `PauseError` otherwise.
 pub use super::super::registry::reconfigure::OWNER_PAUSE;
@@ -140,7 +141,7 @@ pub const OWNER_RELEASED_ARG_LEN: usize = 8;
 
 // ── OTA RAM staging (Pi 5 / hosted Linux) ────────────────────────────────────
 // The RAM-staged counterpart of the RP flash graph-slot pair: a module
-// streams a GRAPH IMAGE (`fluxor build --emit=image`) into the kernel's
+// streams a NODE IMAGE (`fluxor build --emit=image`) into the kernel's
 // inactive staging buffer, then commits it. Commit validates header,
 // payload SHA-256, ABI-surface pin, and epoch monotonicity, then swaps
 // loader+config to the staged blobs and fires the rebuild bridge.
@@ -153,7 +154,7 @@ pub const OWNER_RELEASED_ARG_LEN: usize = 8;
 /// newer than live / -ERROR protect failure), 1 ABORT (discard staged
 /// bytes), 2 EPOCH (returns the live epoch, saturated to i32).
 pub use super::super::registry::reconfigure::OTA_STAGE_CTRL;
-/// Stream graph-image bytes into the staging buffer.
+/// Stream node-image bytes into the staging buffer.
 /// handle=-1, arg = `[offset: u32 LE][payload bytes]`. `offset == 0`
 /// begins a fresh stage; writes advance monotonically — an offset
 /// below the staged length is -EINVAL, a forward gap is zero-filled

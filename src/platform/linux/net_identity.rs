@@ -1,5 +1,5 @@
 // ============================================================================
-// Linux realization of the `workload` Tier-1 network fields
+// Linux realization of the `workload` header's network fields
 // ============================================================================
 //
 // Mechanism behind `NET_ISO_OWN` + the network identity in the `workload`
@@ -1077,7 +1077,7 @@ fn remember(idx: usize, addr: [u8; 4]) {
 /// container-side with the identity address, up). Called by `hp_spawn`
 /// after the container pid is known and before START releases the barrier,
 /// so the network exists before the workload runs. Returns 0 or a negative
-/// errno — a failure fails CREATE (the network is Tier-1; a workload must
+/// errno — a failure fails CREATE (the network is in the header; a workload must
 /// not run with silently-weaker networking). A host-side link needs this
 /// runtime live in the host registry: one made under a tag that is not live
 /// would be collected by the next instance to start.

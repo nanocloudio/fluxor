@@ -1,4 +1,4 @@
-//! `wasm_browser_camera` built-in: camera-frame source. Pulls the latest
+//! `wasm_browser_camera` native module: camera-frame source. Pulls the latest
 //! grayscale frame from the host shim's `getUserMedia` capture loop and forwards
 //! it on the output channel as `[w:u16 LE][h:u16 LE][luma w*h]` — the frame format
 //! the `qr_scan` module reassembles. The shim owns the `<video>` + offscreen
@@ -13,7 +13,9 @@
 //! into kernel memory and returns its total byte length (header + pixels), or 0
 //! when no frame is ready (camera still starting / permission pending).
 
+use crate::abi::platform::native::wasm::wasm_browser_camera as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -65,11 +67,11 @@ unsafe fn alloc_state(out_chan: i32) -> *mut CameraState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn camera_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn camera_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-provided opaque state pointer for this module
-    // instance; cast back to the module-private type allocated by `build`.
+    // instance; cast back to the module-private type allocated by the constructor.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut CameraState);
         if st_ptr.is_null() {
@@ -100,9 +102,19 @@ unsafe fn camera_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_camera", camera_step);
-    let raw = alloc_state(out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut CameraState, raw);
-    m
+/// The `wasm_browser_camera` native module.
+pub static WASM_BROWSER_CAMERA: NativeVtable = super::heap_native(new, camera_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_FRAMES);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, heap_size_for(), || {
+            alloc_state(out_chan).cast()
+        })
+    }
 }

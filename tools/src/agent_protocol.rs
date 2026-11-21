@@ -1,5 +1,5 @@
 //! The agent protocol's semantics: one request and its answer between a
-//! controller and a target's node agent. The records are
+//! controller and a node agent. The records are
 //! `crates/fluxor-abi/src/contracts/agent.rs`; the rules are
 //! `docs/architecture/agent_protocol.md`.
 //!
@@ -18,7 +18,7 @@ use crate::genstore::{FsStorage, GenStore, Storage, StoreError};
 use crate::hash::hex;
 use crate::node_agent::{
     load_committed_plan, load_desired, node_status_with_runtime, publish_committed_plan,
-    record_publish_path, remove_workload_and_commit, resolve_bundle, upsert_workload_and_commit,
+    record_publish_path, remove_workload_and_commit, resolve_package, upsert_workload_and_commit,
     AgentError, RuntimePhase, WorkloadStatus,
 };
 
@@ -28,15 +28,15 @@ pub use fluxor_abi::contracts::agent as wire;
 
 use wire::{op, phase, result, DecodeError, Request, Response};
 
-/// Key of the fence a target holds: `[epoch:u64 LE][seq:u64 LE]`.
+/// Key of the fence a node holds: `[epoch:u64 LE][seq:u64 LE]`.
 const FENCE_KEY: &str = "agent.fence";
 /// Key of the idempotency records.
 const IDEMPOTENCY_KEY: &str = "agent.idempotency";
 /// File serialising every writer of a store: `flock`ed for one request.
 const LOCK_FILE: &str = "agent.lock";
-/// Requests remembered per target; past it the oldest record goes.
+/// Requests remembered per node; past it the oldest record goes.
 pub const IDEMPOTENCY_MAX: usize = 256;
-/// Domain of the activation digest.
+/// Domain-separation tag of the activation digest.
 const ACTIVATION_DOMAIN: &[u8] = b"fluxor.agent.activation\0";
 
 /// The peer a transport vouches for.
@@ -48,16 +48,16 @@ pub enum Peer {
     Verified([u8; 32]),
 }
 
-/// What a target's agent is configured with.
+/// What a node's agent is configured with.
 #[derive(Clone, Debug)]
 pub struct AgentContext {
-    /// The target's key fingerprint.
+    /// The node's key fingerprint.
     pub target_id: [u8; 32],
-    /// Key fingerprints of the controllers of this target.
+    /// Key fingerprints of the controllers of this node.
     pub controllers: Vec<[u8; 32]>,
-    /// The target descriptor; its sha256 is the descriptor revision.
+    /// The node descriptor; its sha256 is the descriptor revision.
     pub descriptor: PathBuf,
-    /// Holds `<bundle digest hex>/{workload.json,resources.json,graph.yaml}`.
+    /// Holds `<package digest hex>/{workload.json,resources.json,graph.yaml}`.
     pub bundles: PathBuf,
     /// Where the committed plan is published for the runtime.
     pub publish: PathBuf,
@@ -238,7 +238,7 @@ pub fn parse_hex<const N: usize>(text: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
-/// The revision of a target descriptor: the sha256 of the file.
+/// The revision of a node descriptor: the sha256 of the file.
 pub fn descriptor_revision(path: &Path) -> io::Result<[u8; 32]> {
     Ok(sha256(&std::fs::read(path)?))
 }
@@ -387,7 +387,7 @@ pub fn handle<S: Storage>(
     if !authorized {
         return reply.with_diag(
             result::REFUSED_UNAUTHORIZED,
-            "the peer is not a controller of this target",
+            "the peer is not a controller of this node",
         );
     }
     let req = match decoded {
@@ -414,7 +414,7 @@ pub fn handle<S: Storage>(
     }
 }
 
-/// `Err` is a fault of the target's own state; a refusal is an `Ok` reply.
+/// `Err` is a fault of the node's own state; a refusal is an `Ok` reply.
 fn answer<S: Storage>(
     req: &Request,
     ctx: &AgentContext,
@@ -503,7 +503,7 @@ fn mutate<S: Storage>(
             return Ok(reply.with_diag(
                 result::REFUSED_DESCRIPTOR,
                 format!(
-                    "descriptor revision {} is not the target's {}",
+                    "descriptor revision {} is not the node's {}",
                     hex(&req.descriptor_revision),
                     hex(revision)
                 ),
@@ -606,7 +606,7 @@ fn present<S: Storage>(store: &GenStore<S>, uid: &[u8; 16]) -> Result<bool, Stri
         .is_some_and(|p| p.assignments.iter().any(|a| a.workload_uid == *uid)))
 }
 
-/// Resolve the desired bundle by digest and put it through admission: the
+/// Resolve the desired workload package by digest and put it through admission: the
 /// workload to commit, or the result and diagnostic that refuse it.
 fn admit(req: &Request, ctx: &AgentContext) -> Result<WorkloadDesired, (u8, String)> {
     let dir = ctx.bundles.join(hex(&req.desired_bundle_digest));
@@ -636,20 +636,20 @@ fn admit(req: &Request, ctx: &AgentContext) -> Result<WorkloadDesired, (u8, Stri
             ),
         ));
     }
-    let bundle = resolve_bundle(&dir).map_err(|d| (result::REFUSED_ADMISSION, d))?;
+    let package = resolve_package(&dir).map_err(|d| (result::REFUSED_ADMISSION, d))?;
     Ok(WorkloadDesired {
         workload_uid: req.workload_uid,
         namespace: "default".to_string(),
-        name: bundle.name,
-        workload_digest: bundle.workload_digest,
+        name: package.name,
+        workload_digest: package.workload_digest,
         config_generation: 0,
         desired_phase: DesiredPhase::Running,
-        profile: bundle.profile,
-        exports: bundle.exports,
+        profile: package.profile,
+        exports: package.exports,
     })
 }
 
-/// Fill `reply` with what the target observes of the workload. The activation
+/// Fill `reply` with what the node observes of the workload. The activation
 /// digest stays zero unless a live runtime reports exactly the committed plan
 /// and the workload's owner running under it.
 fn observe<S: Storage>(
@@ -901,9 +901,9 @@ pub enum CallError {
     Transport(String),
     /// The record is not a response.
     Malformed(String),
-    /// The target states another identity than the one its transport verified,
+    /// The node states another identity than the one its transport verified,
     /// or than the one the controller expects.
-    TargetMismatch {
+    NodeMismatch {
         stated: [u8; 32],
         verified: [u8; 32],
     },
@@ -916,9 +916,9 @@ impl std::fmt::Display for CallError {
         match self {
             CallError::Transport(e) => write!(f, "transport: {e}"),
             CallError::Malformed(e) => write!(f, "malformed response: {e}"),
-            CallError::TargetMismatch { stated, verified } => write!(
+            CallError::NodeMismatch { stated, verified } => write!(
                 f,
-                "target identity mismatch: the response states {}, the expected or verified \
+                "node identity mismatch: the response states {}, the expected or verified \
                  identity is {}",
                 hex(stated),
                 hex(verified)
@@ -941,14 +941,14 @@ pub fn accept_response(
 ) -> Result<Reply, CallError> {
     let reply = Reply::decode(record).map_err(|e| CallError::Malformed(format!("{e:?}")))?;
     if verified && reply.target_id != *stamped {
-        return Err(CallError::TargetMismatch {
+        return Err(CallError::NodeMismatch {
             stated: reply.target_id,
             verified: *stamped,
         });
     }
     if let Some(want) = expected {
         if reply.target_id != *want {
-            return Err(CallError::TargetMismatch {
+            return Err(CallError::NodeMismatch {
                 stated: reply.target_id,
                 verified: *want,
             });

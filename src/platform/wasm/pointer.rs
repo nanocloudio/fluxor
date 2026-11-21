@@ -1,4 +1,4 @@
-//! `wasm_browser_pointer` built-in: pointer / touch input source.
+//! `wasm_browser_pointer` native module: pointer / touch input source.
 //!
 //! Pulls W3C PointerEvent state from the host shim's DOM queue and
 //! emits `input::pointer::MSG_EVENT` records on the output channel.
@@ -13,7 +13,9 @@
 //! Host shim contract: `host_pointer_pop(buf, len)` returns one
 //! 16-byte record per call.
 
+use crate::abi::platform::native::wasm::wasm_browser_pointer as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -47,12 +49,12 @@ unsafe fn alloc_state(out_chan: i32) -> *mut PointerState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn pointer_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn pointer_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut PointerState);
         if st_ptr.is_null() {
@@ -78,9 +80,19 @@ unsafe fn pointer_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_pointer", pointer_step);
-    let raw = alloc_state(out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut PointerState, raw);
-    m
+/// The `wasm_browser_pointer` native module.
+pub static WASM_BROWSER_POINTER: NativeVtable = super::heap_native(new, pointer_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_EVENTS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<PointerState>(), || {
+            alloc_state(out_chan).cast()
+        })
+    }
 }

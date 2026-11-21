@@ -1026,17 +1026,18 @@ fn start_graph() -> Result<usize, &'static str> {
     // SAFETY: this core's timer.
     unsafe { timer::timer_set(period) };
 
-    let (list, count) = scheduler::prepare_graph().map_err(|_| "prepare_failed")?;
+    let staged = scheduler::prepare_graph().map_err(|_| "prepare_failed")?;
     if let Err(why) = domains::cross::bridge_edges() {
         log::error!("[graph] {why}");
+        scheduler::splice::abandon(staged);
         return Err("bridge_failed");
     }
-    let loaded = match domains::instantiate(&list, count) {
+    let loaded = match domains::instantiate(staged) {
         Ok(loaded) => loaded,
         Err(domains::InstantiateError::OwnerPlan(_)) => return Err("owner_plan_invalid"),
-        Err(domains::InstantiateError::Modules(_)) => return Err("module_failed"),
+        Err(domains::InstantiateError::Refused(_)) => return Err("module_failed"),
     };
-    scheduler::finalize_instantiation_accounting();
+    scheduler::log_arena_usage();
     scheduler::admit_resident_workloads_from_config();
     // Domain `n` runs on secondary `n`: a domain with modules and no core
     // would hold its modules unstepped, so the graph is refused instead.
@@ -1163,7 +1164,7 @@ static PLATFORM: domains::Platform = domains::Platform {
 
 /// After each pass of domain 0: the boot core's upkeep, and the summary when
 /// it is due.
-fn after_pass(domain_id: usize, _core_id: usize, _tier: domains::Tier) {
+fn after_pass(domain_id: usize, _core_id: usize, _mode: fluxor_contracts::boot_config::ExecMode) {
     if domain_id != 0 {
         return;
     }

@@ -41,7 +41,7 @@ fn linux_install_wake_thread() {
 
 fn linux_wake_scheduler() {
     // Best-effort: if the runtime thread has been captured, unpark it.
-    // Spurious unparks are fine — the main loop drains wake bits each
+    // Spurious unparks are fine — the domain loop drains wake bits each
     // iteration. Before capture (early boot) wake is a no-op; the bit
     // still latches in EVENT_WAKE_PENDING and the first scheduler tick
     // observes it.
@@ -284,15 +284,8 @@ fn linux_now_micros() -> u64 {
     elapsed_micros()
 }
 fn linux_tick_count() -> u32 {
-    // Back the HAL `tick_count` with wall-clock milliseconds instead
-    // of `DBG_TICK`. The identity
-    // "1 tick == 1 ms" holds only at the fixed 1 ms default; mechanism (b)
-    // varies the period and mechanism (a) stops advancing `DBG_TICK` during
-    // idle, so a `DBG_TICK`-backed `tick_count` returns wrong "ms since boot"
-    // under adaptive tick. Wall-clock `elapsed_micros()/1000` is correct under
-    // any pacing — matching rp's `Instant`-based `rp_tick_count` (rp.rs:449).
-    // The internal logical tick counter (`scheduler::tick_count()` → DBG_TICK)
-    // is unchanged; only this outward HAL op is decoupled.
+    // Wall-clock milliseconds: a domain's pass count is not a clock under
+    // adaptive pacing.
     (elapsed_micros() / 1000) as u32
 }
 
@@ -396,10 +389,10 @@ fn linux_read_cycle_count() -> u32 {
     elapsed_micros() as u32
 }
 
-fn linux_isr_tier_init() {}
-fn linux_isr_tier_start(_period_us: u32) {}
-fn linux_isr_tier_stop() {}
-fn linux_isr_tier_poll() {}
+fn linux_module_timer_init() {}
+fn linux_module_timer_start(_period_us: u32) {}
+fn linux_module_timer_stop() {}
+fn linux_module_timer_poll() {}
 
 /// The platform's owner-release hook, fired by the kernel on every owner it
 /// frees: what the owner holds through the library's providers
@@ -505,8 +498,8 @@ fn linux_init_providers() {
         fluxor::abi::platform::linux::host_process::PROC_CLASS,
         linux_proc_dispatch,
     );
-    // Platform-neutral isolated-workload surface: parses the Tier-1 spec, binds
-    // to a plan-allocated owner + lease, enforces the Tier-2 options envelope
+    // Platform-neutral isolated-workload surface: parses the spec header, binds
+    // to a plan-allocated owner + lease, enforces the options envelope
     // fail-closed, and delegates to the owner-bound host-process backend.
     // Host-linux; gated by the `workload.create` and `host_process.exec` grants.
     provider::register(dev_class::WORKLOAD, linux_workload_dispatch);
@@ -599,10 +592,10 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     step_guard_disarm: linux_step_guard_disarm,
     step_guard_post_check: linux_step_guard_post_check,
     read_cycle_count: linux_read_cycle_count,
-    isr_tier_init: linux_isr_tier_init,
-    isr_tier_start: linux_isr_tier_start,
-    isr_tier_stop: linux_isr_tier_stop,
-    isr_tier_poll: linux_isr_tier_poll,
+    module_timer_init: linux_module_timer_init,
+    module_timer_start: linux_module_timer_start,
+    module_timer_stop: linux_module_timer_stop,
+    module_timer_poll: linux_module_timer_poll,
     init_providers: linux_init_providers,
     release_module_handles: linux_release_module_handles,
     boot_scan: linux_boot_scan,
@@ -611,6 +604,8 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     csprng_fill: linux_csprng_fill,
     core_id: || 0,
     irq_bind: |_, _, _, _| fluxor::kernel::sys::errno::ENOSYS,
+    irq_unbind: |_| 0,
+    irq_mask: |_, _| {},
     sleep_until: linux_sleep_until,
     smp_quiesce_peers: || false,
     smp_release_peers: || {},

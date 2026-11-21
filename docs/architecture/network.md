@@ -675,16 +675,16 @@ address of its own, in a network namespace the runtime owns) or a TAP.
 
 A subgraph staged by a `workload` CREATE (an fmod-graph source) joins the
 network through lanes of its own rather than the fanned `net_out`. Its
-FLXA names the provider as an endpoint, `Net(key)`: one edge from a module
+composed graph names the provider as an endpoint, `Net(key)`: one edge from a module
 into it (commands) and one edge out of it to a module (events) per key.
 Each key becomes one lane.
 
 A workload's `wiring:` is written as a graph's: ends are `module.port`
 (resolved against the module's manifest; a bare `module` is its first
 output in `from:`, its first input in `to:`), and the node's network is
-the platform provider a base graph names — `linux_net` (or `ip`), which
+the platform provider the node graph names — `linux_net` (or `ip`), which
 the workload does not declare among its modules. `fluxor build` gives
-every module wired to it a lane of its own (FLXA endpoint kind 3), keyed
+every module wired to it a lane of its own (endpoint kind 3), keyed
 in the order the wiring first names the module, and refuses a module
 that is not wired to it exactly once each way — `linux_net.net_out` into
 one of its inputs, one of its outputs into `linux_net.net_in`. The
@@ -749,6 +749,33 @@ both surfaces on a lane:
 - When a lane detaches, `ip` resets what it opened, drops frames still
   queued for its events, and cancels the dials it parked on a lookup, so a
   lane that later takes the same channels or index inherits nothing.
+
+A `net=own` workload's traffic takes the same lanes. Its CREATE installs
+its address in the node's net-identity provider (`IP_ADDR_ADD` on `ip`'s
+`addr_ctl`, tagged with the workload's owner) and nothing else: there is
+no second path into the provider and no spare lane. The workload's graph
+names `Net(key)` edges like any other; the splice hands each lane to `ip`
+as a lane of that same owner, and `ip` sources the lane's traffic from the
+address the owner holds. The net-identity provider and the lane provider
+are one module, whichever registers first (`NET_IDENT_PROVIDER` and
+`workload::NET_PROVIDE` from different modules: the second is `EACCES`).
+DESTROY detaches the owner's lanes and removes its address
+(`IP_ADDR_DEL`).
+
+Lanes are a shared, bounded resource: `ip` states its capacity
+(`lane_cap`, 16 on aarch64) and `linux_net` holds 32. A workload takes as
+many lanes as its graph has `Net` keys, and a CREATE whose lanes the
+provider cannot all take is refused `EBUSY` with no owner, address or lane
+left behind. Placing workloads so that each finds its lanes is the node
+agent's capacity planning; the node offers the agent no read of the
+provider's capacity or free lanes today, so the agent learns it from the
+node's graph (`ip`'s `lane_cap`) or from that refusal.
+
+A connection on a workload-owned address or lane is not migratable:
+transport continuity is the node graph's, and `ip` refuses `PAIR_PREPARE`,
+the checkpoint import and the cut of such a connection `UNSUPPORTED`,
+leaving any shadow as it was. Workload-scoped continuity needs its own
+design.
 
 ## TLS as a Channel Transformer
 

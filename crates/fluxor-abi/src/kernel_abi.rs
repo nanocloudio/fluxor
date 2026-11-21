@@ -4,7 +4,7 @@
 //
 // Contents: syscall table, poll flags, error codes, and the explicit
 // typed namespaces for channel / timer / buffer / event / core-system
-// primitives. Hardware contracts live in `contracts/hal/*`; domain
+// primitives. Hardware contracts live in `contracts/hal/*`; service
 // protocols live in `contracts/{net,storage}/*`; kernel-private
 // orchestration lives in `internal/*`; chip-specific raw registers
 // live in `platform/*`.
@@ -12,7 +12,7 @@
 // Vocabulary: the POSIX-derived low-level terms here — `fd` (a handle),
 // `errno` (negative error code), poll flags — are universally understood
 // primitives at the kernel/module boundary, not an orchestrator's
-// vocabulary. Tenancy is Fluxor's own: `owner`, `workload`, `lease`,
+// vocabulary. Ownership is Fluxor's own: `owner`, `workload`, `lease`,
 // `posture`, `endpoint`, `grant`. No user, group or mode bit crosses this
 // boundary; those belong to the host-process platform contract alone.
 //
@@ -35,7 +35,7 @@ pub const ABI_VERSION: u32 = super::wire::ABI_VERSION as u32;
 /// manifest rather than raising this default.
 pub const CHANNEL_BUFFER_SIZE: usize = 8192;
 
-/// Generic stream timing information (domain-neutral).
+/// Generic stream timing information (format-neutral).
 ///
 /// Used to synchronize producers with real-time sinks (audio, LED strips, DACs, etc).
 /// The kernel doesn't know what a "unit" is — that's defined by the sink.
@@ -166,7 +166,7 @@ pub struct SyscallTable {
     /// zero-cost when nothing is collecting.
     ///
     /// Null means "cannot check", NOT "disabled": a table without the word
-    /// (the wasm host, an isolated module whose protection domain does not map
+    /// (the wasm host, an isolated module whose isolation region does not map
     /// kernel memory) emits unconditionally and lets the ring drop when no
     /// consumer is subscribed. Losing the optimisation is the safe failure;
     /// losing the records is not.
@@ -320,7 +320,7 @@ pub mod errno {
     /// No such process / no such context. Answered by
     /// [`query_key::CALLER_OWNER`] when nothing is on the provider stack —
     /// there is no requester to name, which is a different statement from
-    /// "the requester is the system owner".
+    /// "the requester is the node owner".
     pub use super::super::registry::errno::ESRCH;
     /// Cross-device link: the two paths are not on the same volume, so no
     /// second name can reference the same file.
@@ -576,7 +576,7 @@ pub mod timer {
     ///
     /// `handle=-1`, `arg` receives `trusted_time::LEN` bytes:
     ///
-    /// ```text
+    /// ``text
     /// [unix_seconds: u64 LE]
     /// [unix_nanos:   u32 LE]
     /// [uncertainty_ms: u32 LE]   — half-width of the confidence interval
@@ -587,7 +587,7 @@ pub mod timer {
     /// [source_class: u8]         — see `trusted_time::source`
     /// [flags: u8]                — see `trusted_time::flags`
     /// [_reserved: u16]
-    /// ```
+    /// ``
     ///
     /// `source_epoch` is what makes rollback detectable: a consumer stamps a
     /// cached decision with the epoch it was made under and invalidates the
@@ -735,13 +735,14 @@ pub use super::registry::kernel::MODULE_INSTANCE_PARAMS;
 
 /// Register the CALLING module as the node's net-identity provider (the
 /// module owning the shared network stack that realizes `net::identity`
-/// ADDR_ADD/ADDR_DEL installs and net-ingress spare-lane attach).
-/// `arg = [addr_ctl_port: u8][net_in_port: u8]` — the provider declares its
-/// own control and ingress input-port indices, so the kernel learns the
-/// topology from the provider itself rather than from a name convention.
-/// Gated to base-graph (system-owned) modules — a workload module cannot
+/// ADDR_ADD/ADDR_DEL installs).
+/// `arg = [addr_ctl_port: u8]` — the provider declares its own control
+/// input-port index, so the kernel learns it from the provider itself rather
+/// than from a name convention. A workload's traffic reaches the provider
+/// only over its own `Endpoint::Net` lanes.
+/// Gated to node-graph (node-owned) modules — a workload module cannot
 /// hijack identity installs — and first-wins (`EBUSY` on a second claim).
-/// `ENOSYS` on single-tenant builds (no workload backend to serve).
+/// `ENOSYS` on builds without a workload backend.
 pub use super::registry::kernel::NET_IDENT_PROVIDER;
 
 /// This boot's incarnation: 16 bytes drawn from the kernel CSPRNG once per
@@ -756,8 +757,8 @@ pub use super::registry::kernel::NET_IDENT_PROVIDER;
 pub use super::registry::kernel::BOOT_INCARNATION;
 
 /// Describe one of the calling module's programs: an opaque blob the
-/// graph bundled for this module instance (a compiled script, a model, a
-/// table), carried in the bundle's program section beside the module table
+/// graph packs for this module instance (a compiled script, a model, a
+/// table), carried in the image's program section beside the module table
 /// and covered by the same digest and signature as the modules.
 /// `handle = -1`; `arg` is a buffer of at least [`program::INFO_LEN`] bytes
 /// whose first byte names the program's slot (0 for the first) on entry. On
@@ -767,7 +768,7 @@ pub use super::registry::kernel::BOOT_INCARNATION;
 /// module, so a module can only ever name its own.
 ///
 /// The record opens with an address answer `[addr u64][len u32]`: where the
-/// bytes can be read in place (flash on an XIP board, the loaded bundle
+/// bytes can be read in place (flash on an XIP board, the loaded image
 /// elsewhere), or `0, 0` where the module cannot dereference kernel memory
 /// (wasm), which reads through [`PROGRAM_READ`] instead; the size is
 /// stated either way. An isolated module is granted read-only,
@@ -816,7 +817,7 @@ pub use super::registry::kernel::FLASH_LAYOUT;
 /// 4 KiB, is the table header's first reserved word (bytes 10..14); 0
 /// means none.
 ///
-/// ```text
+/// ``text
 ///   header (16): [magic "FXPG": u32][version: u8][count: u8][0: u16]
 ///                [total_size: u32][0: u32]
 ///   entries (count x 64):
@@ -835,7 +836,7 @@ pub use super::registry::kernel::FLASH_LAYOUT;
 ///         4 KiB boundary and is a whole number of 32-byte granules (so an
 ///         MPU region, or the pages a page table maps, covers exactly one
 ///         owner's), each program on a 32-byte boundary.
-/// ```
+/// ``
 ///
 /// Entries run in (type_hash, ordinal, slot) order, every entry of an
 /// owner names the same region, regions follow the entries and each other
@@ -879,7 +880,7 @@ pub mod program {
 pub use super::registry::kernel::MODULE_FLOW_BUDGET;
 
 /// Raise software-generated interrupt `sgi` (0..=15) on core `core`: the
-/// stimulus a Tier-2 module that owns an SGI is tested with. handle=-1,
+/// stimulus an `irq` module that owns an SGI is tested with. handle=-1,
 /// arg=[core:u8, sgi:u8] (2 bytes). Needs `kernel.signal_core`. Returns 0,
 /// `EINVAL` for a core the machine does not have or an `sgi` above 15, or
 /// `ENOSYS` where the machine has no generic interrupt controller.
@@ -929,7 +930,7 @@ pub mod query_key {
     ///
     /// Returns `ESRCH` when nothing is on the provider stack — a module
     /// stepping normally is not serving anybody's request, and answering
-    /// with the system owner there would let a provider charge its own
+    /// with the node owner there would let a provider charge its own
     /// background work to whoever last called it.
     pub use super::super::registry::kernel::QUERY_CALLER_OWNER as CALLER_OWNER;
 

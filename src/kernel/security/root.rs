@@ -6,7 +6,7 @@
 //! root set`). The kernel is built with the key all zero, which is no root:
 //! the loader then verifies nothing and says so once at boot. With a root,
 //! a module whose signature does not verify is refused, and an unsigned one
-//! runs gated or not at all; a graph image must carry a signature by it.
+//! runs gated or not at all; a node image must carry a signature by it.
 //!
 //! What binds the image to the device is the target's boot chain (RP2350
 //! secure boot, Pi 5 signed boot, UEFI Secure Boot, the Linux binary's
@@ -39,7 +39,7 @@ pub fn image_root() -> Option<[u8; 32]> {
     (key != [0; item::KEY_LEN]).then_some(key)
 }
 
-/// The signing root modules and graph images are verified against.
+/// The signing root modules and node images are verified against.
 pub fn signing_root() -> Option<[u8; 32]> {
     crate::kernel::sys::hal::signing_root()
 }

@@ -8,7 +8,7 @@
 //! | Layer | Files | What it contains |
 //! |-------|-------|------------------|
 //! | `kernel_abi` | `kernel_abi.rs` | Core primitives (channel, timer, buffer, event, log, random, arena) |
-//! | `contracts` | `contracts/{hal,net,storage,key_vault}.rs` | Portable domain contracts |
+//! | `contracts` | `contracts/{hal,net,storage,key_vault}.rs` | Portable service contracts |
 //! | `internal` | `internal/*.rs` | Kernel-private orchestration, monitor, bridge, flash |
 //! | `platform` | `platform/{rp,bcm2712}/*.rs` | Chip-specific raw register bridges |
 //!
@@ -121,7 +121,7 @@ pub mod contracts {
         pub mod ws_frame;
     }
     /// The records a controller and a target's node agent exchange: desired
-    /// bundle, descriptor revision, idempotency identity, observed activation
+    /// workload package, descriptor revision, idempotency identity, observed activation
     /// and fenced status.
     pub mod agent;
     /// The `AudioSample` stream's records: PCM frames and the in-band format
@@ -243,6 +243,9 @@ pub mod platform {
     pub mod bcm2712 {
         pub mod nic_ring;
     }
+    /// The native modules' name hashes, params tags and port bindings,
+    /// generated from their manifests (`fluxor abi-regen`).
+    pub mod native;
 }
 
 // ─── Top-level conveniences ──────────────────────────────────────────

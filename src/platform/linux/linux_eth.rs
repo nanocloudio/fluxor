@@ -26,12 +26,11 @@
 // close-on-exec, so no host-process workload the runtime starts inherits
 // it. Included into `linux.rs`; shares its imports.
 
-use fluxor::platform::builtin_param_tags::linux_eth as eth_tags;
-use fluxor::platform::builtin_param_tags::linux_eth::{
+use fluxor::abi::platform::native::linux::linux_eth as eth_tags;
+use fluxor::abi::platform::native::linux::linux_eth::{
     TAG_IFNAME as ETH_TAG_IFNAME, TAG_MAC as ETH_TAG_MAC, TAG_MODE as ETH_TAG_MODE,
 };
 
-const LINUX_ETH_HASH: u32 = 0xF682_A08D; // fnv1a32("linux_eth")
 
 /// The largest frame either direction carries (no FCS, one VLAN tag).
 const ETH_FRAME_MAX: usize = 1518;
@@ -215,9 +214,9 @@ fn eth_read(st: &LinuxEthState, buf: &mut [u8]) -> Option<usize> {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_eth_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn linux_eth_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `LinuxEthState` by the loader.
     let st = unsafe { instance_state::<LinuxEthState>(state) };
     if st.fd < 0 {
@@ -316,7 +315,7 @@ unsafe fn linux_eth_step(state: *mut u8) -> i32 {
 }
 
 /// Construct a `linux_eth` built-in on the interface its `ifname` names.
-fn build_linux_eth(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule {
+fn build_linux_eth(module_idx: usize, params: &[u8]) -> Result<Box<LinuxEthState>, i32> {
     let mut ifname = String::new();
     let mut mac = String::new();
     let mut mode = ETH_MODE_PACKET;
@@ -326,7 +325,6 @@ fn build_linux_eth(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule
         ETH_TAG_MODE => mode = tlv_u8(value),
         _ => {}
     });
-    scheduler::set_current_module(module_idx);
     let rx_out = scheduler::module_port(module_idx, eth_tags::PORT_FRAMES_RX);
     let tx_in = scheduler::module_port(module_idx, eth_tags::PORT_FRAMES_TX);
     let packet = mode != ETH_MODE_TAP;
@@ -356,14 +354,11 @@ fn build_linux_eth(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule
         }
     };
     let mac = eth_parse_mac(&mac).unwrap_or(own_mac);
-    let mut m = scheduler::BuiltInModule::new("linux_eth", linux_eth_step);
     log::info!(
         "[inst] module {module_idx} = linux_eth (built-in) ifname='{ifname}' mode={} fd={fd} rx={rx_out} tx={tx_in}",
         if packet { "packet" } else { "tap" }
     );
-    install_state(
-        &mut m,
-        Box::new(LinuxEthState {
+    let st = Box::new(LinuxEthState {
             fd,
             packet,
             rx_out,
@@ -377,7 +372,15 @@ fn build_linux_eth(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule
             rx_oversize: 0,
             tx_dropped: 0,
             tx_malformed: 0,
-        }),
-    );
-    m
+        });
+    Ok(st)
 }
+
+impl HostNative for LinuxEthState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_eth(slot, params)
+    }
+}
+
+/// The `linux_eth` native module.
+pub static LINUX_ETH: NativeVtable = host_vtable::<LinuxEthState>(linux_eth_step);

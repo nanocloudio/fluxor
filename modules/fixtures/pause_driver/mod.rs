@@ -1,6 +1,6 @@
-//! Owner-pause driver — base-graph half of the metal PAUSE silicon AC.
+//! Owner-pause driver — node-graph half of the metal PAUSE silicon AC.
 //!
-//! Runs in the SYSTEM graph and drives one pause→resume cycle against a
+//! Runs in the node graph and drives one pause→resume cycle against a
 //! resident workload's owner via the OWNER_PAUSE / OWNER_RESUME live-mutation
 //! ops (`reconfigure::OWNER_PAUSE`/`reconfigure::OWNER_RESUME`, beside APPLY_ADD/FREE_OWNER):
 //!
@@ -8,7 +8,7 @@
 //!   at `resume_at_ms` → OWNER_RESUME (same handle record)
 //!
 //! Logs `[pdrv] pause ms=<t> rc=<rc>` / `[pdrv] resume ms=<t> rc=<rc>`
-//! and a periodic `[pdrv] hb ms=<t>` heartbeat proving the SYSTEM graph
+//! and a periodic `[pdrv] hb ms=<t>` heartbeat proving the node graph
 //! keeps stepping throughout the workload's pause window. The paired
 //! `pause_probe` inside the workload logs the freeze (`[pprobe] gap_ms=…`).
 //!
@@ -192,7 +192,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             dev_log(sys, 1, b"[pdrv] clock_dead".as_ptr(), 17);
             return StepReturn::Continue;
         }
-        // System-graph liveness heartbeat — must keep appearing while the
+        // Node-graph liveness heartbeat — must keep appearing while the
         // workload is paused (co-resident isolation).
         if now.saturating_sub(s.last_hb_ms) >= s.hb_every_ms as u64 {
             s.last_hb_ms = now;

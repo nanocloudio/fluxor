@@ -293,7 +293,7 @@ const SUPPORTED_EDITIONS: &[&str] = &["2015", "2018", "2021", "2024"];
 /// inventory `fluxor modules list` reports.
 fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
     let mut out = Vec::new();
-    for dir in crate::manifest::MODULE_TIERS {
+    for dir in crate::manifest::MODULE_LAYERS {
         let root = project_root.join(dir);
         if !root.is_dir() {
             continue;
@@ -541,10 +541,10 @@ fn matches_abi(c: &Candidate, abi: &str) -> bool {
     crate::runtime_abi::module_on_abi(&c.hardware_targets, abi)
 }
 
-/// A `manifest.toml` under `modules/` declares a module, and one the tier walk
+/// A `manifest.toml` under `modules/` declares a module, and one the layer walk
 /// cannot see would never be built: nothing would report it, and a build of
 /// the rest would read as a build of everything.
-fn refuse_manifests_outside_tiers(project_root: &Path) -> Result<()> {
+fn refuse_manifests_outside_layers(project_root: &Path) -> Result<()> {
     let root = project_root.join("modules");
     if !root.is_dir() {
         return Ok(());
@@ -570,11 +570,11 @@ fn refuse_manifests_outside_tiers(project_root: &Path) -> Result<()> {
         return Ok(());
     }
     Err(Error::Module(format!(
-        "{} manifest(s) outside the module tiers, which nothing would build: {}. A module \
-         lives at `<tier>/<name>/` or `<tier>/<group>/<name>/`, a tier being one of {}",
+        "{} manifest(s) outside the module layers, which nothing would build: {}. A module \
+         lives at `<layer>/<name>/` or `<layer>/<group>/<name>/`, a layer being one of {}",
         outside.len(),
         outside.join(", "),
-        crate::manifest::MODULE_TIERS.join(", "),
+        crate::manifest::MODULE_LAYERS.join(", "),
     )))
 }
 
@@ -586,7 +586,7 @@ pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
     // building rather than demanding a manual re-sync.
     crate::store_sync::ensure_synced(&opts.project_root)
         .map_err(|e| crate::error::Error::Config(e.to_string()))?;
-    refuse_manifests_outside_tiers(&opts.project_root)?;
+    refuse_manifests_outside_layers(&opts.project_root)?;
     // The target matrix only means something when there is something to
     // build, so discovery comes first. A portable-core-only repo has no
     // module tree and declares no `[ci].targets` — the `fluxor.toml` schema
@@ -2331,7 +2331,7 @@ pub fn module_root(
 
 /// THE module-root resolution, shared by every subcommand that locates
 /// `.fmod` artefacts (`run` including `--replicas`, `build`, `flash`,
-/// `modules resolve`, bundle staging). Order:
+/// `modules resolve`, package staging). Order:
 ///
 ///   1. the explicit `--module-root <path>`;
 ///   2. `$FLUXOR_MODULE_ROOT` (an empty value counts as unset);
@@ -2796,10 +2796,10 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
         assert!(report.ok());
     }
 
-    /// A manifest the tier walk cannot see is refused by name, whether it is
+    /// A manifest the layer walk cannot see is refused by name, whether it is
     /// the only one in the project or sits beside modules that do build.
     #[test]
-    fn a_manifest_outside_the_tiers_fails_the_build() {
+    fn a_manifest_outside_the_layers_fails_the_build() {
         for (flat, deep) in [(true, false), (false, true)] {
             let dir = tempfile::tempdir().unwrap();
             let opts = targeted_project(dir.path());
@@ -3050,12 +3050,12 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
         assert!(resolve_type_id(Some("Mystery")).is_err());
     }
 
-    /// Discovery walks the one tier list, so a `platform/` module is
+    /// Discovery walks the one layer list, so a `platform/` module is
     /// found — and a `builtin = true` manifest there is a declaration
     /// with no entry file, so it must be skipped as a non-candidate
     /// rather than diagnosed as a broken module.
     #[test]
-    fn discovery_covers_tiers_and_skips_builtin_declarations() {
+    fn discovery_covers_layers_and_skips_builtin_declarations() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -3072,14 +3072,14 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
         std::fs::write(real.join("manifest.toml"), "version = \"1.0.0\"\n").unwrap();
         std::fs::write(real.join("mod.rs"), "// probe\n").unwrap();
 
-        // The inventory sees both tiers…
+        // The inventory sees both layers…
         let all = discover_all(root).unwrap();
         let mut names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
             names,
             vec!["host_thing", "probe"],
-            "the tier list must reach platform/ and fixtures/"
+            "the layer list must reach platform/ and fixtures/"
         );
         // …and the build set does not include the declaration.
         let buildable = discover(root).unwrap();

@@ -1,4 +1,4 @@
-//! `wasm_browser_keyboard` built-in: keyboard input source that
+//! `wasm_browser_keyboard` native module: keyboard input source that
 //! pulls events from the host shim's DOM-keyboard queue and forwards
 //! them on the output channel as `input::key::MSG_EVENT` records.
 //!
@@ -15,7 +15,9 @@
 //! Host shim contract: `host_keyboard_pop(buf, len)` returns one
 //! 8-byte record on each call, or 0 when the queue is empty.
 
+use crate::abi::platform::native::wasm::wasm_browser_keyboard as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -54,12 +56,12 @@ unsafe fn alloc_state(out_chan: i32) -> *mut KeyboardState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn keyboard_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn keyboard_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut KeyboardState);
         if st_ptr.is_null() {
@@ -88,9 +90,19 @@ unsafe fn keyboard_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_keyboard", keyboard_step);
-    let raw = alloc_state(out_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut KeyboardState, raw);
-    m
+/// The `wasm_browser_keyboard` native module.
+pub static WASM_BROWSER_KEYBOARD: NativeVtable = super::heap_native(new, keyboard_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_EVENTS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<KeyboardState>(), || {
+            alloc_state(out_chan).cast()
+        })
+    }
 }

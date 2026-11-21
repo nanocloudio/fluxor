@@ -14,7 +14,7 @@
 //! [`irq_handler`] acknowledges the interrupt at the GIC's CPU interface,
 //! then either re-arms the timer tick (the platform's timer PPI) and ends it,
 //! or ends it and walks `IRQ_BINDINGS` to fan out through the platform's IRQ
-//! multiplexer, enter a Tier-2 module's ISR, or signal a kernel event via
+//! multiplexer, enter an `irq` module's ISR, or signal a kernel event via
 //! `event_signal_from_isr`.
 //!
 //! What the dump can safely write to is the platform's business: it prints
@@ -531,19 +531,19 @@ pub unsafe extern "C" fn irq_handler() {
         core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
         CORE_LAST_ELR[core_id].store(elr, Ordering::Relaxed);
     } else {
-        // Every binding for this INTID (virtio, MSI mux, Tier 2, ...).
+        // Every binding for this INTID (virtio, MSI mux, `irq`, ...).
         let n = IRQ_BINDING_COUNT;
         let mut i = 0;
         while i < n {
             let binding = &IRQ_BINDINGS[i];
             if binding.irq == irq_id {
                 gic::BINDING_FIRES[i].fetch_add(1, Ordering::Relaxed);
-                if binding.event_handle == crate::kernel::exec::isr_tier::ISR_TIER2_EVENT {
-                    // Tier 2 (IRQ-owned) dispatch: route this hardware IRQ
+                if binding.event_handle == crate::kernel::exec::irq::IRQ_MODULE_EVENT {
+                    // `irq` dispatch: route this hardware IRQ
                     // straight into the module's `module_isr_entry` via the
                     // trampoline, which looks the module up by IRQ number and
                     // enforces the ISR-context syscall gate.
-                    let _ = crate::kernel::exec::isr_tier::isr_tier2_trampoline(irq_id as u16);
+                    let _ = crate::kernel::exec::irq::irq_trampoline(irq_id as u16);
                 } else if binding.event_handle == EVENT_HANDLE_MUX {
                     // The platform's multiplexer (a PCIe MSI mux: read +
                     // clear the status, fan out per-vector events, so the

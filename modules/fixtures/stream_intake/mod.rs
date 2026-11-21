@@ -6,7 +6,7 @@
 //! the transport's window closes rather than a byte being dropped. One
 //! connection at a time; a second is closed on arrival.
 //!
-//! The fixture an on-board OTA run is fed by: the bench streams a graph image
+//! The fixture an on-board OTA run is fed by: the bench streams a node image
 //! to it and `ota_ingest` reads the image from `bytes`. Logs
 //! `[intake] bound port=<p>` once listening, `[intake] open` and
 //! `[intake] closed bytes=<n>` per connection, and the same `bytes=` as a

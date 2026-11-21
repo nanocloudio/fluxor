@@ -287,7 +287,7 @@ fn runtime_layer_digest(store: &OciStore, e: &Artifact) -> Result<Option<String>
 // ── Materialisation ───────────────────────────────────────────────────
 
 /// `value` as one path component: a name or target taken from a lockfile
-/// entry or a bundle's `workload.json` becomes a directory or file name
+/// entry or a package's `workload.json` becomes a directory or file name
 /// under the project tree, so it may hold no separator and cannot be `.`,
 /// `..` or empty.
 fn path_component<'a>(what: &str, value: &'a str) -> Result<&'a str> {
@@ -385,10 +385,10 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
             }
             Ok(format!("runtime {} → {}", e.name, dest.display()))
         }
-        "bundle" => materialize_bundle(
+        "bundle" => materialize_package(
             store,
             e,
-            &bundle_dir(project_root, path_component("bundle name", &e.name)?),
+            &package_dir(project_root, path_component("package name", &e.name)?),
         ),
         // A stack is read from the store by the build that includes it;
         // sync proves its layers are present and intact.
@@ -407,12 +407,12 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
     }
 }
 
-/// Where a pinned bundle materialises: `target/fluxor/bundles/<name>/`.
-pub fn bundle_dir(project_root: &Path, name: &str) -> PathBuf {
+/// Where a pinned package materialises: `target/fluxor/bundles/<name>/`.
+pub fn package_dir(project_root: &Path, name: &str) -> PathBuf {
     project_root.join("target/fluxor/bundles").join(name)
 }
 
-/// Materialise one pinned bundle into `dest`, flat:
+/// Materialise one pinned package into `dest`, flat:
 ///
 /// ```text
 /// <dest>/workload.json  graph.yaml  resources.json
@@ -424,10 +424,10 @@ pub fn bundle_dir(project_root: &Path, name: &str) -> PathBuf {
 /// layer digest, and is then held to `workload.json`: the graph and the
 /// resource profile must be the bytes its linux implementation pins, and
 /// each module the bytes its module reference pins. A run launches from
-/// exactly these files, so a bundle is never paired with modules other than
+/// exactly these files, so a package is never paired with modules other than
 /// the ones it was published with. Skipped when the stamp names this
 /// artifact and the tree still holds the bytes it was written with.
-pub fn materialize_bundle(store: &OciStore, e: &Artifact, dest: &Path) -> Result<String> {
+pub fn materialize_package(store: &OciStore, e: &Artifact, dest: &Path) -> Result<String> {
     use crate::oci_store::{
         sha256_hex_prefixed, MT_FLUXOR_GRAPH, MT_FLUXOR_MODULE, MT_FLUXOR_RESOURCES,
         MT_FLUXOR_WORKLOAD,
@@ -437,7 +437,11 @@ pub fn materialize_bundle(store: &OciStore, e: &Artifact, dest: &Path) -> Result
             && stamp.content.as_deref()
                 == Some(crate::store_publish::tree_content_digest(dest)?.as_str())
         {
-            return Ok(format!("bundle {} up to date ({})", e.name, dest.display()));
+            return Ok(format!(
+                "package {} up to date ({})",
+                e.name,
+                dest.display()
+            ));
         }
     }
     let manifest = read_pinned_manifest(store, e)?;
@@ -452,18 +456,21 @@ pub fn materialize_bundle(store: &OciStore, e: &Artifact, dest: &Path) -> Result
     let workload_json = layer(MT_FLUXOR_WORKLOAD)?;
     let graph_yaml = layer(MT_FLUXOR_GRAPH)?;
     let resources_json = layer(MT_FLUXOR_RESOURCES)?;
-    let workload = crate::workload::parse_manifest(
-        std::str::from_utf8(&workload_json)
-            .map_err(|err| Error::Config(format!("bundle '{}': workload.json: {err}", e.name)))?,
-    )
-    .map_err(|err| Error::Config(format!("bundle '{}': {err}", e.name)))?;
+    let workload =
+        crate::workload::parse_manifest(std::str::from_utf8(&workload_json).map_err(|err| {
+            Error::Config(format!(
+                "workload package '{}': workload.json: {err}",
+                e.name
+            ))
+        })?)
+        .map_err(|err| Error::Config(format!("workload package '{}': {err}", e.name)))?;
     let imp = workload
         .implementations
         .iter()
         .find(|i| i.target.family == "linux")
         .ok_or_else(|| {
             Error::Config(format!(
-                "bundle '{}' has no linux implementation to materialise",
+                "workload package '{}' has no linux implementation to materialise",
                 e.name
             ))
         })?;
@@ -474,21 +481,24 @@ pub fn materialize_bundle(store: &OciStore, e: &Artifact, dest: &Path) -> Result
         let actual = sha256_hex_prefixed(bytes);
         if &actual != pinned {
             return Err(Error::Config(format!(
-                "bundle '{}': the {file} layer is {actual} but workload.json pins {pinned}",
+                "workload package '{}': the {file} layer is {actual} but workload.json pins {pinned}",
                 e.name
             )));
         }
     }
     let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
     for m in &imp.modules {
-        path_component(&format!("bundle '{}' module name", e.name), &m.name)?;
+        path_component(
+            &format!("workload package '{}' module name", e.name),
+            &m.name,
+        )?;
         let l = manifest
             .layers
             .iter()
             .find(|l| l.media_type == MT_FLUXOR_MODULE && l.digest == m.digest)
             .ok_or_else(|| {
                 Error::Config(format!(
-                    "bundle '{}' pins module '{}' at {} but carries no layer with that digest",
+                    "workload package '{}' pins module '{}' at {} but carries no layer with that digest",
                     e.name, m.name, m.digest
                 ))
             })?;
@@ -508,16 +518,16 @@ pub fn materialize_bundle(store: &OciStore, e: &Artifact, dest: &Path) -> Result
         Ok(())
     })?;
     Ok(format!(
-        "bundle {} ({} module(s)) → {}",
+        "package {} ({} module(s)) → {}",
         e.name,
         modules.len(),
         dest.display()
     ))
 }
 
-/// Materialise the bundle `fluxor.lock` pins under `name`, if it pins one,
+/// Materialise the package `fluxor.lock` pins under `name`, if it pins one,
 /// and return its directory. Replays the pin; never re-resolves a tag.
-pub fn ensure_bundle(project_root: &Path, name: &str) -> Result<Option<PathBuf>> {
+pub fn ensure_package(project_root: &Path, name: &str) -> Result<Option<PathBuf>> {
     let Some(lock) = read_store_lock(project_root)? else {
         return Ok(None);
     };
@@ -529,13 +539,13 @@ pub fn ensure_bundle(project_root: &Path, name: &str) -> Result<Option<PathBuf>>
         return Ok(None);
     };
     let store = OciStore::open(crate::oci_store::store_root()?)?;
-    let dest = bundle_dir(project_root, path_component("bundle name", name)?);
-    materialize_bundle(&store, e, &dest)?;
+    let dest = package_dir(project_root, path_component("package name", name)?);
+    materialize_package(&store, e, &dest)?;
     Ok(Some(dest))
 }
 
-/// The bundle names `fluxor.lock` pins, for messages that list them.
-pub fn pinned_bundles(project_root: &Path) -> Vec<String> {
+/// The package names `fluxor.lock` pins, for messages that list them.
+pub fn pinned_packages(project_root: &Path) -> Vec<String> {
     read_store_lock(project_root)
         .ok()
         .flatten()
@@ -1395,7 +1405,7 @@ mod tests {
     }
 
     /// A name or target that is not one path component never reaches a
-    /// path join: a bundle's module name is publisher-authored.
+    /// path join: a package's module name is publisher-authored.
     #[test]
     fn path_components_refuse_separators_and_dots() {
         for ok in ["tls", "bcm2712", "aarch64-unknown-linux-gnu", "a.b"] {

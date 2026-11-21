@@ -1,4 +1,4 @@
-//! `wasm_browser_ws_source` built-in: receive-only WebSocket source
+//! `wasm_browser_ws_source` native module: receive-only WebSocket source
 //! that emits its incoming binary messages on the output channel as a
 //! `VideoRaster` byte stream.
 //!
@@ -13,15 +13,17 @@
 //! the canvas, the wire shape, and the user-visible behaviour are
 //! identical between deployments.
 //!
-//! State is heap-allocated; the BuiltInModule's 64-byte inline state
-//! holds a `*mut WsSourceState` pointer.
+//! State: heap-allocated on the module's own heap; its arena state
+//! holds the `*mut WsSourceState` pointer.
 //!
 //! Backpressure: any non-positive `channel_write` return value stashes
 //! the unwritten tail in `rx` and gates further pulls from the JS
 //! rxQueue until the channel accepts again. Same pattern as
 //! `wasm_browser_websocket`.
 
+use crate::abi::platform::native::wasm::wasm_browser_ws_source as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -94,12 +96,12 @@ unsafe fn shift_consume(buf: *mut u8, len: usize, consumed: usize) -> usize {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn ws_source_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn ws_source_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut WsSourceState);
         if st_ptr.is_null() {
@@ -153,9 +155,21 @@ unsafe fn ws_source_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(url: &[u8], out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_ws_source", ws_source_step);
-    let raw = alloc_state(out_chan, url);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut WsSourceState, raw);
-    m
+/// The `wasm_browser_ws_source` native module.
+pub static WASM_BROWSER_WS_SOURCE: NativeVtable = super::heap_native(new, ws_source_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut url_buf = [0u8; 256];
+    let url = super::param_bytes(init.params, tags::TAG_URL, &mut url_buf);
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_BYTES);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<WsSourceState>(), || {
+            alloc_state(out_chan, url).cast()
+        })
+    }
 }

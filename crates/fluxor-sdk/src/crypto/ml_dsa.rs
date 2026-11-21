@@ -27,7 +27,7 @@
 // depend on, and a signature that silently degrades when the entropy
 // pool is empty is worse than one that never needed it. The cost is the
 // usual one — a deterministic signature is a fault-injection target,
-// which is a physical-access threat the vault's tiering answers, not the
+// which is a physical-access threat the vault's custody answers, not the
 // primitive.
 //
 // Keys by seed. KeyGen is a deterministic function of a 32-byte seed ξ,
@@ -237,7 +237,7 @@ pub fn montgomery_reduce(a: i64) -> i32 {
 /// Two Montgomery reductions rather than one: the first leaves the product
 /// scaled by 2^-32, and the second multiplies that by 2^64 and reduces
 /// again, which cancels the factor exactly. The reference implementations
-/// avoid the second by keeping every coefficient in the Montgomery domain
+/// avoid the second by keeping every coefficient in the Montgomery form
 /// throughout — faster, and a second representation to keep straight in
 /// every packing, sampling and norm path. Here one representation is
 /// carried everywhere and the correction is paid per multiply, which is
@@ -395,14 +395,14 @@ pub fn inv_ntt(p: &mut Poly, zetas: &[i32; N]) {
     }
 }
 
-/// Pointwise product in the NTT domain: `out += a * b`.
+/// Pointwise product in the NTT form: `out += a * b`.
 pub fn pointwise_acc(out: &mut Poly, a: &Poly, b: &Poly) {
     for i in 0..N {
         out[i] = addq(out[i], mulq(a[i], b[i]));
     }
 }
 
-/// Pointwise product in the NTT domain: `out = a * b`.
+/// Pointwise product in the NTT form: `out = a * b`.
 pub fn pointwise(out: &mut Poly, a: &Poly, b: &Poly) {
     for i in 0..N {
         out[i] = mulq(a[i], b[i]);
@@ -547,7 +547,7 @@ pub const fn packed_len(a: i32, b: i32) -> usize {
 // Sampling (FIPS 204 §7.3)
 // ===========================================================================
 
-/// RejNTTPoly: a uniform polynomial in the NTT domain, expanded from
+/// RejNTTPoly: a uniform polynomial in the NTT form, expanded from
 /// `rho ‖ column ‖ row`.
 pub fn rej_ntt_poly(rho: &[u8; 32], row: u8, column: u8, out: &mut Poly) {
     let mut xof = Keccak::new(SHAKE128_RATE, SHAKE_PAD);
@@ -672,21 +672,21 @@ pub fn expand_mask(rho: &[u8; 64], kappa: u16, gamma1: i32, out: &mut [Poly]) {
 /// be at least the set's `k`/`l`; [`K_MAX`]/[`L_MAX`] serve every set.
 pub struct SignWorkspace<const K: usize, const L: usize> {
     pub zetas: [i32; N],
-    /// s1 in the NTT domain.
+    /// s1 in the NTT form.
     pub s1: [Poly; L],
-    /// s2 in the NTT domain.
+    /// s2 in the NTT form.
     pub s2: [Poly; K],
-    /// t0 in the NTT domain.
+    /// t0 in the NTT form.
     pub t0: [Poly; K],
     /// The masking vector, overwritten in place by z.
     pub y: [Poly; L],
-    /// The masking vector in the NTT domain.
+    /// The masking vector in the NTT form.
     pub yhat: [Poly; L],
     /// A·y.
     pub w: [Poly; K],
     /// w - c·s2.
     pub wcs2: [Poly; K],
-    /// The challenge, then the challenge in the NTT domain.
+    /// The challenge, then the challenge in the NTT form.
     pub c: Poly,
     pub tmp: Poly,
     pub tmp2: Poly,
@@ -763,14 +763,14 @@ impl<const K: usize, const L: usize> SignWorkspace<K, L> {
 /// Verification touches no secret, so this type has no `zeroize`.
 pub struct VerifyWorkspace<const L: usize> {
     pub zetas: [i32; N],
-    /// z, transformed in place into the NTT domain. Every column is
+    /// z, transformed in place into the NTT form. Every column is
     /// needed at once — this is the vector the matrix multiplies.
     pub z: [Poly; L],
     /// One row of A·z - c·t1·2^d.
     pub w: Poly,
     /// One row of t1.
     pub t1: Poly,
-    /// The challenge, then the challenge in the NTT domain.
+    /// The challenge, then the challenge in the NTT form.
     pub c: Poly,
     pub tmp: Poly,
     /// The hint bits, one bit per coefficient per row. Fixed at the
@@ -890,7 +890,7 @@ pub fn expand_seed<const K: usize, const L: usize>(
     }
 
     // (t1, t0) <- Power2Round(t). t1 goes into the public key; t0 stays
-    // private and is kept in the NTT domain for signing.
+    // private and is kept in the NTT form for signing.
     pk_out[..32].copy_from_slice(&ws.rho);
     for r in 0..p.k {
         for j in 0..N {
@@ -908,7 +908,7 @@ pub fn expand_seed<const K: usize, const L: usize>(
     xof.update(&pk_out[..p.pk_len]);
     xof.squeeze(&mut ws.tr);
 
-    // s1, s2 into the NTT domain for signing.
+    // s1, s2 into the NTT form for signing.
     for i in 0..p.l {
         ws.s1[i] = ws.yhat[i];
     }
@@ -941,7 +941,7 @@ pub fn ml_dsa_keygen<const K: usize, const L: usize>(
     expand_seed(p, xi, ws, pk_out);
 
     // skEncode: rho ‖ K ‖ tr ‖ s1 ‖ s2 ‖ t0, the vectors packed with
-    // their own bounds. The workspace holds them in the NTT domain, so
+    // their own bounds. The workspace holds them in the NTT form, so
     // each is transformed back into `tmp` for packing.
     sk_out[..32].copy_from_slice(&ws.rho);
     sk_out[32..64].copy_from_slice(&ws.key);
@@ -1030,7 +1030,7 @@ pub fn load_sk<const K: usize, const L: usize>(p: Params, sk: &[u8], ws: &mut Si
 // ===========================================================================
 
 /// The rejection loop, run once the workspace holds rho, key, tr and the
-/// secret vectors in the NTT domain.
+/// secret vectors in the NTT form.
 pub fn sign_expanded<const K: usize, const L: usize>(
     p: Params,
     ws: &mut SignWorkspace<K, L>,

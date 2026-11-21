@@ -123,7 +123,7 @@ fn cmd_validate(
     }
 
     // Dry-run the full config-generation pipeline so missing
-    // manifests, malformed wiring, unknown content types, and tier
+    // manifests, malformed wiring, unknown content types, and exec-mode
     // admission errors all surface as `fluxor build --check` failures
     // instead of waiting for `fluxor build` (which needs firmware
     // + .fmod files on disk). The result blob is discarded —
@@ -1296,7 +1296,8 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
 }
 
 fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &Path) -> Result<()> {
-    let (table, modules) = module_table_bytes(config_path, module_root)?;
+    let config_data = generate_config_bytes(config_path, module_root)?;
+    let (table, modules) = module_table_bytes(config_path, module_root, &config_data)?;
     std::fs::write(output, &table)?;
     println!(
         "{} modules from {} → {}",
@@ -1314,8 +1315,13 @@ fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &P
 type ModuleTable = (Vec<u8>, Vec<(String, usize)>);
 
 /// The module table a hosted build packs for the graph at `config_path`,
-/// with each module's name and size.
-fn module_table_bytes(config_path: &Path, module_root: Option<&Path>) -> Result<ModuleTable> {
+/// compiled to `config_data`, with each module's name and size: the modules
+/// the graph names, and the fans its composed graphs run.
+fn module_table_bytes(
+    config_path: &Path,
+    module_root: Option<&Path>,
+    config_data: &[u8],
+) -> Result<ModuleTable> {
     let mut config: serde_json::Value =
         stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
     let yaml_dir = config_path
@@ -1335,8 +1341,15 @@ fn module_table_bytes(config_path: &Path, module_root: Option<&Path>) -> Result<
     let module_root = target_module_root(module_root, &project_root, &target_desc)?;
     // Pins are tagged by module ABI: filter to the ABI the .fmods come from.
     let store_fb = store_cli::lock_store_resolver(&project_root, target_desc.module_abi(), None);
-    let modules = parse_modules_from_config_multi(
+    let mut modules = parse_modules_from_config_multi(
         &config,
+        &module_root,
+        &[],
+        store_fb.as_deref().map(|f| f as _),
+    )?;
+    crate::modules::add_fan_modules(
+        &mut modules,
+        &config::fan_types(config_data)?,
         &module_root,
         &[],
         store_fb.as_deref().map(|f| f as _),
@@ -1451,8 +1464,8 @@ fn require_firmware_and_modules(
 
 /// [`build_one`] with an explicit `--module-root`: the directory every
 /// `.fmod` the graph names is loaded from, instead of the project's built
-/// modules (`$FLUXOR_MODULE_ROOT` applies when it is `None`). A service
-/// bundle builds from its own pinned modules this way.
+/// modules (`$FLUXOR_MODULE_ROOT` applies when it is `None`). A workload
+/// package builds from its own pinned modules this way.
 fn build_one_from(
     yaml_path: &std::path::Path,
     output_override: Option<&std::path::Path>,
@@ -1639,17 +1652,17 @@ fn build_one_from(
             // binary can't provide fails here with the matching
             // `cargo build` command in the error message.
             validate_linux_runtime_features(yaml_path)?;
-            // One graph image: the config first, so a graph the builder
+            // One node image: the config first, so a graph the builder
             // refuses (an anchor file that does not load, say) leaves nothing
             // behind. Signed with the workspace key when there is one, which
             // a runtime whose image carries that key's root requires.
             let config_data = generate_config_bytes(yaml_path, Some(modules_dir.as_path()))?;
-            let (table, _) = module_table_bytes(yaml_path, Some(&modules_dir))?;
+            let (table, _) = module_table_bytes(yaml_path, Some(&modules_dir), &config_data)?;
             let seed = crate::signing::seed(None, &project_root)?;
-            let image = crate::graph_image::compose(&table, &config_data, 0, seed.as_ref())?;
+            let image = crate::node_image::compose(&table, &config_data, 0, seed.as_ref())?;
             std::fs::write(&output_path, &image)?;
             println!(
-                "graph image {}: modules {} B, config {} B, {}",
+                "node image {}: modules {} B, config {} B, {}",
                 output_path.display(),
                 table.len(),
                 config_data.len(),
@@ -1692,17 +1705,13 @@ fn build_one_from(
             let modules_bin_path = work_dir.join(format!("{name}.modules.bin"));
             let config_bin_path = work_dir.join(format!("{name}.config.bin"));
 
-            cmd_mktable_config(yaml_path, Some(&modules_dir), &modules_bin_path)?;
-            cmd_generate(
-                yaml_path,
-                Some(config_bin_path.as_path()),
-                Some(modules_dir.as_path()),
-                true,
-            )?;
+            let config_bin = generate_config_bytes(yaml_path, Some(modules_dir.as_path()))?;
+            std::fs::write(&config_bin_path, &config_bin)?;
+            let (modules_bin, _) =
+                module_table_bytes(yaml_path, Some(&modules_dir), &config_bin)?;
+            std::fs::write(&modules_bin_path, &modules_bin)?;
 
             let kernel_bytes = std::fs::read(&kernel_wasm_path)?;
-            let modules_bin = std::fs::read(&modules_bin_path)?;
-            let config_bin = std::fs::read(&config_bin_path)?;
             let mut bundled = wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
 
             // Asset bank: bake graph-declared assets into the wasm via
@@ -1745,7 +1754,7 @@ fn build_one_from(
 
 // ── Polymorphic `fluxor inspect` ─────────────────────────────────────
 
-/// Flag bundle for the polymorphic `fluxor inspect`: one read-only verb
+/// Flag set for the polymorphic `fluxor inspect`: one read-only verb
 /// over project / config / UF2 / store subjects.
 struct InspectFlags {
     json: bool,
@@ -1875,7 +1884,7 @@ fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
         (epoch, current_epoch.as_deref()),
         (Some(e), Some(c)) if e == c
     );
-    // A workload image's config: the env names a pod must give it.
+    // A workload image's config: the env names a workload must give it.
     let workload = fluxor_tools::oci_store::workload_image_config(&store, &manifest)
         .map_err(|e| Error::Config(e.to_string()))?;
     if json {

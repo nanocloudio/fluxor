@@ -2,10 +2,12 @@
 //
 // Layer: internal (unstable, kernel-private).
 
-/// Get bridge info. handle=the bridge, arg=16-byte output buffer.
-/// Returns: [type:u8, 0:u8, from:u16 LE, to:u16 LE, 0:u16, drops:u32 LE,
-/// seq:u32 LE]
+/// Get bridge info. handle=the bridge, arg=[`INFO_LEN`]-byte output buffer.
+/// Returns [`INFO_LEN`]: [0:u16, from:u16 LE, to:u16 LE, 0:u16, drops:u32 LE,
+/// 0:u32].
 pub use super::super::registry::bridge::INFO;
+/// [`INFO`]'s answer length.
+pub const INFO_LEN: usize = 16;
 /// Poll bridge readiness. handle=the bridge. Returns 1 if readable, 0 if not.
 pub use super::super::registry::bridge::POLL;
 /// Read data from a bridge channel.
@@ -21,10 +23,10 @@ pub use super::super::registry::bridge::WRITE;
 /// module's bridges of that direction. Returns the bridge's handle, usable
 /// with `WRITE` / `READ` / `POLL` / `INFO` and `HANDLE_POLL`; `ENOENT` past
 /// the module's last bridge of `dir`, `ENODEV` when the caller is not an
-/// ISR-tier module with wired bridges.
+/// interrupt-mode module with wired bridges.
 ///
-/// This is the module-facing half of the ISR-tier I/O contract: an ISR-tier
-/// module (Tier 1b / Tier 2) takes its bridge handles in `module_new`, then
+/// This is the module-facing half of the interrupt-mode I/O contract: an interrupt-mode
+/// module (`timer`/`irq`) takes its bridge handles in `module_new`, then
 /// moves data through them with the bridge ops above — exempt from the §D7
 /// ISR-context syscall deny because the underlying ring operations are
 /// lock-free and allocation-free. Taking a handle mints a kernel route, which
@@ -38,12 +40,12 @@ pub const DIR_IN: u8 = 0;
 /// [`SELF_BRIDGE`] `dir`: a bridge the module writes.
 pub const DIR_OUT: u8 = 1;
 
-/// Maximum bridge endpoints per ISR-tier module and direction (matches the
-/// kernel's `isr_tier::MODULE_MAX_BRIDGES`).
+/// Maximum bridge endpoints per interrupt-mode module and direction (matches the
+/// kernel's `interrupt::MODULE_MAX_BRIDGES`).
 pub const MAX_BRIDGES_PER_MODULE: usize = 4;
 
-/// True for the bridge ops an ISR-tier module may call (the §D7 syscall deny
-/// exempts these). The underlying `RingBridge` push/pop/peek are lock-free
+/// True for the bridge ops an interrupt-mode module may call (the §D7 syscall deny
+/// exempts these). The underlying ring push/pop/peek are lock-free
 /// and allocation-free, so the data ops are safe to invoke from
 /// `module_isr_entry`.
 pub const fn is_isr_safe(op: u32) -> bool {

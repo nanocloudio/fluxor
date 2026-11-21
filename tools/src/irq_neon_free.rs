@@ -4,7 +4,7 @@
 //! The EL1 IRQ vector saves general registers only, so any vector register,
 //! FPSR or FPCR the kernel's IRQ path writes is a value of the interrupted
 //! code lost. Module code runs from IRQ context only through
-//! `fluxor_tier2_isr_frame`, which keeps the whole FP/SIMD state around it;
+//! `fluxor_irq_fp_frame`, which keeps the whole FP/SIMD state around it;
 //! everything else on the path must be scalar. The compiler is free to emit
 //! SIMD anywhere on a `+neon` target, its `memset`/`memcpy` included, so
 //! this is checked on the linked image, not the source.
@@ -27,12 +27,12 @@ use std::process::Command;
 /// functions it reaches that the build keeps out of line for this walk.
 pub const ROOTS: &[&str] = &[
     "irq_handler",
-    "fluxor::kernel::exec::isr_tier::isr_tier2_trampoline",
+    "fluxor::kernel::exec::irq::irq_trampoline",
     "fluxor::kernel::ipc::event::event_signal_from_isr",
 ];
 
 /// The functions allowed FP/SIMD registers. The walk does not enter them.
-pub const ALLOWED: &[&str] = &["fluxor_tier2_isr_frame"];
+pub const ALLOWED: &[&str] = &["fluxor_irq_fp_frame"];
 
 /// Functions on the IRQ path that branch through a register, with every
 /// function the register can hold. A target that is not in a given image
@@ -44,13 +44,14 @@ pub const INDIRECT: &[IndirectSite] = &[
         targets: &["fluxor::pcie1_msi_mux"],
     },
     IndirectSite {
-        function: "fluxor::kernel::exec::isr_tier::isr_tier2_trampoline",
-        what: "HAL `core_id` and `read_cycle_count`",
+        function: "fluxor::kernel::exec::irq::irq_trampoline",
+        what: "HAL `core_id`, `read_cycle_count` and `irq_mask`",
         targets: &[
             "fluxor::bcm_core_id",
             "fluxor::bcm_read_cycle_count",
             "fluxor::hal::core_id",
             "fluxor::hal::read_cycle_count",
+            "fluxor::arch::aarch64::gic::irq_mask",
         ],
     },
     IndirectSite {

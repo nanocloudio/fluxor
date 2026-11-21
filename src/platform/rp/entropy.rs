@@ -29,7 +29,7 @@
 //!
 //! # What is here now
 //!
-//! A source with a declared quality tier, and a conditioning step that no
+//! A source with a declared quality grade, and a conditioning step that no
 //! caller can skip:
 //!
 //! - **RP2350** reads its TRNG, and a health-test failure is reported rather

@@ -120,7 +120,7 @@ RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/
 shadow-add:
 	@git shadow add -f -- tests tools/tests tools/rig examples ':(exclude)**/target/**' ':(exclude)**/__pycache__/**'
 
-# One kernel: build + objcopy to a raw boot image.
+# One kernel: build + objcopy to a raw kernel image.
 #   make firmware TARGET=pico2w   # a BOARD id (targets/boards/), or a host token
 firmware:
 	@tools/firmware.sh $(TARGET)

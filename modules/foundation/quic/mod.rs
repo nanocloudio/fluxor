@@ -216,16 +216,16 @@ const MAX_TICKETS: usize = 4;
 /// uptime reading a restart moves backwards, which pins `elapsed` at zero
 /// and satisfies the lifetime check for good.
 ///
-/// So the AAD carries this instance's replay domain, drawn once from the
+/// So the AAD carries this instance's replay scope, drawn once from the
 /// CSPRNG and living exactly as long as the store beside it. A ticket
-/// minted under any other domain — another boot, or another instance in
+/// minted under any other scope — another boot, or another instance in
 /// this one — does not fail a check: it does not open. Anything longer
 /// lived than the store would not do: a value scoped to the boot, say,
 /// survives a re-instantiation and would let the replacement re-open every
 /// ticket its predecessor had already spent (RFC 8446 §8, RFC 9001 §9.2).
 const TICKET_AAD: &[u8] = b"quic-ticket";
 fluxor_rt::name_table!(TICKET_LABEL = [b"quic-resume-0", b"quic-resume-1"]);
-/// `TICKET_AAD` + parity + this instance's replay domain. Derived from the
+/// `TICKET_AAD` + parity + this instance's replay scope. Derived from the
 /// label rather than written out, so changing the label cannot leave a
 /// stale length behind that still compiles.
 const TICKET_AAD_LEN: usize = TICKET_AAD.len() + 1 + 16;
@@ -394,10 +394,10 @@ pub(crate) struct QuicState {
     ticket_rotated_ms: u64,
     /// Accepted tickets held against replay for their acceptance window.
     ticket_seen: [TicketClaim; TICKET_SEEN],
-    /// The domain the store above defends, mixed into every ticket's AAD.
+    /// The scope the store above defends, mixed into every ticket's AAD.
     /// Drawn on first use rather than at construction, since the entropy
     /// source need not have answered by then; all-zero means undrawn.
-    replay_domain: [u8; 16],
+    replay_scope: [u8; 16],
     /// Client-side ticket cache (per-peer).
     client_tickets: [ClientTicketEntry; MAX_TICKETS],
     /// Set after the client kicks off a 0-RTT resumption attempt so
@@ -455,7 +455,7 @@ pub(crate) struct QuicState {
     /// (cadence gated on `dev_millis` — quic has no per-step counter).
     tlm: TlmCounters,
     tlm_last_ms: u64,
-    /// Head-sampling rate (per-mille) for `quic.connection` spans. Target-tier
+    /// Head-sampling rate (per-mille) for `quic.connection` spans. Per-target
     /// default: 50‰ on aarch64 (pi5-class), 0‰ on MCUs. Decided per accepted
     /// connection from its minted trace id.
     sample_permille: u16,
@@ -531,7 +531,7 @@ fluxor_rt::define_params! {
 
     // Head-sampling rate (per-mille, 0..=1000) for the connection/request
     // spans. Default sentinel `0xFFFF` ("unset") so `module_new` applies the
-    // target-tier default (aarch64 50‰ / MCU 0‰) only when not given.
+    // per-target default (aarch64 50‰ / MCU 0‰) only when not given.
     11, trace_sample_permille, u16, 0xFFFF
         => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 0xFFFF); };
 
@@ -856,7 +856,7 @@ pub unsafe extern "C" fn module_new(
     s.ticket_rotate_s = 3600;
     s.ticket_rotated_ms = 0;
     s.ticket_seen = [TicketClaim::EMPTY; TICKET_SEEN];
-    s.replay_domain = [0u8; 16];
+    s.replay_scope = [0u8; 16];
     s.pending_resumption_test = false;
     s.alpn_cfg_len = 0;
     s.alpn_refused = false;
@@ -950,7 +950,7 @@ pub unsafe extern "C" fn module_new(
         return -1;
     }
 
-    // Resolve the target-tier head-sampling default only when
+    // Resolve the per-target head-sampling default only when
     // `trace_sample_permille` was not explicitly supplied (still the sentinel):
     // aarch64 (pi5-class) 50‰, MCUs 0‰. An explicit value (incl. 0) is honoured.
     if s.sample_permille == 0xFFFF {
@@ -1621,32 +1621,32 @@ unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
 }
 
 /// The AAD both seal and open must agree on: label, parity, and the replay
-/// domain that ties a ticket to the store enforcing its single use.
-fn ticket_aad(parity: u8, domain: &[u8; 16]) -> [u8; TICKET_AAD_LEN] {
+/// scope that ties a ticket to the store enforcing its single use.
+fn ticket_aad(parity: u8, scope: &[u8; 16]) -> [u8; TICKET_AAD_LEN] {
     let mut aad = [0u8; TICKET_AAD_LEN];
     aad[..TICKET_AAD.len()].copy_from_slice(TICKET_AAD);
     aad[TICKET_AAD.len()] = parity;
-    aad[TICKET_AAD.len() + 1..].copy_from_slice(domain);
+    aad[TICKET_AAD.len() + 1..].copy_from_slice(scope);
     aad
 }
 
-/// This instance's replay domain, drawn on first use. `None` while the
-/// entropy source has not answered: a domain of zeros is the absence of
+/// This instance's replay scope, drawn on first use. `None` while the
+/// entropy source has not answered: a scope of zeros is the absence of
 /// one, and issuing or accepting under it would let any instance open
 /// another's tickets.
 ///
-/// Takes the domain itself rather than the state, so the borrow stays
+/// Takes the scope itself rather than the state, so the borrow stays
 /// disjoint from a connection being driven — the same shape
 /// [`ticket_claim_held`] uses for the store beside it.
-unsafe fn replay_domain(domain: &mut [u8; 16], sys: &SyscallTable) -> Option<[u8; 16]> {
-    if *domain != [0u8; 16] {
-        return Some(*domain);
+unsafe fn replay_scope(scope: &mut [u8; 16], sys: &SyscallTable) -> Option<[u8; 16]> {
+    if *scope != [0u8; 16] {
+        return Some(*scope);
     }
     let mut v = [0u8; 16];
     if dev_csprng_fill(sys, v.as_mut_ptr(), 16) < 0 || v == [0u8; 16] {
         return None;
     }
-    *domain = v;
+    *scope = v;
     Some(v)
 }
 

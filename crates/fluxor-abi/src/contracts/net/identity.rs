@@ -18,9 +18,9 @@
 // ─── Provider discovery (self-registration) ─────────────────────────
 //
 // The provider SELF-REGISTERS at init via the `NET_IDENT_PROVIDER` syscall
-// (`kernel_abi::NET_IDENT_PROVIDER`), declaring its own `addr_ctl` and
-// net-ingress input-port indices. The kernel therefore never knows the
-// provider's name or fixes its topology — any base-graph (system-owned)
+// (`kernel_abi::NET_IDENT_PROVIDER`), declaring its own `addr_ctl`
+// input-port index. The kernel therefore never knows the
+// provider's name or fixes its topology — any node-graph (node-owned)
 // module implementing this contract's `addr_ctl` receiver may register;
 // first-wins, workload modules are refused. A node where nothing registers
 // simply has no net-identity provider, and a `net=own` CREATE there fails

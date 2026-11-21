@@ -82,7 +82,7 @@ pub enum Access {
     /// Read and execute: code, the gateway's veneers.
     ReadExec,
     /// Read only, never execute: data a module owns but must not change or
-    /// run, such as the programs its bundle carries for it.
+    /// run, such as the programs its image carries for it.
     Read,
     /// Read and write, never execute: state, heap, stack.
     ReadWrite,

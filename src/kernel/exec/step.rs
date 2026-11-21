@@ -1,7 +1,7 @@
 //! What a module's step answers, and the trait the scheduler steps.
 //!
-//! Every slot the scheduler runs (a loaded module, a built-in, a tee or a
-//! merge) implements [`Module`]. A loaded module answers through the
+//! Every instance the scheduler runs (a loaded module or a native one)
+//! implements [`Module`]. A loaded module answers through the
 //! `module_step` wire value, whose codes are
 //! `fluxor_abi::kernel_abi::step_return`; [`StepOutcome::from_wire`] is the
 //! one place they are read.
@@ -53,16 +53,12 @@ pub trait Module {
 
     /// Refill a pipeline input between bounded graph passes. Returns true only
     /// when new work was admitted and another pass can make progress.
-    fn pipeline_refill(&mut self) -> Result<bool, i32> {
-        Ok(false)
-    }
+    fn pipeline_refill(&mut self) -> Result<bool, i32>;
 
     /// Ship output produced by the completed graph pass without re-running
-    /// the module's input/RX path. Modules opt in by exporting the matching
-    /// ABI hook; the default is a no-op.
-    fn post_tick_flush(&mut self) -> Result<(), i32> {
-        Ok(())
-    }
+    /// the module's input/RX path; `Ok` with nothing done for a module that
+    /// has no flush hook.
+    fn post_tick_flush(&mut self) -> Result<(), i32>;
 
     /// The slot's name, for logging.
     fn name(&self) -> &'static str;

@@ -54,7 +54,7 @@ wiring:
 EOF
 ```
 
-`fluxor run` compiles the YAML into a graph image (the binary config
+`fluxor run` compiles the YAML into a node image (the binary config
 and the module artefacts it names) and launches the `fluxor-linux`
 runtime on it. Startup logs similar to these mean the graph is live:
 
@@ -62,7 +62,7 @@ runtime on it. Startup logs similar to these mean the graph is live:
 [... INFO fluxor_linux] [fluxor] linux platform boot
 [... INFO fluxor::kernel::module::loader] [inst] loaded dns
 [... INFO fluxor_linux] [inst] 2 of 2 modules loaded
-[... INFO fluxor_linux] [sched] starting main loop, tick_us=1000
+[... INFO fluxor_linux] [sched] starting domain loop, tick_us=1000
 ```
 
 The scheduler also warns that it is accepting cycle modules:
@@ -98,7 +98,7 @@ run is stateless; running the command again starts fresh.
 ## Running a published service
 
 A service another project publishes is run by name. The consuming
-project lists the publisher under `[dependencies]` and the bundle under
+project lists the publisher under `[dependencies]` and the workload package under
 `[uses] bundles` in its `fluxor.toml`, and `fluxor update` pins it:
 
 ```sh
@@ -106,7 +106,7 @@ fluxor update
 fluxor run dns_service --param port=15353 --param answer=10.1.2.3
 ```
 
-[service-bundles.md](service-bundles.md) covers the params a graph declares
+[workload-packages.md](workload-packages.md) covers the params a graph declares
 and how a service is published.
 
 ## Richer graphs

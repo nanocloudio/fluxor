@@ -9,7 +9,7 @@
  * pointer inside RAM, vector 1 carries its Thumb bit, and
  * `__sdata`/`__edata`/`__sidata`/`__sbss`/`__ebss` come out consistent.
  * Those are exactly the properties
- * `tools/img/verify_boot_image.py` checks in a built image, so the script and
+ * `tools/img/verify_firmware_image.py` checks in a built image, so the script and
  * the gate agree on what correct means.
  *
  * # What the ordering is for

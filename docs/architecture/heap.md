@@ -151,7 +151,7 @@ modules:
 
 A positive integer number of bytes (at least 24, at most `u32::MAX`). The
 tools pack it as params tag `0xEF` (a u32 LE) beside the other per-module
-kernel tags, in a base graph's module entry and a workload module's params
+kernel tags, in a node graph's module entry and a workload module's params
 alike; the kernel reads it before it sizes the heap. It is not a node tag: a
 workload module may set it, and its owner is charged for it.
 
@@ -177,7 +177,7 @@ cap stands; past it, it emits tag `0xEF` = `base + (total - included)`. An
 explicit `heap.arena_bytes` wins, with a warning when it is below
 `base - included + total`. A variant whose feature set moves the rest of the
 heap overrides fields under `[variant.capacities] heap_from_params` (unset
-fields keep the module-scope rule's). Base-graph modules and workload modules
+fields keep the module-scope rule's). Node-graph modules and workload modules
 are sized the same way.
 
 `base` is a copy of a figure the module computes, so it is checked rather
@@ -206,7 +206,7 @@ heap_per_demand = { pool = "store_subs", bytes_each = 96 }
 | `base` | the type's default cap, stated only by a type without a `heap_from_params` rule (whose `base` it otherwise is); `pack` holds it to the declared arena as it does that rule's |
 
 Every instance of the type gets `bytes_each` × the pool's **full planned
-ceiling**: what the graph's instances declare for it (base graph and resident
+ceiling**: what the graph's instances declare for it (node graph and resident
 workloads, a module-provided pool's demand included — the provider serves
 it), plus the pool's `capacity:` entry, else the profile's default reserve.
 That is summed with `heap_from_params`: the cap is that rule's figure (its
@@ -299,8 +299,8 @@ own `define_params!` schema, and every `heap_from_params` tag a param of it:
 `pack` refuses a rule that names anything else, which would count nothing.
 
 A graph's own figure for an instance — `demand: { store_subs: 12 }` on its
-module entry — wins over both. Resident workloads are counted like base
-modules. When the base graph has an unkeyed module provider of
+module entry — wins over both. Resident workloads are counted like node-graph
+modules. When the node graph has an unkeyed module provider of
 `storage.namespace` (no `volume` selector), the `store_subs` demand is left
 off the host table (its consumers call the module) and carried by that
 provider's `heap_per_demand` figure instead, so it is spent once.

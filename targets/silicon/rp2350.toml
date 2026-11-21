@@ -375,7 +375,7 @@ ticks_base = "0x40108000"
 # Alarms this kernel owns, with the NVIC line each raises.
 alarms = [
     { index = 0, owner = "step_guard", irq = 4 },
-    { index = 1, owner = "tier1b", irq = 5 },
+    { index = 1, owner = "module_timer", irq = 5 },
     { index = 2, owner = "scheduler", irq = 6 },
 ]
 # Alarms on `monotonic` left free for the timer provider.

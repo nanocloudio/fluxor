@@ -21,7 +21,7 @@ pub use fluxor_contracts::owner_plan::{Assignment, Lease, Plan, Revocation};
 
 use crate::kernel::workload::owner::MAX_OWNERS;
 
-/// At most one assignment per owner slot: the owner-slot domain. A slot past
+/// At most one assignment per owner slot: the owner-slot range. A slot past
 /// the live owner table is refused when the plan is validated.
 pub const MAX_PLAN_ASSIGNMENTS: usize = MAX_OWNERS;
 
@@ -30,7 +30,7 @@ pub const MAX_PLAN_ASSIGNMENTS: usize = MAX_OWNERS;
 pub enum PlanError {
     /// The codec refused the bytes (framing, limits, digest).
     Codec(codec::PlanError),
-    /// A slot is the system slot (0) or beyond the owner table.
+    /// A slot is the node owner's slot (0) or beyond the owner table.
     SlotOutOfRange,
     /// Two assignments claim the same owner slot.
     DuplicateSlot,
@@ -46,7 +46,9 @@ impl core::fmt::Display for PlanError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Codec(e) => f.write_str(e.kind()),
-            Self::SlotOutOfRange => write!(f, "slot is the system slot or past the owner table"),
+            Self::SlotOutOfRange => {
+                write!(f, "slot is the node owner's slot or past the owner table")
+            }
             Self::DuplicateSlot => write!(f, "two assignments claim one slot"),
             Self::OverlappingModules => write!(f, "two assignments' module ranges overlap"),
             Self::ModuleRangeOutOfRange => write!(f, "module range past the module table"),
@@ -75,7 +77,7 @@ pub fn decode(bytes: &[u8]) -> Result<Plan<'_>, PlanError> {
     // that the plan is coherent. The kernel does not trust the composer's
     // promise of unique slots / non-overlapping ranges — a corrupt or hostile
     // plan is rejected here rather than applied (a partial apply would leave
-    // modules with stale handles or the system owner, silently disabling
+    // modules with stale handles or the node owner, silently disabling
     // isolation). Validate assignments AND revocations under one rule set: a
     // draining owner still occupies its slot and module range, so revocations
     // participate in the same duplicate/overlap checks.
@@ -84,7 +86,7 @@ pub fn decode(bytes: &[u8]) -> Result<Plan<'_>, PlanError> {
             .chain(plan.revocations().map(|r| r.assignment))
     };
     for (i, a) in records().enumerate() {
-        // Slot 0 is the system owner (reserved); slot must be a real workload
+        // Slot 0 is the node owner (reserved); slot must be a real workload
         // slot within the owner table.
         if a.slot == 0 || a.slot as usize >= crate::kernel::exec::scheduler::owners().slot_count() {
             return Err(PlanError::SlotOutOfRange);
@@ -130,7 +132,7 @@ pub fn apply(plan: &Plan<'_>) -> usize {
         {
             installed += 1;
             // `install` reset the owner's log ring iff this is a genuinely
-            // new tenant on the slot; a same-triple reinstall (every routine
+            // new owner on the slot; a same-triple reinstall (every routine
             // rebuild) keeps the ring and its seq counter.
             let base = a.module_base as usize;
             let end = base.saturating_add(a.module_count as usize);
@@ -146,9 +148,9 @@ pub fn apply(plan: &Plan<'_>) -> usize {
 
 // ============================================================================
 // Staged-plan delivery (node-agent stages a plan; the
-// platform applies it BEFORE instantiation so module_new sees tenant ownership,
+// platform applies it BEFORE instantiation so module_new sees workload ownership,
 // and RE-applies the retained plan on every rebuild since prepare_graph resets
-// every module to the system owner)
+// every module to the node owner)
 // ============================================================================
 
 /// Pending staged plan `(ptr, len)`, set by the node agent / platform before the
@@ -165,10 +167,13 @@ static mut LAST_APPLIED_GENERATION: u64 = 0;
 static mut LAST_APPLIED_DIGEST: [u8; 32] = [0; 32];
 
 /// The last successfully-applied plan, retained so a graph rebuild (which runs
-/// `prepare_graph`, resetting every module to the system owner) can RE-apply it
+/// `prepare_graph`, resetting every module to the node owner) can RE-apply it
 /// without a fresh staged blob. `None` until the first plan is applied. A view
 /// over the staged bytes, which live for the run ([`set_staged_plan`]).
 static mut RETAINED_PLAN: Option<Plan<'static>> = None;
+
+/// The staged bytes [`RETAINED_PLAN`] is a view over.
+static mut RETAINED_BYTES: *const u8 = core::ptr::null();
 
 /// Generation of the last successfully-applied plan (0 = none yet). Lets the
 /// platform's owner-status writer stamp which plan generation the live state
@@ -199,6 +204,14 @@ pub unsafe fn set_staged_plan(ptr: *const u8, len: usize) {
     *p = Some((ptr, len));
 }
 
+/// The bytes the retained (last applied) plan is a view over, so a platform
+/// that owns its staged buffers keeps them while the kernel reads them.
+pub fn retained_plan_bytes() -> Option<*const u8> {
+    // SAFETY: scheduler-thread read of a scalar.
+    let p = unsafe { *core::ptr::addr_of!(RETAINED_BYTES) };
+    (!p.is_null()).then_some(p)
+}
+
 /// Test-only: clear all staged/retained plan state so a test starts from a
 /// clean slate (the retained plan + last-applied generation are process-global).
 #[doc(hidden)]
@@ -213,6 +226,7 @@ pub fn reset_staged_plan_for_test() {
         *lg = 0;
         *ld = [0; 32];
         *rp = None;
+        *core::ptr::addr_of_mut!(RETAINED_BYTES) = core::ptr::null();
     }
 }
 
@@ -379,6 +393,7 @@ pub fn try_apply_drain_delta(arm: impl FnMut(DrainArm)) -> Option<usize> {
         LAST_APPLIED_GENERATION = generation;
         LAST_APPLIED_DIGEST = plan.digest;
         RETAINED_PLAN = Some(plan);
+        *core::ptr::addr_of_mut!(RETAINED_BYTES) = ptr;
     }
     log::info!("[owner] drain delta applied: {armed} drains armed (gen {generation})");
     Some(armed)
@@ -441,19 +456,19 @@ pub fn arm_staged_revocation_drains(arm: impl FnMut(DrainArm)) -> usize {
 
 /// Establish plan ownership for the graph. Called by the platform BEFORE module
 /// instantiation (so `module_new`'s provider handles are recorded under the
-/// module's tenant owner, not the system owner) and again on every rebuild.
+/// module's workload owner, not the node owner) and again on every rebuild.
 ///
 /// - A newly-staged plan (a plan-file update) is decoded, validated,
 ///   rollback-checked, applied, and RETAINED.
 /// - With no newly-staged plan but a retained one, it is RE-applied: a rebuild
-///   ran `prepare_graph`, which reset every module to the system owner, so
+///   ran `prepare_graph`, which reset every module to the node owner, so
 ///   isolation must be re-established. An ordinary rebuild must NOT drop
 ///   ownership.
 /// - With nothing ever staged, returns `Ok(0)` — the legitimate no-plan case.
 ///
 /// Returns `Err` only when a staged plan is invalid. The platform MUST fail
 /// closed on `Err`: a corrupt/rolled-back plan must reject the graph, never fall
-/// back to running it system-owned, which would silently disable multi-tenant
+/// back to running it node-owned, which would silently disable multi-owner
 /// enforcement.
 pub fn apply_staged() -> Result<usize, PlanError> {
     let Some((ptr, len)) = take_staged_plan() else {
@@ -496,6 +511,7 @@ pub fn apply_staged() -> Result<usize, PlanError> {
         *last_mut = generation;
         *digest_mut = plan.digest;
         *retained = Some(plan);
+        *core::ptr::addr_of_mut!(RETAINED_BYTES) = ptr;
     }
     log::info!("[owner] applied staged plan: {n} owners (gen {generation})");
     Ok(n)

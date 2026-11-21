@@ -3,8 +3,8 @@
 //! `src/kernel/config.rs`, which this crate embeds at build time. Nothing here
 //! restates a kernel figure: a profile's static pool sizes are its
 //! `STATIC_POOLS` table, its default reserves its `DEFAULT_RESERVES`, and the
-//! arenas and module domain the constants those tables name; the owner-slot
-//! domain is read the same way from `src/kernel/workload/owner.rs`. A kernel
+//! arenas and module range the constants those tables name; the owner-slot
+//! range is read the same way from `src/kernel/workload/owner.rs`. A kernel
 //! change is therefore a tools rebuild, never an edit here.
 //!
 //! With those figures the composer runs the kernel's boot plan
@@ -22,7 +22,7 @@ const KERNEL_CONFIG: &str = include_str!("../../src/kernel/config.rs");
 
 use fluxor_contracts::boot_config::WorkloadRecord;
 
-/// The kernel's owner table, embedded for its owner-slot domain
+/// The kernel's owner table, embedded for its owner-slot range
 /// (`MAX_OWNERS`), which it states per platform.
 const KERNEL_OWNER: &str = include_str!("../../src/kernel/workload/owner.rs");
 
@@ -166,7 +166,7 @@ pub fn kernel_has_pool(target: &str, pool: &str) -> bool {
 /// Whether `target`'s kernel sizes its edge and channel tables at boot from
 /// the graph (Linux, bcm2712, uefi) rather than compiling them at the
 /// profile's `GRAPH_EDGES` (RP and wasm), which is then also its channel-id
-/// domain.
+/// range.
 pub fn edge_tables_sized_at_boot(target: &str) -> bool {
     matches!(
         kernel_profile(target),
@@ -175,13 +175,13 @@ pub fn edge_tables_sized_at_boot(target: &str) -> bool {
 }
 
 /// Kernel `MAX_MODULES` for the profile a target compiles: the module-index
-/// domain, within which Linux, bcm2712, uefi and RP size their module tables
+/// range, within which Linux, bcm2712, uefi and RP size their module tables
 /// from the graph; wasm's static module table.
 pub fn kernel_max_modules(target: &str) -> usize {
     eval(profile_body(kernel_profile(target)), "MAX_MODULES").unwrap_or(32) as usize
 }
 
-/// Graph edges a target's kernel admits, and so its channel-id domain
+/// Graph edges a target's kernel admits, and so its channel-id range
 /// (`MAX_GRAPH_EDGES`, `MAX_CHANNELS`): the static profile's compiled
 /// `GRAPH_EDGES`, or on Linux, bcm2712 and uefi, whose tables are sized at
 /// boot, [`BOOT_SIZED_MAX_EDGES`].
@@ -297,60 +297,60 @@ fn cfg_const(src: &str, cfg: Option<&str>, name: &str) -> Option<u64> {
     None
 }
 
-/// The owner-slot domain (`MAX_OWNERS`, `src/kernel/workload/owner.rs`), the
-/// system slot included: one constant on every kernel. What a node holds is
+/// The owner-slot range (`MAX_OWNERS`, `src/kernel/workload/owner.rs`), the
+/// node owner's slot included: one constant on every kernel. What a node holds is
 /// its plan's `owners` ceiling within it.
 pub fn kernel_max_owners(_target: &str) -> u64 {
     cfg_const(KERNEL_OWNER, None, "MAX_OWNERS").unwrap_or(1)
 }
 
 /// The Linux host-process backend, embedded for its sandbox and PTY-session
-/// index domains.
+/// index ranges.
 const KERNEL_HOST_BACKEND: &str = include_str!("../../src/platform/linux/host_backend.rs");
 
-/// The index domain the kernel holds `pool`'s table within on `target`, with
-/// what the domain is: a boot plan whose ceiling passes it is refused at boot
-/// naming the pool. `None` for a pool with no such domain (its table is bound
+/// The index range the kernel holds `pool`'s table within on `target`, with
+/// what the range is: a boot plan whose ceiling passes it is refused at boot
+/// naming the pool. `None` for a pool with no such range (its table is bound
 /// only by the memory the platform gives it).
-pub fn kernel_pool_domain(target: &str, pool: &str) -> Option<(u64, &'static str)> {
+pub fn kernel_pool_range(target: &str, pool: &str) -> Option<(u64, &'static str)> {
     let linux = kernel_profile(target) == "profile_linux";
     match pool {
         "module_slots" => Some((
             kernel_max_modules(target) as u64,
-            "module-index domain (MAX_MODULES)",
+            "module-index range (MAX_MODULES)",
         )),
         "channels" => Some((
             kernel_max_edges(target) as u64,
-            "channel-id domain (MAX_CHANNELS)",
+            "channel-id range (MAX_CHANNELS)",
         )),
-        "owners" => Some((kernel_max_owners(target), "owner-slot domain (MAX_OWNERS)")),
+        "owners" => Some((kernel_max_owners(target), "owner-slot range (MAX_OWNERS)")),
         "events" | "timers" | "handles" => Some((
-            handle_index_domain(),
-            "handle index domain (handle::INDEX_LIMIT)",
+            handle_index_range(),
+            "handle index range (handle::INDEX_LIMIT)",
         )),
         "sandboxes" if linux => cfg_const(KERNEL_HOST_BACKEND, None, "MAX_SANDBOXES")
-            .map(|n| (n, "sandbox-index domain (MAX_SANDBOXES)")),
+            .map(|n| (n, "sandbox-index range (MAX_SANDBOXES)")),
         "tty_sessions" if linux => cfg_const(KERNEL_HOST_BACKEND, None, "MAX_TTY_SESSIONS")
-            .map(|n| (n, "session-id domain (MAX_TTY_SESSIONS)")),
+            .map(|n| (n, "session-id range (MAX_TTY_SESSIONS)")),
         _ => None,
     }
 }
 
-/// Slots a handle's index field can name (`handle::INDEX_LIMIT`): the domain
+/// Slots a handle's index field can name (`handle::INDEX_LIMIT`): the range
 /// of every table a handle names a slot of (events, timers, routed handles).
-fn handle_index_domain() -> u64 {
+fn handle_index_range() -> u64 {
     fluxor_abi::registry::handle::INDEX_LIMIT as u64
 }
 
 /// What a config gives the kernel's boot plan to derive pool sizes from
-/// (`resource_ledger::plan`): its base graph and its resident workloads.
+/// (`resource_ledger::plan`): its node graph and its resident workloads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GraphShape {
-    /// Base-graph modules.
+    /// Node-graph modules.
     pub modules: u64,
-    /// Base-graph edges.
+    /// Node-graph edges.
     pub edges: u64,
-    /// Tees and merges graph preparation inserts ([`fan_count`]).
+    /// Ports carrying two or more edges ([`fan_count`]).
     pub fans: u64,
     /// Resident workloads (the `WKLD` section).
     pub workloads: u64,
@@ -358,13 +358,13 @@ pub struct GraphShape {
     pub workload_modules: u64,
     /// Their edges, summed.
     pub workload_edges: u64,
-    /// Base-graph edges that cross execution domains ([`crossing_count`]):
+    /// Node-graph edges that cross execution domains ([`crossing_count`]):
     /// where the kernel bridges domains ([`kernel_bridges_domains`]) each
     /// takes a second channel, its consumer side.
     pub crossings: u64,
 }
 
-/// Base-graph edges that cross execution domains, as the kernel's plan counts
+/// Node-graph edges that cross execution domains, as the kernel's plan counts
 /// them (`resource_ledger::cross_domain_edges`): an edge whose two modules sit
 /// in different domains, or whose edge class is cross-core. Each edge is
 /// `(from domain, to domain, cross_core)`; a tee or merge takes the domain of
@@ -376,9 +376,10 @@ pub fn crossing_count(edges: impl IntoIterator<Item = (Option<u8>, Option<u8>, b
         .count() as u64
 }
 
-/// Tees and merges graph preparation inserts for `edges`, as the kernel's
-/// plan counts them (`resource_ledger::fan_count`): one per port carrying two
-/// or more edges in the same direction, an upper bound. Each edge is
+/// Ports of `edges` carrying two or more edges in the same direction, as the
+/// kernel's plan counts them (`resource_ledger::fan_count`), an upper bound:
+/// on a composed graph, whose fans are modules already, the ports the
+/// composer left unfanned (a multi-channel module's). Each edge is
 /// `(from_id, to_id, to_port, from_port_index, to_port_index)`, from the
 /// graph's edge records.
 pub fn fan_count(edges: &[(u16, u16, u8, u8, u8)]) -> u64 {
@@ -403,14 +404,14 @@ pub fn fan_count(edges: &[(u16, u16, u8, u8, u8)]) -> u64 {
 
 /// `(workloads, modules, edges)` of a config's resident workloads, read as
 /// the kernel's plan reads them (`resource_ledger::resident_demand`): each
-/// workload's FLXA blob holds its module count at byte 32 and its edge count
-/// at 33.
+/// workload's composed graph holds its module count, fans included, at byte
+/// 6 and its edge count at 8, each a u16 LE.
 pub fn resident_demand(workloads: &[WorkloadRecord<'_>]) -> (u64, u64, u64) {
     let (mut modules, mut edges) = (0u64, 0u64);
     for w in workloads {
-        if let Some(h) = w.blob.get(..34) {
-            modules += u64::from(h[32]);
-            edges += u64::from(h[33]);
+        if let Some(h) = w.blob.get(..10) {
+            modules += u64::from(u16::from_le_bytes([h[6], h[7]]));
+            edges += u64::from(u16::from_le_bytes([h[8], h[9]]));
         }
     }
     (workloads.len() as u64, modules, edges)
@@ -447,8 +448,8 @@ fn figure(list: &PoolFigures, pool: &str) -> Option<u64> {
 /// cross-domain edge; on Linux the sandboxes from the owner table's workload
 /// slots; the state-arena free list from the module slots), plus `declared`
 /// (`DMND`), plus the reserve — the envelope's entry in `entries`, never
-/// clamped (one past the pool's domain is refused), else what a static table
-/// leaves, else the profile's default clamped to what the pool's index domain
+/// clamped (one past the pool's range is refused), else what a static table
+/// leaves, else the profile's default clamped to what the pool's index range
 /// leaves beside the derived part.
 pub fn plan_pool(
     target: &str,
@@ -486,11 +487,11 @@ pub fn plan_pool(
         (Some(n), _) => n,
         (None, Some(table)) => table.saturating_sub(derived),
         // The profile's default is headroom, not an ask: it takes what the
-        // pool's index domain leaves beside the derived part.
+        // pool's index range leaves beside the derived part.
         (None, None) => {
             let default = kernel_pool_default_reserve(target, pool).unwrap_or(0);
-            match kernel_pool_domain(target, pool) {
-                Some((domain, _)) => default.min(domain.saturating_sub(derived)),
+            match kernel_pool_range(target, pool) {
+                Some((range, _)) => default.min(range.saturating_sub(derived)),
                 None => default,
             }
         }
@@ -505,7 +506,7 @@ pub fn plan_pool(
 /// The kernel's boot-plan checks for a config of `shape` on `target`, with
 /// envelope `entries` and declared demand `declared`, run as
 /// `size_kernel_tables` runs them: a static table must hold what an envelope
-/// asks of it, and every pool with an index domain must keep its ceiling
+/// asks of it, and every pool with an index range must keep its ceiling
 /// within it. `Err` names the first pool the kernel would refuse, by how much
 /// and why; `Ok` is a one-line summary of the structural pools. What a
 /// platform's memory cannot hold (a host refusing an allocation, a carve
@@ -528,7 +529,7 @@ pub fn check_boot_plan(
         // (`resource_ledger::check_static`).
         let static_size = kernel_pool_static_size(target, pool);
         let static_bound = static_size.map(|t| (t, "static table"));
-        let bound = [static_bound, kernel_pool_domain(target, pool)]
+        let bound = [static_bound, kernel_pool_range(target, pool)]
             .into_iter()
             .flatten()
             .min_by_key(|&(n, _)| n);

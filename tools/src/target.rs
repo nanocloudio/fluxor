@@ -375,7 +375,7 @@ struct TomlBoardMeta {
 
 // ── Public types ────────────────────────────────────────────────────────────
 
-/// Which registry tier a target name resolved through. Boards deploy,
+/// Which registry directory a target name resolved through. Boards deploy,
 /// hosts run fluxor as a process, silicon keys module artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
@@ -387,7 +387,7 @@ pub enum TargetKind {
 /// Resolved target descriptor combining silicon + optional board info.
 #[derive(Debug, Clone)]
 pub struct TargetDescriptor {
-    /// Registry tier the name resolved through.
+    /// Registry directory the name resolved through.
     pub kind: TargetKind,
     /// Silicon target id (e.g. "rp2350")
     pub id: String,
@@ -705,7 +705,7 @@ fn platform_string_defaults(
 ///
 /// Resolution order:
 /// 1. Check `<project_root>/targets/boards/{name}.toml` — board first.
-/// 2. Check `<project_root>/targets/host/{name}.toml` — host tier.
+/// 2. Check `<project_root>/targets/host/{name}.toml` — host class.
 /// 3. Check `<project_root>/targets/silicon/{name}.toml`.
 /// 4. **Fall back to the install root** (when discovered — see
 ///    `project::install_root`) and repeat 1+2 against it. Lets an

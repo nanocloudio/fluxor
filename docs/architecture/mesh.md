@@ -129,7 +129,7 @@ A capability is a self-contained signed assertion of authority:
 | not_before     | 20     | 4 B   | u32 seconds since epoch — earliest validity |
 | not_after      | 24     | 4 B   | u32 seconds since epoch — expiry, the lease bound |
 | issuer_key_id  | 28     | 4 B   | First 4 bytes of `SHA-256(issuer_pubkey)`, naming the key carried with the link (see below) |
-| signature      | 32     | 64 B  | Ed25519 over the 16-byte domain tag `fluxor.mesh.cap\0` followed by bytes 0..32 |
+| signature      | 32     | 64 B  | Ed25519 over the 16-byte domain-separation tag `fluxor.mesh.cap\0` followed by bytes 0..32 |
 
 The domain tag separates token signatures from every other signature a
 key makes: a module's signing envelope is also 32 bytes, and without the

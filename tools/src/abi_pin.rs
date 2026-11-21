@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// The recomputed pin plus the content each checked-in site SHOULD have.
 pub struct PinPlan {
     pub digest_hex: String,
-    /// `(path, expected_content)` for each of the two checked-in sites.
+    /// `(path, expected_content)` for each checked-in site.
     pub edits: Vec<(PathBuf, String)>,
 }
 
@@ -68,12 +68,18 @@ pub fn has_abi_surface(repo: &Path) -> bool {
 pub fn compute(repo: &Path) -> Result<PinPlan> {
     use sha2::{Digest, Sha256};
 
-    // The registry is generated first: the pin covers the generated file.
+    // The registry and the native modules' facts are generated first: the
+    // pin covers the generated files.
     let gen_path = crate::abi_registry::gen_path(repo);
     let generated = crate::abi_registry::generate(repo)?;
+    let native_path = crate::native_params::gen_path(repo);
+    let native = crate::native_params::generate(repo)?;
     let srcpin = crate::hash::compute_contracts_platform_src_hash_with(
         repo,
-        &[(gen_path.clone(), generated.clone())],
+        &[
+            (gen_path.clone(), generated.clone()),
+            (native_path.clone(), native.clone()),
+        ],
     )?;
 
     let mut h = Sha256::new();
@@ -95,7 +101,12 @@ pub fn compute(repo: &Path) -> Result<PinPlan> {
 
     Ok(PinPlan {
         digest_hex,
-        edits: vec![(gen_path, generated), (srcpin_file, sp), (hash_file, hs)],
+        edits: vec![
+            (gen_path, generated),
+            (native_path, native),
+            (srcpin_file, sp),
+            (hash_file, hs),
+        ],
     })
 }
 

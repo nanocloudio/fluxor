@@ -18,13 +18,13 @@ Source: `contracts/src/lib.rs` (`CONTENT_TYPES`).
 
 AV pipelines move data on channels typed by `content_type`:
 
-| Surface         | Domain                              | Typical producers / consumers                             |
+| Surface         | Carries                             | Typical producers / consumers                             |
 |-----------------|-------------------------------------|-----------------------------------------------------------|
-| `AudioSample`   | Decoded sample-domain audio         | tone/sample sources, mixers; `i2s_pio`, `linux_audio`, `wasm_browser_audio` (sinks) |
-| `AudioEncoded`  | Codec-domain audio access units     | re-encode, RTP / VoIP, storage paths                      |
-| `VideoEncoded`  | Codec-domain video access units     | hardware decode, transcoders, broadcast packagers         |
+| `AudioSample`   | Decoded audio samples               | tone/sample sources, mixers; `i2s_pio`, `linux_audio`, `wasm_browser_audio` (sinks) |
+| `AudioEncoded`  | Encoded audio access units          | re-encode, RTP / VoIP, storage paths                      |
+| `VideoEncoded`  | Encoded video access units          | hardware decode, transcoders, broadcast packagers         |
 | `VideoDraw`     | Retained / replayable draw lists    | UI / layout, browser, dashboard, remote-desktop UI        |
-| `VideoRaster`   | Pixel-domain frames / regions       | image codecs, `wasm_browser_display_capture` (sources); `st7701s`, `linux_display`, `wasm_browser_canvas` (sinks) |
+| `VideoRaster`   | Raw pixel frames / regions          | image codecs, `wasm_browser_display_capture` (sources); `st7701s`, `linux_display`, `wasm_browser_canvas` (sinks) |
 | `VideoScanout`  | Present-ready frames to a paced sink| compositor → HDMI / DSI sink, page-flip, vsync handoff    |
 | `MediaMuxed`    | Deliberate AV / timing / container  | recording, broadcast packaging, MP4 / TS streams          |
 
@@ -94,7 +94,7 @@ Modules declare AV-side capabilities via the manifest top-level field:
 capabilities = ["video.scanout", "display.scanout", "presentation.clock"]
 ```
 
-The registry covers two tiers. Hardware-facing names describe what the
+The registry covers two kinds of name. Hardware-facing names describe what the
 sink *is*; service-level names describe what data shape the sink
 *accepts*. A paced display sink declares both: `display.scanout`
 (hardware role) and `video.scanout` (carries the VideoScanout content

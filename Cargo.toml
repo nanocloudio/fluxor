@@ -113,15 +113,6 @@ default = ["chip-rp2350b"]
 # lib alone.
 embedded-platform = []
 
-# Test-only: bcm2712 fires a one-shot graph rebuild ~5 s after boot so the
-# live-rebuild bridge can be observed on hardware. Never enabled in
-# production images.
-test-rebuild = []
-
-# Test-only: bcm2712 stages an embedded owner plan at boot so the staged-plan
-# apply path (per-workload ownership) can be observed on hardware. Never shipped.
-test-plan = []
-
 # RP-family silicon support: register layers, generated facts, the boot
 # artefacts, the USB device stack and the step loop that runs the graph.
 rp = [
@@ -225,18 +216,6 @@ board-pi5 = ["chip-bcm2712"]
 # board-qemu-uefi: the uefi runtime on QEMU, whose step deadline is scaled to an
 # emulated machine (`platform/uefi/chip.rs`).
 board-qemu-uefi = ["host-uefi"]
-
-# Rig-validation opt-in: enables the optional adaptive-tick mechanisms — the
-# SGI wake doorbell and the absolute `cntp_cval` re-arm — at boot on bcm2712.
-# OFF by default and never in production; purely a build flag so the pi5 rig
-# can exercise these paths on silicon.
-adaptive_deferred_rig = []
-
-# Rig-validation opt-in: from core 0, periodically fire SGI 15 at core 1 (the
-# Tier-2 dedicated core) so a Tier-2 IRQ-owned module's `module_isr_entry` is
-# driven on silicon. OFF by default; pairs with an `exec: irq` domain hosting the
-# `tier2_probe` module. Validates the Tier-2 dispatch path end-to-end on hardware.
-test_tier2_sgi = []
 
 # Linux hosted (aarch64 userspace). Uses std.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.

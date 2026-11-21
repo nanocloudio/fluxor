@@ -4,16 +4,16 @@
 //! buffer arena. The kernel refuses arena exhaustion as a channel opens —
 //! correct, but late: it presents at boot as `[buf] arena full` and a graph
 //! that never starts. This adds the rings up from the compiled config, by the
-//! rule the kernel opens them by (`ring_plan`), and refuses an image whose
+//! rule the kernel opens them by (`fluxor_contracts::graph::plan`), and refuses an image whose
 //! rings do not fit, naming the edges that take the most.
 //!
 //! The sum is over what graph preparation opens: every edge's ring at the
 //! largest of its producer port's capacity, its consumer port's and its
-//! `buffer_bytes` (the default ring where none sizes it), the tees and merges
-//! the kernel inserts on fanned ports, mailbox groups aliased onto one ring,
-//! and on bcm2712 the consumer-side ring of every edge crossing domains. The
-//! config is the compiled one, so platform-injected modules and the
-//! composer's mailbox groups are in it. The limit is the kernel profile's
+//! `buffer_bytes` (the default ring where none sizes it), the edges of the
+//! tees and merges the composer put on fanned ports, mailbox groups aliased
+//! onto one ring, and on bcm2712 the consumer-side ring of every edge
+//! crossing domains. The config is the compiled one, so platform-injected
+//! modules, the fans and the composer's mailbox groups are in it. The limit is the kernel profile's
 //! arena, or the graph's `capacity: { buffer_arena }` envelope — its size on
 //! RP, which places the arena per graph, and a lower figure only elsewhere,
 //! where the arena is fixed. The rings are also counted against the channel
@@ -24,7 +24,13 @@
 
 use std::collections::HashMap;
 
-use crate::ring_plan::{self as rings, RingEdge, RingError, RingModule, RingNode, RingPlatform};
+use fluxor_contracts::graph::plan::{
+    self as rings, Fan, FanDir, FrameKind, PlanError, PlanModule, PlanPort, RingNode, RingPlatform,
+};
+use fluxor_contracts::graph::{
+    ComposedGraph, EdgeClass, EdgeRecord, Endpoint, MERGE_NAME_HASH, TEE_NAME_HASH,
+};
+use fluxor_contracts::ring_size;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -55,18 +61,84 @@ pub fn buffer_arena_bytes(target: &TargetDescriptor) -> Option<u64> {
 
 /// What the platform `target` runs adds to graph preparation.
 pub fn platform(target: &TargetDescriptor) -> RingPlatform {
+    platform_of(target.runtime())
+}
+
+/// What the kernel of `runtime` adds to graph preparation: its mailbox
+/// groups, and whether it bridges domains.
+pub fn platform_of(runtime: &str) -> RingPlatform {
     RingPlatform {
-        buffer_groups: rings::buffer_groups(crate::capacity::kernel_max_edges(target.runtime())),
-        split_cross_domain: crate::capacity::kernel_bridges_domains(target.runtime()),
+        buffer_groups: ring_size::buffer_groups(crate::capacity::kernel_max_edges(runtime)),
+        split_cross_domain: crate::capacity::kernel_bridges_domains(runtime),
     }
 }
 
 /// The module types a platform keeps one channel per edge for, in and out,
-/// by the name hash the kernel registers them under: the hosted network
-/// provider on the Linux runtime (`register_multi_inbound` and
-/// `register_multi_outbound` of `LINUX_NET_HASH`).
-fn multi_channel(runtime: &str, name_hash: u32) -> bool {
+/// by name hash: the hosted network provider on the Linux runtime, which
+/// drains one inbound lane per wired edge and keeps one events channel per
+/// consumer that is also its producer.
+pub fn multi_channel(runtime: &str, name_hash: u32) -> bool {
     runtime == "linux" && name_hash == fnv1a_hash(b"linux_net")
+}
+
+/// A refusal of the plan, said in the graph's names: `names` are the
+/// declared modules' instance names by index, `manifests` their manifests
+/// by name (for port names), `runtime` the kernel the graph is for.
+pub fn refusal(
+    e: PlanError,
+    names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    runtime: &str,
+) -> String {
+    let namer = Namer { names, manifests };
+    match e {
+        PlanError::OverCeiling { ends, request } => format!(
+            "{} asks for a {request} B ring, over the {} B ceiling of one channel: lower \
+             the request or split the stream",
+            namer.edge(&ends),
+            ring_size::MAX_RING_BYTES
+        ),
+        PlanError::RecordOverRing {
+            ends,
+            max_record,
+            granted,
+        } => format!(
+            "{}: its producer writes records of up to {max_record} B ({} B of ring with \
+             their length prefix) but the ring is {granted} B, so a record that size could \
+             never be written; raise the edge's buffer_bytes or the port's buffer_size",
+            namer.edge(&ends),
+            ring_size::record_bytes(max_record)
+        ),
+        PlanError::GroupsExhausted => format!(
+            "the graph's record edges and fans need more mailbox groups than the {runtime} \
+             kernel has"
+        ),
+        PlanError::FanWidth {
+            dir,
+            of,
+            port,
+            edges,
+        } => {
+            let (node, direction) = match dir {
+                FanDir::Out => (RingNode::Module(of), rings::DIR_OUT),
+                FanDir::In if port & rings::PORT_KEY_CTRL != 0 => {
+                    (RingNode::Module(of), rings::DIR_CTRL)
+                }
+                FanDir::In => (RingNode::Module(of), rings::DIR_IN),
+            };
+            format!(
+                "{} is wired to {edges} ports, and the fan that joins them has {}: \
+                 fan the port in stages through a module of its own, or wire fewer",
+                namer.end(node, port & 0x0F, direction),
+                usize::from(fluxor_contracts::graph::MAX_PORT_INDEX) + 1
+            )
+        }
+        PlanError::UnknownModule { edge } => format!("edge {edge} names no module"),
+        PlanError::EdgeCapacity
+        | PlanError::FanCapacity
+        | PlanError::OrderCapacity
+        | PlanError::Cycle { .. } => format!("the graph does not compose: {e:?}"),
+    }
 }
 
 /// The figure a pool is held to: the kernel's own, or the graph's capacity
@@ -96,102 +168,142 @@ fn limit(config: &Value, pool: &str, kernel: u64, runtime: &str) -> Limit {
     }
 }
 
-/// The graph's rings as `rings::plan` sees them, from a compiled config.
-struct Graph {
-    names: Vec<String>,
-    modules: Vec<RingModule>,
-    edges: Vec<RingEdge>,
+/// A declared module of the composed graph, as the ring plan sees it.
+struct ModuleSpec {
+    ports: Vec<PlanPort>,
+    mailbox_safe: bool,
+    domain: u8,
 }
 
-/// The graph `decoded` (a compiled config, as `config::decode_config` reads
-/// it) holds, with each module's facts.
+/// The composed graph's rings as `rings::rings` sees them: its declared
+/// modules, its fans, and every edge, the fans' joining edges last.
+struct Graph {
+    names: Vec<String>,
+    modules: Vec<ModuleSpec>,
+    fans: Vec<Fan>,
+    edges: Vec<EdgeRecord>,
+    declared_edges: usize,
+}
+
+impl Graph {
+    fn plan(&self, platform: RingPlatform) -> std::result::Result<rings::RingPlan, PlanError> {
+        let modules: Vec<PlanModule<'_>> = self
+            .modules
+            .iter()
+            .map(|m| PlanModule {
+                ports: &m.ports,
+                mailbox_safe: m.mailbox_safe,
+                domain: m.domain,
+                ..PlanModule::default()
+            })
+            .collect();
+        let mut plan = rings::RingPlan::default();
+        let totals = rings::rings(
+            &modules,
+            &self.fans,
+            &self.edges,
+            self.declared_edges,
+            platform,
+            |r| plan.rings.push(r),
+        )?;
+        plan.aliased = totals.aliased;
+        Ok(plan)
+    }
+}
+
+/// The frame kind a fan's params name (tag 1), a stream where they name
+/// none.
+fn fan_kind(params: &[u8]) -> FrameKind {
+    let mut kind = FrameKind::Stream;
+    fluxor_contracts::params_tlv::walk_declared(params, |tag, value| {
+        if tag == rings::fan_param::FRAME_KIND {
+            kind = match value.first() {
+                Some(1) => FrameKind::Eth,
+                Some(2) => FrameKind::Net,
+                Some(3) => FrameKind::Telemetry,
+                Some(4) => FrameKind::Record,
+                _ => FrameKind::Stream,
+            };
+        }
+    });
+    kind
+}
+
+/// The graph `composed` (a compiled config's graph section) holds, with
+/// each declared module's facts. Its declared modules are those before its
+/// fans: the composer appends one `tee` or `merge` module per fan, and one
+/// joining edge per fan after the declared edges.
 fn decode(
     config: &Value,
-    decoded: &Value,
+    composed: &ComposedGraph<'_>,
     facts: &HashMap<u32, ModuleFacts<'_>>,
-    runtime: &str,
 ) -> Result<Graph> {
-    let declared: Vec<&Value> = config
+    let records: Vec<_> = composed.modules().collect();
+    let is_fan = |h: u32| h == TEE_NAME_HASH || h == MERGE_NAME_HASH;
+    let declared = records
+        .iter()
+        .rposition(|m| !is_fan(m.name_hash))
+        .map_or(0, |i| i + 1);
+    let decl: Vec<&Value> = config
         .get("modules")
         .and_then(|m| m.as_array())
         .map(|a| a.iter().collect())
         .unwrap_or_default();
-    let entries = decoded["modules"].as_array().cloned().unwrap_or_default();
-    let mut names = Vec::with_capacity(entries.len());
-    let mut modules = Vec::with_capacity(entries.len());
-    for (i, entry) in entries.iter().enumerate() {
-        let decl = declared.get(i);
+    let mut names = Vec::with_capacity(declared);
+    let mut modules = Vec::with_capacity(declared);
+    for (i, record) in records[..declared].iter().enumerate() {
         let name = decl
+            .get(i)
             .and_then(|d| d.get("name").and_then(|n| n.as_str()))
             .map(String::from)
             .unwrap_or_else(|| format!("module{i}"));
-        let type_name = decl
-            .and_then(|d| d.get("type").and_then(|t| t.as_str()))
-            .unwrap_or(&name)
-            .to_string();
-        let hash = entry["name_hash"]
-            .as_str()
-            .and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-            .unwrap_or_else(|| fnv1a_hash(type_name.as_bytes()));
-        let fact = facts.get(&hash);
-        let multi = multi_channel(runtime, hash);
-        modules.push(RingModule {
+        let fact = facts.get(&record.name_hash);
+        modules.push(ModuleSpec {
             ports: fact
-                .map(|f| {
-                    f.manifest
-                        .ports
-                        .iter()
-                        .map(|p| rings::RingPort {
-                            direction: p.direction,
-                            index: p.index,
-                            buffer_size: p.buffer_size,
-                            max_record: p.max_record,
-                            frame: rings::port_frame(p.content_type, p.flags),
-                        })
-                        .collect()
-                })
+                .map(|f| crate::add_subgraph::plan_ports(f.manifest))
                 .unwrap_or_default(),
             mailbox_safe: fact.is_some_and(|f| f.mailbox_safe),
-            multi_inbound: multi,
-            multi_outbound: multi,
-            domain: entry["domain_id"].as_u64().unwrap_or(0) as u8,
+            domain: record.domain,
         });
         names.push(name);
     }
-    let id_to_index: HashMap<u64, usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| e["id"].as_u64().map(|id| (id, i)))
-        .collect();
-    let mut edges = Vec::new();
-    for (i, e) in decoded["graph"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-    {
-        let end = |key: &str| -> Result<usize> {
-            e[key]
-                .as_u64()
-                .and_then(|id| id_to_index.get(&id).copied())
-                .ok_or_else(|| Error::Config(format!("compiled edge {i} names no module")))
+    let edges: Vec<EdgeRecord> = composed.edges().collect();
+    let mut fans = Vec::with_capacity(records.len() - declared);
+    for (k, record) in records[declared..].iter().enumerate() {
+        let node = Endpoint::New((declared + k) as u16);
+        let (dir, join) = if record.name_hash == TEE_NAME_HASH {
+            (FanDir::Out, edges.iter().find(|e| e.to == node))
+        } else {
+            (FanDir::In, edges.iter().find(|e| e.from == node))
         };
-        edges.push(RingEdge {
-            from: end("from_id")?,
-            from_port: e["from_port_index"].as_u64().unwrap_or(0) as u8,
-            to: end("to_id")?,
-            ctrl: e["to_port"].as_str() == Some("ctrl"),
-            to_port: e["to_port_index"].as_u64().unwrap_or(0) as u8,
-            buffer_group: e["buffer_group"].as_u64().unwrap_or(0) as u8,
-            buffer_bytes: e["buffer_bytes"].as_u64().unwrap_or(0) as u32,
-            cross_core: e["edge_class"].as_str() == Some("cross_core"),
+        let joined = |e: &EdgeRecord| match dir {
+            FanDir::Out => e.from.new_index().map(|of| (of, e.from_port)),
+            FanDir::In => e.to.new_index().map(|of| {
+                let ctrl = if e.to_ctrl { rings::PORT_KEY_CTRL } else { 0 };
+                (of, e.to_port | ctrl)
+            }),
+        };
+        let Some((of, port)) = join.and_then(joined).filter(|&(of, _)| of < declared) else {
+            return Err(Error::Config(format!(
+                "compiled fan {} joins no declared module",
+                declared + k
+            )));
+        };
+        fans.push(Fan {
+            dir,
+            of: of as u16,
+            port,
+            kind: fan_kind(record.params),
+            domain: record.domain,
         });
     }
+    let declared_edges = edges.len().saturating_sub(fans.len());
     Ok(Graph {
         names,
         modules,
+        fans,
         edges,
+        declared_edges,
     })
 }
 
@@ -233,8 +345,12 @@ impl Namer<'_> {
 
     fn end(&self, node: RingNode, port: u8, direction: u8) -> String {
         match node {
-            RingNode::Module(m) => format!("{}.{}", self.names[m], self.port(m, direction, port)),
+            RingNode::Module(m) => {
+                let m = usize::from(m);
+                format!("{}.{}", self.names[m], self.port(m, direction, port))
+            }
             RingNode::Tee { of, port: p } => {
+                let of = usize::from(of);
                 format!(
                     "tee({}.{})",
                     self.names[of],
@@ -242,13 +358,15 @@ impl Namer<'_> {
                 )
             }
             RingNode::Merge { of, port: p } => {
-                let dir = if p & 0x10 != 0 {
+                let of = usize::from(of);
+                let dir = if p & rings::PORT_KEY_CTRL != 0 {
                     rings::DIR_CTRL
                 } else {
                     rings::DIR_IN
                 };
                 format!("merge({}.{})", self.names[of], self.port(of, dir, p & 0x0F))
             }
+            RingNode::External(end) => format!("{end:?}"),
         }
     }
 
@@ -286,19 +404,27 @@ pub fn check(
     let Some(arena) = buffer_arena_bytes(target) else {
         return Ok(());
     };
-    let decoded = crate::config::decode_config(blob)?;
-    check_decoded(config, &decoded, facts, manifests, target, arena)
+    let cfg = fluxor_contracts::boot_config::decode(blob)
+        .map_err(|e| Error::Config(format!("boot config refused: {e}")))?;
+    check_composed(
+        config,
+        &cfg.graph().composed(),
+        facts,
+        manifests,
+        target,
+        arena,
+    )
 }
 
-fn check_decoded(
+fn check_composed(
     config: &Value,
-    decoded: &Value,
+    composed: &ComposedGraph<'_>,
     facts: &HashMap<u32, ModuleFacts<'_>>,
     manifests: &HashMap<String, Manifest>,
     target: &TargetDescriptor,
     kernel_arena: u64,
 ) -> Result<()> {
-    let graph = decode(config, decoded, facts, target.runtime())?;
+    let graph = decode(config, composed, facts)?;
     if graph.edges.is_empty() {
         return Ok(());
     }
@@ -306,61 +432,48 @@ fn check_decoded(
         names: &graph.names,
         manifests,
     };
-    let plan = rings::plan(&graph.modules, &graph.edges, platform(target)).map_err(|e| {
-        Error::Config(match e {
-            RingError::OverCeiling { ends, request } => format!(
-                "{} asks for a {request} B ring, over the {} B ceiling of one channel: lower \
-                 the request or split the stream",
-                namer.edge(&ends),
-                rings::MAX_RING_BYTES
-            ),
-            RingError::RecordOverRing {
-                ends,
-                max_record,
-                granted,
-            } => format!(
-                "{}: its producer writes records of up to {max_record} B ({} B of ring with \
-                 their length prefix) but the ring is {granted} B, so a record that size could \
-                 never be written; raise the edge's buffer_bytes or the port's buffer_size",
-                namer.edge(&ends),
-                rings::record_bytes(max_record)
-            ),
-            RingError::GroupsExhausted => format!(
-                "the graph's record fans need more mailbox groups than {}'s kernel has",
-                target.id
-            ),
-            RingError::UnknownModule { edge } => format!("compiled edge {edge} names no module"),
-        })
-    })?;
+    let plan = graph
+        .plan(platform(target))
+        .map_err(|e| Error::Config(refusal(e, &graph.names, manifests, target.runtime())))?;
     let total = plan.total();
     let arena = limit(config, "buffer_arena", kernel_arena, target.runtime());
     // Every ring takes a slot of the channel table, which the kernel sizes to
-    // its boot plan: the graph's edges and fans (and on bcm2712 the consumer
-    // side of each cross-domain edge) plus the `channels` reserve (the
-    // envelope's entry, else the profile's default). Resident workloads add
-    // their own share to the plan and are not in this sum.
+    // its boot plan: the graph's edges, its fans' modules and edges (and on
+    // bcm2712 the consumer side of each cross-domain edge) plus the
+    // `channels` reserve (the envelope's entry, else the profile's default).
+    // Resident workloads add their own share to the plan and are not in this
+    // sum.
     let compiled: Vec<(u16, u16, u8, u8, u8)> = graph
         .edges
         .iter()
         .map(|e| {
+            let node = |end: Endpoint| end.new_index().map_or(u16::MAX, |i| i as u16);
             (
-                e.from as u16,
-                e.to as u16,
-                u8::from(e.ctrl),
+                node(e.from),
+                node(e.to),
+                u8::from(e.to_ctrl),
                 e.from_port,
                 e.to_port,
             )
         })
         .collect();
+    let domain = |end: Endpoint| {
+        let i = end.new_index()?;
+        graph
+            .modules
+            .get(i)
+            .map(|m| m.domain)
+            .or_else(|| graph.fans.get(i - graph.modules.len()).map(|f| f.domain))
+    };
     let shape = crate::capacity::GraphShape {
-        modules: graph.modules.len() as u64,
+        modules: (graph.modules.len() + graph.fans.len()) as u64,
         edges: compiled.len() as u64,
         fans: crate::capacity::fan_count(&compiled),
         crossings: crate::capacity::crossing_count(graph.edges.iter().map(|e| {
             (
-                graph.modules.get(e.from).map(|m| m.domain),
-                graph.modules.get(e.to).map(|m| m.domain),
-                e.cross_core,
+                domain(e.from),
+                domain(e.to),
+                e.class == EdgeClass::CrossCore,
             )
         })),
         ..Default::default()
@@ -454,6 +567,7 @@ fn check_decoded(
 mod tests {
     use super::*;
     use crate::manifest::PortSpec;
+    use fluxor_contracts::graph::{GraphSpec, ModuleRecord};
 
     fn port(direction: u8, index: u8, buffer_size: u32) -> PortSpec {
         PortSpec {
@@ -493,26 +607,46 @@ mod tests {
     }
 
     /// `n` producer→consumer pairs, each edge asking for `ring` bytes
-    /// through its producer's port: the expanded graph, its compiled form as
-    /// `decode_config` reads it, and the two module types' manifests.
-    fn graph(n: usize, ring: u32) -> (Value, Value, Manifest, Manifest) {
+    /// through its producer's port: the expanded graph, its composed graph's
+    /// bytes, and the two module types' manifests.
+    fn graph(n: usize, ring: u32) -> (Value, Vec<u8>, Manifest, Manifest) {
+        graph_in(n, ring, |_| 0)
+    }
+
+    /// [`graph`], each module in the domain `domain` gives its index.
+    fn graph_in(
+        n: usize,
+        ring: u32,
+        domain: impl Fn(usize) -> u8,
+    ) -> (Value, Vec<u8>, Manifest, Manifest) {
         let mut modules = Vec::new();
-        let mut entries = Vec::new();
+        let mut records = Vec::new();
         let mut edges = Vec::new();
         for i in 0..n {
             modules.push(serde_json::json!({"name": format!("src{i}"), "type": "ring_src"}));
             modules.push(serde_json::json!({"name": format!("dst{i}"), "type": "ring_dst"}));
             for (k, ty) in [(2 * i, "ring_src"), (2 * i + 1, "ring_dst")] {
-                entries.push(serde_json::json!({
-                    "id": k,
-                    "name_hash": format!("0x{:08x}", fnv1a_hash(ty.as_bytes())),
-                    "domain_id": 0,
-                }));
+                records.push(ModuleRecord {
+                    name_hash: fnv1a_hash(ty.as_bytes()),
+                    domain: domain(k),
+                    ..ModuleRecord::default()
+                });
             }
-            edges.push(serde_json::json!({"from_id": 2 * i, "to_id": 2 * i + 1, "to_port": "in"}));
+            edges.push(EdgeRecord {
+                from: Endpoint::New(2 * i as u16),
+                to: Endpoint::New(2 * i as u16 + 1),
+                ..EdgeRecord::default()
+            });
         }
+        let order: Vec<u16> = (0..records.len() as u16).collect();
+        let blob = fluxor_contracts::graph::encode(&GraphSpec {
+            order: &order,
+            modules: &records,
+            edges: &edges,
+            ..GraphSpec::default()
+        })
+        .unwrap();
         let config = serde_json::json!({ "modules": modules });
-        let decoded = serde_json::json!({ "modules": entries, "graph": edges });
         let src = Manifest {
             ports: vec![port(rings::DIR_OUT, 0, ring)],
             ..Default::default()
@@ -521,7 +655,7 @@ mod tests {
             ports: vec![port(rings::DIR_IN, 0, 0)],
             ..Default::default()
         };
-        (config, decoded, src, dst)
+        (config, blob, src, dst)
     }
 
     fn facts<'a>(src: &'a Manifest, dst: &'a Manifest) -> HashMap<u32, ModuleFacts<'a>> {
@@ -545,28 +679,29 @@ mod tests {
 
     fn run(
         config: &Value,
-        decoded: &Value,
+        blob: &[u8],
         facts: &HashMap<u32, ModuleFacts<'_>>,
         manifests: &HashMap<String, Manifest>,
     ) -> Result<()> {
         let target = linux();
         let arena = buffer_arena_bytes(&target).unwrap();
-        check_decoded(config, decoded, facts, manifests, &target, arena)
+        let composed = fluxor_contracts::graph::decode(blob).unwrap();
+        check_composed(config, &composed, facts, manifests, &target, arena)
     }
 
     #[test]
     fn a_graph_under_the_arena_passes() {
         // Eight 1 MiB rings: half the host arena.
-        let (config, decoded, src, dst) = graph(8, 1 << 20);
-        run(&config, &decoded, &facts(&src, &dst), &HashMap::new()).unwrap();
+        let (config, blob, src, dst) = graph(8, 1 << 20);
+        run(&config, &blob, &facts(&src, &dst), &HashMap::new()).unwrap();
     }
 
     #[test]
     fn a_graph_over_the_arena_is_refused_naming_its_largest_edges() {
         // Seventeen rings that each round up to 1 MiB: one over the host's
         // 16 MiB.
-        let (config, decoded, src, dst) = graph(17, (1 << 20) - 100);
-        let e = run(&config, &decoded, &facts(&src, &dst), &HashMap::new())
+        let (config, blob, src, dst) = graph(17, (1 << 20) - 100);
+        let e = run(&config, &blob, &facts(&src, &dst), &HashMap::new())
             .unwrap_err()
             .to_string();
         assert!(e.contains("need 17825792 B"), "{e}");
@@ -582,12 +717,12 @@ mod tests {
 
     #[test]
     fn port_names_come_from_the_source_manifests() {
-        let (config, decoded, src, dst) = graph(17, 1 << 20);
+        let (config, blob, src, dst) = graph(17, 1 << 20);
         let manifests = HashMap::from([
             ("src0".to_string(), src.clone()),
             ("dst0".to_string(), dst.clone()),
         ]);
-        let e = run(&config, &decoded, &facts(&src, &dst), &manifests)
+        let e = run(&config, &blob, &facts(&src, &dst), &manifests)
             .unwrap_err()
             .to_string();
         assert!(e.contains("src0.p1_0 -> dst0.p0_0"), "{e}");
@@ -597,18 +732,19 @@ mod tests {
     fn a_built_in_module_s_ports_are_unsized() {
         // No facts for either type: the kernel holds no manifest for a
         // built-in, so every edge takes the default ring.
-        let (config, decoded, _, _) = graph(3, 1 << 20);
-        let graph = decode(&config, &decoded, &HashMap::new(), "linux").unwrap();
-        let plan = rings::plan(&graph.modules, &graph.edges, platform(&linux())).unwrap();
-        assert_eq!(plan.total(), 3 * rings::DEFAULT_RING_BYTES as u64);
+        let (config, blob, _, _) = graph(3, 1 << 20);
+        let composed = fluxor_contracts::graph::decode(&blob).unwrap();
+        let graph = decode(&config, &composed, &HashMap::new()).unwrap();
+        let plan = graph.plan(platform(&linux())).unwrap();
+        assert_eq!(plan.total(), 3 * ring_size::DEFAULT_RING_BYTES as u64);
     }
 
     #[test]
     fn a_capacity_envelope_below_the_kernel_arena_is_the_limit() {
         // Eight 1 MiB rings fit the host's 16 MiB, not a 4 MiB envelope.
-        let (mut config, decoded, src, dst) = graph(8, 1 << 20);
+        let (mut config, blob, src, dst) = graph(8, 1 << 20);
         config["capacity"] = serde_json::json!({"buffer_arena": 4 << 20});
-        let e = run(&config, &decoded, &facts(&src, &dst), &HashMap::new())
+        let e = run(&config, &blob, &facts(&src, &dst), &HashMap::new())
             .unwrap_err()
             .to_string();
         assert!(
@@ -618,7 +754,7 @@ mod tests {
         // Linux's arena is a fixed array: an envelope above it raises nothing,
         // and the arena itself binds.
         config["capacity"] = serde_json::json!({"buffer_arena": 1u64 << 40});
-        run(&config, &decoded, &facts(&src, &dst), &HashMap::new()).unwrap();
+        run(&config, &blob, &facts(&src, &dst), &HashMap::new()).unwrap();
     }
 
     /// A `channels:` envelope entry is a live-add reserve on top of what the
@@ -627,9 +763,9 @@ mod tests {
     /// seats every ring this graph opens.
     #[test]
     fn a_channels_reserve_is_not_a_ceiling() {
-        let (mut config, decoded, src, dst) = graph(3, 1024);
+        let (mut config, blob, src, dst) = graph(3, 1024);
         config["capacity"] = serde_json::json!({"channels": 0});
-        run(&config, &decoded, &facts(&src, &dst), &HashMap::new()).unwrap();
+        run(&config, &blob, &facts(&src, &dst), &HashMap::new()).unwrap();
     }
 
     /// On bcm2712 an edge between domains opens a consumer-side channel of
@@ -638,18 +774,14 @@ mod tests {
     /// `channels` reserve seats every ring.
     #[test]
     fn cross_domain_rings_are_derived_on_bcm2712() {
-        let (mut config, mut decoded, src, dst) = graph(3, 1024);
-        for m in decoded["modules"].as_array_mut().unwrap() {
-            if m["id"].as_u64().unwrap() % 2 == 1 {
-                m["domain_id"] = serde_json::json!(1);
-            }
-        }
+        let (mut config, blob, src, dst) = graph_in(3, 1024, |k| (k % 2) as u8);
+        let composed = fluxor_contracts::graph::decode(&blob).unwrap();
         let pi5 = crate::target::load_target("pi5", &root()).expect("pi5 target");
         let arena = buffer_arena_bytes(&pi5).unwrap();
         let check = |config: &Value| {
-            check_decoded(
+            check_composed(
                 config,
-                &decoded,
+                &composed,
                 &facts(&src, &dst),
                 &HashMap::new(),
                 &pi5,
@@ -677,13 +809,14 @@ mod tests {
     /// raises nothing.
     #[test]
     fn an_rp_buffer_arena_entry_is_its_size() {
-        let (mut config, decoded, src, dst) = graph(1, 128 * 1024);
+        let (mut config, blob, src, dst) = graph(1, 128 * 1024);
+        let composed = fluxor_contracts::graph::decode(&blob).unwrap();
         let pico2w = crate::target::load_target("pico2w", &root()).expect("pico2w target");
         let arena = buffer_arena_bytes(&pico2w).unwrap();
         let check = |config: &Value| {
-            check_decoded(
+            check_composed(
                 config,
-                &decoded,
+                &composed,
                 &facts(&src, &dst),
                 &HashMap::new(),
                 &pico2w,
@@ -699,32 +832,60 @@ mod tests {
     #[test]
     fn the_hosted_network_provider_keeps_a_channel_per_edge_on_linux_only() {
         // `linux_net` (1) feeds two consumers (2, 3) that both feed it back:
-        // on Linux the kernel keeps an edge each, with no tee or merge.
+        // composed for Linux it keeps an edge each, with no tee or merge.
         let hash = fnv1a_hash(b"linux_net");
-        let entries: Vec<Value> = (0..4)
-            .map(|i| {
-                let h = if i == 1 { hash } else { 0x1000 + i };
-                serde_json::json!({"id": i, "name_hash": format!("0x{h:08x}"), "domain_id": 0})
-            })
-            .collect();
-        let edge = |f: u32, t: u32| serde_json::json!({"from_id": f, "to_id": t, "to_port": "in"});
-        let decoded = serde_json::json!({
-            "modules": entries,
-            "graph": [edge(1, 2), edge(1, 3), edge(2, 1), edge(3, 1)],
-        });
+        let edge = |f: u16, t: u16| EdgeRecord {
+            from: Endpoint::New(f),
+            to: Endpoint::New(t),
+            ..EdgeRecord::default()
+        };
+        let edges = [edge(1, 2), edge(1, 3), edge(2, 1), edge(3, 1)];
         // The expanded graph names no types: the hash alone decides.
         let config = serde_json::json!({ "modules": [] });
         let rings_on = |runtime: &str, target: &TargetDescriptor| {
-            let graph = decode(&config, &decoded, &HashMap::new(), runtime).unwrap();
-            rings::plan(&graph.modules, &graph.edges, platform(target))
-                .unwrap()
-                .rings
-                .len()
+            let modules: Vec<crate::add_subgraph::GraphModule> = (0..4u32)
+                .map(|i| {
+                    let h = if i == 1 { hash } else { 0x1000 + i };
+                    crate::add_subgraph::GraphModule {
+                        name: format!("m{i}"),
+                        name_hash: h,
+                        multi_channel: multi_channel(runtime, h),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let composition = crate::add_subgraph::compose(
+                &modules,
+                &edges,
+                crate::add_subgraph::Placement {
+                    platform: platform(target),
+                    accept_cycles: true,
+                    domain_names: &[],
+                },
+                &crate::add_subgraph::Composer {
+                    describe: &|e| format!("{e:?}"),
+                    fan_params: &|f, scratch| {
+                        Ok(
+                            rings::fan_params(f.kind, rings::FRAMES_PER_STEP_DEFAULT, scratch)
+                                .to_vec(),
+                        )
+                    },
+                },
+            )
+            .unwrap();
+            let records = composition.records();
+            let blob = fluxor_contracts::graph::encode(&composition.spec(&records)).unwrap();
+            let composed = fluxor_contracts::graph::decode(&blob).unwrap();
+            let graph = decode(&config, &composed, &HashMap::new()).unwrap();
+            (
+                graph.fans.len(),
+                graph.plan(platform(target)).unwrap().rings.len(),
+            )
         };
         let pi5 = crate::target::load_target("pi5", &root()).unwrap();
-        assert_eq!(rings_on("linux", &linux()), 4);
+        assert_eq!(rings_on("linux", &linux()), (0, 4));
         // Elsewhere: a tee and a merge, each with its joining edge.
-        assert_eq!(rings_on("bcm2712", &pi5), 6);
+        assert_eq!(rings_on("bcm2712", &pi5), (2, 6));
     }
 
     #[test]

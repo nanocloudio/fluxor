@@ -54,12 +54,10 @@ pub enum FaultPolicy {
     /// Partial restart: channels are flushed and the fault state machine
     /// moves back to `Running`, but state is *not* zeroed and
     /// `module_new()` is *not* re-called. See
-    /// `scheduler::handle_module_restart` for the exact behaviour. Safe for
+    /// `scheduler::fault::restart` for the exact behaviour. Safe for
     /// stateless / idempotent modules; modules with stateful invariants
     /// should use `Skip` and rely on the graph operator to drain and reload.
     Restart = 1,
-    /// Tear down and re-instantiate entire graph.
-    RestartGraph = 2,
     /// Step-deadline overruns are RECORDED (fault counter, [guard]
     /// log, fault ring) but never fault the module. The policy for a
     /// module whose synchronous device ops carry a legitimate heavy
@@ -69,21 +67,16 @@ pub enum FaultPolicy {
     /// control. Step ERRORS (non-zero rc) still fault normally — only
     /// the overrun path is tolerated, and the deadline keeps its
     /// meaning as a telemetry threshold.
-    Tolerate = 3,
+    Tolerate = 2,
 }
 
 impl FaultPolicy {
-    /// The policy a wire byte names: the numbering of the params TLV tag
-    /// `0xF1` and of the FLXA module record (`0` skip, `1` restart, `2`
-    /// restart_graph, `3` tolerate). `None` for any other byte, so a decoder
-    /// can refuse it rather than guess.
-    pub const fn from_wire(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(FaultPolicy::Skip),
-            1 => Some(FaultPolicy::Restart),
-            2 => Some(FaultPolicy::RestartGraph),
-            3 => Some(FaultPolicy::Tolerate),
-            _ => None,
+    /// The policy a composed graph's module record names.
+    pub const fn from_graph(p: fluxor_contracts::graph::FaultPolicy) -> Self {
+        match p {
+            fluxor_contracts::graph::FaultPolicy::Skip => FaultPolicy::Skip,
+            fluxor_contracts::graph::FaultPolicy::Restart => FaultPolicy::Restart,
+            fluxor_contracts::graph::FaultPolicy::Tolerate => FaultPolicy::Tolerate,
         }
     }
 
@@ -93,7 +86,7 @@ impl FaultPolicy {
     /// domain's other modules pay for every late step and the deadline it
     /// was admitted under never binds it. `Restart` releases the module's
     /// provider layers and flushes its channels, which other owners may
-    /// hold, and `RestartGraph` names the whole graph.
+    /// hold.
     pub const fn confined_to_module(self) -> bool {
         matches!(self, FaultPolicy::Skip)
     }
@@ -107,8 +100,6 @@ pub mod fault_type {
     pub const TIMEOUT: u8 = 1;
     /// Module returned error from step().
     pub const STEP_ERROR: u8 = 2;
-    /// Module caused a hard fault (bus error, etc).
-    pub const HARD_FAULT: u8 = 3;
     /// Module caused an MPU/MMU memory protection fault.
     pub const MPU_FAULT: u8 = 4;
     /// Module failed to drain within its deadline.
@@ -166,20 +157,15 @@ pub struct ModuleFaultInfo {
     pub restart_backoff_ms: u16,
     /// Type of last fault.
     pub last_fault_type: u8,
-    /// Tick count at last fault (for ticks_since_fault calculation).
-    /// Diagnostic-cadence class: feeds the ABI `FaultStats.ticks_since_fault`
-    /// field and the best-effort cascade-attribution byte. Kept tick-counted
-    /// — these are best-effort and mis-scale harmlessly under adaptive pacing
-    /// (diagnostic class).
+    /// The module's domain's pass count at the last fault: feeds the ABI
+    /// `FaultStats.ticks_since_fault` (a diagnostic, counted in passes).
     pub last_fault_tick: u32,
-    /// Wall-clock timestamp (ms, `hal::now_millis()`) at last fault. Drives
-    /// the *correctness* quarantine-window decision (`QUARANTINE_WINDOW_MS`),
-    /// which must measure real elapsed time rather than a tick count that
-    /// silently re-scales the moment mechanism (b) varies the period or
-    /// mechanism (a) idle-sleep stops advancing the tick.
+    /// Wall clock (ms, `hal::now_millis()`) at the last fault: the
+    /// quarantine and cascade windows measure from it.
     pub last_fault_ms: u64,
-    /// Backoff countdown (ticks remaining before restart attempt).
-    pub backoff_remaining: u32,
+    /// Wall clock (ms, `hal::now_millis()`) before which a `Faulted`
+    /// module is not restarted.
+    pub restart_not_before_ms: u64,
     /// Step deadline in microseconds (0 = use default).
     pub step_deadline_us: u32,
     /// Optional override for the deadline applied during a `Burst`
@@ -217,7 +203,7 @@ impl ModuleFaultInfo {
             last_fault_type: fault_type::NONE,
             last_fault_tick: 0,
             last_fault_ms: 0,
-            backoff_remaining: 0,
+            restart_not_before_ms: 0,
             step_deadline_us: 0,
             step_deadline_burst_us: 0,
             quarantine_partner: NO_MODULE,
@@ -248,8 +234,6 @@ impl ModuleFaultInfo {
         self.fault_count = self.fault_count.saturating_add(1);
         self.last_fault_type = fault_kind;
         self.last_fault_tick = tick;
-        // Wall-clock stamp for the quarantine-window correctness decision;
-        // independent of the tick-counted diagnostics above.
         self.last_fault_ms = hal::now_millis();
     }
 
@@ -264,17 +248,11 @@ impl ModuleFaultInfo {
         self.restart_count < self.max_restarts
     }
 
-    /// Geometric backoff before the next restart attempt, in scheduler
-    /// ticks. Scales the configured base by `2^restart_count` so a
-    /// module faulting on every restart attempt doesn't monopolise the
-    /// scheduler with a tight retry loop — successive failures pay
-    /// exponentially longer waits, paired with the `max_restarts` cap.
-    ///
-    /// The configured base (`restart_backoff_ms`) is treated as
-    /// **ticks** here, matching the kernel's per-tick decrement of
-    /// `backoff_remaining`. The field name is a legacy misnomer kept
-    /// for ABI stability.
-    pub fn effective_backoff_ticks(&self) -> u32 {
+    /// Geometric backoff before the next restart attempt, in
+    /// milliseconds: the configured base scaled by `2^restart_count` (capped
+    /// at 2^8), so a module faulting on every restart pays exponentially
+    /// longer waits up to its `max_restarts`.
+    pub fn effective_backoff_ms(&self) -> u32 {
         let base = self.restart_backoff_ms as u32;
         let shift = (self.restart_count as u32).min(8);
         base.saturating_mul(1u32 << shift)
@@ -498,8 +476,7 @@ pub fn post_step_check() {
 ///                faulted within the cascade window, or `NO_MODULE` (0xFFFF)
 ///                if independent.
 ///   byte 4:      fault_kind
-///   byte 5:      last_input_ct — content_type of the module's most recent
-///                consumed input, or `0` for unknown.
+///   byte 5:      0
 ///   bytes 6-7:   fault_count (u16 LE)
 ///   bytes 8-11:  tick (u32 LE)
 ///   bytes 12-13: restart_count (u16 LE)
@@ -510,12 +487,10 @@ pub struct FaultRecord {
     /// Module index (0..MAX_MODULES).
     pub module_idx: ModuleId,
     /// Cascade origin — upstream module index that faulted within
-    /// `CASCADE_WINDOW_TICKS` of this fault, or `NO_MODULE` for independent.
+    /// the cascade window (ms) of this fault, or `NO_MODULE` for independent.
     pub caused_by: ModuleId,
     /// Fault type (fault_type::*).
     pub fault_kind: u8,
-    /// Content_type of the last consumed input, or `0` if unknown.
-    pub last_input_ct: u8,
     /// Cumulative fault count for this module after this event.
     pub fault_count: u16,
     /// Tick at which the fault was observed.
@@ -532,7 +507,6 @@ impl FaultRecord {
         b[0..2].copy_from_slice(&self.module_idx.to_le_bytes());
         b[2..4].copy_from_slice(&self.caused_by.to_le_bytes());
         b[4] = self.fault_kind;
-        b[5] = self.last_input_ct;
         b[6..8].copy_from_slice(&self.fault_count.to_le_bytes());
         b[8..12].copy_from_slice(&self.tick.to_le_bytes());
         b[12..14].copy_from_slice(&self.restart_count.to_le_bytes());
@@ -553,7 +527,7 @@ struct FaultRing {
 }
 
 // SAFETY: The actual push always happens in thread mode from the scheduler
-// (handle_step_timeout / handle_step_error / handle_mpu_fault). ISRs only set
+// (`scheduler::fault::fault`). ISRs only set
 // a pending flag; they never touch this ring directly.
 unsafe impl Sync for FaultRing {}
 
@@ -563,7 +537,6 @@ static FAULT_RING: FaultRing = FaultRing {
             module_idx: 0,
             caused_by: NO_MODULE,
             fault_kind: 0,
-            last_input_ct: 0,
             fault_count: 0,
             tick: 0,
             restart_count: 0,
@@ -589,18 +562,16 @@ pub fn subscribe(event_handle: i32) -> i32 {
 /// Safe to call from scheduler thread context. Drops oldest if full.
 pub fn push_fault(rec: FaultRecord) {
     // Emit on the host-facing log transport so `fluxor rig monitor` can
-    // parse faults without a second channel — operators see cascade
-    // origin and consumed content_type alongside the regular counters
-    // without decoding the binary FaultRecord stream separately.
+    // parse faults without a second channel — operators see the cascade
+    // origin alongside the regular counters without decoding the binary
+    // FaultRecord stream separately.
     log::info!(
-        "MON_FAULT mod={} kind={} fault_count={} restart_count={} \
-         caused_by={} last_input_ct={} tick={}",
+        "MON_FAULT mod={} kind={} fault_count={} restart_count={} caused_by={} tick={}",
         rec.module_idx,
         rec.fault_kind,
         rec.fault_count,
         rec.restart_count,
         rec.caused_by,
-        rec.last_input_ct,
         rec.tick,
     );
     let head = FAULT_RING.head.load(Ordering::Relaxed);

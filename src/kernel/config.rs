@@ -66,7 +66,7 @@ mod profile_linux {
     /// refuses one that does not fit, printing its share and the slack left
     /// for the workloads the node will admit.
     pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
-    /// The module-index DOMAIN, not a table size: the scheduler's per-module
+    /// The module-index RANGE, not a table size: the scheduler's per-module
     /// tables are sized at boot from the graph (`resource_ledger::plan`), its
     /// module count, fans and resident workloads plus the module-slot
     /// reserve. What this bounds is what a module index may be at all: a
@@ -74,8 +74,9 @@ mod profile_linux {
     /// Modules read the live slot count at runtime through
     /// `internal::reconfigure::SLOT_CAPACITY`.
     pub const MAX_MODULES: usize = 4096;
-    /// ISR-tier bridge slots: one per edge that crosses into an ISR-tier
-    /// domain, each holding its ring inline (~2 KiB).
+    /// Interrupt-mode rings a graph may hold: one per edge with an end in an
+    /// interrupt-mode domain, ~2 KiB each, sized by the plan
+    /// (`ipc::isr_ring::size`), so a graph without one holds none.
     pub const MAX_BRIDGES: usize = 16;
     /// Loader sanity ceiling for a single module's code segment. 1 MiB fits
     /// media modules (the unified codec's decoder plus its CAVLC/clip tables
@@ -87,7 +88,7 @@ mod profile_linux {
     /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
     /// round for `MAX_MODULES` slots, and never under 32 KiB.
     pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
-    /// Kernel elastic region backing Tier B chunk grants
+    /// Kernel elastic region backing elastic chunk grants
     /// (`resource::ELASTIC_ALLOC`). 16 MiB: room for TLS-session growth to
     /// its compiled maximum (~7.9 MiB at `tls::MAX_SESSIONS`, once 104 KiB
     /// chunks round up to the quantum below) plus several workloads' worth
@@ -114,7 +115,7 @@ mod profile_linux {
     /// carries no entry for it. A pool the graph cannot size (events,
     /// timers, TTY sessions, …) has no derived part, so its default is its
     /// size; the sandbox pool's derived part is the owner table's workload
-    /// slots. A pool held within an index domain (module slots, channels,
+    /// slots. A pool held within an index range (module slots, channels,
     /// owners, events, timers, sandboxes, TTY sessions) takes only the part
     /// of its default the domain leaves beside the derived size
     /// (`resource_ledger::pool_domain`); an envelope entry is never clamped. Every table is sized at boot from derived + reserve
@@ -162,7 +163,7 @@ mod profile_linux {
 //
 // No heap on bare metal. The kernel's tables are sized at boot from the graph
 // (`resource_ledger::plan`), as on Linux, and carved from the DRAM zone the
-// device tree describes above the boot image (`kernel::mem::carve`,
+// device tree describes above the firmware image (`kernel::mem::carve`,
 // `platform/bcm2712/memmap.rs`); the module state arena takes what the carves
 // leave of that zone. Kernel `.bss` holds the fixed arenas only, and must
 // stay below the firmware's reservation (`linker/memory-bcm2712.x` asserts
@@ -173,19 +174,19 @@ mod profile_bcm2712 {
     /// Module state pool the graph builder plans against: the smallest zone a
     /// supported board leaves (a 2 GB Pi 5's DRAM above 1 GB, QEMU virt's
     /// upper GB at `-m 2G`). The arena itself is sized at boot from the device
-    /// tree — the zone above the boot image, less the tables carved from its
+    /// tree — the zone above the firmware image, less the tables carved from its
     /// top — and is never zeroed whole. `targets/silicon/bcm2712.toml` states
     /// the same figure (`state_arena_kb`) for the graph builder.
     pub const STATE_ARENA_SIZE: usize = 1024 * 1024 * 1024;
     /// Per-channel buffer pool (see the Linux profile); zero-initialised
     /// `.bss`.
     pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
-    /// The module-index DOMAIN (see the Linux profile), not a table size: the
+    /// The module-index RANGE (see the Linux profile), not a table size: the
     /// scheduler's per-module tables are sized at boot from the graph plus the
     /// module-slot reserve. A bare-metal node's control plane and image plane
     /// seat ~250 modules before any workload.
     pub const MAX_MODULES: usize = 1024;
-    /// ISR-tier bridge slots (see the Linux profile).
+    /// interrupt-mode bridge slots (see the Linux profile).
     pub const MAX_BRIDGES: usize = 16;
     /// Loader sanity ceiling for a single module's code segment (see the
     /// Linux profile).
@@ -197,7 +198,7 @@ mod profile_bcm2712 {
     /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
     /// round for `MAX_MODULES` slots, and never under 32 KiB.
     pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
-    /// Tier B elastic region (see the Linux profile). Zero-initialised, so
+    /// elastic region (see the Linux profile). Zero-initialised, so
     /// the size costs kernel `.bss` rather than image.
     pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
     /// Grant granularity: the 64 KiB platform quantum.
@@ -268,9 +269,9 @@ mod profile_uefi {
     pub const STATE_ARENA_SIZE: usize = 512 * 1024 * 1024;
     /// Per-channel buffer pool (see the Linux profile).
     pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
-    /// The module-index DOMAIN (see the Linux profile), not a table size.
+    /// The module-index RANGE (see the Linux profile), not a table size.
     pub const MAX_MODULES: usize = 1024;
-    /// ISR-tier bridge slots (see the Linux profile).
+    /// interrupt-mode bridge slots (see the Linux profile).
     pub const MAX_BRIDGES: usize = 16;
     /// Loader sanity ceiling for a single module's code segment (see the
     /// Linux profile).
@@ -280,7 +281,7 @@ mod profile_uefi {
     /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
     /// round for `MAX_MODULES` slots, and never under 32 KiB.
     pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
-    /// Tier B elastic region (see the Linux profile).
+    /// elastic region (see the Linux profile).
     pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
     /// Grant granularity: the 64 KiB platform quantum.
     pub const ELASTIC_QUANTUM: usize = 64 * 1024;
@@ -348,14 +349,14 @@ mod profile_wasm {
     /// chains) declares ~22 modules and the kernel inserts an internal
     /// tee/merge per fan, which 32 cannot hold.
     pub const MAX_MODULES: usize = 48;
-    /// ISR-tier bridge slots (see the Linux profile).
+    /// interrupt-mode bridge slots (see the Linux profile).
     pub const MAX_BRIDGES: usize = 16;
     /// Early-boot log ring.
     pub const LOG_RING_CAPACITY: usize = 16384;
     /// The telemetry ring (`kernel::sys::telemetry_ring`): one whole PSTATUS
     /// round for `MAX_MODULES` slots, and never under 32 KiB.
     pub const TELEMETRY_RING_CAPACITY: usize = super::telemetry_ring_for(MAX_MODULES);
-    /// Tier B elastic region. Browser tabs page lazily, but the region is
+    /// elastic region. Browser tabs page lazily, but the region is
     /// still budgeted small.
     pub const ELASTIC_REGION_SIZE: usize = 2 * 1024 * 1024;
     /// Grant granularity: the wasm page.
@@ -438,11 +439,12 @@ mod profile_rp {
     /// The telemetry ring, from `[kernel] telemetry_ring_kb`. Must be a power
     /// of two and hold one PSTATUS round.
     pub const TELEMETRY_RING_CAPACITY: usize = crate::platform::chip::TELEMETRY_RING_CAPACITY;
-    /// The module-index DOMAIN, not a table size: the module tables are sized
+    /// The module-index RANGE, not a table size: the module tables are sized
     /// from the plan within it. A `ModuleMask` holds one bit per index.
     pub const MAX_MODULES: usize = 32;
-    /// ISR-tier bridge slots. Eight is the ISR edges a graph of this size
-    /// has, at ~2 KiB of static RAM each.
+    /// Interrupt-mode rings (see the Linux profile). Eight is the ISR edges
+    /// a graph of this size has, ~2 KiB each from the kernel pool when the
+    /// graph has them.
     pub const MAX_BRIDGES: usize = 8;
     /// Loader sanity ceiling for a single module's code segment. Code
     /// executes in place from flash, so this costs no RAM and is set by the
@@ -453,7 +455,7 @@ mod profile_rp {
     pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
     #[cfg(fluxor_abi = "thumbv6m")]
     pub const MAX_MODULE_CODE_SIZE: usize = 384 * 1024;
-    /// No Tier B on MCU-class targets: elasticity compiles out —
+    /// No elastic region on MCU-class targets: elasticity compiles out —
     /// `ELASTIC_ALLOC` denies.
     pub const ELASTIC_REGION_SIZE: usize = 0;
     /// Grant granularity (unused while the region is empty).
@@ -462,7 +464,7 @@ mod profile_rp {
     /// instantiation, as the silicon TOML's state-arena budget plans it.
     pub const HEAP_SEGMENTS: usize = 1;
     /// Graph edge slots: the config blob's graph section holds this many, so
-    /// it is the channel-id domain; the channel table is sized from the plan
+    /// it is the channel-id range; the channel table is sized from the plan
     /// within it.
     pub const GRAPH_EDGES: usize = 128;
 

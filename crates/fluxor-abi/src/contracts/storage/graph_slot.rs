@@ -7,8 +7,8 @@
 // Storage layout (flash offsets, slot sizes) is NOT part of this
 // contract — it lives in `platform/<chip>/flash_layout.rs` because it's
 // platform-specific (RP 4 MB XIP flash vs. ESP32 NVS vs. BCM2712
-// SD/NVMe). Each slot holds one graph image, whose 256-byte header is
-// `wire::graph_image`.
+// SD/NVMe). Each slot holds one node image, whose 256-byte header is
+// `wire::node_image`.
 //
 // The graph_slot PIC module owns the on-flash format. It is served
 // over channels — consumers write FMP-framed requests and read

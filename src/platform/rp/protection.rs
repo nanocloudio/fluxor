@@ -361,7 +361,7 @@ pub fn register(module: usize) -> bool {
             return false;
         }
     }
-    // The programs the bundle carries for this instance, read-only and never
+    // The programs the node image carries for this instance, read-only and never
     // executable: an isolated module reads them in place and nothing else of
     // the section. The loader admits a section only when each owner's
     // programs share one region disjoint from every other owner's, so the

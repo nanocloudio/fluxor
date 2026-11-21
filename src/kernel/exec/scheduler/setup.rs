@@ -20,25 +20,21 @@ use super::*;
 pub unsafe fn size_kernel_tables(
     config: &Config,
 ) -> Result<(), crate::kernel::sys::resource_ledger::Refused> {
+    // The platform frames the plan: it may plan its own memory around the
+    // kernel's tables, and it sizes the tables it keeps after them.
+    // SAFETY: the caller's contract, forwarded to both.
+    unsafe { crate::platform::chip::plan_tables(|| size_tables(config)) }
+}
+
+/// The kernel's own tables, from the plan `config` derives.
+///
+/// # Safety
+/// As [`size_kernel_tables`].
+unsafe fn size_tables(config: &Config) -> Result<(), crate::kernel::sys::resource_ledger::Refused> {
     use crate::abi::contracts::resource as res;
-    use crate::kernel::mem::table::TableError;
     use crate::kernel::sys::resource_ledger as ledger;
-    // RP: the graph plans the kernel's static pool afresh.
-    #[cfg(feature = "rp")]
-    let _window = crate::kernel::mem::carve::begin_plan();
     ledger::plan(config);
-    let refused = |pool: u16, e: TableError| {
-        ledger::refuse(
-            pool,
-            match e {
-                TableError::Ceiling => "past this profile's table or the format's bound",
-                TableError::NoMemory => {
-                    "the platform refused the memory (the host, or a full carve zone)"
-                }
-            },
-        );
-        ledger::Refused
-    };
+    let refused = ledger::refuse_table;
     for pool in 1..=res::KERNEL_POOL_COUNT as u16 {
         ledger::check_static(pool)?;
     }
@@ -47,14 +43,14 @@ pub unsafe fn size_kernel_tables(
     if modules > MAX_MODULES {
         ledger::refuse(
             res::POOL_MODULE_SLOTS,
-            "past the module-index domain (12-bit config ids, ModuleMask width)",
+            "past the module-index range (12-bit config ids, ModuleMask width)",
         );
         return Err(ledger::Refused);
     }
     let (edge_derived, _) = ledger::plan_parts(res::POOL_CHANNELS);
     let edges = ledger::ceiling(res::POOL_CHANNELS) as usize;
     if edges > MAX_CHANNELS {
-        ledger::refuse(res::POOL_CHANNELS, "past the channel-id domain");
+        ledger::refuse(res::POOL_CHANNELS, "past the channel-id range");
         return Err(ledger::Refused);
     }
     // SAFETY: graph preparation is SCHED's single mutator.
@@ -78,7 +74,7 @@ pub unsafe fn size_kernel_tables(
     let index_limit = crate::abi::kernel_abi::handle::INDEX_LIMIT;
     for pool in [res::POOL_EVENTS, res::POOL_TIMERS, res::POOL_HANDLES] {
         if whole(pool) > index_limit {
-            ledger::refuse(pool, "past the handle index domain");
+            ledger::refuse(pool, "past the handle index range");
             return Err(ledger::Refused);
         }
     }
@@ -95,33 +91,13 @@ pub unsafe fn size_kernel_tables(
     // code-pack region (and one being staged), one graph-workload slot per
     // owner slot; the graph-local pacers and the resident-graph index hold
     // one entry per owner slot and execution domain.
-    super::merge::size_graph_pacers(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
+    super::pacer::size_graph_pacers(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     super::multigraph::size_resident_graphs(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     #[cfg(feature = "host-linux")]
     crate::kernel::workload::owner_log::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     crate::kernel::workload::code_pack::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     crate::kernel::workload::workload_graph::size(owners)
         .map_err(|e| refused(res::POOL_OWNERS, e))?;
-    super::live::size_workspaces(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
-    // A host-process sandbox is a workload with an owner of its own: the
-    // owner table's workload slots are the sandbox pool's derived part, so
-    // every workload owner the table seats has a sandbox slot. The reserve on
-    // top seats finished sandboxes held until destroyed; by default it takes
-    // only what the sandbox-index domain leaves, so an owner table near its
-    // own domain leaves the sandboxes little headroom, and a workload that
-    // keeps finished sandboxes past it is refused its next spawn. TTY
-    // sessions have no structural source.
-    #[cfg(feature = "host-linux")]
-    {
-        ledger::set_derived(res::POOL_SANDBOXES, owners.saturating_sub(1) as u32);
-        let sandboxes = whole(res::POOL_SANDBOXES);
-        crate::platform::linux::host_backend::size_sandboxes(sandboxes)
-            .map_err(|e| refused(res::POOL_SANDBOXES, e))?;
-        crate::platform::linux::workload::size_workloads(sandboxes)
-            .map_err(|e| refused(res::POOL_SANDBOXES, e))?;
-        crate::platform::linux::host_backend::size_tty_sessions(whole(res::POOL_TTY_SESSIONS))
-            .map_err(|e| refused(res::POOL_TTY_SESSIONS, e))?;
-    }
     crate::kernel::module::provider::size_routes(whole(res::POOL_HANDLES))
         .map_err(|e| refused(res::POOL_HANDLES, e))?;
     crate::kernel::ipc::lend::size(whole(res::POOL_LENDS))
@@ -139,20 +115,46 @@ pub unsafe fn size_kernel_tables(
         whole(res::POOL_NET_ROUTE_HELD),
     )
     .map_err(|e| refused(res::POOL_NET_ROUTE_SEGMENTS, e))?;
-    #[cfg(feature = "host-linux")]
-    crate::platform::linux::store::size_from_plan();
-    #[cfg(feature = "chip-bcm2712")]
-    crate::platform::store::size_from_plan().map_err(|e| refused(res::POOL_STORE_SUBS, e))?;
-    // RP: the arenas take what the tables left of the pool.
-    #[cfg(feature = "rp")]
-    crate::kernel::mem::carve::finish_plan()?;
+    // A ring per edge with an interrupt-mode end; past the profile's rings
+    // an edge loses its routing, logged when it is wired.
+    // SAFETY: the caller's contract, forwarded.
+    unsafe {
+        crate::kernel::ipc::isr_ring::size(
+            isr_edges(config).min(crate::kernel::ipc::isr_ring::MAX_RINGS),
+        )
+    }
+    .map_err(|e| refused(res::POOL_CHANNELS, e))?;
     Ok(())
 }
 
-/// Synchronous setup - returns true if ready to run, false on error
-///
-/// Call this first, then call run_main_loop() if it returns true.
-pub fn setup(runner_config: &RunnerConfig) -> bool {
+/// Edges of the node graph with an end in an interrupt-mode domain.
+fn isr_edges(config: &Config) -> usize {
+    let isr = |id: ModuleId| {
+        config
+            .modules
+            .get(usize::from(id))
+            .copied()
+            .flatten()
+            .and_then(|m| {
+                config
+                    .domain_exec_mode
+                    .get(usize::from(m.domain_id))
+                    .copied()
+            })
+            .is_some_and(ExecMode::is_interrupt)
+    };
+    config
+        .graph_edges
+        .iter()
+        .take(config.edge_count as usize)
+        .flatten()
+        .filter(|e| isr(e.from_id) || isr(e.to_id))
+        .count()
+}
+
+/// Boot setup: the module loader, the configuration, the runtime parameter
+/// store and the step guard. `false` has logged what failed.
+pub fn setup() -> bool {
     // SAFETY: setup runs once at boot; no concurrent reader yet.
     let loader = unsafe {
         let p = &raw mut STATIC_LOADER;
@@ -180,110 +182,103 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
     // Initialize step guard timer hardware
     step_guard::init();
 
-    // Validate hardware requirements
-    if !validate_hardware_requirements(runner_config) {
-        log::error!("[boot] hardware validation failed");
-        return false;
-    }
-
     true
 }
 
-/// `fnv1a32("vault_store")`: the module that keeps the vault's records.
-const VAULT_STORE_HASH: u32 = crate::abi::wire::fnv1a32(b"vault_store");
+/// Whether the module `name_hash` names declares what the `vault_store`
+/// contract asks of whoever calls it: the graph's store for the vault's
+/// records, by its manifest rather than by its name.
+fn keeps_vault_records(loader: &ModuleLoader, name_hash: u32) -> bool {
+    use crate::abi::registry::{contract_grant, vault_store, OpGrant};
+    let Ok(m) = loader.find_by_name_hash(name_hash) else {
+        return false;
+    };
+    let held = m.manifest_grants();
+    match contract_grant(vault_store::ID) {
+        Some(OpGrant::Contract(c)) => held[0] & (1u64 << c) != 0,
+        Some(OpGrant::Grant(g)) => held[1] & (1u64 << g) != 0,
+        Some(OpGrant::Free) | None => false,
+    }
+}
 
-/// Common graph preparation: validate config, wire edges, insert fan modules,
-/// open channels, and compute execution order.
+/// Prepare the node's graph: release the previous graph, reset the kernel's
+/// tables to the plan the installed config derives, and stage the config's
+/// composed graph through the splice under the node owner
+/// (`splice::admit_boot`): checked as any add is, its edges wired and their
+/// channels opened, every slot stamped. The caller applies what must hold
+/// before any module runs (an owner plan, cross-domain bridging), then
+/// [`instantiate_graph`] instantiates and publishes it.
 ///
-/// Returns (module_list, module_count) on success, or -1 on error.
-/// After this call, edges/modules/module_ports/finished/exec_order are initialized.
-pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
+/// The negative errno on refusal; the graph is then idle until the next
+/// preparation succeeds.
+pub fn prepare_graph() -> Result<super::splice::StagedAdd, i32> {
     // SAFETY: prepare_graph runs single-threaded during graph bring-up.
-    let config = unsafe {
-        let p = &raw const STATIC_CONFIG;
-        &*p
+    let config: &'static Config = unsafe { &*core::ptr::addr_of!(STATIC_CONFIG) };
+    let Some(composed) = config.composed() else {
+        log::error!("[graph] no composed graph");
+        return Err(crate::kernel::sys::errno::EINVAL);
     };
-    // SAFETY: as above.
-    let loader = unsafe {
-        let p = &raw const STATIC_LOADER;
-        &*p
-    };
-    let edge_count = config.edge_count as usize;
-    let declared_modules = config.module_count as usize;
-
-    if declared_modules == 0 {
-        log::error!("[graph] no modules");
-        return Err(-1);
-    }
-    if declared_modules > MAX_MODULES {
-        log::error!("[graph] too many modules");
-        return Err(-1);
-    }
-    if edge_count > MAX_CHANNELS {
-        log::error!("[graph] too many edges");
-        return Err(-1);
-    }
-
-    let (mut module_list, mut module_count, id_to_slot) = build_module_list(config)?;
+    let module_count = usize::from(composed.module_count());
+    let edge_count = usize::from(composed.edge_count());
     if module_count == 0 {
-        log::error!("[graph] no usable modules");
-        return Err(-1);
+        log::error!("[graph] no modules");
+        return Err(crate::kernel::sys::errno::EINVAL);
+    }
+    if module_count > MAX_MODULES || edge_count > MAX_CHANNELS {
+        log::error!("[graph] {module_count} modules / {edge_count} edges past the kernel's domain");
+        return Err(crate::kernel::sys::errno::E2BIG);
     }
 
-    // A graph that keeps the vault's records through a `vault_store` module
-    // says so before any module runs: until that store loads, the vault
-    // answers `EAGAIN` rather than read the platform's store, or none, as
-    // its own and mint a key over one already kept.
-    let mut carries_store = false;
-    for i in 0..module_count {
-        if let Some(e) = &module_list[i] {
-            carries_store |= e.name_hash == VAULT_STORE_HASH;
-        }
-    }
-    crate::kernel::security::vault_store::expect(carries_store);
+    // A graph that keeps the vault's records through a store module says so
+    // before any module runs: until that store loads, the vault answers
+    // `EAGAIN` rather than read the platform's store, or none, as its own
+    // and mint a key over one already kept.
+    // SAFETY: graph preparation, the loader's single reader.
+    let loader = unsafe { static_loader() };
+    crate::kernel::security::vault_store::expect(
+        composed
+            .modules()
+            .any(|m| keeps_vault_records(loader, m.name_hash)),
+    );
 
-    log::info!("[graph] modules={declared_modules} edges={edge_count}");
+    log::info!("[graph] modules={module_count} edges={edge_count}");
 
     // SAFETY: prepare_graph is the single mutator of SCHED until
     // graph stepping resumes; this `&mut` is exclusive.
-    let sched = unsafe {
-        let p = &raw mut SCHED;
-        &mut *p
-    };
+    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
 
     // Transaction marker, latched before any destructive reset: while it
-    // is set, `step_modules` reports the graph `StepResult::Done` (cleanly
-    // idle) instead of stepping a half-prepared one. Cleared on the
-    // successful return below. A failed preparation leaves it set, so a
-    // domain that resumes after the quiesce steps nothing until the next
-    // `prepare_graph` succeeds.
+    // is set, `pass::run` reports the graph `StepResult::Done` (cleanly
+    // idle) instead of stepping a half-prepared one. The splice clears it
+    // once the new graph is published; a failed preparation leaves it set,
+    // so a domain that resumes after the quiesce steps nothing until the
+    // next preparation succeeds.
     sched.prepare_in_progress = true;
 
-    // Clear `current_module` so the runtime EACCES gate
-    // (`deny_isr_tier_syscall`) doesn't fire for kernel-internal
-    // `channel_open` / `channel_read` / `channel_write` calls that
-    // happen during graph build. The stale value from the previous
-    // graph could point at a slot whose *new* domain is Tier 1b — a
-    // classic teardown race that would surface as "open_channels
-    // returns EACCES" inside the very call that's *populating* the
-    // new graph. Reset is bounded by MAX_MODULES so the gate's
-    // `caller >= module_slots()` short-circuit kicks in.
+    // No module is current while the graph is built: kernel-internal
+    // channel calls are never mistaken for a stale interrupt-mode slot's.
     set_current_module(MAX_MODULES);
 
-    // No ISR-tier module may run while the tables move: one stepped from a
-    // Tier 1b or Tier 2 handler on another core reads the module tables in a
-    // syscall's admission check. Its registration reopens dispatch once the
-    // new graph has instantiated it.
-    crate::kernel::exec::isr_tier::close_dispatch();
+    // No interrupt-mode module may run while the tables move: one dispatched
+    // on another core reads the module tables in a syscall's admission
+    // check. Its registration reopens dispatch once the new graph has
+    // instantiated it.
+    crate::kernel::exec::interrupt::close_dispatch();
+
+    // The previous graph's instances go first, while the arena their state
+    // was drawn from is intact: a native module releases what it built.
+    for i in 0..sched.modules.len() {
+        let _ = sched.modules[i].take_state_range();
+    }
 
     // Size every boot-sized table to the plan this config derives, before
     // anything below walks one. A plan the platform cannot hold fails the
     // graph here, naming the pool.
     // SAFETY: graph preparation — no module runs and nothing holds a
     // reference into a kernel table: the cooperative domains are parked or
-    // not yet started, and ISR-tier dispatch is closed above.
+    // not yet started, and interrupt-mode dispatch is closed above.
     if unsafe { size_kernel_tables(config) }.is_err() {
-        return Err(-1);
+        return Err(crate::kernel::sys::errno::ENOSPC);
     }
 
     // Reset all scheduler state, state arena, and name arena. Channel
@@ -305,31 +300,26 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
     crate::kernel::ipc::channel::reset_all();
     crate::kernel::ipc::buffer_pool::reset_all();
     crate::kernel::ipc::buffer_pool::reset_buffer_arena();
-    NameArena::reset();
     crate::kernel::module::provider::reset_handle_tracking();
     crate::kernel::module::provider::reset_module_layers();
     // The old graph's slots no longer name net.route writers; the tables stay.
     crate::kernel::net_route::reset_bindings();
     // A module net provider and the lanes queued for it belong to the old
-    // graph; a built-in one registers again as the new graph instantiates.
+    // graph; a native one registers again as the new graph instantiates.
     crate::kernel::workload::net_attach::reset_queued();
-    // Tear down any prior graph's ISR-tier registrations and bridge
-    // slots before walking the new module table. Without this, the
-    // post-instantiation `register_isr_tier_modules_from_graph`
-    // helper would append on top of stale entries from the previous
-    // graph, and `wire_isr_bridges` would over-allocate bridge slots.
-    crate::kernel::exec::isr_tier::reset_all();
-    crate::kernel::bridge::bridge_reset_all();
+    // The previous graph's interrupt-mode registrations and bridge slots go
+    // before the new graph registers its own.
+    crate::kernel::exec::interrupt::reset_all();
+    crate::kernel::ipc::isr_ring::reset_all();
     sched.reset();
-    // The mechanism-(a)/(b) pacer statics live outside `Sched`, so reset them
-    // here too — a rebuilt graph must start from a clean cadence (level/dwell/
-    // deadband/idle-latch/burst) rather than inheriting the prior graph's.
+    // A resident owner's state is charged again as the new graph
+    // instantiates its modules; what the previous graph charged goes.
+    sched.owners.clear_state_charges();
+    // The pacer statics live outside `SCHED`: a rebuilt graph starts from a
+    // clean cadence rather than the prior graph's.
     pacer_reset_all();
-    // Owner-pause wake masking also lives outside `Sched`; the rebuild clears
-    // every module's owner stamp (below) and plan re-apply reinstalls owners
-    // Active, so stale mask bits would suppress wakes for reused module slots
-    // (pause is a runtime posture, not
-    // desired state; it does not survive a rebuild).
+    // Owner-pause wake masking also lives outside `SCHED`; pause is a
+    // runtime posture, not desired state, and does not survive a rebuild.
     crate::kernel::ipc::event::reset_pause_masking();
 
     // Store graph-level sample rate from config header
@@ -349,56 +339,38 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
         log::info!("[graph] tick_us={}", sched.tick_us);
     }
 
-    // Store per-module domain assignments and infer domain count.
-    // Mirror the per-module `pre_tick_drain` flag into SCHED at the
-    // same time so the post-instantiation ISR-tier admission helper
-    // reads it without re-touching the config blob.
-    let mut max_domain: u8 = 0;
-    // Rebuild the per-domain module bitmap from scratch (prepare_graph re-runs
-    // on live reconfigure). The pacer intersects it with EVENT_WAKE_PENDING
-    // for a per-domain idle decision.
-    for m in sched.domain_module_mask.iter_mut() {
-        *m = ModuleMask::EMPTY;
-    }
-    for entry in config.modules.iter().flatten() {
-        let id = entry.id as usize;
-        if id < module_slots() {
-            sched.domain_id[id] = entry.domain_id;
-            sched.pre_tick_drain[id] = entry.pre_tick_drain;
-            let d = entry.domain_id as usize;
-            if d < MAX_DOMAINS {
-                sched.domain_module_mask[d].set(id);
-            }
-            if entry.domain_id > max_domain {
-                max_domain = entry.domain_id;
-            }
-        }
-    }
-    sched.domain_count = if max_domain > 0 {
+    // The node runs every domain its graph declares, occupied or not (a
+    // workload may be placed in one later), and every domain a module
+    // occupies; a single domain counts as none.
+    let max_domain = composed.modules().map(|m| m.domain).max().unwrap_or(0);
+    let occupied = if max_domain > 0 {
         (max_domain + 1).min(MAX_DOMAINS as u8)
     } else {
         0
     };
+    let declared = config.domain_count.min(MAX_DOMAINS as u8);
+    sched.domain_count = if declared > 1 {
+        declared.max(occupied)
+    } else {
+        occupied
+    };
 
-    // Populate per-domain tick_us, exec_mode, and budget limit from
-    // config. The budget limit *is* the tick: a domain that exceeds
-    // its tick_us within a single pass is over-subscribed by
-    // definition. Per-domain `tick_us == 0` means "inherit the
-    // graph-level tick"; that fallback is what the budget guards
-    // against — the cooperative path doesn't gate inter-module
-    // execution by anything else.
+    // Per-domain tick_us, exec_mode, and budget limit from config. The
+    // budget limit *is* the tick: a domain that exceeds its tick_us within a
+    // single pass is over-subscribed by definition. Per-domain `tick_us == 0`
+    // means "inherit the graph-level tick".
     for d in 0..MAX_DOMAINS {
-        sched.domain_tick_us[d] = config.domain_tick_us[d] as u32;
-        sched.domain_exec_mode[d] = config.domain_exec_mode[d];
+        sched.domains[d].tick_us = config.domain_tick_us[d] as u32;
+        sched.domains[d].exec_mode = config.domain_exec_mode[d];
         // Adaptive-tick per-domain config. The config parser already
         // default-filled tick_min/tick_max to the domain's effective tick
         // when unset, so for an unmodified config tick_min == tick_max ==
         // tick and adaptive_flags == 0 ⇒ no-op.
-        sched.domain_adaptive_flags[d] = config.domain_adaptive_flags[d];
-        sched.domain_tick_min_us[d] = config.domain_tick_min_us[d] as u32;
-        sched.domain_tick_max_us[d] = config.domain_tick_max_us[d] as u32;
-        let dtick = sched.domain_tick_us[d];
-        sched.domain_budget_us_limit[d] = if dtick > 0 {
+        sched.domains[d].adaptive_flags = config.domain_adaptive_flags[d];
+        sched.domains[d].tick_min_us = config.domain_tick_min_us[d] as u32;
+        sched.domains[d].tick_max_us = config.domain_tick_max_us[d] as u32;
+        let dtick = sched.domains[d].tick_us;
+        sched.domains[d].budget_limit_us = if dtick > 0 {
             dtick
         } else if sched.tick_us > 0 {
             sched.tick_us
@@ -409,249 +381,72 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
         };
     }
 
-    let edges = &mut sched.edges;
-
-    // Wire edges from config
-    for (i, edge_opt) in config.graph_edges.iter().take(edge_count).enumerate() {
-        if let Some(edge) = *edge_opt {
-            let from_slot = id_to_slot.get(edge.from_id as usize).copied().unwrap_or(-1);
-            let to_slot = id_to_slot.get(edge.to_id as usize).copied().unwrap_or(-1);
-
-            if from_slot < 0 || to_slot < 0 {
-                log::error!(
-                    "[graph] edge {} unknown module {}→{}",
-                    i,
-                    edge.from_id,
-                    edge.to_id
-                );
-                return Err(-1);
-            }
-
-            let to_port_name = if edge.to_port == 1 { "ctrl" } else { "in" };
-            let mut e = Edge::new_indexed(
-                from_slot as usize,
-                "out",
-                edge.from_port_index,
-                to_slot as usize,
-                to_port_name,
-                edge.to_port_index,
-            );
-            e.buffer_group = edge.buffer_group;
-            e.edge_class = edge.edge_class;
-            e.buffer_bytes = edge.buffer_bytes;
-            e.rate_class = edge.rate_class;
-            e.wake_on_write = edge.wake_on_write;
-            e.retains_send = edge.retains_send;
-            edges[i] = e;
-        } else {
-            log::error!("[graph] edge {i} missing");
-            return Err(-1);
-        }
-    }
-
-    // Insert fan-out (tee) and fan-in (merge) modules
-    let mut runtime_edge_count = edge_count;
-    if !insert_fan_out(
-        edges,
-        &mut runtime_edge_count,
-        &mut module_list,
-        &mut module_count,
-        loader,
-    ) {
-        return Err(-1);
-    }
-    if !insert_fan_in(
-        edges,
-        &mut runtime_edge_count,
-        &mut module_list,
-        &mut module_count,
-        loader,
-    ) {
-        return Err(-1);
-    }
-
-    // Isolation pre-pass: mark which modules requested a gated protection
-    // level in their config params. The full protection TLV is parsed later,
-    // at instantiation (`parse_protection_config`), but the zero-copy check
-    // below must already know which modules are gated. Cheap, idempotent with
-    // the later full parse.
-    mark_isolated_from_params(&module_list, module_count);
-
-    // Query channel hints and open channels
-    collect_module_hints(loader, &module_list, module_count);
-    if open_channels(&mut edges[..runtime_edge_count]) < 0 {
-        log::error!("[graph] channel open failed");
-        return Err(-1);
-    }
-
-    // Allocate ISR-tier bridge slots for any edge with at least one
-    // endpoint in a Tier 1b/2 domain. The producer continues to
-    // write the regular PIPE channel; `pump_isr_bridges` drains it
-    // into the bridge ring each scheduler tick (and vice versa for
-    // ISR→cooperative direction).
-    wire_isr_bridges(&mut edges[..runtime_edge_count]);
-
-    // Wake-on-write wiring: bind `wake: true` edges' channels to their
-    // consumer module so a successful write latches the consumer's
-    // event-wake bit and rings the scheduler doorbell. Same-domain
-    // direct edges only here: bridged (ISR-tier) endpoints have no PIPE
-    // writes to hook, and any edge the platform will split across the
-    // SPSC pump (different domains, or `EdgeClass::CrossCore`) must
-    // wake at consumer-side pump DELIVERY — a write-time wake on the
-    // producer-side channel is guaranteed-spurious because the
-    // consumer's domain steps before it pumps inbound, and the bytes
-    // aren't readable through the consumer's handle until the pump
-    // moves them. The cross-domain binding happens where the knowledge
-    // lives: the platform's cross-edge bridging binds the
-    // consumer-local channel (`domains::cross::bridge_edges`),
-    // so the pump's delivery write into it triggers the same wake hook
-    // at the first moment the consumer could actually read the bytes.
-    for e in edges[..runtime_edge_count].iter() {
-        if !e.wake_on_write || e.channel < 0 || e.bridge_slot >= 0 || e.consumer_channel >= 0 {
-            continue;
-        }
-        if e.edge_class == crate::kernel::boot::config::EdgeClass::CrossCore {
-            // Bridged regardless of domain assignment — the consumer
-            // reads the pump-delivered consumer-local channel, so the
-            // wake binds there (platform bridging), not on the
-            // producer-side channel.
-            continue;
-        }
-        // SAFETY: scheduler-thread context during graph prep.
-        let same_domain = unsafe {
-            let p = core::ptr::addr_of!(SCHED);
-            (&(*p).domain_id)[e.from_module] == (&(*p).domain_id)[e.to_module]
-        };
-        if !same_domain {
-            continue; // bound at platform bridging, delivery side
-        }
-        crate::kernel::ipc::channel::channel_set_wake_module(e.channel, e.to_module as i32);
-        log::info!(
-            "[wake] edge {}→{} chan={} wake-on-write bound",
-            e.from_module,
-            e.to_module,
-            e.channel
-        );
-    }
-
-    // Validate buffer-group constraints uniformly across every
-    // platform. Runs after `collect_module_hints` (which populates
-    // `in_place_writer`) and `open_channels` (which sets
-    // `edge.channel >= 0` for the live edges); two in-place writers
-    // pinned into the same buffer group is undefined producer
-    // ownership and must be rejected before the graph can step.
-    if !validate_buffer_groups(&edges[..runtime_edge_count]) {
-        log::error!("[graph] buffer group validation failed");
-        return Err(crate::kernel::sys::errno::EINVAL);
-    }
-
-    // A gated module's channels stay kernel memory: it reads and writes them
-    // only through the gateway, which copies, so no channel buffer is ever
-    // mapped into its protection domain. Zero-copy edges (mailbox, in-place)
-    // cannot touch a gated module.
-    for e in edges[..runtime_edge_count].iter() {
-        if e.buffer_group == 0 {
-            continue;
-        }
-        for m in [e.from_module, e.to_module] {
-            if crate::kernel::exec::scheduler::module_level(m).is_gated() {
-                log::error!(
-                    "[graph] module {m} is gated and sits on a zero-copy edge; a gated \
-                     module reaches channels only through the gateway"
-                );
-                return Err(crate::kernel::sys::errno::EINVAL);
-            }
-        }
-    }
-
-    // Compute topological execution order. A graph with cycles is
-    // rejected by default: silently running the topological prefix
-    // plus the cyclic remainder produces a *different* graph than
-    // the author declared. Typed feedback edges with explicit
-    // buffering will get their own ABI shape; until then a cycle is
-    // malformed and must be regenerated.
-    //
-    // Opt-in escape hatch (`graph_flags & ACCEPT_CYCLES`): the
-    // config blob's graph-section flags byte can carry an explicit
-    // author attestation that any cycles are bidirectional feedback
-    // pairs (canonically `http <-> linux_net` in any linux http
-    // example). When the flag is set, cycle members are appended to
-    // exec_order in declaration order and a loud `log::warn!` line
-    // is emitted so the choice is visible in operator output.
-    let cycle_count = compute_exec_order(edges, runtime_edge_count, module_count);
-    if cycle_count > 0 {
-        let accept =
-            (config.graph_flags & crate::kernel::boot::config::GRAPH_FLAG_ACCEPT_CYCLES) != 0;
-        if !accept {
-            log::error!(
-                "[graph] {cycle_count} module(s) involved in cycles — graph rejected. \
-                 Set `scheduler: {{ accept_cycles: true }}` in the graph YAML \
-                 if these cycles are bidirectional feedback pairs."
-            );
-            return Err(crate::kernel::sys::errno::EINVAL);
-        }
-        log::warn!(
-            "[graph] accepting {cycle_count} cycle module(s) under graph_flags.ACCEPT_CYCLES \
-             — stepping order within the cycle is best-effort, declaration order."
-        );
-    }
-
-    // Compute upstream dependency masks for ready-signal gating
-    compute_upstream_mask(edges, runtime_edge_count);
-
-    // Partition modules by domain and validate the partitioning.
-    // These use the global SCHED directly to avoid borrow conflicts with `edges`.
-    compute_domain_exec_orders_static(module_count);
-    validate_domains_static(module_count, runtime_edge_count);
-
-    // Log DmaOwned edges so operators can confirm the graph declares them.
-    // DmaOwned is a metadata annotation: the scheduler issues no DC CVAC /
-    // DC IVAC at edge handoff, because channels are copy-FIFO and a
-    // DMA-driving consumer (nvme) owns its own streaming buffers.
-    log_dma_owned_edges(runtime_edge_count);
-
-    sched.active_module_count = module_count;
-    sched.edge_count = runtime_edge_count;
-
-    // Populate every module's port table from the compiled edges so
-    // `get_module_port` resolves correctly before any module is
-    // instantiated. Built-ins that bypass `instantiate_one_module` and
-    // post-processors (e.g. cross-domain bridging) can read the wired
-    // handles immediately on return.
-    for module_idx in 0..module_count {
-        if !populate_module_ports_from_edges(module_idx, module_idx) {
-            log::error!("[graph] port limit exceeded for module {module_idx}");
-            return Err(-1);
-        }
-    }
-
-    // Graph is fully wired — clear the in-progress marker so the
-    // scheduler can step. Earlier early-returns leave it set, which is
-    // the safe state (no module slots may be valid).
-    sched.prepare_in_progress = false;
-
-    Ok((module_list, module_count))
+    super::splice::admit_boot(composed, usize::from(config.domain_count)).map_err(|why| {
+        log::error!("[graph] node graph refused: {}", why.name());
+        why.code()
+    })
 }
 
-/// Default cycle budget for Tier 1b modules when no per-module
-/// override is configured. ~2 µs on a Cortex-A76 at 2 GHz; tuned to
-/// stay quiet on rp1_gem-class workloads while still catching a
-/// runaway ISR body. Per-module overrides via the YAML `scheduler:
-/// { isr_budget_cycles: N }` per-module block override this default;
-/// see `prepare_graph` for the plumbing.
-pub const DEFAULT_ISR_BUDGET_CYCLES: u32 = 2000;
+/// Instantiate the node's graph [`prepare_graph`] staged and publish it
+/// (`splice::instantiate_batch`, `splice::finish`, as a live add): a module
+/// at a time, `each(slot)` after each one; `wait()` between polls of a load
+/// that completes later, within the shared poll budget. The module count,
+/// or the negative errno that refused the graph, which is then idle.
+pub fn instantiate_graph(
+    mut st: super::splice::StagedAdd,
+    wait: &mut dyn FnMut(),
+    each: &mut dyn FnMut(usize),
+) -> Result<usize, i32> {
+    use crate::kernel::exec::graph_build::GraphWalk;
+    let n = st.module_count();
+    let mut walk = GraphWalk::new(n);
+    while !walk.is_finished() {
+        match super::splice::instantiate_batch(&mut st, 1) {
+            Ok(_) if st.loading() => {
+                if !walk.record_poll() {
+                    log::error!(
+                        "[inst] module {} still loading after {} polls",
+                        walk.next_entry(),
+                        walk.polls()
+                    );
+                    super::splice::abandon(st);
+                    return Err(crate::kernel::sys::errno::ETIMEDOUT);
+                }
+                wait();
+            }
+            Ok(_) => {
+                each(st.slot(walk.next_entry()));
+                walk.advance_instantiated();
+            }
+            Err(why) => {
+                log::error!(
+                    "[inst] module {} refused the graph: {}",
+                    walk.next_entry(),
+                    why.name()
+                );
+                return Err(why.code());
+            }
+        }
+    }
+    super::splice::finish(st).map_err(|why| {
+        log::error!("[graph] node graph not published: {}", why.name());
+        why.code()
+    })?;
+    Ok(n)
+}
 
-/// Per-module ISR cycle budget override populated from the
-/// `isr_budget_cycles:` YAML field via the kernel TLV tag 0xFB at
-/// instantiation time. `0` means "fall back to
-/// `DEFAULT_ISR_BUDGET_CYCLES`". Indexed by module slot.
-static mut MODULE_ISR_BUDGET_OVERRIDE: [u32; MAX_MODULES] = [0; MAX_MODULES];
+/// [`prepare_graph`] and [`instantiate_graph`] with nothing between them, no
+/// wait between polls and no per-module step: the node's graph where the
+/// platform applies nothing before its modules run.
+pub fn build_graph() -> Result<usize, i32> {
+    let st = prepare_graph()?;
+    instantiate_graph(st, &mut || {}, &mut |_| {})
+}
 
-/// Per-module hardware IRQ number for Tier 2 admission. Populated
-/// from the `irq:` YAML field via TLV tag 0xFC at instantiation
-/// time. `u16::MAX` (the default) means "unset" — non-Tier-2 modules
-/// keep the sentinel and the admission helper skips them.
-static mut MODULE_IRQ_NUMBER: [u16; MAX_MODULES] = [u16::MAX; MAX_MODULES];
+/// Default cycle budget of an interrupt-mode module when the graph gives
+/// none (YAML `isr_budget_cycles`, params tag 0xFB): the chip's, in its own
+/// cycle counter.
+pub const DEFAULT_ISR_BUDGET_CYCLES: u32 = crate::platform::chip::DEFAULT_ISR_BUDGET_CYCLES;
 
 /// Read the resolved IRQ for `module_idx`, or `None` when unset.
 pub fn module_irq(module_idx: usize) -> Option<u16> {
@@ -659,7 +454,7 @@ pub fn module_irq(module_idx: usize) -> Option<u16> {
         return None;
     }
     // SAFETY: scheduler-thread read; module_idx bounded.
-    let v = unsafe { MODULE_IRQ_NUMBER[module_idx] };
+    let v = unsafe { (&*core::ptr::addr_of!(SCHED)).irq[module_idx] };
     if v == u16::MAX {
         None
     } else {
@@ -667,7 +462,7 @@ pub fn module_irq(module_idx: usize) -> Option<u16> {
     }
 }
 
-/// Assign a Tier 2 IRQ number to a module. Production path is
+/// Assign an `irq` IRQ number to a module. Production path is
 /// `parse_protection_config`'s TLV-tag 0xFC handler at module
 /// instantiation; conformance tests call this directly to plant an
 /// IRQ on a slot without going through a YAML/TLV cycle. `u16::MAX`
@@ -679,11 +474,11 @@ pub fn set_module_irq(module_idx: usize, irq: u16) {
     }
     // SAFETY: scheduler-thread mutation; module_idx bounded.
     unsafe {
-        MODULE_IRQ_NUMBER[module_idx] = irq;
+        (&mut *core::ptr::addr_of_mut!(SCHED)).irq[module_idx] = irq;
     }
 }
 
-/// Set the Tier 1b cycle budget override for a module. `0` clears
+/// Set the `timer` cycle budget override for a module. `0` clears
 /// the override so the kernel falls back to
 /// `DEFAULT_ISR_BUDGET_CYCLES`. Production path is
 /// `parse_protection_config`'s TLV-tag 0xFB handler at module
@@ -694,11 +489,11 @@ pub fn set_module_isr_budget_cycles(module_idx: usize, budget_cycles: u32) {
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
-        MODULE_ISR_BUDGET_OVERRIDE[module_idx] = budget_cycles;
+        (&mut *core::ptr::addr_of_mut!(SCHED)).isr_budget_cycles[module_idx] = budget_cycles;
     }
 }
 
-/// Public accessor for the resolved per-module Tier 1b/2 ISR budget
+/// Public accessor for the resolved per-module `timer`/`irq` ISR budget
 /// (override if set, else `DEFAULT_ISR_BUDGET_CYCLES`). Lets conformance
 /// tests observe the result of the TLV-tag-0xFB parse → `set_*` round trip
 /// without exposing the private override array.
@@ -706,14 +501,14 @@ pub fn module_isr_budget_cycles(module_idx: usize) -> u32 {
     resolved_isr_budget_cycles(module_idx)
 }
 
-/// Read the resolved Tier 1b budget for a module: the per-module
+/// Read the resolved `timer` budget for a module: the per-module
 /// override if non-zero, otherwise `DEFAULT_ISR_BUDGET_CYCLES`.
 fn resolved_isr_budget_cycles(module_idx: usize) -> u32 {
     if module_idx >= module_slots() {
         return DEFAULT_ISR_BUDGET_CYCLES;
     }
     // SAFETY: scheduler-thread read; module_idx bounded.
-    let ov = unsafe { MODULE_ISR_BUDGET_OVERRIDE[module_idx] };
+    let ov = unsafe { (&*core::ptr::addr_of!(SCHED)).isr_budget_cycles[module_idx] };
     if ov == 0 {
         DEFAULT_ISR_BUDGET_CYCLES
     } else {
@@ -721,26 +516,24 @@ fn resolved_isr_budget_cycles(module_idx: usize) -> u32 {
     }
 }
 
-/// Element size advertised by every kernel-allocated ISR bridge ring.
-/// Sized to the bridge crate's `MAX_BRIDGE_DATA` so the entire payload
-/// fits in one slot; chunked payloads need their own bridge protocol.
-const ISR_BRIDGE_ELEM_SIZE: usize = 56;
+/// Element size of every interrupt-mode ring: the ring's whole element, so
+/// a payload fits in one; chunked payloads need a protocol of their own.
+const ISR_BRIDGE_ELEM_SIZE: usize = crate::kernel::ipc::isr_ring::MAX_ELEM;
 
-/// Walk every edge with at least one endpoint in an ISR-tier
-/// (Tier 1b/2) domain and allocate a `RingBridge` slot, recording the
+/// Walk every edge with at least one endpoint in an interrupt-mode
+/// (`timer`/`irq`) domain and wire an `IsrRing` to it, recording the
 /// slot index in `edge.bridge_slot`. The bridge is the *only*
-/// channel ISR-tier modules read/write through — the cooperative
+/// channel interrupt-mode modules read/write through — the cooperative
 /// side keeps its PIPE channel, and `pump_isr_bridges` shuttles
 /// bytes between the two at every scheduler tick. Edges with both
-/// endpoints in cooperative tiers are skipped.
+/// endpoints in cooperative modes are skipped.
 ///
-/// `MAX_BRIDGES` caps the total bridges. Exceeding it returns
-/// without crashing — the affected edges lose their ISR routing,
-/// the cooperative scheduler's runtime gate still rejects any
-/// channel I/O attempts from the ISR side, so the graph is dead
-/// rather than corrupt. The build-time validator catches the
-/// over-budget case in practice.
-fn wire_isr_bridges(edges: &mut [Edge]) {
+/// The rings are the boot plan's: one per edge of the node graph with an
+/// interrupt-mode end, at most `MAX_RINGS`. An edge past them loses its
+/// ISR routing, logged; the cooperative scheduler's runtime gate still
+/// rejects channel I/O from the ISR side, so the graph is dead rather than
+/// corrupt. The build-time validator catches the over-budget case.
+pub(crate) fn wire_isr_bridges(edges: &mut [Edge]) {
     // SAFETY: prepare_graph runs single-threaded; SCHED writers are
     // serialised, so a shared read of `domain_id`/`domain_exec_mode`
     // is consistent here.
@@ -748,61 +541,58 @@ fn wire_isr_bridges(edges: &mut [Edge]) {
         let p = &raw const SCHED;
         &*p
     };
+    let mut wired: u16 = 0;
     for edge in edges.iter_mut() {
         if edge.bridge_slot >= 0 {
-            continue; // already assigned (rerun safety)
+            continue;
         }
         let from_d = sched.domain_id[edge.from_module] as usize;
         let to_d = sched.domain_id[edge.to_module] as usize;
-        let from_isr =
-            from_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[from_d]);
-        let to_isr = to_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[to_d]);
+        let from_isr = from_d < MAX_DOMAINS && sched.domains[from_d].exec_mode.is_interrupt();
+        let to_isr = to_d < MAX_DOMAINS && sched.domains[to_d].exec_mode.is_interrupt();
         if !from_isr && !to_isr {
             continue;
         }
-        let slot = crate::kernel::bridge::bridge_alloc();
-        if slot < 0 {
+        let Some(slot_idx) = crate::kernel::ipc::isr_ring::alloc(
+            ISR_BRIDGE_ELEM_SIZE,
+            edge.from_module as ModuleId,
+            edge.to_module as ModuleId,
+        ) else {
             log::error!(
-                "[isr] bridge alloc exhausted at edge {}->{} (MAX_BRIDGES={MAX_ISR_BRIDGES_PER_GRAPH})",
+                "[isr] no ring left for edge {}->{}: the boot plan sized none for it",
                 edge.from_module,
                 edge.to_module,
             );
             continue;
-        }
-        let slot_idx = slot as usize;
-        if let Some(bs) = crate::kernel::bridge::bridge_slot_mut(slot_idx) {
-            bs.init_ring(
-                ISR_BRIDGE_ELEM_SIZE,
-                edge.from_module as ModuleId,
-                edge.to_module as ModuleId,
-            );
-        }
-        edge.bridge_slot = slot as i8;
+        };
+        edge.bridge_slot = slot_idx as i8;
+        wired += 1;
         log::info!(
             "[isr] bridge slot {slot_idx} wired for edge {}->{} (from_isr={from_isr} to_isr={to_isr})",
             edge.from_module,
             edge.to_module,
         );
     }
+    // SAFETY: as above; a scalar the pass reads to skip the pump when no
+    // bridge is wired.
+    unsafe {
+        let count = &mut (*core::ptr::addr_of_mut!(SCHED)).bridge_count;
+        *count = count.saturating_add(wired);
+    }
 }
 
-/// Public alias for the `MAX_BRIDGES` ceiling visible from the
-/// scheduler. Re-exported so logging + diagnostics that originate
-/// here name the same constant as the bridge implementation.
-const MAX_ISR_BRIDGES_PER_GRAPH: usize = crate::kernel::bridge::MAX_BRIDGES;
-
 /// Drain bytes between the PIPE channels and their associated ISR
-/// bridge slots. Runs once per scheduler tick after `step_modules`
-/// (cooperative path) and from the BCM2712 Tier 0 arm. Direction is
-/// inferred from each edge's endpoint tiers:
+/// bridge slots. Runs once per tick pass, after the graphs
+/// (cooperative path) and from the BCM2712 `tick` arm. Direction is
+/// inferred from each edge's endpoint modes:
 ///
-/// * `from = cooperative, to = Tier 1b/2` → drain bytes from
+/// * from cooperative to `timer`/`irq` → drain bytes from
 ///   `edge.channel` (PIPE) into `bridge_slot` (Ring push). ISR
 ///   consumes from bridge on its next fire.
-/// * `from = Tier 1b/2, to = cooperative` → pop from `bridge_slot`
+/// * from `timer`/`irq` to cooperative → pop from `bridge_slot`
 ///   and write into `edge.channel` (PIPE). Cooperative consumer
 ///   reads from the channel via the regular `channel_read` path.
-/// * Same-tier (both endpoints ISR-tier) is rare but works: the
+/// * Both endpoints interrupt-mode is rare but works: the
 ///   bridge becomes the only conduit; the helper drains it back
 ///   into the consumer's PIPE handle so downstream port resolution
 ///   keeps working.
@@ -830,17 +620,11 @@ pub fn pump_isr_bridges() {
         }
         let from_d = sched.domain_id[edge.from_module] as usize;
         let to_d = sched.domain_id[edge.to_module] as usize;
-        let from_isr =
-            from_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[from_d]);
-        let to_isr = to_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[to_d]);
+        let from_isr = from_d < MAX_DOMAINS && sched.domains[from_d].exec_mode.is_interrupt();
+        let to_isr = to_d < MAX_DOMAINS && sched.domains[to_d].exec_mode.is_interrupt();
         let slot_idx = edge.bridge_slot as usize;
-        let bridge = match crate::kernel::bridge::bridge_get(slot_idx) {
-            Some(b) => b,
-            None => continue,
-        };
-        let ring = match bridge.as_ring() {
-            Some(r) => r,
-            None => continue,
+        let Some(ring) = crate::kernel::ipc::isr_ring::get(slot_idx) else {
+            continue;
         };
 
         // Cooperative → ISR: drain PIPE → bridge push.
@@ -916,21 +700,18 @@ pub fn pump_isr_bridges() {
     }
 }
 
-/// Collect the bridge slots whose ISR-tier endpoint is `module_idx`,
+/// Collect the bridge slots whose interrupt-mode endpoint is `module_idx`,
 /// partitioning into (`in_bridges`, `out_bridges`) for the
-/// `isr_tier::register_*` calls. Each return slice carries at most 4
-/// entries (matching `MAX_ISR_BRIDGES` in `src/kernel/isr_tier.rs`).
-fn collect_isr_bridges_for_module(module_idx: usize) -> ([i8; 4], usize, [i8; 4], usize) {
+/// `interrupt::register_*` calls. Each return slice carries at most 4
+/// entries (matching `interrupt::MODULE_MAX_BRIDGES`).
+fn collect_isr_bridges_for_module(
+    sched: &SchedulerState,
+    module_idx: usize,
+) -> ([i8; 4], usize, [i8; 4], usize) {
     let mut in_bridges = [-1i8; 4];
     let mut in_count = 0usize;
     let mut out_bridges = [-1i8; 4];
     let mut out_count = 0usize;
-    // SAFETY: scheduler-thread access during the post-instantiation
-    // admission helper.
-    let sched = unsafe {
-        let p = &raw const SCHED;
-        &*p
-    };
     let edge_count = sched.edge_count;
     for i in 0..edge_count.min(MAX_CHANNELS) {
         let edge = &sched.edges[i];
@@ -948,265 +729,133 @@ fn collect_isr_bridges_for_module(module_idx: usize) -> ([i8; 4], usize, [i8; 4]
     (in_bridges, in_count, out_bridges, out_count)
 }
 
-/// Tier 1b BCM admission trampoline state — exposes the BuiltInModule's
-/// step pointer + state buffer via the slot index encoded in the
-/// `state_ptr` argument. The `isr_tier1b_handler` invokes step_fn
-/// with this index, the trampoline resolves the slot and dispatches
-/// to the inner BuiltInModule step function.
-unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
-    // `state` is the module index encoded as an integer pointer (see
-    // `register_isr_tier_modules_from_graph` below). The encoding
-    // round-trips through `usize` because the scheduler's module
-    // slots are stable for the graph's lifetime.
-    let module_idx = state as usize;
-    // SAFETY: ISR-tier dispatch on BCM is polled from the scheduler
-    // thread (the platform's `bcm_isr_tier_poll` invocation), so
-    // there's no preemption against the cooperative writer; we
-    // observe a coherent slot.
-    let sched = unsafe { sched_ref() };
-    if module_idx >= module_slots() {
-        return 0;
-    }
-    if let crate::kernel::exec::scheduler::module_types::ModuleSlot::BuiltIn(m) =
-        &sched.modules[module_idx]
-    {
-        // Cast away the const — BuiltInModule::step_fn writes to the
-        // state buffer in-place. The state buffer is owned by the slot
-        // and not shared with anyone else this tick.
-        let state_ptr = m.state.as_ptr() as *mut u8;
-        // SAFETY: `state_ptr` is this slot's own state buffer, which no
-        // other code touches during the step.
-        return unsafe { (m.step_fn())(state_ptr) };
-    }
-    0
+/// How [`register_isr_module`] registered a module.
+pub(crate) enum IsrRegistration {
+    /// a `timer` slot, stepped by the timer of this period.
+    Timer { period_us: u32 },
+    /// an `irq` slot, its IRQ bound to the domain's core.
+    Irq,
 }
 
-/// Walk the prepared graph and hand every Tier 1b module to the ISR-
-/// tier dispatcher. For each ISR-tier-domain module, the helper picks
-/// the appropriate `(step_fn, state_ptr)` pair from its slot and
-/// invokes `isr_tier::register_tier1b_module`. After all modules are
-/// registered, the helper computes the minimum tick interval across
-/// all Tier 1b domains and arms the platform's Tier 1b timer via
-/// `isr_tier::start_tier1b`.
+/// Hand one interrupt-mode module to its dispatcher: a timer slot for a
+/// `timer` domain, an interrupt slot for an `irq` domain, its line bound to
+/// the domain's core when `bind` (at graph bring-up) and unmasked otherwise
+/// (a restart: the binding stayed, the line was masked when the module's
+/// outcome latched). `None` for a module of a cooperative domain, or when
+/// registration fails (logged). The one registration path, at graph
+/// bring-up and when a faulted module restarts; the timer dispatcher is
+/// started by the splice at bring-up only.
 ///
-/// Returns the number of modules registered. A return of `0` means
-/// no Tier 1b modules are present and the timer was not started.
-///
-/// Bridge-channel wiring from YAML edges is **partially wired**:
-///   * `wire_isr_bridges` allocates a `RingBridge` slot for every
-///     edge with at least one ISR-tier endpoint; the slot index
-///     lands in `Edge::bridge_slot`.
-///   * `collect_isr_bridges_for_module` (called below) populates
-///     the per-module `in_bridges` / `out_bridges` arrays passed to
-///     `register_tier1b_module` from those slots.
-///   * `pump_isr_bridges` drains PIPE↔ring each scheduler tick
-///     using the `is_full` + `peek_one` peek-then-commit pattern
-///     so backpressure is non-lossy.
-///
-/// **Module-facing gap:** PIC modules have no documented SDK
-/// surface to read/write their bridge slots from inside
-/// `module_step`. The SDK's `bridge_dispatch` helper rides
-/// `provider_call`, which the syscall gate denies for
-/// ISR-tier callers. The build-time validator rejects any
-/// YAML edge touching an ISR-tier endpoint to prevent silently-
-/// broken admission; production Tier 1b step bodies do
-/// private-state work only. See
-/// `docs/architecture/scheduler.md` §"ISR-tier I/O contract".
-pub fn register_isr_tier_modules_from_graph() -> usize {
-    // SAFETY: caller runs on the scheduler thread during graph bring-
-    // up; no concurrent observers of SCHED/ISR_SLOTS yet.
-    let sched = unsafe { sched_ref() };
-    let count = sched.active_module_count;
-    let mut registered: usize = 0;
-    let mut min_period_us: u32 = u32::MAX;
+/// An `irq` module is dispatched through its interrupt entry (a PIC
+/// module's `module_isr_entry` export, a native module's `isr_entry`),
+/// never its cooperative step; one without it is refused here, behind the
+/// splice's admission check.
+pub(crate) fn register_isr_module(
+    sched: &SchedulerState,
+    modules: &[ModuleSlot],
+    module_idx: usize,
+    bind: bool,
+) -> Option<IsrRegistration> {
+    use crate::kernel::exec::{irq, timer};
+    let domain = sched.domain_id[module_idx] as usize;
+    if domain >= MAX_DOMAINS {
+        return None;
+    }
+    let exec_mode = sched.domains[domain].exec_mode;
+    if !exec_mode.is_interrupt() {
+        return None;
+    }
+    let (in_arr, in_n, out_arr, out_n) = collect_isr_bridges_for_module(sched, module_idx);
+    let in_bridges = &in_arr[..in_n];
+    let out_bridges = &out_arr[..out_n];
+    let budget = resolved_isr_budget_cycles(module_idx);
 
-    for module_idx in 0..count {
-        let domain = sched.domain_id[module_idx] as usize;
-        if domain >= MAX_DOMAINS {
-            continue;
-        }
-        let exec_mode = sched.domain_exec_mode[domain];
-
-        // Tier 2: per-IRQ-owned.
-        //
-        // A dynamically-loaded Tier 2 module is dispatched from IRQ
-        // context through its dedicated `module_isr_entry` export
-        // (resolved by `loader::lookup_exports` into
-        // `DynamicModule::isr_entry_fn()`), never the cooperative
-        // `module_step`. A Dynamic module with no ISR entry is a hard
-        // registration failure here — the build-time validator requires
-        // the export, and this is the runtime backstop. `BuiltInModule`
-        // fixtures (whose Rust step function is trivially ISR-safe) take
-        // the trampoline arm below.
-        if exec_mode == exec_mode::IRQ {
-            let irq = match module_irq(module_idx) {
-                Some(n) => n,
-                None => {
-                    log::error!("[isr] Tier 2 module {module_idx} has no IRQ assigned — skipping");
-                    continue;
-                }
-            };
-            let (in_arr, in_n, out_arr, out_n) = collect_isr_bridges_for_module(module_idx);
-            let budget = resolved_isr_budget_cycles(module_idx);
-            let rc = match &sched.modules[module_idx] {
-                crate::kernel::exec::scheduler::module_types::ModuleSlot::Dynamic(m) => {
-                    match m.isr_entry_fn() {
-                        Some(isr_entry) => crate::kernel::exec::isr_tier::register_tier2_module(
-                            crate::kernel::exec::isr_tier::Tier2Registration {
-                                isr_entry,
-                                state_ptr: m.state_ptr(),
-                                irq_number: irq,
-                                module_index: module_idx as ModuleId,
-                                budget_cycles: budget,
-                                uses_fpu: false,
-                                in_bridges: &in_arr[..in_n],
-                                out_bridges: &out_arr[..out_n],
-                            },
-                        ),
-                        None => {
-                            log::error!(
-                                "[isr] Tier 2 module {module_idx} exports no \
-                                 module_isr_entry — refusing to dispatch its \
-                                 cooperative module_step from IRQ context"
-                            );
-                            -1
-                        }
-                    }
-                }
-                crate::kernel::exec::scheduler::module_types::ModuleSlot::BuiltIn(_) => {
-                    crate::kernel::exec::isr_tier::register_tier2_module(
-                        crate::kernel::exec::isr_tier::Tier2Registration {
-                            isr_entry: builtin_tier1b_trampoline,
-                            state_ptr: module_idx as *mut u8,
-                            irq_number: irq,
-                            module_index: module_idx as ModuleId,
-                            budget_cycles: budget,
-                            uses_fpu: false,
-                            in_bridges: &in_arr[..in_n],
-                            out_bridges: &out_arr[..out_n],
-                        },
-                    )
-                }
-                _ => -1,
-            };
-            if rc < 0 {
-                log::error!("[isr] failed to register Tier 2 module {module_idx}");
-                continue;
-            }
-            // Bind the IRQ vector to the trampoline. The HAL hook is
-            // a no-op on platforms without a real interrupt
-            // controller (e.g. the host harness); production platforms
-            // wire the IRQ-controller register here.
-            // Deliver the IRQ to the core that runs this Tier-2 domain's
-            // `irq` park loop (domain id == core id on the multi-core
-            // platform), not core 0 — otherwise the GIC dispatches
-            // `module_isr_entry` on the wrong core. Single-core / no-IRQ
-            // platforms ignore the target.
-            let bind_rc = crate::kernel::sys::hal::irq_bind(
-                irq as u32,
-                crate::kernel::exec::isr_tier::ISR_TIER2_EVENT,
-                crate::kernel::sys::hal::IrqAck::None,
-                domain as u8,
+    if exec_mode == ExecMode::Irq {
+        let Some(irq) = module_irq(module_idx) else {
+            log::error!("[isr] irq-domain module {module_idx} has no IRQ assigned — skipping");
+            return None;
+        };
+        let entry = match &modules[module_idx] {
+            ModuleSlot::Dynamic(m) => m.isr_entry_fn().map(|e| (e, m.state_ptr())),
+            ModuleSlot::Native(m) => m.vtable().isr_entry.map(|e| (e, m.state_ptr())),
+            ModuleSlot::Empty => return None,
+        };
+        let Some((isr_entry, state_ptr)) = entry else {
+            log::error!(
+                "[isr] irq-domain module {module_idx} has no interrupt entry — refusing to \
+                 dispatch its cooperative step from IRQ context"
             );
-            if bind_rc < 0 {
-                log::warn!(
-                    "[isr] hal::irq_bind(irq={irq}) returned {bind_rc} — Tier 2 \
-                     dispatch may not fire on this platform"
-                );
-            }
-            registered += 1;
-            continue;
-        }
-
-        if exec_mode != exec_mode::TIMER {
-            continue;
-        }
-        // Find the period for this domain (fall back to graph-level
-        // tick_us, then DEFAULT_TICK_US for fully un-configured cases).
-        let dtick = sched.domain_tick_us[domain];
-        let period_us = if dtick > 0 {
-            dtick
-        } else if sched.tick_us > 0 {
-            sched.tick_us
-        } else {
-            DEFAULT_TICK_US
+            return None;
         };
-        if period_us < min_period_us {
-            min_period_us = period_us;
-        }
-
-        // Resolve in/out bridge slots for this module from the edge
-        // table populated by `wire_isr_bridges`.
-        let (in_arr, in_n, out_arr, out_n) = collect_isr_bridges_for_module(module_idx);
-        let in_slice = &in_arr[..in_n];
-        let out_slice = &out_arr[..out_n];
-        let budget = resolved_isr_budget_cycles(module_idx);
-
-        // Resolve the step_fn + state_ptr pair based on the slot kind.
-        let rc = match &sched.modules[module_idx] {
-            crate::kernel::exec::scheduler::module_types::ModuleSlot::Dynamic(m) => {
-                crate::kernel::exec::isr_tier::register_tier1b_module(
-                    m.step_fn(),
-                    m.state_ptr(),
-                    module_idx as ModuleId,
-                    budget,
-                    in_slice,
-                    out_slice,
-                )
-            }
-            crate::kernel::exec::scheduler::module_types::ModuleSlot::BuiltIn(_) => {
-                // BuiltInModule has Rust ABI; route through the
-                // `builtin_tier1b_trampoline` which decodes the slot
-                // index from `state_ptr`.
-                crate::kernel::exec::isr_tier::register_tier1b_module(
-                    builtin_tier1b_trampoline,
-                    module_idx as *mut u8,
-                    module_idx as ModuleId,
-                    budget,
-                    in_slice,
-                    out_slice,
-                )
-            }
-            _ => -1,
-        };
+        let rc = irq::register_module(irq::IrqRegistration {
+            isr_entry,
+            state_ptr,
+            irq_number: irq,
+            module_index: module_idx as ModuleId,
+            budget_cycles: budget,
+            in_bridges,
+            out_bridges,
+        });
         if rc < 0 {
-            log::error!("[isr] failed to register Tier 1b module {module_idx} (domain {domain})");
-            continue;
+            log::error!("[isr] failed to register irq-domain module {module_idx}");
+            return None;
         }
-        registered += 1;
+        if !bind {
+            crate::kernel::sys::hal::irq_mask(irq as u32, false);
+            return Some(IsrRegistration::Irq);
+        }
+        // The IRQ goes to the core that runs this domain's loop (domain id
+        // == core id on the multi-core platform); single-core and no-IRQ
+        // platforms ignore the target, and a HAL without an interrupt
+        // controller binds nothing.
+        let bind_rc = crate::kernel::sys::hal::irq_bind(
+            irq as u32,
+            irq::IRQ_MODULE_EVENT,
+            crate::kernel::sys::hal::IrqAck::None,
+            domain as u8,
+        );
+        if bind_rc < 0 {
+            log::warn!(
+                "[isr] hal::irq_bind(irq={irq}) returned {bind_rc} — interrupt dispatch may \
+                 not fire on this platform"
+            );
+        }
+        return Some(IsrRegistration::Irq);
     }
 
-    if registered > 0 && min_period_us < u32::MAX {
-        log::info!(
-            "[isr] starting Tier 1b timer period={min_period_us}us with {registered} modules"
-        );
-        crate::kernel::exec::isr_tier::start_tier1b(min_period_us);
+    // The period: the domain's tick, else the graph's, else the default.
+    let dtick = sched.domains[domain].tick_us;
+    let period_us = if dtick > 0 {
+        dtick
+    } else if sched.tick_us > 0 {
+        sched.tick_us
+    } else {
+        DEFAULT_TICK_US
+    };
+    let (step_fn, state_ptr): (crate::kernel::module::loader::ModuleStepFn, *mut u8) =
+        match &modules[module_idx] {
+            ModuleSlot::Dynamic(m) => (m.step_fn(), m.state_ptr()),
+            ModuleSlot::Native(m) => (m.vtable().step, m.state_ptr()),
+            ModuleSlot::Empty => return None,
+        };
+    let rc = timer::register_module(
+        step_fn,
+        state_ptr,
+        module_idx as ModuleId,
+        budget,
+        in_bridges,
+        out_bridges,
+    );
+    if rc < 0 {
+        log::error!("[isr] failed to register timer-domain module {module_idx} (domain {domain})");
+        return None;
     }
-    registered
+    Some(IsrRegistration::Timer { period_us })
 }
 
-/// Fold per-owner state accounting for the modules a boot/rebuild pass
-/// instantiated, then emit the one-line `[arena]` summary.
-///
-/// Each platform calls this once after its instantiation loop completes, so
-/// STATE_ARENA reflects every `alloc_state` call (BUFFER and CONFIG arenas are
-/// filled earlier, by `open_channels` and `populate_static_state`
-/// respectively).
-///
-/// The accounting half runs here rather than per module because the resident
-/// path stamps owners from the composed plan BEFORE instantiation (so
-/// `module_new` sees tenant ownership), which means no single module's
-/// instantiation is the point at which its owner becomes known — the pass is.
-/// Unlike the live-admission path, a resident owner over its cap is reported
-/// rather than refused: the graph it describes is the node's own boot
-/// composition, and failing it closed would leave the node with no graph at
-/// all rather than with a cap to raise.
-pub fn finalize_instantiation_accounting() {
-    charge_resident_owner_state();
-    // Providers registered during instantiation: gate their consumers on
-    // them (`gate_contract_consumers`). Here because every platform runs
-    // this once its instantiation loop is done — boot and rebuild alike.
-    super::exec_order::gate_contract_consumers();
+/// Log the arenas the node's graph and its workloads drew: the one-line
+/// `[arena]` summary each platform writes once its graph is up.
+pub fn log_arena_usage() {
     let (state_used, state_cap) = crate::kernel::module::loader::arena_usage();
     let (cfg_used, cfg_cap) = crate::kernel::boot::config::config_params_usage();
     let (buf_used, buf_cap) = crate::kernel::ipc::buffer_pool::arena_usage();
@@ -1219,38 +868,3 @@ pub fn finalize_instantiation_accounting() {
          heap={heap_committed}/{heap_cap} heaps={heaps}"
     );
 }
-
-/// Charge every instantiated module's state-arena draw to the owner stamped on
-/// its slot. Idempotent against a rebuild: each pass zeroes the workload
-/// owners' charges before re-folding them, so a reconfigure that reuses a slot
-/// does not double-count it.
-fn charge_resident_owner_state() {
-    // SAFETY: post-instantiation, scheduler thread, single-threaded at this
-    // point on every platform (each calls this once after its instantiation
-    // loop, before the runner starts).
-    let s = unsafe { crate::kernel::exec::scheduler::sched_mut() };
-    s.owners.clear_state_charges();
-    for idx in 0..crate::kernel::exec::scheduler::module_slots() {
-        let owner = crate::kernel::exec::scheduler::module_owner(idx);
-        if owner.is_system() {
-            continue;
-        }
-        let bytes = crate::kernel::exec::scheduler::module_state_footprint(idx);
-        if bytes == 0 {
-            continue;
-        }
-        if s.owners.charge_state(owner, bytes).is_err() {
-            let (charged, cap) = s.owners.charged_state(owner);
-            log::warn!(
-                "[arena] owner slot {} over its admitted state_cap: {charged} charged against \
-                 {cap} (module {idx} adds {bytes}); the graph runs, the cap is the thing to fix",
-                owner.slot,
-            );
-        }
-    }
-}
-
-// Async graph setup (setup_graph_async) and run_main_loop are in
-// src/platform/rp.rs.
-// Sync variants (setup_graph_sync, run_main_loop_sync) are in
-// src/platform/bcm2712.rs.

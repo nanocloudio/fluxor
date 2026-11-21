@@ -412,7 +412,7 @@ mod tests {
 
     /// Ed25519 is deterministic, so reissuing a root-signed golden link from
     /// its own fields must give its bytes exactly: the issuer signs what the
-    /// contract verifies, domain tag included.
+    /// contract verifies, domain-separation tag included.
     #[test]
     fn the_issuer_reproduces_every_root_signed_golden_link() {
         let root: [u8; 32] = unhex(golden::ROOT_KEY).try_into().unwrap();

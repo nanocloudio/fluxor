@@ -19,6 +19,7 @@ extern crate alloc;
 
 pub mod boot;
 pub mod boot_config;
+pub mod graph;
 pub mod isolation;
 #[cfg(feature = "alloc")]
 pub mod log_ring;
@@ -36,11 +37,11 @@ pub mod vocabulary;
 // the byte index. The kernel routes by byte, never by name.
 //
 // AV surface family:
-//   - AudioSample  — decoded sample-domain audio
-//   - AudioEncoded — codec-domain audio access units (Opus/MP3/AAC/G.711/...)
-//   - VideoEncoded — codec-domain video access units (H.264/H.265/AV1/...)
+//   - AudioSample  — decoded PCM audio
+//   - AudioEncoded — encoded audio access units (Opus/MP3/AAC/G.711/...)
+//   - VideoEncoded — encoded video access units (H.264/H.265/AV1/...)
 //   - VideoDraw    — retained/replayable draw lists (UI, browser, dashboards)
-//   - VideoRaster  — pixel-domain frames
+//   - VideoRaster  — pixel frames
 //   - VideoScanout — present-ready output to a paced display sink
 //   - MediaMuxed   — deliberate combined AV/timing/container streams
 //
@@ -94,7 +95,7 @@ pub const CONTENT_TYPES: &[&str] = &[
     // event records with stream-time / t-state timestamps. Used to
     // bridge a compute core (e.g. an emulator core) to platform-
     // specific renderer modules without leaking the producer's
-    // domain-specific identity. Receivers parse the inner packet
+    // core-specific identity. Receivers parse the inner packet
     // shape; the surface itself only declares "frame-aligned event
     // stream, video flavour" or "frame-aligned event stream, audio
     // flavour".
@@ -218,7 +219,7 @@ pub const CONTENT_TYPES: &[&str] = &[
 /// Sustained-throughput class of a stream. Attached to content types
 /// (defaults below) and overridable per wiring edge (`rate:`). The
 /// config compiler validates each edge's granted ring against its
-/// class floor at build time; the kernel derives per-step pump
+/// class floor at build time; the kernel derives per-step flow
 /// budgets from it (`MODULE_FLOW_BUDGET`).
 ///
 /// Deliberately does **not** derive `PartialOrd`/`Ord`: declaration

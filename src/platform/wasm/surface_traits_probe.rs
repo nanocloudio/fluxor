@@ -1,4 +1,4 @@
-//! `wasm_browser_surface_traits_probe` built-in: a demo consumer of the
+//! `wasm_browser_surface_traits_probe` native module: a demo consumer of the
 //! Surface Traits surface. It reads `input::surface_traits::MSG_TRAITS`
 //! records from its input channel and logs the decoded fields to the
 //! kernel log ring (visible in the DOM terminal), proving the full
@@ -6,7 +6,9 @@
 //! → channel → consumer. Not a production module — it is the live
 //! acceptance check for the Surface Traits surface.
 
+use crate::abi::platform::native::wasm::wasm_browser_surface_traits_probe as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -50,12 +52,12 @@ fn u32le(b: &[u8], off: usize) -> u64 {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn probe_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn probe_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for this
     // module instance; we cast it back to the module-private state type
-    // allocated by the new_fn and operate within that allocation.
+    // allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut ProbeState);
         if st_ptr.is_null() {
@@ -96,9 +98,19 @@ unsafe fn probe_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(in_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_surface_traits_probe", probe_step);
-    let raw = alloc_state(in_chan);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut ProbeState, raw);
-    m
+/// The `wasm_browser_surface_traits_probe` native module.
+pub static WASM_BROWSER_SURFACE_TRAITS_PROBE: NativeVtable = super::heap_native(new, probe_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_EVENTS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<ProbeState>(), || {
+            alloc_state(in_chan).cast()
+        })
+    }
 }

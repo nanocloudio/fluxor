@@ -85,13 +85,13 @@ range:
 - consensus and replication pipelines for distributed state
 - protocol stacks from frame to TLS to HTTP/3
 - storage services backed by NVMe
-- hardware-timed control loops with ISR-tier execution
-- browser-hosted bundles consuming the same module outputs
+- hardware-timed control loops in interrupt-mode domains
+- browser-hosted wasm bundles consuming the same module outputs
 
 None of these required changing the graph model. Each required
 building modules and, in some cases, extending the execution model
-with additional tiers: hardware-timer-driven execution for hard
-real-time control, poll-mode execution for throughput-bound workloads.
+with additional execution modes: `timer` domains for hard real-time
+control, `poll` domains for throughput-bound workloads.
 The core
 abstraction, modules connected by typed channels, executed with
 explicit timing and validated before deployment, stayed the same.
@@ -177,7 +177,7 @@ server, a recorded stream replayed in place of live capture. The consumer binds 
 the capability and receives events with the same semantic structure
 regardless of provider.
 
-The inference pipeline on every tier is the same graph shape: sensor
+The inference pipeline on every target is the same graph shape: sensor
 → preprocess → inference → postprocess → action. Only the inference
 module and its resource budget differ.
 
@@ -189,8 +189,8 @@ current tree:
 - the graph runtime, scheduler, and channel model run today across
   microcontroller, application-processor bare-metal, Linux-hosted,
   and browser-hosted targets
-- ISR-tier execution, cooperative tiers, and poll-mode pipelines
-  coexist in the same scheduler
+- interrupt-mode (`timer`, `irq`) and cooperative (`tick`, `poll`)
+  domains coexist in the same scheduler
 - the capability/manifest/stack-expansion machinery resolves
   hardware to provider chains at build time
 - modules cross targets unchanged: the same foundation modules

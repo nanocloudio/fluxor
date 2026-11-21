@@ -14,7 +14,7 @@
 // forward as a second request would turn every ordinary stop into an
 // immediate one.
 
-/// Set by the first SIGTERM / SIGINT; the main loop starts the drain.
+/// Set by the first SIGTERM / SIGINT; the domain loop starts the drain.
 static STOP_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The signal that asked.
 static STOP_SIGNAL: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);

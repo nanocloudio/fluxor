@@ -24,9 +24,8 @@
 // realistic MIDI rates and bounds the CPU a runaway producer can
 // steal from other modules in the same domain.
 
-use fluxor::platform::builtin_param_tags::linux_alsa_midi as alsa_midi_tags;
+use fluxor::abi::platform::native::linux::linux_alsa_midi as alsa_midi_tags;
 
-const LINUX_ALSA_MIDI_HASH: u32 = 0xC38E5605; // fnv1a32("linux_alsa_midi")
 
 struct LinuxAlsaMidiState {
     /// `events_in` channel handle (input port). `-1` when no
@@ -35,9 +34,9 @@ struct LinuxAlsaMidiState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn linux_alsa_midi_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn linux_alsa_midi_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-owned per-instance arena for this
     // module; size-matched to `LinuxAlsaMidiState` by the loader.
     let st = unsafe { instance_state::<LinuxAlsaMidiState>(state) };
@@ -52,15 +51,22 @@ unsafe fn linux_alsa_midi_step(state: *mut u8) -> i32 {
     0
 }
 
-fn build_linux_alsa_midi(module_idx: usize, _params: &[u8]) -> scheduler::BuiltInModule {
-    scheduler::set_current_module(module_idx);
+fn build_linux_alsa_midi(module_idx: usize, _params: &[u8]) -> Result<Box<LinuxAlsaMidiState>, i32> {
     // Unbound in mode=in graphs, where the handle is -1.
     let events_in = scheduler::module_port(module_idx, alsa_midi_tags::PORT_EVENTS_IN);
-    let mut m = scheduler::BuiltInModule::new("linux_alsa_midi", linux_alsa_midi_step);
-    install_state(&mut m, Box::new(LinuxAlsaMidiState { events_in }));
+    let st = Box::new(LinuxAlsaMidiState { events_in });
     log::warn!(
         "[inst] module {module_idx} = linux_alsa_midi (built-in, STUB — ALSA seq integration not yet implemented; \
          events_in={events_in} drains to /dev/null)"
     );
-    m
+    Ok(st)
 }
+
+impl HostNative for LinuxAlsaMidiState {
+    fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
+        build_linux_alsa_midi(slot, params)
+    }
+}
+
+/// The `linux_alsa_midi` native module.
+pub static LINUX_ALSA_MIDI: NativeVtable = host_vtable::<LinuxAlsaMidiState>(linux_alsa_midi_step);

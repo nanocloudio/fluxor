@@ -1,4 +1,4 @@
-//! Fluxor workload-bundle manifest: parse, validate, target-select, and extract
+//! Fluxor workload-package manifest: parse, validate, target-select, and extract
 //! the resource footprint.
 //!
 //! The manifest (`application/vnd.nanocloud.fluxor.workload.v1+json`) separates a
@@ -154,7 +154,7 @@ pub struct Implementation {
     pub bindings: Bindings,
 }
 
-/// A parsed workload bundle manifest.
+/// A parsed workload package manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadManifest {
@@ -175,7 +175,7 @@ pub struct WorkloadManifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamSpec>,
     /// Where this workload's control-plane store lives, relative to the
-    /// bundle directory unless absolute.
+    /// package directory unless absolute.
     ///
     /// A workload that keeps state says where it keeps it, and what it
     /// says beats `FLUXOR_STORE_DIR` in the launching process's
@@ -272,9 +272,9 @@ pub fn is_workload_name(name: &str) -> bool {
 }
 
 /// Is `name` a module name: an ASCII letter or digit, then letters, digits,
-/// `_` or `-`, at most 64 bytes. A bundle names its modules in
+/// `_` or `-`, at most 64 bytes. A package names its modules in
 /// `workload.json`, and the name becomes a file name (`<name>.fmod`) wherever
-/// the bundle is materialised, so it can hold no separator or `.`.
+/// the package is materialised, so it can hold no separator or `.`.
 pub fn is_module_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
@@ -518,7 +518,7 @@ pub fn qualify_implementation_modules(
 mod tests {
     use super::*;
 
-    /// A Quantum-shaped bundle exercising the full manifest shape (digests are
+    /// A Quantum-shaped package exercising the full manifest shape (digests are
     /// synthetic but valid 64-hex; the linux impl carries an OCI-backed broker
     /// node).
     fn quantum_manifest_json() -> String {
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn quantum_bundle_parses_and_validates() {
+    fn quantum_package_parses_and_validates() {
         let m = parse_manifest(&quantum_manifest_json()).expect("parse");
         assert_eq!(m.name, "quantum");
         assert_eq!(m.implementations.len(), 2);

@@ -34,4 +34,4 @@ access = "write"
 
 # Module-scope observability — exempt.
 [observability]
-exempt = "display scanout — frame/refresh rate is the domain metric, not byte throughput"
+exempt = "display scanout — frame/refresh rate is the metric that matters, not byte throughput"

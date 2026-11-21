@@ -10,7 +10,9 @@
 //!     2 = busy-wait for configurable microseconds
 //!     3 = normal operation (no fault, for baseline testing)
 //!     4 = never return from `module_new` (a graph build that hangs before
-//!         the main loop; the boot watchdog must end it in BOOTSEL)
+//!         the domain loop; the boot watchdog must end it in BOOTSEL)
+//!     5 = refuse in `module_new` (a construction that fails after the
+//!         kernel allocated for it)
 //!   delay_steps (u16, tag 2): steps before triggering fault (default 10)
 //!   busy_us (u16, tag 3): microseconds to busy-wait in mode 2 (default 5000)
 //!
@@ -41,7 +43,7 @@ use fluxor_rt::*;
 struct TestFaultState {
     syscalls: *const SyscallTable,
     /// Fault mode (0=infinite_loop, 1=error, 2=busy_wait, 3=normal,
-    /// 4=hang_in_new)
+    /// 4=hang_in_new, 5=refuse_in_new)
     mode: u8,
     /// Steps remaining before triggering fault
     delay_steps: u16,
@@ -65,7 +67,7 @@ mod params_def {
     fluxor_rt::define_params! {
         TestFaultState;
 
-        1, mode, u8, 0, enum { infinite_loop=0, error=1, busy_wait=2, normal=3, hang_in_new=4 }
+        1, mode, u8, 0, enum { infinite_loop=0, error=1, busy_wait=2, normal=3, hang_in_new=4, refuse_in_new=5 }
             => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
 
         2, delay_steps, u16, 10
@@ -137,6 +139,9 @@ pub unsafe extern "C" fn module_new(
                 s.step_count = s.step_count.wrapping_add(1);
                 core::hint::spin_loop();
             }
+        }
+        if s.mode == 5 {
+            return -22;
         }
 
         0 // Ready

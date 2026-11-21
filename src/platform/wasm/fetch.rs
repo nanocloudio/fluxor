@@ -1,11 +1,13 @@
-//! `host_browser_fetch` built-in: HTTP fetch source. Opens the
+//! `host_browser_fetch` native module: HTTP fetch source. Opens the
 //! configured URL through the host shim and emits the response body
 //! bytes on its output channel as they arrive.
 //!
-//! State: heap-allocated; the BuiltInModule's 64-byte inline state
-//! holds a `*mut FetchState` pointer.
+//! State: heap-allocated on the module's own heap; its arena state
+//! holds the `*mut FetchState` pointer.
 
+use crate::abi::platform::native::wasm::host_browser_fetch as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -85,12 +87,12 @@ unsafe fn alloc_state(out_chan: i32, url: &[u8]) -> *mut FetchState {
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn fetch_step(state: *mut u8) -> i32 {
+unsafe extern "C" fn fetch_step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut FetchState);
         if st_ptr.is_null() {
@@ -181,9 +183,21 @@ unsafe fn fetch_step(state: *mut u8) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(url: &[u8], out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("host_browser_fetch", fetch_step);
-    let raw = alloc_state(out_chan, url);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut FetchState, raw);
-    m
+/// The `host_browser_fetch` native module.
+pub static HOST_BROWSER_FETCH: NativeVtable = super::heap_native(new, fetch_step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut url_buf = [0u8; 256];
+    let url = super::param_bytes(init.params, tags::TAG_URL, &mut url_buf);
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_BYTES);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, super::heap_for::<FetchState>(), || {
+            alloc_state(out_chan, url).cast()
+        })
+    }
 }

@@ -350,7 +350,7 @@ Named here so nothing above reads as more than it is.
   ABI for a GPU-visible arena is an open decision. There is no offline
   WGSL→QPU compiler, so there is no artifact to submit even if there were a
   driver.
-- **HDMI and bare-metal display.** A separate tier, and separately gated:
+- **HDMI and bare-metal display.** A separate piece of work, and separately gated:
   whether ARM can program a Pi 5's display directly rather than through
   firmware is a question to answer from board evidence and pinned sources, not
   from assertion.

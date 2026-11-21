@@ -3,7 +3,7 @@
 //! The contract-proving provider for the namespace surface
 //! (`crates/fluxor-abi/src/contracts/storage/namespace.rs`), and the implementor of
 //! `BIND` that proves it. Exists so the surface — and the
-//! `mount` routing tier above it — is testable with **no on-disk
+//! `mount` routing layer above it — is testable with **no on-disk
 //! format in the loop**: a repo that owns a contract holds an in-repo
 //! provider that proves it.
 //!

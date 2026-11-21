@@ -1,29 +1,29 @@
 # Network Boot and OTA
 
-Fluxor devices can boot a base image from the network and then pull
-their application graph from an OCI registry at runtime. The delivered
-unit is a **graph image**: modules, compiled configuration, and a
+Fluxor devices can boot a firmware image from the network and then pull
+the node graph they run from an OCI registry at runtime. The delivered
+unit is a **node image**: modules, compiled configuration, and a
 header that pins the graph to the kernel it runs on. The device
 becomes a compute node whose behaviour is determined by what the
 registry serves.
 
 Two delivery paths exist:
 
-- **Pi-5-class targets** netboot their boot image over TFTP, then pull
-  graph images over TLS from an OCI registry and stage them in RAM
+- **Pi-5-class targets** netboot their firmware image over TFTP, then pull
+  node images over TLS from an OCI registry and stage them in RAM
   through a kernel staging surface.
-- **RP-class targets** stage graph images into on-flash A/B graph
+- **RP-class targets** stage node images into on-flash A/B graph
   slots through the `ota_ingest` / `graph_slot` module pair.
 
-## The Graph Image
+## The Node Image
 
-Source: `crates/fluxor-abi/src/wire/graph_image.rs` (header and codec),
-`tools/src/graph_image.rs` (writer), `src/kernel/boot/graph_image.rs`
+Source: `crates/fluxor-abi/src/wire/node_image.rs` (header and codec),
+`tools/src/node_image.rs` (writer), `src/kernel/boot/node_image.rs`
 (admission), `src/kernel/boot/config.rs`, `src/kernel/module/ota_stage.rs`,
 `modules/foundation/graph_slot/` and `modules/foundation/ota_ingest/`
 (readers).
 
-`fluxor build <config> --emit=image --output <file>` produces a graph
+`fluxor build <config> --emit=image --output <file>` produces a node
 image: a 256-byte FXSL header; from the first 4 KiB boundary, the module
 table (FXMT format, one FXMD entry per module) followed by the graph's
 program section when its modules own programs (see
@@ -45,7 +45,7 @@ little-endian:
 | 168..256 | unused (0xFF) |
 
 The same header opens every graph a kernel runs: an RP flash slot, an
-OTA image staged in RAM, the graph a combined firmware image carries
+OTA image staged in RAM, the node image a firmware image carries
 after the kernel (RP UF2, Pi 5 and uefi raw images: the header on the
 first 256-byte boundary past the kernel's file-backed end), and the
 `graph.img` file `fluxor build` writes for Linux and `fluxor-linux
@@ -60,7 +60,7 @@ where `ota_ingest` stops reading, so nothing is padded across the wire.
 Its ceiling is the board's graph slot on an RP target (below) and 8 MiB
 of RAM staging elsewhere.
 
-### Graph-image signatures
+### Node-image signatures
 
 Source: `src/kernel/security/image_signature.rs`.
 
@@ -87,7 +87,7 @@ kernel image with a root:
 
 - boots from a flash slot only when its header carries a record for the
   root that verifies and its payload matches the digest; otherwise it falls
-  back to the other slot, then to the graph the firmware image carries,
+  back to the other slot, then to the node image the firmware image carries,
   which is held to the same check. Verification is
   strict (S below the group order, canonical encodings, no small-order
   points) and is the same in the kernel and in `graph_slot`, so the boot
@@ -99,7 +99,7 @@ kernel image with a root:
 
 A kernel built without a root checks no signature: signed and unsigned
 images are admitted alike, on their structure, ABI pin, digest and epoch.
-`fluxor build` signs the graph a combined firmware image or a Linux
+`fluxor build` signs the node image a firmware image or a Linux
 `graph.img` carries with the workspace signing key, whose public half is
 the root it writes, and refuses a `--root` the workspace holds no key
 for, since that kernel would refuse its own graph.
@@ -109,9 +109,9 @@ for, since that kernel would refuse its own graph.
 Source: `tools/src/store_cli.rs`, `tools/src/oci_store.rs`,
 `tools/src/store_remote.rs`.
 
-Graph images and boot images are OCI artefacts in the local store:
+Node images and firmware images are OCI artefacts in the local store:
 
-- `fluxor publish image <file>` publishes a built graph image (media
+- `fluxor publish image <file>` publishes a built node image (media
   type `application/vnd.nanocloud.fluxor.image.v1`). By default the
   image is exploded into layers — a skeleton (header + module-table
   header), one layer per `.fmod`, the program section
@@ -124,7 +124,7 @@ Graph images and boot images are OCI artefacts in the local store:
   are mirrored from the header into the `io.fluxor.image.epoch` and
   `io.fluxor.abi-surface` annotations so a consumer can admit an image
   from the manifest alone.
-- `fluxor publish firmware <file>` publishes a boot image (for
+- `fluxor publish firmware <file>` publishes a firmware image (for
   example the Pi 5 `kernel_2712.img`) for staging hosts — TFTP roots
   and SD writers — to pull.
 - `fluxor store push <ref> <host[:port]/repo:tag> [--ca <pem>]` and
@@ -138,19 +138,19 @@ on an ordinary OCI-distribution registry. The device pull is
 anonymous; the registry does not authenticate devices
 or select per-device content beyond the tag.
 
-## Boot Image and Netboot
+## Firmware Image and Netboot
 
 Source: `targets/boards/pi5.toml`, `memory-bcm2712.x`.
 
-A boot image is the kernel with a module table and compiled config
-appended in the platform's payload window: the base graph the device
-runs before any OTA pull. On Pi 5 the board firmware netboots this
+A firmware image is the kernel with a node image (module table and
+compiled config) appended in the platform's payload window: the node
+graph the device runs before any OTA pull. On Pi 5 the board firmware netboots this
 image (`kernel_2712.img`) over TFTP from standard TFTP
 infrastructure; `fluxor flash` writes the SD-card alternative to
 `/boot/firmware/kernel8.img`. Nothing need reside in local flash on a
 netbooted Pi 5.
 
-The base graph for an OTA device is small: the network driver, `ip`,
+The node graph an OTA device boots with is small: the network driver, `ip`,
 `tls` in client mode, and `ota_registry`. Application logic belongs in
 the pulled graph.
 
@@ -200,7 +200,7 @@ client-mode `tls` instance of the run that names no identity of its own
 (no `cert_file`, no `key_file`, no `identity_label`), and without the flag
 `$HOME/.config/<applet>/client.der` and `client.key.der` are used when
 both exist. A published applet therefore carries no credential, and one
-bundle serves every operator. Server instances are never given one. A key
+workload package serves every operator. Server instances are never given one. A key
 longer than a `tls` instance holds (2400 bytes) is refused. The config the
 run writes with the key in it is created `0600` in a directory only the
 operator can enter, outside the project tree — under `$XDG_RUNTIME_DIR`
@@ -274,7 +274,7 @@ validation, and is loaded from the same buffer that was validated.
 Failure posture: a validation failure leaves the running graph
 untouched; a failure during the rebuild itself leaves the graph idle,
 recoverable by power cycle back into the netboot image. Staging never
-writes the boot image, so the netboot/SD image is the fallback by
+writes the firmware image, so the netboot/SD image is the fallback by
 construction. The live epoch is held in RAM and starts at 0 each boot:
 within a boot an older or equal epoch is refused, and after a power
 cycle any image with an epoch of 1 or more is accepted. Recovering an
@@ -282,7 +282,7 @@ older version means a power cycle and a re-pull, or publishing it under
 a newer epoch. On targets without the RAM stage (RP, WASM) the
 surface returns `ENOSYS`.
 
-Activating a new graph image restarts the graph. For graphs holding
+Activating a new node image restarts the graph. For graphs holding
 storage state, treat activation as reboot-class maintenance rather
 than a live handoff.
 
@@ -319,8 +319,8 @@ module as `[flash_size][slot_a][slot_b][slot_size][param_store]`, each a
 `u32` LE offset from the XIP base, and `graph_slot`, `ota_ingest` and
 `flash_rp` ask rather than compile a geometry in, so one module build
 serves every board of a silicon. The tool computes the same partition
-from the same TOMLs: it bounds the graph image it emits by the board's
-slot, refuses a combined firmware image that reaches slot A, and
+from the same TOMLs: it bounds the node image it emits by the board's
+slot, refuses a firmware image that reaches slot A, and
 `fluxor inspect <config>` prints the partition (`--json`:
 `config.resolved_target.flash`), which is what a bench reads to erase or
 plant a slot. The CI gate holds every board's kernel image under the
@@ -332,7 +332,7 @@ firmware region carries.
 `graph_slot` owns the slots and exposes an FMP channel protocol
 (`gs.erase`, `gs.write`, `gs.activate`, `gs.query_active`,
 `gs.query_cfg`; responses are `[req_type: u32 LE][value: i32 LE]`).
-`ota_ingest` accepts a graph image as a byte stream on its `stream`
+`ota_ingest` accepts a node image as a byte stream on its `stream`
 input, buffers it into 256-byte pages, and drives erase → write →
 activate, reporting progress on its `status` output as 4-byte records
 `[kind: u8][pad][rc: i16 LE]` with kinds `0x01` erased, `0x02` written,
@@ -343,7 +343,7 @@ slot is refused before anything is erased. Nothing is erased until a
 whole header page has arrived, and bytes that do not begin with the
 image magic (`FXSL`) — what follows an image, or the rest of one that
 was refused — are dropped until an image begins. The slot content is the
-packed (single-blob) graph-image form.
+packed (single-blob) node-image form.
 
 `graph_slot` never erases or programs the slot the kernel booted from:
 module code runs in place from flash on RP, and a rebuild
@@ -383,7 +383,7 @@ Content trust on the OTA path is digest pinning end to end: the
 manifest names layer digests, every fetched blob is hashed as it
 streams, and commit re-verifies the whole-image hash from the FXSL
 header. Transport trust is TLS with the deployment CA pinned in the
-base graph's `tls` module. Binding to the running kernel is the
+booted node graph's `tls` module. Binding to the running kernel is the
 ABI-surface pin; downgrade resistance is epoch monotonicity (within a
 boot on the RAM stage; against the slot it replaces on flash).
 
@@ -397,7 +397,7 @@ separate, per-module check in the loader, described in `security.md`.
 
 ## Where It Fits
 
-The same graph image and the same store/registry model serve every
+The same node image and the same store/registry model serve every
 deployment shape: RP flash slots, Pi 5 RAM-staged OTA, and hosted
 runs. The image format, the digest/ABI/epoch validation, and the OCI
 artefact model are shared; devices differ only in where the bytes come

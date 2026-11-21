@@ -6,7 +6,7 @@ Source: `src/kernel/ipc/event.rs`
 
 ## Design Principles
 
-1. **Pure mechanism** — no domain semantics. Events are generic flags. The kernel has no knowledge of WiFi, sensors, or any device protocol.
+1. **Pure mechanism** — no device semantics. Events are generic flags. The kernel has no knowledge of WiFi, sensors, or any device protocol.
 2. **ISR-safe** — `event_signal_from_isr()` is bounded: one atomic store, one atomic RMW, one Signal. No allocation, no validation, no channel writes.
 3. **Cooperative** — events trigger intra-tick module stepping. No preemption, no blocking, no priority inversion.
 4. **Static pool** — 32 event slots, atomically allocated. No heap. Deterministic memory.
@@ -33,10 +33,10 @@ poll_gpio_edges()  ──>  doorbell_ring(doorbell)
                          signals SCHEDULER_WAKE
                               |
                               v
-                    main loop detects wake
+                    domain loop detects wake
                               |
                               v
-                    step_woken_modules() steps only affected modules
+                    wake pass (pass::run, PassKind::Wake) steps only affected modules
 ```
 
 For ISR sources (DMA completion, timer expiry):
@@ -52,7 +52,7 @@ event_signal_from_isr(handle)
     signals SCHEDULER_WAKE  ──>  breaks the sleep early
                                       |
                                       v
-                            step_woken_modules() runs immediately
+                            wake pass runs immediately
 ```
 
 ## Event Lifecycle
@@ -162,52 +162,57 @@ unsubscribe opcode.
 
 ## Scheduler Wake Integration
 
-The main loop sleeps until the next deadline or a wake, whichever comes
-first:
+Every loop drives one pass engine (`src/kernel/exec/scheduler/pass.rs`):
+`pass::run(domain, kind)` steps one domain, either a full tick
+(`PassKind::Tick`) or only the woken modules (`PassKind::Wake(&mask)`).
+A single-core loop (RP, Linux) runs every domain in order through
+`pass::tick_all()` and `pass::wake_all()`, then sleeps until the
+deadline the tick pass returned or a wake, whichever comes first:
 
 ```rust
 loop {
     // 1. Poll GPIO edges (signals events for bound pins)
     poll_gpio_edges();
 
-    // 2. Step all modules in topological order
-    step_modules(modules, module_count);
+    // 2. Tick pass over every domain; returns the merged sleep deadline
+    let pass = pass::tick_all();
 
-    // 3. Intra-tick wake: events fired during step_modules
-    let wake = take_wake_pending();
-    if wake != 0 {
-        step_woken_modules(modules, module_count, wake);
-    }
+    // 3. Intra-tick wake: events latched during the tick pass
+    pass::wake_all();
 
-    // 4. Sleep until 1ms tick OR event signal
-    SCHEDULER_WAKE.reset();
-    select(
-        Timer::after(1ms),
-        SCHEDULER_WAKE.wait(),
-    ).await;
+    // 4. Sleep until the pass deadline OR an event signal
+    SCHEDULER_WAKE.take();
+    wait_for_wake(&SCHEDULER_WAKE, now + pass.deadline_us, ...);
 
     // 5. Post-sleep wake: events from ISR during sleep
-    let wake = take_wake_pending();
-    if wake != 0 {
-        step_woken_modules(modules, module_count, wake);
-    }
+    pass::wake_all();
 }
 ```
 
-### step_woken_modules
+A domain loop on its own core does the same for its one domain:
+`pass::run(d, PassKind::Tick)`, then `pass::take_domain_wakes(d)` and
+`pass::run(d, PassKind::Wake(&woken))`. A domain loop takes only its own
+domain's wake bits.
 
-A lightweight variant of `step_modules` that:
-- Only steps modules whose bit is set in `wake_bits`
-- Bypasses frequency gating (`step_period`) — event-triggered steps override period
-- Preserves topological order (producer before consumer)
-- Same done/error handling as the normal step path
+### Wake pass
+
+`PassKind::Wake` runs the per-graph step of a tick pass for the woken
+modules alone:
+- Only steps modules whose bit is set in the wake mask, each once
+- Bypasses the period gate (`step_period`) — an event-triggered step does
+  not wait for the module's periodic due
+- Preserves the domain's exec order (producer before consumer)
+- Same fault, done and error handling as a tick pass
+- The domain's step budget defers what does not fit
+  (`MON_WAKE_BUDGET_DEFER`); a paused graph's wakes go to the deferred
+  store
 
 ### Wake Timing
 
 | Source | Latency | Mechanism |
 |--------|---------|-----------|
-| GPIO edge (software polled) | Same tick cycle (~0-1ms) | `poll_gpio_edges()` → `event_signal()` → `step_woken_modules()` |
-| Module-to-module signal | Same tick cycle | Module A signals → `step_woken_modules()` runs before sleep |
+| GPIO edge (software polled) | Same tick cycle (~0-1ms) | `poll_gpio_edges()` → `event_signal()` → wake pass |
+| Module-to-module signal | Same tick cycle | Module A signals → wake pass runs before sleep |
 | ISR sources | Sub-tick | ISR → `event_signal_from_isr()` → `SCHEDULER_WAKE` breaks the sleep |
 
 ### Channel readiness and stream state
@@ -269,7 +274,7 @@ The kernel does two things with the armed timers of a domain each time it
 decides how long to sleep:
 
 - **Fire.** An expired timer latches its owner's wake bit exactly as
-  `event_signal` would, once per arming, so `step_woken_modules()` runs
+  `event_signal` would, once per arming, so a wake pass runs
   that module and it finds `POLL_IN`. The latch is what makes a fire an
   edge rather than a level — an expired-but-unread timer does not wake its
   owner again on every pass. `SET`, `CANCEL` and `DESTROY` clear it.
@@ -399,7 +404,7 @@ The module never runs in interrupt context. The kernel signals its event when a 
 
 ## Litmus Test
 
-> Any hardware driver that can be written as a cooperative state machine with event notifications can live entirely as a module, with zero kernel knowledge of the device's domain.
+> Any hardware driver that can be written as a cooperative state machine with event notifications can live entirely as a module, with zero kernel knowledge of the device's protocol.
 
 The kernel provides:
 - Bus primitives (GPIO, SPI, PIO) for hardware access
@@ -410,7 +415,7 @@ The kernel provides:
 The kernel does NOT provide:
 - WiFi opcodes, netif types, association states
 - Protocol logic, packet formats, device registers
-- Any domain-specific dispatch, or a sideband word beside a channel: what
+- Any device-specific dispatch, or a sideband word beside a channel: what
   two modules tell each other travels in the contract they speak
 
 ## Implementation
@@ -424,7 +429,7 @@ The kernel does NOT provide:
 | `crates/fluxor-abi/src/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
 | `src/kernel/module/syscalls.rs` | Event contract dispatch |
 | `src/platform/rp/io.rs` | `poll_gpio_edges()` and the per-pin edge bindings (RP) |
-| `src/kernel/exec/scheduler/` | wake handling, `step_woken_modules()` |
+| `src/kernel/exec/scheduler/pass.rs` | the pass engine: `pass::run` tick and wake passes, `take_domain_wakes()` |
 
 ## Limits
 

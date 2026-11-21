@@ -68,7 +68,7 @@ pub struct WorkloadDesired {
     pub desired_phase: DesiredPhase,
     pub profile: ResourceProfile,
     /// Declared exports from the admitted workload manifest (empty for
-    /// flag-based commits with no bundle).
+    /// flag-based commits with no package).
     #[serde(default)]
     pub exports: Vec<ExportDecl>,
 }
@@ -103,7 +103,7 @@ pub struct NodeCapacity {
 ///
 /// `linux` and `pi5`/`bcm2712` share one arm but not their figures: each is
 /// read from its own kernel profile (`profile_linux`, `profile_bcm2712`).
-/// `max_owners` is the kernel's owner-slot domain, one on every kernel; the
+/// `max_owners` is the kernel's owner-slot range, one on every kernel; the
 /// table a node actually holds is its boot plan's
 /// `owners` ceiling (the system slot, its resident workloads and the owner
 /// reserve), which a deployment raises within the domain with `capacity: {
@@ -137,7 +137,7 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
         // textually and fails on drift — the same mitigation the host row uses
         // against the kernel constants.
         //
-        // `max_owners` is the kernel's owner-slot domain; an RP plan keeps
+        // `max_owners` is the kernel's owner-slot range; an RP plan keeps
         // no owner reserve by default, so it seats only what its graph
         // carries. The module and edge figures are the RP profile's domains.
         "rp2040" | "pico" | "picow" => Some(NodeCapacity {
@@ -420,7 +420,7 @@ pub fn compose(
         .collect();
     occupied_slots.extend(revocations.iter().map(|r| r.assignment.slot));
 
-    let mut next_free: u16 = 1; // slot 0 is the system owner
+    let mut next_free: u16 = 1; // slot 0 is the node owner
     let mut free_slot = |occupied: &[u16], cap: &NodeCapacity| -> Option<u16> {
         while (next_free as usize) < cap.max_owners as usize {
             let s = next_free;
@@ -1548,7 +1548,7 @@ mod tests {
                 let mut p = profile(1, 0);
                 p.domains = 0;
                 // Endpoints are the node's admission policy (`max_endpoints`),
-                // not the owner domain: the first workloads lease one each.
+                // not the owner's profile: the first workloads lease one each.
                 p.endpoints = u16::from(i < 60);
                 let mut w = workload(0, DesiredPhase::Running, p);
                 w.workload_uid[..4].copy_from_slice(&(i + 1).to_be_bytes());
@@ -1884,16 +1884,16 @@ mod tests {
             extract(&kcfg, "SMALL_GRAPH_EDGES")
         );
         // The subgraph caps the workload encoder refuses past.
-        let live = read("src/kernel/exec/scheduler/live.rs");
+        let splice = read("src/kernel/exec/scheduler/splice.rs");
         assert_eq!(
             crate::add_subgraph::MAX_ADD_MODULES as u64,
-            extract(&live, "MAX_ADD_MODULES")
+            extract(&splice, "MAX_ADD_MODULES")
         );
         assert_eq!(
             crate::add_subgraph::MAX_ADD_EDGES as u64,
-            extract(&live, "MAX_ADD_EDGES")
+            extract(&splice, "MAX_ADD_EDGES")
         );
-        // The MCU rows carry the same owner-slot domain as every kernel.
+        // The MCU rows carry the same owner-slot range as every kernel.
         // Their arena figures are pinned against the silicon TOMLs by
         // `capacity_mirrors_silicon_tomls`; what belongs here is the half
         // that mirrors a kernel source — the owner domain and profile_rp's

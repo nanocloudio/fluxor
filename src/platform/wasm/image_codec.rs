@@ -1,4 +1,4 @@
-//! `wasm_browser_image_codec` built-in: encoded-image → RGB565
+//! `wasm_browser_image_codec` native module: encoded-image → RGB565
 //! transformer that delegates the actual decode to the browser via
 //! `createImageBitmap` + `OffscreenCanvas`.
 //!
@@ -37,7 +37,9 @@
 //! `createImageBitmap`'s async-ness behind the same poll-then-pull
 //! pattern as `host_browser_fetch`.
 
+use crate::abi::platform::native::wasm::wasm_browser_image_codec as tags;
 use crate::kernel::exec::scheduler;
+use crate::kernel::exec::scheduler::{NativeInit, NativeVtable};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::syscalls;
 
@@ -122,10 +124,9 @@ pub(crate) struct ImageCodecState {
     pub encoded_cap: u32,
 }
 
-/// Public — used by `wasm.rs` to size the per-module heap. The
-/// per-module heap must hold the State struct plus the encoded
-/// buffer plus a small overhead. Allocations come out of
-/// STATE_ARENA so this is the one knob the wiring code consults.
+/// The per-module heap the constructor seats: the State struct plus
+/// the encoded buffer plus a small overhead. It comes out of the
+/// state arena, so this is the one knob that sizes the module.
 pub(crate) fn heap_size_for(max_bytes: u32) -> usize {
     core::mem::size_of::<ImageCodecState>() + max_bytes as usize + 256
 }
@@ -173,12 +174,12 @@ unsafe fn alloc_state(
 }
 
 /// # Safety
-/// `state` is this module's own 64-byte state buffer, exclusively the
+/// `state` is this module's own arena state, exclusively the
 /// step's for its duration.
-unsafe fn step(state: *mut u8) -> i32 {
+unsafe extern "C" fn step(state: *mut u8) -> i32 {
     // SAFETY: state is the kernel-provided opaque state pointer for
     // this module instance; we cast it back to the module-private state
-    // type allocated by the new_fn and operate within that allocation.
+    // type allocated by the constructor and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut ImageCodecState);
         if st_ptr.is_null() {
@@ -327,15 +328,29 @@ unsafe fn outputting_step(st: &mut ImageCodecState) -> i32 {
     }
 }
 
-pub(crate) unsafe fn build(
-    in_chan: i32,
-    out_chan: i32,
-    width: u16,
-    height: u16,
-    max_bytes: u32,
-) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new("wasm_browser_image_codec", step);
-    let raw = alloc_state(in_chan, out_chan, width, height, max_bytes);
-    core::ptr::write(m.state.as_mut_ptr() as *mut *mut ImageCodecState, raw);
-    m
+/// The `wasm_browser_image_codec` native module.
+pub static WASM_BROWSER_IMAGE_CODEC: NativeVtable = super::heap_native(new, step);
+
+/// # Safety
+/// `state` is the instance's zeroed arena state; the current module is
+/// `init.slot`.
+unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
+    let mut width = 0u16;
+    let mut height = 0u16;
+    let mut max_bytes = 8u32 * 1024 * 1024;
+    super::walk_tlv(init.params, |tag, value| match tag {
+        tags::TAG_WIDTH => width = super::tlv_u32(value) as u16,
+        tags::TAG_HEIGHT => height = super::tlv_u32(value) as u16,
+        tags::TAG_MAX_BYTES => max_bytes = super::tlv_u32(value),
+        _ => {}
+    });
+    let in_chan = scheduler::module_port(init.slot, tags::PORT_ENCODED);
+    let out_chan = scheduler::module_port(init.slot, tags::PORT_PIXELS);
+    // SAFETY: the constructor's own contract; the instance is built on
+    // the slot's heap, which the current module allocates through.
+    unsafe {
+        super::seat_heap_instance(state, init.slot, heap_size_for(max_bytes), || {
+            alloc_state(in_chan, out_chan, width, height, max_bytes).cast()
+        })
+    }
 }
