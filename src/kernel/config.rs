@@ -372,6 +372,22 @@ mod profile_wasm {
     /// long transfer.
     pub const LENDS: usize = 16;
 
+    /// Every module the loader resolves runs as its own wasm instance through
+    /// the platform's module host (`platform::wasm::module_host`), which takes
+    /// two allocations from the state arena per instance: this state (its
+    /// host instance handle and its scratch heap's base) and the scratch heap.
+    /// The module keeps its own state and heap in its own linear memory. The
+    /// composer charges each module these two (`tools/src/capacity.rs`).
+    pub const MODULE_HOST_STATE_BYTES: usize = 64;
+    /// The kernel-side scratch heap each hosted module gets. The host shim
+    /// routes every PIC syscall that crosses linear-memory boundaries
+    /// (`channel_read`/`channel_write`/`provider_call`) through
+    /// `kernel_heap_alloc`, which allocates on the module's heap. 256 KiB so a
+    /// single read up to 64 KiB (e.g. media_loader's snapshot poll) fits after
+    /// the heap's per-block header and alignment slack, with room for a few
+    /// in-flight syscalls per step.
+    pub const MODULE_HOST_SCRATCH_BYTES: usize = 256 * 1024;
+
     /// The pools this profile holds as static tables, `(pool, size)`: the
     /// ceiling every boot plan must fit. The composer reads this table as the
     /// profile's data (`tools/src/capacity.rs`).

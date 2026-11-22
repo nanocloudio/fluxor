@@ -157,4 +157,4 @@ impl HostNative for LinuxGpuInstance {
 }
 
 /// The `linux_gpu` native module.
-pub static LINUX_GPU: NativeVtable = host_vtable::<LinuxGpuInstance>(linux_gpu_step);
+pub static LINUX_GPU: NativeVtable = host_vtable::<LinuxGpuInstance>(linux_gpu_step, native::linux_gpu::STATE_BYTES);

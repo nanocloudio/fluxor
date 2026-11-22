@@ -1,6 +1,10 @@
 version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
+# An instance's state in the kernel's arena, in 64-byte units: the pointer
+# to its host instance. `fluxor abi-regen` emits it as `STATE_BYTES`, which
+# the kernel's vtable and the build's state-arena charge both read.
+state_bytes_64 = 1
 
 # Host-side built-in module that holds N file paths and streams them on
 # demand. Mirrors the fat32 streaming pattern but without a filesystem

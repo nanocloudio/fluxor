@@ -223,6 +223,94 @@ pub fn kernel_places_arenas(runtime: &str) -> bool {
     kernel_profile(runtime) == "profile_rp"
 }
 
+/// Bytes of state arena the kernel carves for an allocation of `n` bytes: the kernel's carve
+/// (`fluxor_contracts::state_arena::carve_bytes`).
+pub fn state_carve(n: u64) -> u64 {
+    usize::try_from(n)
+        .ok()
+        .and_then(fluxor_contracts::state_arena::carve_bytes)
+        .map_or(u64::MAX, |c| c as u64)
+}
+
+/// Where `runtime`'s kernel runs every loaded module through a module host
+/// (wasm): the two allocations the host takes from the state arena per
+/// module, `(state, scratch heap)` (`MODULE_HOST_STATE_BYTES`,
+/// `MODULE_HOST_SCRATCH_BYTES`). The module's own state and heap are then not
+/// the kernel's. `None` where modules run in place.
+pub fn kernel_module_host(runtime: &str) -> Option<(u64, u64)> {
+    let body = profile_body(kernel_profile(runtime));
+    Some((
+        eval(body, "MODULE_HOST_STATE_BYTES")?,
+        eval(body, "MODULE_HOST_SCRATCH_BYTES")?,
+    ))
+}
+
+/// The kernel's module loader, embedded for its isolated-module arena.
+const KERNEL_LOADER: &str = include_str!("../../src/kernel/module/loader.rs");
+
+/// The isolated-module arena of `runtime`'s kernel (`ISO_ARENA_SIZE`, kernels
+/// with page-table virtual memory): where an isolated module's state and heap
+/// are carved, each by `fluxor_contracts::state_arena::iso_carve_bytes`, in
+/// place of the state arena. `None` for a kernel without one.
+pub fn kernel_iso_arena(runtime: &str) -> Option<u64> {
+    match kernel_profile(runtime) {
+        "profile_bcm2712" | "profile_uefi" => cfg_const(
+            KERNEL_LOADER,
+            Some("feature = \"kernel-vm\""),
+            "ISO_ARENA_SIZE",
+        ),
+        _ => None,
+    }
+}
+
+/// Bytes of the isolated-module arena the kernel carves for an allocation of
+/// `n` bytes.
+pub fn iso_carve(n: u64) -> u64 {
+    usize::try_from(n)
+        .ok()
+        .and_then(fluxor_contracts::state_arena::iso_carve_bytes)
+        .map_or(u64::MAX, |c| c as u64)
+}
+
+/// The heap a native seats for an instance with `params` on `runtime`'s
+/// kernel, by the native's seat rule (`fluxor_abi::platform::native`,
+/// `fluxor_contracts::state_arena::heap_seat_bytes`). `None` for a native
+/// that seats none.
+pub fn kernel_native_seat(runtime: &str, hash: u32, params: &[u8]) -> Option<u64> {
+    use fluxor_abi::platform::native;
+    let table = match kernel_profile(runtime) {
+        "profile_linux" => native::linux::HEAP_SEAT_BY_HASH,
+        "profile_wasm" => native::wasm::HEAP_SEAT_BY_HASH,
+        _ => &[],
+    };
+    let (_, seat) = table.iter().find(|&&(h, _)| h == hash)?;
+    Some(
+        fluxor_contracts::state_arena::heap_seat_bytes(seat, params).map_or(u64::MAX, |b| b as u64),
+    )
+}
+
+/// The native modules `runtime`'s kernel instantiates, as `(name hash, state
+/// bytes)`: the state each one's vtable takes from the state arena, generated
+/// from its manifest (`fluxor_abi::platform::native`). Empty for a kernel
+/// with none.
+pub fn kernel_natives(runtime: &str) -> &'static [(u32, u32)] {
+    use fluxor_abi::platform::native;
+    match kernel_profile(runtime) {
+        "profile_linux" => native::linux::STATE_BYTES_BY_HASH,
+        "profile_wasm" => native::wasm::STATE_BYTES_BY_HASH,
+        _ => &[],
+    }
+}
+
+/// Where `runtime`'s kernel grows module heaps in segments (`HEAP_SEGMENTS`
+/// above 1): `(segments, quantum)`, which size the first segment it commits
+/// at instantiation (`fluxor_contracts::state_arena::first_heap_segment`).
+pub fn kernel_elastic_heaps(runtime: &str) -> Option<(usize, usize)> {
+    let body = profile_body(kernel_profile(runtime));
+    let segments = eval(body, "HEAP_SEGMENTS")?;
+    (segments > 1).then_some((segments as usize, eval(body, "ELASTIC_QUANTUM")? as usize))
+}
+
 /// Whether `target`'s kernel commits a module heap whole at instantiation
 /// (`HEAP_SEGMENTS` == 1), carving the instance's whole cap from the state
 /// arena before the module runs. Elsewhere a heap grows on demand, so its cap
@@ -277,7 +365,7 @@ pub fn planned_state_arena(
 /// unguarded declaration). `None` when there is no such declaration or its
 /// value is not a literal product.
 fn cfg_const(src: &str, cfg: Option<&str>, name: &str) -> Option<u64> {
-    let decl = format!("pub const {name}: usize = ");
+    let decl = format!("const {name}: usize = ");
     let mut guard: Option<&str> = None;
     for line in src.lines() {
         let t = line.trim();
@@ -285,7 +373,7 @@ fn cfg_const(src: &str, cfg: Option<&str>, name: &str) -> Option<u64> {
             guard = Some(pred);
             continue;
         }
-        if let Some(rest) = t.strip_prefix(&decl) {
+        if let Some(rest) = t.strip_prefix("pub ").unwrap_or(t).strip_prefix(&decl) {
             if guard == cfg {
                 return eval("", rest.trim_end_matches(';'));
             }

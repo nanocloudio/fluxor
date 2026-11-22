@@ -529,4 +529,4 @@ impl HostNative for LinuxDisplayState {
 }
 
 /// The `linux_display` native module.
-pub static LINUX_DISPLAY: NativeVtable = host_vtable::<LinuxDisplayState>(linux_display_step);
+pub static LINUX_DISPLAY: NativeVtable = host_vtable::<LinuxDisplayState>(linux_display_step, native::linux_display::STATE_BYTES);

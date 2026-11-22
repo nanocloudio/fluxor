@@ -57,12 +57,25 @@ the module and the platform profile (`HEAP_SEGMENTS` in
   contained` or `isolated`: its heap must lie where its protection regions
   cover it) and every module on a one-segment profile (RP and wasm, whose
   small arenas are planned up front).
-- **Elastic** — linux and bcm2712 (`HEAP_SEGMENTS = 8`). Nothing is carved at
-  instantiation. The first allocation carves a segment of
-  `cap >> 7` bytes (at least the 64 KiB quantum, at least the request); an
-  allocation no segment can serve carves the next, each at least as large as
-  everything committed so far, until the committed total reaches the cap.
-  Eight carves always reach the cap; the last takes what is left.
+- **Elastic** — linux, bcm2712 and uefi (`HEAP_SEGMENTS = 8`). The first
+  segment is carved at instantiation, before the module runs: `cap >> 7`
+  bytes, at least the 64 KiB quantum, never past the cap
+  (`fluxor_contracts::state_arena::first_heap_segment`, by which the build
+  also charges it). An allocation no segment can serve carves the next, each
+  at least as large as everything committed so far, until the committed
+  total reaches the cap. Eight carves always reach the cap; the last takes
+  what is left.
+- **Elastic, committed whole** — an instance whose params carry tag `0xEE`
+  has its whole cap carved as one segment at instantiation, and is charged
+  the whole cap. The composer marks every instance of a type that sizes its
+  heap from its params (`[capacities] heap_from_params` or
+  `heap_per_param`, the fans among them) and every type or instance that
+  declares raw arena use (`[capacities] raw_arena`, `heap.raw_arena`). A
+  type that sizes its heap from its params takes its tables at
+  construction, as one block near the cap ("One block for several tables"
+  below); after an eager first segment the next segment could only be what
+  remains of the cap, which that block does not fit, so it is committed
+  whole instead.
 
 ```
 STATE_ARENA
@@ -70,13 +83,21 @@ STATE_ARENA
   | seg 0   | | seg 1      | | seg 2                  |  ... up to 8,
   | cap/128 | | >= seg 0   | | >= seg 0 + seg 1       |  sum <= cap
   +---------+ +------------+ +------------------------+
-   carved on    carved when    carved when 0 and 1
-   first alloc  seg 0 is full  cannot serve a request
+   carved at    carved when    carved when 0 and 1
+   instantiation seg 0 is full cannot serve a request
 ```
 
-An elastic heap costs its module only what it touches: a reader type declared
-for the largest object it might ever hold commits, per instance, what that
-instance actually reads.
+An elastic heap costs its module only its first segment and what it touches
+past it: a reader type declared for the largest object it might ever hold
+commits, per instance, what that instance actually reads.
+
+The build's state-arena budget (`fluxor build`) charges the fixed carves —
+each module's state, each committed heap, each elastic heap's first segment
+(or its whole cap where the module declares raw arena use) — and nothing
+past them. Growth beyond the first segment, in `module_new` or later, is the
+module's own allocation: where the arena cannot serve it the allocation
+fails (and a module whose `module_new` fails on it is refused at load), which
+is the module's failure, not a budget the build could predict.
 
 Elastic growth follows the bare-metal rules:
 
@@ -222,8 +243,8 @@ placeholder cap on each such instance — its type's figure without the
 per-demand bytes — and the planned cap is written over it once the demand is
 counted. A workload image (`--emit=workload`) is planned the same way, from
 its own workload's demand and its target's reserve. On an elastic heap the
-larger cap costs nothing until it is used: the first segment is `cap >> 7`
-(at least the 64 KiB quantum) and the heap grows with use. A committed-heap
+larger cap costs only its first segment until it is used: the first segment
+is `cap >> 7` (at least the 64 KiB quantum) and the heap grows with use. A committed-heap
 profile carves the whole cap, for every instance of the type.
 
 ### Per-param cap: `[capacities] heap_per_param`
@@ -262,9 +283,10 @@ tables taken one by one can strand the tail of a segment and miss a cap
 that holds their sum — at some counts and not others. A module with more
 than one table takes them as ONE allocation of their summed size and
 carves each from it (each carve rounded to the heap's 16-byte
-granularity, which `base` covers): a single allocation the cap holds is
-always served from one segment. A module with one table is that case
-already.
+granularity, which `base` covers). A module with one table is that case
+already. Its heap is committed whole at instantiation (tag `0xEE`, which
+the composer writes for every type with this rule), so a single
+allocation the cap holds is always served from one segment.
 
 `pack` holds the rule to the module: `base` to the declared arena, each
 `tag` to an integer param of the module's `define_params!` schema, and each

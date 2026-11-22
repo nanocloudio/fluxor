@@ -64,6 +64,11 @@ const MIN_ALLOC: usize = 16;
 
 /// Block header size in bytes.
 const HEADER_SIZE: usize = 8;
+const _: () = assert!(
+    HEADER_SIZE == fluxor_contracts::state_arena::HEAP_BLOCK_HEADER
+        && MIN_ALLOC == fluxor_contracts::state_arena::HEAP_MIN_BLOCK,
+    "the composer sizes a heap's first segment by these"
+);
 
 /// Bit 31 of size_and_flags indicates allocated.
 const ALLOC_FLAG: u32 = 0x8000_0000;
@@ -981,6 +986,35 @@ impl ModuleHeap {
         Some((base, size))
     }
 
+    /// Commit an elastic heap's first segment, before its module runs: the
+    /// segment `fluxor_contracts::state_arena::first_heap_segment` sizes from
+    /// the cap, which the build charges. `false` when the state arena cannot
+    /// seat it; `true` with nothing carved for a heap that is not elastic (a
+    /// cap too small to hold a block gets none) or has a segment already.
+    #[cfg(not(any(feature = "rp", feature = "host-wasm")))]
+    fn commit_first(&mut self) -> bool {
+        if !self.elastic || self.seg_count != 0 {
+            return true;
+        }
+        let size = fluxor_contracts::state_arena::first_heap_segment(
+            self.cap as usize,
+            HEAP_SEGMENTS,
+            MIN_SEGMENT,
+        );
+        let Ok(base) = crate::kernel::module::loader::alloc_state(size) else {
+            return false;
+        };
+        let Some(seg) = Segment::init(base, size) else {
+            // SAFETY: the allocation just returned, referenced by nothing.
+            unsafe { crate::kernel::module::loader::free_state_range(base, size) };
+            return false;
+        };
+        self.segs[0] = seg;
+        self.seg_count = 1;
+        self.committed = seg.size;
+        true
+    }
+
     /// The segments this heap owns (an elastic heap's carves; a committed
     /// heap's arena belongs to whoever supplied it).
     fn owned_segments(&self) -> HeapSegments {
@@ -1071,7 +1105,8 @@ pub fn init_module_heap(module_idx: usize, arena_ptr: *mut u8, arena_size: usize
 }
 
 /// Initialize a module's elastic heap with a cap of `cap` bytes: nothing is
-/// committed until it allocates.
+/// committed until its first segment is (`commit_first`, at instantiation) or
+/// it allocates.
 pub fn init_module_heap_elastic(module_idx: usize, cap: usize) {
     let Some(h) = heap_at(module_idx) else {
         return;
@@ -1145,6 +1180,24 @@ pub fn commit_whole(module_idx: usize) -> Option<(*mut u8, usize)> {
         );
     }
     r
+}
+
+/// Commit module `module_idx`'s elastic heap's first segment at its
+/// instantiation (`ModuleHeap::commit_first`). `false` when the state arena
+/// cannot seat it; `true` for a heap that is not elastic.
+#[cfg(not(any(feature = "rp", feature = "host-wasm")))]
+pub fn commit_first(module_idx: usize) -> bool {
+    let Some(h) = heap_at(module_idx) else {
+        return true;
+    };
+    // SAFETY: instantiation context; the module does not run yet.
+    unsafe { (*h).commit_first() }
+}
+
+/// A one-segment profile (RP, wasm) has no elastic heap: nothing to commit.
+#[cfg(any(feature = "rp", feature = "host-wasm"))]
+pub fn commit_first(_module_idx: usize) -> bool {
+    true
 }
 
 /// Whether module `module_idx` has an elastic heap.

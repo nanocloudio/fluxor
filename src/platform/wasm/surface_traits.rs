@@ -100,7 +100,11 @@ unsafe extern "C" fn surface_traits_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_surface_traits` native module.
-pub static WASM_BROWSER_SURFACE_TRAITS: NativeVtable = super::heap_native(new, surface_traits_step);
+pub static WASM_BROWSER_SURFACE_TRAITS: NativeVtable = super::heap_native(
+    new,
+    surface_traits_step,
+    crate::abi::platform::native::wasm::wasm_browser_surface_traits::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -113,8 +117,15 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
         super::seat_heap_instance(
             state,
             init.slot,
-            super::heap_for::<SurfaceTraitsState>(),
+            &crate::abi::platform::native::wasm::wasm_browser_surface_traits::HEAP_SEAT,
+            init.params,
             || alloc_state(out_chan).cast(),
         )
     }
 }
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_surface_traits::HEAP_SEAT[0] as usize
+        >= super::heap_for::<SurfaceTraitsState>(),
+    "the declared heap seat holds the instance"
+);

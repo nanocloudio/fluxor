@@ -1151,8 +1151,10 @@ pub fn zero_totals() -> (u64, u64) {
 // needs more fails closed loudly.
 /// Page granule for isolated allocations (matches the EL0 4 KiB page size).
 #[cfg(feature = "kernel-vm")]
-const ISO_PAGE: usize = 4096;
-/// Per-image budget for all isolated module state + heap combined.
+use fluxor_contracts::state_arena::{iso_carve_bytes, ISO_PAGE};
+/// Per-image budget for all isolated module state + heap combined. The
+/// composer charges a graph's isolated modules against it by the same carve
+/// (`iso_carve_bytes`), reading this declaration.
 #[cfg(feature = "kernel-vm")]
 const ISO_ARENA_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(feature = "kernel-vm")]
@@ -1177,10 +1179,7 @@ pub fn alloc_isolated(size: usize) -> Result<(*mut u8, usize), LoaderError> {
         let off = (ISO_ARENA_OFFSET + ISO_PAGE - 1) & !(ISO_PAGE - 1);
         // Pad the (user + canary) footprint up to a whole number of pages so
         // the region the MMU maps is exclusively this allocation's.
-        let mapped = size
-            .checked_add(STATE_CANARY_SIZE)
-            .map(|n| (n + ISO_PAGE - 1) & !(ISO_PAGE - 1))
-            .ok_or(LoaderError::StatePoolExhausted)?;
+        let mapped = iso_carve_bytes(size).ok_or(LoaderError::StatePoolExhausted)?;
         let next = match off.checked_add(mapped) {
             Some(n) if n <= ISO_ARENA_SIZE => n,
             _ => {
@@ -1262,7 +1261,7 @@ pub unsafe fn free_private(ptr: *mut u8, size: usize) {
     // footprint `free_state_range` computes is the region itself.
     // SAFETY: the caller's contract — `ptr` is a region `alloc_private`
     // returned with this size, and nothing uses it any more.
-    unsafe { free_state_range(ptr, size - STATE_CANARY_SIZE) };
+    unsafe { free_state_range(ptr, size - STATE_CANARY_BYTES) };
 }
 
 /// The memory a torn-down module held: its state buffer, the heap arena it
@@ -1362,34 +1361,20 @@ fn is_iso_ptr(ptr: *const u8) -> bool {
     }
 }
 
-const STATE_ALIGN: usize = 8;
+use fluxor_contracts::state_arena::{carve_bytes, STATE_ALIGN, STATE_CANARY_BYTES};
 #[inline]
 fn align_up(n: usize) -> usize {
     (n + STATE_ALIGN - 1) & !(STATE_ALIGN - 1)
 }
 
-/// `align_up` via checked arithmetic. The unchecked
-/// `n + STATE_ALIGN - 1` form wraps on `n` near `usize::MAX`; returns
-/// `None` so callers refuse the allocation rather than proceed with
-/// a tiny, wrapped value while the rest of the path treats the size
-/// as huge.
-#[inline]
-fn align_up_checked(n: usize) -> Option<usize> {
-    n.checked_add(STATE_ALIGN - 1)
-        .map(|m| m & !(STATE_ALIGN - 1))
-}
-
 /// 32-bit canary written at the trailing edge of every state
-/// allocation. A module that overruns its state buffer clobbers this
-/// word, and `free_state_range` (or `validate_state_canary` for
-/// ad-hoc checks) reports it. Distinct from heap's `0xDEAD_BEEF`
-/// `ALLOC_MAGIC` so a single 4-byte dump identifies which arena
-/// overflowed.
+/// allocation (`STATE_CANARY_BYTES` of it, inside the carve). A module
+/// that overruns its state buffer clobbers this word, and
+/// `free_state_range` (or `validate_state_canary` for ad-hoc checks)
+/// reports it. Distinct from heap's `0xDEAD_BEEF` `ALLOC_MAGIC` so a
+/// single 4-byte dump identifies which arena overflowed.
 const STATE_CANARY: u32 = 0xDEAD_C0DE;
-/// Trailing bytes reserved per allocation for the canary, kept
-/// within the alignment-rounded `need` budget so caller pointer
-/// math is unaffected.
-const STATE_CANARY_SIZE: usize = 4;
+const _: () = assert!(core::mem::size_of::<u32>() == STATE_CANARY_BYTES);
 /// Allocate a state buffer of `size` bytes from the pool.
 ///
 /// Returns a pointer to a zeroed, 8-byte-aligned buffer. Served from
@@ -1405,7 +1390,7 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
     // canary.
     let start = dirty.0.min(size);
     let len = dirty.1.min(size - start);
-    // SAFETY: `reserve_state` reserved `size + STATE_CANARY_SIZE` bytes at
+    // SAFETY: `reserve_state` reserved `carve_bytes(size)` bytes at
     // `ptr` for this caller alone.
     unsafe {
         if len > 0 {
@@ -1432,10 +1417,7 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
 fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> {
     // SAFETY: the arena statics are touched only under `STATE_LOCK`.
     unsafe {
-        let need = size
-            .checked_add(STATE_CANARY_SIZE)
-            .and_then(align_up_checked)
-            .ok_or(LoaderError::StatePoolExhausted)?;
+        let need = carve_bytes(size).ok_or(LoaderError::StatePoolExhausted)?;
         let _lock = StateLock::acquire();
         // 1. Scan free list for first-fit.
         let free_list = free_list();
@@ -1608,9 +1590,9 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     if ptr.is_null() {
         return;
     }
-    // Zero-sized allocations still consume
-    // `align_up(STATE_CANARY_SIZE) = 8` bytes (canary plus alignment
-    // slack) — the free path releases the true footprint regardless
+    // Zero-sized allocations still consume `carve_bytes(0) = 8` bytes
+    // (canary plus alignment slack) — the free path releases the true
+    // footprint regardless
     // of user-visible size. Validate the trailing canary first; for
     // zero-sized regions the canary lives at `ptr + 0`.
     // SAFETY: the caller's contract: `ptr` came from `alloc_state(size)`.
@@ -1631,13 +1613,10 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     }
     let base = arena_ptr();
     let offset = ptr as usize - base as usize;
-    // Checked arithmetic mirrors `alloc_state`. A wrapping
-    // `size + STATE_CANARY_SIZE` would compute a tiny `need` and
-    // leave the rest of the region claimed but unreachable.
-    let Some(need) = size
-        .checked_add(STATE_CANARY_SIZE)
-        .and_then(align_up_checked)
-    else {
+    // The carve `alloc_state` made, checked as it was: a wrapped size
+    // would compute a tiny `need` and leave the rest of the region claimed
+    // but unreachable.
+    let Some(need) = carve_bytes(size) else {
         log::error!("[loader] free_state_range: size={size} overflows");
         return;
     };
@@ -3446,7 +3425,7 @@ impl DynamicModule {
     /// responsible for also freeing any heap arena recorded separately
     /// (see `free_state_range`).
     pub unsafe fn free(self) {
-        // A stateless module still occupies `align_up(STATE_CANARY_SIZE)`
+        // A stateless module still occupies `carve_bytes(0)`
         // bytes of arena (canary + alignment slack), so the free
         // path runs regardless of `state_size`. `free_state_range`
         // computes the true footprint and handles `size == 0`.
@@ -3612,7 +3591,7 @@ impl DynamicModule {
                 + crate::platform::rp_protection::EXCEPTION_FRAME_BYTES
                 + params.len.next_multiple_of(8)
                 + 64;
-            let state = (required_size + STATE_CANARY_SIZE).next_multiple_of(8);
+            let state = carve_bytes(required_size).ok_or(LoaderError::StatePoolExhausted)?;
             let total = (stack + state + arena.next_multiple_of(8)) as u64;
             let (size, align) = fluxor_contracts::isolation::private_region_shape(
                 total,
@@ -3694,21 +3673,30 @@ impl DynamicModule {
         crate::kernel::mem::heap::reset_module_heap(inst_idx);
         {
             // An ungated module on a profile with elastic heaps commits its
-            // heap as it allocates (`kernel::mem::heap`): nothing is carved
-            // here, and its cap is recorded for owner accounting.
+            // heap's first segment here (`fluxor_contracts::state_arena::
+            // first_heap_segment`, which the build charges) and the rest as
+            // it allocates (`kernel::mem::heap`); its cap is recorded for
+            // owner accounting. Growth past the first segment, in `module_new`
+            // or later, is the module's own allocation: a failure there is the
+            // module's, which no state-arena budget predicts.
             let elastic = arena_size > 0 && !gated && crate::kernel::mem::heap::elastic_heaps();
             if elastic {
                 crate::kernel::mem::heap::init_module_heap_elastic(inst_idx, arena_size);
                 // A module that declares raw arena use has its whole cap
                 // committed now, at instantiation: `ARENA_GET` hands it this
                 // arena and commits nothing on a step.
-                if crate::kernel::exec::scheduler::params_raw_arena(params_slice)
-                    && crate::kernel::mem::heap::commit_whole(inst_idx).is_none()
-                {
+                let raw = crate::kernel::exec::scheduler::params_raw_arena(params_slice);
+                let committed = if raw {
+                    crate::kernel::mem::heap::commit_whole(inst_idx).is_some()
+                } else {
+                    crate::kernel::mem::heap::commit_first(inst_idx)
+                };
+                if !committed {
                     log::error!(
-                        "[loader] {}: raw heap arena commit failed need={arena_size} (state \
+                        "[loader] {}: heap {} commit failed cap={arena_size} (state \
                          used={}, cap={})",
                         name,
+                        if raw { "arena" } else { "first segment" },
                         arena_usage().0,
                         arena_usage().1
                     );

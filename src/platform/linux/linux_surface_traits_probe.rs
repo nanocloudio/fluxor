@@ -62,4 +62,4 @@ impl HostNative for LinuxSurfaceTraitsProbeState {
 }
 
 /// The `linux_surface_traits_probe` native module.
-pub static LINUX_SURFACE_TRAITS_PROBE: NativeVtable = host_vtable::<LinuxSurfaceTraitsProbeState>(linux_surface_traits_probe_step);
+pub static LINUX_SURFACE_TRAITS_PROBE: NativeVtable = host_vtable::<LinuxSurfaceTraitsProbeState>(linux_surface_traits_probe_step, native::linux_surface_traits_probe::STATE_BYTES);

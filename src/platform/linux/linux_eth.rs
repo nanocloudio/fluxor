@@ -383,4 +383,4 @@ impl HostNative for LinuxEthState {
 }
 
 /// The `linux_eth` native module.
-pub static LINUX_ETH: NativeVtable = host_vtable::<LinuxEthState>(linux_eth_step);
+pub static LINUX_ETH: NativeVtable = host_vtable::<LinuxEthState>(linux_eth_step, native::linux_eth::STATE_BYTES);

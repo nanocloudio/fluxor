@@ -79,16 +79,17 @@ pub(crate) struct CanvasState {
     pub format: u8,
 }
 
-/// The per-module heap the constructor seats.
-///
-/// Sized for the widest format, because a self-describing stream chooses its
-/// format per frame and a buffer that only fits RGB565 would refuse an RGBA8
-/// frame at runtime rather than at composition.
-pub(crate) fn heap_size_for(width: u16, height: u16) -> usize {
-    core::mem::size_of::<CanvasState>()
-        + (width as usize) * (height as usize) * bytes_per_pixel(RASTER_RGBA8)
-        + 256
-}
+/// The per-module heap the constructor seats is its manifest's `HEAP_SEAT`:
+/// the state and slack, and a backing buffer at `width` x `height` sized for
+/// the widest format, because a self-describing stream chooses its format per
+/// frame and a buffer that only fits RGB565 would refuse an RGBA8 frame at
+/// runtime rather than at composition.
+const SEAT: [u32; 6] = crate::abi::platform::native::wasm::wasm_browser_canvas::HEAP_SEAT;
+const _: () = assert!(
+    SEAT[0] as usize >= core::mem::size_of::<CanvasState>() + 256
+        && SEAT[1] as usize == bytes_per_pixel(RASTER_RGBA8),
+    "the declared heap seat holds the state and an RGBA8 frame"
+);
 
 /// Allocate a `CanvasState` on the kernel heap and return its raw
 /// pointer. The constructor stashes the pointer in the arena state;
@@ -229,7 +230,11 @@ unsafe extern "C" fn canvas_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_canvas` native module.
-pub static WASM_BROWSER_CANVAS: NativeVtable = super::heap_native(new, canvas_step);
+pub static WASM_BROWSER_CANVAS: NativeVtable = super::heap_native(
+    new,
+    canvas_step,
+    crate::abi::platform::native::wasm::wasm_browser_canvas::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -248,8 +253,12 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, heap_size_for(width, height), || {
-            alloc_state(in_chan, width, height, header).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_canvas::HEAP_SEAT,
+            init.params,
+            || alloc_state(in_chan, width, height, header).cast(),
+        )
     }
 }

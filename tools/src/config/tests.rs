@@ -6558,8 +6558,10 @@ mod heap_from_params_tests {
         assert_eq!(tag_0xef(&p), None);
     }
 
-    /// Bodies the type's default cap already holds emit no tag: the module
-    /// keeps its own figure, byte for byte as before.
+    /// Bodies the type's default cap already holds emit no cap tag: the
+    /// module keeps its own figure. The heap is still marked for a whole-cap
+    /// commit (0xEE, three bytes), as every instance of a type that sizes its
+    /// heap from its params is.
     #[test]
     fn bodies_within_the_default_emit_no_tag() {
         let m = manifest();
@@ -6578,7 +6580,9 @@ mod heap_from_params_tests {
                 &HeapPlan::default(),
             )
             .unwrap();
-            assert_eq!(p, params, "{len} B: params untouched");
+            assert_eq!(tag_0xef(&p), None, "{len} B: no cap tag");
+            assert_eq!(p.len(), params.len() + 3, "{len} B: only the 0xEE mark joined");
+            assert!(p.windows(3).any(|w| w == [0xEE, 1, 1]), "{len} B: marked 0xEE");
         }
     }
 
@@ -6634,8 +6638,8 @@ mod heap_from_params_tests {
         assert_eq!(schema::tlv_basic_end(&p), Some(p.len()));
         assert_eq!(
             p.len(),
-            params.len() + 6,
-            "the 0xEF entry joined before the end"
+            params.len() + 6 + 3,
+            "the 0xEF entry and the 0xEE mark joined before the end"
         );
 
         // Under 64 KiB the field stays exact.

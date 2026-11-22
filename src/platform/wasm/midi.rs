@@ -93,7 +93,11 @@ unsafe extern "C" fn midi_out_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_midi_in` native module.
-pub static WASM_BROWSER_MIDI_IN: NativeVtable = super::heap_native(new_in, midi_in_step);
+pub static WASM_BROWSER_MIDI_IN: NativeVtable = super::heap_native(
+    new_in,
+    midi_in_step,
+    crate::abi::platform::native::wasm::wasm_browser_midi_in::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -106,14 +110,22 @@ unsafe fn new_in(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, super::heap_for::<MidiInState>(), || {
-            alloc_state_in().cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_midi_in::HEAP_SEAT,
+            init.params,
+            || alloc_state_in().cast(),
+        )
     }
 }
 
 /// The `wasm_browser_midi_out` native module.
-pub static WASM_BROWSER_MIDI_OUT: NativeVtable = super::heap_native(new_out, midi_out_step);
+pub static WASM_BROWSER_MIDI_OUT: NativeVtable = super::heap_native(
+    new_out,
+    midi_out_step,
+    crate::abi::platform::native::wasm::wasm_browser_midi_out::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -124,8 +136,24 @@ unsafe fn new_out(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, super::heap_for::<MidiOutState>(), || {
-            alloc_state_out(events_in).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_midi_out::HEAP_SEAT,
+            init.params,
+            || alloc_state_out(events_in).cast(),
+        )
     }
 }
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_midi_in::HEAP_SEAT[0] as usize
+        >= super::heap_for::<MidiInState>(),
+    "the declared heap seat holds the instance"
+);
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_midi_out::HEAP_SEAT[0] as usize
+        >= super::heap_for::<MidiOutState>(),
+    "the declared heap seat holds the instance"
+);

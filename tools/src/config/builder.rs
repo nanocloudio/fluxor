@@ -1712,15 +1712,25 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether an instance uses its heap arena raw: its `heap.raw_arena`, else
-/// its module type's `[capacities] raw_arena`.
+/// Whether an instance's heap is committed whole at instantiation (params
+/// tag 0xEE): its `heap.raw_arena`, else its module type's `[capacities]
+/// raw_arena`, else a type that sizes its heap from its params
+/// (`heap_from_params`, `heap_per_param`). Such a module takes its tables at
+/// construction, typically as one block near the cap, which a heap whose
+/// first segment is already committed could not serve; committed whole, one
+/// segment holds any allocation the cap holds. Every other elastic heap
+/// commits only its first segment at instantiation.
 fn declares_raw_arena(module: &Value, manifest: Option<&Manifest>) -> bool {
     module
         .get("heap")
         .and_then(|h| h.get("raw_arena"))
         .and_then(Value::as_bool)
         .unwrap_or_else(|| {
-            manifest.is_some_and(|m| m.capacities.get("raw_arena").is_some_and(|&v| v != 0))
+            manifest.is_some_and(|m| {
+                m.capacities.get("raw_arena").is_some_and(|&v| v != 0)
+                    || m.heap_from_params.is_some()
+                    || m.heap_per_param.is_some()
+            })
         })
 }
 
@@ -3135,11 +3145,11 @@ fn build_module_entry_in(
         }
     }
 
-    // Tag 0xEE: raw arena use — the module reads its heap arena raw
-    // (`ARENA_GET`), so the kernel commits the whole cap at instantiation
-    // rather than on whichever step first asks. Declared per instance
-    // (`heap.raw_arena: true`) or by the module type (`[capacities]
-    // raw_arena = 1`).
+    // Tag 0xEE: the kernel commits the whole cap at instantiation — for a
+    // module that reads its heap arena raw (`ARENA_GET`), declared per
+    // instance (`heap.raw_arena: true`) or by the module type (`[capacities]
+    // raw_arena = 1`), and for a type that sizes its heap from its params
+    // (`declares_raw_arena`).
     if declares_raw_arena(module, manifests.get(name)) && base + extra_len + 3 < entry.len() {
         entry[base + extra_len] = 0xEE;
         entry[base + extra_len + 1] = 1;

@@ -69,4 +69,4 @@ impl HostNative for LinuxAlsaMidiState {
 }
 
 /// The `linux_alsa_midi` native module.
-pub static LINUX_ALSA_MIDI: NativeVtable = host_vtable::<LinuxAlsaMidiState>(linux_alsa_midi_step);
+pub static LINUX_ALSA_MIDI: NativeVtable = host_vtable::<LinuxAlsaMidiState>(linux_alsa_midi_step, native::linux_alsa_midi::STATE_BYTES);

@@ -143,4 +143,4 @@ impl HostNative for HostAssetState {
 }
 
 /// The `host_asset_source` native module.
-pub static HOST_ASSET_SOURCE: NativeVtable = host_vtable::<HostAssetState>(host_asset_step);
+pub static HOST_ASSET_SOURCE: NativeVtable = host_vtable::<HostAssetState>(host_asset_step, native::host_asset_source::STATE_BYTES);

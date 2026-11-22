@@ -184,7 +184,11 @@ unsafe extern "C" fn fetch_step(state: *mut u8) -> i32 {
 }
 
 /// The `host_browser_fetch` native module.
-pub static HOST_BROWSER_FETCH: NativeVtable = super::heap_native(new, fetch_step);
+pub static HOST_BROWSER_FETCH: NativeVtable = super::heap_native(
+    new,
+    fetch_step,
+    crate::abi::platform::native::wasm::host_browser_fetch::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -196,8 +200,18 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, super::heap_for::<FetchState>(), || {
-            alloc_state(out_chan, url).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::host_browser_fetch::HEAP_SEAT,
+            init.params,
+            || alloc_state(out_chan, url).cast(),
+        )
     }
 }
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::host_browser_fetch::HEAP_SEAT[0] as usize
+        >= super::heap_for::<FetchState>(),
+    "the declared heap seat holds the instance"
+);

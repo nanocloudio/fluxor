@@ -52,8 +52,15 @@ pub trait HostNative: Sized + 'static {
 }
 
 /// The vtable of host native `T` whose step is `step`: its arena state is
-/// the instance's heap pointer, its drop the instance's.
-pub const fn host_vtable<T: HostNative>(step: ModuleStepFn) -> NativeVtable {
+/// the instance's heap pointer, its drop the instance's. `state_bytes` is
+/// the native's declared state (`abi::platform::native::linux::<name>::
+/// STATE_BYTES`), the figure the build charges it; a declaration that cannot
+/// hold the pointer fails the build of the static that names it.
+pub const fn host_vtable<T: HostNative>(step: ModuleStepFn, state_bytes: u32) -> NativeVtable {
+    assert!(
+        state_bytes as usize >= core::mem::size_of::<*mut T>(),
+        "a host native's declared state holds its instance pointer"
+    );
     NativeVtable {
         new: host_new::<T>,
         step,
@@ -61,12 +68,13 @@ pub const fn host_vtable<T: HostNative>(step: ModuleStepFn) -> NativeVtable {
         flush: None,
         isr_entry: None,
         drop: Some(host_drop::<T>),
-        state_size: core::mem::size_of::<*mut T>() as u32,
+        state_size: state_bytes,
     }
 }
 
 /// # Safety
-/// `state` is the instance's arena state, `size_of::<*mut T>()` bytes.
+/// `state` is the instance's arena state, at least `size_of::<*mut T>()`
+/// bytes.
 unsafe fn host_new<T: HostNative>(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     match T::build(init.slot, init.params) {
         Ok(b) => {

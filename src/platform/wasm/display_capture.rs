@@ -57,11 +57,11 @@ const ENDED: i32 = -2;
 /// Bytes one frame at `width` x `height` occupies: the self-describing header
 /// plus RGB565 pixels.
 ///
-/// One expression, because [`heap_size_for`] sizes the arena from it and
+/// One expression, because the heap seat is asserted against it and
 /// [`alloc_state`] allocates from it. Two copies that disagree would size the
 /// arena below the allocation, which surfaces as a module that faults on its
 /// first step rather than as anything that names the real cause.
-fn frame_bytes(width: u16, height: u16) -> usize {
+const fn frame_bytes(width: u16, height: u16) -> usize {
     SRF1_HDR_LEN + (width as usize) * (height as usize) * 2
 }
 
@@ -83,12 +83,15 @@ pub(crate) struct DisplayCaptureState {
     pub header: bool,
 }
 
-/// Heap footprint: the State struct plus one full frame at the configured
-/// backing geometry. Sized from the params because the buffer *is* the bound
-/// on what a stream-supplied header may claim.
-pub(crate) fn heap_size_for(width: u16, height: u16) -> usize {
-    core::mem::size_of::<DisplayCaptureState>() + frame_bytes(width, height) + 256
-}
+/// Heap footprint, the manifest's `HEAP_SEAT`: the State struct plus one full
+/// frame at the configured backing geometry. Sized from the params because
+/// the buffer *is* the bound on what a stream-supplied header may claim.
+const SEAT: [u32; 6] = crate::abi::platform::native::wasm::wasm_browser_display_capture::HEAP_SEAT;
+const _: () = assert!(
+    SEAT[0] as usize >= core::mem::size_of::<DisplayCaptureState>() + frame_bytes(0, 0) + 256
+        && SEAT[1] as usize == frame_bytes(1, 1) - frame_bytes(0, 0),
+    "the declared heap seat holds the state and one frame"
+);
 
 unsafe fn alloc_state(
     out_chan: i32,
@@ -188,8 +191,11 @@ unsafe extern "C" fn display_capture_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_display_capture` native module.
-pub static WASM_BROWSER_DISPLAY_CAPTURE: NativeVtable =
-    super::heap_native(new, display_capture_step);
+pub static WASM_BROWSER_DISPLAY_CAPTURE: NativeVtable = super::heap_native(
+    new,
+    display_capture_step,
+    crate::abi::platform::native::wasm::wasm_browser_display_capture::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -208,8 +214,12 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, heap_size_for(width, height), || {
-            alloc_state(out_chan, width, height, header).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_display_capture::HEAP_SEAT,
+            init.params,
+            || alloc_state(out_chan, width, height, header).cast(),
+        )
     }
 }

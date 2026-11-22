@@ -265,4 +265,4 @@ impl HostNative for LinuxPointerState {
 }
 
 /// The `linux_pointer` native module.
-pub static LINUX_POINTER: NativeVtable = host_vtable::<LinuxPointerState>(linux_pointer_step);
+pub static LINUX_POINTER: NativeVtable = host_vtable::<LinuxPointerState>(linux_pointer_step, native::linux_pointer::STATE_BYTES);

@@ -39,10 +39,13 @@ pub(crate) struct CameraState {
     pub pos: u32, // bytes of the current frame already written to the channel
 }
 
-/// Heap footprint: the State struct + the frame buffer.
-pub(crate) fn heap_size_for() -> usize {
-    core::mem::size_of::<CameraState>() + MAX_FRAME + 64
-}
+/// Heap footprint, the manifest's `HEAP_SEAT`: the State struct + the frame
+/// buffer.
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_camera::HEAP_SEAT[0] as usize
+        >= core::mem::size_of::<CameraState>() + MAX_FRAME + 64,
+    "the declared heap seat holds the state and a frame"
+);
 
 unsafe fn alloc_state(out_chan: i32) -> *mut CameraState {
     let table = syscalls::get_syscall_table();
@@ -103,7 +106,11 @@ unsafe extern "C" fn camera_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_camera` native module.
-pub static WASM_BROWSER_CAMERA: NativeVtable = super::heap_native(new, camera_step);
+pub static WASM_BROWSER_CAMERA: NativeVtable = super::heap_native(
+    new,
+    camera_step,
+    crate::abi::platform::native::wasm::wasm_browser_camera::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -113,8 +120,12 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, heap_size_for(), || {
-            alloc_state(out_chan).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_camera::HEAP_SEAT,
+            init.params,
+            || alloc_state(out_chan).cast(),
+        )
     }
 }

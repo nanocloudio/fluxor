@@ -1,6 +1,10 @@
 version = "1.0.0"
 hardware_targets = ["wasm"]
 builtin = true
+# An instance's state in the kernel's arena, in 64-byte units: its
+# heap-seated instance record. `fluxor abi-regen` emits it as `STATE_BYTES`,
+# which the kernel's vtable and the build's state-arena charge both read.
+state_bytes_64 = 1
 
 # The browser as an addressed WebSocket connector. A consumer holding
 # several links addresses them by index, and that index rides in `WsFrame`'s
@@ -61,3 +65,10 @@ default = ""
 # Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; the page's network panel is the message stream"
+
+[capacities]
+# The module heap the kernel seats for an instance, from the state arena:
+# its instance, as the kernel lays it out on wasm32. `fluxor abi-regen` emits it as
+# `HEAP_SEAT`, which the kernel seats by and the build charges by
+# (`fluxor_contracts::state_arena::heap_seat_bytes`).
+heap_seat = 45444

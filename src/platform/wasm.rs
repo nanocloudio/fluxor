@@ -15,7 +15,6 @@
 )]
 
 use crate::kernel::exec::scheduler;
-use crate::kernel::ipc::channel;
 
 #[path = "wasm/canvas.rs"]
 mod canvas;
@@ -169,9 +168,6 @@ fn tlv_u32(value: &[u8]) -> u32 {
 // and import their own per-capability host functions directly.
 
 extern "C" {
-    /// Monotonic microseconds since host boot.
-    fn host_now_us() -> u64;
-
     /// Emit a log line at `level` (0=trace, 1=debug, 2=info, 3=warn,
     /// 4=error). `ptr`/`len` is a UTF-8 slice in this module's linear
     /// memory.
@@ -301,7 +297,7 @@ static WASM_LOGGER: WasmLogger = WasmLogger;
 // ── Graph bookkeeping ────────────────────────────────────────────────
 //
 // `MODULE_COUNT` is what `kernel_module_count` reports: the module count of
-// the graph `kernel_init` built (or the tick demo's two).
+// the graph `kernel_init` built (0 for a kernel with no bundled graph).
 static mut MODULE_COUNT: usize = 0;
 
 // ── Native modules ───────────────────────────────────────────────────
@@ -313,7 +309,7 @@ static mut MODULE_COUNT: usize = 0;
 // arena, which its drop returns.
 
 use crate::kernel::exec::scheduler::native::NativeNewFn;
-use crate::kernel::exec::scheduler::{native, NativeInit, NativeVtable};
+use crate::kernel::exec::scheduler::{native, NativeVtable};
 use crate::kernel::module::loader::{self, ModuleStepFn};
 
 /// The wasm platform's native modules, registered once at init before the
@@ -433,8 +429,15 @@ struct HeapInstance {
 }
 
 /// The vtable of a native module built by `new` on its own heap and stepped
-/// by `step`.
-const fn heap_native(new: NativeNewFn, step: ModuleStepFn) -> NativeVtable {
+/// by `step`. `state_bytes` is the native's declared state
+/// (`abi::platform::native::wasm::<name>::STATE_BYTES`), the figure the build
+/// charges it; a declaration that cannot hold a [`HeapInstance`] fails the
+/// build of the static that names it.
+const fn heap_native(new: NativeNewFn, step: ModuleStepFn, state_bytes: u32) -> NativeVtable {
+    assert!(
+        state_bytes as usize >= core::mem::size_of::<HeapInstance>(),
+        "a heap native's declared state holds its instance record"
+    );
     NativeVtable {
         new,
         step,
@@ -442,20 +445,23 @@ const fn heap_native(new: NativeNewFn, step: ModuleStepFn) -> NativeVtable {
         flush: None,
         isr_entry: None,
         drop: Some(release_heap_instance),
-        state_size: core::mem::size_of::<HeapInstance>() as u32,
+        state_size: state_bytes,
     }
 }
 
-/// Heap bytes for an instance that allocates one `S` and nothing else: the
-/// struct plus the heap's block header and alignment slack.
+/// Heap bytes an instance that allocates one `S` and nothing else needs: the
+/// struct plus the heap's block header and alignment slack. Such a native's
+/// declared heap seat (`HEAP_SEAT`) is asserted to hold it.
 const fn heap_for<S>() -> usize {
     core::mem::size_of::<S>() + 32
 }
 
-/// Seat a module heap of `heap_bytes` for `slot`, build the instance on it
-/// with `build` (which allocates through the slot's heap and answers null
-/// when it cannot), and record both in `state`. `0`, or `ENOMEM` with
-/// nothing kept.
+/// Seat a module heap for `slot`, sized by the native's seat rule `seat`
+/// (its `HEAP_SEAT`) for its `params` — the figure the build charges it
+/// (`fluxor_contracts::state_arena::heap_seat_bytes`) — build the instance on
+/// it with `build` (which allocates through the slot's heap and answers null
+/// when it cannot), and record both in `state`. `0`, or `ENOMEM` with nothing
+/// kept.
 ///
 /// # Safety
 /// `state` is the zeroed arena state of a [`heap_native`] instance, and the
@@ -463,9 +469,14 @@ const fn heap_for<S>() -> usize {
 unsafe fn seat_heap_instance(
     state: *mut u8,
     slot: usize,
-    heap_bytes: usize,
+    seat: &[u32; 6],
+    params: &[u8],
     build: impl FnOnce() -> *mut u8,
 ) -> i32 {
+    let Some(heap_bytes) = fluxor_contracts::state_arena::heap_seat_bytes(seat, params) else {
+        log::error!("[wasm-kernel] module {slot}: its heap seat overflows");
+        return crate::kernel::sys::errno::ENOMEM;
+    };
     let Ok(arena) = loader::alloc_state(heap_bytes) else {
         log::error!("[wasm-kernel] module {slot}: no state arena for a {heap_bytes}-byte heap");
         return crate::kernel::sys::errno::ENOMEM;
@@ -519,34 +530,6 @@ fn param_bytes<'b>(params: &[u8], tag: u8, buf: &'b mut [u8]) -> &'b [u8] {
         }
     });
     &buf[..len]
-}
-
-/// In-kernel tick_source / tick_sink demo. Runs only when no bundled
-/// modules are present — mainly for the bare `firmware.wasm` smoke
-/// artifact. Real configs ship through `load_embedded_modules`.
-fn init_tick_demo() {
-    let chan = channel::channel_open(&[]);
-    if chan < 0 {
-        log_str(4, b"[wasm-kernel] channel_open failed");
-        return;
-    }
-    let params = chan.to_le_bytes();
-    if scheduler::store_native_module(0, &TICK_SOURCE, &params).is_err()
-        || scheduler::store_native_module(1, &TICK_SINK, &params).is_err()
-    {
-        log_str(4, b"[wasm-kernel] tick demo: modules not stored");
-        return;
-    }
-
-    // SAFETY: MODULE_COUNT mutated once at boot under single-threaded
-    // wasm runtime; init_tick_demo is the only writer in this path.
-    unsafe {
-        MODULE_COUNT = 2;
-    }
-    log_str(
-        2,
-        b"[wasm-kernel] tick demo: 2 native modules (tick_source -> tick_sink)",
-    );
 }
 
 /// Bytes the bundle tool wrote into the modules and config blobs: zero for
@@ -633,13 +616,10 @@ pub extern "C" fn kernel_init() -> i32 {
 
     // Build the graph the embedded blobs (rewritten in-place by the
     // bundle tool when building a `<config>.wasm`) compose. A bare
-    // `firmware.wasm` carries none, and falls back to the in-kernel
-    // tick demo so the smoke artifact still exercises scheduler
-    // dispatch and channel IPC.
+    // `firmware.wasm` carries none: it says so and idles.
     let (modules_used, config_used) = embedded_lens();
     if modules_used == 0 || config_used == 0 {
-        log_str(2, b"[wasm-kernel] no bundled modules; running tick demo");
-        init_tick_demo();
+        log_str(2, b"[wasm-kernel] no bundled graph; idle");
     } else {
         // SAFETY: single-threaded wasm boot; runs once at init.
         let module_count = unsafe { load_embedded_modules() };
@@ -875,121 +855,6 @@ pub extern "C" fn kernel_config_blob_capacity() -> u32 {
     EMBEDDED_CONFIG_BLOB.capacity
 }
 
-// ── tick_source / tick_sink native modules ───────────────────────────
-//
-// Arena state of both modules:
-//   bytes 0..4:  i32 channel handle (from the params `init_tick_demo` builds)
-//   bytes 4..8:  u32 step counter
-//   bytes 8..16: u64 first-tick timestamp from host_now_us (LE)
-
-const REPORT_INTERVAL: u32 = 60;
-
-/// Bytes of a tick module's arena state.
-const TICK_STATE_SIZE: u32 = 16;
-
-/// The demo's source: one tick count per step onto its channel.
-static TICK_SOURCE: NativeVtable = NativeVtable {
-    new: tick_new,
-    step: tick_source_step,
-    refill: None,
-    flush: None,
-    isr_entry: None,
-    drop: None,
-    state_size: TICK_STATE_SIZE,
-};
-
-/// The demo's sink: drains the channel and reports every
-/// `REPORT_INTERVAL` messages.
-static TICK_SINK: NativeVtable = NativeVtable {
-    new: tick_new,
-    step: tick_sink_step,
-    refill: None,
-    flush: None,
-    isr_entry: None,
-    drop: None,
-    state_size: TICK_STATE_SIZE,
-};
-
-/// Both tick modules: the params are the channel handle, 4 bytes LE.
-///
-/// # Safety
-/// `state` is `TICK_STATE_SIZE` zeroed bytes, exclusively the constructor's.
-unsafe fn tick_new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
-    let Some(chan) = init.params.get(..4) else {
-        return crate::kernel::sys::errno::EINVAL;
-    };
-    // SAFETY: the first 4 of the state's `TICK_STATE_SIZE` bytes.
-    unsafe { core::ptr::copy_nonoverlapping(chan.as_ptr(), state, 4) };
-    0
-}
-
-/// # Safety
-/// `state` is this module's own arena state, exclusively the step's for
-/// its duration.
-unsafe extern "C" fn tick_source_step(state: *mut u8) -> i32 {
-    // SAFETY: state is the module's 16-byte arena state; we read the
-    // channel handle from [0..4] and the tick counter from [4..8].
-    unsafe {
-        let chan = core::ptr::read_unaligned(state as *const i32);
-        let counter_ptr = state.add(4) as *mut u32;
-        let mut ticks = core::ptr::read_unaligned(counter_ptr);
-        ticks = ticks.wrapping_add(1);
-        core::ptr::write_unaligned(counter_ptr, ticks);
-
-        // Emit the tick counter as a 4-byte LE message. The sink reads
-        // it back and counts received messages.
-        let bytes = ticks.to_le_bytes();
-        let _ = channel::channel_write(chan, bytes.as_ptr(), 4);
-    }
-    0
-}
-
-/// # Safety
-/// `state` is this module's own arena state, exclusively the step's for
-/// its duration.
-unsafe extern "C" fn tick_sink_step(state: *mut u8) -> i32 {
-    // SAFETY: state is the module's 16-byte arena state; we read the
-    // channel handle from [0..4], counter from [4..8], timestamp from [8..16].
-    unsafe {
-        let chan = core::ptr::read_unaligned(state as *const i32);
-        let counter_ptr = state.add(4) as *mut u32;
-        let ts_ptr = state.add(8) as *mut u64;
-
-        // Drain any messages currently readable.
-        loop {
-            let mut buf = [0u8; 4];
-            let n = channel::channel_read(chan, buf.as_mut_ptr(), 4);
-            if n <= 0 {
-                break;
-            }
-
-            let mut received = core::ptr::read_unaligned(counter_ptr);
-            if received == 0 {
-                core::ptr::write_unaligned(ts_ptr, host_now_us());
-            }
-            received = received.wrapping_add(1);
-            core::ptr::write_unaligned(counter_ptr, received);
-
-            if received.is_multiple_of(REPORT_INTERVAL) {
-                let first_us = core::ptr::read_unaligned(ts_ptr);
-                let now_us = host_now_us();
-                let elapsed_ms = ((now_us - first_us) / 1000) as u32;
-                let last_payload = u32::from_le_bytes(buf);
-                log_fmt3(
-                    2,
-                    "[wasm_tick_sink] received=",
-                    received as u64,
-                    " last_payload=",
-                    last_payload as u64,
-                    " elapsed_ms=",
-                    elapsed_ms as u64,
-                );
-            }
-        }
-    }
-    0
-}
-
 // ── Panic handler ────────────────────────────────────────────────────
 
 #[cfg(target_arch = "wasm32")]
@@ -1035,29 +900,6 @@ pub(crate) fn log_fmt2(level: u32, label_a: &str, value_a: u64, label_b: &str, v
     pos = append_u64(&mut buf, pos, value_a);
     pos = append_str(&mut buf, pos, label_b.as_bytes());
     pos = append_u64(&mut buf, pos, value_b);
-    // SAFETY: wasm import; pass the formatted buffer pointer + populated length.
-    unsafe {
-        host_log(level, buf.as_ptr(), pos);
-    }
-}
-
-fn log_fmt3(
-    level: u32,
-    label_a: &str,
-    value_a: u64,
-    label_b: &str,
-    value_b: u64,
-    label_c: &str,
-    value_c: u64,
-) {
-    let mut buf = [0u8; 192];
-    let mut pos = 0usize;
-    pos = append_str(&mut buf, pos, label_a.as_bytes());
-    pos = append_u64(&mut buf, pos, value_a);
-    pos = append_str(&mut buf, pos, label_b.as_bytes());
-    pos = append_u64(&mut buf, pos, value_b);
-    pos = append_str(&mut buf, pos, label_c.as_bytes());
-    pos = append_u64(&mut buf, pos, value_c);
     // SAFETY: wasm import; pass the formatted buffer pointer + populated length.
     unsafe {
         host_log(level, buf.as_ptr(), pos);

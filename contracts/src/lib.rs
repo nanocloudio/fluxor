@@ -3,7 +3,8 @@
 //! Fluxor owns the wire-byte content-type table used by every module
 //! manifest, its rate classes and framing, the isolation planner, the
 //! boot memory map, the boot configuration and owner plan codecs, the
-//! channel ring sizing rule, the params TLV and the owner-log ring format. Downstream
+//! channel ring sizing rule, the state arena's carve rule, the params TLV and
+//! the owner-log ring format. Downstream
 //! implementers — sibling projects authoring module manifests, host
 //! tools — depend on this crate and use these names directly instead of
 //! duplicating them.
@@ -27,6 +28,7 @@ pub mod observability;
 pub mod owner_plan;
 pub mod params_tlv;
 pub mod ring_size;
+pub mod state_arena;
 pub mod vocabulary;
 
 // ── Content type string→u8 mapping (single source of truth) ─────────────────

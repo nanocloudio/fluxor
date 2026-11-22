@@ -470,4 +470,4 @@ impl HostNative for LinuxAudioState {
 }
 
 /// The `linux_audio` native module.
-pub static LINUX_AUDIO: NativeVtable = host_vtable::<LinuxAudioState>(linux_audio_step);
+pub static LINUX_AUDIO: NativeVtable = host_vtable::<LinuxAudioState>(linux_audio_step, native::linux_audio::STATE_BYTES);

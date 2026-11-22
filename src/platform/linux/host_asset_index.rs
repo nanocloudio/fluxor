@@ -229,4 +229,4 @@ impl HostNative for HostAssetIndexState {
 }
 
 /// The `host_asset_index` native module.
-pub static HOST_ASSET_INDEX: NativeVtable = host_vtable::<HostAssetIndexState>(host_asset_index_step);
+pub static HOST_ASSET_INDEX: NativeVtable = host_vtable::<HostAssetIndexState>(host_asset_index_step, native::host_asset_index::STATE_BYTES);

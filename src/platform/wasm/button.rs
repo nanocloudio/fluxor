@@ -88,7 +88,11 @@ unsafe extern "C" fn button_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_button` native module.
-pub static WASM_BROWSER_BUTTON: NativeVtable = super::heap_native(new, button_step);
+pub static WASM_BROWSER_BUTTON: NativeVtable = super::heap_native(
+    new,
+    button_step,
+    crate::abi::platform::native::wasm::wasm_browser_button::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -98,8 +102,18 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, super::heap_for::<ButtonState>(), || {
-            alloc_state(out_chan).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_button::HEAP_SEAT,
+            init.params,
+            || alloc_state(out_chan).cast(),
+        )
     }
 }
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_button::HEAP_SEAT[0] as usize
+        >= super::heap_for::<ButtonState>(),
+    "the declared heap seat holds the instance"
+);

@@ -510,6 +510,11 @@ fn check_code_ceiling(
 /// on a die with no console guarantee. Doing the arithmetic here turns it into a
 /// build error with the numbers shown.
 ///
+/// Every instance is charged what the kernel carves for it
+/// ([`instance_state_charge`]): a native module its declared state, a module
+/// its state (and, where the kernel commits it at load, its heap), each
+/// allocation by the arena's carve rule.
+///
 /// Modules that publish no figure are counted and named. On a target without
 /// an MMU — a microcontroller, where the arena is the die's RAM and nothing
 /// traps an overrun — an unknown figure is refused: a sum with a hole in it
@@ -557,9 +562,45 @@ fn check_state_budget(
         .filter(|m| !matches!(m, fluxor_contracts::isolation::RegionModel::Pages));
     let levels = module_levels(config, target);
     let default = graph_default_level(config, target);
+    let kernel = KernelCarves {
+        runtime: target.runtime(),
+        commits_heaps,
+        elastic: crate::capacity::kernel_elastic_heaps(target.runtime()),
+        module_host: crate::capacity::kernel_module_host(target.runtime()),
+        natives: crate::capacity::kernel_natives(target.runtime()),
+    };
+    // A gated module on a page-table target is isolated: its state and heap
+    // come from the isolated-module arena, page by page, not the state arena.
+    let iso_arena = match target.isolation.planner_model() {
+        Some(fluxor_contracts::isolation::RegionModel::Pages) => {
+            crate::capacity::kernel_iso_arena(target.runtime())
+        }
+        _ => None,
+    };
+    let mut iso_total = 0u64;
+    let mut iso_rows: Vec<(String, u64)> = Vec::new();
+    let native_names = native_names(config);
     for (hash, params) in instances {
-        // A built-in instance has no .fmod: the kernel holds its state.
         let Some(m) = by_hash.get(&hash) else {
+            // Not a module the image carries: one of the kernel's natives,
+            // charged the state its vtable takes.
+            let Some(bytes) = kernel.native(hash, params) else {
+                let name = native_names
+                    .get(&hash)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{hash:#010x}"));
+                return Err(Error::Config(format!(
+                    "`{name}` is neither a module the image carries nor a native module {}'s \
+                     kernel instantiates, so the kernel would refuse it at load",
+                    target.id
+                )));
+            };
+            total += bytes;
+            let name = native_names
+                .get(&hash)
+                .cloned()
+                .unwrap_or_else(|| format!("{hash:#010x}"));
+            rows.push((name, bytes));
             continue;
         };
         let state = m.manifest.state_bytes_64 as u64 * 64;
@@ -567,6 +608,13 @@ fn check_state_budget(
             .map(|at| u32::from_le_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]]))
             .unwrap_or(m.manifest.arena_bytes) as u64;
         let gated = levels.get(&m.name).copied().unwrap_or(default).is_gated();
+        if gated && state != 0 && iso_arena.is_some() {
+            use crate::capacity::iso_carve;
+            let bytes = iso_carve(state) + if heap > 0 { iso_carve(heap) } else { 0 };
+            iso_total += bytes;
+            iso_rows.push((m.name.clone(), bytes));
+            continue;
+        }
         let bytes = match mpu {
             Some(model) if gated && state != 0 => crate::protection::private_region_bytes(
                 m.manifest.stack_bytes_64 as u64 * 64,
@@ -576,8 +624,7 @@ fn check_state_budget(
                 model,
             ),
             _ if state == 0 => 0,
-            _ if commits_heaps => state + heap,
-            _ => state,
+            _ => kernel.module(state, heap, raw_arena(params)),
         };
         if bytes == 0 {
             unknown.push(m.name.as_str());
@@ -587,6 +634,24 @@ fn check_state_budget(
         rows.push((m.name.clone(), bytes));
     }
     rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if let Some(iso) = iso_arena.filter(|_| !iso_rows.is_empty()) {
+        iso_rows.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("Isolated-module arena ({}): {iso} B", target.id);
+        for (name, bytes) in &iso_rows {
+            println!("  {name:<20} {bytes:>9}");
+        }
+        println!("  {:<20} {iso_total:>9}", "total");
+        if iso_total > iso {
+            return Err(Error::Config(format!(
+                "graph's isolated modules need {iso_total} B of the isolated-module arena but \
+                 {}'s is {iso} B — over by {} B. Run fewer modules isolated, or raise \
+                 ISO_ARENA_SIZE (src/kernel/module/loader.rs).",
+                target.id,
+                iso_total - iso
+            )));
+        }
+    }
 
     println!(
         "State arena ({}{}): {} B",
@@ -654,6 +719,114 @@ fn check_state_budget(
         )));
     }
     Ok(())
+}
+
+/// What a target's kernel carves from the state arena when it instantiates a
+/// graph, by the arena's carve rule (`capacity::state_carve`).
+struct KernelCarves<'a> {
+    /// The target's runtime.
+    runtime: &'a str,
+    /// The kernel commits a module's heap whole at instantiation.
+    commits_heaps: bool,
+    /// The kernel grows heaps in segments, `(segments, quantum)`, committing
+    /// the first at instantiation.
+    elastic: Option<(usize, usize)>,
+    /// Every module runs through a module host taking `(state, scratch)`
+    /// from the arena in place of the module's own (wasm).
+    module_host: Option<(u64, u64)>,
+    /// The natives the kernel instantiates, `(name hash, state bytes)`.
+    natives: &'static [(u32, u32)],
+}
+
+impl KernelCarves<'_> {
+    /// A native instance of type `hash` with `params`: its vtable's state, and
+    /// the module heap it seats for its instance where it seats one. `None`
+    /// for a type the kernel has no native of.
+    fn native(&self, hash: u32, params: &[u8]) -> Option<u64> {
+        use crate::capacity::state_carve;
+        let state = self
+            .natives
+            .iter()
+            .find(|&&(h, _)| h == hash)
+            .map(|&(_, bytes)| state_carve(bytes as u64))?;
+        let seat = crate::capacity::kernel_native_seat(self.runtime, hash, params)
+            .map_or(0, state_carve);
+        Some(state + seat)
+    }
+
+    /// A module instance of `state` bytes with a heap cap of `heap` bytes,
+    /// `raw` when it declares raw arena use (params tag 0xEE: an elastic heap
+    /// committed whole at instantiation). `state` is not zero. An elastic
+    /// heap is charged the first segment it commits at instantiation; what it
+    /// grows by later is the module's own allocation, not the budget's.
+    fn module(&self, state: u64, heap: u64, raw: bool) -> u64 {
+        use crate::capacity::state_carve;
+        use fluxor_contracts::state_arena::first_heap_segment;
+        if let Some((host_state, scratch)) = self.module_host {
+            return state_carve(host_state) + state_carve(scratch);
+        }
+        let heap_carve = match self.elastic {
+            _ if heap == 0 => 0,
+            Some((segments, quantum)) => {
+                let cap = usize::try_from(heap).unwrap_or(usize::MAX);
+                let seg = if raw {
+                    first_heap_segment(cap, 1, quantum)
+                } else {
+                    first_heap_segment(cap, segments, quantum)
+                };
+                if seg == 0 {
+                    0
+                } else {
+                    state_carve(seg as u64)
+                }
+            }
+            None if self.commits_heaps => state_carve(heap),
+            None => 0,
+        };
+        state_carve(state) + heap_carve
+    }
+}
+
+/// Whether an instance's params declare raw arena use (tag 0xEE nonzero),
+/// as the kernel reads them (`scheduler::params_raw_arena`).
+fn raw_arena(params: &[u8]) -> bool {
+    if params.len() < 4 {
+        return false;
+    }
+    let mut off = if params.first() == Some(&0xFE) { 4 } else { 0 };
+    while off + 2 <= params.len() {
+        let (tag, len) = (params[off], params[off + 1] as usize);
+        off += 2;
+        if tag == 0xFF {
+            break;
+        }
+        let Some(value) = params.get(off..off + len) else {
+            return false;
+        };
+        if tag == 0xEE {
+            return value.first().is_some_and(|&b| b != 0);
+        }
+        off += len;
+    }
+    false
+}
+
+/// The graph's native instance types by name hash, for the state table's
+/// rows: every `modules:` entry's `type` (else its `name`).
+fn native_names(config: &serde_json::Value) -> std::collections::HashMap<u32, String> {
+    config
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let ty = m
+                .get("type")
+                .or_else(|| m.get("name"))
+                .and_then(|v| v.as_str())?;
+            Some((crate::hash::fnv1a_hash(ty.as_bytes()), ty.to_string()))
+        })
+        .collect()
 }
 
 /// Charge a compiled graph's channel rings against the target's buffer arena
@@ -1804,16 +1977,19 @@ mod state_budget_tests {
         let e = check_state_budget(&mods, &cfg, &one, &target)
             .unwrap_err()
             .to_string();
+        // Over by the 16 KiB, and the 8 bytes the carve adds to the state
+        // (its canary, rounded to the arena's alignment).
         assert!(
             e.contains(&format!("arena is {} B", default - 32 * 1024))
                 && e.contains("capacity envelope")
-                && e.contains("over by 16384 B"),
+                && e.contains("over by 16392 B"),
             "{e}"
         );
         // A state-arena entry is the size the kernel guarantees.
         let cfg = json!({"capacity": {"state_arena": default - 32 * 1024}});
         check_state_budget(&mods, &cfg, &one, &target).expect_err("a smaller state arena");
-        let big = [module("a", default + 8 * 1024)];
+        // Past the default, and within the larger entry with its carve.
+        let big = [module("a", default + 8 * 1024 - 64)];
         check_state_budget(&big, &json!({}), &one, &target).expect_err("past the default");
         let cfg = json!({"capacity": {"state_arena": default + 8 * 1024}});
         check_state_budget(&big, &cfg, &one, &target).expect("the entry places a larger arena");
@@ -1830,6 +2006,190 @@ mod state_budget_tests {
             .expect("one instance fits");
         check_state_budget(&mods, &json!({}), &image(&[("a", &[]), ("a", &[])]), &target)
             .expect_err("two instances do not");
+    }
+
+    fn linux() -> crate::target::TargetDescriptor {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        crate::target::load_target("linux", &root).expect("linux target")
+    }
+
+    fn wasm() -> crate::target::TargetDescriptor {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        crate::target::load_target("wasm", &root).expect("wasm target")
+    }
+
+    /// What the kernel carves for an allocation of `n` bytes.
+    fn carve(n: u32) -> u64 {
+        fluxor_contracts::state_arena::carve_bytes(n as usize).expect("carves") as u64
+    }
+
+    /// A graph of natives and a module is charged exactly what the kernel
+    /// carves for it: each native the state its vtable takes (its manifest's
+    /// `STATE_BYTES`), the module its state, each by the carve rule. An
+    /// envelope of exactly that admits the graph; a byte less is refused.
+    #[test]
+    fn natives_and_modules_are_charged_what_the_kernel_carves() {
+        use fluxor_abi::platform::native::linux::{cli_in, cli_out};
+        let target = linux();
+        let mods = [module("sensor", 320)];
+        let graph = image(&[("cli_in", &[]), ("sensor", &[]), ("cli_out", &[])]);
+        let need = carve(cli_in::STATE_BYTES) + carve(320) + carve(cli_out::STATE_BYTES);
+        assert_eq!(need, 72 + 328 + 72);
+        let cfg = json!({
+            "modules": [{"name": "cli_in"}, {"name": "sensor"}, {"name": "cli_out"}],
+            "capacity": {"state_arena": need},
+        });
+        check_state_budget(&mods, &cfg, &graph, &target).expect("exactly the carves fits");
+        let cfg = json!({"capacity": {"state_arena": need - 1}});
+        let e = check_state_budget(&mods, &cfg, &graph, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&format!("needs {need} B")) && e.contains("over by 1 B"), "{e}");
+    }
+
+    /// A type that is neither a module of the image nor one of the target's
+    /// natives is refused by name: the kernel would refuse it at load.
+    #[test]
+    fn an_unknown_native_is_refused() {
+        let target = linux();
+        let cfg = json!({"modules": [{"name": "no_such_native"}]});
+        let e = check_state_budget(&[module("a", 64)], &cfg, &image(&[("a", &[]), ("no_such_native", &[])]), &target)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`no_such_native`"), "{e}");
+    }
+
+    /// On an elastic profile the kernel commits a heap's first segment at
+    /// instantiation (`first_heap_segment` of its cap), and the whole cap for
+    /// a module that declares raw arena use (params tag 0xEE); that is what
+    /// is charged beside the state. Growth past the first segment is not.
+    #[test]
+    fn an_elastic_heap_is_charged_its_first_segment() {
+        use fluxor_contracts::state_arena::first_heap_segment;
+        let target = linux();
+        let (segments, quantum) =
+            crate::capacity::kernel_elastic_heaps("linux").expect("linux heaps are elastic");
+        let cap = 1024 * 1024;
+        let first = first_heap_segment(cap as usize, segments, quantum) as u32;
+        assert_eq!(first, 64 * 1024, "a 1 MiB cap commits one 64 KiB quantum");
+        let mods = [module_with_heap("a", 128, cap)];
+        let plain = image(&[("a", &[])]);
+        let raw: &[u8] = &[0xFE, 0x01, 3, 0, 0xEE, 1, 1, 0xFF, 0x00];
+        let raw = image(&[("a", raw)]);
+        for (graph, need) in [
+            (&plain, carve(128) + carve(first)),
+            (&raw, carve(128) + carve(cap)),
+        ] {
+            let fits = json!({"capacity": {"state_arena": need}});
+            check_state_budget(&mods, &fits, graph, &target).expect("fits its carves");
+            let short = json!({"capacity": {"state_arena": need - 1}});
+            check_state_budget(&mods, &short, graph, &target).expect_err("a byte short");
+        }
+    }
+
+    /// A type that sizes its heap from its params (`heap_per_param`) takes
+    /// its tables at construction as one block near the cap, so the composer
+    /// marks every instance for a whole-cap commit (tag 0xEE) and the build
+    /// charges the whole cap, not a first segment.
+    #[test]
+    fn a_heap_per_param_module_is_charged_its_whole_cap() {
+        use crate::manifest::{HeapParamTerm, HeapPerParam};
+        let target = linux();
+        let manifest = Manifest {
+            state_bytes_64: 2,
+            arena_bytes: 64,
+            heap_per_param: Some(HeapPerParam {
+                params: vec![HeapParamTerm {
+                    tag: 2,
+                    default: 2,
+                    bytes_each: 387_224,
+                }],
+                base: Some(64),
+            }),
+            ..Default::default()
+        };
+        let params = crate::config::insert_heap_tags(
+            Vec::new(),
+            &json!({}),
+            "tc",
+            Some(&manifest),
+            &crate::config::HeapPlan::default(),
+        )
+        .expect("heap tags");
+        assert!(params.windows(3).any(|w| w == [0xEE, 1, 1]), "marked 0xEE: {params:x?}");
+        let cap: u32 = 64 + 2 * 387_224;
+        assert!(params.windows(6).any(|w| w[..2] == [0xEF, 4] && w[2..] == cap.to_le_bytes()));
+        let mods = [ModuleInfo {
+            name: "tc".into(),
+            name_hash: crate::hash::fnv1a_hash(b"tc"),
+            module_type: 0,
+            mailbox_safe: false,
+            in_place_writer: false,
+            drain_capable: false,
+            schema: None,
+            manifest,
+            data: Vec::new(),
+        }];
+        let graph = image(&[("tc", &params)]);
+        let need = carve(128) + carve(cap & !7);
+        let fits = json!({"capacity": {"state_arena": need}});
+        check_state_budget(&mods, &fits, &graph, &target).expect("the whole cap fits");
+        let short = json!({"capacity": {"state_arena": need - 1}});
+        check_state_budget(&mods, &short, &graph, &target).expect_err("a byte short");
+    }
+
+    /// On wasm every module runs through the module host, which carves its
+    /// own state and a scratch heap per module; the module's state lives in
+    /// its own linear memory. Natives are charged their declared state and
+    /// the heap they seat, sized from the instance's own params.
+    #[test]
+    fn wasm_charges_the_module_host_and_natives() {
+        use fluxor_abi::platform::native::wasm::wasm_browser_canvas as canvas;
+        let target = wasm();
+        let (host, scratch) =
+            crate::capacity::kernel_module_host("wasm").expect("wasm hosts its modules");
+        let mods = [module_with_heap("a", 4096, 8192)];
+        // width 320 (tag 10), height 200 (tag 11).
+        let wh: &[u8] = &[0xFE, 0x01, 10, 0, 10, 2, 0x40, 0x01, 11, 2, 0xC8, 0x00, 0xFF, 0x00];
+        let graph = image(&[("a", &[]), ("wasm_browser_canvas", wh)]);
+        let [base, per_pixel, ..] = canvas::HEAP_SEAT;
+        let seat = base + per_pixel * 320 * 200;
+        assert_eq!(
+            fluxor_contracts::state_arena::heap_seat_bytes(&canvas::HEAP_SEAT, wh),
+            Some(seat as usize)
+        );
+        let need = carve(host as u32)
+            + carve(scratch as u32)
+            + carve(canvas::STATE_BYTES)
+            + carve(seat);
+        let cfg = json!({"capacity": {"state_arena": need}});
+        check_state_budget(&mods, &cfg, &graph, &target).expect("exactly the carves fits");
+        let cfg = json!({"capacity": {"state_arena": need - 1}});
+        check_state_budget(&mods, &cfg, &graph, &target).expect_err("a byte short");
+    }
+
+    /// On a page-table target an isolated module's state and heap come from
+    /// the isolated-module arena, whole pages each, and nothing of it from
+    /// the state arena; past that arena the graph is refused.
+    #[test]
+    fn isolated_modules_are_charged_to_the_isolated_arena() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let target = crate::target::load_target("bcm2712", &root).expect("bcm2712 target");
+        let iso = crate::capacity::kernel_iso_arena("bcm2712").expect("an isolated arena");
+        let mods = [module_with_heap("a", 4096, 8192), module("b", 320)];
+        let graph = image(&[("a", &[]), ("b", &[])]);
+        let cfg = json!({
+            "modules": [{"name": "a", "protection": "contained"}, {"name": "b"}],
+            "capacity": {"state_arena": carve(320)},
+        });
+        check_state_budget(&mods, &cfg, &graph, &target)
+            .expect("the isolated module takes nothing of the state arena");
+        let big = [module_with_heap("a", iso, 0), module("b", 320)];
+        let e = check_state_budget(&big, &cfg, &graph, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("isolated-module arena"), "{e}");
+        assert_eq!(crate::capacity::iso_carve(4096) + crate::capacity::iso_carve(8192), 8192 + 12288);
     }
 
     /// RP commits a heap whole at instantiation, so the cap is charged beside

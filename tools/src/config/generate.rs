@@ -2366,13 +2366,13 @@ const WORKLOAD_NODE_KEYS: &[&str] = &[
 
 /// A workload module's or a fan's `heap:` keys as params TLV entries (0xF8
 /// zero on free, 0xF9 fault on alloc failure, 0xFA canary, 0xEF the
-/// instance's heap cap, 0xEE raw arena use), with the node graph's
+/// instance's heap cap, 0xEE a heap committed whole: `declares_raw_arena`), with the node graph's
 /// validation and encoding, inserted before the TLV's end marker. A module
 /// with no schema params gets a TLV of its own for them. The heap cap is the
 /// node graph's too: `heap.arena_bytes`, else what the type's `[capacities]
 /// heap_from_params`, `heap_per_demand` and `heap_per_param` rules derive
 /// (`instance_heap_cap`).
-fn insert_heap_tags(
+pub(crate) fn insert_heap_tags(
     params: Vec<u8>,
     module: &Value,
     mname: &str,
@@ -2396,7 +2396,7 @@ fn insert_heap_tags(
         entries.extend_from_slice(&[0xEF, 4]);
         entries.extend_from_slice(&n.to_le_bytes());
     }
-    if flag("raw_arena").and_then(Value::as_bool) == Some(true) {
+    if declares_raw_arena(module, manifest) {
         entries.extend_from_slice(&[0xEE, 1, 1]);
     }
     if entries.is_empty() {

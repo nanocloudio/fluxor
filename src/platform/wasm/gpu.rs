@@ -231,9 +231,11 @@ pub(crate) struct GpuState {
 
 const CMD_BUF_SIZE: u32 = 64 * 1024; // 64KB command buffer
 
-pub(crate) fn heap_size_for(_width: u16, _height: u16) -> usize {
-    core::mem::size_of::<GpuState>() + CMD_BUF_SIZE as usize + 256
-}
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_gpu::HEAP_SEAT[0] as usize
+        >= core::mem::size_of::<GpuState>() + CMD_BUF_SIZE as usize + 256,
+    "the declared heap seat holds the state and the command buffer"
+);
 
 unsafe fn alloc_state(in_chan: i32, width: u16, height: u16) -> *mut GpuState {
     let table = syscalls::get_syscall_table();
@@ -673,7 +675,11 @@ unsafe extern "C" fn gpu_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_gpu` native module.
-pub static WASM_BROWSER_GPU: NativeVtable = super::heap_native(new, gpu_step);
+pub static WASM_BROWSER_GPU: NativeVtable = super::heap_native(
+    new,
+    gpu_step,
+    crate::abi::platform::native::wasm::wasm_browser_gpu::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -690,8 +696,12 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, heap_size_for(width, height), || {
-            alloc_state(in_chan, width, height).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_gpu::HEAP_SEAT,
+            init.params,
+            || alloc_state(in_chan, width, height).cast(),
+        )
     }
 }

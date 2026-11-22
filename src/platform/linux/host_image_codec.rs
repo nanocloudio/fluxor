@@ -282,4 +282,4 @@ impl HostNative for HostImageState {
 
 /// The `host_image_codec` native module.
 #[cfg(feature = "host-image")]
-pub static HOST_IMAGE_CODEC: NativeVtable = host_vtable::<HostImageState>(host_image_step);
+pub static HOST_IMAGE_CODEC: NativeVtable = host_vtable::<HostImageState>(host_image_step, native::host_image_codec::STATE_BYTES);

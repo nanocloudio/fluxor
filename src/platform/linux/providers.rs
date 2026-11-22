@@ -2653,7 +2653,10 @@ impl super::builtin_params::HostNative for LinuxNetState {
 
 /// The `linux_net` native module.
 pub static LINUX_NET: crate::kernel::exec::scheduler::NativeVtable =
-    super::builtin_params::host_vtable::<LinuxNetState>(linux_net_step);
+    super::builtin_params::host_vtable::<LinuxNetState>(
+        linux_net_step,
+        crate::abi::platform::native::linux::linux_net::STATE_BYTES,
+    );
 
 impl Drop for LinuxNetState {
     /// The instance's sockets and epoll set close with it, so a rebuilt

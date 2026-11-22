@@ -1,6 +1,10 @@
 version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
+# An instance's state in the kernel's arena, in 64-byte units: the pointer
+# to its host instance. `fluxor abi-regen` emits it as `STATE_BYTES`, which
+# the kernel's vtable and the build's state-arena charge both read.
+state_bytes_64 = 1
 
 # Host stdout/stderr sink + exit-code latch.
 # exit_in takes [code: i32 LE]; absent wiring means exit 0 on completion.

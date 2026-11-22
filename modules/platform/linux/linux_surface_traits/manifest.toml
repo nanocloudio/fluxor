@@ -1,6 +1,10 @@
 version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
+# An instance's state in the kernel's arena, in 64-byte units: the pointer
+# to its host instance. `fluxor abi-regen` emits it as `STATE_BYTES`, which
+# the kernel's vtable and the build's state-arena charge both read.
+state_bytes_64 = 1
 
 # Linux Surface Traits authority — the Linux implementation of the runtime
 # environment plane, publishing the same wire shape as the bare-metal panel

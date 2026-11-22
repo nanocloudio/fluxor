@@ -171,8 +171,8 @@ pub(crate) struct GpuComputeState {
     awaiting: *mut Await,
 }
 
-/// Heap the module asks the runtime for.
-pub(crate) fn heap_size_for() -> usize {
+/// Heap the module needs: its manifest's `HEAP_SEAT` holds it.
+const fn heap_need() -> usize {
     core::mem::size_of::<GpuComputeState>()
         + CMD_BUF
         + RING_BYTES
@@ -189,6 +189,10 @@ pub(crate) fn heap_size_for() -> usize {
         + MAX_FENCES * core::mem::size_of::<Await>()
         + 4096
 }
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_compute::HEAP_SEAT[0] as usize >= heap_need(),
+    "the declared heap seat holds the module's tables and buffers"
+);
 
 // The widths `GpuDevice::new` checks at runtime, asserted here instead: this
 // provider builds its device with `restore`, and a compile-time constant is a
@@ -1023,7 +1027,11 @@ fn encode_exec(
 }
 
 /// The `wasm_browser_compute` native module.
-pub static WASM_BROWSER_COMPUTE: NativeVtable = super::heap_native(new, gpu_compute_step);
+pub static WASM_BROWSER_COMPUTE: NativeVtable = super::heap_native(
+    new,
+    gpu_compute_step,
+    crate::abi::platform::native::wasm::wasm_browser_compute::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -1034,8 +1042,12 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, heap_size_for(), || {
-            alloc_state(in_chan, out_chan).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_compute::HEAP_SEAT,
+            init.params,
+            || alloc_state(in_chan, out_chan).cast(),
+        )
     }
 }

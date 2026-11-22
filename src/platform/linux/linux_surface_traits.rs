@@ -252,4 +252,4 @@ impl HostNative for LinuxSurfaceTraitsState {
 }
 
 /// The `linux_surface_traits` native module.
-pub static LINUX_SURFACE_TRAITS: NativeVtable = host_vtable::<LinuxSurfaceTraitsState>(linux_surface_traits_step);
+pub static LINUX_SURFACE_TRAITS: NativeVtable = host_vtable::<LinuxSurfaceTraitsState>(linux_surface_traits_step, native::linux_surface_traits::STATE_BYTES);

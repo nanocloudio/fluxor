@@ -99,7 +99,11 @@ unsafe extern "C" fn probe_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_surface_traits_probe` native module.
-pub static WASM_BROWSER_SURFACE_TRAITS_PROBE: NativeVtable = super::heap_native(new, probe_step);
+pub static WASM_BROWSER_SURFACE_TRAITS_PROBE: NativeVtable = super::heap_native(
+    new,
+    probe_step,
+    crate::abi::platform::native::wasm::wasm_browser_surface_traits_probe::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -109,8 +113,18 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, super::heap_for::<ProbeState>(), || {
-            alloc_state(in_chan).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_surface_traits_probe::HEAP_SEAT,
+            init.params,
+            || alloc_state(in_chan).cast(),
+        )
     }
 }
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_surface_traits_probe::HEAP_SEAT[0] as usize
+        >= super::heap_for::<ProbeState>(),
+    "the declared heap seat holds the instance"
+);

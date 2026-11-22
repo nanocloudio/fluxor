@@ -1,6 +1,10 @@
 version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
+# An instance's state in the kernel's arena, in 64-byte units: the pointer
+# to its host instance. `fluxor abi-regen` emits it as `STATE_BYTES`, which
+# the kernel's vtable and the build's state-arena charge both read.
+state_bytes_64 = 1
 
 # Host argv + stdin source. argv is one record —
 # everything after `--` in the process's own argv, NUL-separated. stdin bytes

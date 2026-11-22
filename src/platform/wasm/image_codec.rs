@@ -124,12 +124,16 @@ pub(crate) struct ImageCodecState {
     pub encoded_cap: u32,
 }
 
-/// The per-module heap the constructor seats: the State struct plus
-/// the encoded buffer plus a small overhead. It comes out of the
-/// state arena, so this is the one knob that sizes the module.
-pub(crate) fn heap_size_for(max_bytes: u32) -> usize {
-    core::mem::size_of::<ImageCodecState>() + max_bytes as usize + 256
-}
+/// The per-module heap the constructor seats, the manifest's `HEAP_SEAT`:
+/// the State struct plus a small overhead, plus the encoded buffer of
+/// `max_bytes`. It comes out of the state arena, so `max_bytes` is the one
+/// knob that sizes the module.
+const SEAT: [u32; 6] = crate::abi::platform::native::wasm::wasm_browser_image_codec::HEAP_SEAT;
+const _: () = assert!(
+    SEAT[0] as usize >= core::mem::size_of::<ImageCodecState>() + 256
+        && SEAT[4] == tags::TAG_MAX_BYTES as u32,
+    "the declared heap seat holds the state and the encoded buffer"
+);
 
 unsafe fn alloc_state(
     in_chan: i32,
@@ -329,7 +333,11 @@ unsafe fn outputting_step(st: &mut ImageCodecState) -> i32 {
 }
 
 /// The `wasm_browser_image_codec` native module.
-pub static WASM_BROWSER_IMAGE_CODEC: NativeVtable = super::heap_native(new, step);
+pub static WASM_BROWSER_IMAGE_CODEC: NativeVtable = super::heap_native(
+    new,
+    step,
+    crate::abi::platform::native::wasm::wasm_browser_image_codec::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -337,7 +345,7 @@ pub static WASM_BROWSER_IMAGE_CODEC: NativeVtable = super::heap_native(new, step
 unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     let mut width = 0u16;
     let mut height = 0u16;
-    let mut max_bytes = 8u32 * 1024 * 1024;
+    let mut max_bytes = SEAT[5];
     super::walk_tlv(init.params, |tag, value| match tag {
         tags::TAG_WIDTH => width = super::tlv_u32(value) as u16,
         tags::TAG_HEIGHT => height = super::tlv_u32(value) as u16,
@@ -349,8 +357,12 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, heap_size_for(max_bytes), || {
-            alloc_state(in_chan, out_chan, width, height, max_bytes).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_image_codec::HEAP_SEAT,
+            init.params,
+            || alloc_state(in_chan, out_chan, width, height, max_bytes).cast(),
+        )
     }
 }

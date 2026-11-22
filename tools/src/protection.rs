@@ -197,7 +197,7 @@ pub fn private_region_bytes(
     model: fluxor_contracts::isolation::RegionModel,
 ) -> u64 {
     let stack = stack.next_multiple_of(8) + frame + PARAMS_BUDGET + 64;
-    let state = (state + 4).next_multiple_of(8);
+    let state = crate::capacity::state_carve(state);
     let total = stack + state + arena.next_multiple_of(8);
     fluxor_contracts::isolation::private_region_shape(total, model).0
 }

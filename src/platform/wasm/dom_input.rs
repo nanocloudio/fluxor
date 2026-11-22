@@ -97,7 +97,11 @@ unsafe extern "C" fn dom_input_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_dom_input` native module.
-pub static WASM_BROWSER_DOM_INPUT: NativeVtable = super::heap_native(new, dom_input_step);
+pub static WASM_BROWSER_DOM_INPUT: NativeVtable = super::heap_native(
+    new,
+    dom_input_step,
+    crate::abi::platform::native::wasm::wasm_browser_dom_input::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -107,8 +111,18 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, super::heap_for::<DomInputState>(), || {
-            alloc_state(out_chan).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_dom_input::HEAP_SEAT,
+            init.params,
+            || alloc_state(out_chan).cast(),
+        )
     }
 }
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_dom_input::HEAP_SEAT[0] as usize
+        >= super::heap_for::<DomInputState>(),
+    "the declared heap seat holds the instance"
+);

@@ -12,14 +12,9 @@ use crate::kernel::exec::scheduler::{self, NativeInit, NativeVtable};
 use crate::kernel::module::loader::{self, LoadedModule, ModuleHeader};
 use crate::kernel::sys::errno;
 
-/// Kernel-side scratch heap each hosted module gets. The host shim routes
-/// every PIC syscall that crosses linear-memory boundaries
-/// (`channel_read`/`channel_write`/`provider_call`) through
-/// `kernel_heap_alloc`, which allocates on the module's heap. 256 KiB so a
-/// single read up to 64 KiB (e.g. media_loader's snapshot poll) fits after
-/// the heap's per-block header and alignment slack, with room for a few
-/// in-flight syscalls per step.
-const KERNEL_SCRATCH_BYTES: usize = 256 * 1024;
+/// Kernel-side scratch heap each hosted module gets (the profile's
+/// `MODULE_HOST_SCRATCH_BYTES`).
+const KERNEL_SCRATCH_BYTES: usize = crate::kernel::config::MODULE_HOST_SCRATCH_BYTES;
 
 /// Arena state of a hosted module: its host instance and its scratch heap's
 /// arena. The module keeps its own state in its own linear memory.
@@ -29,7 +24,14 @@ struct Hosted {
     scratch: *mut u8,
 }
 
-/// The host every loader-resolved module instantiates through.
+const _: () = assert!(
+    crate::kernel::config::MODULE_HOST_STATE_BYTES >= core::mem::size_of::<Hosted>(),
+    "the module host's declared state holds a Hosted"
+);
+
+/// The host every loader-resolved module instantiates through. Its state is
+/// the profile's `MODULE_HOST_STATE_BYTES`, the figure the build charges each
+/// hosted module.
 pub static WASM_MODULE_HOST: NativeVtable = NativeVtable {
     new,
     step,
@@ -37,7 +39,7 @@ pub static WASM_MODULE_HOST: NativeVtable = NativeVtable {
     flush: None,
     isr_entry: None,
     drop: Some(release),
-    state_size: core::mem::size_of::<Hosted>() as u32,
+    state_size: crate::kernel::config::MODULE_HOST_STATE_BYTES as u32,
 };
 
 /// The module whose code payload starts at `code`.

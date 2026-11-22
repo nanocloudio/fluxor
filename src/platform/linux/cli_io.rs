@@ -339,7 +339,7 @@ impl HostNative for CliInState {
 }
 
 /// The `cli_in` native module.
-pub static CLI_IN: NativeVtable = host_vtable::<CliInState>(cli_in_step);
+pub static CLI_IN: NativeVtable = host_vtable::<CliInState>(cli_in_step, native::cli_in::STATE_BYTES);
 
 // ── host stream I/O ─────────────────────────────────────────────────────────
 //
@@ -579,4 +579,4 @@ impl HostNative for CliOutState {
 }
 
 /// The `cli_out` native module.
-pub static CLI_OUT: NativeVtable = host_vtable::<CliOutState>(cli_out_step);
+pub static CLI_OUT: NativeVtable = host_vtable::<CliOutState>(cli_out_step, native::cli_out::STATE_BYTES);

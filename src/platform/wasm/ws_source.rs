@@ -156,7 +156,11 @@ unsafe extern "C" fn ws_source_step(state: *mut u8) -> i32 {
 }
 
 /// The `wasm_browser_ws_source` native module.
-pub static WASM_BROWSER_WS_SOURCE: NativeVtable = super::heap_native(new, ws_source_step);
+pub static WASM_BROWSER_WS_SOURCE: NativeVtable = super::heap_native(
+    new,
+    ws_source_step,
+    crate::abi::platform::native::wasm::wasm_browser_ws_source::STATE_BYTES,
+);
 
 /// # Safety
 /// `state` is the instance's zeroed arena state; the current module is
@@ -168,8 +172,18 @@ unsafe fn new(state: *mut u8, init: &NativeInit<'_>) -> i32 {
     // SAFETY: the constructor's own contract; the instance is built on
     // the slot's heap, which the current module allocates through.
     unsafe {
-        super::seat_heap_instance(state, init.slot, super::heap_for::<WsSourceState>(), || {
-            alloc_state(out_chan, url).cast()
-        })
+        super::seat_heap_instance(
+            state,
+            init.slot,
+            &crate::abi::platform::native::wasm::wasm_browser_ws_source::HEAP_SEAT,
+            init.params,
+            || alloc_state(out_chan, url).cast(),
+        )
     }
 }
+
+const _: () = assert!(
+    crate::abi::platform::native::wasm::wasm_browser_ws_source::HEAP_SEAT[0] as usize
+        >= super::heap_for::<WsSourceState>(),
+    "the declared heap seat holds the instance"
+);
