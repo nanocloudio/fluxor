@@ -22,10 +22,10 @@ fn main() {
         .nth(1)
         .expect("usage: emit_plan <out-path>");
 
-    let mut workload_uid = [0u8; 16];
-    workload_uid[0] = 0xaa;
+    let mut owner_uid = [0u8; 16];
+    owner_uid[0] = 0xaa;
     let workload = WorkloadDesired {
-        workload_uid,
+        owner_uid,
         namespace: "default".into(),
         name: "demo".into(),
         workload_digest: [0u8; 32],

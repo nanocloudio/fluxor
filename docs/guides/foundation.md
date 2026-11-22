@@ -58,8 +58,8 @@ The foundation layer covers:
 - **Media and session orchestration** (`format` for audio format
   conversion and resampling, control-plane bridges)
 
-Each domain follows the same graph composition model and the same
-scheduler semantics; there is no special-case API for any of these.
+Every area follows the same graph composition model and the same
+scheduler semantics; there is no special-case API for any of them.
 
 ## Contract usage
 
@@ -69,8 +69,8 @@ contract surfaces from drivers:
 - channels and buffers for data movement
 - timers and events for coordination
 - net_proto frames for networking (see [../architecture/network.md](../architecture/network.md))
-- block I/O channels for storage
-- filesystem (`FS`) contract for VFS-style access
+- the storage contracts (`storage.block`, `fs`, `storage.namespace`,
+  `storage.object`; see [../architecture/storage_capability_surface.md](../architecture/storage_capability_surface.md))
 
 See [../architecture/abi_layers.md](../architecture/abi_layers.md)
 for the full contract inventory.

@@ -20,8 +20,10 @@ use fluxor_rt::*;
 
 /// Bytes allocated per step.
 const CHUNK: u32 = 16 * 1024;
-/// The heap's cap. Elastic: the kernel commits it a segment at a time, the
-/// first `ARENA_BYTES >> 7`, each later one doubling what is committed.
+/// The heap's cap, which its graph grants (`heap: { arena_bytes: 33554432 }`)
+/// above the one chunk it declares: the kernel commits the declared chunk at
+/// instantiation and the rest a segment at a time, each doubling what is
+/// committed.
 const ARENA_BYTES: u32 = 32 * 1024 * 1024;
 /// Chunks held at most: the cap's worth.
 const HELD_MAX: usize = (ARENA_BYTES / CHUNK) as usize;
@@ -65,7 +67,7 @@ fn put_dec(line: &mut [u8], n: &mut usize, mut v: u32) {
     }
 }
 
-fluxor_rt::module_facts! { state: State, arena: ARENA_BYTES }
+fluxor_rt::module_facts! { state: State, arena: CHUNK }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]

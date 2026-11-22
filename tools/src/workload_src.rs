@@ -3,7 +3,7 @@
 //! A thin TOML source manifest — non-derivable fields only — from which
 //! `fluxor build <workload.toml>` emits the package format the agent
 //! consumes (`workload.json` + `resources.json` + `graph.yaml`), plus the
-//! per-target node image (`graph.img`) the run path consumes. Emitting a
+//! per-target node image (`node.img`) the run path consumes. Emitting a
 //! package calls the same `build_one` a plain `fluxor build <graph>` calls,
 //! so a package's blobs are byte-for-byte what building the graph directly
 //! produces.
@@ -26,11 +26,11 @@
 //! target/fluxor/<name>/
 //!   workload.json                    # all implementations
 //!   <target>/{workload.json, graph.yaml, resources.json,   # flat triple —
-//!             graph.img}                                   # agent-committable
+//!             node.img}                                   # agent-committable
 //! ```
 //!
 //! `workload.json` is duplicated into each target dir so that dir is
-//! directly consumable by `fluxor agent commit --bundle`, which expects the
+//! directly consumable by `fluxor agent commit --package`, which expects the
 //! flat triple in one directory. The package pins each artifact by sha256 in
 //! `workload.json`, and every consumer re-hashes the files it reads and
 //! refuses a mismatch.
@@ -98,7 +98,7 @@ fn sum_module_state_bytes(modules_dir: &Path, module_types: &[String]) -> (u64, 
 /// The facts of a package graph. The graph is the expanded one
 /// ([`package_graph`]): facts read from a graph that still includes stacks
 /// would miss their modules, so one is refused. `module_types` leaves out
-/// kernel built-ins, which every runtime carries and no package pins.
+/// native modules, which every runtime carries and no package pins.
 fn graph_facts(template: &str) -> Result<GraphFacts> {
     let doc = params::parse_graph(template).map_err(Error::Config)?.doc;
     if includes_stacks(&doc) {
@@ -126,7 +126,7 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
         if first_module.is_none() {
             first_module = Some(ty.to_string());
         }
-        if crate::modules::is_builtin_module(ty) {
+        if crate::modules::is_native_module(ty) {
             continue;
         }
         // The artifact, not the type: a non-default variant builds as
@@ -350,12 +350,12 @@ pub fn emit_package(
         if params.is_empty() {
             crate::build_one_from(
                 &graph_path,
-                Some(&target_dir.join("graph.img")),
+                Some(&target_dir.join("node.img")),
                 module_root,
                 verbose,
             )?;
         } else {
-            let _ = std::fs::remove_file(target_dir.join("graph.img"));
+            let _ = std::fs::remove_file(target_dir.join("node.img"));
             let check_dir = project_root.join("target/fluxor/run").join(format!(
                 "{}-emit-{}",
                 src.workload.name,
@@ -370,7 +370,7 @@ pub fn emit_package(
             std::fs::write(&check_graph, rendered)?;
             let built = crate::build_one_from(
                 &check_graph,
-                Some(&check_dir.join("graph.img")),
+                Some(&check_dir.join("node.img")),
                 module_root,
                 verbose,
             );
@@ -655,7 +655,7 @@ pub fn package_by_name(name: &str) -> Result<PathBuf> {
     Err(Error::Config(format!(
         "'{name}' is neither a path, this project's own package (packaging/service/{name}/ or \
          packaging/applet/{name}/), nor a package pinned in {} (pinned packages: {}) — list it \
-         in fluxor.toml `[uses] bundles` and run `fluxor update` to pin it from the \
+         in fluxor.toml `[uses] packages` and run `fluxor update` to pin it from the \
          dependency that publishes it",
         fluxor_tools::store_resolve::lockfile_path(&project_root).display(),
         if pinned.is_empty() {
@@ -1017,7 +1017,7 @@ fn launch_package(
     }
 
     let project_root = crate::project::root_for_config(&dir);
-    let prebuilt = manifest.params.is_empty() && target_dir.join("graph.img").is_file();
+    let prebuilt = manifest.params.is_empty() && target_dir.join("node.img").is_file();
     // Scratch holds what this launch writes: a rendered graph and its blobs,
     // a widened config. Parameter values reach all of them, so the directory
     // is private and goes away on every exit path. A config carrying the
@@ -1028,7 +1028,7 @@ fn launch_package(
         None
     };
     let mut image = match (prebuilt, &scratch) {
-        (true, _) | (_, None) => target_dir.join("graph.img"),
+        (true, _) | (_, None) => target_dir.join("node.img"),
         (false, Some(scratch)) => {
             let run_dir = &scratch.dir;
             let module_root = if target_dir.join("modules").is_dir() {
@@ -1076,11 +1076,11 @@ fn launch_package(
             std::fs::write(&graph, rendered)?;
             crate::build_one_from(
                 &graph,
-                Some(&run_dir.join("graph.img")),
+                Some(&run_dir.join("node.img")),
                 Some(&module_root),
                 verbose,
             )?;
-            run_dir.join("graph.img")
+            run_dir.join("node.img")
         }
     };
     if !image.is_file() {
@@ -1138,7 +1138,7 @@ fn launch_package(
     // nothing of its own unless asked (`-v`).
     if verbose || applet.is_none() {
         eprintln!(
-            "Running bundle '{}' v{} ({}): {} --image {}",
+            "Running package '{}' v{} ({}): {} --image {}",
             manifest.name,
             manifest.version,
             imp.target.family,
@@ -1484,7 +1484,7 @@ pub fn applet_logs(name: &str, tail: usize, all: bool) -> Result<()> {
 /// Materialise the package this project pins under `name` as a runnable
 /// package dir under the applet cache (`$XDG_DATA_HOME/fluxor/applets/<name>/`):
 /// the same digest-verified flat layout `fluxor sync` writes (documents +
-/// the package's own `modules/`), plus the node image (`graph.img`) built
+/// the package's own `modules/`), plus the node image (`node.img`) built
 /// once from those pinned modules, so `exec` runs
 /// without compiling anything.
 fn materialize_pinned_package(name: &str, verbose: bool) -> Result<PathBuf> {
@@ -1495,12 +1495,12 @@ fn materialize_pinned_package(name: &str, verbose: bool) -> Result<PathBuf> {
         .and_then(|l| {
             l.artifacts
                 .into_iter()
-                .find(|a| a.kind == "bundle" && a.name == name)
+                .find(|a| a.kind == "package" && a.name == name)
         })
         .ok_or_else(|| {
             Error::Config(format!(
                 "'{name}' is neither a path, this project's own package, nor a package pinned in \
-                 {} — list it in fluxor.toml `[uses] bundles` and run `fluxor update`",
+                 {} — list it in fluxor.toml `[uses] packages` and run `fluxor update`",
                 fluxor_tools::store_resolve::lockfile_path(&project_root).display()
             ))
         })?;
@@ -1525,7 +1525,7 @@ fn materialize_pinned_package(name: &str, verbose: bool) -> Result<PathBuf> {
     }
     crate::build_one_from(
         &cache_root.join("graph.yaml"),
-        Some(&cache_root.join("graph.img")),
+        Some(&cache_root.join("node.img")),
         Some(&cache_root.join("modules")),
         verbose,
     )?;
@@ -1595,7 +1595,7 @@ buffer_bytes = 32768
     }
 
     #[test]
-    fn graph_facts_leave_kernel_built_ins_unpinned() {
+    fn graph_facts_leave_native_modules_unpinned() {
         let f = graph_facts(
             "target: linux\nmodules:\n  - name: cli_in\n  - name: tool\n  - name: cli_out\n",
         )

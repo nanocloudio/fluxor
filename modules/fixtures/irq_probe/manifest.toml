@@ -1,5 +1,9 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
+# Each dispatch polls the module's first input bridge (`bridge::POLL`, the
+# ISR-exempt op under test); `SELF_BRIDGE`, which takes the handle, needs no
+# grant.
+grants = ["bridge"]
 
 # IRQ-owned validation probe. `interrupt_safe` attests the step/ISR body
 # never calls a forbidden syscall from interrupt context — no heap

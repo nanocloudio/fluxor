@@ -51,8 +51,9 @@ image at `fluxor/fluxor.img` (`tools/src/uefi_disk.rs`).
 
 The kernel maps the machine from the firmware's memory map, reads its ACPI
 tables (`src/platform/uefi/acpi.rs`), starts its interrupt controller, timer
-and cores, enumerates PCI, and runs the graph on the boot core, one pass per
-tick. It reports each stage on the console UART as it reaches it —
+and cores, enumerates PCI, and runs the graph's domains as bcm2712 does: one
+domain loop per core, domain d on core d (see
+[concurrency.md](concurrency.md)). It reports each stage on the console UART as it reaches it —
 `[boot] stage=kernel_entry`, then `mmu`, `acpi`, `irq`, `timer`,
 `step_guard`, `smp`, `pcie` and `graph` — and repeats a `[boot] stages=`
 summary every 10 s for as long as it runs, because a cloud console can
@@ -108,6 +109,6 @@ needs glibc 2.39 or newer.
   a module under a runtime its manifest does not name, and the loader
   refuses a module whose signed runtime mask lacks its own runtime's
   bit.
-- A runtime's name and bit are fixed once, in the table, before it is
+- A runtime's name and bit are fixed in the table before it is
   buildable, so adding one is additive: a new build recipe and target
   file, no renames.

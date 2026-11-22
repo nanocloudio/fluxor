@@ -16,7 +16,7 @@ master key the module owns. The key bytes never enter the module.
 In attach mode the module takes these steps:
 1. It generates a fresh P-256 recipient key and writes `"FXRK"` and the
    public key (69 bytes) to its `recipient` output.
-2. It waits for the attachment bundle on its `bundle` control input: `"FXSB"`,
+2. It waits for the attachment share set on its `shares` control input: `"FXSB"`,
    the count 2 and three zero bytes, then two share envelopes (528 bytes).
    The envelopes are two custodians' shares, re-wrapped to that recipient.
 3. It reconstructs the master with `SHARE_COMBINE`, bound to the volume id
@@ -24,10 +24,10 @@ In attach mode the module takes these steps:
    verified under the reconstructed key.
 4. It destroys the recipient key, whatever the outcome.
 
-A bundle for another recipient or another volume fails the attach with
-`EACCES`. A device with no container is formatted with the bundle's volume
+A share set for another recipient or another volume fails the attach with
+`EACCES`. A device with no container is formatted with the share set's volume
 id and epoch only when `format` is 1. A new attach is a new instance with a
-new recipient key; a bundle is never reusable.
+new recipient key; a share set is never reusable.
 
 ## Parameters
 
@@ -38,7 +38,7 @@ new recipient key; a bundle is never reusable.
 | 3 | `block_size` | 512 | Upper logical block size: a power of two from 512 to the unit size |
 | 4 | `unit_size` | 4096 | Authentication unit: a power of two from 512 to 4096, at least the lower block size |
 | 5 | `journal_units` | 64 | Write-ahead journal size in units: even, 2 to 128; a record takes two, a header and its ciphertext |
-| 6 | `attach` | 0 | 1: take the master from an attachment bundle on `bundle` |
+| 6 | `attach` | 0 | 1: take the master from an attachment share set on `shares` |
 
 ## Ports
 
@@ -48,7 +48,7 @@ new recipient key; a bundle is never reusable.
 | `blocks` | output | The decrypted `storage.block` device |
 | `recipient` | output | Attach mode: the recipient key's announcement |
 | `status` | output | Optional: the status record, written when it changes |
-| `bundle` | control input | The attachment bundle (attach mode); then control records, and a rotation's bundles |
+| `shares` | control input | The attachment share set (attach mode); then control records, and a rotation's share sets |
 
 ## Data-key rotation
 
@@ -74,12 +74,12 @@ is committed. Epoch 1's master is filed under `key`, and epoch N's under
 
 ### Attached volumes
 
-The next master comes from the custodians, as a bundle for the next epoch:
+The next master comes from the custodians, as a share set for the next epoch:
 1. The `"FXRT"` record makes a fresh recipient key and announces it on
    `recipient` (`"FXRK"`, as at attach). Nothing is written yet. The
    announcement does not name an epoch: the pipeline that sent the record
    asked for the next one. A second record while it waits changes nothing.
-2. The pipeline answers with the next epoch's bundle (`"FXSB"`, 528 bytes)
+2. The pipeline answers with the next epoch's share set (`"FXSB"`, 528 bytes)
    on the control input: a new split of the new key, which two custodians
    re-wrap to that recipient.
 3. The module reconstructs it with `SHARE_COMBINE`, bound to the volume id
@@ -89,27 +89,27 @@ The next master comes from the custodians, as a bundle for the next epoch:
    handles. Retirement destroys the old epoch's handles; nothing was ever
    filed under a label.
 
-A bundle that is refused leaves the volume steady and serving at its
-epoch, with the device untouched. A bundle is refused when it is for
+A share set that is refused leaves the volume steady and serving at its
+epoch, with the device untouched. A share set is refused when it is for
 another epoch, for another volume, or for a spent recipient. A fresh
-recipient is then announced for the next try. A bundle that arrives with
+recipient is then announced for the next try. A share set that arrives with
 no rotation waiting for it is refused `EINVAL`.
 
 Attached masters are never persisted, so a restart during a rotation needs
-both epochs' bundles again. The mount then works as follows:
+both epochs' share sets again. The mount then works as follows:
 - It reads the superblock and knows what it needs: the superblock's epoch,
   and while a rotation is under way the other one. That is the next epoch
   while prepared, and the previous epoch after.
-- It announces one recipient at a time. It takes a bundle for either epoch
+- It announces one recipient at a time. It takes a share set for either epoch
   it still needs, in whichever order they come, going by the epoch the
   envelopes name.
-- A bundle for an epoch it does not need is refused, and a fresh recipient
+- A share set for an epoch it does not need is refused, and a fresh recipient
   is announced. So a pipeline that knows only that a rotation from N to
   N+1 is under way can offer N and N+1 in turn.
 - It mounts once it holds every master it needs, and the rotation resumes
   where the superblock left it.
 
-A bundle for a needed epoch that does not open fails the mount (`EACCES`,
+A share set for a needed epoch that does not open fails the mount (`EACCES`,
 `EINVAL`), as at attach.
 
 ## Crypto-erase
@@ -117,7 +117,7 @@ A bundle for a needed epoch that does not open fails the mount (`EACCES`,
 An `"FXER"` record (then four zero bytes) on the control input erases the
 volume:
 1. Every master it has is destroyed: the current and previous epochs', and
-   a prepared next one. A recipient awaiting a rotation's bundle goes too.
+   a prepared next one. A recipient awaiting a rotation's share set goes too.
 2. Both superblocks are zeroed and flushed.
 3. The device goes offline (`ENODEV`).
 
@@ -128,25 +128,25 @@ recovery shares is the custodians' part.
 ## Status
 
 The optional `status` output lets the pipeline that sends rotation, erase
-and bundle records follow the volume. It carries one 40-byte record,
+and share set records follow the volume. It carries one 40-byte record,
 little-endian, written whenever a field changes, and so once at ready:
 
 | Off | Len | Field |
 | --- | --- | --- |
 | 0 | 4 | `"FXST"` |
-| 4 | 1 | State: 0 opening, 1 awaiting bundle, 2 ready, 3 rotating, 4 failed, 5 erased |
+| 4 | 1 | State: 0 opening, 1 awaiting share set, 2 ready, 3 rotating, 4 failed, 5 erased |
 | 5 | 1 | The superblock's rotation state: 0 steady, 1 prepared, 2 active, 3 migrating, 4 retiring |
 | 6 | 2 | Reserved, zero |
 | 8 | 4 | Epoch |
 | 12 | 4 | Previous epoch |
-| 16 | 4 | Awaited epoch: the epoch a bundle is awaited for, 0 for none (or a blank device, which takes the bundle's) |
-| 20 | 4 | Errno: the mount's or erase's failure, or the last background step's result (a refused bundle is `EACCES`) |
+| 16 | 4 | Awaited epoch: the epoch a share set is awaited for, 0 for none (or a blank device, which takes the share set's) |
+| 20 | 4 | Errno: the mount's or erase's failure, or the last background step's result (a refused share set is `EACCES`) |
 | 24 | 16 | Volume id |
 
 What the states mean for a pipeline:
-- **Awaiting bundle:** a recipient has been announced for the awaited
+- **Awaiting share set:** a recipient has been announced for the awaited
   epoch. A mount under a rotation awaits the superblock's epoch first, then
-  the other epoch the rotation holds. A refused bundle leaves it awaiting,
+  the other epoch the rotation holds. A refused share set leaves it awaiting,
   with the refusal in the errno.
 - **Rotating:** a rotation is under way, in the state the record names.
 - **Ready** with rotation 0 at epoch N after a rotation: it is steady, and

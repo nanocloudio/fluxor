@@ -27,10 +27,14 @@ modules:
 wiring:
   - from: disk.blocks
     to: nbd.blocks
+  - from: linux_net.net_out
+    to: nbd.net_in
+  - from: nbd.net_out
+    to: linux_net.net_in
 ```
 
-The `platform.net` stack wires `nbd.net_in` / `nbd.net_out` to the transport.
-Then, as root on the client host:
+`platform.net` brings the transport (`linux_net` here); the graph wires
+`nbd.net_in` / `nbd.net_out` to it. Then, as root on the client host:
 
 ```sh
 nbd-client -N '' -b 512 <host> 10809 /dev/nbd0
@@ -53,7 +57,7 @@ client that asks with `NBD_INFO_BLOCK_SIZE`).
 
 | Port | Direction | Carries |
 | --- | --- | --- |
-| `blocks` | input | the `storage.block` source (channel ioctls) |
+| `blocks` | input | the `storage.block` source, called through the wired channel |
 | `net_in` | input | `net_proto` events from the transport |
 | `net_out` | output | `net_proto` commands to the transport |
 
@@ -121,12 +125,9 @@ no `/dev/ublk-control`), while `nbd.ko` is available and io_uring is enabled.
 A ublk frontend would consume the same `storage.block` records and replace
 only the transport.
 
-Attaching a real `/dev/nbdN` needs root, so the host tests play the NBD
-client byte for byte over a modelled transport instead.
-
 ## Limits
 
-Registered in `docs/architecture/limit_register.md`: `MAX_SLOTS` (8),
+Registered in [limit_register.md](../../../docs/architecture/limit_register.md): `MAX_SLOTS` (8),
 `SLOT_SIZE` (16 KiB), `MAX_REQUESTS` (16), `MAX_REQUEST_BYTES` (32 MiB),
 `EXPORT_NAME_CAP`, `OPT_BUF_SIZE`, `OUT_DATA_MAX`, and the per-step frame
 and reap budgets. The pool and frame buffers are module state (about 140 KiB),

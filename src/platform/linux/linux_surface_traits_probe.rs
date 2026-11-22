@@ -1,4 +1,4 @@
-// linux_surface_traits_probe built-in — demo consumer of the Surface Traits
+// linux_surface_traits_probe native module — demo consumer of the Surface Traits
 // surface on Linux. Reads `input::surface_traits::MSG_TRAITS` records from its
 // input port and logs the decoded fields via `log::info!`, proving the
 // round-trip end-to-end on a headless Linux box: linux_surface_traits →
@@ -51,7 +51,7 @@ unsafe extern "C" fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
 fn build_linux_surface_traits_probe(module_idx: usize, _params: &[u8]) -> Result<Box<LinuxSurfaceTraitsProbeState>, i32> {
     let in_chan = scheduler::module_port(module_idx, surface_traits_probe_tags::PORT_EVENTS);
     let st = Box::new(LinuxSurfaceTraitsProbeState { in_chan });
-    log::info!("[inst] module {module_idx} = linux_surface_traits_probe (built-in, demo consumer; in_chan={in_chan})");
+    log::info!("[inst] module {module_idx} = linux_surface_traits_probe (native, demo consumer; in_chan={in_chan})");
     Ok(st)
 }
 

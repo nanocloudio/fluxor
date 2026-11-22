@@ -140,7 +140,7 @@ mod hal;
 mod module_host;
 
 /// Lightweight TLV walker for native module params. Mirrors
-/// `src/platform/linux/builtin_params.rs::walk_tlv`. A native module
+/// `src/platform/linux/native_params.rs::walk_tlv`. A native module
 /// receives its per-instance TLV blob as `NativeInit::params`; tags
 /// 10..0xEF are the manifest-declared params, tags 0xF0..0xFF are reserved.
 ///

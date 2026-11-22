@@ -1,4 +1,4 @@
-// linux_display built-in — RGB565 sink. Three modes:
+// linux_display native module — RGB565 sink. Three modes:
 //   file   write each frame to a PPM file on disk
 //   window blit into a winit/softbuffer host window (host-window feature)
 //   null   discard
@@ -518,7 +518,7 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> Result<Box<LinuxDisp
             #[cfg(feature = "host-window")]
             window,
         });
-    log::info!("[inst] module {module_idx} = linux_display (built-in) in={in_chan}");
+    log::info!("[inst] module {module_idx} = linux_display (native) in={in_chan}");
     Ok(st)
 }
 

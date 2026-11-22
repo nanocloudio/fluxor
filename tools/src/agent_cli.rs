@@ -8,7 +8,7 @@
 //! `fluxor agent commit` — reconcile a single-workload desired state into a durable
 //! generation store and publish the committed plan blob for the Linux
 //! runtime's `FLUXOR_PLAN` staging. Prints the workload handle
-//! (`fluxor://<workload-uid-hex>/<generation>`) on stdout for the caller to track.
+//! (`fluxor://<owner-uid-hex>/<generation>`) on stdout for the caller to track.
 //!
 //! `fluxor agent serve` and `fluxor agent call` — the agent protocol
 //! (`docs/architecture/agent_protocol.md`): the two ends of one request and its
@@ -55,7 +55,7 @@ pub enum AgentCommand {
     /// Remove a workload from the desired state, recompose, and publish.
     Remove(RemoveArgs),
     /// Report the node's committed generation and per-workload status
-    /// (owner-tagged by the full join key: workload UID + owner slot + generation).
+    /// (owner-tagged by the full join key: owner uid + owner slot + generation).
     Status(StatusArgs),
     /// Stream an owner's per-owner log ring.
     Logs(LogsArgs),
@@ -79,13 +79,13 @@ pub struct ServeArgs {
     pub publish: PathBuf,
     /// Directory of workload packages, one per `<workload digest hex>/`.
     #[arg(long)]
-    pub bundles: PathBuf,
+    pub packages: PathBuf,
     /// The node descriptor; its sha256 is the descriptor revision.
     #[arg(long)]
     pub descriptor: PathBuf,
     /// This node's key fingerprint: 64 hex chars.
     #[arg(long)]
-    pub target_id: String,
+    pub node_id: String,
     /// A controller's key fingerprint: 64 hex chars. Repeatable.
     #[arg(long = "controller")]
     pub controllers: Vec<String>,
@@ -131,13 +131,13 @@ pub struct CallArgs {
     /// apply | remove | observe.
     #[arg(long)]
     pub op: String,
-    /// Workload UID as 32 hex chars (dashes allowed). Default for `observe`:
+    /// Owner uid as 32 hex chars (dashes allowed). Default for `observe`:
     /// none, which reports the node alone.
     #[arg(long)]
-    pub workload_uid: Option<String>,
+    pub owner_uid: Option<String>,
     /// `apply`: the desired workload package's digest, 64 hex chars.
     #[arg(long)]
-    pub bundle_digest: Option<String>,
+    pub package_digest: Option<String>,
     /// `apply`: the node descriptor revision this was validated against, 64
     /// hex chars.
     #[arg(long)]
@@ -151,10 +151,10 @@ pub struct CallArgs {
     #[arg(long, default_value_t = 0)]
     pub fence_seq: u64,
     /// The node's key fingerprint this call must reach, 64 hex chars. On a
-    /// runtime transport the response's `target_id` is held to the fingerprint
+    /// runtime transport the response's `node_id` is held to the fingerprint
     /// the channel verified whether or not this is given.
     #[arg(long)]
-    pub target_id: Option<String>,
+    pub node_id: Option<String>,
     /// How long to wait for the session and the answer.
     #[arg(long, default_value_t = 30_000)]
     pub timeout_ms: u64,
@@ -215,9 +215,9 @@ pub struct RemoveArgs {
     pub store: PathBuf,
     #[arg(long)]
     pub publish: PathBuf,
-    /// Workload UID as 32 hex chars (dashes allowed).
+    /// Owner uid as 32 hex chars (dashes allowed).
     #[arg(long)]
-    pub workload_uid: String,
+    pub owner_uid: String,
     /// Grace window in seconds: the owner drains (admission closed, in-flight
     /// work runs, readiness withdrawn) and is revoked at quiescence or this
     /// deadline, whichever comes first. 0 = revoke immediately.
@@ -237,9 +237,9 @@ pub struct CommitArgs {
     /// Path to publish the committed plan blob to (FLUXOR_PLAN target).
     #[arg(long)]
     pub publish: PathBuf,
-    /// Workload UID as 32 hex chars (dashes allowed).
+    /// Owner uid as 32 hex chars (dashes allowed).
     #[arg(long)]
-    pub workload_uid: String,
+    pub owner_uid: String,
     #[arg(long, default_value = "default")]
     pub namespace: String,
     #[arg(long)]
@@ -260,24 +260,24 @@ pub struct CommitArgs {
     /// the linux implementation, and takes the resource profile from
     /// `resources.json` — overriding the explicit profile flags above.
     #[arg(long)]
-    pub bundle: Option<PathBuf>,
+    pub package: Option<PathBuf>,
     /// Target capacity profile (linux | pi5 | bcm2712) — sets the kernel
     /// limits admission checks against.
     #[arg(long, default_value = "linux")]
     pub profile: String,
 }
 
-fn parse_workload_uid(hex: &str) -> Result<[u8; 16]> {
+fn owner_uid_arg(hex: &str) -> Result<[u8; 16]> {
     let cleaned: String = hex.chars().filter(|c| *c != '-').collect();
     if cleaned.len() != 32 || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(Error::Config(format!(
-            "--workload-uid must be 32 hex chars (got '{hex}')"
+            "--owner-uid must be 32 hex chars (got '{hex}')"
         )));
     }
     let mut uid = [0u8; 16];
     for (i, byte) in uid.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16)
-            .map_err(|e| Error::Config(format!("--workload-uid: {e}")))?;
+            .map_err(|e| Error::Config(format!("--owner-uid: {e}")))?;
     }
     Ok(uid)
 }
@@ -329,9 +329,9 @@ fn runtime_log(t: &TransportArgs, default: Stdio) -> Result<Stdio> {
 }
 
 fn serve(s: ServeArgs) -> Result<()> {
-    let target_id = hex_arg::<32>("target-id", &s.target_id)?;
-    if target_id == [0; 32] {
-        return Err(Error::Config("--target-id: names no key".into()));
+    let node_id = hex_arg::<32>("node-id", &s.node_id)?;
+    if node_id == [0; 32] {
+        return Err(Error::Config("--node-id: names no key".into()));
     }
     let mut controllers = Vec::with_capacity(s.controllers.len());
     for c in &s.controllers {
@@ -342,10 +342,10 @@ fn serve(s: ServeArgs) -> Result<()> {
         controllers.push(fp);
     }
     let ctx = AgentContext {
-        target_id,
+        node_id,
         controllers,
         descriptor: s.descriptor.clone(),
-        bundles: s.bundles.clone(),
+        packages: s.packages.clone(),
         publish: s.publish.clone(),
         capacity: capacity(&s.profile)?,
         remove_grace: s.remove_grace,
@@ -445,15 +445,15 @@ fn call_request(c: &CallArgs) -> Result<Request> {
             )))
         }
     };
-    let workload_uid = match c.workload_uid.as_deref() {
-        Some(u) => hex_arg::<16>("workload-uid", u)?,
+    let owner_uid = match c.owner_uid.as_deref() {
+        Some(u) => hex_arg::<16>("owner-uid", u)?,
         None if opcode == op::OBSERVE => [0; 16],
-        None => return Err(Error::Config("--workload-uid is needed".into())),
+        None => return Err(Error::Config("--owner-uid is needed".into())),
     };
-    let desired_bundle_digest = match (c.bundle_digest.as_deref(), opcode) {
-        (Some(d), op::APPLY) => hex_arg::<32>("bundle-digest", d)?,
-        (None, op::APPLY) => return Err(Error::Config("apply needs --bundle-digest".into())),
-        (Some(_), _) => return Err(Error::Config("--bundle-digest is for apply".into())),
+    let desired_package_digest = match (c.package_digest.as_deref(), opcode) {
+        (Some(d), op::APPLY) => hex_arg::<32>("package-digest", d)?,
+        (None, op::APPLY) => return Err(Error::Config("apply needs --package-digest".into())),
+        (Some(_), _) => return Err(Error::Config("--package-digest is for apply".into())),
         (None, _) => [0; 32],
     };
     let descriptor_revision = match (c.descriptor_revision.as_deref(), opcode) {
@@ -469,8 +469,8 @@ fn call_request(c: &CallArgs) -> Result<Request> {
     Ok(Request {
         op: opcode,
         flags: 0,
-        workload_uid,
-        desired_bundle_digest,
+        owner_uid,
+        desired_package_digest,
         descriptor_revision,
         idempotency_id,
         fence_epoch: c.fence_epoch,
@@ -481,9 +481,9 @@ fn call_request(c: &CallArgs) -> Result<Request> {
 fn call(c: CallArgs) -> Result<()> {
     let req = call_request(&c)?;
     let expected = c
-        .target_id
+        .node_id
         .as_deref()
-        .map(|t| hex_arg::<32>("target-id", t))
+        .map(|t| hex_arg::<32>("node-id", t))
         .transpose()?;
     let mut record = [0u8; wire::REQUEST_LEN];
     let len = req
@@ -722,13 +722,13 @@ fn status(a: StatusArgs) -> Result<()> {
     }
     println!(
         "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6} {:<24}",
-        "WORKLOAD-UID", "NAME", "NAMESPACE", "PHASE", "SLOT", "GEN", "MODULES", "EDGES", "RUNTIME"
+        "OWNER-UID", "NAME", "NAMESPACE", "PHASE", "SLOT", "GEN", "MODULES", "EDGES", "RUNTIME"
     );
     for p in &st.workloads {
         let dash = || "-".to_string();
         println!(
             "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6} {:<24}",
-            p.workload_uid_hex,
+            p.owner_uid_hex,
             p.name,
             p.namespace,
             format!("{:?}", p.desired_phase),
@@ -762,14 +762,14 @@ fn runtime_column(rt: Option<&WorkloadRuntimeStatus>) -> String {
 }
 
 fn remove(r: RemoveArgs) -> Result<()> {
-    let workload_uid = parse_workload_uid(&r.workload_uid)?;
+    let owner_uid = owner_uid_arg(&r.owner_uid)?;
     let _lock = StoreLock::acquire(&r.store)
         .map_err(|e| Error::Config(format!("lock store {}: {e}", r.store.display())))?;
     let storage = FsStorage::open(&r.store)
         .map_err(|e| Error::Config(format!("open store {}: {e}", r.store.display())))?;
     let mut store = GenStore::new(storage);
     let cap = capacity(&r.profile)?;
-    let (plan, gen) = remove_workload_and_commit(&mut store, workload_uid, r.grace, &cap)
+    let (plan, gen) = remove_workload_and_commit(&mut store, owner_uid, r.grace, &cap)
         .map_err(|e| Error::Config(format!("remove/recompose failed: {e:?}")))?;
     publish_committed_plan(&store, &r.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?;
@@ -780,8 +780,8 @@ fn remove(r: RemoveArgs) -> Result<()> {
 }
 
 fn commit(c: CommitArgs) -> Result<()> {
-    let workload_uid = parse_workload_uid(&c.workload_uid)?;
-    let (profile, workload_digest, exports) = match &c.bundle {
+    let owner_uid = owner_uid_arg(&c.owner_uid)?;
+    let (profile, workload_digest, exports) = match &c.package {
         Some(dir) => {
             let b = resolve_package(dir).map_err(Error::Config)?;
             (b.profile, b.workload_digest, b.exports)
@@ -801,7 +801,7 @@ fn commit(c: CommitArgs) -> Result<()> {
         ),
     };
     let workload = WorkloadDesired {
-        workload_uid,
+        owner_uid,
         namespace: c.namespace.clone(),
         name: c.name.clone(),
         workload_digest,
@@ -830,7 +830,7 @@ fn commit(c: CommitArgs) -> Result<()> {
     // The workload handle the orchestrator tracks: `fluxor://<uid-hex>/<gen>`.
     println!(
         "fluxor://{}/{}",
-        c.workload_uid
+        c.owner_uid
             .chars()
             .filter(|c| *c != '-')
             .collect::<String>(),

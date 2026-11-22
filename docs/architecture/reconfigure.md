@@ -74,7 +74,8 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
 }
 ```
 
-The pack tool detects this export and sets header flag bit 3 (`drain_capable`).
+The pack tool detects this export and sets header flag bit 3 (`DRAIN`; see
+[Header flags](module_architecture.md#header-flags)).
 During DRAINING, the scheduler calls `module_drain()` once (in reverse
 topological order), then continues calling `module_step()` normally. When
 your module has no more in-flight work, return `StepReturn::Done`
@@ -92,7 +93,7 @@ Subscribe in the manifest:
 observes_owner_release = true
 ```
 
-The packer carries it as a header flag; the loader acts on it after provider
+The packer carries it as header flag bit 6; the loader acts on it after provider
 registration succeeds, and a module that registers no contract has no dispatch
 to call and is refused. A module that does not say so is never notified, so a
 provider holding nothing per consumer pays nothing.
@@ -146,6 +147,8 @@ pool it asks the provider. Opt in with a second manifest fact:
 samples_pool = true
 ```
 
+(header flag bit 7)
+
 As with the owner-release fact, the loader acts on it after provider
 registration succeeds, refuses it from a module that registers no contract,
 and drops it with the module's provider layers. The node's server of the pool
@@ -182,8 +185,9 @@ is in.
 By default an added owner is a workload: walled from the node's provider
 layers, its storage rooted. A node component that places subgraphs to act on
 its own behalf (an operator shell running a user's commands) sets
-`ADD_FLAG_CREATOR_AUTHORITY` (`0x0001`) in the `AddSubgraph` header's `flags`
-(bytes 6..8, big-endian). The owner then acts with the node's authority: it
+`ADD_FLAG_CREATOR_AUTHORITY` (`0x0001`) in the composed graph's header
+`flags` (`fluxor_contracts::graph::FLAG_CREATOR_AUTHORITY`: bytes 4..6,
+little-endian). The owner then acts with the node's authority: it
 reaches the node's provider layers and the platform's storage as the node
 does and, on Linux, spawns host processes and binds ports as the node does,
 outside the lease plan, while everything it opens is still stamped with its
@@ -198,7 +202,7 @@ The rule, enforced by the decoder and the add:
   node module, or a module of an owner admitted this way); a workload creator
   is refused `EACCES` before anything is allocated, so a workload can neither
   pass on what it does not hold nor gain it through an add of its own.
-- Every other path that decodes an `AddSubgraph` names no creator and refuses
+- Every other path that admits a composed graph names no creator and refuses
   the flag `EINVAL`: a workload `CREATE` (whose blob comes from off the node)
   and the node graph's resident workloads.
 - Every undefined flag bit is refused `EINVAL` on every path.
@@ -297,15 +301,3 @@ Summary: 3 survive, 1 drain, 1 terminate, 0 add, 0 remove
 If the drain deadline is exceeded, all still-draining modules are
 force-terminated. Their in-flight work is lost — the same outcome those
 modules would see under an atomic reconfigure.
-
-## Header Flag Layout (module header `reserved[0]`)
-
-| Bit | Name | Description |
-|-----|------|-------------|
-| 0 | mailbox_safe | Can consume from mailbox channels |
-| 1 | in_place_writer | Uses the channel's `ACQUIRE_INPLACE` |
-| 2 | deferred_ready | Needs init time before downstream runs |
-| 3 | drain_capable | Exports module_drain for live reconfigure |
-| 4 | isr_module | Defines module_isr_entry (`irq` mode) |
-| 5 | wasm_payload | Module body is a wasm payload (set by `pack_fmod_wasm`, read by `src/platform/wasm.rs`) |
-| 6-7 | reserved | Must be 0 |

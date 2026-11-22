@@ -9,7 +9,7 @@
 // native provider passes an owned Rust enum across a thread; the browser
 // backend is JavaScript, which cannot hold a Rust value, so its work has to be
 // bytes. Rather than inventing a second private layout inside the wasm
-// built-in, the layout lives here — path-mounted by the Rust side and pinned
+// native module, the layout lives here — path-mounted by the Rust side and pinned
 // against the JS literals by `tests/harness/tests/gpu_backend_wire.rs`, which
 // is the only way a number can move on one side and not the other.
 //

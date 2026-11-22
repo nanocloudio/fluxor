@@ -7,21 +7,13 @@ Button PIC Module
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `raw` | output | `OctetStream` |  |
 
-[[ports]]
-name = "raw"
-direction = "output"
-content_type = "OctetStream"
-
-[[resources]]
-requires_contract = "gpio"
-access = "read"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
@@ -29,8 +21,3 @@ access = "read"
 - `control_id`
 - `pin`
 - `pull`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

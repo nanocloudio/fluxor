@@ -1,7 +1,7 @@
 //! Blocking-tolerant whole writes and reads on a host fd: partial writes
 //! resumed, EINTR retried, EAGAIN/EWOULDBLOCK waited out with poll(2), so a
 //! non-blocking stdio pipe neither cuts output nor reads as end of input.
-//! Shared by the cli_in/cli_out built-ins; host-tested by
+//! Shared by the cli_in/cli_out native modules; host-tested by
 //! tests/harness/tests/cli_fd_stream.rs.
 
 /// Wait until `fd` is ready for `events`, or a bounded while has passed (the

@@ -195,8 +195,8 @@ fn sched() -> &'static mut SchedulerState {
 }
 
 // On a multi-domain kernel (the `smp` feature) every peer domain core is
-// parked while an owner is torn down, and the affected domains' dispatch
-// tables are reprojected from the compacted flat order.
+// parked while an owner is torn down, and the owner's modules are dropped
+// from the affected domains' orders (`unsplice_from_orders`).
 
 /// Bit `d` set ⇒ a module in the mutation touches domain `d`. Bounded by
 /// `scheduler::MAX_DOMAINS` (≤ 32, so a `u32` mask is always sufficient).
@@ -240,7 +240,7 @@ fn release_peers(parked: bool) {
 /// drain is the reconfigure module's cross-tick policy, layered on top by
 /// driving the owner's modules to `Done` *before* calling `free_owner`.
 pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
-    if handle.is_system() {
+    if handle.is_node() {
         return Err(FreeError::NotWorkload);
     }
     let state = match sched().owners.lookup(handle) {
@@ -443,7 +443,7 @@ fn owned_module_mask(handle: OwnerHandle) -> crate::kernel::workload::bitmask::M
 /// The node owner is refused. Scheduler-thread only (same access class
 /// as the splice and `free_owner`).
 pub fn owner_pause(handle: OwnerHandle) -> Result<(), PauseError> {
-    if handle.is_system() {
+    if handle.is_node() {
         return Err(PauseError::NotWorkload);
     }
     let state = match sched().owners.lookup(handle) {
@@ -475,7 +475,7 @@ pub fn owner_pause(handle: OwnerHandle) -> Result<(), PauseError> {
 /// `event_wake = true`, as if the wake had just fired. Idempotent (resume
 /// of an Active owner is a no-op).
 pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
-    if handle.is_system() {
+    if handle.is_node() {
         return Err(PauseError::NotWorkload);
     }
     let state = match sched().owners.lookup(handle) {

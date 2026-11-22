@@ -1,6 +1,6 @@
 # linux_audio
 
-Linux-only built-in audio sink. Consumes signed-16-bit little-endian
+Linux-only native audio sink. Consumes signed-16-bit little-endian
 PCM (interleaved stereo by default) on its `audio` input and either
 captures to a file, discards, or plays through the host audio device.
 
@@ -25,9 +25,9 @@ cargo build --release --bin fluxor-linux \
 `fluxor-linux` binary lacks `host-playback`, naming the exact `cargo
 build` invocation that adds the feature.
 
-The playback queue is capped at ~250 ms of audio. If the producer
-outruns the device, oldest samples are dropped and a rate-limited
-underrun warning is logged.
+The playback queue is capped at ~250 ms of audio: if the producer
+outruns the device, the oldest samples are dropped. If the device runs
+dry it plays silence and logs a rate-limited underrun warning.
 
 ## Configuration
 
@@ -61,8 +61,8 @@ the YAML.
 
 The WAV header carries total sample-data length. Since the graph runs
 indefinitely, the header is written with placeholder lengths on first
-write and the file is left in a state that most players accept (we
-update the header lengths in place every `flush_interval` writes —
-default ~1 second of audio). On graceful teardown the final lengths
+write and the file is left in a state that most players accept: the header
+lengths are updated in place every `flush_interval` writes (about one
+second of audio). On graceful teardown the final lengths
 are written; if the process dies abruptly, the file remains playable
 up to the last flush boundary.

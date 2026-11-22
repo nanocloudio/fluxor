@@ -43,7 +43,7 @@ pub struct MetricMeta {
     pub name: String,
     pub kind: Option<InstrumentKind>,
     pub bounds_us: Vec<u64>,
-    /// Declared dimension keys with their domain, composite-index order.
+    /// Declared dimension keys with their kind, composite-index order.
     pub dimensions: Vec<(String, DimView)>,
 }
 
@@ -138,7 +138,7 @@ impl TableView {
                         .and_then(|k| k.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let view = match d.get("domain").and_then(|x| x.as_str()) {
+                    let view = match d.get("kind").and_then(|x| x.as_str()) {
                         Some("numeric") => DimView::Numeric {
                             max: d.get("max").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
                         },
@@ -177,9 +177,9 @@ impl TableView {
         Ok(t)
     }
 
-    /// Decode a composite dimension index against `meta`'s declared domains
+    /// Decode a composite dimension index against `meta`'s declared ranges
     /// (row-major, `dim = ((i0·s1)+i1)·s2+…`) into label pairs. `DIM_OTHER`
-    /// folds every key to `__other__`; an out-of-range composite (a domain
+    /// folds every key to `__other__`; an out-of-range composite (a range
     /// the table doesn't cover) does the same rather than invent component
     /// values.
     pub fn decode_dim(meta: &MetricMeta, dim: u16) -> Vec<(String, String)> {
@@ -684,8 +684,8 @@ mod tests {
                      "bounds_us": [250,500,1000,2500,5000,10000,25000,50000,100000,250000,500000,1000000,2500000,5000000,10000000]},
                     {"id": 20, "name": "consumer_lag", "kind": "updown",
                      "dimensions": [
-                        {"key": "messaging.destination.partition.id", "domain": "numeric", "max": 4},
-                        {"key": "messaging.consumer.group.name", "domain": "enum", "values": ["ingest","audit"]}
+                        {"key": "messaging.destination.partition.id", "kind": "numeric", "max": 4},
+                        {"key": "messaging.consumer.group.name", "kind": "enum", "values": ["ingest","audit"]}
                      ]},
                 ],
                 "spans": [{"id": 0, "name": "http.server.request"}],

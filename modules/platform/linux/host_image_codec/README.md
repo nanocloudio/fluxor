@@ -1,6 +1,6 @@
 # host_image_codec
 
-Linux-only built-in. Reads a complete encoded image (JPEG, PNG, BMP,
+Linux-only native module. Reads a complete encoded image (JPEG, PNG, BMP,
 GIF) from its `encoded` input, decodes via the `image` crate, resizes
 to the target dimensions, and emits a single RGB565 frame on `pixels`.
 

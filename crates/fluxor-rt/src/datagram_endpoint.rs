@@ -452,7 +452,7 @@ impl DatagramEndpoint {
     reason = "shared datagram-endpoint core; each including module uses a subset"
 )]
 /// Frames read through while waiting for the bound reply, per step. Matches
-/// the kernel fan's own per-step budget (`FAN_FRAMES_PER_STEP`), so a fanned
+/// a fan's default per-step budget (`FRAMES_PER_STEP_DEFAULT`), so a fanned
 /// input never gains on an endpoint that is still binding.
 pub const BIND_WAIT_DRAIN: usize = 64;
 

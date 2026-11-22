@@ -6,12 +6,13 @@ keep the two clocks separate get predictable A/V sync; modules that
 conflate them drift.
 
 Source: `crates/fluxor-abi/src/kernel_abi.rs` (`StreamTime`),
-`crates/fluxor-abi/src/contracts/stream_clock.rs`
+`crates/fluxor-abi/src/contracts/stream_clock.rs`,
+`src/kernel/module/syscalls.rs` (the `STREAM_TIME` query).
 
 ## 1) Define what "time" means in your system
 
 Use two distinct clocks:
-- Wall clock (host time): `micros()`/`millis()` used only for when to schedule work.
+- Wall clock (host time): `dev_micros` / `dev_millis` (`fluxor-rt`), used only for when to schedule work.
 - Stream clock (media time): a monotonically increasing count of frames (audio frames, LED frames, etc.) that represents what time the data corresponds to.
 
 Do not try to achieve precise A/V sync using wall clock alone.
@@ -20,19 +21,26 @@ Do not try to achieve precise A/V sync using wall clock alone.
 
 ## 2) Make one clock the authority per stream
 
-For audio pipelines, the authority is the I2S DMA consumption rate.
+For audio pipelines, the authority is the sink's consumption rate — the
+I2S DMA on RP, the audio device on a host.
 
-The kernel exposes timing via `StreamTime`, available through
-`provider_query` with key `kernel_abi::STREAM_TIME` (0x0030):
+Any module reads it with `provider_query(-1, kernel_abi::STREAM_TIME, out)`
+(key `0x0030`, no grant needed), which writes a 24-byte `StreamTime`:
 
 ```c
 struct StreamTime {
     u64 consumed_units;      // units consumed by hardware (monotonic)
     u32 queued_units;        // units buffered ahead of consumption
-    u32 units_per_sec_q16;   // consumption rate (Q16.16 fixed point)
+    u32 units_per_sec_q16;   // consumption rate (Q16.16 fixed point, 0 = unknown)
     u64 t0_micros;           // monotonic µs timestamp of first push (0 = not started)
 };
 ```
+
+The kernel answers from the registered `stream_clock` provider (the
+Linux and wasm hosts register one backed by their audio sink); where none
+is registered (bare-metal RP) it answers from the first active PIO
+stream, whose rate is set with the PIO `STREAM_SET_RATE` op. A
+non-negative handle names one stream instead of the first.
 
 Units are defined by the stream — for I2S they are PIO words (= stereo frames).
 `t0_micros` is captured on the first push, not at init or alloc.
@@ -73,12 +81,14 @@ If you do not carry `target_frame`, you will get jitter equal to your processing
 Your system is inherently quantised by:
 - Audio chunk size: jitter up to one chunk if control applies at chunk boundaries.
 - Scheduler tick: jitter up to one tick if producers are wall-clock paced.
-- Channel partial reads/writes: jitter when messages are split across steps.
+- Split reads: a channel write is whole or nothing, but a read is a byte
+  stream ([record boundaries](pipeline.md#record-boundaries)); a consumer
+  that reads one message across two steps applies it a step late.
 
 To reduce jitter:
 - Prefer smaller chunks for control-sensitive generators.
-- Prefer `micros()` over `millis()` for scheduling.
-- Use atomic-sized control messages (`u32`) so the channel can be implemented without partial delivery.
+- Prefer `dev_micros` over `dev_millis` for scheduling.
+- Keep control messages small (`u32`) and read each one whole.
 
 ---
 
@@ -90,7 +100,7 @@ For any source -> processors -> sink chain, define a "start of stream" moment:
 
 Practical approach:
 - The kernel captures `t0_micros` automatically on first push (see `StreamTime`).
-- Any module can query `StreamTime` via `provider_query(-1, kernel_abi::STREAM_TIME, …)` and convert
+- Any module can read `StreamTime` (section 2) and convert
   `target_frame` <-> `target_time`:
 
 ```
@@ -140,29 +150,11 @@ If LEDs are not tied to the audio sample clock, they will still have their own o
 
 ---
 
-## 10) Instrumentation the stream service provides
-
-The PIO stream service already exposes `StreamTime` via `provider_query(-1, kernel_abi::STREAM_TIME, …)`
-(key 0x0030). It provides everything needed for sync:
-
-| Field | Meaning |
-|-------|---------|
-| `consumed_units` | Frames consumed by DMA (monotonic) |
-| `queued_units` | Frames buffered ahead of DMA |
-| `units_per_sec_q16` | Consumption rate, Q16.16 (set via `STREAM_SET_RATE`) |
-| `t0_micros` | Monotonic µs of first push (0 = not started) |
-
-Derived: `committed = consumed_units + queued_units`.
-
-With just `consumed_units + queued_units`, you can produce stable sync.
-
----
-
 ## Checklist for new modules
 
 - Does the module operate in stream frames, not wall-clock ms?
 - Are outputs timestamped (`target_frame`) or explicitly "next boundary"?
-- Is control messaging atomic-sized (`u32`) to avoid partials?
+- Is control messaging small (`u32`) and read whole?
 - Does the control consumer drain all pending messages each step and apply only
   the most recent value?
 - Does it advance time only on commit, not on attempt?

@@ -1,6 +1,6 @@
 # host_asset_source
 
-Linux-only built-in. Streams a host filesystem file as `OctetStream` on
+Linux-only native module. Streams a host filesystem file as `OctetStream` on
 its output port. Used by hosted media examples to feed encoded bytes
 (JPEG, MP3, ROM dumps, …) into a codec without an SD/FAT32 chain.
 
@@ -31,8 +31,8 @@ The transparent `params: { ... }` wrapper is also accepted:
 ```
 
 The schema lives in `manifest.toml` `[[params]]`; the config tool packs
-`path` into the kernel's TLV params stream alongside every other
-built-in. See `docs/architecture/abi_layers.md` for the full
+`path` into the kernel's TLV params stream like every other native
+module's params. See `docs/architecture/abi_layers.md` for the full
 manifest-schema design.
 
 ## Behaviour

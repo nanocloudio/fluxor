@@ -5,8 +5,8 @@ the graph config, validated against the target's silicon and board
 definitions at build time, and brought up by the kernel from the packed
 binary config before any module is instantiated. Modules never name
 physical pins at runtime; they open HAL contracts (GPIO, SPI, I2C, UART,
-ADC, PWM, PIO) through `provider_open` and receive resources the config
-assigned to them.
+ADC, PWM, and on RP the PIO engine) through `provider_open` and receive
+resources the config assigned to them.
 
 The pieces:
 
@@ -21,9 +21,9 @@ The pieces:
 - **Config validation** (`tools/src/board.rs`,
   `tools/src/config/validate.rs`) — checks the YAML `hardware:` section
   against the resolved target and packs the binary hardware section.
-- **Runtime bring-up** (`src/platform/rp/config.rs`) — parses the binary
-  section into `HardwareConfig` and initialises buses and pins into a
-  `HardwareContext` before graph start.
+- **Runtime bring-up** (`src/platform/rp/config.rs`, `src/platform/rp.rs`)
+  — decodes the binary section into `HardwareConfig`, re-checks it as a
+  resource plan, and brings up pins and buses before graph start.
 
 `fluxor inspect` lists every available target.
 
@@ -100,11 +100,11 @@ Recognised arrays and their fields:
 
 | Array | Fields | Defaults |
 |---|---|---|
-| `spi` | `bus`, `miso`, `mosi`, `sck`, `freq_hz` | `freq_hz` 400000 |
-| `i2c` | `bus`, `sda`, `scl`, `freq_hz` | `freq_hz` 100000 |
-| `uart` | `bus`, `tx_pin`, `rx_pin`, `baudrate` | `baudrate` 115200 |
-| `gpio` | `pin`, `direction`, `pull`, `initial`, `owner` | `direction` output, `pull` none, `initial` high |
-| `pio` | `pio_idx`, `data_pin`, `clk_pin`, `extra_pin` | — |
+| `spi` | `bus`, `miso`, `mosi`, `sck`, `freq_hz` | `bus` 0, `miso` 16, `mosi` 19, `sck` 18, `freq_hz` 400000 |
+| `i2c` | `bus`, `sda`, `scl`, `freq_hz` | `bus` 0, `sda` 4, `scl` 5, `freq_hz` 100000 |
+| `uart` | `bus`, `tx_pin`, `rx_pin`, `baudrate` | `bus` 0, `tx_pin` 0, `rx_pin` 1, `baudrate` 115200 |
+| `gpio` | `pin`, `direction` (`output`/`input`), `pull` (`none`/`up`/`down`), `initial` (`high`/`low`), `owner` | `direction` output, `pull` none, `initial` high |
+| `pio` | `pio_idx`, `data_pin`, `clk_pin`, `extra_pin` | `extra_pin` 255 (unused) |
 
 `gpio.owner` names a module; the kernel grants the pin to that module at
 instantiation (`owner_module_id` in the packed record). An unknown owner
@@ -112,22 +112,26 @@ name is a build error.
 
 ## Validation rules
 
-Source: `tools/src/board.rs`.
+Source: `tools/src/board.rs` (`validate_config`),
+`tools/src/config/validate.rs` (`build_hardware_section`).
 
 Every `fluxor build` runs these checks against the resolved target:
 
-1. **Pin range** — every pin is within the board's `max_pin`.
-2. **Reserved pins** — a reserved pin is rejected, with the board's
+1. **Bus and block exist** — an `spi`/`i2c` `bus` or a `pio` `pio_idx`
+   past the silicon's count is rejected.
+2. **Pin range** — every pin is within the board's `max_pin`.
+3. **Reserved pins** — a reserved pin is rejected, with the board's
    recorded reason.
-3. **Pin function** — SPI/I2C/UART pin tuples must be a valid combination
+4. **Pin function** — SPI and I2C pin tuples must be a valid combination
    for the named bus per the silicon definition
-   (`is_valid_spi_pins` and friends).
-4. **Conflicts** — no pin is used twice across `hardware:` arrays and
-   module pin references.
-5. **Counts** — per-family limits on bus and pin entries (see below).
+   (`is_valid_spi_pins`, `is_valid_i2c_pins`).
+5. **Conflicts** — no pin is used twice across the `hardware:` `spi`,
+   `i2c` and `gpio` arrays.
+6. **Counts** — per-family limits on entries (see below).
 
-Diagnostics are deterministic and name the offending config path
-(`hardware.spi[0].miso`, `modules[2].cs_pin`).
+UART entries are checked for pin range only. Pins a module names in its
+parameters (`cs_pin`) are not part of these checks. Diagnostics are
+deterministic and name the offending entry (`hardware.spi[0]: …`).
 
 ## Binary hardware section
 
@@ -146,33 +150,41 @@ header (6 bytes): spi_count, i2c_count, gpio_count, pio_count, max_gpio, uart_co
 spi   × spi_count  (8 bytes): bus, miso, mosi, sck, freq_hz (u32 LE)
 i2c   × i2c_count  (8 bytes): bus, sda, scl, reserved, freq_hz (u32 LE)
 uart  × uart_count (8 bytes): bus, tx_pin, rx_pin, reserved, baudrate (u32 LE)
-gpio  × gpio_count (5 bytes): pin, flags, initial, owner_module_id, reserved
+gpio  × gpio_count (5 bytes): pin, flags, initial, owner_module_id (u16 LE)
 pio   × pio_count  (4 bytes): pio_idx, data_pin, clk_pin, extra_pin
 ```
 
 GPIO `flags`: bit 0 direction (0 = input, 1 = output), bits 1–2 pull
 (0 = none, 1 = up, 2 = down). `owner_module_id` is the owning module's
-index, `0xFF` for kernel-owned.
+index, `0xFFFF` for kernel-owned. `extra_pin` `0xFF` means unused;
+`max_gpio` 0 means the default part (30 pins).
 
-The RP platform enforces the same count ceilings when parsing
-(`src/platform/rp/config.rs`): `MAX_SPI_BUSES = 2`, `MAX_I2C_BUSES = 2`,
-`MAX_UART_BUSES = 2`, `MAX_GPIO_CONFIGS = 8`, `MAX_PIO_CONFIGS = 3`.
-A section whose counts exceed them is rejected at boot.
+The composer and the RP platform hold the same count ceilings: two SPI,
+two I2C and two UART entries, eight GPIO and three PIO
+(`MAX_SPI_BUSES`, `MAX_I2C_BUSES` in `src/kernel/boot/config.rs`;
+`MAX_UART_BUSES`, `MAX_GPIO_CONFIGS`, `MAX_PIO_CONFIGS` in
+`src/platform/rp/config.rs`). A section whose counts exceed them, or
+whose length disagrees with its counts, is refused at admission, and
+with it the config: nothing is clamped.
 
 ## Runtime bring-up
 
-Source: `src/platform/rp/config.rs`.
+Source: `src/platform/rp/config.rs` (`decode_hardware`, `resolve`),
+`src/platform/rp.rs` (`rp_boot_hardware`).
 
 The RP platform decodes the section into `HardwareConfig`
-(fixed-size `Option` arrays per bus family). Platform bring-up walks it
-to initialise SPI/I2C/UART buses and register GPIO pins into a
-`HardwareContext` before module instantiation, so a module's first
-`provider_open` finds its bus already configured. There are no hardcoded
-pin assignments in the kernel — everything flows from the validated
-config blob.
+(fixed-size `Option` arrays per bus family) and resolves it into a
+resource plan, re-checking pin range, SPI/I2C pin combinations and pin
+or PIO conflicts; a plan that fails halts boot with the conflict named.
+Bring-up then walks the plan before module instantiation: SPI and I2C
+buses are marked available (the bus driver module initialises the
+peripheral), GPIO pins are configured, and PIO pins are routed to their
+block. There are no hardcoded pin assignments in the kernel — everything
+flows from the validated config.
 
 Modules then access hardware exclusively through HAL contracts
-(`crates/fluxor-abi/src/contracts/hal/`), dispatched via `provider_open` /
+(`crates/fluxor-abi/src/contracts/hal/`; the RP PIO engine in
+`crates/fluxor-abi/src/platform/rp/pio.rs`), dispatched via `provider_open` /
 `provider_call`; see [abi_layers.md](abi_layers.md) for the contract
 inventory and [hal_architecture.md](hal_architecture.md) for the backend
 model. A module's parameters carry logical references (`spi_bus`,

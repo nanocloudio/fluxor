@@ -1,9 +1,9 @@
 # Publishing fluxor artefacts
 
 This guide is for fluxor maintainers: "I just edited fluxor, how do
-I get my changes into downstream projects?" If you are on the
-consumer side trying to use fluxor in your own project, see that
-project's own `docs/consuming_fluxor.md` (or equivalent).
+I get my changes into downstream projects?" A consuming project's side —
+`[dependencies]`, references and pins — is in
+[project-layout.md](project-layout.md).
 
 Source: `tools/src/store_publish.rs`, `tools/src/oci_store.rs`,
 `tools/src/store_sync.rs`, `tools/src/store_resolve.rs`,
@@ -12,7 +12,7 @@ Source: `tools/src/store_publish.rs`, `tools/src/oci_store.rs`,
 ## The short version
 
 ```sh
-make build     # the tools crate (debug) and the fmods for every `[ci].targets` silicon
+make build     # the cargo workspace (debug) and the fmods for every `[ci].targets` silicon
 make publish   # fluxor publish
 ```
 
@@ -73,14 +73,14 @@ published.
 Every stack and workload package is checked before anything is written. A stack that
 does not parse, declares no `version`, is not at
 `packaging/stack/<name>.yaml`, or composes a module that is neither the
-project's own, nor pinned, nor a kernel built-in, and a workload package whose source
+project's own, nor pinned, nor a native module, and a workload package whose source
 manifest or graph does not check, refuse the publish with the reason; none
 is skipped. `fluxor publish --dry-run` prints the displacement report and
 lists every stack and workload package the sweep would publish, and writes nothing.
 `--store <dir>` publishes the sweep into another store.
 
 `fluxor publish --only <kind>` scopes the publish to a subset of
-artefact kinds (`source`, `fmod`, `runtime`, `stack`, `bundle` for workload
+artefact kinds (`source`, `fmod`, `runtime`, `stack`, `package` for workload
 packages). Only the
 chosen kinds' tags move; the project index is rewritten over them plus the
 project's other artefacts already in the store.
@@ -89,7 +89,7 @@ Only fluxor publishes runtimes; the `fluxor/run/` namespace is
 reserved. A sibling "runtime" is a graph on `fluxor-linux`.
 
 One workload package publishes on its own with
-`fluxor publish bundle <packaging/…/workload.toml | dir>`: it emits the
+`fluxor publish package <packaging/…/workload.toml | dir>`: it emits the
 package, carries the `.fmod` of every module it pins, and adds it to the
 project index in one transaction. Workload packages and their params are
 covered in [workload-packages.md](workload-packages.md).
@@ -101,7 +101,7 @@ to the project index as `stack/<name>:<version>`. See
 [../architecture/stacks.md](../architecture/stacks.md).
 
 A consumer never pins a stack or a workload package by hand: a graph that includes a
-stack by name, and a workload package listed under `[uses] bundles`, are references,
+stack by name, and a workload package listed under `[uses] packages`, are references,
 and `fluxor update` pins each from the dependency that publishes it (with a
 stack's module references); a stack bound under `[uses.stacks]` is pinned
 from whichever project index publishes it; an update pins exactly the
@@ -195,7 +195,7 @@ every consumer, whether or not a single module had changed — which is
 why it is not.
 
 `fluxor publish` records every project artefact as `local-build`;
-only `fluxor publish bundle --published` records `published`.
+only `fluxor publish package --published` records `published`.
 `local-build` is ordinary dev flow: every publish is a real,
 consumable store write, distinguished by its provenance record, not
 by filename or a separate shelf.
@@ -268,7 +268,8 @@ make install
 ```
 
 Bootstrap only — the first build on an empty-store machine. It
-builds the CLI, the launcher, the rig observers and `fluxor-linux`,
+builds the CLI, the launcher, the rig observers, `fluxor-linux` and the
+wasm kernel,
 publishes the runtimes (`fluxor publish --only runtime`), installs
 the launcher at `$BINDIR/fluxor` (default `$CARGO_HOME/bin`, else
 `~/.cargo/bin`; it resolves `:latest` and execs the content-addressed

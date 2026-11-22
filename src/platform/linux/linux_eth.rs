@@ -1,4 +1,4 @@
-// linux_eth built-in — a Linux network interface as the Ethernet frame
+// linux_eth native module — a Linux network interface as the Ethernet frame
 // driver under `ip`, so the module's own TCP/IP stack runs on the hosted
 // runtime exactly as it does over a NIC on bare metal. Frames cross both
 // ports as the records every frame driver exchanges with `ip`,
@@ -19,8 +19,8 @@
 //
 // `mac` overrides either. A frame `frames_rx` has no room for is dropped and
 // counted, as a NIC drops on a full ring; so is one longer than
-// `ETH_FRAME_MAX` either way, never truncated. The interface is the boot
-// graph's to name: built-ins are constructed only from the runtime's own
+// `ETH_FRAME_MAX` either way, never truncated. The interface is the node
+// graph's to name: native modules are constructed only from the runtime's own
 // configuration, and the reach is the runtime process's — its network
 // namespace and the capabilities it holds there. The descriptor is
 // close-on-exec, so no host-process workload the runtime starts inherits
@@ -314,7 +314,7 @@ unsafe extern "C" fn linux_eth_step(state: *mut u8) -> i32 {
     0
 }
 
-/// Construct a `linux_eth` built-in on the interface its `ifname` names.
+/// Construct a `linux_eth` native module on the interface its `ifname` names.
 fn build_linux_eth(module_idx: usize, params: &[u8]) -> Result<Box<LinuxEthState>, i32> {
     let mut ifname = String::new();
     let mut mac = String::new();
@@ -355,7 +355,7 @@ fn build_linux_eth(module_idx: usize, params: &[u8]) -> Result<Box<LinuxEthState
     };
     let mac = eth_parse_mac(&mac).unwrap_or(own_mac);
     log::info!(
-        "[inst] module {module_idx} = linux_eth (built-in) ifname='{ifname}' mode={} fd={fd} rx={rx_out} tx={tx_in}",
+        "[inst] module {module_idx} = linux_eth (native) ifname='{ifname}' mode={} fd={fd} rx={rx_out} tx={tx_in}",
         if packet { "packet" } else { "tap" }
     );
     let st = Box::new(LinuxEthState {

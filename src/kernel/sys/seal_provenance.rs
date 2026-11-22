@@ -14,9 +14,9 @@
 /// is worth on it.
 ///
 /// This is the whole reason persistence cannot be read as raising a vault's
-/// isolation tier. A key sealed under something the host can also read
+/// custody. A key sealed under something the host can also read
 /// survives a restart and protects nothing from the host, which is exactly
-/// what `tier::SOFTWARE` already says. The variants exist so that fact is
+/// what `custody::SOFTWARE` already says. The variants exist so that fact is
 /// carried rather than assumed either way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SealProvenance {
@@ -26,12 +26,12 @@ pub enum SealProvenance {
     /// A key derived from material the host can also read — a file, an
     /// environment variable, a fixed constant. Sealing works: the blob is
     /// opaque to a compromised MODULE. It is not opaque to a compromised
-    /// HOST, so the vault's tier stays `SOFTWARE`.
+    /// HOST, so the vault's custody stays `SOFTWARE`.
     HostReadable,
     /// A key bound to this device and not extractable from it — fuses, OTP,
     /// a TPM's storage root. Sealing here isolates against host compromise
     /// to the extent the hardware does, and only this variant may raise the
-    /// tier.
+    /// custody.
     DeviceUnique,
 }
 
@@ -44,10 +44,10 @@ pub enum SealProvenance {
 /// or mis-addressed read looks like?**
 ///
 /// Getting that wrong is the single most expensive mistake in this file.
-/// `DeviceUnique` is the only variant that RAISES a vault's tier, and the
-/// tier is what a consumer's `tier >= DEVICE_HW` refusal reads — so a
+/// `DeviceUnique` is the only variant that RAISES a vault's custody, and the
+/// custody is what a consumer's `custody >= DEVICE_HW` refusal reads — so a
 /// platform that claims it wrongly converts a fail-closed refusal into a
-/// silent pass, and every consumer checking `tier >= DEVICE_HW` believes
+/// silent pass, and every consumer checking `custody >= DEVICE_HW` believes
 /// keys are hardware-protected when they are not.
 ///
 /// So the key is not believed on its own: it must be preceded by this
@@ -110,7 +110,7 @@ pub fn provenance_from_hardware_key(read_ok: bool, blob: &[u8]) -> SealProvenanc
     // others — and OTP is blown ROW BY ROW, so an interrupted provisioning
     // run leaves some rows programmed and the rest degenerate. A whole-key
     // check misses that: magic plus two real rows plus five zero rows is
-    // "not all zero" while carrying a fraction of the entropy the tier
+    // "not all zero" while carrying a fraction of the entropy the custody
     // claims. So the check is per row, over EVERY row of the key material:
     // any all-zero or all-one row is a provisioning failure worth failing
     // closed on. The false-reject cost on a genuinely random key is

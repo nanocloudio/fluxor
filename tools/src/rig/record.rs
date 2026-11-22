@@ -210,21 +210,21 @@ pub fn hash_artifact_file(path: &Path) -> Result<String> {
     Ok(crate::hash::hex(&hasher.finalize()))
 }
 
-/// Artifact digest for a multi-file bundle.
+/// Artifact digest for a multi-file directory.
 ///
-/// Deterministic because the bundle is canonicalised before it is hashed:
-/// entries sorted by path relative to the bundle root, each emitted as
+/// Deterministic because the directory is canonicalised before it is hashed:
+/// entries sorted by path relative to the directory root, each emitted as
 /// `len(path)||path||len(content)||content`, concatenated and SHA-256'd. The
-/// lengths are what stop two different bundles colliding — without them,
+/// lengths are what stop two different directories colliding — without them,
 /// moving a byte from the end of a path to the start of its content would
 /// hash identically.
 ///
 /// Only regular files are included; symlinks and special files are
 /// ignored, and directories are walked.
-pub fn hash_artifact_bundle(root: &Path) -> Result<String> {
+pub fn hash_artifact_dir(root: &Path) -> Result<String> {
     if !root.is_dir() {
         return Err(Error::Config(format!(
-            "run record: bundle root {} is not a directory",
+            "run record: artifact root {} is not a directory",
             root.display()
         )));
     }
@@ -236,7 +236,7 @@ pub fn hash_artifact_bundle(root: &Path) -> Result<String> {
     for (rel, abs) in &entries {
         let bytes = std::fs::read(abs).map_err(|e| {
             Error::Config(format!(
-                "run record: reading bundle entry {}: {e}",
+                "run record: reading artifact entry {}: {e}",
                 abs.display()
             ))
         })?;
@@ -496,9 +496,9 @@ regex = "kernel\\.img$"
     }
 
     #[test]
-    fn bundle_hash_is_stable_across_dir_walk_order() {
+    fn dir_hash_is_stable_across_dir_walk_order() {
         let _scratch = tempfile::Builder::new()
-            .prefix("fluxor-rig-bundle-")
+            .prefix("fluxor-rig-dir-")
             .tempdir()
             .unwrap();
         let tmp = _scratch.path();
@@ -507,14 +507,14 @@ regex = "kernel\\.img$"
         std::fs::write(tmp.join("sub/b.bin"), b"bbb").unwrap();
         std::fs::write(tmp.join("c.bin"), b"ccc").unwrap();
 
-        let h1 = hash_artifact_bundle(tmp).unwrap();
+        let h1 = hash_artifact_dir(tmp).unwrap();
         // Perturb: add and remove a file that shouldn't change the hash
         // after being removed.
         std::fs::write(tmp.join("temp.bin"), b"xxx").unwrap();
-        let h_with = hash_artifact_bundle(tmp).unwrap();
+        let h_with = hash_artifact_dir(tmp).unwrap();
         assert_ne!(h1, h_with);
         std::fs::remove_file(tmp.join("temp.bin")).unwrap();
-        let h_after = hash_artifact_bundle(tmp).unwrap();
+        let h_after = hash_artifact_dir(tmp).unwrap();
         assert_eq!(h1, h_after);
 
         let _ = std::fs::remove_dir_all(tmp);

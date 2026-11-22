@@ -1,6 +1,9 @@
 # wifi Module
 
-WiFi Connect PIC Module
+Sequences WiFi association through the `cyw43` driver, over FMP commands
+on `wifi_ctrl` and status events on `status` and `netif_state`. With an
+`ssid` it sends `connect` and waits for the link; without one it sends `scan`
+and logs the results from `scan_data`.
 
 ## Files
 
@@ -8,40 +11,20 @@ WiFi Connect PIC Module
 - `mod.rs`
 - `constants.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `status` | input | `FmpMessage` |  |
+| `scan_data` | input | `OctetStream` |  |
+| `netif_state` | input | `FmpMessage` |  |
+| `wifi_ctrl` | output | `FmpMessage` |  |
 
-[[ports]]
-name = "status"
-direction = "input"
-content_type = "FmpMessage"
-
-[[ports]]
-name = "scan_data"
-index = 1
-direction = "input"
-content_type = "OctetStream"
-
-[[ports]]
-name = "wifi_ctrl"
-direction = "output"
-content_type = "FmpMessage"
-
-[commands]
-accepts = ["radio_ready", "connected", "disconnected", "scan_done", "scan_result"]
-emits = ["connect", "disconnect", "scan"]
-```
+Builds for: `rp2040`, `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
-- `password`
-- `security`
-- `ssid`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01
+- `ssid` (str, up to 32 bytes).
+- `password` (str, up to 64 bytes).
+- `security` (enum `open`, `wpa`, `wpa2`, `wpa3`; default `wpa3`). `wpa` is
+  sent to the driver as WPA2.

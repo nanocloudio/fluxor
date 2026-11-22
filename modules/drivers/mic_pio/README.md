@@ -8,30 +8,16 @@ Microphone Source PIC Module (I2S RX via PIO)
 - `mod.rs`
 - `pio.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `audio` | output | `AudioSample` |  |
 
-[[ports]]
-name = "audio"
-direction = "output"
-content_type = "AudioSample"
-
-[[resources]]
-requires_contract = "pio"
-access = "read"
-instance = 0
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
 - `clock_base`
 - `in_pin`
 - `sample_rate`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

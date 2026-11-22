@@ -7,27 +7,14 @@ Gesture PIC Module
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `raw` | input | `OctetStream` | required |
+| `commands` | output | `FmpMessage` | required |
 
-[[ports]]
-name = "raw"
-direction = "input"
-content_type = "OctetStream"
-required = true
-
-[[ports]]
-name = "commands"
-direction = "output"
-content_type = "FmpMessage"
-required = true
-
-[commands]
-emits = ["next", "prev", "toggle", "select", "long_press", "on", "off"]
-```
+Builds for: `rp2350`, `bcm2712`, `wasm`, `linux`, `rp2040`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
@@ -38,8 +25,3 @@ emits = ["next", "prev", "toggle", "select", "long_press", "on", "off"]
 - `mode`
 - `multi_click_ms`
 - `triple_click`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

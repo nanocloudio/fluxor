@@ -144,8 +144,8 @@ const TICK_US_MAX: u32 = 50_000;
 const DEFAULT_HEARTBEAT_MS: u64 = 150;
 
 /// Effective tick_us when the config doesn't set one anywhere. Mirrors
-/// the platform domain-loop fallback (`tick_period_us = 1000` when
-/// `cfg_header_tick_us == 0`).
+/// the kernel's `DEFAULT_TICK_US`, which `scheduler::tick_us` answers when
+/// the config names no tick.
 const DEFAULT_TICK_US: u32 = 1000;
 
 /// Hard absolute cap on a single module's burst deadline. The burst
@@ -1548,12 +1548,12 @@ fn resolve_domain_id(module: &Value, config: &Value) -> Result<u8> {
     )))
 }
 
-/// Load a built-in module's manifest from the source tree and
+/// Load a native module's manifest from the source tree and
 /// synthesize a `ParamSchema` from its `[[params]]` declarations.
 /// Returns `None` when the manifest doesn't exist, isn't marked
-/// built-in, or declares no params. Repeated lookups share a
+/// native module, or declares no params. Repeated lookups share a
 /// per-process cache via `Manifest::from_source_tree`.
-fn load_builtin_param_schema(
+fn load_native_param_schema(
     module_type: &str,
 ) -> Option<(crate::manifest::Manifest, schema::ParamSchema)> {
     let m = crate::manifest::Manifest::from_source_tree(module_type).ok()??;
@@ -1564,7 +1564,7 @@ fn load_builtin_param_schema(
     Some((m, s))
 }
 
-/// Any YAML key on a built-in module entry that the schema does not know
+/// Any YAML key on a native module entry that the schema does not know
 /// is rejected: a PIC module ignores a key it does not know, so the
 /// manifest is the contract and a typo would otherwise silently use the
 /// default. Structural metadata (name, type, …) is skipped.
@@ -1992,7 +1992,7 @@ fn stack_param_skew(module: &Value, module_name: &str, param: &str) -> Option<St
 
 /// Reject any YAML key on a module entry that the schema doesn't know
 /// about. Hard-fails for both `.fmod` modules (schema embedded in the
-/// .fmod) and built-ins (schema in `manifest.toml [[params]]`).
+/// .fmod) and native modules (schema in `manifest.toml [[params]]`).
 ///
 /// The candidate-name check mirrors `build_params_from_schema`'s
 /// flattening: nested objects expand to dotted/underscored variants,
@@ -2226,7 +2226,7 @@ fn validate_param_ranges(
 /// default that the YAML didn't supply. Honours the transparent
 /// `params: { ... }` wrapper — values inside it are picked up first.
 /// Result: every declared param has a value (YAML override or default),
-/// so the packer emits a TLV entry for each one and built-ins don't
+/// so the packer emits a TLV entry for each one and native modules don't
 /// need to re-encode defaults in code.
 fn inject_manifest_defaults(module: &Value, manifest: &crate::manifest::Manifest) -> Value {
     let mut clone = module.clone();
@@ -2781,15 +2781,15 @@ fn build_module_entry_in(
     // schema params (e.g. `broker: "host:port"` in mqtt). Expand them
     // into the flat fields the schema knows about before packing.
     let normalized_module = expand_compound_yaml_fields(type_name, module, config);
-    // PIC modules embed their schema in the `.fmod`; built-ins declare
+    // PIC modules embed their schema in the `.fmod`; native modules declare
     // it in `modules/platform/<platform>/<name>/manifest.toml`. Both
     // paths produce a `ParamSchema` and feed the same TLV packer, so
     // the wire format is identical at the kernel boundary.
     //
     // `?` propagates only the pinned-but-unresolvable case, which is a hard
     // error (sibling of `assert_pinned_manifests_resolvable`). "No `.fmod`
-    // schema" stays `Ok(None)` and falls through to the built-in path — a
-    // built-in is never pinned and has no `.fmod`.
+    // schema" stays `Ok(None)` and falls through to the native path — a
+    // native module is never pinned and has no `.fmod`.
     let pic_schema = schema::load_schema_for_entry(module, type_name, loc)?;
     // On a module whose schema declares `trust` (tls, quic) the key is a
     // trust-anchor source spec: validated against the schema with the
@@ -2825,12 +2825,12 @@ fn build_module_entry_in(
             type_name,
         )
         .map_err(|e| out_of_room_or(out_of_room, e))?;
-    } else if let Some((manifest, param_schema)) = load_builtin_param_schema(type_name) {
+    } else if let Some((manifest, param_schema)) = load_native_param_schema(type_name) {
         validate_yaml_params(module, &param_schema, type_name)?;
         validate_param_ranges(module, &manifest, type_name)?;
         validate_required_params(module, &manifest, type_name)?;
         // Inject manifest defaults into a YAML clone so every declared
-        // param produces a TLV entry. The built-in's step function
+        // param produces a TLV entry. The native module's step function
         // reads values straight off the wire, with no defaults
         // duplicated in Rust.
         let module_with_defaults = inject_manifest_defaults(packed_module, &manifest);
@@ -3676,13 +3676,13 @@ fn check_verify_uri(uri: &str) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
 
-    /// A ranged built-in param is checked at the value the packer reads:
+    /// A ranged native param is checked at the value the packer reads:
     /// past `u32` it is not wrapped into range, a numeric string (what a
     /// stack's `user:` source resolves to) is checked like a number, and a
     /// negative or non-numeric value is refused.
     #[test]
     fn a_ranged_param_is_checked_at_its_whole_value() {
-        let (manifest, _) = load_builtin_param_schema("linux_net").expect("linux_net manifest");
+        let (manifest, _) = load_native_param_schema("linux_net").expect("linux_net manifest");
         let check =
             |v: Value| validate_param_ranges(&json!({ "max_conns": v }), &manifest, "linux_net");
         for ok in [json!(2), json!(65535), json!("128"), json!("0x80")] {

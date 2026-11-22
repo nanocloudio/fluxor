@@ -147,7 +147,7 @@ pub fn module_entries(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
         .collect())
 }
 
-/// The fan module types a config's graphs run (`tee`, `merge`) — its base
+/// The fan module types a config's graphs run (`tee`, `merge`) — its node
 /// graph's and its resident workloads' — which its image's module table must
 /// carry.
 pub fn fan_types(data: &[u8]) -> Result<Vec<&'static str>> {

@@ -20,9 +20,8 @@ in whole instead of writing out. There are two ways a stack enters a graph:
 | Reached through | the ports its variant injects | its named `exports:` |
 | Distributed as | part of fluxor's catalog | an OCI artifact, `stack/<name>:<version>` |
 
-A platform stack answers "what substrate does this board need": the `net`
-stack is `virtio_net + ip` on qemu-virt and `rp1_gem + conn_guard + ip` on
-a Pi 5, under one unchanged node graph. A published stack answers
+A platform stack answers "what substrate does this board need"
+([Platform stacks](#platform-stacks)). A published stack answers
 "how is this subsystem composed": a storage node, a store replica, a
 broker, shaped once by the project that owns it and instantiated by any
 graph that wants one.
@@ -53,11 +52,14 @@ three different substrate stacks under one unchanged node graph.
 Board defaults (e.g. `net → {phy: wifi, nic: cyw43}`) come from the target
 descriptor, so most configs need only name the stack.
 
-Module params inside a stack resolve through chained sources: `env:VAR`
-(environment), `user:KEY` (merged user platform fields), `host:PATH`
-(`~/.config/fluxor/host.toml`), or a literal. The first source that
-resolves wins; a trailing `|required` turns "nothing resolved" into a
-build-time error so safety-critical params cannot fall back silently.
+Module params inside a stack resolve through `|`-chained sources:
+`env:VAR` (environment), `user:KEY` (merged user platform fields),
+`host:PATH` (a dotted path into the host config: `$FLUXOR_HOST_CONFIG`,
+else `$XDG_CONFIG_HOME/fluxor/host.toml`, `~/.config` when that is
+unset), or a literal. The first source that resolves wins. A `required`
+token turns "nothing resolved" into a build-time error, so
+safety-critical params cannot fall back silently; a `warn` token only
+reports it.
 
 A project may override one platform stack by carrying its own
 `stacks/<name>.toml`; every other name resolves to fluxor's catalog. The
@@ -250,8 +252,7 @@ An include entry carries `stack`, `as`, and optionally `params` and
 - **`stack`** is a bound name when it begins with `@`
   ([Bound names](#bound-names)). Otherwise it is a file path when it
   contains `/` or ends in `.yaml` or `.yml`, and is resolved against the
-  including graph's directory. This is how tests and examples include
-  fixtures. Otherwise it is a stack name: the project's own
+  including graph's directory. Otherwise it is a stack name: the project's own
   `packaging/stack/<name>.yaml`, else the stack its `fluxor.lock` pins
   under that name ([References](#references)).
 - **`as`** is `[a-z][a-z0-9_]*`. It names the instance. It must differ from
@@ -582,7 +583,7 @@ checks each one as the publish does. A stack document anywhere else is not
 published; a graph may still include it by path. Each stack is checked
 before anything is written: a document that does not parse, declares no
 `version`, is not at `packaging/stack/<name>.yaml`, or composes a module
-that is neither the project's own, nor pinned, nor a kernel built-in
+that is neither the project's own, nor pinned, nor a kernel native module
 refuses the whole sweep.
 
 One stack publishes on its own with:
@@ -600,7 +601,7 @@ The publish:
 2. Resolves the stack's module references through the publishing
    project. For each distinct module type, it takes the project's own
    published modules (`<project>/meta:latest`), every target, or, failing
-   that, the module pins of the project's `fluxor.lock`. A kernel built-in
+   that, the module pins of the project's `fluxor.lock`. A kernel native module
    needs no reference. A type that resolves neither way is refused, because
    the stack would name a module no consumer could find.
 3. Publishes one OCI artifact, kind `stack`, tagged

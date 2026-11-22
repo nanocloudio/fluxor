@@ -1,8 +1,8 @@
 # Graph Pipeline Architecture
 
-The kernel loads PIC modules into a runtime graph, opens channels
-between them, and its domain loops step them cooperatively in
-topological order. This
+The kernel loads modules into a runtime graph, opens channels
+between them, and its domain loops step them cooperatively in the
+composer's order (producers before consumers). This
 document describes the runtime model, the channel mechanics, the
 execution loop, and the lifecycle of modules and graphs.
 
@@ -24,14 +24,14 @@ Config (flash or firmware image)          Runtime
 --------------------------------          -------
 modules[]   ───────────────────►  ModuleSlot[] (state, hints, caps)
 edges[]     ───────────────────►  Edge[] with channel handles
-domains[]   ───────────────────►  Per-domain tick budget
+domains[]   ───────────────────►  Per-domain exec mode, cadence, budget
             ───────────────────►  setup() → graph instantiation → domain loop
 ```
 
 A graph is a set of module instances and a set of directed edges that
 connect them. Each module is a `.fmod` artefact loaded from flash. Each
 edge becomes a kernel-allocated channel ring buffer. Each domain loop
-steps its domain's instantiated modules each pass, in topological order, until
+steps its domain's instantiated modules each pass, in the composer's order, until
 the graph reaches a terminal state, encounters a fault, or is asked to
 reconfigure.
 
@@ -51,7 +51,7 @@ stacks (see [capability_surface.md](capability_surface.md)).
 - `modules` — application module instances and their parameters
 - `wiring` — directed edges between module ports
 - `data` — optional inline assets referenced by modules
-- `execution` — optional per-domain tick periods and core assignments
+- `execution` — optional domains: each one's exec mode and cadence (see [scheduler.md](scheduler.md#where-the-execution-mode-is-declared))
 - `reconfigure` — optional drain timeout and policy
 
 ### Wiring
@@ -72,9 +72,13 @@ against the source and destination modules' manifests.
 
 ### Topology Rules
 
-- Graph execution order is topological (producers before consumers)
-- Fan-out and fan-in are represented as runtime helpers (tee/merge)
-- Cycles require explicit buffering and are an advanced pattern
+- The stepping order is the composer's breadth-first topological order
+  over the edges (producers before consumers), projected onto each domain
+- Fan-out and fan-in become `tee` and `merge` modules the composer inserts
+  (see [Tee and Merge](#tee-and-merge))
+- A cycle refuses the graph unless the config sets
+  `scheduler.accept_cycles`; then its members step after the rest, in index
+  order
 
 ### Inline Data Assets
 
@@ -142,8 +146,8 @@ scheduler re-steps a bursting module under a burst deadline: either the
 module's manifest-declared burst deadline, or the per-step deadline
 multiplied by a fixed burst multiplier. Between burst iterations the
 scheduler also checks the domain budget, so a single bursting module
-cannot consume the whole tick. `MAX_BURST_STEPS` in
-`src/kernel/exec/scheduler/mod.rs` bounds the iteration count as a
+cannot consume the whole tick. `MAX_BURST_STEPS` (16384) in
+`src/kernel/exec/scheduler/pass.rs` bounds the iteration count as a
 final safety valve.
 
 `Ready` participates in the deferred-ready chain: a module that exports
@@ -187,36 +191,25 @@ expressed as start/poll pairs.
 Source: `src/kernel/exec/scheduler/pass.rs`, `src/platform/rp.rs`,
 `src/kernel/exec/domains/mod.rs`
 
-Every target's loop drives the one pass engine, `pass::run(domain,
-PassKind::Tick | PassKind::Wake(&mask))`, which returns the pass's result,
-the domain's next sleep deadline and whether work is still bursting. A
-single-core loop runs every domain in order:
+Every target's loop drives the one pass engine; [scheduler.md](scheduler.md#passes)
+describes the passes and [events.md](events.md#scheduler-wake-integration)
+the loop around them. A single-core loop (RP, Linux, wasm) runs a tick
+pass over every domain, then a wake pass for what the tick latched, then
+sleeps until the pass's deadline or a wake, then runs a wake pass again; a
+domain loop on its own core (bcm2712, uefi) does the same for its one
+domain.
 
-```
-loop {
-    poll_gpio_edges();                     // GPIO/IRQ → event signals
-    let pass = pass::tick_all();           // tick pass, every domain in order
-    pass::wake_all();                      // intra-tick wake from events
-    sleep_until(pass.deadline_us, wake);   // pacer deadline or an event
-    pass::wake_all();                      // post-sleep wake from ISR
-}
-```
-
-A domain loop on its own core runs `pass::run(d, PassKind::Tick)` and
-then a wake pass over `pass::take_domain_wakes(d)` for its one domain.
-
-The "sleep until tick or event" step differs by target:
+The sleep differs by target:
 
 | Target | Sleep mechanism |
 |--------|----------------|
 | RP2040, RP2350 | Deadline alarm against the scheduler wake (WFE, woken by SEV) via `wait_for_wake` |
-| BCM2712 (Pi 5) | Synchronous wait on the chip's monotonic timer with interrupt unmasking |
+| BCM2712, UEFI | Each domain loop arms its core's timer at the pass's deadline and waits in WFI for it or another interrupt |
 
-In both cases an event signal from an ISR or another module wakes the
+In every case an event signal from an ISR or another module wakes the
 loop early: the sleep is bounded above by the deadline the tick pass
 returned (the graphs' pacers, bounded by the domain's armed timers) but
-can return immediately when there is work to do. See
-[events.md](events.md) for the event/wake contract.
+returns at once when there is work to do.
 
 ## Channel-Based IPC
 
@@ -235,10 +228,10 @@ if ready & POLL_IN != 0 {
 ```
 
 A channel is a ring buffer between exactly one producer and one
-consumer. Fan-out and fan-in are handled by tee/merge helper modules
-inserted by the composer when wiring requires them: at boot for the graph,
-and when a workload's subgraph is staged at runtime for the ports of that
-subgraph's own modules, by the same rules. The kernel allocates
+consumer. Fan-out and fan-in are handled by `tee`/`merge` modules
+the composer inserts when wiring requires them: at build time for a
+node graph, and when a workload's graph is composed for the ports of that
+graph's own modules, by the same rules. The kernel allocates
 channel buffers from a dedicated buffer arena, separate from module
 state, so that channel sizing does not compete with module memory.
 
@@ -285,9 +278,8 @@ buffer arena and the slack, and refuses a graph whose rings do not fit,
 naming the edges that take the most. The limit is the kernel profile's
 arena, or the graph's `capacity: { buffer_arena }` envelope where that is
 lower; every ring also takes a channel slot, counted against the
-profile's channel table or `capacity: { channels }`. The harness test
-`ring_demand` boots graphs through the kernel and pins the arena they use
-and the channels they open to that replay. Typical hint choices: a few
+profile's channel table or `capacity: { channels }`. The arena a booted
+graph uses and the channels it opens equal that replay. Typical hint choices: a few
 hundred bytes for control channels, 2048 bytes for PCM audio, several KiB
 for network frames, and tens of KiB for mailbox video frames — a ring
 sized to the records its edge carries.
@@ -409,31 +401,23 @@ it (a mailbox record left READY when the reader retires is dropped).
 
 #### Capability flags
 
-Each module participating in a mailbox chain declares its capabilities
-via header flags (`reserved[0]` in the `.fmod` header):
-
-| Bit | Name | Meaning |
-|-----|------|--------|
-| 0 | `mailbox_safe` | Module can consume from a mailbox channel |
-| 1 | `in_place_writer` | Module uses `ACQUIRE_INPLACE` to transform the record |
-| 2 | `deferred_ready` | Module needs init time before downstream may run |
-| 3 | `drain_capable` | Module exports `module_drain` for live reconfigure |
-| 4 | `isr_module` | Module defines `module_isr_entry` |
-| 5 | `wasm_payload` | Module body is a wasm payload |
-
-The pack tool detects the corresponding `module_*` export and sets the
-flag automatically. The loader uses these flags to validate that the
-config's mailbox chains are consistent; a module without
-`mailbox_safe` cannot appear in a `buffer_group` chain.
+A module in a mailbox chain declares what it can do there in its manifest
+(`mailbox_safe`, `in_place_writer`), carried as header flag bits (see
+[Header flags](module_architecture.md#header-flags)). A group's ring is
+aliased only into an edge whose consumer is `mailbox_safe`; any other
+member opens a mailbox of its own at the group's size, which later members
+alias. A reader needs `mailbox_safe`; a module that modifies the record in
+place needs both, and setup refuses a group with more than one
+`in_place_writer`.
 
 #### Constraints
 
 - At most one in-place transform per alias chain (the `processed` bit
   prevents double-processing)
-- No alias chain passes through a tee/merge helper. Over a port whose
+- No alias chain passes through a `tee` or `merge`. Over a port whose
   content type is `Framed` (or a port declared `framed = true`) the composer
-  gives every edge around the helper a `buffer_group` of its own, so each
-  is a mailbox and the helper moves one record per transfer; over any
+  gives every edge around the fan a `buffer_group` of its own, so each
+  is a mailbox and the fan moves one record per transfer; over any
   other port it clears `buffer_group` and the edges are FIFOs
 - Buffer sizing for grouped edges is the maximum of all port hints
   across the group, so the channel is large enough for the most
@@ -513,7 +497,7 @@ Source: `contracts/src/graph/plan.rs`, `modules/foundation/tee`,
 `modules/foundation/merge`
 
 When the wiring connects one output to multiple inputs, or multiple
-outputs to one input, the composer inserts a helper module:
+outputs to one input, the composer inserts a fan module:
 
 ```
 Config:                Runtime:
@@ -527,21 +511,23 @@ B → C                  B →
 
 Tee and merge are foundation modules (`tee`, `merge`) the composer
 adds to the composed graph and to the image's module table; each takes
-scratch from its own heap, sized to the largest ring beside it. They are
-not visible in the config, but the inserted instances do occupy module
-slots, so a heavily fanned graph consumes more of `MAX_MODULES` than its
-config lists.
+scratch from its own heap, sized to the largest ring beside it. Two fans
+are left out: a module with several inbound edges keeps its data inputs
+unmerged, and an output whose consumers are exactly the modules feeding
+the producer stays unteed. Fans are not visible in the config, but the
+inserted instances do occupy module slots, so a heavily fanned graph
+consumes more of the module table than its config lists.
 
-A helper always copies, and what it copies per transfer is set by the
+A fan always copies, and what it copies per transfer is set by the
 fanned port's content type. Over a byte stream it moves whatever is
 waiting. Over a length-prefixed type (`EthernetFrame`, `NetProto`) or a
 self-sizing one (`Telemetry`) it peeks the header and moves one whole
 frame, once every output has room for it. Over a `Framed` type, or a
-port declared `framed = true`, every edge around the helper is a mailbox
-of its own and the helper moves one record per transfer, taking it from
+port declared `framed = true`, every edge around the fan is a mailbox
+of its own and the fan moves one record per transfer, taking it from
 the input only once every output is free; a record larger than the
-fan scratch is a topology error the helper reports rather than retries.
-No alias chain passes through a helper: the mailboxes a record fan uses
+fan scratch is a topology error the fan reports rather than retries.
+No alias chain passes through a fan: the mailboxes a record fan uses
 are never shared, and over every other type `buffer_group` is cleared.
 
 ## Module Instantiation
@@ -557,8 +543,9 @@ PIC modules go through this sequence during graph setup:
    is refused
 4. **Allocate** — reserve state from the state arena
 5. **Heap** — the cap is the graph's per-instance `heap.arena_bytes`, else the
-   type's declared arena (the manifest's); a committed heap
-   is carved now, an elastic one as the module allocates
+   type's declared arena (the manifest's); a committed heap is carved whole
+   now, an elastic one commits its declared heap now and the room the graph
+   grants above it as the module allocates
 6. **Init** — call `module_init(syscalls)` once
 7. **New** — call `module_new(in, out, ctrl, params, params_len, state, state_size, syscalls)`.
    `params` points into the resident config blob itself (or a live add's
@@ -579,60 +566,52 @@ module proceeds.
 Modules that need dynamic allocation declare an arena (`module_facts!`'s
 `arena:`, written into the manifest), which the graph may resize per instance with
 `heap.arena_bytes`. The SDK helpers `heap_alloc`, `heap_free`,
-`heap_realloc` allocate within that cap; on linux and bcm2712 the heap
-commits state-arena memory as it is used, elsewhere the cap is carved at
-instantiation. Modules with no arena get no heap and pay zero cost. See
-[heap.md](heap.md).
+`heap_realloc` allocate within that cap; on linux, bcm2712 and uefi the heap
+commits the declared arena at instantiation and the room a larger graph cap
+grants as it is used, elsewhere the cap is carved at instantiation. Modules with no
+arena get no heap and pay zero cost. See [heap.md](heap.md).
 
-### Per-Module Sandboxing
+### Protection and fault policy
 
-Source: `src/kernel/exec/step_guard.rs`
+Source: `contracts/src/isolation.rs`, `src/kernel/exec/step_guard.rs`
 
-Modules can declare a protection level:
+Every module runs under the step guard at one protection level
+(`protection:`, config tag `0xF5`):
 
-| Level | Name | Mechanism |
-|-------|------|----------|
-| 0 | None | Direct call, no isolation |
-| 1 | Guarded | Step guard timer detects timeouts |
-| 2 | Contained | Unprivileged: its own RAM and all of flash (MPU targets) |
-| 3 | Isolated | Unprivileged: its own RAM and its own code (MPU on RP, MMU on Pi 5) |
+| Wire | Level | Mechanism |
+|------|-------|----------|
+| 0 | `privileged` | Direct call; the step guard detects overruns |
+| 1 | `contained` | Unprivileged: its own RAM and all of XIP flash (MPU targets) |
+| 2 | `isolated` | Unprivileged: its own RAM and its own code (MPU on RP, MMU on bcm2712) |
 
 A gated (contained or isolated) module reaches the kernel only through the
 gateway, which checks every pointer, channel and handle it is handed; see
 [module_isolation.md](module_isolation.md). An access outside its regions
-raises a fault that the scheduler catches, classifies, and handles via a
-per-module fault policy:
-
-| Policy | Behaviour |
-|--------|-----------|
-| `Skip` | Terminate the module; the graph continues without it |
-| `Restart` | Flush the module's channels and resume stepping. State is not zeroed and `module_new` is not re-called, so this is safe only for stateless or idempotent modules |
-| `Tolerate` | Step-deadline overruns are recorded (fault counter, log, fault ring) but never fault the module; step errors still fault normally. Intended for modules whose synchronous device operations have a legitimate heavy tail, such as storage cache flushes |
-
-The same step guard catches modules that exceed their per-step time
-budget. See [reconfigure.md](reconfigure.md) for the recovery state
-machine.
+raises a fault that the scheduler catches, classifies, and handles by the
+module's fault policy (`skip`, `restart` or `tolerate`; see
+[module_architecture.md](module_architecture.md#fault-recovery)). The same
+step guard catches modules that exceed their per-step time budget; see
+[scheduler.md](scheduler.md#deadline-enforcement).
 
 ## Live Graph Reconfigure
 
-The scheduler supports updating a running graph through phases:
+The scheduler updates a running graph by draining it and rebuilding it:
 
 ```
 RUNNING → DRAINING → RUNNING (rebuild)
 ```
 
 In `Draining`, modules with the `drain_capable` flag have `module_drain`
-called in reverse topological order. They stop accepting new work but
-keep stepping until in-flight work completes (or the drain timeout
-expires). The graph is then `Running` again while the new graph's modules
-are instantiated and the scheduler swaps over. Surviving modules (same binary, same config,
-same wiring) are preserved across the swap.
+called in reverse order. They stop accepting new work but keep stepping
+until in-flight work completes (or the drain timeout expires). The graph is
+then rebuilt through the same `prepare_graph` path as at boot: every arena
+is reset and every module re-instantiated, so no module's state carries
+across.
 
-This is what makes live config updates possible: an HTTP server can
-finish responding to in-flight requests, then the new HTTP server
-instance takes over without dropping connections. See
-[reconfigure.md](reconfigure.md) for the full state machine and the
-drain protocol.
+This is what lets an HTTP server finish responding to in-flight requests
+before the new graph's server takes over. See
+[reconfigure.md](reconfigure.md) for the state machine and the drain
+protocol.
 
 ## Static Memory
 
@@ -643,25 +622,13 @@ The scheduler consolidates per-module arrays into a single
 slots, ports, channel hints, arenas, capability classes, permissions,
 and drain state all live in one struct with a single `reset()`.
 
-Kernel capacity is stated in one place, `src/kernel/config.rs`, one
-profile per kernel platform (linux, bcm2712, wasm, RP). On RP targets the
-arena sizes come from the per-silicon TOML files under
-`targets/silicon/`, through `platform::chip`. None of it is part of the
-module ABI (see `abi_layers.md`, "Kernel capacity is not ABI"):
-
-| Resource | Constant | Values |
-|----------|----------|--------|
-| Modules | `MAX_MODULES` | 32 (RP), 48 (wasm), 1024 (linux, bcm2712) |
-| Channel edges | `MAX_GRAPH_EDGES` | 128, or 1536 where `MAX_MODULES` exceeds 128 (`src/kernel/boot/config.rs`) |
-| Event slots | `MAX_EVENTS` | 32 (`src/kernel/ipc/event.rs`) |
-| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (wasm), 1 GiB (linux, bcm2712) |
-| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 64 KiB (rp2350), 8 MiB (wasm), 16 MiB (linux, bcm2712) |
-| Buffer slots | `MAX_BUFFER_SLOTS` | one per channel: `MAX_GRAPH_EDGES` (`src/kernel/ipc/buffer_pool.rs`) |
-
-These are sized per silicon: small embedded targets have tight
-budgets, server-class targets have headroom for larger graphs. The
-config tool validates that the requested resources fit within the
-target's limits.
+Kernel capacity — modules, edges, events, the state and buffer arenas —
+is stated in one place, `src/kernel/config.rs`, one profile per kernel
+platform (linux, bcm2712, uefi, wasm, RP); on RP the arena sizes come from
+the per-silicon TOML files under `targets/silicon/`. Where a plan sizes a
+table at boot, the profile states its bound. None of it is part of the
+module ABI. [limit_register.md](limit_register.md) holds every figure, and
+the config tool refuses a graph that does not fit the target's.
 
 ## Async Runtime Guardrails
 

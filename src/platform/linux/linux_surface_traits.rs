@@ -1,4 +1,4 @@
-// linux_surface_traits built-in — Linux Surface Traits authority.
+// linux_surface_traits native module — Linux Surface Traits authority.
 //
 // The Linux implementation of the runtime environment plane. Emits
 // `input::surface_traits::MSG_TRAITS` (24-byte) records on its output port:

@@ -1,4 +1,4 @@
-// host_asset_index built-in — indexed bank of host file paths.
+// host_asset_index native module — indexed bank of host file paths.
 //
 // Serves `stream_select` on its `stream` output: the consumer (e.g.
 // foundation/http) binds the contract through its input port and calls
@@ -207,7 +207,7 @@ fn build_host_asset_index(module_idx: usize, params: &[u8]) -> Result<Box<HostAs
     // drops it after the graph's provider layers are reset), so the edge
     // server's state pointer stays valid.
     let state = (&mut *st as *mut HostAssetIndexState).cast::<u8>();
-    let rc = fluxor::kernel::module::provider::register_builtin_edge_server(
+    let rc = fluxor::kernel::module::provider::register_native_edge_server(
         fluxor::abi::registry::stream_select::ID,
         module_idx as scheduler::ModuleId,
         host_asset_index_select,
@@ -217,7 +217,7 @@ fn build_host_asset_index(module_idx: usize, params: &[u8]) -> Result<Box<HostAs
         log::warn!("[host_asset_index] module {module_idx}: stream_select not served: {rc}");
     }
     log::info!(
-        "[inst] module {module_idx} = host_asset_index (built-in) out={out_chan} paths={paths:?}"
+        "[inst] module {module_idx} = host_asset_index (native) out={out_chan} paths={paths:?}"
     );
     Ok(st)
 }

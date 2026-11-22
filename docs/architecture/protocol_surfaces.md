@@ -37,7 +37,7 @@ Every row in the table shares the 3-byte TLV header `[msg_type: u8][len: u16 LE]
 so the `net_read_frame` / `net_write_frame` helpers in
 `crates/fluxor-rt/src/net.rs` work unchanged on all of them.
 
-`contracts/net/ws_frame.rs` lives in that directory too and
+`ws_frame.rs` lives in that directory too and
 deliberately carries no row: it defines a connection-addressed envelope
 (`[conn: u32][opcode: u8][fin: u8][payload_len: u16]`) rather than a
 message-type range, so it holds no opcodes and the TLV helpers do not apply
@@ -577,8 +577,8 @@ Event constants for replicated-state failover (`fence_initiated` /
 `fence_confirmed`, `vip_moved`, `reservation_granted` /
 `reservation_exhausted_stall`, `rpo_loss`,
 `unsafe_recovery_epoch_void`, `class_report`) are defined in the
-telemetry vocabulary and in `monitor-protocol.md`, but no emitter
-exists yet — they are reserved for the replicated-state mechanism.
+telemetry vocabulary and in `monitor-protocol.md`; no module in this
+repository emits them.
 
 ## Deployment Patterns
 
@@ -762,8 +762,8 @@ quiet is admitted only when it is declared on another one.
 
 Source: `crates/fluxor-sdk/src/cores/`.
 
-Reusable continuity logic lives in cores that modules mount with
-`include!`:
+Reusable continuity logic lives in SDK cores (`fluxor_sdk::cores`) that
+modules link:
 
 - `session_handoff.rs` — opaque export/import chunking with
   incremental CRC32 (`HandoffExport` / `HandoffImport`), plus the
@@ -779,14 +779,15 @@ Reusable continuity logic lives in cores that modules mount with
   double-buffering. This is the anchor side; the granting authority (a
   durable single-writer directory) is not implemented in this
   repository.
-- `protocol_timer.rs` — nearest-deadline tracking (`ProtocolTimers`)
-  with post-import rebase, so imported sessions re-anchor their timers
-  on the new host's clock.
+- `transport_continuity.rs` and `transport_continuity_record.rs` — the
+  TCP/TLS continuity provider and its canonical record codec, linked by
+  `transport_continuity` and `quic_continuity` ([network.md](network.md)
+  §Transport Continuity).
 
-Further cores are extracted from real implementations once two
-consumers exist; packaging (monolithic `ip`, `ip` plus `quic`, or
-individual modules) is a per-target decision that must expose the same
-surfaces, continuity classes, and capabilities either way.
+A core is an SDK file only where two consumers share it. Packaging
+(monolithic `ip`, `ip` plus `quic`, or individual modules) is a
+per-target decision that exposes the same surfaces, continuity classes,
+and capabilities either way.
 
 ## Reference Fixtures
 

@@ -87,15 +87,16 @@ The file carries a small envelope plus one entry per resident workload:
 }
 ```
 
-`plan_digest` is the SHA-256 the plan the runtime decoded and applied
-carries (over its header and every section, `fluxor_contracts::owner_plan`),
-all zero before the first. The
+`plan_digest` is the SHA-256 carried by the plan the runtime last decoded
+and applied (over its header and every section,
+`fluxor_contracts::owner_plan`); all zero before the first. The
 [agent protocol](agent_protocol.md#what-the-activation-digest-proves) holds it to
 the committed plan's before it reports an activation.
 
 `terminated` is present only when `phase == "Terminated"`; `waiting_reason`
-only when `phase == "Activating"`; `started_at` only once the owner has
-started. Two groups appear only when they apply and are omitted otherwise:
+only when `phase == "Activating"` and the owner has modules stamped;
+`started_at` only once the owner has started. `exit_code` is non-zero for
+every reason but `Completed`, and `signal` is always `null`. Two groups appear only when they apply and are omitted otherwise:
 
 - `bound_endpoints`: the owner's bound network ports, as
   `[{"protocol": "tcp" | "udp", "port": N}, …]`.
@@ -115,12 +116,12 @@ Reasons the Linux runtime emits:
 | `GraphNodeFault` | An owned module was permanently terminated by the fault state machine — step error, hard/MPU fault, or drain timeout. `exit_code` is the step-guard fault kind, non-zero. |
 | `LivenessFailure` | A step-deadline `TIMEOUT` fault: the runtime's liveness enforcement caught a non-responsive module. |
 | `Completed` | Every owned module returned `Done`. `exit_code` 0. |
-| `ActivationBackOff` | *(waiting)* Some but not all of the owner's planned modules instantiated. A per-module instantiate failure holds the owner out of `Running` rather than presenting a partially-built graph as healthy. |
+| `ActivationBackOff` | *(waiting)* The owner has modules stamped but not every one instantiated. A per-module instantiate failure holds the owner out of `Running` rather than presenting a partially-built graph as healthy. |
 
 `ExternalProcessExited`, `Evicted`, `FluxorReservationInvalid` and the
-waiting reason `FluxorReserving` are reserved for the paths that can produce
-them — the external-process bridge, eviction, and reservation handling — and
-are in the vocabulary so those paths can land without a format change.
+waiting reason `FluxorReserving` belong to the external-process bridge,
+eviction and reservation handling. The reader accepts them; the Linux
+runtime does not emit them.
 
 ## Semantics
 
@@ -140,7 +141,8 @@ are in the vocabulary so those paths can land without a format change.
   runtime's `pid` and `pid_start_ticks` (process start time, field 22 of
   `/proc/<pid>/stat`); the reader drops the join when that exact process is
   gone. A crashed runtime, a recycled PID, or a zombie can never present stale
-  state as live. A timestamp would only say when the file was written, which is
+  state as live. (On a host with no `/proc` the reader cannot check and
+  trusts the file.) A timestamp would only say when the file was written, which is
   a different question from whether anyone is still maintaining it.
 - **Generation scoping.** The file carries the `plan_generation` its state was
   derived under, and the writer rewrites on generation change even when the
@@ -157,7 +159,9 @@ are in the vocabulary so those paths can land without a format change.
 records. Each committed workload is owned by the owner whose UID is the
 workload's UID; the agent joins each `owner_status.json` entry onto that
 workload by UID, slot and owner generation, and emits its `runtime` as
-`workloads[].runtime` with the field names above.
+`workloads[].runtime` with the field names above. Where a runtime is
+attached, the agent also joins the workload's declared exports against
+`bound_endpoints` into `workloads[].endpoints`.
 
 Two properties matter to a consumer:
 

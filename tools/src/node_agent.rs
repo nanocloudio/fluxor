@@ -278,7 +278,7 @@ fn snapshot_from_committed<S: Storage>(
     if let Some(plan) = load_committed_plan(store) {
         for a in &plan.assignments {
             if let Some(slot) = snap.slots.get_mut(a.slot as usize) {
-                slot.occupant = Some(a.workload_uid);
+                slot.occupant = Some(a.owner_uid);
                 slot.generation = slot.generation.max(a.generation);
             }
         }
@@ -372,7 +372,7 @@ pub struct TerminatedState {
 }
 
 /// One workload's LIVE runtime status, in the closed status vocabulary above. Joined
-/// into [`WorkloadStatus`] by workload UID; absent entirely when the runtime isn't up.
+/// into [`WorkloadStatus`] by owner uid; absent entirely when the runtime isn't up.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WorkloadRuntimeStatus {
     pub phase: RuntimePhase,
@@ -506,9 +506,9 @@ struct RuntimeStatusFile {
 #[derive(Debug, serde::Deserialize)]
 struct RuntimeStatusWorkload {
     /// The runtime speaks owner-space: the UID it reports is the owner's,
-    /// which the commit sets to the workload's UID.
+    /// which the commit sets to the owner uid.
     owner_uid_hex: String,
-    /// Owner slot + generation — with the workload UID, the full join key. ALL
+    /// Owner slot + generation — with the owner uid, the full join key. ALL
     /// three must match the committed assignment for the join to attach.
     slot: u16,
     owner_generation: u32,
@@ -516,13 +516,13 @@ struct RuntimeStatusWorkload {
 }
 
 /// One workload's surfaced status: the owner-tagged join of the persisted desired
-/// state and the committed plan. Workload UID + owner slot + owner generation is
+/// state and the committed plan. owner uid + owner slot + owner generation is
 /// the join key between orchestrator-facing status and device telemetry; a
 /// partial match is not a match. `slot`/`owner_generation`/allocation fields are present only
 /// when the workload is in the committed generation.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct WorkloadStatus {
-    pub workload_uid_hex: String,
+    pub owner_uid_hex: String,
     pub namespace: String,
     pub name: String,
     pub desired_phase: DesiredPhase,
@@ -540,7 +540,7 @@ pub struct WorkloadStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_cap: Option<u32>,
     /// LIVE per-workload runtime status (in the closed status vocabulary), joined
-    /// from the runtime's `owner_status.json` by workload UID. Absent when the runtime isn't up —
+    /// from the runtime's `owner_status.json` by owner uid. Absent when the runtime isn't up —
     /// additive: existing consumers of the durable fields are unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<WorkloadRuntimeStatus>,
@@ -588,18 +588,16 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
     let mut workloads: Vec<WorkloadStatus> = desired
         .iter()
         .map(|p| {
-            let assignment = plan.as_ref().and_then(|pl| {
-                pl.assignments
-                    .iter()
-                    .find(|a| a.workload_uid == p.workload_uid)
-            });
+            let assignment = plan
+                .as_ref()
+                .and_then(|pl| pl.assignments.iter().find(|a| a.owner_uid == p.owner_uid));
             let mut hex = String::with_capacity(32);
-            for b in &p.workload_uid {
+            for b in &p.owner_uid {
                 use std::fmt::Write;
                 let _ = write!(hex, "{b:02x}");
             }
             WorkloadStatus {
-                workload_uid_hex: hex,
+                owner_uid_hex: hex,
                 namespace: p.namespace.clone(),
                 name: p.name.clone(),
                 desired_phase: p.desired_phase,
@@ -623,20 +621,20 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
     // showing the owner (and, via the runtime join, its Draining/Terminated
     // state) instead of the workload silently vanishing mid-drain. Namespace and
     // name left empty — the desired record that carried them is gone; the
-    // workload UID is the orchestrator's join key.
+    // owner uid is the orchestrator's join key.
     if let Some(pl) = plan.as_ref() {
         for rev in &pl.revocations {
             let a = &rev.assignment;
             let mut hex = String::with_capacity(32);
-            for b in &a.workload_uid {
+            for b in &a.owner_uid {
                 use std::fmt::Write;
                 let _ = write!(hex, "{b:02x}");
             }
-            if workloads.iter().any(|p| p.workload_uid_hex == hex) {
+            if workloads.iter().any(|p| p.owner_uid_hex == hex) {
                 continue;
             }
             workloads.push(WorkloadStatus {
-                workload_uid_hex: hex,
+                owner_uid_hex: hex,
                 namespace: String::new(),
                 name: String::new(),
                 desired_phase: DesiredPhase::Stopped,
@@ -652,7 +650,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
             });
         }
     }
-    workloads.sort_by(|a, b| a.workload_uid_hex.cmp(&b.workload_uid_hex));
+    workloads.sort_by(|a, b| a.owner_uid_hex.cmp(&b.owner_uid_hex));
     Ok(NodeStatus {
         generation,
         abi_surface: crate::hash::hex(&crate::hash::abi_surface_digest()),
@@ -665,7 +663,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
 /// `node_status` plus the LIVE per-workload runtime join: read the runtime's
 /// `owner_status.json` (located beside the plan file recorded by
 /// [`record_publish_path`]) and attach each workload's `runtime` object by the full
-/// join key — workload UID + owner slot + owner generation,
+/// join key — owner uid + owner slot + owner generation,
 /// scoped to the committed plan generation. Best-effort and fail-absent: a
 /// missing/garbled/out-of-vocabulary file, a writer process that is no
 /// longer alive (or is a recycled PID), a file from a different plan
@@ -686,13 +684,13 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
             let desired = load_desired(store)?;
             for workload in &mut st.workloads {
                 if let Some(entry) = file.workloads.iter().find(|p| {
-                    p.owner_uid_hex == workload.workload_uid_hex
+                    p.owner_uid_hex == workload.owner_uid_hex
                         && Some(p.slot) == workload.slot
                         && Some(p.owner_generation) == workload.owner_generation
                 }) {
                     let declared = desired
                         .iter()
-                        .find(|d| crate::hash::hex(&d.workload_uid) == workload.workload_uid_hex)
+                        .find(|d| crate::hash::hex(&d.owner_uid) == workload.owner_uid_hex)
                         .map(|d| d.exports.as_slice())
                         .unwrap_or(&[]);
                     let bound = entry.runtime.bound_endpoints.as_deref().unwrap_or(&[]);
@@ -709,12 +707,12 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
                 if st
                     .workloads
                     .iter()
-                    .any(|p| p.workload_uid_hex == entry.owner_uid_hex)
+                    .any(|p| p.owner_uid_hex == entry.owner_uid_hex)
                 {
                     continue;
                 }
                 st.workloads.push(WorkloadStatus {
-                    workload_uid_hex: entry.owner_uid_hex.clone(),
+                    owner_uid_hex: entry.owner_uid_hex.clone(),
                     namespace: String::new(),
                     name: String::new(),
                     desired_phase: DesiredPhase::Stopped,
@@ -730,7 +728,7 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
                 });
             }
             st.workloads
-                .sort_by(|a, b| a.workload_uid_hex.cmp(&b.workload_uid_hex));
+                .sort_by(|a, b| a.owner_uid_hex.cmp(&b.owner_uid_hex));
         }
     }
     Ok(st)
@@ -879,7 +877,7 @@ pub fn upsert_workload_and_commit<S: Storage>(
     cap: &NodeCapacity,
 ) -> Result<(CompositionPlan, u64), AgentError> {
     let mut workloads = load_desired(store).map_err(AgentError::Store)?;
-    workloads.retain(|p| p.workload_uid != workload.workload_uid);
+    workloads.retain(|p| p.owner_uid != workload.owner_uid);
     workloads.push(workload);
     recompose(store, workloads, cap, &[])
 }
@@ -892,13 +890,13 @@ pub fn upsert_workload_and_commit<S: Storage>(
 /// the same code path, with an already-past deadline.
 pub fn remove_workload_and_commit<S: Storage>(
     store: &mut GenStore<S>,
-    workload_uid: [u8; 16],
+    owner_uid: [u8; 16],
     grace_secs: u16,
     cap: &NodeCapacity,
 ) -> Result<(CompositionPlan, u64), AgentError> {
     let mut workloads = load_desired(store).map_err(AgentError::Store)?;
-    workloads.retain(|p| p.workload_uid != workload_uid);
-    recompose(store, workloads, cap, &[(workload_uid, grace_secs)])
+    workloads.retain(|p| p.owner_uid != owner_uid);
+    recompose(store, workloads, cap, &[(owner_uid, grace_secs)])
 }
 
 fn recompose<S: Storage>(
@@ -980,7 +978,7 @@ mod tests {
 
     fn workload(n: u8, modules: u16) -> WorkloadDesired {
         WorkloadDesired {
-            workload_uid: uid(n),
+            owner_uid: uid(n),
             namespace: "default".into(),
             name: format!("workload-{n}"),
             workload_digest: [n; 32],
@@ -1155,7 +1153,7 @@ mod tests {
         let b = plan2
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(2))
+            .find(|a| a.owner_uid == uid(2))
             .unwrap();
         assert_eq!(
             b.module_base, 3,
@@ -1178,12 +1176,12 @@ mod tests {
         let a = p2
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(1))
+            .find(|a| a.owner_uid == uid(1))
             .unwrap();
         let b = p2
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(2))
+            .find(|a| a.owner_uid == uid(2))
             .unwrap();
         assert_eq!(
             (a.slot, a.generation),
@@ -1202,7 +1200,7 @@ mod tests {
         assert_eq!(p3.assignments[0], *b, "survivor untouched by removal");
         assert_eq!(p3.revocations.len(), 1);
         let rev = &p3.revocations[0];
-        assert_eq!(rev.assignment.workload_uid, uid(1));
+        assert_eq!(rev.assignment.owner_uid, uid(1));
         assert_eq!(
             (rev.assignment.slot, rev.assignment.generation),
             (a.slot, a.generation)
@@ -1216,7 +1214,7 @@ mod tests {
         let c = p4
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(3))
+            .find(|a| a.owner_uid == uid(3))
             .unwrap();
         assert_eq!(c.slot, 3, "drain window holds slot 1");
         // The revocation rides along until expiry.
@@ -1421,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn status_joins_live_runtime_by_workload_uid() {
+    fn status_joins_live_runtime_by_owner_uid() {
         let (store, dir) = store_with_published_workload("join");
         let rt = "{\"phase\":\"Terminated\",\"ready\":false,\"started\":false,\
                   \"restart_count\":2,\"started_at\":\"2026-07-07T00:00:01Z\",\
@@ -1437,7 +1435,7 @@ mod tests {
         let p = st
             .workloads
             .iter()
-            .find(|p| p.workload_uid_hex == UID1_HEX)
+            .find(|p| p.owner_uid_hex == UID1_HEX)
             .unwrap();
         let rt = p.runtime.as_ref().expect("runtime joined");
         assert_eq!(rt.phase, RuntimePhase::Terminated);
@@ -1451,7 +1449,7 @@ mod tests {
         // nested optional object with the exact status-vocabulary field names.
         let v = serde_json::to_value(&st).unwrap();
         let pj = &v["workloads"][0];
-        assert_eq!(pj["workload_uid_hex"], UID1_HEX);
+        assert_eq!(pj["owner_uid_hex"], UID1_HEX);
         assert!(pj["committed"].as_bool().unwrap());
         assert_eq!(pj["runtime"]["phase"], "Terminated");
         assert_eq!(pj["runtime"]["terminated"]["reason"], "GraphNodeFault");
@@ -1506,7 +1504,7 @@ mod tests {
         let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         // Live state derived under a different plan generation (runtime not
         // yet rebuilt onto the current commit) must not attach to the new
-        // durable records — same PID, same workload UID, wrong generation.
+        // durable records — same PID, same owner uid, wrong generation.
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
         std::fs::write(
             dir.join("owner_status.json"),
@@ -1527,7 +1525,7 @@ mod tests {
         let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
 
-        // Right workload UID, wrong slot.
+        // Right owner uid, wrong slot.
         let (store, dir) = store_with_published_workload("wrongslot");
         std::fs::write(
             dir.join("owner_status.json"),
@@ -1538,7 +1536,7 @@ mod tests {
         assert!(st.workloads[0].runtime.is_none(), "slot mismatch refused");
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Right workload UID and slot, wrong owner generation.
+        // Right owner uid and slot, wrong owner generation.
         let (store, dir) = store_with_published_workload("wrongogen");
         std::fs::write(
             dir.join("owner_status.json"),

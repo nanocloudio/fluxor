@@ -571,7 +571,7 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
         // mod.rs) — except for `builtin = true` manifests, which are
         // declarations of kernel-side implementations and carry no
         // module source of their own.
-        let is_builtin = manifest
+        let is_native = manifest
             .lines()
             .map(str::trim)
             .any(|l| l.starts_with("builtin") && l.contains("true"));
@@ -584,7 +584,7 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
                     .map(|v| v.trim().trim_matches('"').to_string())
             })
             .unwrap_or_else(|| "mod.rs".to_string());
-        if !is_builtin && !module_dir.join(&entry_file).is_file() {
+        if !is_native && !module_dir.join(&entry_file).is_file() {
             push(
                 module_rel.clone(),
                 format!("module entry file `{entry_file}` missing"),
@@ -1582,7 +1582,50 @@ const RETIRED_WORDS: &[(&str, &str)] = &[
     ("index domain", "index range"),
     ("id domain", "id range"),
     ("slot domain", "slot range"),
-    ("dimdomain", "`DimValues`"),
+    ("dimdomain", "`DimKind`"),
+    ("publish bundle", "`fluxor publish package`"),
+    ("[uses] bundles", "`[uses] packages`"),
+    ("kind = \"bundle\"", "`kind = \"package\"`"),
+    ("fluxor/bundles", "`target/fluxor/packages`"),
+    ("desired_bundle_digest", "`desired_package_digest`"),
+    ("bundle_missing", "`PACKAGE_MISSING`"),
+    ("--bundle", "`--package`"),
+    ("--bundles", "`--packages`"),
+    ("bundle-digest", "`--package-digest`"),
+    ("running bundle", "\"Running package\""),
+    ("boot_bundle", "`firmware_image`"),
+    ("artifact_bundle_dir", "`artifact_dir`"),
+    ("attachment bundle", "attachment share set"),
+    ("bundle_magic", "`SHARE_SET_MAGIC`"),
+    ("graph.img", "`node.img`"),
+    ("emit=image", "`--emit=node`"),
+    ("emit=combined", "`--emit=firmware`"),
+    ("publish image", "`fluxor publish node`"),
+    ("target_id", "the node id (`node_id`)"),
+    ("target-id", "`--node-id`"),
+    ("workload-uid", "`--owner-uid`"),
+    ("graph runner", "domain loop"),
+    ("domain runner", "domain loop"),
+    ("shared runner", "domain loop"),
+    ("pre-tick", "pre-pass"),
+    (
+        "step_modules",
+        "a tick pass (`pass::tick_all`, `pass::run`)",
+    ),
+    ("step_domain_modules", "a domain's tick pass (`pass::run`)"),
+    ("step_woken_modules", "a wake pass (`PassKind::Wake`)"),
+    (
+        "step_resident_graphs",
+        "a tick pass (`pass::tick_all`, `pass::run`)",
+    ),
+    ("exec_order_offset", "`exec_offset`"),
+    ("kernel fan", "a tee or merge module"),
+    ("built-in module", "native module"),
+    ("built-in modules", "native modules"),
+    ("builtin module", "native module"),
+    ("builtin modules", "native modules"),
+    ("built-ins", "native modules"),
+    ("all-builtin", "native-only"),
 ];
 
 /// `tier` in any sense but the USB hub tier: an execution mode is `tick`,
@@ -2585,6 +2628,22 @@ mod tests {
             "// the vault tier\n// unknown key `tier`\n// the graph image\n// a frontier\n",
         );
         assert_eq!(v.iter().map(|v| v.line).collect::<Vec<_>>(), vec![1, 3]);
+        let v = scan_retired_vocabulary(
+            Path::new("docs/guides/x.md"),
+            "`fluxor publish bundle`\nthe wasm bundle\na CA bundle\n`--emit=combined`\n\
+             `graph.img`\n`--bundles`\nthe node's `target_id`\nkind = \"bundle\"\n\
+             target_idx\n",
+        );
+        let lines: Vec<_> = v.iter().map(|v| (v.line, v.message.clone())).collect();
+        assert_eq!(
+            v.iter().map(|v| v.line).collect::<Vec<_>>(),
+            vec![1, 4, 5, 6, 7, 8],
+            "{lines:?}"
+        );
+        assert!(v[0].message.contains("`fluxor publish package`"));
+        assert!(v[1].message.contains("`--emit=firmware`"));
+        assert!(v[2].message.contains("`node.img`"));
+        assert!(v[4].message.contains("`node_id`"));
         assert!(scan_retired_vocabulary(
             Path::new("src/kernel/usb/xhci_topology.rs"),
             "// five hub tiers\n"
@@ -2593,6 +2652,23 @@ mod tests {
         let md = "A tenant.\n<!-- vocabulary-exempt-begin: the retired words -->\n| tenant | owner |\n<!-- vocabulary-exempt-end -->\n";
         let v = scan_retired_vocabulary(Path::new("docs/guides/x.md"), md);
         assert_eq!(v.iter().map(|v| v.line).collect::<Vec<_>>(), vec![1]);
+        let v = scan_retired_vocabulary(
+            Path::new("src/kernel/a.rs"),
+            "// the graph runner\n// the pre-tick slot\n// see step_woken_modules\n\
+             // a built-in module\n// the native module\n// the cargo built-in\n\
+             // the pre-pass\n// instantiates only built-ins\n",
+        );
+        let lines: Vec<_> = v.iter().map(|v| (v.line, v.message.clone())).collect();
+        assert_eq!(
+            v.iter().map(|v| v.line).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 8],
+            "{lines:?}"
+        );
+        assert!(v[0].message.contains("say domain loop"));
+        assert!(v[1].message.contains("say pre-pass"));
+        assert!(v[2].message.contains("`PassKind::Wake`"));
+        assert!(v[3].message.contains("say native module"));
+        assert!(v[4].message.contains("say native modules"));
     }
 
     #[test]

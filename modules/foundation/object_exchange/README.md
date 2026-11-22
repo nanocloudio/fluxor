@@ -49,7 +49,7 @@ The module acts under the one capability its graph gives it, for every
 request.
 
 - **Presenting.** Given `scope` and `capability`, the module presents them to
-  the store once (`PRESENT`, `contracts/storage/object.rs`), and every call it
+  the store once (`PRESENT`, `crates/fluxor-abi/src/contracts/storage/object.rs`), and every call it
   makes for every request — `HEAD`, `GET`, `PUT`, `PUT_STREAMED_OPEN`,
   `DELETE`, `RETAIN`, `LIST` — names the grant the store answered. The grant is held for
   the module's life and dropped (`CLOSE`) when the module is destroyed.
@@ -145,7 +145,7 @@ a `legal-hold` that is neither `on` nor `off`, a `PATCH` with neither
 `retain-until` nor `legal-hold`, and a `PATCH` with a body or flagged `MORE`
 are refused `400`. Retention and the hold are the store's to judge, by its own
 clock and at the write's linearization point (`Kept`,
-`contracts/storage/object.rs`). A store that cannot keep one refuses it, which
+`crates/fluxor-abi/src/contracts/storage/object.rs`). A store that cannot keep one refuses it, which
 is answered `501`: a `200` always means the store kept what was asked.
 
 A `range` that is not one of the three forms, including a list of ranges, is
@@ -252,7 +252,7 @@ marked `RAISED`; every other status is the store's answer and is not.
 | `416` | an unsatisfiable range | no |
 | `423` | the object's retention or legal hold refuses the `PUT` or `DELETE`, or a `PATCH` would shorten its retention (`ERETAINED`) | no |
 | `500` | the store failed, or answered something the module cannot carry | yes when the module could not answer, no when the store failed |
-| `501` | the store does not offer the operation, or cannot keep a `key-ref`, a retention or a hold (`ENOSYS`) | no |
+| `501` | the store does not offer the operation, or cannot keep a `key-ref`, a retention or a hold (`ENOSYS`, `ENOTSUP`) | no |
 | `503` | every exchange slot is taken | yes |
 | `503` | the store is busy (`EBUSY`, `ENOMEM`), or had no room for the capability's grant | no |
 

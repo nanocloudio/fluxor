@@ -375,8 +375,8 @@ pub fn prepare_graph() -> Result<super::splice::StagedAdd, i32> {
         } else if sched.tick_us > 0 {
             sched.tick_us
         } else {
-            // Last resort: matches the platform main-loop default
-            // (`tick_period_us = 1000` when nothing is configured).
+            // Last resort: the scheduler's default tick (`DEFAULT_TICK_US`)
+            // when nothing is configured.
             1000
         };
     }

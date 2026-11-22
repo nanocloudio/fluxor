@@ -212,16 +212,13 @@ const DATA_STORE_ID: u64 = 0x6661_6c73_6864_6174;
 mod params_def {
     use super::FlashState;
 
-    use super::{p_u16, p_u8};
+    use super::p_u16;
 
     fluxor_rt::define_params! {
         FlashState;
 
         1, debounce_ms, u16, 50
             => |s, d, len| { s.debounce_ms = p_u16(d, len, 0, 50); };
-
-        9, item_count, u8, 0
-            => |s, d, len| { let _ = p_u8(d, len, 0, 0); };
 
         10, presets, blob, 0
             => |s, d, len| {

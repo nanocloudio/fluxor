@@ -10876,7 +10876,7 @@ unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize)
 /// owner's own address when the owner holds one, and serves every address it
 /// holds of either family (`bind_serves`); it lands on the wildcard (the
 /// node's shared addresses) when the owner holds none. The kernel then admits it as
-/// it admits a bind for a built-in provider (`NET_LANE_ADMIT`): refused while
+/// it admits a bind for a native provider (`NET_LANE_ADMIT`): refused while
 /// the owner drains or is gone, and refused for a port the committed plan
 /// does not lease to it.
 unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16, u16), i8> {

@@ -3,7 +3,7 @@
 #
 # See `docs/architecture/wasm_platform.md` for the platform contract.
 # The same `<config>.wasm` runs on any host that implements the
-# host-import surface; per-host built-ins live in their own host docs.
+# host-import surface; per-host native modules live in their own host docs.
 
 [target]
 id = "wasm"

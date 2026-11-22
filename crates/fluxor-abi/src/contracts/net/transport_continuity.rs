@@ -151,7 +151,7 @@ pub mod tc_end {
 ///
 /// Evidence: `[record 148][recipient_pub 65][signer_pub 65][sig_len u16]
 /// [sig]` — `record` is `key_vault` `ATTEST_KEY`'s `FXHA` record for the
-/// recipient key (challenge, composition digest, backend, tier, persistence,
+/// recipient key (challenge, composition digest, backend, custody, persistence,
 /// suite, uses, owner namespace, commitment, public thumbprint) and `sig`
 /// the signer's P-256 `r‖s` over its SHA-256. The signer is the standby
 /// host's custody identity; that it is the host the transfer was decided
@@ -178,7 +178,7 @@ pub mod tc_custody {
     pub const R_CHALLENGE: usize = 4;
     pub const R_COMPOSITION: usize = 36;
     pub const R_BACKEND: usize = 68;
-    pub const R_TIER: usize = 69;
+    pub const R_CUSTODY: usize = 69;
     pub const R_PERSISTED: usize = 70;
     pub const R_SUITE: usize = 72;
     pub const R_USAGE: usize = 76;

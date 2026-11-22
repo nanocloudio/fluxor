@@ -945,7 +945,7 @@
   // when any of these change. This publisher lifts that state out of the
   // overlay's private CSS-reflow path and pushes it onto the kernel-bound
   // `__fluxor_surface_traits_queue`, where the `wasm_browser_surface_traits`
-  // built-in drains it onto a `SurfaceTraits` channel. Runs independently
+  // native module drains it onto a `SurfaceTraits` channel. Runs independently
   // of whether the overlay is mounted — a chrome-less player still needs
   // traits.
   //
@@ -1155,7 +1155,7 @@
         audioRateHz: p.audioHz, displayCount: 1, epoch, dpr8,
       });
       // The publisher is installed for every runtime, but only the
-      // `wasm_browser_surface_traits` built-in drains the queue. A scenario
+      // `wasm_browser_surface_traits` native module drains the queue. A scenario
       // without that module never consumes, so an actively-resizing window
       // would grow the queue unbounded. Records are last-write-wins snapshots,
       // so cap the backlog and drop the oldest — a late-wired consumer still

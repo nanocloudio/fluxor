@@ -16,8 +16,8 @@ smallest microcontroller, is a first-class citizen of the same
 substrate.
 
 The architecture rests on eight primitives. Everything else in this
-document is their elaboration; a closing note records how far the
-runtime has adopted them.
+document is their elaboration; the closing section states which of them
+the tree implements.
 
 ## The Eight Primitives
 
@@ -409,21 +409,18 @@ routing each record by its peer's key fingerprint).
 Mesh events and commands ride this fabric like every other cross-node
 channel.
 
-## Adoption Status
-
-What the tree implements:
+## What the Tree Implements
 
 - the 128-bit `ObjectId` and the 32-byte event header, carrying the
   storage namespace change feed;
 - the content-type registry shared with on-device channels;
 - the capability token and chain codec, local verification against
   trusted time, the session presentation wire and per-session grants
-  (`contracts/mesh/capability.rs`), with their golden vectors;
+  (`crates/fluxor-abi/src/contracts/mesh/capability.rs`), with their golden vectors;
 - issuance and checking in the `fluxor` CLI (`fluxor modules cap`);
 - capability grants on `storage.object` (`PRESENT`): scope, permission
   and expiry enforced per op by the Linux store when it holds roots;
 - the remote-channel fabric.
 
-The object registry and the mesh bridge are not built. When built they
-complete a single module of identity, event, command, handle, object
-and mesh_bridge submodules over the capability contract above.
+There is no object registry and no mesh bridge: nothing in the tree
+resolves an `ObjectId` to a host or routes mesh events between devices.

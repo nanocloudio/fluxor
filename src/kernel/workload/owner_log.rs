@@ -12,7 +12,7 @@
 //! created: the kernel's owner table installs a ring when it hands out or
 //! installs a slot ([`install_slot`]) and releases it when the owner is freed
 //! ([`release_slot`]), so a node with a thousand owner slots and ten
-//! workloads holds ten 64 KiB rings, not a thousand. Slot 0 (system) has a
+//! workloads holds ten 64 KiB rings, not a thousand. Slot 0 (the node owner) has a
 //! ring from its first record.
 //!
 //! **Release.** When a flusher is registered ([`set_flusher`]), a released
@@ -293,7 +293,7 @@ pub fn push_on_slot(
     r.state.push(&mut r.buf, &frame);
 }
 
-/// The ring a record for `slot` lands in. The system slot's starts with its
+/// The ring a record for `slot` lands in. The node owner's slot's starts with its
 /// first record; a workload slot's exists while its owner does, and one
 /// whose owner was installed without the kernel's table seeing it (an owner
 /// a test drives directly) starts here if that owner is live.

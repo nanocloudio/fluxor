@@ -14,11 +14,13 @@ plaintext in is one delivery, a whole record out one delta.
 - `stack.rs` — the provider (`TcStack`): the FXTC and CT_TLS codecs, compose
   and decompose, and the operations; pure, host-tested by
   `tools/src/transport_continuity_stack.rs`
+- `heap_table.rs` — the flow table, taken from the module's heap at
+  instantiation
 
 ## How it works
 
 An anchor's operations become the per-layer continuity commands `ip` and
-`tls` already answer (`session_ctrl.rs` §Transport continuity). At the
+`tls` already answer (`crates/fluxor-abi/src/contracts/net/session_ctrl.rs`, transport continuity). At the
 primary, the checkpoint is composed from the two per-layer records the
 modules export at the cut; at the standby it is decomposed into the two they
 import, into silent shadows, at EMISSION_ARM. ACTIVATE checks what it can
@@ -32,12 +34,12 @@ covering it; a standby takes over from the checkpoint and the deltas alone.
 KeyUpdate under a crash-continuous pair is a `KeyUpdate` delta naming the next
 secret by reference; the standby's `tls` derives it at import (the CT_TLS
 record carries the epochs its sealed secret set is at). `CUSTODY_ATTEST` /
-`CUSTODY_WRAP` / `CUSTODY_UNWRAP` move the flow's continuity key vault to
-vault: the standby's `tls` attests a fresh recipient, the authority accepts the evidence, the primary's `tls` verifies it and wraps
+`CUSTODY_WRAP` / `CUSTODY_UNWRAP` move the flow's continuity key from
+vault to vault: the standby's `tls` attests a fresh recipient, the authority accepts the evidence, the primary's `tls` verifies it and wraps
 the key to it, the standby's unwraps it — no key is ever in a frame. The map
 between the records, and what is and is not enforced, is at the head of
-`stack.rs`; `docs/architecture/network.md` §`TRANSPORT_CONTINUITY` over `ip`
-and `tls` has the summary.
+`stack.rs`; [network.md](../../../docs/architecture/network.md#transport_continuity-over-ip-and-tls) has the
+summary.
 
 ## Wiring
 
@@ -62,6 +64,10 @@ takes only its own frames. Every port carries `[type:1][len:2 LE][payload]`.
 
 - `anchor_id` (str, 16 hex digits) — the anchor identity a per-flow emission
   token must name.
+- `flows` (u16, default 2) — the flows this instance moves at once. The
+  table is taken from the module's heap, which the composer sizes for the
+  count; a pairing past it is refused `CAPACITY`, and an instance with
+  `flows = 0`, or whose heap cannot hold the table, refuses to start.
 
 ## Example
 

@@ -28,13 +28,13 @@ fn main() {
         .next()
         .expect("usage: agent_publish <store-dir> <plan-out>");
 
-    let mut workload_uid = [0u8; 16];
-    workload_uid[0] = 0xaa;
+    let mut owner_uid = [0u8; 16];
+    owner_uid[0] = 0xaa;
     let desired = DeviceDesiredState {
         generation: 1,
         system_revision: 1,
         workloads: vec![WorkloadDesired {
-            workload_uid,
+            owner_uid,
             namespace: "default".into(),
             name: "hello".into(),
             workload_digest: [0u8; 32],

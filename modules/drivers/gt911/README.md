@@ -7,34 +7,13 @@ GT911 Capacitive Touch Controller PIC Module
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `touch` | output | `InputEvent` | required |
 
-[[ports]]
-name = "touch"
-direction = "output"
-content_type = "InputEvent"
-required = true
-
-[[resources]]
-requires_contract = "i2c"
-access = "exclusive"
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
-
-[[resources]]
-requires_contract = "event"
-access = "write"
-
-[[resources]]
-requires_contract = "timer"
-access = "write"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
@@ -42,8 +21,3 @@ access = "write"
 - `i2c_bus`
 - `int_pin`
 - `rst_pin`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

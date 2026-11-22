@@ -953,7 +953,7 @@ pub fn dispatch(
     }
     // The node's routing is the node's: only a module acting with its
     // authority reaches it, whatever else it holds.
-    if !crate::kernel::exec::scheduler::caller_authority().is_system() {
+    if !crate::kernel::exec::scheduler::caller_authority().is_node() {
         return errno::EACCES;
     }
     // SAFETY: provider-dispatch context; the store sizes itself once, before

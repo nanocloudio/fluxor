@@ -10,7 +10,7 @@ Fluxor's input architecture rests on two layered concepts:
 
 This document is the input peer of `av_capability_surface.md`,
 `protocol_surfaces.md`, and `monitor-protocol.md`. The guiding rule is
-the one stated in `vision.md`: a button is not a GPIO pin, a keyboard
+the one stated in [vision.md](../vision.md): a button is not a GPIO pin, a keyboard
 is not a Bluetooth peripheral. Input providers describe what happened
 on a labelled control; application meaning belongs in mapper modules
 or graph configuration.
@@ -31,8 +31,8 @@ shape regardless of which producer is on the other end:
 | `PointerEvents`     | Unified mouse / touch / stylus events        | `wasm_browser_pointer`, `linux_pointer`, touchscreen drivers   |
 | `GamepadEvents`     | Gamepad state snapshots                      | `wasm_browser_gamepad`, `wasm_browser_touch_gamepad_overlay`   |
 | `MidiEvents`        | Pre-decoded MIDI 1.0 channel-voice events    | `wasm_browser_midi_in`, `linux_alsa_midi`                      |
-| `OctetStream` (button wire) | Debounced single-button transitions  | `foundation/button`, `flash_rp` (BOOTSEL), `wasm_browser_button` |
-| `FmpMessage`        | Semantic commands after mapping              | `foundation/gesture`, `wasm_browser_action`                    |
+| `OctetStream` (button wire) | Debounced single-button transitions  | `modules/drivers/button`, `flash_rp` (BOOTSEL), `wasm_browser_button` |
+| `FmpMessage`        | Semantic commands after mapping              | `modules/foundation/gesture`, `wasm_browser_action`                    |
 | `SurfaceTraits`     | Environment-plane snapshots (viewport, modality, audio config) | `wasm_browser_surface_traits`, `linux_surface_traits` |
 | `InputBinaryState`  | Keyboard-state snapshots on a single port    | `wasm_browser_dom_input`                                       |
 | `InputEvent`        | Generic surface: a driver's own record shape, for a device that fits none of the per-class surfaces | `gt911` touch driver             |
@@ -43,9 +43,8 @@ mismatch from `tools/src/config/manifest.rs::validate_wiring_types`.
 The surface ID table is `CONTENT_TYPES` in `contracts/src/lib.rs`,
 re-exported through `tools/src/manifest.rs`.
 
-New graphs wire the per-class surfaces; `InputEvent` stays in the
-table because reordering or removing `CONTENT_TYPES` entries is a
-wire-format break.
+A graph wires a per-class surface wherever one applies; `InputEvent`
+carries only a device whose events fit none of them.
 
 ---
 
@@ -190,12 +189,12 @@ enforcement path is not.
 
 ## Related documentation
 
-- `architecture/av_capability_surface.md` — AV peer of this document.
-- `architecture/capability_surface.md` — capability matching and
+- [av_capability_surface.md](av_capability_surface.md) — AV peer of this document.
+- [capability_surface.md](capability_surface.md) — capability matching and
   content-type resolution.
-- `architecture/events.md` — kernel-level event signalling that
+- [events.md](events.md) — kernel-level event signalling that
   hardware-facing input modules build on.
-- `architecture/browser_capability_surface.md` — how browser DOM
+- [browser_capability_surface.md](browser_capability_surface.md) — how browser DOM
   events map onto these surfaces.
-- `guides/input_system.md`, `guides/input_gestures.md` — guide-level
+- [input_system.md](../guides/input_system.md), [input_gestures.md](../guides/input_gestures.md) — guide-level
   treatment of the source / gesture / action layering.

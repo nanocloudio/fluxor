@@ -34,7 +34,7 @@ pub type DetachFn = unsafe fn(OwnerHandle);
 struct Provider {
     slot: usize,
     /// The slot's generation when a module provider claimed the role (0 for
-    /// a built-in provider, which is not a module occupancy).
+    /// a native provider, which is not a module occupancy).
     generation: u32,
     /// The lanes the provider holds for every workload together.
     lanes: usize,
@@ -122,7 +122,7 @@ pub unsafe fn detach(owner: OwnerHandle) {
 
 // ── A provider that is a module: lanes queued for it to take ────────────
 //
-// A built-in provider (linux_net) is called directly. A provider that is a
+// A native provider (linux_net) is called directly. A provider that is a
 // module (the bare-metal `ip`) cannot be: the kernel holds no function of it.
 // It claims the role once (`wl::NET_PROVIDE`) and the kernel then records
 // each attach and detach here for it to take at the top of its step
@@ -446,7 +446,7 @@ fn is_queued_provider(slot: usize) -> bool {
 }
 
 /// The slot of the node's lane provider while its registration is live: a
-/// built-in provider, or a module provider in its current occupancy.
+/// native provider, or a module provider in its current occupancy.
 pub fn live_provider_slot() -> Option<usize> {
     provider()
         .filter(|p| !is_queued(p) || queued_current(p))
@@ -466,7 +466,7 @@ pub fn lane_capacity() -> usize {
 }
 
 /// Forget a module provider and every lane queued for it: its graph is being
-/// rebuilt, and with it every channel a lane named. A built-in provider is
+/// rebuilt, and with it every channel a lane named. A native provider is
 /// left registered; it registers again as the new graph instantiates. The
 /// tables keep their size.
 pub fn reset_queued() {
@@ -523,7 +523,7 @@ pub fn take_queued(slot: usize, out: &mut [u8]) -> i32 {
 }
 
 /// May the owner a module provider names bind a new endpoint
-/// (`wl::NET_LANE_ADMIT`)? The gate a built-in provider applies to a lane's
+/// (`wl::NET_LANE_ADMIT`)? The gate a native provider applies to a lane's
 /// bind: the owner must still admit work, and when the committed plan is
 /// lease-aware the (protocol, port) must be granted to it.
 pub fn admit_queued(slot: usize, arg: &[u8]) -> i32 {

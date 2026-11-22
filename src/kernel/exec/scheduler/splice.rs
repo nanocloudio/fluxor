@@ -409,7 +409,7 @@ fn check_endpoints(graph: &ComposedGraph<'_>, authority: AddAuthority) -> Result
             Endpoint::Existing(g)
                 if authority == AddAuthority::Own
                     && live_slot(usize::from(g))
-                    && super::module_owner(usize::from(g)).is_system() =>
+                    && super::module_owner(usize::from(g)).is_node() =>
             {
                 Err(AddError::NodeModuleRefused)
             }
@@ -643,7 +643,7 @@ pub unsafe fn admit(
             || !sched()
                 .owners
                 .authority_of(super::module_owner(idx))
-                .is_system()
+                .is_node()
         {
             return Err(AddError::AuthorityRefused);
         }
@@ -852,7 +852,7 @@ fn assign_slots(st: &mut StagedAdd) -> Result<(), AddError> {
             let stamp = super::module_owner(candidate);
             if matches!(s.modules[candidate], ModuleSlot::Empty)
                 && !crate::kernel::ipc::lend::slot_quarantined(candidate)
-                && (stamp.is_system() || s.owners.lookup(stamp).is_none())
+                && (stamp.is_node() || s.owners.lookup(stamp).is_none())
             {
                 break candidate;
             }
@@ -1268,7 +1268,7 @@ fn instantiate_pic(
 fn settle(st: &mut StagedAdd, k: usize) -> Result<(), AddError> {
     let slot = st.slot(k);
     let owner = super::module_owner(slot);
-    if !owner.is_system() {
+    if !owner.is_node() {
         let footprint = super::module_state_footprint(slot);
         if sched().owners.charge_state(owner, footprint).is_err() {
             let (charged, cap) = sched().owners.charged_state(owner);

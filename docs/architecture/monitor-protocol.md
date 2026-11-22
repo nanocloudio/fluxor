@@ -28,22 +28,24 @@ Emitted unconditionally from `step_guard::push_fault` whenever a module
 faults. No on-device configuration required.
 
 ```
-MON_FAULT mod=<idx> kind=<k> fault_count=<n> restart_count=<n> tick=<t>
+MON_FAULT mod=<idx> kind=<k> fault_count=<n> restart_count=<n> caused_by=<idx> tick=<t>
 ```
 
 | Field           | Meaning                                                                 |
 |-----------------|-------------------------------------------------------------------------|
 | `mod`           | Module index (0..MAX_MODULES-1).                                        |
-| `kind`          | Fault type: `1` timeout, `2` step error, `3` hard fault, `4` protection (MPU or MMU abort, stack bound, stack fence). |
+| `kind`          | Fault type (`step_guard::fault_type`): `1` timeout, `2` step error, `4` protection (MPU or MMU abort, stack bound, stack fence), `5` drain timeout. |
 | `fault_count`   | Cumulative fault count for this module after this event.                |
 | `restart_count` | Cumulative restart count after this event.                              |
+| `caused_by`     | The upstream module whose fault within the cascade window this one followed; `65535` (`NO_MODULE`) for an independent fault. |
 | `tick`          | Kernel tick at which the fault was recorded.                            |
 
 ### `MON_HIST`
 
 Snapshot of a module's step-time histogram (eight log2-spaced buckets).
-Not emitted by the kernel directly — requires an on-device monitor module
-that periodically calls `STEP_HISTOGRAM_QUERY` and prints the line.
+Not emitted by the kernel directly: the on-device `monitor` module
+(`modules/foundation/monitor`) calls `STEP_HISTOGRAM_QUERY` on a slow
+cadence and prints the line.
 
 ```
 MON_HIST mod=<idx> b0=<n> b1=<n> b2=<n> b3=<n> b4=<n> b5=<n> b6=<n> b7=<n>
@@ -86,7 +88,6 @@ MON_STATE mod=<idx> name=<s> state=<s> ready=<0|1> finished=<0|1> restarts=<n> d
 - `state` — `running`, `faulted`, `recovering`, or `terminated`.
 - `ready` — the module has signalled `StepOutcome::Ready`.
 - `finished` — it has finalised, by `Done` or by termination.
-- `fault` — `0` running, `1` faulted, `2` recovering, `3` terminated.
 - `period` — ticks between steps; `0` means every tick.
 - `inactive` — consecutive ticks the readiness gate has blocked this
   module from stepping. Zero after any successful step, so a climbing
@@ -188,9 +189,9 @@ Status codes (from the `STATUS_*` constants): `ok`, `stale_epoch`,
 
 #### Failover records (`transport_migratable` sessions)
 
-Status: design target, not wired — no module emits these lines yet.
-
-For sessions declared `transport_migratable` with platform-replicated
+The SDK defines these events (`MON_EV_FENCE_INITIATED` through
+`MON_EV_CLASS_REPORT` in `crates/fluxor-rt/src/telemetry.rs`) and formats
+them; no module in this repository emits them. For sessions declared `transport_migratable` with platform-replicated
 state, the record set above is extended so an unplanned failover is
 visible in telemetry rather than inferred after the fact. Same line
 format; additional events:
@@ -233,58 +234,6 @@ Operators grep `MON_SESSION ... session=44454d4f2d413031000000000000000a`
 to follow one session's lifecycle across anchor / worker / directory
 emitters.
 
-### `MON_PRESENTATION`
-
-Status: design target, not wired — no module emits these lines yet.
-
-AV presentation-group observability, defined by
-[av_capability_surface.md](av_capability_surface.md). Clock authorities,
-presentation anchors, and group coordinators emit one line per state
-change so operators can trace lip-sync drift, sink join / leave, anchor
-rebind, and missed present / audio boundaries on the same telemetry
-channel as session continuity.
-
-```
-MON_PRESENTATION mod=<idx> event=<e> group=<id> [member=<name>] [authority=<name>] [latency_ms=<n>] [skew_us=<n>] [epoch=<n>] [reason=<r>] [status=<s>]
-```
-
-| Field        | Meaning                                                                       |
-|--------------|-------------------------------------------------------------------------------|
-| `mod`        | Module index of the emitter (clock authority, anchor, or coordinator).        |
-| `event`      | Transition label; see event table below.                                      |
-| `group`      | `presentation_group.id` from YAML config (e.g. `living_room`).                |
-| `member`     | Module name of the member the event applies to. Omit for whole-group events.  |
-| `authority`  | Module name of the current clock authority. Present on `epoch_advance`.       |
-| `latency_ms` | Group latency budget consumed; reported on `latency_report`.                  |
-| `skew_us`    | Inter-member skew in microseconds; reported on `skew_report`.                 |
-| `epoch`      | Presentation epoch as decimal u32. Bumps on cutover.                          |
-| `reason`     | Cause; e.g. `cutover`, `clock_loss`, `member_drop`, `degraded_mode`.          |
-| `status`     | Status code; e.g. `ok`, `underflow`, `overflow`, `missed_present`.            |
-
-#### Events
-
-| Event             | Emitter(s)         | When                                                                       |
-|-------------------|--------------------|----------------------------------------------------------------------------|
-| `group_active`    | coordinator/anchor | Group reached steady state. `authority=<name>`.                            |
-| `member_joined`   | coordinator        | Sink admitted into group. `member=<name>`.                                 |
-| `member_left`     | coordinator        | Sink departed (planned or fault). `member=<name> reason=<r>`.              |
-| `epoch_advance`   | clock authority    | Presentation epoch bumped at a media boundary. `epoch=<n> reason=cutover`. |
-| `anchor_rebind`   | anchor             | Stable sink attachment moved (anchor-preserved continuity).                |
-| `clock_lost`      | clock authority    | Authority lost timing reference. `reason=clock_loss`.                      |
-| `clock_recovered` | clock authority    | Authority regained timing.                                                 |
-| `latency_report`  | any                | Periodic latency report; `latency_ms=<n>`.                                 |
-| `skew_report`     | coordinator        | Periodic inter-member skew report; `skew_us=<n>`.                          |
-| `underflow`       | sink               | Sink starved at the boundary. `status=underflow`.                          |
-| `overflow`        | sink               | Sink dropped frames/samples. `status=overflow`.                            |
-| `missed_present`  | scanout sink       | Frame missed its target vsync. `status=missed_present`.                    |
-| `degraded_mode`   | coordinator        | Group entered/left degraded mode. `reason=<r> status=<s>`.                 |
-
-Reasons: `cutover`, `clock_loss`, `member_drop`, `degraded_mode`,
-`member_recovered`, `protected_required`, `format_change`.
-
-Status codes: `ok`, `underflow`, `overflow`, `missed_present`,
-`drift_corrected`, `protected_denied`.
-
 ## Kernel support
 
 Source: `crates/fluxor-abi/src/internal/monitor.rs`.
@@ -297,7 +246,9 @@ Source: `crates/fluxor-abi/src/internal/monitor.rs`.
   module index.
 - `STEP_HISTOGRAM_QUERY` (`0x2155`) — fetch the 8-bucket histogram for a
   module (or the global histogram with `handle=-1`).
+- `MODULE_STATE_QUERY` (`0x2157`) — fetch a module's scheduler-visible
+  state, the fields of `MON_STATE`.
 
-A monitor module reads these syscalls on a slow cadence and prints the
+The `monitor` module reads these calls on a slow cadence and prints the
 corresponding `MON_*` lines. The parser in `tools/src/monitor.rs` accepts
 whatever arrives — any subset is acceptable.

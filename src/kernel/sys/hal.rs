@@ -64,7 +64,7 @@ pub struct HalOps {
     /// The provenance is a separate hook from `seal`/`unseal` on purpose.
     /// Sealing that works and sealing that protects are different
     /// questions, and a platform that can do the first without the second
-    /// must be able to say so — otherwise the vault's isolation tier would
+    /// must be able to say so — otherwise the vault's custody would
     /// have to be inferred from whether an encrypt call returned bytes,
     /// which it always does.
     pub seal_provenance: fn() -> SealProvenance,

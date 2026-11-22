@@ -50,7 +50,7 @@ one log line.
   board has no sealing key` once.
 - `none`: each record is the key itself, under its own record magic (`FXVC`,
   `FXVR`). Whoever holds the medium holds the keys. `DESCRIBE` reports such a
-  key `persisted::CLEAR` with tier `SOFTWARE`, and `TIER` reports `SOFTWARE`,
+  key `persisted::CLEAR` with custody `SOFTWARE`, and `CUSTODY` reports `SOFTWARE`,
   so a consumer that requires protection at rest refuses it. A sealed store
   never reads a readable record: one found there is treated as absent.
 

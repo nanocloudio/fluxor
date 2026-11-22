@@ -16,7 +16,7 @@
 //! platform may re-register both the KEY_VAULT class dispatch and its
 //! vtable at platform boot (e.g. the Linux PKCS#11 backend), swapping
 //! custody transparently behind the same contract. Isolation honesty:
-//! this backend reports `TIER = SOFTWARE` — kernel static memory
+//! this backend reports `CUSTODY = SOFTWARE` — kernel static memory
 //! isolates against a compromised *module*, not a compromised
 //! host/kernel.
 use crate::abi::contracts::key_vault as dev_key_vault;
@@ -161,7 +161,7 @@ pub const MAX_KEY_BYTES: usize = 64;
 const FLAG_IN_USE: u8 = 0x01;
 /// This slot's key is backed by a sealed blob and survives a restart.
 ///
-/// Reported by `DESCRIBE` NEXT TO the tier and deliberately separate from
+/// Reported by `DESCRIBE` NEXT TO the custody and deliberately separate from
 /// it: durability and isolation are different properties, and a consumer
 /// that conflates them is the failure this whole surface is shaped to
 /// prevent.
@@ -356,7 +356,7 @@ impl Caller {
 fn realm_of(idx: usize) -> [u8; 16] {
     use crate::kernel::exec::scheduler;
     let owner = scheduler::module_owner(idx);
-    if owner.is_system() {
+    if owner.is_node() {
         return NODE_REALM;
     }
     scheduler::owners()
@@ -495,8 +495,8 @@ unsafe fn resolve(handle: i32) -> Result<usize, i32> {
 //
 // It survives by being SEALED, through `hal::seal`, and the platform says
 // what that is worth via `hal::seal_provenance`. This store deliberately
-// does not care which answer it gets: it persists either way, and `TIER`
-// reports the provenance separately. Wiring persistence to the tier here
+// does not care which answer it gets: it persists either way, and `CUSTODY`
+// reports the provenance separately. Wiring persistence to the custody here
 // would be the exact conflation the surface exists to prevent — a key that
 // survives a restart is not thereby protected from the host.
 
@@ -1339,28 +1339,28 @@ pub(crate) fn zeroize(buf: &mut [u8]) {
     }
 }
 
-/// The tier this vault reports: decided by the sealing key's provenance,
+/// The custody this vault reports: decided by the sealing key's provenance,
 /// and only by a sealing key the platform can actually seal with.
 ///
 /// A device-unique key that no seal uses protects nothing: the platform
 /// that reads its OTP key and stubs `seal` holds every key in RAM with
 /// nothing bound to the device, and reporting `DEVICE_HW` there would pass
-/// every `tier >= DEVICE_HW` refusal on a claim nobody implemented.
-fn current_tier() -> u8 {
+/// every `custody >= DEVICE_HW` refusal on a claim nobody implemented.
+fn current_custody() -> u8 {
     // A store kept readable holds the node's keys in the clear on its medium.
     if crate::kernel::security::vault_store::clear() {
-        return dev_key_vault::tier::SOFTWARE;
+        return dev_key_vault::custody::SOFTWARE;
     }
     if crate::kernel::sys::hal::seal_provenance()
         != crate::kernel::sys::hal::SealProvenance::DeviceUnique
     {
-        return dev_key_vault::tier::SOFTWARE;
+        return dev_key_vault::custody::SOFTWARE;
     }
     let mut probe = [0u8; 1 + 32];
-    if crate::kernel::sys::hal::seal(b"fluxor/tier", &[0u8], &mut probe).is_some() {
-        dev_key_vault::tier::DEVICE_HW
+    if crate::kernel::sys::hal::seal(b"fluxor/custody", &[0u8], &mut probe).is_some() {
+        dev_key_vault::custody::DEVICE_HW
     } else {
-        dev_key_vault::tier::SOFTWARE
+        dev_key_vault::custody::SOFTWARE
     }
 }
 
@@ -1900,7 +1900,7 @@ unsafe fn dispatch_slots(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
         | dev_key_vault::OPEN
         | dev_key_vault::DESTROY_BY_LABEL
         | dev_key_vault::DESCRIBE_SUITE
-        | dev_key_vault::TIER => usize::MAX,
+        | dev_key_vault::CUSTODY => usize::MAX,
         _ => match resolve(handle) {
             Ok(i) => i,
             Err(e) => return e,
@@ -1923,13 +1923,13 @@ unsafe fn dispatch_slots(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
         dev_key_vault::KEY_UNWRAP => key_unwrap(idx, buf),
         dev_key_vault::AEAD_SEAL => aead_seal(idx, arg, buf),
         dev_key_vault::AEAD_OPEN => aead_open(idx, arg, buf),
-        dev_key_vault::TIER => {
+        dev_key_vault::CUSTODY => {
             // Isolation honesty, and the one place persistence must NOT be
             // allowed to speak.
             //
             // This backend seals keys so they survive a restart — see
             // `persist_key`. That is durability, and durability is not
-            // isolation. The tier is derived from where the platform's
+            // isolation. The custody is derived from where the platform's
             // sealing key COMES FROM, never from whether sealing works:
             //
             //   - no sealing, or a key the host can also read
@@ -1940,19 +1940,19 @@ unsafe fn dispatch_slots(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
             //       → `DEVICE_HW`. Only here has anything actually been
             //         isolated from the host.
             //
-            // A backend that reported a higher tier because it had learned
-            // to persist would hand every consumer checking `tier >= N` a
+            // A backend that reported a stronger custody because it had learned
+            // to persist would hand every consumer checking `custody >= N` a
             // guarantee nobody implemented.
             let Some(t) = arg.first_mut() else {
                 return EINVAL;
             };
-            *t = current_tier();
+            *t = current_custody();
             1
         }
         dev_key_vault::DESCRIBE_SUITE => describe_suite(arg),
         dev_key_vault::DESCRIBE => {
             let slot = &SLOTS[idx];
-            // Reported side by side and meaning different things. The tier
+            // Reported side by side and meaning different things. The custody
             // says what this key is isolated from; `persisted` says whether
             // it comes back after a restart. A key a workload's own vault
             // holds is sealed under a key its owner supplied, and a key kept
@@ -1961,10 +1961,10 @@ unsafe fn dispatch_slots(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
             let d = dev_key_vault::describe::Described {
                 suite: slot.suite,
                 usage: slot.usage,
-                tier: if slot.flags & (FLAG_OWNER_SEALED | FLAG_CLEAR) != 0 {
-                    dev_key_vault::tier::SOFTWARE
+                custody: if slot.flags & (FLAG_OWNER_SEALED | FLAG_CLEAR) != 0 {
+                    dev_key_vault::custody::SOFTWARE
                 } else {
-                    current_tier()
+                    current_custody()
                 },
                 persisted: if slot.flags & FLAG_PERSISTED == 0 {
                     dev_key_vault::persisted::NO
@@ -2649,10 +2649,10 @@ unsafe fn attest_composition(idx: usize, arg: &mut [u8], buf: &mut [u8]) -> i32 
     if sig_len == 0 {
         return ENOSYS;
     }
-    let tier = current_tier();
+    let custody = current_custody();
     let rec = &mut *core::ptr::addr_of_mut!(ATTEST_RECORD);
     let Some(rec_len) =
-        crate::kernel::exec::scheduler::attest::write_record(&challenge, tier, &mut rec[..])
+        crate::kernel::exec::scheduler::attest::write_record(&challenge, custody, &mut rec[..])
     else {
         return ENOMEM;
     };
@@ -2752,7 +2752,7 @@ unsafe fn key_unwrap(idx: usize, blob: &[u8]) -> i32 {
     };
     let rec = &mut *core::ptr::addr_of_mut!(ATTEST_RECORD);
     let Some(ours) =
-        crate::kernel::exec::scheduler::attest::composition_digest(current_tier(), &mut rec[..])
+        crate::kernel::exec::scheduler::attest::composition_digest(current_custody(), &mut rec[..])
     else {
         return ENOMEM;
     };
@@ -3457,25 +3457,28 @@ pub(crate) unsafe fn attestable(handle: i32) -> Option<Attestable> {
     })
 }
 
-/// The composition digest `KEY_WRAP` binds to, under `tier`.
+/// The composition digest `KEY_WRAP` binds to, under `custody`.
 ///
 /// # Safety
 /// Kernel context, exclusive access to the attestation scratch.
-pub(crate) unsafe fn composition_digest(tier: u8) -> Option<[u8; 32]> {
+pub(crate) unsafe fn composition_digest(custody: u8) -> Option<[u8; 32]> {
     let rec_ptr = &raw mut ATTEST_RECORD;
     let rec = &mut *rec_ptr;
-    crate::kernel::exec::scheduler::attest::composition_digest(tier, &mut rec[..])
+    crate::kernel::exec::scheduler::attest::composition_digest(custody, &mut rec[..])
 }
 
-/// The composition record for `challenge`, ending in `tier`, in the
+/// The composition record for `challenge`, ending in `custody`, in the
 /// attestation scratch.
 ///
 /// # Safety
 /// Kernel context, exclusive access to the attestation scratch; the slice
 /// is valid until the next attestation.
-pub(crate) unsafe fn composition_record(challenge: &[u8; 32], tier: u8) -> Option<&'static [u8]> {
+pub(crate) unsafe fn composition_record(
+    challenge: &[u8; 32],
+    custody: u8,
+) -> Option<&'static [u8]> {
     let rec_ptr = &raw mut ATTEST_RECORD;
     let rec = &mut *rec_ptr;
-    let n = crate::kernel::exec::scheduler::attest::write_record(challenge, tier, &mut rec[..])?;
+    let n = crate::kernel::exec::scheduler::attest::write_record(challenge, custody, &mut rec[..])?;
     Some(&rec[..n])
 }

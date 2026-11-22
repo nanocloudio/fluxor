@@ -1,4 +1,4 @@
-// linux_gpu built-in — the channel edge of the native GPU provider.
+// linux_gpu native module — the channel edge of the native GPU provider.
 //
 // Everything that decides anything lives in `fluxor::platform::linux::gpu`,
 // which takes command bytes and produces outcome bytes and touches no channel.
@@ -144,7 +144,7 @@ fn build_linux_gpu(module_idx: usize, params: &[u8]) -> Result<Box<LinuxGpuInsta
             announced: false,
         });
     log::info!(
-        "[inst] module {module_idx} = linux_gpu (built-in) in={in_chan} out={out_chan} \
+        "[inst] module {module_idx} = linux_gpu (native) in={in_chan} out={out_chan} \
          resident={resident_mb} MiB staging={staging_kb} KiB"
     );
     Ok(st)

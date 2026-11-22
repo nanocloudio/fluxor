@@ -1,4 +1,4 @@
-// host_image_codec built-in — decode JPEG/PNG/BMP/GIF into RGB565
+// host_image_codec native module — decode JPEG/PNG/BMP/GIF into RGB565
 // frames sized to a target width/height. Reads encoded bytes
 // incrementally on `encoded`; once the upstream stalls (channel quiet
 // for ~EOF_TICKS consecutive steps), decodes the accumulated buffer,
@@ -258,7 +258,7 @@ fn build_host_image_codec(module_idx: usize, params: &[u8]) -> Result<Box<HostIm
             pending_pos: 0,
         });
     log::info!(
-        "[inst] module {} = host_image_codec (built-in) in={} out={} {}x{} mode={} max_bytes={}",
+        "[inst] module {} = host_image_codec (native) in={} out={} {}x{} mode={} max_bytes={}",
         module_idx,
         in_ch,
         out_ch,

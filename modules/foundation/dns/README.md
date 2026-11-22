@@ -1,39 +1,39 @@
 # dns Module
 
-DNS Server PIC Module
+A DNS server: answers configured hostnames locally and forwards every other
+query to an upstream resolver. DNS64 synthesis (`dns64_prefix`), a
+TSIG-authenticated dynamic-update zone (`update_zone`), an encrypted upstream
+(`upstream_transport`) and DNSSEC validation (`dnssec`) are each off unless
+their parameter is set.
+
+Two variants: `full` (the default) and `resolver`, which serves neither
+dynamic update nor DNSSEC validation and holds none of their tables; an
+instance that sets `update_*`, `dnssec` or `dnssec_anchor` on `resolver`
+refuses to construct.
 
 ## Files
 
 - `manifest.toml`
 - `mod.rs`
-- `sdk/contracts/net/dns_wire.rs` (mounted) — the message codec: header,
+- `crates/fluxor-abi/src/contracts/net/dns_wire.rs` — the message codec: header,
   names with compression, question, resource records. Shared with the `ip`
   module's stub resolver; this module stays a server.
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
-
-# Network transport: wired to the IP / transport stack via NetProto.
-[[ports]]
-name = "net_in"
-direction = "input"
-content_type = "NetProto"
-
-[[ports]]
-name = "net_out"
-direction = "output"
-content_type = "NetProto"
-```
+Two `NetProto` ports, `net_in` and `net_out`, wired to the transport
+(`ip` on bare metal, `linux_net` on a Linux host); the module builds for
+rp2040, rp2350, bcm2712 and linux. [manifest.toml](manifest.toml) is the
+declaration.
 
 ## Parameters
 
-- `host`
-- `port`
-- `ttl`
-- `upstream`
+- `host` (repeatable `"hostname=ip"`, up to 16 entries): local answers.
+- `port` (u16, default 53): listen port.
+- `ttl` (u32, default 300): TTL of local answers, in seconds.
+- `trace_sample_permille` (`dns.query` head-sampling rate; default per target:
+  50‰ on aarch64, 0 on an MCU)
+- `upstream` (IPv4 address, default 8.8.8.8): the forwarding upstream.
 - `upstream_port` (destination port for forwarded queries, default 53 —
   lets a delegation listener on a non-standard port be the upstream)
 - `dns64_prefix` (absent by default; `"<ipv6>/<len>"` — any RFC 6052
@@ -63,7 +63,7 @@ content_type = "NetProto"
   constructed from the header plus that question; nothing trailing the
   question is echoed.
 - Names up to `MAX_NAME_LEN` (255) bytes, labels up to `MAX_LABEL_LEN` (63) —
-  both registered in `docs/architecture/limit_register.md`.
+  both registered in [limit_register.md](../../../docs/architecture/limit_register.md).
 - Forwarded queries carry a CSPRNG-drawn upstream transaction id, not the
   client's. An upstream answer is relayed only when it arrives from the
   configured upstream address and port with QR set, the expected opcode, and
@@ -85,8 +85,3 @@ content_type = "NetProto"
   zone-signing key makes every answer for it fail. Only the first anchor
   given for a zone is consulted, so a second entry does not carry a
   rollover.
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-09-20

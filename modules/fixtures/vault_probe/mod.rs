@@ -21,7 +21,7 @@ struct State {
     label: [u8; MAX_LABEL],
     label_len: u8,
     done: u8,
-    tier: u8,
+    custody: u8,
     persisted: u8,
     waits: u32,
     rc: i32,
@@ -137,8 +137,8 @@ unsafe fn report(s: &State) {
         n += 2;
         i += 1;
     }
-    n = put(p, n, b" tier=");
-    n = put_dec(p, n, u64::from(s.tier));
+    n = put(p, n, b" custody=");
+    n = put_dec(p, n, u64::from(s.custody));
     n = put(p, n, b" persisted=");
     n = put_dec(p, n, u64::from(s.persisted));
     dev_log(sys, 3, p, n);
@@ -210,7 +210,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> StepReturn {
     ) >= 0
     {
         if let Some(described) = kv::describe::parse(&d) {
-            s.tier = described.tier;
+            s.custody = described.custody;
             s.persisted = described.persisted;
         }
     }

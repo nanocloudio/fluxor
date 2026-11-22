@@ -1,6 +1,6 @@
 # linux_display
 
-Linux-only built-in display sink. Consumes RGB565 frames (row-major,
+Linux-only native display sink. Consumes RGB565 frames (row-major,
 `width × height × 2` bytes per frame) on its `pixels` input and either
 writes them as PPM files, blits them through a host window, or
 discards them.
@@ -36,6 +36,7 @@ Configured via `[[params]]` in [manifest.toml](manifest.toml):
 | `width`  | u32  | 480 (range 1..=4096)                     | frame width in pixels                                         |
 | `height` | u32  | 480 (range 1..=4096)                     | frame height in pixels                                        |
 | `scale`  | u32  | 1 (range 1..=16)                         | integer pixel scale for `window` mode                         |
+| `header` | u32  | 0 (range 0..=1)                          | 1: each frame carries an `SRF1` header (magic, width, height, format) and the sink takes its geometry from the stream, not from `width`/`height` |
 
 ```yaml
 modules:
@@ -60,7 +61,7 @@ instance is named `display` and its params come from
 
 ## Pixel format
 
-v1 consumes RGB565, row-major. Each frame is exactly
+The sink consumes RGB565, row-major. Each frame is exactly
 `width × height × 2` bytes. The PPM is written as P6 binary RGB888 —
 RGB565 is expanded per-pixel.
 

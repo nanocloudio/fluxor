@@ -6,7 +6,7 @@ builtin = true
 # the kernel's vtable and the build's state-arena charge both read.
 state_bytes_64 = 1
 
-# Host-side built-in module that holds N file paths and streams them on
+# Host-side native module that holds N file paths and streams them on
 # demand. Mirrors the fat32 streaming pattern but without a filesystem
 # layer — suitable for small static assets (JS, HTML, images) co-located
 # with the host fluxor binary, so a foundation/http route can fetch them

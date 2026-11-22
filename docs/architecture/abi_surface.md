@@ -1,7 +1,9 @@
 # ABI Surface Digest
 
-Fluxor has no ABI version numbers. There is one surface, and the rule is that
-the latest one is the only one: no compatibility windows, no negotiation. So
+Fluxor has no ABI versioning. There is one surface, and the rule is that
+the latest one is the only one: no compatibility windows, no negotiation (the
+module header's `ABI_VERSION` byte is a fixed format marker, never a choice
+between surfaces). So
 the only way to know that a module and a kernel agree is to hash everything
 they must agree on and compare the hashes.
 
@@ -23,7 +25,8 @@ channel message types, the handle word's bit split — is declared once, in
 `crates/fluxor-abi/registry/registry.toml`. `fluxor abi-regen` generates
 `crates/fluxor-abi/src/registry.rs` from it, and that generated file is one of
 the sources `CONTRACTS_PLATFORM_SRC_HASH` covers, so a number change moves the
-digest exactly as a layout change does. A retired number is simply gone.
+digest exactly as a layout change does. A number that leaves the registry
+is gone.
 `SEMANTIC_EPOCH`, also in the registry, moves the digest when a meaning
 changes without a number changing.
 
@@ -42,18 +45,17 @@ one per change.
 Source: `crates/fluxor-abi/src/abi_surface/srcpin.rs`.
 
 `CONTRACTS_PLATFORM_SRC_HASH` and `ABI_SURFACE_DIGEST` live adjacent in
-`abi_surface_srcpin.rs`, which makes them look like a pair. They are an input
+`abi_surface/srcpin.rs`, which makes them look like a pair. They are an input
 and an output:
 
 | Constant | Role | Why it must be a constant |
 |---|---|---|
 | `CONTRACTS_PLATFORM_SRC_HASH` | ingredient, read inside `write_surface` | The kernel computes its own digest at run time, on bare metal, with no filesystem to hash source files from |
-| `ABI_SURFACE_DIGEST` | result, embedded by every module the SDK compiles as `FLUXOR_ABI_SURFACE` | It is the module's attestation stamp, in `no_std` code |
+| `ABI_SURFACE_DIGEST` | result, embedded in every module as `FLUXOR_ABI_SURFACE` (`crates/fluxor-rt/src/lib.rs`, which every module link keeps) | It is the module's attestation stamp, in `no_std` code |
 
-Neither can be derived away at build time. PIC modules compile through direct
-`rustc` invocations with no `--extern` flags, so `abi_surface.rs` may use
-`core` and nothing else; a const-evaluated SHA-256 would mean carrying a
-second hash implementation in the SDK to delete one cached value.
+Neither can be derived away at build time. `abi_surface.rs` is `no_std` and
+allocation-free, and `fluxor-abi` carries no hash implementation; a
+const-evaluated SHA-256 would mean adding one to delete one cached value.
 
 Both are written by **`fluxor abi-regen`**, which is the single writer. Never
 hand-edit either: a hand-pasted digest that happens to be wrong produces
@@ -62,19 +64,19 @@ artefacts that attest a surface nobody has.
 ## Where the digest ends up
 
 ```
-                    crates/fluxor-abi/src/abi_surface.rs
-                    (constants + src hash)
+          crates/fluxor-abi/src/** + contracts/src/**
+          (token-hashed with SEMANTIC_EPOCH)
                               │
                       fluxor abi-regen
                               │
                 ┌─────────────┴─────────────┐
                 ▼                           ▼
-  abi_surface_srcpin.rs              tools/src/hash.rs
+  abi_surface/srcpin.rs              tools/src/hash.rs
   ABI_SURFACE_DIGEST                 the one spelled-out
   (embedded in every module)         digest, as a tripwire
                 │
                 ├──► every .fmod        (stamped at pack time)
-                ├──► every graph slot   (stamped at build time)
+                ├──► every node image   (pinned at build time)
                 └──► every store artefact (io.fluxor.abi-surface annotation)
 ```
 
@@ -89,8 +91,8 @@ surface?* — at five different moments:
 | Gate | Where | Catches |
 |---|---|---|
 | **Pack / read** | `tools/src/modules.rs::verify_module_abi_surface` | an `.fmod` whose stamp differs from the CLI's digest |
-| **Load** | `src/kernel/module/loader.rs::validate_module` | a module, signed or not, that carries no attestation (manifest flag bit 4) or attests a surface other than the running kernel's — native modules, code packs and wasm envelopes alike |
-| **Boot** | `src/kernel/boot/config.rs::decode_slot_header` | a graph slot that doesn't match the running kernel |
+| **Load** | `src/kernel/module/loader.rs::validate_module` | a module, signed or not, that carries no attestation (manifest flag `FLAG_ATTESTATION`, `0x10`) or attests a surface other than the running kernel's — native modules, code packs and wasm envelopes alike |
+| **Boot** | `src/kernel/boot/node_image.rs::admit` | a node image whose ABI pin doesn't match the running kernel |
 | **Sync** | `tools/src/store_resolve.rs::check_epoch` | a store artefact set that is mixed-epoch, unstamped, or behind the current surface |
 | **Pin freshness** | `fluxor abi-regen --check` | the checked-in constants having gone stale against the source |
 
@@ -107,22 +109,21 @@ the packer copies only when it equals its own: the module was compiled
 against this surface, not merely packed by a current tool. A wasm module's
 payload must contain the current digest, and the packer stamps it. At load,
 the attestation sits at its canonical offset (after the integrity hash and
-the signature block, where present) and the manifest ends there; a signature
-covers it. The loader applies the check to every module it admits: the node
+the signature block, where present), followed only by the conditional-grant
+block where the manifest has one; a signature covers it. The loader applies the check to every module it admits: the node
 graph, a live subgraph add, a workload's subgraph, the modules of a code
 pack and a wasm child alike. An unsigned module's attestation is the
 builder's claim, so the check catches a stale or mismatched build rather than
 a forger; authenticity is the signature's job.
 
-## The tripwire, and the two mounts
+## The tripwire, and the one constant
 
-`abi_surface.rs` is `#[path]`-mounted into two different crates: the host
-tools and the kernel. Both must compute the same digest, or an artefact
-stamped by the CLI would be rejected by a kernel that disagrees about the
-surface. The invariant: both mounts resolve to the single
-`ABI_SURFACE_DIGEST` constant in `abi_surface_srcpin.rs`, so they cannot
-disagree with each other without one of them disagreeing with the constant —
-and a stale constant is exactly what `abi-regen --check` reports.
+The host tools and the kernel both link `fluxor-abi`, and both must agree on
+the digest, or an artefact stamped by the CLI would be rejected by a kernel
+that disagrees about the surface. Both read the single `ABI_SURFACE_DIGEST`
+constant in `abi_surface/srcpin.rs`, so they cannot disagree with each other
+without one of them disagreeing with the constant — and a stale constant is
+exactly what `abi-regen --check` reports.
 
 `tools/src/hash.rs` additionally carries the one spelled-out digest hex in
 the tree. That literal is a deliberate tripwire: it goes stale on *any*
@@ -204,4 +205,4 @@ The messages you may see:
 The one case that is *not* a stale pin is the spelled-out hex tripwire firing
 on its own: that means the wire surface genuinely changed. Update the literal
 only as part of that deliberate decision, and expect every already-built
-`.fmod` and every pinned graph slot to stop matching — correctly.
+`.fmod` and every pinned node image to stop matching — correctly.

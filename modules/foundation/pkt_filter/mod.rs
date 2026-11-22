@@ -115,10 +115,9 @@ pub const POLICY_BUF: usize = 4096;
 /// (`ipfrag_time`).
 pub const FRAG_SLOTS: usize = 8;
 pub const FRAG_MS: u32 = 30_000;
-/// The heap the flow table is sized into when the graph names none: room to
-/// declare up to the most `max_flows` allows on aarch64, where the heap
-/// commits only what is touched; the default table on MCU-class targets,
-/// where it is committed whole.
+/// The heap the flow table is sized into when the graph names none, committed
+/// whole when the module is instantiated: room to declare up to the most
+/// `max_flows` allows on aarch64; the default table on MCU-class targets.
 #[cfg(target_arch = "aarch64")]
 const HEAP_DEFAULT_BYTES: u32 = 4 * 1024 * 1024;
 #[cfg(not(target_arch = "aarch64"))]

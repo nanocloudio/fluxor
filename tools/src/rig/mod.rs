@@ -61,7 +61,7 @@ pub use profile::{
 };
 pub use project::{BuildOutput, BuildRecipe, ProjectDescriptor, PROJECT_DESCRIPTOR};
 pub use record::{
-    canonical_profile, hash_artifact_bundle, hash_artifact_file, hash_profile, ActuatorRecord,
+    canonical_profile, hash_artifact_dir, hash_artifact_file, hash_profile, ActuatorRecord,
     GitIdentity, Reports, RunRecord, TeardownRecord, Verdict,
 };
 pub use scenario::{load_scenario, parse_scenario_str, ExpectRule, ObservationRule, Scenario};

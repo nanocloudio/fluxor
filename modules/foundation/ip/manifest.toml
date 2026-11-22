@@ -1,7 +1,7 @@
 version = "1.0.0"
 # timer_class: TCP/ARP timers increment on a 50 ms wall-clock gate (dev_millis), not per tick.
 timer_class = "wall_clock"
-# `linux`: over the `linux_eth` built-in frame driver the module is the hosted runtime's
+# `linux`: over the `linux_eth` native frame driver the module is the hosted runtime's
 # own TCP/IP stack (the transport-continuity surfaces need a stack that owns
 # its connections; `linux_net`'s host sockets cannot checkpoint one).
 hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "uefi"]
@@ -16,7 +16,7 @@ deferred_ready = true
 cutoff = "ring_handoff"
 
 # Workload network lanes (NET_PROVIDE / NET_LANE_TAKE / NET_LANE_ADMIT): on
-# a kernel with no built-in lane provider (bare metal), ip serves each staged
+# a kernel with no native lane provider (bare metal), ip serves each staged
 # workload's `Net(key)` edges as a lane of its own. Where no workload backend
 # exists the claim fails and ip serves its own net_in/net_out alone.
 [[resources]]

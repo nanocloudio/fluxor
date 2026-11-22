@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use fluxor_contracts::log_ring::{read_ring_records, GapCursor, LogRecord, RingHeader, HEADER_LEN};
 
 /// The all-zero UID names owner 0 (platform / system records), addressed on the
-/// CLI by the reserved literal `system`. A workload UID is never all-zero
+/// CLI by the reserved literal `system`. A owner uid is never all-zero
 /// (validation rejects it), so this is unambiguous.
 pub const SYSTEM_UID: [u8; 16] = [0u8; 16];
 

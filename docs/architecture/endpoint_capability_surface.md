@@ -214,7 +214,7 @@ Presents audio through host APIs:
 Maintains endpoint lifecycle:
 
 - connect, disconnect, reconnect
-- endpoint registration and capability advertisement
+- endpoint registration
 - session epoch handling
 - transport fallback
 - telemetry and diagnostics
@@ -236,70 +236,14 @@ the application profile declares it.
 ## 5. Capability Vocabulary
 
 Endpoint capabilities describe role surface and platform mechanics, not
-application identity. Generic role-and-mechanic names live under
-`endpoint.*`. Host-specific feature names live under `<host>.*` in the
-corresponding profile document (`browser.*`, `mobile.*`, `desktop.*`,
-`headset.*`, etc.).
+application identity. The AV and input capability vocabularies are the
+role vocabulary for media and input shape; an endpoint is described by
+the surfaces it produces and consumes in those terms.
 
-Status: design target, not wired. The `endpoint.*` names are not part of
-the manifest capability registry (`contracts/src/vocabulary.rs`); they
-are the negotiation vocabulary of the endpoint session protocol, and the
-capability advertisement below is the shape profiles converge on.
-
-Generic names:
-
-| Capability             | Meaning |
-|------------------------|---------|
-| `endpoint`             | endpoint session provider                              |
-| `endpoint.control`     | can produce endpoint-originated input surfaces         |
-| `endpoint.visual`      | can present visual surfaces                            |
-| `endpoint.audio`       | can present audio surfaces                             |
-| `endpoint.cache`       | can provide host-side storage / cache                  |
-| `endpoint.media_url`   | can play direct media URLs through host media APIs     |
-| `endpoint.pcm_timed`   | can run a host timed PCM sink with stream-time scheduling |
-| `endpoint.encoded`     | can decode encoded media on the host                   |
-| `endpoint.muxed`       | can play container-muxed media on the host             |
-
-The AV and input capability vocabularies remain the authoritative role
-vocabulary for media and input shape. Endpoint capabilities describe
-endpoint mechanics on top of them.
-
-A profile-shaped capability advertisement, transport-neutral:
-
-```text
-EndpointCaps:
-  endpoint_id: <opaque>
-  profile: <profile-name>          # e.g. browser, mobile, desktop, headset
-  roles:
-    control
-    visual
-    audio
-  input:
-    key
-    pointer
-    touch
-    action
-  visual:
-    video.raster
-    video.draw
-  audio:
-    audio.sample
-    audio.encoded
-    media.muxed
-  endpoint:
-    media_url
-    pcm_timed
-    encoded
-  <host>:                          # profile-specific feature flags
-    <host>.<feature>
-  constraints:
-    audio_unlock_required: <bool>
-    background_throttle_possible: <bool>
-    sandboxed_storage_only: <bool>
-```
-
-The `<host>:` block is the only profile-specific section; everything else
-is generic and validated against the vocabulary above.
+No endpoint capability is negotiated at run time. Endpoint names are not
+part of the manifest capability registry (`contracts/src/vocabulary.rs`),
+and the shipped browser runtime advertises none: a page is written for the
+graph it talks to, and it uses the host APIs its profile script calls.
 
 ---
 
@@ -340,39 +284,15 @@ implementations.
 The session protocol is the stable boundary between the gateway and the
 endpoint runtime. It is independent of the transport.
 
-Status: design target, not wired. The message-class model below is the
-generic shape; the shipped browser profile speaks a compact
-`[kind | flags | reserved | payload_len]` packet envelope whose kind
-bytes cover a subset of these classes (see
-`browser_capability_surface.md` and
-`src/platform/wasm/host/endpoint_runtime.js`).
-
-Message classes:
-
-| Class                  | Direction        | Purpose |
-|------------------------|------------------|---------|
-| `Hello` / `Caps`       | both             | version and endpoint capability negotiation |
-| `Attach` / `Detach`    | both             | bind endpoint roles to graph sessions       |
-| `AudioSample`          | Fluxor → endpoint | decoded PCM blocks with timing metadata    |
-| `AudioEncoded`         | Fluxor → endpoint | encoded access units or segments           |
-| `MediaUrl`             | Fluxor → endpoint | direct URL / range playback instruction    |
-| `VideoRaster`          | Fluxor → endpoint | pixel frames or damage regions             |
-| `VideoDraw`            | Fluxor → endpoint | retained / replayable draw operations      |
-| `Input*`               | endpoint → Fluxor | key, pointer, touch, vector, scalar, binary, action input |
-| `Control`              | both             | application / session commands              |
-| `Telemetry`            | both             | buffer, latency, underrun, error, feature reports |
-
-Every media-bearing message carries enough metadata for the sink to make
-deterministic scheduling decisions:
-
-- session id
-- stream id
-- epoch
-- sequence
-- content type
-- codec / config id when encoded
-- StreamTime start and duration when timed
-- payload length and integrity hint
+The shipped instance is the browser profile's envelope: every packet is
+an 8-byte header `[kind u8][flags u8][reserved u16][payload_len u32 LE]`
+followed by `payload_len` bytes (`src/platform/wasm/host/endpoint_runtime.js`).
+A packet whose length disagrees with its header is dropped. The kind bytes
+and their payloads belong to the application profile on both sides: the
+runtime dispatches each kind to the handler the profile registered and
+ignores a kind with none. Its timed PCM packet, for one, carries its own
+start frame, rate, frame count and layout after the envelope, so the sink
+schedules it without asking the producer (`browser_capability_surface.md`).
 
 Transport-level fragmentation never leaks into the application message
 model. Stream chunks, datagram boundaries, and record frames are
@@ -392,7 +312,6 @@ Generic responsibilities:
 
 - endpoint connection and reconnect
 - session protocol parse / build / dispatch
-- capability advertisement
 - feature detection and fallback paths for the host's audio, draw,
   decode, and storage APIs
 - audio unlock / resume policy where the host requires it
@@ -509,7 +428,6 @@ A *profile* is the host-API-specific binding for this surface. A profile
 document specifies:
 
 - which host APIs implement each generic role
-- profile-specific capability names under `<host>.*`
 - host-specific runtime concerns that the generic runtime cannot abstract
   (audio unlock policy, sandboxed storage, background throttling,
   permission models, sleep / wake handling)
@@ -577,18 +495,18 @@ An endpoint integration is sound when:
 
 ## 14. Related Documentation
 
-- `architecture/av_capability_surface.md` — AV peer; hosts the
+- [av_capability_surface.md](av_capability_surface.md) — AV peer; hosts the
   audio / video surface family endpoints map onto.
-- `architecture/input_capability_surface.md` — input peer; hosts the
+- [input_capability_surface.md](input_capability_surface.md) — input peer; hosts the
   input surface family and identity-namespace model endpoints produce
   into.
-- `architecture/protocol_surfaces.md` — protocol substrate that carries
+- [protocol_surfaces.md](protocol_surfaces.md) — protocol substrate that carries
   endpoint session traffic across stream, datagram, mux, and
   remote-channel transports.
-- `architecture/capability_surface.md` — capability registries and
+- [capability_surface.md](capability_surface.md) — capability registries and
   content types; the native vocabulary endpoint gateways translate at
   the boundary.
-- `architecture/monitor-protocol.md` — `MON_*` line-format conventions
+- [monitor-protocol.md](monitor-protocol.md) — `MON_*` line-format conventions
   shared with endpoint telemetry.
-- `architecture/browser_capability_surface.md` — browser profile of this
+- [browser_capability_surface.md](browser_capability_surface.md) — browser profile of this
   surface.

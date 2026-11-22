@@ -448,7 +448,7 @@ unsafe fn slots() -> &'static mut [Slot; MAX_SLOTS] {
 }
 
 fn owner_alive(owner: OwnerHandle) -> bool {
-    !owner.is_system() && scheduler::owners().lookup(owner).is_some()
+    !owner.is_node() && scheduler::owners().lookup(owner).is_some()
 }
 
 fn reserve(owner: OwnerHandle, bytes: u64) -> bool {
@@ -1230,7 +1230,7 @@ pub unsafe fn set_backend(backend: Option<Backend>) {
 /// previous run left is its own all the same. An owner that acted with the
 /// node's authority has no root, and none is queued for removal.
 pub fn release(owner: OwnerHandle) {
-    if owner.is_system() || !crate::kernel::workload::storage::rooted(owner) {
+    if owner.is_node() || !crate::kernel::workload::storage::rooted(owner) {
         return;
     }
     // SAFETY: owner release runs on the scheduler thread, as every dispatch.

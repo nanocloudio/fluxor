@@ -3,8 +3,7 @@
 The browser is a profile of the endpoint capability surface defined in
 `endpoint_capability_surface.md`. This document specifies the
 browser-specific bindings: which web platform APIs implement each
-generic concept, which browser constraints the runtime absorbs, and
-which capability names describe browser-specific platform features.
+generic concept, and which browser constraints the runtime absorbs.
 
 This document is normative only for browser endpoints. The shape of
 an endpoint, its role decomposition, its session protocol, and its
@@ -20,7 +19,6 @@ This profile defines:
 
 - which web platform APIs realise each generic endpoint role
 - the shipped browser runtime core (`endpoint_runtime.js`)
-- browser-specific capability names under `browser.*`
 - browser constraints the runtime absorbs (audio unlock, background
   throttling, sandboxed storage)
 - transport options a browser endpoint can speak
@@ -118,36 +116,16 @@ projects carry their own profiles against this runtime.
 
 ## 4. Browser capability names
 
-Generic role and routing-mode names live under `endpoint.*` in the
-parent surface. Browser-specific *platform feature* names live here
-and belong in the `<host>:` block of the capability advertisement
-defined by the endpoint surface.
-
-Status: design target, not wired. The runtime does not yet detect and
-advertise these names; the table fixes the vocabulary a browser
-endpoint will use.
-
-| Capability                 | Meaning                                                           |
-|----------------------------|--------------------------------------------------------------------|
-| `browser.media_element`    | Can play direct media URLs through `HTMLMediaElement`             |
-| `browser.webaudio`         | Can play or process audio through WebAudio                        |
-| `browser.audio_worklet`    | Can run a worklet-backed timed PCM sink                           |
-| `browser.webcodecs`        | Can use WebCodecs for encoded media                               |
-| `browser.mse`              | Can use Media Source Extensions                                   |
-| `browser.canvas2d`         | Can render through Canvas 2D                                      |
-| `browser.webgl`            | Can render through WebGL                                          |
-| `browser.webgpu`           | Can render through WebGPU                                         |
-| `browser.gamepad_api`      | Can capture gamepad input through the Gamepad API                 |
-| `browser.webxr`            | Can capture pose / controller input through WebXR                 |
-| `browser.websocket`        | Can connect via WebSocket                                         |
-| `browser.webtransport`     | Can connect via WebTransport                                      |
+A browser endpoint advertises no capability names: the runtime detects no
+host features on the producer's behalf, and a page is written for the graph
+it talks to. Which web APIs a page uses (§2) is its profile script's
+choice.
 
 ---
 
 ## 5. Browser constraints
 
-Three web-platform facts shape every browser endpoint, and the
-advertised constraints in the endpoint capability block reflect them:
+Three web-platform facts shape every browser endpoint:
 
 - **Audio unlock.** An `AudioContext` cannot start without a user
   gesture. The runtime's `unlock()` must be called from a gesture
@@ -159,13 +137,6 @@ advertised constraints in the endpoint capability block reflect them:
 - **Sandboxed storage.** Host-side cache storage (Cache Storage,
   IndexedDB, OPFS) is origin-scoped and may be evicted, so the cache
   role stays best-effort.
-
-```text
-constraints:
-  audio_unlock_required: true
-  background_throttle_possible: true
-  sandboxed_storage_only: true
-```
 
 ---
 
@@ -220,8 +191,8 @@ generic endpoint validation rules:
   application page.
 - Application code never reads DOM events directly; it reads only the
   normalised input surfaces.
-- Feature detection picks the highest-fidelity audio routing mode the
-  capability advertisement supports, with documented fallback.
+- The page picks the highest-fidelity audio routing mode the browser
+  supports, with documented fallback.
 - Background-throttling transitions are reported, not silently
   dropped.
 - The cache role is best-effort and never required for correctness.
@@ -234,16 +205,16 @@ the rest of the graph's point of view.
 
 ## 9. Related documentation
 
-- `architecture/endpoint_capability_surface.md` — generic endpoint
+- [endpoint_capability_surface.md](endpoint_capability_surface.md) — generic endpoint
   surface this profile refines. Owns role decomposition, session
   protocol, audio routing modes, input policy, and validation.
-- `architecture/av_capability_surface.md` — AV surface family the
+- [av_capability_surface.md](av_capability_surface.md) — AV surface family the
   browser profile maps web APIs onto.
-- `architecture/input_capability_surface.md` — input surface family
+- [input_capability_surface.md](input_capability_surface.md) — input surface family
   the browser profile produces into.
-- `architecture/protocol_surfaces.md` — protocol substrate WebSocket
+- [protocol_surfaces.md](protocol_surfaces.md) — protocol substrate WebSocket
   and WebTransport ride on.
-- `architecture/capability_surface.md` — capability matching and
+- [capability_surface.md](capability_surface.md) — capability matching and
   content types.
-- `architecture/wasm_browser_host.md` — the browser as a WASM kernel
+- [wasm_browser_host.md](wasm_browser_host.md) — the browser as a WASM kernel
   host rather than an endpoint.

@@ -74,7 +74,7 @@ pub const SUBSCRIBE_INTERVAL_OFFSET: usize = 4;
 // stamps the `module` header field at emit time so a module cannot forge
 // another's identity. Two indices are reserved and never assigned to a real
 // module: `UNATTRIBUTED` (emitted outside a step bracket — provider re-entry,
-// host built-ins) and `KERNEL` (the kernel's own PSTATUS records).
+// host native modules) and `KERNEL` (the kernel's own PSTATUS records).
 pub const MODULE_UNATTRIBUTED: u16 = 0xFFFF;
 pub const MODULE_KERNEL: u16 = 0xFFFE;
 

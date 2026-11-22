@@ -696,7 +696,7 @@ module_provided = true
   gate = { handle = "minted", arg = "out", max = 4, data = "out", data_max = 4096 }
 
   [[contract.op]]
-  name = "TIER"
+  name = "CUSTODY"
   op = 0x07
   gate = { handle = "global", arg = "out", max = 1 }
 

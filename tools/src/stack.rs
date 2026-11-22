@@ -1463,7 +1463,7 @@ pub fn read_pinned(store: &OciStore, e: &Artifact) -> Result<PinnedStack> {
 /// The module artifacts a stack composes, per target — each module's
 /// variant artifact when it names one ([`Stack::module_artifacts`]) —
 /// resolved through the publishing project: its own published modules
-/// first, then the module pins of its `fluxor.lock`. A kernel built-in has no artifact and
+/// first, then the module pins of its `fluxor.lock`. A native module has no artifact and
 /// is carried by every runtime. A module that resolves neither way is
 /// refused: the stack would name a module no consumer could find.
 pub fn module_references(
@@ -1493,7 +1493,7 @@ pub fn module_references(
             mine
         };
         if found.is_empty() {
-            if !crate::modules::is_builtin_module(&ty) {
+            if !crate::modules::is_native_module(&ty) {
                 missing.push(artifact);
             }
             continue;
@@ -1635,7 +1635,7 @@ pub fn read_for_publish(path: &Path) -> Result<(Stack, Vec<u8>)> {
 
 /// What a publish sweep checks of a stack before it writes anything: the
 /// document, as [`read_for_publish`] checks it, and that every module type
-/// it composes will have a reference to record — a kernel built-in, a
+/// it composes will have a reference to record — a native module, a
 /// module of the publishing project (which the same sweep publishes first),
 /// or a module its `fluxor.lock` pins. Returns the reference the stack
 /// publishes under.
@@ -1666,13 +1666,13 @@ pub fn check_publishable(path: &Path, project_root: &Path) -> Result<String> {
         .module_artifacts()
         .into_iter()
         .filter(|(artifact, ty)| !own.contains(ty) && !pinned.contains(artifact))
-        .filter(|(_, ty)| !crate::modules::is_builtin_module(ty))
+        .filter(|(_, ty)| !crate::modules::is_native_module(ty))
         .map(|(artifact, _)| artifact)
         .collect();
     if !missing.is_empty() {
         return Err(Error::Config(format!(
             "{}: stack '{}' composes {} — neither a module of this project, nor a kernel \
-             built-in, nor pinned from a dependency in its fluxor.lock, so the stack would name \
+             native module, nor pinned from a dependency in its fluxor.lock, so the stack would name \
              a module no consumer could find. Declare the dependency that publishes it and run \
              `fluxor update`, then publish",
             path.display(),

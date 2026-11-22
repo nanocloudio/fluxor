@@ -2782,7 +2782,7 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
 
     /// A declared `builtin` carries no entry, and that is not a failure.
     #[test]
-    fn a_builtin_needs_no_entry() {
+    fn a_native_module_needs_no_entry() {
         let dir = tempfile::tempdir().unwrap();
         let opts = targeted_project(dir.path());
         let m = dir.path().join("modules/platform/linux/kernel_side");
@@ -3055,14 +3055,14 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
     /// with no entry file, so it must be skipped as a non-candidate
     /// rather than diagnosed as a broken module.
     #[test]
-    fn discovery_covers_layers_and_skips_builtin_declarations() {
+    fn discovery_covers_layers_and_skips_native_declarations() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let builtin = root.join("modules/platform/linux/host_thing");
-        std::fs::create_dir_all(&builtin).unwrap();
+        let native = root.join("modules/platform/linux/host_thing");
+        std::fs::create_dir_all(&native).unwrap();
         std::fs::write(
-            builtin.join("manifest.toml"),
+            native.join("manifest.toml"),
             "version = \"1.0.0\"\nhardware_targets = [\"linux\"]\nbuiltin = true\n",
         )
         .unwrap();
@@ -3087,7 +3087,7 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
         assert_eq!(
             names,
             vec!["probe"],
-            "builtin declarations are not build candidates"
+            "native declarations are not build candidates"
         );
     }
 

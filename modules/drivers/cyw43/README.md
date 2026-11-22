@@ -1,6 +1,10 @@
 # cyw43 Module
 
-CYW43 WiFi Driver PIC Module
+Driver for the CYW43439 WiFi chip (Pico W, Pico 2 W) over gSPI on a PIO
+instance. It loads the chip's firmware and CLM from the module's `.rodata`,
+registers a network interface, passes Ethernet frames on `frames_tx` /
+`frames_rx`, and takes `connect` / `disconnect` / `scan` commands on
+`wifi_ctrl`.
 
 ## Files
 
@@ -10,87 +14,27 @@ CYW43 WiFi Driver PIC Module
 - `gspi.rs`
 - `wifi_ops.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `frames_tx` | input | `EthernetFrame` |  |
+| `led` | input | `FmpMessage` |  |
+| `hci_tx` | input | `HciMessage` |  |
+| `frames_rx` | output | `EthernetFrame` | required |
+| `scan_text` | output | `OctetStream` |  |
+| `scan_data` | output | `OctetStream` |  |
+| `status` | output | `OctetStream` |  |
+| `hci_rx` | output | `HciMessage` |  |
+| `netif_state` | output | `FmpMessage` |  |
+| `wifi_ctrl` | ctrl_input | `FmpMessage` |  |
 
-[[ports]]
-name = "frames_tx"
-direction = "input"
-content_type = "EthernetFrame"
-
-[[ports]]
-name = "led"
-index = 1
-direction = "input"
-content_type = "FmpMessage"
-
-[[ports]]
-name = "hci_tx"
-index = 2
-direction = "input"
-content_type = "HciMessage"
-
-[[ports]]
-name = "frames_rx"
-direction = "output"
-content_type = "EthernetFrame"
-required = true
-
-[[ports]]
-name = "scan_text"
-index = 1
-direction = "output"
-content_type = "OctetStream"
-
-[[ports]]
-name = "scan_data"
-index = 2
-direction = "output"
-content_type = "OctetStream"
-
-[[ports]]
-name = "status"
-index = 3
-direction = "output"
-content_type = "OctetStream"
-
-[[ports]]
-name = "hci_rx"
-index = 4
-direction = "output"
-content_type = "HciMessage"
-
-[[ports]]
-name = "wifi_ctrl"
-direction = "ctrl_input"
-content_type = "FmpMessage"
-
-[[resources]]
-requires_contract = "pio"
-access = "exclusive"
-instance = 1
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
-
-[commands]
-accepts = ["connect", "disconnect", "scan"]
-emits = ["radio_ready", "connected", "disconnected", "scan_done", "scan_result"]
-```
+Builds for: `rp2040`, `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
-- `clk_pin`
-- `cs_pin`
-- `dio_pin`
-- `pio_idx`
-- `pwr_pin`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01
+- `pio_idx` (enum `pio0`, `pio1`, `pio2`; default `pio1`): PIO instance.
+- `dio_pin` (u8, default 24): gSPI data pin.
+- `clk_pin` (u8, default 29): gSPI clock pin.
+- `cs_pin` (u8, default 25): chip select.
+- `pwr_pin` (u8, default 23): power control.

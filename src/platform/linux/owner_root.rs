@@ -114,7 +114,7 @@ pub unsafe fn set_vault(
     key: [u8; crate::abi::contracts::workload::vault::SEAL_KEY_LEN],
 ) -> Result<(), i32> {
     let vaults = &mut *core::ptr::addr_of_mut!(VAULTS);
-    if owner.is_system() || vaults.iter().any(|v| v.owner == owner) {
+    if owner.is_node() || vaults.iter().any(|v| v.owner == owner) {
         return Err(errno::EINVAL);
     }
     let rel = relative(dir)?;
@@ -307,7 +307,7 @@ pub unsafe fn vault_delete(owner: OwnerHandle, name: &[u8]) -> bool {
 /// # Safety
 /// Single-threaded platform dispatch only: touches the `static mut` table.
 pub unsafe fn lend(owner: OwnerHandle, src: &[u8], dst: &[u8], ro: bool) -> Result<(), i32> {
-    if owner.is_system() || !src.starts_with(b"/") || src.contains(&0) {
+    if owner.is_node() || !src.starts_with(b"/") || src.contains(&0) {
         return Err(errno::EINVAL);
     }
     let mut norm = Vec::new();
@@ -473,7 +473,7 @@ pub use crate::kernel::workload::storage::rooted;
 /// # Safety
 /// Single-threaded platform dispatch only: touches the `static mut` table.
 unsafe fn root_for(owner: OwnerHandle) -> Option<&'static mut Root> {
-    if owner.is_system() {
+    if owner.is_node() {
         return None;
     }
     let roots = &mut *core::ptr::addr_of_mut!(ROOTS);
@@ -555,7 +555,7 @@ pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Served> {
 /// removed. The runtime's owner-release hook calls it, while the owner still
 /// resolves, beside the host namespace and HTTP object providers' own.
 pub fn release(owner: OwnerHandle) {
-    if owner.is_system() {
+    if owner.is_node() {
         return;
     }
     // Lent, not owned: closed, and left as they are; the vault's key wiped.

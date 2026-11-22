@@ -729,9 +729,9 @@ mod tests {
     }
 
     #[test]
-    fn a_built_in_module_s_ports_are_unsized() {
+    fn a_native_module_s_ports_are_unsized() {
         // No facts for either type: the kernel holds no manifest for a
-        // built-in, so every edge takes the default ring.
+        // native module, so every edge takes the default ring.
         let (config, blob, _, _) = graph(3, 1 << 20);
         let composed = fluxor_contracts::graph::decode(&blob).unwrap();
         let graph = decode(&config, &composed, &HashMap::new()).unwrap();

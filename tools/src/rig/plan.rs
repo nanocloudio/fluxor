@@ -102,7 +102,7 @@ pub enum ArtifactPlan {
         project_root: PathBuf,
         path: PathBuf,
     },
-    Bundle {
+    Dir {
         command: Vec<String>,
         project_root: PathBuf,
         root: PathBuf,
@@ -599,7 +599,7 @@ fn pick_artifact(
                 ArtifactPlan::Unresolved {
                     reason: format!(
                         "board artifact class is '{}' but the project recipe produces \
-                         a single file — use 'artifact_bundle_dir'",
+                         a single file — use 'artifact_dir'",
                         board.artifact.as_deref().unwrap_or("")
                     ),
                 }
@@ -611,7 +611,7 @@ fn pick_artifact(
                 }
             }
         }
-        BuildOutput::Bundle(root) => {
+        BuildOutput::Dir(root) => {
             if board
                 .artifact
                 .as_deref()
@@ -620,12 +620,12 @@ fn pick_artifact(
                 ArtifactPlan::Unresolved {
                     reason: format!(
                         "board artifact class is '{}' but the project recipe produces a \
-                         bundle — use 'artifact' (single file)",
+                         directory — use 'artifact' (single file)",
                         board.artifact.as_deref().unwrap_or("")
                     ),
                 }
             } else {
-                ArtifactPlan::Bundle {
+                ArtifactPlan::Dir {
                     command,
                     project_root: project.project_root.clone(),
                     root: root.clone(),
@@ -712,12 +712,12 @@ impl fmt::Display for Plan {
                 writeln!(f, "  build cwd         {}", project_root.display())?;
                 writeln!(f, "  build             {}", shell_render(command))?;
             }
-            ArtifactPlan::Bundle {
+            ArtifactPlan::Dir {
                 command,
                 project_root,
                 root,
             } => {
-                writeln!(f, "  artifact          bundle {}", root.display())?;
+                writeln!(f, "  artifact          dir {}", root.display())?;
                 writeln!(f, "  build cwd         {}", project_root.display())?;
                 writeln!(f, "  build             {}", shell_render(command))?;
             }
@@ -796,7 +796,7 @@ mod tests {
 
     const PI5_BOARD: &str = r#"
         [rig]
-        artifact = "boot_bundle"
+        artifact = "firmware_image"
         deploy = ["deploy.netboot_tftp", "deploy.bootfs_copy"]
         preferred_deploy = "deploy.netboot_tftp"
         console = ["console.serial"]
@@ -845,7 +845,7 @@ mod tests {
     const PROJECT: &str = r#"
         [build.pi5]
         command = ["make", "firmware", "TARGET=pi5"]
-        artifact_bundle_dir = "target/pi5/bundle"
+        artifact_dir = "target/pi5/boot"
     "#;
 
     fn load() -> (BoardRig, RigProfile, Scenario, ProjectDescriptor) {
@@ -875,7 +875,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.rig, "pi5-a");
         assert_eq!(p.deploy.capability.as_str(), "deploy.netboot_tftp");
-        assert!(matches!(p.artifact, ArtifactPlan::Bundle { .. }));
+        assert!(matches!(p.artifact, ArtifactPlan::Dir { .. }));
         assert_eq!(p.effective_timeout_s, 30);
         assert_eq!(p.pass_rules.len(), 1);
         assert_eq!(p.fail_rules.len(), 1);
@@ -965,8 +965,8 @@ mod tests {
     }
 
     #[test]
-    fn artifact_class_bundle_vs_file_mismatch_unresolved() {
-        // Board says uf2 but project recipe is a bundle → unresolved.
+    fn artifact_class_dir_vs_file_mismatch_unresolved() {
+        // Board says uf2 but project recipe is a directory → unresolved.
         let uf2_board = r#"
             [rig]
             artifact = "uf2"
@@ -1007,7 +1007,7 @@ mod tests {
         let project = parse_project_str(
             r#"[build.pico2w]
                 command = ["make"]
-                artifact_bundle_dir = "out"
+                artifact_dir = "out"
             "#,
             std::path::Path::new("/repo"),
             "p",

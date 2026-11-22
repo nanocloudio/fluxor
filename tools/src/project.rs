@@ -411,12 +411,12 @@ struct FluxorTomlParse {
 #[serde(deny_unknown_fields)]
 struct UsesSection {
     #[serde(default)]
-    bundles: Vec<String>,
+    packages: Vec<String>,
     #[serde(default)]
     stacks: std::collections::BTreeMap<String, String>,
 }
 
-/// `fluxor.toml::[uses] bundles`: the workload packages this project runs by name
+/// `fluxor.toml::[uses] packages`: the workload packages this project runs by name
 /// (`fluxor run <name>`, `fluxor install <name>`) from scripts, which no
 /// graph names. Each is a reference `fluxor update` pins from the
 /// dependency that publishes it. Empty when absent.
@@ -427,7 +427,7 @@ struct UsesSection {
 pub fn used_packages(project_root: &Path) -> Result<Vec<String>, String> {
     Ok(read_fluxor_toml(project_root)?
         .and_then(|f| f.uses)
-        .map(|u| u.bundles)
+        .map(|u| u.packages)
         .unwrap_or_default())
 }
 

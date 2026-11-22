@@ -16,7 +16,7 @@
     clippy::print_stderr,
     reason = "CLI is the user-facing product surface; `println!`/`eprintln!` is intentional output, not log misuse"
 )]
-//!     fluxor build config.yaml --emit=combined --firmware fw.uf2 -o out.uf2
+//!     fluxor build config.yaml --emit=firmware --firmware fw.uf2 -o out.uf2
 //!     fluxor modules pack module.o -o module.fmod  # Pack ELF into .fmod
 
 mod abi_pin;
@@ -535,7 +535,7 @@ fn lifted(r: std::result::Result<(), fluxor_tools::error::Error>) -> Result<()> 
 
 /// `fluxor publish` — the single store-write verb. The optional
 /// subcommand (`abi|sdk|common|fmod|runtime`) and the `--only` flag
-/// both narrow the artifact kinds; `publish bundle <dir>` publishes one
+/// both narrow the artifact kinds; `publish package <dir>` publishes one
 /// workload package, `publish stack <file>` one stack. Bare `publish`
 /// sweeps everything the project ships, in dependency order: sources;
 /// built fmods and `[project].runtimes` binaries (and, in the fluxor repo,
@@ -564,7 +564,7 @@ fn cmd_publish(
                 .into(),
         ));
     }
-    if let Some(PublishAction::Bundle {
+    if let Some(PublishAction::Package {
         package,
         store,
         tag,
@@ -588,7 +588,7 @@ fn cmd_publish(
     {
         return store_cli::cmd_stack_publish(stack, store.as_deref(), tag.as_deref(), published);
     }
-    if let Some(PublishAction::Image {
+    if let Some(PublishAction::Node {
         ref file,
         ref packed,
         ref name,
@@ -643,13 +643,13 @@ fn cmd_publish(
         Some(PublishAction::Runtime { project_root: r }) => (vec!["runtime"], r),
         // Handled by the early returns above.
         Some(
-            PublishAction::Bundle { .. }
+            PublishAction::Package { .. }
             | PublishAction::Stack { .. }
-            | PublishAction::Image { .. }
+            | PublishAction::Node { .. }
             | PublishAction::Workload { .. }
             | PublishAction::Firmware { .. },
         ) => {
-            unreachable!("publish bundle/stack/image/workload/firmware handled above")
+            unreachable!("publish package/stack/node/workload/firmware handled above")
         }
         None => {
             let mut kinds = Vec::new();
@@ -659,11 +659,11 @@ fn cmd_publish(
                     "fmod" => "fmod",
                     "runtime" => "runtime",
                     "stack" => "stack",
-                    "bundle" => "bundle",
+                    "package" => "package",
                     other => {
                         return Err(Error::Config(format!(
                             "unknown --only kind '{other}' (expected \
-                             source|fmod|runtime|stack|bundle)"
+                             source|fmod|runtime|stack|package)"
                         )))
                     }
                 });
@@ -698,7 +698,7 @@ fn publish_sweep(
     let project_kinds: Vec<&str> = kinds
         .iter()
         .copied()
-        .filter(|k| !matches!(*k, "stack" | "bundle"))
+        .filter(|k| !matches!(*k, "stack" | "package"))
         .collect();
     let sweep_project = kinds.is_empty() || !project_kinds.is_empty();
     let rel = |p: &Path| p.strip_prefix(pr).unwrap_or(p).display().to_string();
@@ -724,7 +724,7 @@ fn publish_sweep(
         }
     }
     let mut packages: Vec<(PathBuf, String)> = Vec::new();
-    if want("bundle") {
+    if want("package") {
         let mut errors = Vec::new();
         for (_, manifest) in shippables.packages {
             match fluxor_tools::packaging::check_package(&manifest, pr)
@@ -765,7 +765,7 @@ fn publish_sweep(
             println!("would publish stack {reference} ({})", rel(path));
         }
         for (manifest, name) in &packages {
-            println!("would publish bundle {name} ({})", rel(manifest));
+            println!("would publish package {name} ({})", rel(manifest));
         }
         println!("\ndry run: nothing was written.");
         return Ok(());
@@ -775,8 +775,9 @@ fn publish_sweep(
             .map_err(|e| Error::Config(format!("publish stack {}: {}", rel(path), bare(e))))?;
     }
     for (manifest, _) in &packages {
-        store_cli::cmd_package_publish(manifest, store, None, false, verbose)
-            .map_err(|e| Error::Config(format!("publish bundle {}: {}", rel(manifest), bare(e))))?;
+        store_cli::cmd_package_publish(manifest, store, None, false, verbose).map_err(|e| {
+            Error::Config(format!("publish package {}: {}", rel(manifest), bare(e)))
+        })?;
     }
     Ok(())
 }

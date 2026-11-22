@@ -11,7 +11,7 @@
 //! Declaration order is the contract: a module's Nth declared metric (or span)
 //! name is local id N, and the emitter references it by that same index.
 
-use crate::manifest::{DimDomain, InstrumentDecl, Manifest, Observability};
+use crate::manifest::{DimKind, InstrumentDecl, Manifest, Observability};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -222,12 +222,12 @@ impl IdTable {
                                 let dims: Vec<Value> = decl
                                     .dimensions
                                     .iter()
-                                    .map(|d| match &d.domain {
-                                        DimDomain::Numeric { max } => {
-                                            json!({ "key": d.key, "domain": "numeric", "max": max })
+                                    .map(|d| match &d.kind {
+                                        DimKind::Numeric { max } => {
+                                            json!({ "key": d.key, "kind": "numeric", "max": max })
                                         }
-                                        DimDomain::Enum { values } => {
-                                            json!({ "key": d.key, "domain": "enum", "values": values })
+                                        DimKind::Enum { values } => {
+                                            json!({ "key": d.key, "kind": "enum", "values": values })
                                         }
                                     })
                                     .collect();
@@ -479,7 +479,7 @@ pub fn lint_with_exemptions(root: &Path, toml_exemptions: &[TomlExemption]) -> O
 /// which is why stack expansion PREPENDS its modules before this runs — and
 /// each entry's type resolves to its source `[observability]` table by
 /// locating `<root>/**/<type>/manifest.toml` across `roots` in order. A type
-/// with no locatable manifest (a built-in, or a dependency shipped only as an
+/// with no locatable manifest (a native module, or a dependency shipped only as an
 /// .fmod) still consumes its index with an empty row, so later modules keep
 /// the index the kernel stamps.
 ///

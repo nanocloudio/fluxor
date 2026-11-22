@@ -41,20 +41,6 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
         validate_hardware_section(hardware, target, &mut result, &mut used_pins)?;
     }
 
-    // Validate sources for pin usage
-    if let Some(sources) = config.get("sources").and_then(|s| s.as_array()) {
-        for (i, src) in sources.iter().enumerate() {
-            validate_source_pins(src, i, target, &mut result, &mut used_pins);
-        }
-    }
-
-    // Validate sinks for pin usage
-    if let Some(sinks) = config.get("sinks").and_then(|s| s.as_array()) {
-        for (i, sink) in sinks.iter().enumerate() {
-            validate_sink_pins(sink, i, target, &mut result, &mut used_pins);
-        }
-    }
-
     // Validate reconfigure section if present
     if let Some(reconfig) = config
         .get("reconfigure")
@@ -516,96 +502,6 @@ fn check_pin_conflict(
         result.add_error(format!(
             "{context}: Pin {pin} is already used by another peripheral"
         ));
-    }
-}
-
-/// Validate pins used by sources
-fn validate_source_pins(
-    src: &Value,
-    index: usize,
-    target: &TargetDescriptor,
-    result: &mut ValidationResult,
-    used_pins: &mut HashSet<u8>,
-) {
-    let type_name = src["type"].as_str().unwrap_or("");
-
-    match type_name.to_lowercase().as_str() {
-        "gpioinput" | "gpio_input" => {
-            if let Some(pin) = src["pin"].as_u64() {
-                let pin = pin as u8;
-                check_pin_range(pin, &format!("sources[{index}]"), target, result);
-                check_reserved_pin(pin, &format!("sources[{index}]"), target, result);
-                check_pin_conflict(pin, &format!("sources[{index}].pin"), used_pins, result);
-            }
-        }
-        "spiread" | "spi_read" => {
-            if let Some(cs_pin) = src["cs_pin"].as_u64() {
-                let pin = cs_pin as u8;
-                check_pin_range(pin, &format!("sources[{index}]"), target, result);
-                check_reserved_pin(pin, &format!("sources[{index}]"), target, result);
-                check_pin_conflict(pin, &format!("sources[{index}].cs_pin"), used_pins, result);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Validate pins used by sinks
-fn validate_sink_pins(
-    sink: &Value,
-    index: usize,
-    target: &TargetDescriptor,
-    result: &mut ValidationResult,
-    used_pins: &mut HashSet<u8>,
-) {
-    let type_name = sink["type"].as_str().unwrap_or("");
-
-    match type_name.to_lowercase().as_str() {
-        "gpiooutput" | "gpio_output" | "gpio" => {
-            if let Some(pin) = sink["pin"].as_u64() {
-                let pin = pin as u8;
-                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
-                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
-                check_pin_conflict(pin, &format!("sinks[{index}].pin"), used_pins, result);
-            }
-        }
-        "i2soutput" | "i2s_output" | "i2s" => {
-            if let Some(data_pin) = sink["data_pin"].as_u64() {
-                let pin = data_pin as u8;
-                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
-                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
-                check_pin_conflict(pin, &format!("sinks[{index}].data_pin"), used_pins, result);
-            }
-            if let Some(clock_base) = sink["clock_pin_base"].as_u64() {
-                let pin = clock_base as u8;
-                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
-                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
-                check_pin_conflict(
-                    pin,
-                    &format!("sinks[{index}].clock_pin_base"),
-                    used_pins,
-                    result,
-                );
-                let pin2 = pin + 1;
-                check_pin_range(pin2, &format!("sinks[{index}]"), target, result);
-                check_reserved_pin(pin2, &format!("sinks[{index}]"), target, result);
-                check_pin_conflict(
-                    pin2,
-                    &format!("sinks[{index}].clock_pin_base+1"),
-                    used_pins,
-                    result,
-                );
-            }
-        }
-        "spiwrite" | "spi_write" => {
-            if let Some(cs_pin) = sink["cs_pin"].as_u64() {
-                let pin = cs_pin as u8;
-                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
-                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
-                check_pin_conflict(pin, &format!("sinks[{index}].cs_pin"), used_pins, result);
-            }
-        }
-        _ => {}
     }
 }
 

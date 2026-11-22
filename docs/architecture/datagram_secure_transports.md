@@ -10,38 +10,46 @@ sibling and reaches these transports over channel contracts.
 ## Module layout
 
 ```
-modules/
-├── foundation/
-│   ├── tls/                  # TLS 1.3 + DTLS 1.3
-│   │   ├── mod.rs            # Module surface, params, server + client roles
-│   │   ├── handshake.rs      # ClientHello / ServerHello / Finished etc.
-│   │   ├── handshake_driver.rs  # Record-agnostic handshake state machine
-│   │   ├── handshake_pump.rs # Drives the driver per connection
-│   │   ├── record.rs         # TLS record framing (TCP)
-│   │   ├── dtls_record.rs    # DTLS 1.3 record layer (RFC 9147)
-│   │   ├── dtls_state.rs     # Per-peer DTLS sessions, server + client
-│   │   ├── key_schedule.rs
-│   │   ├── x509.rs
-│   │   └── alert.rs
-│   └── quic/                 # QUIC v1 (RFC 9000/9001/9002)
-│       ├── mod.rs            # Module surface, channel plumbing
-│       ├── connection.rs     # Per-connection state, RTT, stream state
-│       ├── pump.rs           # Handshake pump, loss recovery, send path
-│       ├── packet.rs         # Long/short header parse, PN reconstruction
-│       ├── wire.rs           # Packet build + protection application
-│       ├── keys.rs           # Initial keys, AEAD schedule, header protection
-│       ├── frame.rs          # Frame parsers/builders
-│       └── ack.rs            # Sliding ACK range tracker
-└── sdk/
-    ├── wire/varint.rs        # RFC 9000 §16 varints
-    ├── cores/datagram_endpoint.rs  # Shared bind/send/recv datagram core
-    └── crypto/
-        ├── aes_gcm.rs        # AES-GCM (AesGcm::new_128 / new_256) + Aes128Hp
-        ├── chacha20.rs       # ChaCha20-Poly1305
-        ├── hmac.rs           # HMAC + HKDF
-        ├── sha256.rs, sha384.rs  # FIPS 180-4 hashes
-        ├── p256.rs           # P-256 ECDH + ECDSA
-        └── ed25519.rs
+modules/foundation/
+├── tls/                      # TLS 1.3 + DTLS 1.3
+│   ├── mod.rs                # Module surface, params, server + client roles
+│   ├── handshake.rs          # ClientHello / ServerHello / Finished etc.
+│   ├── handshake_driver.rs   # Record-agnostic handshake state machine
+│   ├── handshake_pump.rs     # Drives the driver per connection
+│   ├── record.rs             # TLS record framing (TCP)
+│   ├── dtls_record.rs        # DTLS 1.3 record layer (RFC 9147)
+│   ├── dtls_state.rs         # Per-peer DTLS sessions, server + client
+│   ├── key_schedule.rs
+│   ├── x509.rs
+│   ├── ed25519_job.rs        # Stepped Ed25519 verification
+│   ├── cred_file.rs          # Credentials read at runtime
+│   ├── identity.rs           # Vault-born identity, certificate requests
+│   ├── continuity.rs         # Transport continuity (record layer)
+│   └── alert.rs
+└── quic/                     # QUIC v1 (RFC 9000/9001/9002)
+    ├── mod.rs                # Module surface, channel plumbing
+    ├── connection.rs         # Per-connection state, RTT, stream state
+    ├── pump.rs               # Handshake pump, loss recovery, send path
+    ├── packet.rs             # Long/short header parse, PN reconstruction
+    ├── wire.rs               # Packet build + protection application
+    ├── keys.rs               # Initial keys, AEAD schedule, header protection
+    ├── frame.rs              # Frame parsers/builders
+    ├── ack.rs                # Sliding ACK range tracker
+    ├── cid_route.rs          # Routable connection IDs
+    ├── ticket_replay.rs      # Single-use resumption tickets
+    ├── custody.rs            # Continuity key custody
+    └── continuity.rs         # Transport continuity (the mux)
+
+crates/
+├── fluxor-abi/src/wire/varint.rs        # RFC 9000 §16 varints
+├── fluxor-rt/src/datagram_endpoint.rs   # Shared bind/send/recv datagram core
+└── fluxor-sdk/src/crypto/
+    ├── aes_gcm.rs            # AES-GCM (AesGcm::new_128 / new_256) + Aes128Hp
+    ├── chacha20.rs           # ChaCha20-Poly1305
+    ├── hmac.rs               # HMAC + HKDF
+    ├── sha256.rs, sha384.rs  # FIPS 180-4 hashes
+    ├── p256.rs, p384.rs      # P-256 / P-384 ECDH + ECDSA
+    └── ed25519.rs
 ```
 
 ## SDK primitives

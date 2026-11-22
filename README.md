@@ -46,8 +46,9 @@ Fluxor's approach:
 - **One model from interrupt to internet.** Hardware-timer ISR work,
   cooperative microsecond-scale modules, network protocol stacks, and
   browser-hosted bundles use the same graph primitive: modules connected
-  by channels, executed in topological order. There is no separate
-  real-time tier with a different API.
+  by channels, stepped in an order the composer fixes. An interrupt-driven
+  domain runs the same modules under a narrower syscall surface, not a
+  separate API.
 - **Validation is the trust root.** Every config is checked against a
   target descriptor: pin assignments, bus configurations, capability
   requirements, channel typing, resource budgets. A config that violates
@@ -104,29 +105,32 @@ Modules are organised into three layers:
 
 Every box above the syscall ABI is a position-independent module. On RP
 targets, modules execute in place from flash via XIP. On aarch64
-targets, they are loaded from the boot image's module table into RAM.
+targets, they are loaded from the node image's module table into RAM.
 The same `.fmod` artefact works across every kernel build that exposes
 the same ABI surface on that architecture.
 
 ## Core Capabilities
 
-- Module graph runtime with topological execution and explicit YAML
-  wiring
-- Cooperative scheduler with intra-tick event-driven wake
+- Module graph runtime with a composer-fixed step order and explicit
+  YAML wiring
+- Pass-based scheduler: each execution domain runs tick passes on its
+  cadence and wake passes when an event fires
 - Channel IPC in FIFO mode (copy semantics) and mailbox mode (zero-copy
   buffer aliasing)
 - Event objects with IRQ binding, scheduler wake integration, and
   ISR-safe signalling
 - Per-module heap with bounded arenas, observable via the provider
   query surface
-- Per-module sandboxing at three protection levels (None / Guarded /
-  Isolated), MPU-enforced on RP2350 and MMU-enforced on aarch64
-- Live graph reconfigure with a four-phase drain protocol
+- Per-module isolation at three protection levels (privileged /
+  contained / isolated), MPU-enforced on RP2350 and MMU-enforced on aarch64
+- Live graph reconfigure that drains admitted work before the new graph
+  takes over
 - Stacks at build time: a config's `platform:` section expands into the
   board-appropriate driver chain, and its `include:` takes in published
   stacks — parameterised subsystems other projects own — by name
-- Hardware-timer ISR tier for hard real-time control, admitted into the
-  same scheduler as cooperative modules
+- Four execution modes per domain — `tick` and `poll` (cooperative),
+  `timer` and `irq` (interrupt, bridge-only) — for hard real-time control
+  beside cooperative modules
 - Stream clock vs wall clock separation via `StreamTime` for
   sample-accurate A/V sync
 - Validation before deployment: pin conflicts, bus assignments, content
@@ -138,8 +142,9 @@ the same ABI surface on that architecture.
 Fluxor separates **silicon** (the chip: peripherals, register layout,
 CPU architecture) from **boards** (a chip plus a specific PCB layout,
 pin assignments, and on-board peripherals). One silicon definition can
-back many boards. **Host** targets run the graph inside an existing OS
-process.
+back many boards. **Host** targets name a runtime that is not a chip: a
+Linux process, a browser, or a machine its UEFI firmware describes. A
+board may stand on a host instead of a silicon.
 
 ### Silicon
 
@@ -148,7 +153,7 @@ process.
 | **RP2040** | thumbv6m-none-eabi (Cortex-M0+) | XIP execution |
 | **RP2350** | thumbv8m.main-none-eabihf (Cortex-M33) | XIP execution |
 | **BCM2712** | aarch64-unknown-none (Cortex-A76) | DRAM-resident, MMU + page tables |
-| **ESP32** | xtensa-esp32-none-elf (dual Xtensa LX6) | Validation only (no kernel build) |
+| **ESP32** | xtensa-esp32-none-elf (dual Xtensa LX6) | Config validation only; no kernel or module build |
 
 ### Boards and hosts
 
@@ -159,7 +164,12 @@ process.
 | **waveshare-lcd4** | RP2350 | Waveshare board with on-board display and touch |
 | **qemu-virt** | BCM2712 | Synthetic aarch64 target for development under QEMU |
 | **pi5** | BCM2712 | Raspberry Pi 5, bare metal |
-| **linux** | host | Linux userspace runtime for embedded Linux services and simulation |
+| **pi5-adaptive** | BCM2712 | Raspberry Pi 5 with the adaptive tick's wake mechanisms on |
+| **linux** | host | Linux userspace runtime (aarch64) for embedded Linux services and simulation |
+| **uefi** | host | A machine its UEFI firmware describes, with Fluxor as its only software |
+| **qemu-uefi-arm64** | uefi | QEMU aarch64 `virt` machine with UEFI firmware |
+| **ec2-arm64** | uefi | AWS EC2 arm64 instance, native |
+| **ec2-linux-arm64** | linux | AWS EC2 arm64 instance, hosted Linux runtime |
 | **wasm** | host | Browser-instantiated WASM bundle |
 
 Silicon definitions live in `targets/silicon/*.toml`, board definitions
@@ -192,9 +202,13 @@ rustup target add aarch64-unknown-linux-gnu   # host tools
 make build
 ```
 
-This builds the `fluxor` CLI, the kernel for every target, every module
-palette, and the `fluxor-linux` runtime binary. It is the default goal,
-so a bare `make` does the same.
+This is `fluxor build`, the default goal (a bare `make` does the same):
+it builds the cargo workspace (debug, every target of every crate) and the
+PIC modules for every silicon `fluxor.toml`'s `[ci].targets` names.
+Kernel images are built per board (below). On a machine whose store is
+empty, `make install` builds the release `fluxor` CLI, the `fluxor-linux`
+runtime and the wasm kernel, publishes them into the local store, and puts
+the resolving `fluxor` launcher on `PATH`.
 
 ### 3. Build one piece at a time
 
@@ -202,8 +216,8 @@ A single board's kernel image (the Makefile selector is `TARGET`, and it
 takes a **board** id — firmware is built per board, modules per silicon):
 
 ```bash
-make firmware TARGET=pico2w    # boards: pico | picow | pico2w | waveshare-lcd4 | qemu-virt | pi5
-make firmware TARGET=wasm      # hosts:  linux | wasm
+make firmware TARGET=pico2w    # any board id under targets/boards/
+make firmware TARGET=wasm      # or a host id: linux | uefi | wasm
 ```
 
 An RP image resolves no third-party runtime crate; the firmware build checks
@@ -279,16 +293,15 @@ downstream project, and keeping the store itself are covered in
 ```text
 fluxor/
 ├── src/                # Kernel: scheduler, syscalls, channels, events, loader, HAL
-│   ├── kernel/         # Cooperative scheduler, IPC, loader, fault recovery
+│   ├── kernel/         # Pass-based scheduler, IPC, loader, fault recovery
 │   └── platform/       # Per-target runtime and HAL backends
 ├── modules/            # Position-independent modules
-│   ├── sdk/            # Shared SDK: ABI, runtime, params
 │   ├── drivers/        # Hardware drivers (cyw43, enc28j60, nvme, st7701s, ...)
 │   ├── foundation/     # Portable services (ip, fat32, dns, tls, quic, ...)
-│   ├── platform/       # Dual-context platform tables shared with the kernel
-│   └── fixtures/       # Probe and demo modules for protocol surfaces
-├── crates/             # Host-side crates: fluxor-abi, fluxor-sdk, fluxor-launcher
-├── contracts/          # Capability contract definitions
+│   ├── platform/       # Native modules of the linux and wasm hosts (manifests; code in src/platform/)
+│   └── fixtures/       # Probe and demo modules that exercise the surfaces
+├── crates/             # fluxor-abi, fluxor-sdk, fluxor-rt (the module SDK), fluxor-launcher, fluxor-uefi-loader
+├── contracts/          # Wire records kernel and tools share: composed graph, boot config, state arena
 ├── tools/              # Host CLI: validate, build, run, flash, pack, sign, inspect
 ├── stacks/             # Platform stacks: board-matched substrate a config's `platform:` names
 ├── targets/            # Silicon, board, and host definitions
@@ -309,13 +322,14 @@ index.
 Recommended reading path:
 
 1. [docs/guides/running.md](docs/guides/running.md) — bring a graph up on the Linux host
-2. [docs/architecture/pipeline.md](docs/architecture/pipeline.md) — graph runner, channels, scheduler, mailbox mode
-3. [docs/architecture/module_architecture.md](docs/architecture/module_architecture.md) — module contract, lifecycle, fault recovery
-4. [docs/architecture/hal_architecture.md](docs/architecture/hal_architecture.md) — kernel/module split and per-silicon HAL
-5. [docs/architecture/abi_layers.md](docs/architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
-6. [docs/architecture/network.md](docs/architecture/network.md) — channel-based networking and net_proto
-7. [docs/architecture/capability_surface.md](docs/architecture/capability_surface.md) — capability vocabulary and resolution
-8. [docs/vision.md](docs/vision.md) — the capability-centric argument
+2. [docs/architecture/pipeline.md](docs/architecture/pipeline.md) — graphs, channels, mailbox mode
+3. [docs/architecture/scheduler.md](docs/architecture/scheduler.md) — domains, execution modes, passes
+4. [docs/architecture/module_architecture.md](docs/architecture/module_architecture.md) — module contract, lifecycle, fault recovery
+5. [docs/architecture/hal_architecture.md](docs/architecture/hal_architecture.md) — kernel/module split and per-silicon HAL
+6. [docs/architecture/abi_layers.md](docs/architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
+7. [docs/architecture/network.md](docs/architecture/network.md) — channel-based networking and net_proto
+8. [docs/architecture/capability_surface.md](docs/architecture/capability_surface.md) — capability vocabulary and resolution
+9. [docs/vision.md](docs/vision.md) — the capability-centric argument
 
 ## License
 

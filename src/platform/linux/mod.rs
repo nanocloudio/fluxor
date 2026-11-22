@@ -9,14 +9,13 @@
 //! Host-only: they use `std`/`libc` and spawn real processes, so the whole tree
 //! is gated on `host-linux`.
 
-pub mod builtin_params;
 pub mod clock;
 /// The privilege and system-call surface of a host-process workload:
 /// capability sets, `no_new_privs`, the system-call filter, parent death.
 pub mod confine;
 pub mod descriptors;
 /// Native GPU compute over wgpu/Vulkan, headless — the provider behind the
-/// `linux_gpu` built-in. In the library, not only the binary, so the host test
+/// `linux_gpu` native module. In the library, not only the binary, so the host test
 /// harness can drive it against a real adapter.
 pub mod gpu;
 pub mod host_backend;
@@ -26,6 +25,7 @@ pub mod hsm_key_vault;
 /// Instance scoping: this runtime's tag, the host registry runtimes on one
 /// host share, and dead-tag collection.
 pub mod instance;
+pub mod native_params;
 pub mod net_identity;
 pub mod net_policy;
 pub mod net_route;

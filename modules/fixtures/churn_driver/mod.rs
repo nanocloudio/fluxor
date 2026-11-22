@@ -1,9 +1,9 @@
 //! Workload-churn driver.
 //!
 //! Admits and reaps a two-module workload `cycles` times through the metal
-//! `workload` backend (0x1A), as a node agent does, then stages two faulting
-//! workloads. See the manifest for the log lines; the kernel's `[live]` line
-//! reports the arenas beside them.
+//! `workload` backend (0x1A), as a node agent does, then stages up to two
+//! faulting workloads (`fault`). See the manifest for the log lines; the
+//! kernel's `[live]` line reports the arenas beside them.
 
 #![no_std]
 #![allow(
@@ -106,8 +106,10 @@ mod params_def {
         4, read_timeout_ms, u32, 2000
             => |s, d, len| { s.read_timeout_ms = p_u32(d, len, 0, 2000); };
 
+        // How many faulting workloads the fault phase stages: 0 none, 1 mode
+        // `error`, 2 mode `error` then mode `infinite_loop`.
         5, fault, u8, 1
-            => |s, d, len| { s.fault = p_u8(d, len, 0, 1); };
+            => |s, d, len| { s.fault = p_u8(d, len, 0, 2); };
 
         // Pack mode: the module pack as hex, appended chunk by chunk (the TLV
         // encoder splits a long string into repeated entries).
@@ -639,7 +641,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             &[(b"mode", mode as i64), (b"rc", h as i64)],
                         );
                         s.fault_idx += 1;
-                        if s.fault_idx >= 2 {
+                        if s.fault_idx >= s.fault {
                             s.phase = PH_DONE;
                         }
                         return StepReturn::Continue;
@@ -682,7 +684,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 s.handle = -1;
                 s.since_ms = 0;
                 s.fault_idx += 1;
-                if s.fault_idx >= 2 {
+                if s.fault_idx >= s.fault {
                     s.phase = PH_DONE;
                 }
             }

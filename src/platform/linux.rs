@@ -5,7 +5,7 @@
 // step loop with std::thread::sleep for tick timing.
 //
 // Usage:
-//   fluxor-linux --image graph.img
+//   fluxor-linux --image node.img
 
 #![allow(
     unsafe_code,
@@ -294,14 +294,14 @@ fn parse_args() -> CliArgs {
                 }
             }
             "--help" | "-h" => {
-                eprintln!("Usage: fluxor-linux --image <graph.img>");
+                eprintln!("Usage: fluxor-linux --image <node.img>");
                 eprintln!("       fluxor-linux vault-import --module <type> --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex> [--wrap yes]");
                 eprintln!("       fluxor-linux vault-identity --module <type> --label <label>   (print, making if absent, a P-256 identity's public key)");
                 eprintln!("       fluxor-linux reclaim   (collect dead instances' host objects; FLUXOR_INSTANCE names one)");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!(
-                    "  -i, --image <path>    The node image `fluxor build` writes (graph.img)"
+                    "  -i, --image <path>    The node image `fluxor build` writes (node.img)"
                 );
                 eprintln!("      --print-features  Print compiled-in host-* features and exit");
                 eprintln!("  -h, --help            Show this help");
@@ -340,7 +340,7 @@ fn parse_args() -> CliArgs {
 
     if image_path.is_empty() {
         eprintln!("error: --image is required");
-        eprintln!("Usage: fluxor-linux --image <graph.img>");
+        eprintln!("Usage: fluxor-linux --image <node.img>");
         process::exit(1);
     }
 
@@ -367,9 +367,9 @@ include!("linux/namespace.rs");
 use fluxor::platform::linux::workload::linux_workload_dispatch;
 // TLV param walkers + per-instance state helpers, in the library so the
 // library provider modules can reach them; glob-imported so the flat
-// built-in modules here resolve them by bare name.
+// native modules here resolve them by bare name.
 use fluxor::kernel::exec::scheduler::NativeVtable;
-use fluxor::platform::linux::builtin_params::*;
+use fluxor::platform::linux::native_params::*;
 include!("linux/cli_io.rs");
 include!("linux/stop.rs");
 include!("linux/host_asset_source.rs");

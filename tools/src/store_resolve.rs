@@ -31,7 +31,7 @@ const LOCKFILE_NAME: &str = "fluxor.lock";
 /// One pinned artifact — the uniform lockfile entry for every kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
-    /// `module` | `source` | `runtime` | `bundle` | `stack`.
+    /// `module` | `source` | `runtime` | `package` | `stack`.
     pub kind: String,
     /// Artifact name (module name, source-tree name, runtime binary
     /// name, package name, stack name).
@@ -385,7 +385,7 @@ pub fn artifact_from_descriptor(d: &Descriptor) -> Result<Option<Artifact>> {
                 content: None,
             }
         }
-        "bundle" | "stack" => Artifact {
+        "package" | "stack" => Artifact {
             kind: kind.clone(),
             name: last_segment,
             project,
@@ -498,14 +498,14 @@ pub struct References {
     /// reference whether or not a graph uses it: a CLI verb's graph is no
     /// file `references` can see.
     pub bound: BTreeMap<String, String>,
-    /// `fluxor.toml::[uses] bundles`, other than the project's own
+    /// `fluxor.toml::[uses] packages`, other than the project's own
     /// `packaging/` packages.
     pub packages: BTreeSet<String>,
 }
 
 /// What this project references by name: every stack a graph it versions
 /// includes by name (a file path is not a reference), every stack its
-/// `[uses.stacks]` binds, and every package its `[uses] bundles` declares.
+/// `[uses.stacks]` binds, and every package its `[uses] packages` declares.
 /// Its own packaged stacks and packages resolve to themselves and are not
 /// references. A nested project's graphs are its own. A graph's
 /// `stack: "@<name>"` with no `[uses.stacks]` entry is refused here,
@@ -717,7 +717,7 @@ fn pin_references(
         crate::stack::derived_pins(store, &stack, out, me.as_deref())?;
     }
     for name in &refs.packages {
-        let mut package = find_reference(&indexes, "bundle", name)?.clone();
+        let mut package = find_reference(&indexes, "package", name)?.clone();
         fill_content(store, std::slice::from_mut(&mut package));
         out.push(package);
     }
@@ -1234,7 +1234,7 @@ mod tests {
             ("FLUXOR_STORE", &store_dir),
             ("FLUXOR_WORKSPACE", &no_workspace),
         ]);
-        let package = entry("bundle", "svc", "web", None);
+        let package = entry("package", "svc", "web", None);
         write_store_lock_stamped(dir.path(), std::slice::from_ref(&package), None).unwrap();
         let path = lockfile_path(dir.path());
         let mut text = std::fs::read_to_string(&path).unwrap();
@@ -1258,8 +1258,8 @@ mod tests {
             "[project]\nname = \"fluxor\"\nversion = \"0.0.1\"\n",
         )
         .unwrap();
-        let own = entry("bundle", "fluxor", "dns_service", None);
-        let theirs = entry("bundle", "wave", "http_service", None);
+        let own = entry("package", "fluxor", "dns_service", None);
+        let theirs = entry("package", "wave", "http_service", None);
         write_store_lock_stamped(dir.path(), &[theirs, own], None).unwrap();
         let err = crate::store_sync::ensure_synced(dir.path())
             .unwrap_err()
@@ -1671,12 +1671,12 @@ mod tests {
     }
 
     #[test]
-    fn bundles_run_by_name_are_declared_under_uses() {
+    fn packages_run_by_name_are_declared_under_uses() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(
             root.join("fluxor.toml"),
-            "[project]\nname = \"c\"\n\n[uses]\nbundles = [\"object-store\", \"tool\"]\n",
+            "[project]\nname = \"c\"\n\n[uses]\npackages = [\"object-store\", \"tool\"]\n",
         )
         .unwrap();
         // `tool` is the project's own applet: it resolves from packaging/.
@@ -1693,7 +1693,7 @@ mod tests {
         let index = vec![
             (
                 "storage".to_string(),
-                vec![entry("bundle", "storage", "object-store", None)],
+                vec![entry("package", "storage", "object-store", None)],
             ),
             (
                 "control".to_string(),
@@ -1701,7 +1701,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            find_reference(&index, "bundle", "object-store")
+            find_reference(&index, "package", "object-store")
                 .unwrap()
                 .project,
             "storage"

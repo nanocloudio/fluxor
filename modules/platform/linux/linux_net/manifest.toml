@@ -37,7 +37,7 @@ type = "u32"
 default = 128
 range = [1, 65535]
 
-# Records are bounded per port, header included; the built-in states the
+# Records are bounded per port, header included; the native module states the
 # same figures in providers.rs (`LINUX_NET_OUT_MAX_RECORD`,
 # `LINUX_NET_IN_ACCEPTS_RECORD`). A MSG_DATA carries at most 1460 bytes and a
 # datagram is delivered only while its MSG_DG_RX_FROM fits 1483 (1472 bytes

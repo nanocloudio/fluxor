@@ -18,7 +18,7 @@
 // that needs two keys is two calls. Each layout has one codec below, with
 // the `const fn` lengths a caller sizes its `arg` with.
 //
-// - Small answers (a handle's facts, a suite record, a tier, a tag) are
+// - Small answers (a handle's facts, a suite record, a custody, a tag) are
 //   written back into `arg`; the call returns the bytes it wrote there.
 // - Signatures, public keys, records, wrapped keys and envelopes are
 //   written into `data`; the call returns their length.
@@ -51,8 +51,8 @@
 // A backend that signs whole (a token) never answers `EAGAIN`; a caller
 // handles it anyway. Backend facts — which suites exist, how big each
 // answer is, which sign resumably — come from [`DESCRIBE_SUITE`]; the
-// isolation a backend gives comes from [`TIER`]. A consumer MUST NOT claim
-// a hardware guarantee it did not read from `TIER`.
+// isolation a backend gives comes from [`CUSTODY`]. A consumer MUST NOT claim
+// a hardware guarantee it did not read from `CUSTODY`.
 
 /// Import a private key. handle=-1. arg in [`store`]; `data` in = the key's
 /// bytes (their length is the key's). Returns an opaque handle (>= 0) or a
@@ -148,14 +148,14 @@ pub use super::super::registry::key_vault::GENERATE;
 /// Returns its length; `ERANGE` with the requirement in `arg`.
 pub use super::super::registry::key_vault::PUBLIC;
 
-/// The backend's isolation tier. handle=-1. arg out `[tier u8]` (a
-/// [`tier`] ordinal); returns 1.
+/// The backend's custody. handle=-1. arg out `[custody u8]` (a
+/// [`custody`] ordinal); returns 1.
 ///
-/// Tiers are mutually-exclusive ordinal levels (not independent
+/// Custody levels are mutually-exclusive ordinal levels (not independent
 /// capabilities, hence not per-suite); a consumer with a security
-/// requirement checks `tier >= N` and MUST NOT claim a hardware guarantee
+/// requirement checks `custody >= N` and MUST NOT claim a hardware guarantee
 /// it did not read from here.
-pub use super::super::registry::key_vault::TIER;
+pub use super::super::registry::key_vault::CUSTODY;
 
 /// Open the key named by `label`, generating it if it does not exist.
 /// handle=-1. arg inout [`open`]; `data` out = the public key. Returns an
@@ -205,7 +205,7 @@ pub use super::super::registry::key_vault::DESTROY_BY_LABEL;
 /// What a key is. handle = the key. arg out [`describe`]; returns 8.
 ///
 /// Exists so a consumer can check what it actually got rather than what it
-/// asked for. `persisted` sits next to `tier` and is deliberately separate
+/// asked for. `persisted` sits next to `custody` and is deliberately separate
 /// from it: a caller that conflates the two is the failure mode this whole
 /// surface is shaped to prevent.
 pub use super::super::registry::key_vault::DESCRIBE;
@@ -228,14 +228,14 @@ pub use super::super::registry::key_vault::DESCRIBE_SUITE;
 /// Sign the running composition. handle = a signing key. arg inout
 /// [`attest_composition`]; `data` out = `[record][signature]`, where the
 /// record is the kernel's composition record (`scheduler::attest`, prefix
-/// `"FXAT"`) ending in the vault's tier byte, and the signature is over the
+/// `"FXAT"`) ending in the vault's custody byte, and the signature is over the
 /// record in the key's suite convention: ECDSA over the record's SHA-256 for
 /// P-256, the whole record for Ed25519 and ML-DSA. Returns the length
 /// written; `ERANGE` with the requirement in `len`.
 ///
 /// The challenge is the caller's, so the answer cannot be replayed; the
 /// record carries the boot incarnation, so it cannot outlive the boot. What
-/// the signature MEANS is the tier byte's: `DEVICE_HW` says this hardware
+/// the signature MEANS is the custody byte's: `DEVICE_HW` says this hardware
 /// runs exactly this closure, `SOFTWARE` says a readable process does. The
 /// composition digest — SHA-256 of the record with the challenge zeroed —
 /// is the identity [`KEY_WRAP`] binds to.
@@ -364,7 +364,7 @@ pub use super::super::registry::key_vault::SHARE_COMBINE;
 /// [`attest_key::RECORD_LEN`].
 ///
 /// The record commits to the key without revealing it, names its suite,
-/// uses, owner namespace, persistence and the vault's tier, and carries the
+/// uses, owner namespace, persistence and the vault's custody, and carries the
 /// composition digest. The caller signs it with the key it attests under
 /// ([`SIGN`]: P-256 over the record's SHA-256 with `DIGEST`, Ed25519 and
 /// ML-DSA over the record with `RAW`), so a verifier that trusts that key's
@@ -465,7 +465,7 @@ pub mod usage {
     /// can be.
     pub const EXPORT_PUBLIC: u32 = 1 << 3;
     /// The key may be persisted across a restart — and persistence says
-    /// nothing about isolation, which is [`super::TIER`]'s business.
+    /// nothing about isolation, which is [`super::CUSTODY`]'s business.
     pub const PERSIST: u32 = 1 << 4;
     /// The key may leave the vault WRAPPED ([`super::KEY_WRAP`]): sealed to
     /// a destination vault's public key and bound to that vault's attested
@@ -701,8 +701,8 @@ pub mod public {
     }
 }
 
-/// [`TIER`]: arg out `[tier:u8]`.
-pub mod tier_arg {
+/// [`CUSTODY`]: arg out `[custody:u8]`.
+pub mod custody_arg {
     pub const ARG_LEN: usize = 1;
 }
 
@@ -795,7 +795,7 @@ pub mod destroy_by_label {
     }
 }
 
-/// [`DESCRIBE`]: arg out `[suite:u16][usage:u32][tier:u8][persisted:u8]`.
+/// [`DESCRIBE`]: arg out `[suite:u16][usage:u32][custody:u8][persisted:u8]`.
 pub mod describe {
     pub const ARG_LEN: usize = 8;
 
@@ -803,7 +803,7 @@ pub mod describe {
     pub struct Described {
         pub suite: u16,
         pub usage: u32,
-        pub tier: u8,
+        pub custody: u8,
         /// A [`super::persisted`] value.
         pub persisted: u8,
     }
@@ -811,7 +811,7 @@ pub mod describe {
     pub const fn encode(d: &Described) -> [u8; ARG_LEN] {
         let s = d.suite.to_le_bytes();
         let u = d.usage.to_le_bytes();
-        [s[0], s[1], u[0], u[1], u[2], u[3], d.tier, d.persisted]
+        [s[0], s[1], u[0], u[1], u[2], u[3], d.custody, d.persisted]
     }
 
     pub fn parse(arg: &[u8]) -> Option<Described> {
@@ -821,7 +821,7 @@ pub mod describe {
         Some(Described {
             suite: super::rd16(arg, 0)?,
             usage: super::rd32(arg, 2)?,
-            tier: arg[6],
+            custody: arg[6],
             persisted: arg[7],
         })
     }
@@ -835,7 +835,7 @@ pub mod persisted {
     pub const SEALED: u8 = 1;
     /// Kept READABLE (the vault's store is seal mode `none`): whoever holds
     /// the medium holds the key. A consumer that needs a key protected at
-    /// rest refuses this, as it refuses a tier it did not ask for.
+    /// rest refuses this, as it refuses a custody it did not ask for.
     pub const CLEAR: u8 = 2;
 }
 
@@ -1310,7 +1310,7 @@ pub mod share {
 
 /// [`ATTEST_KEY`]: arg in `[challenge:32]`; `data` out = the record.
 ///
-/// record: `["FXHA"][challenge:32][composition:32][backend:u8][tier:u8]
+/// record: `["FXHA"][challenge:32][composition:32][backend:u8][custody:u8]
 /// [persisted:u8][_pad:u8][suite:u16][_pad:u16][usage:u32][namespace:u32]
 /// [commitment:32][public_thumbprint:32]`, where `composition` is the
 /// composition digest [`KEY_WRAP`] binds to, `commitment` is
@@ -1326,7 +1326,7 @@ pub mod attest_key {
     pub const R_CHALLENGE: usize = 4;
     pub const R_COMPOSITION: usize = 36;
     pub const R_BACKEND: usize = 68;
-    pub const R_TIER: usize = 69;
+    pub const R_CUSTODY: usize = 69;
     pub const R_PERSISTED: usize = 70;
     pub const R_SUITE: usize = 72;
     pub const R_USAGE: usize = 76;
@@ -1357,8 +1357,8 @@ pub mod wrap {
     pub const MAX_LEN: usize = SEALED_OFF + SEALED_PREFIX + 64 + TAG_LEN;
 }
 
-/// Isolation-tier ordinals written by the [`TIER`] opcode.
-pub mod tier {
+/// Custody ordinals written by the [`CUSTODY`] opcode.
+pub mod custody {
     /// The software backend — in-process on hosted platforms. Isolates
     /// against a compromised module, not a compromised host/kernel.
     pub const SOFTWARE: u8 = 0;

@@ -1,5 +1,5 @@
 //! Native GPU compute over wgpu/Vulkan, headless — the provider behind the
-//! `linux_gpu` built-in.
+//! `linux_gpu` native module.
 //!
 //! The generic GPU contract on a real device, with no display, no swapchain
 //! and no window: a compute graph builds and runs here on a Pi 5's V3D exactly
@@ -31,7 +31,7 @@
 //! ## Bytes in, bytes out
 //!
 //! [`GpuProvider`] takes command bytes and produces outcome bytes. It touches
-//! no channel, which is what lets the same provider be driven by the built-in
+//! no channel, which is what lets the same provider be driven by the native module
 //! wrapper in a live graph and by a test against a real adapter. I/O belongs at
 //! the edge; this is not the edge.
 //!

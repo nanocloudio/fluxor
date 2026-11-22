@@ -1,13 +1,13 @@
-// TLV walker for built-in module params.
+// TLV walker for native module params.
 //
-// Built-in modules receive a per-instance TLV blob via `ModuleEntry::params()`.
+// Native modules receive a per-instance TLV blob via `ModuleEntry::params()`.
 // Format mirrors `crates/fluxor-rt/src/params.rs::parse_tlv` and the config-tool
 // packer in `tools/src/schema.rs`:
 //
 //   [0xFE][0x01][len_lo][len_hi]
 //   [tag][len][value...] [tag][len][value...] ... [0xFF (optional end)]
 //
-// Each built-in walks the blob with `walk_tlv` and dispatches by tag.
+// Each native module walks the blob with `walk_tlv` and dispatches by tag.
 // Tags are declared per parameter in the module's `manifest.toml` and are
 // permanent, so the wire meaning of a field survives any reordering of the
 // `[[params]]` table. Tags 0xF0..0xFF are reserved for protection / fault

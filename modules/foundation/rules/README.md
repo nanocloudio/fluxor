@@ -7,30 +7,17 @@ Rules Engine PIC Module
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `sensor` | input | `OctetStream` |  |
+| `alarm` | output | `OctetStream` |  |
 
-[[ports]]
-name = "sensor"
-direction = "input"
-content_type = "OctetStream"
-
-[[ports]]
-name = "alarm"
-direction = "output"
-content_type = "OctetStream"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
 - `high_threshold`
 - `low_threshold`
 - `topic`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

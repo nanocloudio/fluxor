@@ -70,7 +70,7 @@ pub const OWNER_MAX_OPEN_FILES: usize = 32;
 /// is the node's own, and so is that of an owner acting with the node's
 /// authority; the platform neither roots, charges nor removes it.
 pub fn rooted(owner: OwnerHandle) -> bool {
-    !scheduler::owners().authority_of(owner).is_system()
+    !scheduler::owners().authority_of(owner).is_node()
 }
 
 /// Whether `owner` may come to hold storage: one whose grant gives it a
@@ -78,7 +78,7 @@ pub fn rooted(owner: OwnerHandle) -> bool {
 /// no root, so nothing it does on its way out can bring back a root its
 /// release removed.
 pub fn may_hold_storage(owner: OwnerHandle) -> bool {
-    !owner.is_system()
+    !owner.is_node()
         && scheduler::owners().lookup(owner).is_some_and(|e| {
             e.acct.storage_grant == StorageGrant::OwnRoot
                 && matches!(

@@ -5,7 +5,7 @@ and smoke checks it. It is self-contained: the config is embedded
 below and piped straight into `fluxor run` on stdin, so there is
 nothing else to fetch.
 
-Source: `tools/src/main.rs` (the `run` command), `src/platform/linux.rs`
+Source: `tools/src/cli/commands_c.rs` (the `run` command), `src/platform/linux.rs`
 (the hosted runtime), `modules/foundation/dns/mod.rs` (the module the
 graph runs).
 
@@ -15,14 +15,14 @@ Follow the toolchain setup in the repository [README](../../README.md),
 then build and install:
 
 ```sh
-make build      # CLI, kernels, module palettes, and the Linux runtime
-make install    # put the `fluxor` CLI on PATH
+make build      # the cargo workspace and the PIC modules
+make install    # the release CLI and fluxor-linux runtime; the `fluxor` launcher on PATH
 ```
 
 ## Run
 
 The graph is one `dns` module answering on UDP port 15353, wired to
-the host network surface (`platform: net` provides the built-in
+the host network surface (`platform: net` provides the native
 `linux_net` module). The single entry in its host table gives a query
 something to resolve. Passing `-` as the config argument makes
 `fluxor run` read the YAML from stdin, so the whole bring-up is one
@@ -61,13 +61,14 @@ runtime on it. Startup logs similar to these mean the graph is live:
 ```text
 [... INFO fluxor_linux] [fluxor] linux platform boot
 [... INFO fluxor::kernel::module::loader] [inst] loaded dns
-[... INFO fluxor_linux] [inst] 2 of 2 modules loaded
+[... INFO fluxor_linux] [inst] 2 modules
 [... INFO fluxor_linux] [sched] starting domain loop, tick_us=1000
+[... INFO fluxor::kernel::module::syscalls] [dns] serving
 ```
 
-The scheduler also warns that it is accepting cycle modules:
-`linux_net` and `dns` feed each other, which is why the config sets
-`scheduler.accept_cycles`.
+`linux_net` and `dns` feed each other. The composer refuses a graph with
+a cycle unless `scheduler.accept_cycles` is set, and then steps the cycle's
+members in module order.
 
 ## Smoke check
 
@@ -99,7 +100,7 @@ run is stateless; running the command again starts fresh.
 
 A service another project publishes is run by name. The consuming
 project lists the publisher under `[dependencies]` and the workload package under
-`[uses] bundles` in its `fluxor.toml`, and `fluxor update` pins it:
+`[uses] packages` in its `fluxor.toml`, and `fluxor update` pins it:
 
 ```sh
 fluxor update

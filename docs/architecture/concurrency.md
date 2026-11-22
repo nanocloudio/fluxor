@@ -29,7 +29,8 @@ publishing the node's graph runs on core 0 only. Secondary cores wait for `domai
 written exclusively in that window need no synchronisation:
 
 - `src/kernel/module/loader.rs`: `STATE_ARENA`, `STATE_ARENA_OFFSET`,
-  `FREE_LIST`, `FREE_COUNT`, `PIC_IRQ_DISABLED_COUNT`
+  `FREE_LIST`, `FREE_COUNT`, `PIC_IRQ_DISABLED_COUNT` (the arena's
+  bookkeeping is also written after init, under `STATE_LOCK`, below)
 - `src/kernel/exec/scheduler/`: `STATIC_CONFIG`, `STATIC_LOADER`,
   `INSTANTIATION_STATE`, `INSTANTIATION_IDX`
 - `src/kernel/module/syscalls.rs`: `SYSCALL_TABLE`, `HARDWARE_CONTEXT`,
@@ -173,13 +174,14 @@ syscall traffic is cross-core-shared by default; any state populated by
 `populate_static_state` / `prepare_graph` is boot-only; anything else,
 justify in a comment.
 
-## Function-local `static mut`
+## Function-local statics
 
-Two function-local `static mut`s exist in
-`src/kernel/module/syscalls.rs` (`LOGGED` in the EAGAIN logger
-throttle, `LOGGED_NULL_STATE` in the null-state logger). Both can race
-across cores; the worst case is a duplicate log line per process
-lifetime. Acceptable.
+A static declared inside a function is an atomic, never a `static mut`:
+the gateway's refusal-log throttle (`LOGGED`, `src/kernel/module/gateway.rs`),
+the key vault's once-only warning (`WARNED`), the host page size read once
+(`PAGE`, Linux), and the gateway's minted-handle table (`MINTED`). The
+throttles and once-flags tolerate a race with at worst a duplicate log
+line; the handle table is updated by compare-exchange.
 
 ## What this document is not
 

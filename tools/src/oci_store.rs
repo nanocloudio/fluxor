@@ -62,7 +62,7 @@ pub const MT_FLUXOR_STACK: &str = "application/vnd.nanocloud.fluxor.stack.v1+yam
 pub const MT_FLUXOR_STACK_MODULES: &str = "application/vnd.nanocloud.fluxor.stack.modules.v1+json";
 /// Module manifest.toml metadata carried alongside the `.fmod` layer.
 pub const MT_FLUXOR_MODULE_META: &str = "application/vnd.nanocloud.fluxor.module.manifest.v1+toml";
-/// A NODE IMAGE (`fluxor build --emit=image`): FXSL header + modules
+/// A NODE IMAGE (`fluxor build --emit=node`): FXSL header + modules
 /// blob + config blob — the packaged deployable graph, the sanctioned
 /// OTA delivery unit (on RP it is what a flash A/B graph slot holds).
 /// The header's own sha256/ABI-pin/epoch travel inside the layer; the
@@ -1752,7 +1752,7 @@ impl OciStore {
             .rsplit_once(':')
             .map_or(b.ref_name, |(body, _)| body);
         for d in &self.read_index()?.manifests {
-            let is_package = d.annotations.get(ANN_KIND).map(String::as_str) == Some("bundle");
+            let is_package = d.annotations.get(ANN_KIND).map(String::as_str) == Some("package");
             let same_name = d
                 .annotations
                 .get(ANN_REF_NAME)
@@ -1847,7 +1847,7 @@ impl OciStore {
                 annotations: Annotations::new(),
             },
             layers,
-            annotations: base_annotations("bundle", meta),
+            annotations: base_annotations("package", meta),
         };
         Ok(Prepared {
             manifest,
@@ -3518,7 +3518,7 @@ mod tests {
         );
         assert_eq!(
             m.annotations.get(ANN_KIND).map(String::as_str),
-            Some("bundle")
+            Some("package")
         );
         assert_eq!(
             m.annotations.get(ANN_PROJECT).map(String::as_str),

@@ -49,12 +49,13 @@ debug with one.
 
 | Layer | File | Owns |
 |---|---|---|
-| Wire | `sdk/wire/gpu_wire.rs` | Envelope, operations, handles, outcomes, capability and arithmetic facts |
-| Programs | `sdk/cores/gpu_pack.rs` | Pack manifest, digests, binding declarations, device fit |
-| Device | `sdk/cores/gpu_device.rs` | Admission, handle tables, views, sealing, residency, fences, output commit, epochs |
-| Pump | `sdk/cores/gpu_pump.rs` | The provider loop: fault latching, chunk assembly, outcome staging, refusal |
-| Client | `sdk/cores/gpu_client.rs` | The producer half: handle bookkeeping, correlation, outcome folding |
-| Replay | `sdk/cores/gpu_replay.rs` | A deterministic backend with no device |
+| Wire | `crates/fluxor-abi/src/contracts/gpu.rs` | Envelope, operations, handles, outcomes, capability and arithmetic facts |
+| Hand-off | `crates/fluxor-abi/src/wire/gpu_exec_wire.rs` | Admitted work with handles resolved to table slots, as bytes for a backend across a foreign-function boundary |
+| Programs | `crates/fluxor-sdk/src/gpu/pack.rs` | Pack manifest, digests, binding declarations, device fit |
+| Device | `crates/fluxor-sdk/src/gpu/device.rs` | Admission, handle tables, views, sealing, residency, fences, output commit, epochs |
+| Pump | `crates/fluxor-sdk/src/gpu/pump.rs` | The provider loop: fault latching, chunk assembly, outcome staging, refusal |
+| Client | `crates/fluxor-sdk/src/gpu/client.rs` | The producer half: handle bookkeeping, correlation, outcome folding |
+| Replay | `crates/fluxor-sdk/src/gpu/replay.rs` | A deterministic backend with no device |
 
 ## 3. Providers
 
@@ -344,18 +345,12 @@ Named here so nothing above reads as more than it is.
 
 - **Presentation sinks.** The contract carries surface leases and the device
   model validates them. No provider exports one.
-- **Direct V3D.** Bare-metal V3D does not inherit Linux's GPU services.
-  Selecting MMIO, interrupts, power/clock/reset, address translation and cache
-  policy needs silicon evidence from pinned sources and a rig, and the kernel
-  ABI for a GPU-visible arena is an open decision. There is no offline
-  WGSL→QPU compiler, so there is no artifact to submit even if there were a
-  driver.
-- **HDMI and bare-metal display.** A separate piece of work, and separately gated:
-  whether ARM can program a Pi 5's display directly rather than through
-  firmware is a question to answer from board evidence and pinned sources, not
-  from assertion.
+- **Direct V3D.** No bare-metal provider drives a Pi 5's V3D: the kernel
+  has no GPU-visible memory arena, and there is no offline WGSL→QPU compiler
+  to produce an artifact for one.
+- **HDMI and bare-metal display.** No bare-metal provider programs a Pi 5's
+  display.
 - **SPIR-V ingestion, subgroups, indirect dispatch, preemption, dma-buf
   export.** No provider advertises any of them.
 
-Compute acceptance does not wait for any of this, and a framebuffer is not GPU
-acceleration.
+A framebuffer is not GPU acceleration.

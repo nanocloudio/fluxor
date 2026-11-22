@@ -303,8 +303,8 @@ pub fn kernel_natives(runtime: &str) -> &'static [(u32, u32)] {
 }
 
 /// Where `runtime`'s kernel grows module heaps in segments (`HEAP_SEGMENTS`
-/// above 1): `(segments, quantum)`, which size the first segment it commits
-/// at instantiation (`fluxor_contracts::state_arena::first_heap_segment`).
+/// above 1) past the declared heap it commits at instantiation:
+/// `(segments, quantum)`.
 pub fn kernel_elastic_heaps(runtime: &str) -> Option<(usize, usize)> {
     let body = profile_body(kernel_profile(runtime));
     let segments = eval(body, "HEAP_SEGMENTS")?;

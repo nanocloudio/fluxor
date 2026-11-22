@@ -9,7 +9,7 @@
 //! `(desired, capacity, snapshot)` inputs must produce a byte-identical plan
 //! and the same `plan_digest`, so any node — or offline tooling — composes the
 //! same answer. The rules enforced here:
-//!   * workloads are processed in ascending `workload_uid` order;
+//!   * workloads are processed in ascending `owner_uid` order;
 //!   * an already-resident workload keeps its slot and generation (handle preserved);
 //!   * a new workload takes the lowest free slot; its generation is the slot's
 //!     persistent counter + 1 (monotonic across reuse, so a stale handle from a
@@ -25,7 +25,7 @@ use fluxor_contracts::owner_plan;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub type WorkloadUid = [u8; 16];
+pub type OwnerUid = [u8; 16];
 pub type Digest32 = [u8; 32];
 
 /// Desired lifecycle of a workload.
@@ -60,7 +60,7 @@ pub struct ExportDecl {
 /// One workload's desired state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadDesired {
-    pub workload_uid: WorkloadUid,
+    pub owner_uid: OwnerUid,
     pub namespace: String,
     pub name: String,
     pub workload_digest: Digest32,
@@ -82,7 +82,7 @@ pub struct DeviceDesiredState {
 }
 
 /// Node capacity facts — mirrors the per-profile kernel limits the plan must
-/// fit within. `max_owners` includes the system slot 0.
+/// fit within. `max_owners` includes the node owner's slot 0.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeCapacity {
     pub max_owners: u16,
@@ -105,7 +105,7 @@ pub struct NodeCapacity {
 /// read from its own kernel profile (`profile_linux`, `profile_bcm2712`).
 /// `max_owners` is the kernel's owner-slot range, one on every kernel; the
 /// table a node actually holds is its boot plan's
-/// `owners` ceiling (the system slot, its resident workloads and the owner
+/// `owners` ceiling (the node owner's slot, its resident workloads and the owner
 /// reserve), which a deployment raises within the domain with `capacity: {
 /// owners }`. `max_endpoints` is agent-level admission policy: the kernel has
 /// no endpoint table.
@@ -167,7 +167,7 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
 /// so reuse always issues a strictly higher generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotState {
-    pub occupant: Option<WorkloadUid>,
+    pub occupant: Option<OwnerUid>,
     pub generation: u32,
 }
 
@@ -192,7 +192,7 @@ pub struct OwnerSnapshot {
 }
 
 impl OwnerSnapshot {
-    /// An empty snapshot sized for `max_owners` (only the system slot present).
+    /// An empty snapshot sized for `max_owners` (only the node owner's slot present).
     pub fn empty(max_owners: u16) -> Self {
         OwnerSnapshot {
             slots: vec![SlotState::EMPTY; max_owners as usize],
@@ -201,7 +201,7 @@ impl OwnerSnapshot {
         }
     }
 
-    fn slot_of(&self, uid: &WorkloadUid) -> Option<u16> {
+    fn slot_of(&self, uid: &OwnerUid) -> Option<u16> {
         self.slots
             .iter()
             .position(|s| s.occupant.as_ref() == Some(uid))
@@ -219,7 +219,7 @@ impl OwnerSnapshot {
 /// One owner's placement in a composed plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerAssignment {
-    pub workload_uid: WorkloadUid,
+    pub owner_uid: OwnerUid,
     pub slot: u16,
     pub generation: u32,
     pub module_base: u16,
@@ -365,18 +365,18 @@ pub fn compose(
     desired: &DeviceDesiredState,
     cap: &NodeCapacity,
     prior: &OwnerSnapshot,
-    revoke_graces: &[(WorkloadUid, u16)],
+    revoke_graces: &[(OwnerUid, u16)],
     now_unix: u64,
     reserved_ports: &[u16],
     system_modules: u16,
 ) -> Result<CompositionPlan, ComposeError> {
-    // 1. Only running workloads are placed; sort by workload_uid for a stable order.
+    // 1. Only running workloads are placed; sort by owner_uid for a stable order.
     let mut running: Vec<&WorkloadDesired> = desired
         .workloads
         .iter()
         .filter(|p| p.desired_phase == DesiredPhase::Running)
         .collect();
-    running.sort_by(|a, b| a.workload_uid.cmp(&b.workload_uid));
+    running.sort_by(|a, b| a.owner_uid.cmp(&b.owner_uid));
 
     // 2. Revocations: carry forward the prior plan's live records, then add one
     //    for each prior occupant departing in this generation.
@@ -387,16 +387,16 @@ pub fn compose(
         .copied()
         .collect();
     let prior_assignment_of =
-        |uid: &WorkloadUid| prior.assignments.iter().find(|a| &a.workload_uid == uid);
+        |uid: &OwnerUid| prior.assignments.iter().find(|a| &a.owner_uid == uid);
     for a in &prior.assignments {
-        let still_running = running.iter().any(|p| p.workload_uid == a.workload_uid);
+        let still_running = running.iter().any(|p| p.owner_uid == a.owner_uid);
         let already_revoked = revocations
             .iter()
             .any(|r| r.assignment.slot == a.slot && r.assignment.generation == a.generation);
         if !still_running && !already_revoked {
             let grace = revoke_graces
                 .iter()
-                .find(|(uid, _)| uid == &a.workload_uid)
+                .find(|(uid, _)| uid == &a.owner_uid)
                 .map(|(_, g)| *g)
                 .unwrap_or(0);
             let rev = PlanRevocation {
@@ -416,7 +416,7 @@ pub fn compose(
     //    bumped generation.
     let mut occupied_slots: Vec<u16> = running
         .iter()
-        .filter_map(|p| prior.slot_of(&p.workload_uid))
+        .filter_map(|p| prior.slot_of(&p.owner_uid))
         .collect();
     occupied_slots.extend(revocations.iter().map(|r| r.assignment.slot));
 
@@ -435,7 +435,7 @@ pub fn compose(
     // (slot, generation) per running workload, in the running (uid-sorted) order.
     let mut placed: Vec<(u16, u32)> = Vec::with_capacity(running.len());
     for p in &running {
-        if let Some(slot) = prior.slot_of(&p.workload_uid) {
+        if let Some(slot) = prior.slot_of(&p.owner_uid) {
             placed.push((slot, prior.generation_at(slot)));
         } else {
             let slot = free_slot(&occupied_slots, cap).ok_or(ComposeError::OwnerSlotsExhausted)?;
@@ -482,7 +482,7 @@ pub fn compose(
     let mut pending: Vec<Pending> = Vec::with_capacity(order.len());
     for &i in &order {
         let p = running[i];
-        let retained = prior_assignment_of(&p.workload_uid).and_then(|a| {
+        let retained = prior_assignment_of(&p.owner_uid).and_then(|a| {
             (a.module_count == p.profile.modules && a.edge_count == p.profile.edges)
                 .then_some((a.module_base, a.edge_base))
         });
@@ -545,7 +545,7 @@ pub fn compose(
         };
 
         assignments.push(OwnerAssignment {
-            workload_uid: p.workload_uid,
+            owner_uid: p.owner_uid,
             slot,
             generation,
             module_base: module_base as u16,
@@ -629,7 +629,7 @@ pub fn max_plan_assignments() -> usize {
 
 fn wire_assignment(a: &OwnerAssignment) -> owner_plan::Assignment {
     owner_plan::Assignment {
-        owner_uid: a.workload_uid,
+        owner_uid: a.owner_uid,
         slot: a.slot,
         generation: a.generation,
         module_base: a.module_base,
@@ -643,7 +643,7 @@ fn wire_assignment(a: &OwnerAssignment) -> owner_plan::Assignment {
 
 fn owned_assignment(a: owner_plan::Assignment) -> OwnerAssignment {
     OwnerAssignment {
-        workload_uid: a.owner_uid,
+        owner_uid: a.owner_uid,
         slot: a.slot,
         generation: a.generation,
         module_base: a.module_base,
@@ -777,7 +777,7 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, owner_plan::PlanErro
 /// digests, and the node epoch under which it was issued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservationToken {
-    pub workload_uid: WorkloadUid,
+    pub owner_uid: OwnerUid,
     pub workload_digest: Digest32,
     pub plan_digest: Digest32,
     pub node_epoch: u64,
@@ -799,7 +799,7 @@ pub enum ReserveError {
 #[derive(Clone, Debug)]
 pub struct Reservations {
     node_epoch: u64,
-    consumed: Vec<(WorkloadUid, u64)>,
+    consumed: Vec<(OwnerUid, u64)>,
 }
 
 impl Reservations {
@@ -817,12 +817,12 @@ impl Reservations {
     /// Issue a reservation against the current epoch.
     pub fn reserve(
         &self,
-        workload_uid: WorkloadUid,
+        owner_uid: OwnerUid,
         workload_digest: Digest32,
         plan_digest: Digest32,
     ) -> ReservationToken {
         ReservationToken {
-            workload_uid,
+            owner_uid,
             workload_digest,
             plan_digest,
             node_epoch: self.node_epoch,
@@ -838,11 +838,11 @@ impl Reservations {
         if self
             .consumed
             .iter()
-            .any(|(uid, epoch)| *uid == token.workload_uid && *epoch == token.node_epoch)
+            .any(|(uid, epoch)| *uid == token.owner_uid && *epoch == token.node_epoch)
         {
             return Err(ReserveError::AlreadyConsumed);
         }
-        self.consumed.push((token.workload_uid, token.node_epoch));
+        self.consumed.push((token.owner_uid, token.node_epoch));
         Ok(())
     }
 
@@ -859,7 +859,7 @@ impl Reservations {
 mod tests {
     use super::*;
 
-    fn uid(n: u8) -> WorkloadUid {
+    fn uid(n: u8) -> OwnerUid {
         let mut u = [0u8; 16];
         u[0] = n;
         u
@@ -878,7 +878,7 @@ mod tests {
 
     fn workload(n: u8, phase: DesiredPhase, p: ResourceProfile) -> WorkloadDesired {
         WorkloadDesired {
-            workload_uid: uid(n),
+            owner_uid: uid(n),
             namespace: "default".into(),
             name: format!("workload-{n}"),
             workload_digest: [n; 32],
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(p1.plan_digest, p2.plan_digest);
 
         // workload 1 (lower uid) takes slot 1, module base 0; workload 2 slot 2.
-        assert_eq!(p1.assignments[0].workload_uid, uid(1));
+        assert_eq!(p1.assignments[0].owner_uid, uid(1));
         assert_eq!(p1.assignments[0].slot, 1);
         assert_eq!(p1.assignments[0].module_base, 0);
         assert_eq!(p1.assignments[1].slot, 2);
@@ -945,7 +945,7 @@ mod tests {
         };
         let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         assert_eq!(plan.assignments.len(), 1);
-        assert_eq!(plan.assignments[0].workload_uid, uid(2));
+        assert_eq!(plan.assignments[0].owner_uid, uid(2));
     }
 
     #[test]
@@ -968,12 +968,12 @@ mod tests {
         let a2 = plan
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(2))
+            .find(|a| a.owner_uid == uid(2))
             .unwrap();
         let a3 = plan
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(3))
+            .find(|a| a.owner_uid == uid(3))
             .unwrap();
         // resident workload 2 keeps slot 1 + generation 5
         assert_eq!((a2.slot, a2.generation), (1, 5));
@@ -1284,7 +1284,7 @@ mod tests {
     fn snap_from(plan: &CompositionPlan, max_owners: u16) -> OwnerSnapshot {
         let mut snap = OwnerSnapshot::empty(max_owners);
         for a in &plan.assignments {
-            snap.slots[a.slot as usize].occupant = Some(a.workload_uid);
+            snap.slots[a.slot as usize].occupant = Some(a.owner_uid);
             snap.slots[a.slot as usize].generation = a.generation;
         }
         for r in &plan.revocations {
@@ -1312,7 +1312,7 @@ mod tests {
         expected.extend_from_slice(&(asgn_len as u32).to_le_bytes());
         expected.extend_from_slice(&(plan.assignments.len() as u32).to_le_bytes());
         for a in &plan.assignments {
-            expected.extend_from_slice(&a.workload_uid);
+            expected.extend_from_slice(&a.owner_uid);
             expected.extend_from_slice(&a.slot.to_le_bytes());
             expected.extend_from_slice(&a.generation.to_le_bytes());
             expected.extend_from_slice(&a.module_base.to_le_bytes());
@@ -1347,7 +1347,7 @@ mod tests {
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.revocations.len(), 1);
         let rev = &plan.revocations[0];
-        assert_eq!(rev.assignment.workload_uid, uid(1));
+        assert_eq!(rev.assignment.owner_uid, uid(1));
         assert_eq!(rev.grace_secs, 30);
         assert_eq!(rev.deadline_unix, 1030);
 
@@ -1377,12 +1377,12 @@ mod tests {
         let survivor = *committed
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(2))
+            .find(|a| a.owner_uid == uid(2))
             .unwrap();
         let departed = *committed
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(1))
+            .find(|a| a.owner_uid == uid(1))
             .unwrap();
         let snap = snap_from(&committed, 16);
 
@@ -1412,7 +1412,7 @@ mod tests {
         let newcomer = plan2
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(3))
+            .find(|a| a.owner_uid == uid(3))
             .unwrap();
         let dep_end = departed.module_base + departed.module_count;
         let new_end = newcomer.module_base + newcomer.module_count;
@@ -1432,7 +1432,7 @@ mod tests {
         let departed = *committed
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(1))
+            .find(|a| a.owner_uid == uid(1))
             .unwrap();
         let snap = snap_from(&committed, 16);
         let ds = DeviceDesiredState {
@@ -1461,7 +1461,7 @@ mod tests {
         let newcomer = plan2
             .assignments
             .iter()
-            .find(|a| a.workload_uid == uid(3))
+            .find(|a| a.owner_uid == uid(3))
             .unwrap();
         assert_eq!(newcomer.slot, departed.slot, "slot freed by the calendar");
         assert!(
@@ -1551,7 +1551,7 @@ mod tests {
                 // not the owner's profile: the first workloads lease one each.
                 p.endpoints = u16::from(i < 60);
                 let mut w = workload(0, DesiredPhase::Running, p);
-                w.workload_uid[..4].copy_from_slice(&(i + 1).to_be_bytes());
+                w.owner_uid[..4].copy_from_slice(&(i + 1).to_be_bytes());
                 w.name = format!("workload-{i}");
                 if i < 60 {
                     w.exports = vec![ExportDecl {

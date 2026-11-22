@@ -1,6 +1,6 @@
 # linux_eth
 
-Linux-only built-in Ethernet frame driver: the hosted runtime's counterpart
+Linux-only native Ethernet frame driver: the hosted runtime's counterpart
 of `virtio_net` or `rp1_gem`, so `ip` runs its own TCP/IP stack on Linux
 rather than `linux_net`'s host sockets. A graph needs that when it needs
 the stack itself — the transport-continuity surfaces checkpoint
@@ -41,7 +41,7 @@ A frame `frames_rx` has no room for is dropped and counted, as a NIC drops on
 a full ring; so is a frame longer than 1518 bytes (no FCS, one VLAN tag)
 either way, never truncated, and a transmit the interface refuses.
 
-The interface is named by the boot graph: built-in modules are constructed
+The interface is named by the node graph: native modules are constructed
 only from the runtime's own configuration, so `linux_eth` reaches what the
 runtime process can — its network namespace and the capabilities it holds
 there — and nothing a staged workload chooses. Its descriptor is

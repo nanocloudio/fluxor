@@ -42,7 +42,7 @@ pub struct ProjectDescriptor {
 pub struct BuildRecipe {
     /// argv of the build command (no shell interpretation).
     pub command: Vec<String>,
-    /// Exactly one of `artifact` or `artifact_bundle_dir` is set.
+    /// Exactly one of `artifact` or `artifact_dir` is set.
     pub output: BuildOutput,
 }
 
@@ -50,10 +50,10 @@ pub struct BuildRecipe {
 pub enum BuildOutput {
     /// Single-file artifact (e.g. a UF2). Absolute path.
     File(PathBuf),
-    /// Multi-file artifact bundle (e.g. pi5 boot bundle). Absolute path
+    /// Multi-file artifact directory (e.g. a pi5 firmware image). Absolute path
     /// to the directory; the deploy adapter decides what to do with its
     /// contents based on the board's artifact class.
-    Bundle(PathBuf),
+    Dir(PathBuf),
 }
 
 impl ProjectDescriptor {
@@ -166,7 +166,7 @@ struct ProjectFile {
 struct BuildToml {
     command: Vec<String>,
     artifact: Option<String>,
-    artifact_bundle_dir: Option<String>,
+    artifact_dir: Option<String>,
 }
 
 pub fn parse_project_str(raw: &str, project_root: &Path, ctx: &str) -> Result<ProjectDescriptor> {
@@ -178,19 +178,19 @@ pub fn parse_project_str(raw: &str, project_root: &Path, ctx: &str) -> Result<Pr
                 "{ctx}: [build.{board_id}].command is empty"
             )));
         }
-        let output = match (b.artifact, b.artifact_bundle_dir) {
+        let output = match (b.artifact, b.artifact_dir) {
             (Some(_), Some(_)) => {
                 return Err(Error::Config(format!(
-                    "{ctx}: [build.{board_id}] has both 'artifact' and 'artifact_bundle_dir' \
+                    "{ctx}: [build.{board_id}] has both 'artifact' and 'artifact_dir' \
                      — pick exactly one"
                 )));
             }
             (Some(p), None) => BuildOutput::File(resolve(project_root, &p)),
-            (None, Some(p)) => BuildOutput::Bundle(resolve(project_root, &p)),
+            (None, Some(p)) => BuildOutput::Dir(resolve(project_root, &p)),
             (None, None) => {
                 return Err(Error::Config(format!(
                     "{ctx}: [build.{board_id}] must set one of 'artifact' or \
-                     'artifact_bundle_dir'"
+                     'artifact_dir'"
                 )));
             }
         };
@@ -226,7 +226,7 @@ mod tests {
         let src = r#"
             [build.pi5]
             command = ["make", "firmware", "TARGET=pi5"]
-            artifact_bundle_dir = "target/pi5/bundle"
+            artifact_dir = "target/pi5/boot"
 
             [build.pico2w]
             command = ["cargo", "build", "--release"]
@@ -239,10 +239,10 @@ mod tests {
         let pi5 = p.recipe("pi5").unwrap();
         assert_eq!(pi5.command, vec!["make", "firmware", "TARGET=pi5"]);
         match &pi5.output {
-            BuildOutput::Bundle(path) => {
-                assert_eq!(path, &PathBuf::from("/home/me/proj/target/pi5/bundle"));
+            BuildOutput::Dir(path) => {
+                assert_eq!(path, &PathBuf::from("/home/me/proj/target/pi5/boot"));
             }
-            _ => panic!("expected bundle"),
+            _ => panic!("expected dir"),
         }
 
         let pico = p.recipe("pico2w").unwrap();
@@ -260,11 +260,11 @@ mod tests {
         let src = r#"
             [build.pi5]
             command = ["make"]
-            artifact_bundle_dir = "/srv/fluxor/pi5-out"
+            artifact_dir = "/srv/fluxor/pi5-out"
         "#;
         let p = parse_project_str(src, Path::new("/proj"), "p").unwrap();
         match &p.recipe("pi5").unwrap().output {
-            BuildOutput::Bundle(path) => assert_eq!(path, &PathBuf::from("/srv/fluxor/pi5-out")),
+            BuildOutput::Dir(path) => assert_eq!(path, &PathBuf::from("/srv/fluxor/pi5-out")),
             _ => panic!(),
         }
     }
@@ -285,7 +285,7 @@ mod tests {
             [build.pi5]
             command = ["a"]
             artifact = "a.uf2"
-            artifact_bundle_dir = "b"
+            artifact_dir = "b"
         "#;
         assert!(parse_project_str(src, Path::new("/"), "p").is_err());
     }
@@ -308,7 +308,7 @@ mod tests {
             r#"
                 [build.pi5]
                 command = ["make"]
-                artifact_bundle_dir = "target/out"
+                artifact_dir = "target/out"
             "#,
         )
         .unwrap();
@@ -318,7 +318,7 @@ mod tests {
 
         assert_eq!(p.project_root, elsewhere);
         match &p.recipe("pi5").unwrap().output {
-            BuildOutput::Bundle(path) => {
+            BuildOutput::Dir(path) => {
                 assert_eq!(path, &elsewhere.join("target").join("out"));
             }
             _ => panic!(),

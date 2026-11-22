@@ -59,10 +59,10 @@ form a build or a run compiles.
 
 | Term | Definition | Relations |
 |---|---|---|
-| **workload package** | The artefact `fluxor publish bundle` publishes from `packaging/`: `workload.json`, `resources.json`, the source graph and the `.fmod`s ([workload-packages.md](../guides/workload-packages.md)). | A node agent admits a workload by its package's digest; a run renders the package's graph with its params. |
+| **workload package** | The artefact `fluxor publish package` publishes from `packaging/`: `workload.json`, `resources.json`, the source graph and the `.fmod`s ([workload-packages.md](../guides/workload-packages.md)). | A node agent admits a workload by its package's digest; a run renders the package's graph with its params. |
 | **workload image** | The artefact `fluxor build --emit=workload` writes and `fluxor publish workload` publishes: the composed graph and the `.fmod` of every module it loads. | The compiled form of one workload. Never the package. |
-| **node image** | The `FXSL` image of a node graph: a header that pins it to the kernel it runs on, the module table and the compiled config ([network_boot.md](network_boot.md)). | What an RP flash slot holds, what OTA stages and activates, and what a Linux node loads (`graph.img`). |
-| **firmware image** | The kernel with a node image appended. | What a board boots or netboots; the node image it carries is the fallback an OTA stage returns to. |
+| **node image** | The `FXSL` image of a node graph: a header that pins it to the kernel it runs on, the module table and the compiled config ([network_boot.md](network_boot.md)). | What an RP flash slot holds, what OTA stages and activates, and what a Linux node loads (`node.img`). `fluxor build --emit=node` writes it and `fluxor publish node` publishes it. |
+| **firmware image** | The kernel with a node image appended (`fluxor build --emit=firmware`). | What a board boots or netboots; the node image it carries is the fallback an OTA stage returns to. |
 | **wasm bundle** | The `.wasm` file a wasm build writes: kernel, modules and config in one web asset ([wasm_platform.md](wasm_platform.md)). | The wasm target's firmware form; "bundle" in its web sense. |
 
 A stack ([Code](#code)) is a composition a graph includes, not an artefact a
@@ -78,23 +78,32 @@ naming the term that replaced it; this table is the one place they stand.
 |---|---|
 | tier, the numbered tiers (Tier 0, 1a, 1b, 1c, 2, 3), ISR tier | exec mode: `tick` (0 and 1a), `poll` (3), `timer` (1b), `irq` (2); 1c is the pre-pass attribute |
 | the workload contract's Tier 1 and Tier 2 | header and options (an options entry) |
-| runner, graph runner, domain runner | domain loop |
+| runner, graph runner, domain runner, shared runner | domain loop |
+| pre-tick (slot, budget, overrun) | pre-pass |
+| `step_modules`, `step_domain_modules`, `step_resident_graphs_*` | a tick pass: `pass::tick_all` (every domain in index order), `pass::run(d, PassKind::Tick)` (one domain) |
+| `step_woken_modules` | a wake pass: `pass::run(d, PassKind::Wake(..))` |
+| `exec_order_offset` | `exec_offset`, the domain's rotation of its exec order |
+| kernel fan | a tee or merge module the composer inserts |
+| built-in module, built-ins, all-builtin (of modules) | native module, native modules, native-only; its manifest still says `builtin = true` |
 | pump, main loop (for the domain loop) | domain loop. Data movers keep their own names: the cross-domain bridge pump, the interrupt bridge pump |
 | base graph, boot graph, system graph, root graph, application graph | node graph |
 | system owner, `OWNER_SYSTEM` | node owner, `OWNER_NODE` |
 | tenant | owner |
 | pod | workload |
-| `workload_uid` | owner uid. The agent field `workload_uid` renames in the next epoch |
-| target (for the running machine) | node |
+| `workload_uid`, `--workload-uid` | owner uid: the agent field `owner_uid`, the flag `--owner-uid` |
+| target (for the running machine), `target_id`, `--target-id` | node: the node id `node_id`, the flag `--node-id` |
 | domain (for a value bound: module-index domain, edge domain) | range |
 | isolation domain, protection domain | isolation region |
-| bundle, service bundle, applet bundle (the `packaging/` artefact) | workload package. The CLI and lock names (`fluxor publish bundle`, `[uses] bundles`, `kind = "bundle"`, the agent's `--bundle` flags and `desired_bundle_digest`) rename in the next epoch |
-| graph image | node image. `graph.img`, `--emit=image` and `fluxor publish image` rename in the next epoch |
-| boot image, combined image | firmware image |
+| bundle, service bundle, applet bundle (the `packaging/` artefact); `fluxor publish bundle`, `[uses] bundles`, `kind = "bundle"`, `target/fluxor/bundles`, the agent's `--bundle`, `--bundles` and `--bundle-digest`, `desired_bundle_digest`, `BUNDLE_MISSING` | workload package: `fluxor publish package`, `[uses] packages`, `kind = "package"`, `target/fluxor/packages`, `--package`, `--packages`, `--package-digest`, `desired_package_digest`, `PACKAGE_MISSING` |
+| graph image, `graph.img`, `--emit=image`, `fluxor publish image` | node image, `node.img`, `--emit=node`, `fluxor publish node` |
+| boot image, combined image, `--emit=combined`, the rig's `boot_bundle` | firmware image, `--emit=firmware`, the rig's `firmware_image` |
 | Tier A, Tier B (memory) | the static reservation (Tier A), the elastic region (Tier B) |
 | trust tier | trust class |
 | module tier (`modules/foundation`, `modules/drivers`, …) | module layer |
 | `BlobTier` | `BlobKind` |
+| the key vault's tier, `TIER`, `vault_tier` | custody: the `CUSTODY` op, `R_CUSTODY`, `vault_custody` |
+| the metric dimension key `domain`, `DimDomain` | `kind`, `DimKind` |
+| crypt_block's attachment bundle, its `bundle` port | the attachment share set, the `shares` port |
 | the fs contract's write, async, byte, object-model, handle-acquisition and degraded tiers | surface: the write surface, the async surface, … |
 | the OPFS read and write tiers | the read layer and the write layer |
 <!-- vocabulary-exempt-end -->

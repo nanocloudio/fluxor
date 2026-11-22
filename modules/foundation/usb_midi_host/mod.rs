@@ -7,7 +7,7 @@
 //!
 //! `mode: in` emits frames on `events_out`; `mode: out` consumes
 //! frames on `events_in`; `mode: duplex` does both. The stack
-//! `stacks/midi.toml` selects this module on pico2w / picow / pi5
+//! `stacks/midi.toml` selects this module on pico2w / pi5
 //! targets via `platform.midi: {direction: ...}`.
 //!
 //! Status: **scaffold**. The module compiles, packs to `.fmod`, loads

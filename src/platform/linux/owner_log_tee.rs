@@ -264,7 +264,7 @@ fn enable_owner_log_attribution() {
 }
 
 /// On-step owner attribution: the module the scheduler is currently stepping →
-/// its owner `(uid, slot, generation)`, or owner 0 (system) when the current
+/// its owner `(uid, slot, generation)`, or owner 0 (the node owner) when the current
 /// module is node-owned. Valid only on the scheduler thread.
 fn on_step_attribution() -> ([u8; 16], u16, u32) {
     let idx = fluxor::kernel::exec::scheduler::current_module_index();

@@ -258,10 +258,10 @@ host-gpu = ["host-linux", "wgpu", "pollster"]
 # PKCS#11 `key_vault` backend: overrides the kernel software vault with
 # an HSM/token (SoftHSM2 in tests) when FLUXOR_HSM_PKCS11_MODULE + token
 # selector + PIN are set. Carried by the published runtime (Makefile
-# `install`), so reaching a PROCESS_HW custody tier is a matter of
+# `install`), so reaching a PROCESS_HW custody level is a matter of
 # configuration rather than of rebuilding. Unconfigured, the backend
 # never registers and KEY_VAULT stays on the software one
-# (TIER=SOFTWARE).
+# (CUSTODY=SOFTWARE).
 host-hsm = ["host-linux", "cryptoki"]
 
 # Optional `host_image_codec` built-in: decode JPEG/PNG/BMP/GIF into

@@ -1,6 +1,6 @@
 # sd Module
 
-SD Card PIC Module
+An SD card over SPI, served as a sector stream and a `storage.block` source.
 
 Detailed design notes are in [DESIGN.md](./DESIGN.md).
 
@@ -9,37 +9,21 @@ Detailed design notes are in [DESIGN.md](./DESIGN.md).
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `blocks` | output | `OctetStream` | required, serves `storage.block` |
 
-[[ports]]
-name = "blocks"
-direction = "output"
-content_type = "OctetStream"
-required = true
-
-[[resources]]
-requires_contract = "spi"
-access = "exclusive"
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
-
-[[resources]]
-requires_contract = "timer"
-access = "write"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
-- `block_count`
-- `cs_pin`
-- `spi_bus`
-- `start_block`
+- `spi_bus` (u8, default 0).
+- `cs_pin` (u8, default 5): chip select.
+- `start_block` (u32, default 0): the stream's first block.
+- `block_count` (u32, default 0): blocks the stream reads before it ends; 0
+  never ends it.
 
 ## Block source
 
@@ -91,7 +75,3 @@ and a request whose argument would not fit in 32 is refused with `EINVAL`
 rather than wrapped onto another block; the stream stops with a read error
 at such a block. `CAPS` reports the card's real block count, so a request
 past it is refused before it reaches the card.
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.

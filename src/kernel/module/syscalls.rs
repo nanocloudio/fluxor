@@ -286,7 +286,7 @@ fn admission_closed(surface: &'static str) -> bool {
     let owner = crate::kernel::exec::scheduler::module_owner(
         crate::kernel::exec::scheduler::current_module_index(),
     );
-    if owner.is_system() {
+    if owner.is_node() {
         return false;
     }
     if crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner) {
@@ -396,7 +396,7 @@ pub fn init_providers() {
     // and, when a platform registers one behind it (the Linux PKCS#11
     // backend), a hardware backend; each handle names the backend that
     // holds its key. Consumers never name a platform — they read
-    // PROBE/TIER/DESCRIBE.
+    // PROBE/CUSTODY/DESCRIBE.
     provider::register(dev_class::KEY_VAULT, key_vault_provider_dispatch);
     provider::register(
         crate::abi::registry::metal_device::ID,
@@ -1608,7 +1608,7 @@ fn handle_core_primitive(handle: i32, opcode: u32, arg: &mut [u8], mut data: Use
                 _ => return E_INVAL,
             };
             let idx = scheduler::current_module_index();
-            if !scheduler::module_owner(idx).is_system() {
+            if !scheduler::module_owner(idx).is_node() {
                 return crate::kernel::sys::errno::EACCES;
             }
             crate::kernel::workload::workload_graph::register_net_identity_provider(

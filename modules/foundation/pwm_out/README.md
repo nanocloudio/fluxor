@@ -8,28 +8,14 @@ PWM Output PIC Module
 - `mod.rs`
 - `params_def.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `brightness` | input | `OctetStream` | required |
 
-[[ports]]
-name = "brightness"
-direction = "input"
-content_type = "OctetStream"
-required = true
-
-[[resources]]
-requires_contract = "pwm"
-access = "exclusive"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
 - `pin`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

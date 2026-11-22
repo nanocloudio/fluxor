@@ -32,9 +32,9 @@ use crate::kernel::workload::storage::StorageGrant;
 /// per-owner table beside it (log rings, code-pack regions, workload slots)
 /// — is sized at boot from the plan's `owners` ceiling (the node owner's slot, the
 /// resident workloads and the owner reserve, `resource_ledger::plan`). What
-/// this bounds is what a slot may be at all: the host-process backend's
-/// workload index, which shares an fd slot space with the graph backend's
-/// above `0x1000` (`platform::linux::workload::GRAPH_SLOT_BASE`). A plan past
+/// this bounds is what a slot may be at all: the graph backend's workload
+/// index, which shares a handle index space with the host-process backend's
+/// above `0x1000` (`platform::linux::workload::HOST_SLOT_BASE`). A plan past
 /// it is refused at boot naming `owners`. Wire fields carrying a slot are
 /// `u16`.
 pub const MAX_OWNERS: usize = 4096;
@@ -74,7 +74,7 @@ pub const OWNER_NODE: OwnerHandle = OwnerHandle {
 
 impl OwnerHandle {
     #[inline]
-    pub const fn is_system(&self) -> bool {
+    pub const fn is_node(&self) -> bool {
         self.slot == 0
     }
 }
@@ -169,7 +169,7 @@ impl OwnerEntry {
         authority: Authority::Own,
     };
 
-    const SYSTEM: OwnerEntry = OwnerEntry {
+    const NODE: OwnerEntry = OwnerEntry {
         owner_uid: [0; 16],
         generation: 0,
         state: OwnerState::Active,
@@ -197,7 +197,7 @@ pub struct OwnerTable {
 #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 fn owner_init(slot: usize) -> OwnerEntry {
     if slot == 0 {
-        OwnerEntry::SYSTEM
+        OwnerEntry::NODE
     } else {
         OwnerEntry::EMPTY
     }
@@ -226,7 +226,7 @@ impl OwnerTable {
         #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
         {
             let mut entries = [OwnerEntry::EMPTY; OWNER_TABLE_SLOTS];
-            entries[0] = OwnerEntry::SYSTEM;
+            entries[0] = OwnerEntry::NODE;
             OwnerTable {
                 entries: crate::kernel::mem::table::Table::from_array(entries),
             }
@@ -510,9 +510,9 @@ impl OwnerTable {
     /// Free `h`'s slot. The generation is retained so the next `alloc` bumps it;
     /// the slot's state becomes `Free`, which already invalidates outstanding
     /// handles via `lookup`/`authorize`. Caller is responsible for reclaiming
-    /// owner-scoped resources first. The system slot cannot be freed.
+    /// owner-scoped resources first. The node owner's slot cannot be freed.
     pub fn free(&mut self, h: OwnerHandle) -> bool {
-        if h.is_system() || !self.slot_valid(h) {
+        if h.is_node() || !self.slot_valid(h) {
             return false;
         }
         let e = &mut self.entries[h.slot as usize];
@@ -595,7 +595,7 @@ impl OwnerTable {
     /// — including a handle that no longer resolves, which so fails closed as
     /// the workload it was.
     pub fn authority_of(&self, h: OwnerHandle) -> OwnerHandle {
-        if h.is_system() {
+        if h.is_node() {
             return OWNER_NODE;
         }
         match self.lookup(h) {
@@ -635,7 +635,7 @@ impl OwnerTable {
                   caller only branches on success vs failure"
     )]
     pub fn charge_storage(&mut self, h: OwnerHandle, bytes: u64) -> Result<(), ()> {
-        if h.is_system() {
+        if h.is_node() {
             return Ok(());
         }
         let e = self.lookup_mut(h).ok_or(())?;
@@ -651,7 +651,7 @@ impl OwnerTable {
     /// storage found on disk is the owner's whatever its cap, and an owner
     /// over its cap can shrink but not grow.
     pub fn charge_storage_held(&mut self, h: OwnerHandle, bytes: u64) {
-        if h.is_system() {
+        if h.is_node() {
             return;
         }
         if let Some(e) = self.lookup_mut(h) {
@@ -675,7 +675,7 @@ impl OwnerTable {
                   caller only branches on success vs failure"
     )]
     pub fn charge_state(&mut self, h: OwnerHandle, bytes: u32) -> Result<(), ()> {
-        if h.is_system() {
+        if h.is_node() {
             return Ok(());
         }
         let e = self.lookup_mut(h).ok_or(())?;
@@ -707,7 +707,7 @@ impl OwnerTable {
 
     /// Release `bytes` of previously charged module state. Saturating.
     pub fn uncharge_state(&mut self, h: OwnerHandle, bytes: u32) {
-        if h.is_system() {
+        if h.is_node() {
             return;
         }
         if let Some(e) = self.lookup_mut(h) {
@@ -722,7 +722,7 @@ impl OwnerTable {
                   caller only branches on success vs failure"
     )]
     pub fn charge_buffer(&mut self, h: OwnerHandle, bytes: u32) -> Result<(), ()> {
-        if h.is_system() {
+        if h.is_node() {
             return Ok(());
         }
         let e = self.lookup_mut(h).ok_or(())?;
@@ -736,7 +736,7 @@ impl OwnerTable {
 
     /// Release `bytes` of previously charged channel-buffer memory. Saturating.
     pub fn uncharge_buffer(&mut self, h: OwnerHandle, bytes: u32) {
-        if h.is_system() {
+        if h.is_node() {
             return;
         }
         if let Some(e) = self.lookup_mut(h) {
@@ -764,6 +764,6 @@ impl Default for OwnerTable {
 /// resource stamped by an owner that is gone is never the next owner of its
 /// slot's. Explicit cross-owner bindings are not modeled by this predicate.
 #[inline]
-pub fn same_or_system(caller: OwnerHandle, target: OwnerHandle) -> bool {
-    target.is_system() || caller == target
+pub fn same_or_node(caller: OwnerHandle, target: OwnerHandle) -> bool {
+    target.is_node() || caller == target
 }

@@ -1,23 +1,23 @@
 # Platform-layer modules
 
-Linux-host and wasm/browser built-ins. Their implementations are compiled
-into the kernel (`builtin = true`); the `manifest.toml` here is the
-declaration.
+The native modules of the Linux and wasm hosts. Their implementations are
+compiled into the kernel (`src/platform/<p>/`, manifest `builtin = true`);
+the `manifest.toml` here is the declaration.
 
 ## Parameter tags
 
 Every `[[params]]` entry declares an explicit `tag = N`, in
 `10..=239`. The tag — not the entry's position in the file — is the
-parameter's identity on the wire: a built-in receives its configuration as
+parameter's identity on the wire: a native module receives its configuration as
 a TLV blob keyed by tag, and the platform decodes it by tag.
 
 Consequences:
 
-- A tag is permanent once the built-in ships. Renaming a parameter,
+- A tag is permanent once the module ships. Renaming a parameter,
   changing its type, or moving its tag re-points every deployed
   configuration that carries it.
-- A retired parameter's tag is retired with it. Reusing the number makes
-  an old config decode as the new field.
+- A tag is never reused. A parameter that goes takes its number with it;
+  reusing the number makes a config that carries it decode as another field.
 - `[[params]]` entries may be reordered or inserted freely; nothing about
   the encoding depends on the order.
 - Duplicate, reserved, and out-of-range tags are rejected when the
@@ -33,13 +33,13 @@ released row changes only by updating the pin in the same commit.
 
 ## State
 
-A built-in the kernel instantiates declares the state its instance takes
+A native module the kernel instantiates declares the state its instance takes
 from the kernel's state arena, in 64-byte units: `state_bytes_64`. It is
 generated as `STATE_BYTES` beside the name hash. The platform's vtable takes
 exactly that (a compile-time assertion holds it to the instance's real state
 type), and `fluxor build` charges the instance exactly that against the state
 arena, by the arena's carve rule (`contracts/src/state_arena.rs`). A
-manifest that describes a built-in the kernel does not instantiate as a graph
+manifest that describes a native module the kernel does not instantiate as a graph
 module (a boot-time provider backend) declares none, and a graph naming it is
 refused at build.
 

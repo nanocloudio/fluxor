@@ -1,9 +1,10 @@
 # Fluxor Documentation
 
-Fluxor is a composable runtime that replaces threads and processes with
-a deterministic module graph. Systems are assembled as explicitly wired
-position-independent modules connected by typed channels and executed
-in topological order by a cooperative scheduler. The runtime
+Fluxor is a composable runtime built on a deterministic module graph in
+place of threads and processes. Systems are assembled as explicitly wired
+position-independent modules connected by typed channels. Each execution
+domain steps its modules in passes, in an order the composer fixes, under
+the domain's execution mode. The runtime
 distinguishes wall-clock time from stream-clock time, giving
 predictable pipelines for audio, display, control, networking, storage,
 consensus, and compute workloads across microcontrollers, application
@@ -12,7 +13,7 @@ processors, Linux-hosted runs, and browser-hosted WASM bundles.
 ## Start Here
 
 - [guides/running.md](guides/running.md) — bring a graph up on the Linux host, config included
-- [architecture/pipeline.md](architecture/pipeline.md) — domain loop, channels, and execution model
+- [architecture/pipeline.md](architecture/pipeline.md) — graphs, channels, and the execution model
 - [architecture/module_architecture.md](architecture/module_architecture.md) — module contract, step semantics, composition rules
 - [vision.md](vision.md) — the capability-centric argument and where the model is headed
 
@@ -21,10 +22,10 @@ processors, Linux-hosted runs, and browser-hosted WASM bundles.
 How the system works. These are the authoritative references.
 
 - [architecture/vocabulary.md](architecture/vocabulary.md) — the one term for each concept (node, domain, exec mode, graph kinds, owner, workload, artefacts) and the words they retire
-- [architecture/pipeline.md](architecture/pipeline.md) — domain loop, channels, FIFO and mailbox IPC, burst stepping, capacity profiles
+- [architecture/pipeline.md](architecture/pipeline.md) — graphs, wiring, channels, FIFO and mailbox IPC, fan-out and fan-in, burst stepping
 - [architecture/module_architecture.md](architecture/module_architecture.md) — module lifecycle, step contract, fault recovery, drain protocol
 - [architecture/module_isolation.md](architecture/module_isolation.md) — protection levels, the gateway, MPU/MMU backends, device windows
-- [architecture/scheduler.md](architecture/scheduler.md) — execution modes, interrupt-mode admission and I/O contract, domain loops
+- [architecture/scheduler.md](architecture/scheduler.md) — execution modes, passes, deadlines, workload budgets and environment, interrupt-mode admission and I/O contract
 - [architecture/concurrency.md](architecture/concurrency.md) — what is shared, what is domain-local, and why it is safe
 - [architecture/timing.md](architecture/timing.md) — stream clock vs wall clock, StreamTime, producer scheduling
 - [architecture/events.md](architecture/events.md) — event objects, IRQ binding, scheduler wake, ISR safety contract
@@ -43,7 +44,7 @@ How the system works. These are the authoritative references.
 - [architecture/av_capability_surface.md](architecture/av_capability_surface.md) — audio/video surfaces, presentation groups, clock authority
 - [architecture/browser_capability_surface.md](architecture/browser_capability_surface.md) — the browser as a capability provider
 - [architecture/wasm_platform.md](architecture/wasm_platform.md) — the WASM target: wasm bundle format, entry points, host imports
-- [architecture/wasm_browser_host.md](architecture/wasm_browser_host.md) — the browser host runtime and its built-in modules
+- [architecture/wasm_browser_host.md](architecture/wasm_browser_host.md) — the browser host runtime and its native modules
 - [architecture/network.md](architecture/network.md) — channel-based networking, net_proto, drivers, IP module, TLS
 - [architecture/datagram_secure_transports.md](architecture/datagram_secure_transports.md) — DTLS 1.3 and QUIC v1 on the datagram surface
 - [architecture/exchange.md](architecture/exchange.md) — the exchange contract: one request and its answer between any requester and provider
@@ -74,9 +75,13 @@ How to build and run things with the system.
 - [guides/displays.md](guides/displays.md) — display/touch configuration and pixel pipeline
 - [guides/midi.md](guides/midi.md) — the MIDI transport surface and synthesis composition
 - [guides/compute_heavy_modules.md](guides/compute_heavy_modules.md) — patterns for emulators, codecs, and compute-intensive workloads
+- [guides/rig.md](guides/rig.md) — hardware rigs: scenarios, rig profiles, backends, and unattended test runs
 
 ## Modules
 
 Module documentation is colocated with each module implementation under
-[modules/](../modules/). Each module's `mod.rs` is the authoritative
-source for its parameters, channel hints, and capability flags.
+[modules/](../modules/). Each module's `manifest.toml` declares its
+ports, resources and capabilities (the loader takes a module's facts only
+from its signed manifest), its `mod.rs` declares its params
+(`define_params!`), and its `README.md`, where it has one, documents its
+behaviour.

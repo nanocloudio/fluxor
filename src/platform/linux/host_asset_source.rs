@@ -1,4 +1,4 @@
-// host_asset_source built-in — streams a host file as OctetStream.
+// host_asset_source native module — streams a host file as OctetStream.
 //
 // Params declared in `modules/platform/wasm/host_asset_source/manifest.toml`:
 //   path: filesystem path to the asset (required, no default)
@@ -131,7 +131,7 @@ fn build_host_asset_source(module_idx: usize, params: &[u8]) -> Result<Box<HostA
             pending_pos: 0,
         });
     log::info!(
-        "[inst] module {module_idx} = host_asset_source (built-in) out={out_chan} path='{path}'"
+        "[inst] module {module_idx} = host_asset_source (native) out={out_chan} path='{path}'"
     );
     Ok(st)
 }

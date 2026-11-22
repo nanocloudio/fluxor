@@ -85,7 +85,7 @@ pub fn extract_module_search_paths(
 
 /// any additional search paths (e.g., relative to the config file).
 /// Standard fluxor module subdirectories, relative to a root: the one
-/// layer list (`manifest::MODULE_LAYERS`). Built-ins live under
+/// layer list (`manifest::MODULE_LAYERS`). Native modules live under
 /// `modules/platform/<platform>/<name>/`.
 const STANDARD_MODULE_SUBDIRS: &[&str] = crate::manifest::MODULE_LAYERS;
 
@@ -461,7 +461,7 @@ fn resolve_port_spec<'a>(
     // (e.g. `sequencr.notes` when the module is declared as
     // `sequencer`), a typo in the `type:` field, a `.fmod` whose
     // source tree fluxor can't see (the project root is wrong, or
-    // the install root needs to be set), or a built-in module
+    // the install root needs to be set), or a native module
     // whose feature isn't compiled into the running fluxor binary.
     // Run a Levenshtein lookup against the declared module-name
     // list first — typo'd name is the single most common cause.
@@ -478,7 +478,7 @@ fn resolve_port_spec<'a>(
              doesn't exist;\n\
              \x20\x20- the project / install roots don't include the module's source tree \
              (run `fluxor inspect` to see the search paths in use);\n\
-             \x20\x20- the module is a built-in whose feature isn't compiled into this \
+             \x20\x20- the module is a native module whose feature isn't compiled into this \
              `fluxor` binary."
         )
     })?;

@@ -83,21 +83,21 @@
 //! colour-grade), screen-space reflection, and (with a depth target) shadow
 //! maps.
 //!
-//! - CREATE_TARGET [0x04] [target_id:u32] [width:u32] [height:u32] [flags:u32]
-//!   Creates/replaces offscreen target `target_id` (id 0 = swapchain, rejected).
+//! - CREATE_TARGET [0x04] [render_target:u32] [width:u32] [height:u32] [flags:u32]
+//!   Creates/replaces offscreen target `render_target` (id 0 = swapchain, rejected).
 //!   width/height 0 track the canvas. flags bit0 = allocate a depth attachment
 //!   (needed to render the scene into the target with depth testing). The
 //!   target's colour is a sampleable texture the MSAA pass resolves into.
 //!   Device state — applied outside frame gating.
-//! - BEGIN_PASS [0x05] [frame_tick:u32] [target_id:u32] [flags:u32]
+//! - BEGIN_PASS [0x05] [frame_tick:u32] [render_target:u32] [flags:u32]
 //!                     [clear_r:f32, clear_g:f32, clear_b:f32]
-//!   Begins a render pass into `target_id` (0 = swapchain). flags bit0 = attach
+//!   Begins a render pass into `render_target` (0 = swapchain). flags bit0 = attach
 //!   depth. The first BEGIN_PASS of a frame opens the encoder and takes the
 //!   vsync gate (like FRAME_BEGIN); a later BEGIN_PASS auto-ends the previous
 //!   pass. A multi-pass frame uses BEGIN_PASS for every pass and FRAME_END to
 //!   submit; FRAME_BEGIN is the single-pass form (one swapchain pass).
-//! - BIND_TEXTURE [0x06] [pipeline_id:u32] [unit:u32] [target_id:u32]
-//!   Binds target `target_id`'s resolved colour texture to sampled `unit` of
+//! - BIND_TEXTURE [0x06] [pipeline_id:u32] [unit:u32] [render_target:u32]
+//!   Binds target `render_target`'s resolved colour texture to sampled `unit` of
 //!   `pipeline_id`. The pipeline draws once all its declared units are bound.
 //!   Device state.
 //! - DRAW_FULLSCREEN [0x21] [pipeline_id:u32] [vertex_count:u32]
@@ -188,13 +188,13 @@ extern "C" {
     /// w/h of 0 track the canvas size. flags bit0 = allocate depth. Returns 0/<0.
     fn host_gpu_raster_target(id: u32, w: u32, h: u32, flags: u32) -> i32;
 
-    /// Begin a render pass into `target_id` (0 = swapchain). flags bit0 = attach
+    /// Begin a render pass into `render_target` (0 = swapchain). flags bit0 = attach
     /// depth. The first pass of a frame opens the encoder + takes the vsync gate.
-    fn host_gpu_raster_begin_pass(target_id: u32, r: f32, g: f32, b: f32, flags: u32) -> i32;
+    fn host_gpu_raster_begin_pass(render_target: u32, r: f32, g: f32, b: f32, flags: u32) -> i32;
 
-    /// Bind offscreen target `target_id`'s resolved color texture to sampled
+    /// Bind offscreen target `render_target`'s resolved color texture to sampled
     /// unit `unit` of pipeline `pipeline_id`. Returns 0/<0.
-    fn host_gpu_raster_bind_texture(pipeline_id: u32, unit: u32, target_id: u32) -> i32;
+    fn host_gpu_raster_bind_texture(pipeline_id: u32, unit: u32, render_target: u32) -> i32;
 
     /// Draw a vertexless pipeline (`count` vertices from @builtin(vertex_index))
     /// — a fullscreen post/reflection pass. Returns 0/<0.
@@ -405,7 +405,7 @@ unsafe extern "C" fn gpu_step(state: *mut u8) -> i32 {
                 }
 
                 CMD_BIND_TEXTURE => {
-                    // 12 bytes: pipeline_id, unit, target_id. Device state.
+                    // 12 bytes: pipeline_id, unit, render_target. Device state.
                     if st.cmd_offset + 12 > st.cmd_len {
                         st.cmd_offset -= 1;
                         break;
@@ -451,7 +451,7 @@ unsafe extern "C" fn gpu_step(state: *mut u8) -> i32 {
                 }
 
                 CMD_BEGIN_PASS => {
-                    // 24 bytes: frame_tick, target_id, flags, clear r/g/b. The
+                    // 24 bytes: frame_tick, render_target, flags, clear r/g/b. The
                     // multi-pass frame opener (scene→offscreen, then post→
                     // swapchain); gated exactly like FRAME_BEGIN.
                     if st.cmd_offset + 24 > st.cmd_len {
@@ -459,7 +459,7 @@ unsafe extern "C" fn gpu_step(state: *mut u8) -> i32 {
                         break;
                     }
                     let frame_tick = read_u32(st.cmd_buf, st.cmd_offset as usize);
-                    let target_id = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    let render_target = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
                     let flags = read_u32(st.cmd_buf, st.cmd_offset as usize + 8);
                     let r = read_f32(st.cmd_buf, st.cmd_offset as usize + 12);
                     let g = read_f32(st.cmd_buf, st.cmd_offset as usize + 16);
@@ -472,7 +472,7 @@ unsafe extern "C" fn gpu_step(state: *mut u8) -> i32 {
                         continue;
                     }
                     if !st.skip_frame {
-                        let rc = host_gpu_raster_begin_pass(target_id, r, g, b, flags);
+                        let rc = host_gpu_raster_begin_pass(render_target, r, g, b, flags);
                         // -2 = vsync gate on the frame opener → skip the whole
                         // frame. Any other error (e.g. unknown target) is left
                         // for FRAME_END to still submit/clean the encoder.

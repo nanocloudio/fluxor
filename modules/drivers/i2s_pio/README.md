@@ -9,35 +9,16 @@ I2S PIC Module
 - `params_def.rs`
 - `pio.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `audio` | input | `AudioSample` | required |
 
-[[ports]]
-name = "audio"
-direction = "input"
-content_type = "AudioSample"
-required = true
-
-[[resources]]
-requires_contract = "pio"
-access = "exclusive"
-instance = 0
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
 - `clock_base`
 - `data_pin`
 - `sample_rate`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

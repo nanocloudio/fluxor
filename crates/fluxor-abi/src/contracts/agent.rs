@@ -11,13 +11,13 @@
 //
 // ```text
 // request (REQUEST_LEN):
-//   [op:u8][flags:u8][workload_uid:16][desired_bundle_digest:32]
+//   [op:u8][flags:u8][owner_uid:16][desired_package_digest:32]
 //   [descriptor_revision:32][idempotency_id:16][fence_epoch:u64][fence_seq:u64]
 //
 // response (RESPONSE_FIXED_LEN + diag_len):
-//   [result:u8][target_id:32][workload_uid:16][descriptor_revision:32]
+//   [result:u8][node_id:32][owner_uid:16][descriptor_revision:32]
 //   [idempotency_id:16][fence_epoch:u64][fence_seq:u64]
-//   [observed_activation_digest:32][desired_bundle_digest:32]
+//   [observed_activation_digest:32][desired_package_digest:32]
 //   [phase:u8][generation:u64][diag_len:u16][diag:diag_len]
 //
 // frame, on a socket, on stdio and on a `peer_tag` remote channel's local port:
@@ -67,7 +67,7 @@ pub mod result {
     /// This idempotency identity was used by a different request.
     pub const REFUSED_CONFLICT: u8 = 4;
     /// The node holds no workload package at the desired digest.
-    pub const BUNDLE_MISSING: u8 = 5;
+    pub const PACKAGE_MISSING: u8 = 5;
     /// Validation or composition refused; `diag` is its diagnostic.
     pub const REFUSED_ADMISSION: u8 = 6;
     /// The record is malformed.
@@ -125,8 +125,8 @@ pub enum DecodeError {
 pub struct Request {
     pub op: u8,
     pub flags: u8,
-    pub workload_uid: [u8; 16],
-    pub desired_bundle_digest: [u8; 32],
+    pub owner_uid: [u8; 16],
+    pub desired_package_digest: [u8; 32],
     pub descriptor_revision: [u8; 32],
     pub idempotency_id: [u8; 16],
     pub fence_epoch: u64,
@@ -137,14 +137,14 @@ pub struct Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Response<'a> {
     pub result: u8,
-    pub target_id: [u8; 32],
-    pub workload_uid: [u8; 16],
+    pub node_id: [u8; 32],
+    pub owner_uid: [u8; 16],
     pub descriptor_revision: [u8; 32],
     pub idempotency_id: [u8; 16],
     pub fence_epoch: u64,
     pub fence_seq: u64,
     pub observed_activation_digest: [u8; 32],
-    pub desired_bundle_digest: [u8; 32],
+    pub desired_package_digest: [u8; 32],
     pub phase: u8,
     pub generation: u64,
     pub diag: &'a [u8],
@@ -220,8 +220,8 @@ impl Request {
     pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
         let mut p = Put { out, at: 0 };
         p.bytes(&[self.op, self.flags])?;
-        p.bytes(&self.workload_uid)?;
-        p.bytes(&self.desired_bundle_digest)?;
+        p.bytes(&self.owner_uid)?;
+        p.bytes(&self.desired_package_digest)?;
         p.bytes(&self.descriptor_revision)?;
         p.bytes(&self.idempotency_id)?;
         p.bytes(&self.fence_epoch.to_le_bytes())?;
@@ -249,8 +249,8 @@ impl Request {
             return Err(DecodeError::BadFlags);
         }
         let (
-            Some(workload_uid),
-            Some(desired_bundle_digest),
+            Some(owner_uid),
+            Some(desired_package_digest),
             Some(descriptor_revision),
             Some(idempotency_id),
             Some(fence_epoch),
@@ -266,14 +266,14 @@ impl Request {
         else {
             return Err(DecodeError::Truncated);
         };
-        if op != op::APPLY && !all_zero(&desired_bundle_digest) {
+        if op != op::APPLY && !all_zero(&desired_package_digest) {
             return Err(DecodeError::UnexpectedDigest);
         }
         Ok(Request {
             op,
             flags,
-            workload_uid,
-            desired_bundle_digest,
+            owner_uid,
+            desired_package_digest,
             descriptor_revision,
             idempotency_id,
             fence_epoch,
@@ -291,14 +291,14 @@ impl Response<'_> {
         }
         let mut p = Put { out, at: 0 };
         p.bytes(&[self.result])?;
-        p.bytes(&self.target_id)?;
-        p.bytes(&self.workload_uid)?;
+        p.bytes(&self.node_id)?;
+        p.bytes(&self.owner_uid)?;
         p.bytes(&self.descriptor_revision)?;
         p.bytes(&self.idempotency_id)?;
         p.bytes(&self.fence_epoch.to_le_bytes())?;
         p.bytes(&self.fence_seq.to_le_bytes())?;
         p.bytes(&self.observed_activation_digest)?;
-        p.bytes(&self.desired_bundle_digest)?;
+        p.bytes(&self.desired_package_digest)?;
         p.bytes(&[self.phase])?;
         p.bytes(&self.generation.to_le_bytes())?;
         p.bytes(&(self.diag.len() as u16).to_le_bytes())?;
@@ -315,14 +315,14 @@ impl Response<'_> {
         let mut t = Take { src: record, at: 0 };
         let (
             Some(result),
-            Some(target_id),
-            Some(workload_uid),
+            Some(node_id),
+            Some(owner_uid),
             Some(descriptor_revision),
             Some(idempotency_id),
             Some(fence_epoch),
             Some(fence_seq),
             Some(observed_activation_digest),
-            Some(desired_bundle_digest),
+            Some(desired_package_digest),
             Some(phase),
             Some(generation),
             Some(diag_len),
@@ -361,14 +361,14 @@ impl Response<'_> {
         }
         Ok(Response {
             result,
-            target_id,
-            workload_uid,
+            node_id,
+            owner_uid,
             descriptor_revision,
             idempotency_id,
             fence_epoch,
             fence_seq,
             observed_activation_digest,
-            desired_bundle_digest,
+            desired_package_digest,
             phase,
             generation,
             diag,

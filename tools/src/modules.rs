@@ -439,8 +439,8 @@ pub fn build_module_table_with_programs(
 }
 
 /// Check if a module type is a kernel built-in (has `builtin = true` in its manifest).
-/// Built-in modules don't have .fmod files — they're compiled into the kernel binary.
-pub fn is_builtin_module(module_type: &str) -> bool {
+/// Native modules don't have .fmod files — they're compiled into the kernel binary.
+pub fn is_native_module(module_type: &str) -> bool {
     matches!(
         manifest::Manifest::from_source_tree(module_type),
         Ok(Some(m)) if m.builtin
@@ -669,13 +669,13 @@ pub fn parse_modules_from_config_multi(
             )? {
                 Some(p) => p,
                 None => {
-                    // Check if this is a built-in module (no .fmod needed)
-                    if is_builtin_module(module_type) {
+                    // Check if this is a native module (no .fmod needed)
+                    if is_native_module(module_type) {
                         if let Some(v) = variant {
                             return Err(Error::Module(format!(
                                 "module '{module_name}' (type '{module_type}') requests \
                                  variant '{v}', but the type is built into the kernel — \
-                                 built-ins have no variant artifacts; drop `variant:`"
+                                 native modules have no variant artifacts; drop `variant:`"
                             )));
                         }
                         continue;
@@ -719,13 +719,13 @@ pub fn parse_modules_from_config_multi(
             )? {
                 Some(p) => p,
                 None => {
-                    // Check if this is a built-in module (no .fmod needed)
-                    if is_builtin_module(module_type) {
+                    // Check if this is a native module (no .fmod needed)
+                    if is_native_module(module_type) {
                         if let Some(v) = variant {
                             return Err(Error::Module(format!(
                                 "module '{instance_name}' (type '{module_type}') requests \
                                  variant '{v}', but the type is built into the kernel — \
-                                 built-ins have no variant artifacts; drop `variant:`"
+                                 native modules have no variant artifacts; drop `variant:`"
                             )));
                         }
                         continue;
@@ -817,11 +817,11 @@ pub fn parse_modules_from_config_multi(
             if !loaded_types.insert(module_type.to_string()) {
                 continue;
             }
-            if is_builtin_module(module_type) {
+            if is_native_module(module_type) {
                 if let Some(v) = variant {
                     return Err(Error::Module(format!(
                             "module type '{module_type}' (staged by a workload or workload_modules) requests variant \
-                             '{v}', but the type is built into the kernel — built-ins have no \
+                             '{v}', but the type is built into the kernel — native modules have no \
                              variant artifacts; drop `variant:`"
                         )));
                 }
@@ -2730,7 +2730,7 @@ content_type = "NetProto"
     /// Two module entries of one type naming different variants is a
     /// hard config error — the image carries
     /// one FXMT entry per name_hash, so silent first-wins would ship
-    /// whichever variant parsed first. Uses a builtin type so the
+    /// whichever variant parsed first. Uses a native type so the
     /// first entry needs no .fmod on disk.
     #[test]
     fn same_type_conflicting_variants_is_hard_error() {
@@ -2768,12 +2768,12 @@ content_type = "NetProto"
         assert!(msg.contains("default [[variant]]"), "got: {msg}");
     }
 
-    /// A built-in module type takes no `variant:` — built-ins ship
+    /// A native module type takes no `variant:` — native modules ship
     /// inside the kernel, there is no variant artifact to resolve. The
     /// error must say so instead of suggesting a build/pin that can
     /// never produce the artifact.
     #[test]
-    fn variant_on_builtin_type_is_an_error() {
+    fn variant_on_native_type_is_an_error() {
         let config = serde_json::json!({
             "modules": [
                 { "name": "net", "type": "linux_net", "variant": "slim" },
@@ -2781,14 +2781,14 @@ content_type = "NetProto"
         });
         let tmp = tempfile::tempdir().unwrap();
         let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
-            .expect_err("variant on builtin must fail");
+            .expect_err("variant on native must fail");
         let msg = err.to_string();
         assert!(msg.contains("built into the kernel"), "got: {msg}");
     }
 
     /// Workload-vs-workload variant conflict must fail, not first-wins: the
     /// variant conflict check runs BEFORE the workload dedup skip and
-    /// before the builtin bypass, so even a builtin type (which never
+    /// before the native bypass, so even a native type (which never
     /// resolves an artifact) surfaces the disagreement.
     #[test]
     fn workload_conflicting_variants_is_hard_error() {
@@ -2865,8 +2865,8 @@ content_type = "NetProto"
         });
         let tmp = tempfile::tempdir().unwrap();
         let mods = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
-            .expect("builtin dedup should succeed");
-        assert!(mods.is_empty(), "builtins carry no fmod entries");
+            .expect("native dedup should succeed");
+        assert!(mods.is_empty(), "native modules carry no fmod entries");
     }
 
     #[test]

@@ -47,7 +47,7 @@
 //! - **Local:** a persisted `KDF_KEY` under this module's `key` label.
 //! - **Attach:** reconstructed from two share envelopes. The module makes a
 //!   fresh recipient key, writes its public key to the `recipient` output,
-//!   and waits for the attachment bundle on its `bundle` control input.
+//!   and waits for the attachment share set on its `shares` control input.
 //!   The master it reconstructs is bound to the container's volume id and
 //!   epoch, never persisted, and the recipient key is destroyed once used.
 //!
@@ -56,7 +56,7 @@
 //! superblock carries it through prepared, active, migrating and retiring,
 //! so a crash at any point resumes where it was:
 //! - **Prepared:** the next epoch's master is held: generated and
-//!   persisted (local), or reconstructed from its bundle (attach).
+//!   persisted (local), or reconstructed from its share set (attach).
 //! - **Active:** new writes seal under the new epoch; reads take each
 //!   unit's key from the epoch its metadata names.
 //! - **Migrating:** each step re-seals a bounded batch of old-epoch units
@@ -68,16 +68,16 @@
 //! Attached, the next master comes from the custodians. The `"FXRT"` record
 //! makes a fresh recipient and announces it on `recipient`; the pipeline
 //! that sent the record knows it asked for the next epoch, and answers with
-//! that epoch's bundle on the control input. The bundle is reconstructed
+//! that epoch's share set on the control input. The share set is reconstructed
 //! bound to the volume id and the next epoch, its recipient destroyed, and
-//! only then is the prepared superblock committed. A bundle refused (another
+//! only then is the prepared superblock committed. A share set refused (another
 //! epoch, volume or recipient) changes nothing: the volume stays steady and
 //! a fresh recipient is announced for the next try. Attached masters are
-//! never persisted, so a mount under a rotation needs both epochs' bundles
-//! again: it announces a recipient, takes a bundle for either epoch it
+//! never persisted, so a mount under a rotation needs both epochs' share sets
+//! again: it announces a recipient, takes a share set for either epoch it
 //! needs (the one its superblock names, and the next while prepared or the
 //! previous after), refuses one for any other epoch and announces afresh,
-//! and mounts once it holds both. Each epoch a bundle is for is the one its
+//! and mounts once it holds both. Each epoch a share set is for is the one its
 //! envelopes name.
 //!
 //! **Crypto-erase:** an `"FXER"` record on the control input destroys every
@@ -88,9 +88,9 @@
 //! **Status:** the optional `status` output carries one fixed record,
 //! written whenever what it reports changes (and so once at ready), for
 //! the pipeline that drives the control records to follow: `"FXST"`,
-//! state (opening, awaiting a bundle, ready, rotating, failed, erased),
+//! state (opening, awaiting a share set, ready, rotating, failed, erased),
 //! the superblock's rotation state, two reserved bytes, epoch, previous
-//! epoch, the epoch a bundle is awaited for (0 for none or unknown), an
+//! epoch, the epoch a share set is awaited for (0 for none or unknown), an
 //! errno, and the volume id; little-endian. A full channel never holds the
 //! module up: a record not yet written waits for the next step, and only
 //! the latest is kept, so a slow reader loses intermediate states and never
@@ -100,10 +100,10 @@
 //! - `key`: the vault label of the volume's master key (local), at most 64
 //!   bytes. Epoch 1's master is filed under `key`, a later epoch's under
 //!   `key#<epoch>`, which must fit the same bound.
-//! - `attach`: 1 takes the master from an attachment bundle instead.
+//! - `attach`: 1 takes the master from an attachment share set instead.
 //! - `format`: 1 formats a lower device with no superblock in either slot.
 //!   A device whose superblocks do not verify holds a container and is never
-//!   formatted. In attach mode the new container takes the bundle's volume id
+//!   formatted. In attach mode the new container takes the share set's volume id
 //!   and epoch.
 //! - `block_size`: the upper logical block size, a power of two from 512 to
 //!   the unit size (default 512).
@@ -161,16 +161,16 @@ pub const AAD_LEN: usize = 56;
 /// Unit flag: discarded, reads as zeros.
 pub const FLAG_DISCARDED: u32 = 1;
 
-/// A bundle not for this volume, epoch or recipient.
+/// A share set not for this volume, epoch or recipient.
 const E_ACCES: i32 = -13;
 
 pub const SUITE_CHACHA: u16 = 1;
 pub const SUITE_AES: u16 = 2;
 
-/// An attachment bundle on the `bundle` input: `"FXSB"`, the envelope
+/// An attachment share set on the `shares` input: `"FXSB"`, the envelope
 /// count (2) and three zero bytes, then the two share envelopes.
-pub const BUNDLE_MAGIC: [u8; 4] = *b"FXSB";
-pub const BUNDLE_LEN: usize = 8 + 2 * kv::share::P256_LEN;
+pub const SHARE_SET_MAGIC: [u8; 4] = *b"FXSB";
+pub const SHARE_SET_LEN: usize = 8 + 2 * kv::share::P256_LEN;
 /// The recipient announcement on the `recipient` output: `"FXRK"` then
 /// the recipient's uncompressed P-256 public key.
 pub const RECIPIENT_MAGIC: [u8; 4] = *b"FXRK";
@@ -190,7 +190,7 @@ pub const STATUS_MAGIC: [u8; 4] = *b"FXST";
 pub const STATUS_LEN: usize = 40;
 /// Status states.
 pub const ST_OPENING: u8 = 0;
-pub const ST_AWAITING_BUNDLE: u8 = 1;
+pub const ST_AWAITING_SHARE_SET: u8 = 1;
 pub const ST_READY: u8 = 2;
 pub const ST_ROTATING: u8 = 3;
 pub const ST_FAILED: u8 = 4;
@@ -537,7 +537,7 @@ struct CryptState {
     phase: u8,
     format: u8,
     key_len: u8,
-    /// 1: the master comes from an attachment bundle.
+    /// 1: the master comes from an attachment share set.
     attach: u8,
     open_err: i32,
     upper_block: u32,
@@ -569,29 +569,29 @@ struct CryptState {
     _pad4: [u8; 6],
     done: [Cpl; QUEUE_DEPTH],
     key_label: [u8; KEY_LABEL_CAP],
-    /// Attach mode: the `bundle` input, the `recipient` output, the fresh
-    /// recipient key, and the bundle as it arrives.
+    /// Attach mode: the `shares` input, the `recipient` output, the fresh
+    /// recipient key, and the share set as it arrives.
     ctrl_chan: i32,
     recipient_out: i32,
     recipient: i32,
-    bundle_len: u32,
+    share_set_len: u32,
     /// The volume id and epoch a container formatted in attach mode takes.
     attach_resource: [u8; 16],
     attach_epoch: u32,
     _pad5: u32,
-    /// The bundle as it arrives while mounting; once the container is
+    /// The share set as it arrives while mounting; once the container is
     /// ready, each record on the control input (a control record, or a
-    /// rotation's bundle) as it arrives.
-    bundle: [u8; BUNDLE_LEN],
-    /// Attach mode. `rot_want`: the epoch a rotation waits for a bundle of,
+    /// rotation's share set) as it arrives.
+    share_set: [u8; SHARE_SET_LEN],
+    /// Attach mode. `rot_want`: the epoch a rotation waits for a share set of,
     /// 0 for none. `need_other`: the other epoch a mount under a rotation
-    /// needs a bundle of, 0 for none. `other_epoch`: the epoch
+    /// needs a share set of, 0 for none. `other_epoch`: the epoch
     /// `other_master` was reconstructed for while mounting.
     rot_want: u32,
     need_other: u32,
     other_epoch: u32,
-    /// The record in `bundle` is a bundle for the rotation to take.
-    bundle_ready: u8,
+    /// The record in `share_set` is one for the rotation to take.
+    share_set_ready: u8,
     _pad7: [u8; 3],
     /// The last background step's result, logged when it changes.
     rotate_err: i32,
@@ -611,7 +611,7 @@ struct CryptState {
     /// The kind of the background frame running.
     bg_kind: u8,
     /// Attach mode: the superblocks were read, unverified, before the
-    /// bundle was awaited; `probe_sb` is the newest of them. `probe_blank`:
+    /// share set was awaited; `probe_sb` is the newest of them. `probe_blank`:
     /// neither slot holds a superblock (the only device a mount formats).
     attach_probed: u8,
     probe_blank: u8,
@@ -2128,10 +2128,10 @@ fn keep_a(s: &mut CryptState, a: Option<Superblock>) {
 /// Mount: find the master, verify the newest superblock (or format), open
 /// the data keys, reserve a fresh nonce range in one committed generation,
 /// then replay the journal. Only the wait for the lower source to attach and
-/// the waits for attachment bundles answer `EAGAIN` and start again; all
+/// the waits for attachment share sets answer `EAGAIN` and start again; all
 /// come before anything is written. Everything after resumes where it waited.
 ///
-/// An attached volume under a rotation needs two bundles: one for the epoch
+/// An attached volume under a rotation needs two share sets: one for the epoch
 /// its superblock names and one for the other epoch the rotation holds (the
 /// next while prepared, the previous after). Each is announced a recipient
 /// of its own, one after the other, and taken in whichever order it comes.
@@ -2175,7 +2175,7 @@ unsafe fn run_mount(s: &mut CryptState, f: &mut Frame) -> Act {
             ATTACH => {
                 // Bound to this container: the volume id and epoch its
                 // superblock names, read here unverified — before the
-                // bundle is awaited, so the status can name the epoch it
+                // share set is awaited, so the status can name the epoch it
                 // is awaited for — and verified with the key made. Nothing
                 // is written while the mount waits, so they are read once.
                 if s.attach_probed != 0 {
@@ -2213,7 +2213,7 @@ unsafe fn run_mount(s: &mut CryptState, f: &mut Frame) -> Act {
                 if rc != 0 {
                     return Act::Done(rc);
                 }
-                if s.bundle[..4] != BUNDLE_MAGIC || s.bundle[4] != 2 {
+                if s.share_set[..4] != SHARE_SET_MAGIC || s.share_set[4] != 2 {
                     return Act::Done(attach_finish(s, E_INVAL));
                 }
                 if s.probe_blank != 0 && s.master < 0 {
@@ -2227,8 +2227,8 @@ unsafe fn run_mount(s: &mut CryptState, f: &mut Frame) -> Act {
                 f.pc = ATTACH + 3;
             }
             13 => {
-                // A bundle for an epoch this mount does not need is refused
-                // and a fresh recipient announced; a bundle for one it needs
+                // A share set for an epoch this mount does not need is refused
+                // and a fresh recipient announced; a share set for one it needs
                 // that does not open fails the mount.
                 let rc = attach_take(s);
                 if rc != 0 {
@@ -2326,7 +2326,7 @@ unsafe fn run_mount(s: &mut CryptState, f: &mut Frame) -> Act {
             KEYS => {
                 // The other epoch's keys first: an attached volume whose
                 // verified superblock needs one it does not hold yet goes
-                // back to wait for its bundle, with nothing written.
+                // back to wait for its share set, with nothing written.
                 let rc = open_rotation_keys(s);
                 if rc != 0 {
                     return Act::Done(rc);
@@ -2396,8 +2396,8 @@ unsafe fn attach_recipient(s: &mut CryptState) -> i32 {
     0
 }
 
-/// Announce the recipient and collect the attachment bundle: `E_AGAIN`
-/// until the whole bundle has arrived.
+/// Announce the recipient and collect the attachment share set: `E_AGAIN`
+/// until the whole share set has arrived.
 unsafe fn attach_gather(s: &mut CryptState) -> i32 {
     if s.ctrl_chan < 0 {
         return E_INVAL;
@@ -2408,41 +2408,41 @@ unsafe fn attach_gather(s: &mut CryptState) -> i32 {
             return rc;
         }
     }
-    while (s.bundle_len as usize) < BUNDLE_LEN {
-        let have = s.bundle_len as usize;
-        let p = s.bundle.as_mut_ptr().add(have);
-        let n = (s.sys().channel_read)(s.ctrl_chan, p, BUNDLE_LEN - have);
+    while (s.share_set_len as usize) < SHARE_SET_LEN {
+        let have = s.share_set_len as usize;
+        let p = s.share_set.as_mut_ptr().add(have);
+        let n = (s.sys().channel_read)(s.ctrl_chan, p, SHARE_SET_LEN - have);
         if n <= 0 {
             return E_AGAIN;
         }
-        s.bundle_len += n as u32;
+        s.share_set_len += n as u32;
     }
     0
 }
 
 /// End an attach: the recipient key served it and is destroyed whatever
-/// the outcome, and the bundle is forgotten.
+/// the outcome, and the share set is forgotten.
 unsafe fn attach_finish(s: &mut CryptState, rc: i32) -> i32 {
     if s.recipient >= 0 {
         vault_destroy(s, s.recipient);
     }
     s.recipient = -1;
-    s.bundle.fill(0);
-    s.bundle_len = 0;
-    s.bundle_ready = 0;
+    s.share_set.fill(0);
+    s.share_set_len = 0;
+    s.share_set_ready = 0;
     rc
 }
 
-/// The epoch the bundle's first envelope names. Unverified: it only picks
-/// which epoch the bundle is offered for, and `SHARE_COMBINE` binds the
+/// The epoch the share set's first envelope names. Unverified: it only picks
+/// which epoch the share set is offered for, and `SHARE_COMBINE` binds the
 /// envelopes to that epoch.
-fn bundle_epoch(s: &CryptState) -> u32 {
+fn share_set_epoch(s: &CryptState) -> u32 {
     let e = 8 + kv::share::EPOCH;
     u32::from_le_bytes([
-        s.bundle[e],
-        s.bundle[e + 1],
-        s.bundle[e + 2],
-        s.bundle[e + 3],
+        s.share_set[e],
+        s.share_set[e + 1],
+        s.share_set[e + 2],
+        s.share_set[e + 3],
     ])
 }
 
@@ -2456,16 +2456,16 @@ fn other_epoch_of(sb: &Superblock) -> u32 {
     }
 }
 
-/// A mount still waits for a bundle: the current epoch's, or the other
+/// A mount still waits for a share set: the current epoch's, or the other
 /// epoch's a rotation under way needs.
 fn attach_wanting(s: &CryptState) -> bool {
     s.master < 0 || (s.need_other != 0 && s.other_master < 0)
 }
 
-/// Reconstruct the master the bundle holds, bound to `resource` and
-/// `epoch`, into a new handle (or a negative errno): the bundle's two
+/// Reconstruct the master the share set holds, bound to `resource` and
+/// `epoch`, into a new handle (or a negative errno): the share set's two
 /// envelopes, one `SHARE_COMBINE` each, both opened by the recipient key.
-/// The recipient key and the bundle are spent whatever the outcome.
+/// The recipient key and the share set are spent whatever the outcome.
 unsafe fn share_combine(s: &mut CryptState, resource: &[u8; 16], epoch: u32) -> i32 {
     use kv::share as sh;
     let arg = sh::combine::encode(kv::suite::KDF_KEY, kv::usage::DERIVE, resource, epoch);
@@ -2478,7 +2478,7 @@ unsafe fn share_combine(s: &mut CryptState, resource: &[u8; 16], epoch: u32) -> 
     let mut i = 0;
     while i < 2 && h == abi::errno::EINPROGRESS {
         let at = 8 + i * sh::P256_LEN;
-        env.copy_from_slice(&s.bundle[at..at + sh::P256_LEN]);
+        env.copy_from_slice(&s.share_set[at..at + sh::P256_LEN]);
         let mut a = arg;
         h = (s.sys().provider_call)(
             s.recipient,
@@ -2497,8 +2497,8 @@ unsafe fn share_combine(s: &mut CryptState, resource: &[u8; 16], epoch: u32) -> 
     attach_finish(s, h)
 }
 
-/// On a device with no container: the master from the bundle, bound to the
-/// bundle's own volume and epoch, to be formatted.
+/// On a device with no container: the master from the share set, bound to the
+/// share set's own volume and epoch, to be formatted.
 unsafe fn attach_combine(s: &mut CryptState, newest: Option<Superblock>) -> i32 {
     use kv::share as sh;
     if newest.is_some() || s.format != 1 {
@@ -2506,8 +2506,8 @@ unsafe fn attach_combine(s: &mut CryptState, newest: Option<Superblock>) -> i32 
     }
     let env_a = 8;
     s.attach_resource
-        .copy_from_slice(&s.bundle[env_a + sh::RESOURCE..env_a + sh::RESOURCE + 16]);
-    s.attach_epoch = bundle_epoch(s);
+        .copy_from_slice(&s.share_set[env_a + sh::RESOURCE..env_a + sh::RESOURCE + 16]);
+    s.attach_epoch = share_set_epoch(s);
     let resource = s.attach_resource;
     let h = share_combine(s, &resource, s.attach_epoch);
     if h < 0 {
@@ -2517,12 +2517,12 @@ unsafe fn attach_combine(s: &mut CryptState, newest: Option<Superblock>) -> i32 
     0
 }
 
-/// Take a mount's bundle for the epoch it names: the superblock's own epoch
+/// Take a mount's share set for the epoch it names: the superblock's own epoch
 /// (the master that verifies it) or the other epoch a rotation holds. A
-/// bundle for any other epoch, or one already held, is refused `EAGAIN`:
+/// share set for any other epoch, or one already held, is refused `EAGAIN`:
 /// its recipient is destroyed, and the next attempt announces a fresh one.
 unsafe fn attach_take(s: &mut CryptState) -> i32 {
-    let epoch = bundle_epoch(s);
+    let epoch = share_set_epoch(s);
     let resource = s.attach_resource;
     if s.master < 0 && epoch == s.attach_epoch {
         let h = share_combine(s, &resource, epoch);
@@ -2559,10 +2559,10 @@ fn data_suite(s: &CryptState) -> u16 {
 /// master while prepared, the previous master and data key after that. In
 /// steady state, remove a previous master a crash left behind.
 ///
-/// Attached, the other master is the one reconstructed from its own bundle
+/// Attached, the other master is the one reconstructed from its own share set
 /// while mounting. When the verified superblock needs another epoch than
 /// the one gathered — or one when none was — the mount answers `EAGAIN` and
-/// goes back to wait for that epoch's bundle.
+/// goes back to wait for that epoch's share set.
 unsafe fn open_rotation_keys(s: &mut CryptState) -> i32 {
     if s.attach == 1 {
         if s.sb.rotation > ROT_RETIRING {
@@ -2674,9 +2674,9 @@ unsafe fn run_rot_prepare(s: &mut CryptState, f: &mut Frame) -> Act {
     Act::Done(f.rc)
 }
 
-/// Ask for the next epoch's bundle: a fresh recipient key, announced on
-/// `recipient`. The rotation then waits for the bundle; nothing is written.
-unsafe fn rot_ask_bundle(s: &mut CryptState) -> i32 {
+/// Ask for the next epoch's share set: a fresh recipient key, announced on
+/// `recipient`. The rotation then waits for the share set; nothing is written.
+unsafe fn rot_ask_share_set(s: &mut CryptState) -> i32 {
     let Some(next) = s.sb.epoch.checked_add(1) else {
         s.rot_want = 0;
         return E_INVAL;
@@ -2693,35 +2693,35 @@ unsafe fn rot_ask_bundle(s: &mut CryptState) -> i32 {
 
 /// An attached volume's rotation. The next epoch's master comes from its
 /// custodians: a `"FXRT"` record asks for it with a fresh recipient; its
-/// bundle, arriving on the control input, is reconstructed bound to the
+/// share set, arriving on the control input, is reconstructed bound to the
 /// volume and the next epoch, and the prepared superblock is committed.
-/// A bundle refused — not for the next epoch, this volume or the recipient
+/// A share set refused — not for the next epoch, this volume or the recipient
 /// — leaves the volume as it was, and a fresh recipient is announced for
-/// the bundle to come.
+/// the share set to come.
 unsafe fn rot_prepare_attached(s: &mut CryptState, f: &mut Frame) -> Act {
     if f.pc == 0 {
-        let is_bundle = s.bundle_ready != 0;
-        s.bundle_ready = 0;
-        if !is_bundle {
+        let is_share_set = s.share_set_ready != 0;
+        s.share_set_ready = 0;
+        if !is_share_set {
             if s.sb.rotation != ROT_STEADY || s.rot_want != 0 {
                 // Under way, or already asked: the recipient announced stands.
                 return Act::Done(0);
             }
-            return Act::Done(rot_ask_bundle(s));
+            return Act::Done(rot_ask_share_set(s));
         }
         if s.rot_want == 0 || s.sb.rotation != ROT_STEADY {
-            // No rotation waits for a bundle.
+            // No rotation waits for a share set.
             return Act::Done(attach_finish(s, E_INVAL));
         }
         let want = s.rot_want;
-        let h = if s.bundle[4] == 2 && bundle_epoch(s) == want {
+        let h = if s.share_set[4] == 2 && share_set_epoch(s) == want {
             let resource = s.sb.volume_id;
             share_combine(s, &resource, want)
         } else {
             attach_finish(s, E_ACCES)
         };
         if h < 0 {
-            let rc = rot_ask_bundle(s);
+            let rc = rot_ask_share_set(s);
             return Act::Done(if rc != 0 { rc } else { h });
         }
         s.rot_want = 0;
@@ -2734,11 +2734,11 @@ unsafe fn rot_prepare_attached(s: &mut CryptState, f: &mut Frame) -> Act {
     }
     if f.rc != 0 {
         // The master is not persisted: without the commit it is spent, and
-        // the next epoch's bundle is asked for again.
+        // the next epoch's share set is asked for again.
         s.sb = s.revert_sb;
         vault_destroy(s, s.other_master);
         s.other_master = -1;
-        rot_ask_bundle(s);
+        rot_ask_share_set(s);
     }
     Act::Done(f.rc)
 }
@@ -2990,7 +2990,7 @@ unsafe fn run_erase(s: &mut CryptState, f: &mut Frame) -> Act {
             s.other_data_key = -1;
             s.master = -1;
             s.other_master = -1;
-            // A rotation waiting for its bundle waits no more.
+            // A rotation waiting for its share set waits no more.
             attach_finish(s, 0);
             s.rot_want = 0;
             if s.attach == 0 {
@@ -3027,39 +3027,39 @@ unsafe fn run_erase(s: &mut CryptState, f: &mut Frame) -> Act {
 /// Read a record from the control input, if one has arrived, and start its
 /// work: the kind of background frame to run, 0 when there was nothing to
 /// do, or a negative errno for a record that is not one. Its magic says how
-/// long it is: a bundle (`"FXSB"`, attach mode) is `BUNDLE_LEN` bytes,
+/// long it is: a share set (`"FXSB"`, attach mode) is `BUNDLE_LEN` bytes,
 /// every control record `ROTATE_LEN`.
 unsafe fn poll_control(s: &mut CryptState) -> i32 {
     if s.ctrl_chan < 0 {
         return 0;
     }
     loop {
-        let have = s.bundle_len as usize;
+        let have = s.share_set_len as usize;
         let need = if have < 4 {
             4
-        } else if s.bundle[..4] == BUNDLE_MAGIC {
-            BUNDLE_LEN
+        } else if s.share_set[..4] == SHARE_SET_MAGIC {
+            SHARE_SET_LEN
         } else {
             ROTATE_LEN
         };
         if have >= need {
             break;
         }
-        let p = s.bundle.as_mut_ptr().add(have);
+        let p = s.share_set.as_mut_ptr().add(have);
         let n = (s.sys().channel_read)(s.ctrl_chan, p, need - have);
         if n <= 0 {
             return 0;
         }
-        s.bundle_len += n as u32;
+        s.share_set_len += n as u32;
     }
-    s.bundle_len = 0;
+    s.share_set_len = 0;
     let mut magic = [0u8; 4];
-    magic.copy_from_slice(&s.bundle[..4]);
-    if magic == BUNDLE_MAGIC && s.attach == 1 {
-        s.bundle_ready = 1;
+    magic.copy_from_slice(&s.share_set[..4]);
+    if magic == SHARE_SET_MAGIC && s.attach == 1 {
+        s.share_set_ready = 1;
         return i32::from(K_ROT_PREPARE);
     }
-    s.bundle.fill(0);
+    s.share_set.fill(0);
     if magic == ERASE_MAGIC {
         return i32::from(K_ERASE);
     }
@@ -3468,13 +3468,13 @@ fn status_record(s: &CryptState) -> Option<[u8; STATUS_LEN]> {
             if attach_wanting(s) {
                 // The superblock's own epoch first; then the other epoch a
                 // rotation under way needs. 0 on a blank device, whose
-                // epoch is the bundle's.
+                // epoch is the share set's.
                 awaited = if s.master < 0 {
                     s.attach_epoch
                 } else {
                     s.need_other
                 };
-                ST_AWAITING_BUNDLE
+                ST_AWAITING_SHARE_SET
             } else {
                 ST_OPENING
             }
@@ -3488,7 +3488,7 @@ fn status_record(s: &CryptState) -> Option<[u8; STATUS_LEN]> {
         err = s.bg_err;
         if s.rot_want != 0 {
             awaited = s.rot_want;
-            ST_AWAITING_BUNDLE
+            ST_AWAITING_SHARE_SET
         } else if s.sb.rotation != ROT_STEADY {
             ST_ROTATING
         } else {

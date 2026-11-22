@@ -1778,7 +1778,7 @@ const VC_CH_PROPERTY: u32 = 8;
 /// Status reads per wait before giving up. Device-memory reads are on the
 /// order of 100 ns, so this is roughly a tenth of a second — far past the
 /// ~100 µs a property call takes, and it runs on a lazy provider call
-/// (`TIER`/`DESCRIBE`), never on the boot path, so the worst case is one
+/// (`CUSTODY`/`DESCRIBE`), never on the boot path, so the worst case is one
 /// slow syscall that answers `false`.
 #[cfg(feature = "board-pi5")]
 const VC_MBOX_POLL_BOUND: u32 = 1_000_000;
@@ -1804,10 +1804,10 @@ static mut VC_MBOX_BUF: VcMboxBuf = VcMboxBuf([0; 32]);
 /// One caller at a time; the loser answers `false` (fail-safe) rather than
 /// sharing the buffer. Needed because provider syscalls execute on the
 /// calling core and this platform runs module domains on secondaries —
-/// two cores CAN be in `TIER` at once. `compare_exchange` with
+/// two cores CAN be in `CUSTODY` at once. `compare_exchange` with
 /// Acquire/Release so the winner's buffer writes are ordered against the
 /// flag; every exit path below releases it, because in a kernel with no
-/// RAII a leaked flag would be a permanent SOFTWARE tier until reboot.
+/// RAII a leaked flag would be a permanent SOFTWARE custody until reboot.
 #[cfg(feature = "board-pi5")]
 static VC_MBOX_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -1833,7 +1833,7 @@ unsafe fn vc_cache_civac(addr: usize, len: usize) {
 /// `true` means the firmware took our address and answered SOMETHING at it
 /// — whether it answered *successfully* is the parser's question, asked on
 /// the buffer afterwards. Every failure path answers `false`, which the
-/// caller turns into `SealProvenance::None`, which is the tier this part
+/// caller turns into `SealProvenance::None`, which is the custody this part
 /// reported before any of this existed.
 ///
 /// # Safety
@@ -1976,7 +1976,7 @@ fn boot_fail_stop() -> ! {
 
 /// This board's sealing provenance, memoized on SUCCESS only.
 ///
-/// `key_vault` asks on every `TIER` and every `DESCRIBE`, and each ask is a
+/// `key_vault` asks on every `CUSTODY` and every `DESCRIBE`, and each ask is a
 /// full cache-maintained mailbox round trip — plus, under concurrency, the
 /// busy-flag loser would transiently answer `None`, and a provenance
 /// check racing an unrelated `DESCRIBE` would refuse spuriously. A

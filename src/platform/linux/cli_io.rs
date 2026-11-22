@@ -1,6 +1,6 @@
-// cli_in / cli_out built-ins — the host stdio/argv/exit-code surface. Host
+// cli_in / cli_out native modules — the host stdio/argv/exit-code surface. Host
 // facts stay host-side: argv, stdin, stdout, stderr, and the process exit
-// code are owned by these built-ins; app modules remain pure channel-in/out.
+// code are owned by these native modules; app modules remain pure channel-in/out.
 //
 //   cli_in   args_out  (out 0)  one record: argv after `--`, NUL-separated
 //            stdin_out (out 1)  stdin bytes (worker thread → ExtBridge)
@@ -283,7 +283,7 @@ unsafe extern "C" fn cli_in_step(state: *mut u8) -> i32 {
     0
 }
 
-/// Construct a `cli_in` built-in: read this process's argv/stdin. The stdin
+/// Construct a `cli_in` native module: read this process's argv/stdin. The stdin
 /// pump thread is spawned only when `stdin_out` is wired.
 fn build_cli_in(module_idx: usize, _params: &[u8]) -> Result<Box<CliInState>, i32> {
     let args_out = scheduler::module_port(module_idx, cli_in_tags::PORT_ARGS_OUT);
@@ -327,7 +327,7 @@ fn build_cli_in(module_idx: usize, _params: &[u8]) -> Result<Box<CliInState>, i3
             args_retries: 0,
         });
     log::info!(
-        "[inst] module {module_idx} = cli_in (built-in) args_out={args_out} stdin_out={stdin_out}"
+        "[inst] module {module_idx} = cli_in (native) args_out={args_out} stdin_out={stdin_out}"
     );
     Ok(st)
 }
@@ -549,7 +549,7 @@ fn spawn_sink(fd: i32, gone: &'static core::sync::atomic::AtomicBool) -> CliSink
     }
 }
 
-/// Construct a `cli_out` built-in: own stdout/stderr and the exit-code latch.
+/// Construct a `cli_out` native module: own stdout/stderr and the exit-code latch.
 fn build_cli_out(module_idx: usize, _params: &[u8]) -> Result<Box<CliOutState>, i32> {
     let bytes_in = scheduler::module_port(module_idx, cli_out_tags::PORT_BYTES_IN);
     let err_in = scheduler::module_port(module_idx, cli_out_tags::PORT_ERR_IN);
@@ -567,7 +567,7 @@ fn build_cli_out(module_idx: usize, _params: &[u8]) -> Result<Box<CliOutState>, 
             exited: false,
         });
     log::info!(
-        "[inst] module {module_idx} = cli_out (built-in) bytes_in={bytes_in} err_in={err_in} exit_in={exit_in}"
+        "[inst] module {module_idx} = cli_out (native) bytes_in={bytes_in} err_in={err_in} exit_in={exit_in}"
     );
     Ok(st)
 }

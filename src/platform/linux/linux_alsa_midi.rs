@@ -1,4 +1,4 @@
-// linux_alsa_midi built-in — STUB.
+// linux_alsa_midi native module — STUB.
 //
 // Real implementation pending. When wired, this will open an ALSA
 // seq client (`snd_seq_open`), publish input and/or output ports
@@ -14,7 +14,7 @@
 //   client_name: str — name the ALSA seq client publishes as
 //
 // Stub behaviour:
-//   - registers in the built-in table so configs load cleanly,
+//   - registers in the native table so configs load cleanly,
 //   - logs a one-shot STUB marker on construction,
 //   - **drains** the input channel (`events_in`) every step so a
 //     producer wired to MIDI output / duplex doesn't backpressure
@@ -56,7 +56,7 @@ fn build_linux_alsa_midi(module_idx: usize, _params: &[u8]) -> Result<Box<LinuxA
     let events_in = scheduler::module_port(module_idx, alsa_midi_tags::PORT_EVENTS_IN);
     let st = Box::new(LinuxAlsaMidiState { events_in });
     log::warn!(
-        "[inst] module {module_idx} = linux_alsa_midi (built-in, STUB — ALSA seq integration not yet implemented; \
+        "[inst] module {module_idx} = linux_alsa_midi (native, STUB — ALSA seq integration not yet implemented; \
          events_in={events_in} drains to /dev/null)"
     );
     Ok(st)

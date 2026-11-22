@@ -254,7 +254,7 @@ fn build_linux_pointer(module_idx: usize, params: &[u8]) -> Result<Box<LinuxPoin
             rbuf: [0u8; EVDEV_EVENT_SIZE * 64],
             rbuf_len: 0,
         });
-    log::info!("[inst] module {module_idx} = linux_pointer (built-in) out_chan={out_chan}");
+    log::info!("[inst] module {module_idx} = linux_pointer (native) out_chan={out_chan}");
     Ok(st)
 }
 

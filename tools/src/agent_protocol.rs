@@ -52,13 +52,13 @@ pub enum Peer {
 #[derive(Clone, Debug)]
 pub struct AgentContext {
     /// The node's key fingerprint.
-    pub target_id: [u8; 32],
+    pub node_id: [u8; 32],
     /// Key fingerprints of the controllers of this node.
     pub controllers: Vec<[u8; 32]>,
     /// The node descriptor; its sha256 is the descriptor revision.
     pub descriptor: PathBuf,
     /// Holds `<package digest hex>/{workload.json,resources.json,graph.yaml}`.
-    pub bundles: PathBuf,
+    pub packages: PathBuf,
     /// Where the committed plan is published for the runtime.
     pub publish: PathBuf,
     /// The limits admission checks against.
@@ -71,31 +71,31 @@ pub struct AgentContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reply {
     pub result: u8,
-    pub target_id: [u8; 32],
-    pub workload_uid: [u8; 16],
+    pub node_id: [u8; 32],
+    pub owner_uid: [u8; 16],
     pub descriptor_revision: [u8; 32],
     pub idempotency_id: [u8; 16],
     pub fence_epoch: u64,
     pub fence_seq: u64,
     pub observed_activation_digest: [u8; 32],
-    pub desired_bundle_digest: [u8; 32],
+    pub desired_package_digest: [u8; 32],
     pub phase: u8,
     pub generation: u64,
     pub diag: Vec<u8>,
 }
 
 impl Reply {
-    fn new(target_id: [u8; 32]) -> Self {
+    fn new(node_id: [u8; 32]) -> Self {
         Reply {
             result: result::OK,
-            target_id,
-            workload_uid: [0; 16],
+            node_id,
+            owner_uid: [0; 16],
             descriptor_revision: [0; 32],
             idempotency_id: [0; 16],
             fence_epoch: 0,
             fence_seq: 0,
             observed_activation_digest: [0; 32],
-            desired_bundle_digest: [0; 32],
+            desired_package_digest: [0; 32],
             phase: phase::ABSENT,
             generation: 0,
             diag: Vec::new(),
@@ -120,14 +120,14 @@ impl Reply {
     fn as_response(&self) -> Response<'_> {
         Response {
             result: self.result,
-            target_id: self.target_id,
-            workload_uid: self.workload_uid,
+            node_id: self.node_id,
+            owner_uid: self.owner_uid,
             descriptor_revision: self.descriptor_revision,
             idempotency_id: self.idempotency_id,
             fence_epoch: self.fence_epoch,
             fence_seq: self.fence_seq,
             observed_activation_digest: self.observed_activation_digest,
-            desired_bundle_digest: self.desired_bundle_digest,
+            desired_package_digest: self.desired_package_digest,
             phase: self.phase,
             generation: self.generation,
             diag: &self.diag,
@@ -139,14 +139,14 @@ impl Reply {
         let r = Response::decode(record)?;
         Ok(Reply {
             result: r.result,
-            target_id: r.target_id,
-            workload_uid: r.workload_uid,
+            node_id: r.node_id,
+            owner_uid: r.owner_uid,
             descriptor_revision: r.descriptor_revision,
             idempotency_id: r.idempotency_id,
             fence_epoch: r.fence_epoch,
             fence_seq: r.fence_seq,
             observed_activation_digest: r.observed_activation_digest,
-            desired_bundle_digest: r.desired_bundle_digest,
+            desired_package_digest: r.desired_package_digest,
             phase: r.phase,
             generation: r.generation,
             diag: r.diag.to_vec(),
@@ -158,15 +158,15 @@ impl Reply {
     pub fn to_json(&self, verified_peer: Option<&[u8; 32]>) -> serde_json::Value {
         serde_json::json!({
             "result": result_name(self.result),
-            "target_id": hex(&self.target_id),
+            "node_id": hex(&self.node_id),
             "verified_peer": verified_peer.map(|p| hex(p)),
-            "workload_uid": hex(&self.workload_uid),
+            "owner_uid": hex(&self.owner_uid),
             "descriptor_revision": hex(&self.descriptor_revision),
             "idempotency_id": hex(&self.idempotency_id),
             "fence_epoch": self.fence_epoch,
             "fence_seq": self.fence_seq,
             "observed_activation_digest": hex(&self.observed_activation_digest),
-            "desired_bundle_digest": hex(&self.desired_bundle_digest),
+            "desired_package_digest": hex(&self.desired_package_digest),
             "phase": phase_name(self.phase),
             "generation": self.generation,
             "diag": String::from_utf8_lossy(&self.diag),
@@ -193,7 +193,7 @@ pub fn result_name(r: u8) -> &'static str {
         result::REFUSED_UNAUTHORIZED => "REFUSED_UNAUTHORIZED",
         result::REFUSED_DESCRIPTOR => "REFUSED_DESCRIPTOR",
         result::REFUSED_CONFLICT => "REFUSED_CONFLICT",
-        result::BUNDLE_MISSING => "BUNDLE_MISSING",
+        result::PACKAGE_MISSING => "PACKAGE_MISSING",
         result::REFUSED_ADMISSION => "REFUSED_ADMISSION",
         result::BAD_REQUEST => "BAD_REQUEST",
         result::FAULT => "FAULT",
@@ -246,12 +246,12 @@ pub fn descriptor_revision(path: &Path) -> io::Result<[u8; 32]> {
 /// The activation digest of a workload, over what a live runtime reported:
 ///
 /// ```text
-/// sha256("fluxor.agent.activation\0" || workload_uid || workload_digest
+/// sha256("fluxor.agent.activation\0" || owner_uid || workload_digest
 ///        || applied_plan_digest || slot:u16 LE || owner_generation:u32 LE)
 /// ```
 #[must_use]
 pub fn activation_digest(
-    workload_uid: &[u8; 16],
+    owner_uid: &[u8; 16],
     workload_digest: &[u8; 32],
     applied_plan_digest: &[u8; 32],
     slot: u16,
@@ -259,7 +259,7 @@ pub fn activation_digest(
 ) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(ACTIVATION_DOMAIN);
-    h.update(workload_uid);
+    h.update(owner_uid);
     h.update(workload_digest);
     h.update(applied_plan_digest);
     h.update(slot.to_le_bytes());
@@ -273,7 +273,7 @@ pub fn activation_digest(
 /// be. `response` is absent while the commit's outcome is unrecorded.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct IdempotencyRecord {
-    workload_uid: String,
+    owner_uid: String,
     idempotency_id: String,
     request_digest: String,
     generation: u64,
@@ -283,7 +283,7 @@ struct IdempotencyRecord {
 
 impl IdempotencyRecord {
     fn is_for(&self, uid: &[u8; 16], id: &[u8; 16]) -> bool {
-        self.workload_uid == hex(uid) && self.idempotency_id == hex(id)
+        self.owner_uid == hex(uid) && self.idempotency_id == hex(id)
     }
 }
 
@@ -333,9 +333,7 @@ fn load_records<S: Storage>(store: &GenStore<S>) -> Result<Vec<IdempotencyRecord
 /// newest [`IDEMPOTENCY_MAX`].
 fn save_record<S: Storage>(store: &mut GenStore<S>, rec: IdempotencyRecord) -> Result<(), String> {
     let mut records = load_records(store)?;
-    records.retain(|r| {
-        !(r.workload_uid == rec.workload_uid && r.idempotency_id == rec.idempotency_id)
-    });
+    records.retain(|r| !(r.owner_uid == rec.owner_uid && r.idempotency_id == rec.idempotency_id));
     records.push(rec);
     if records.len() > IDEMPOTENCY_MAX {
         let excess = records.len() - IDEMPOTENCY_MAX;
@@ -372,10 +370,10 @@ pub fn handle<S: Storage>(
     ctx: &AgentContext,
     store: &mut GenStore<S>,
 ) -> Reply {
-    let mut reply = Reply::new(ctx.target_id);
+    let mut reply = Reply::new(ctx.node_id);
     let decoded = Request::decode(record);
     if let Ok(req) = &decoded {
-        reply.workload_uid = req.workload_uid;
+        reply.owner_uid = req.owner_uid;
         reply.idempotency_id = req.idempotency_id;
     }
     // Before anything is read: a peer that is not a controller learns only the
@@ -446,7 +444,7 @@ fn answer<S: Storage>(
 
     match req.op {
         op::OBSERVE => {
-            observe(req.workload_uid, store, &mut reply)?;
+            observe(req.owner_uid, store, &mut reply)?;
             Ok(reply)
         }
         op::APPLY | op::REMOVE => mutate(req, ctx, store, reply, &revision),
@@ -462,14 +460,14 @@ fn mutate<S: Storage>(
     mut reply: Reply,
     revision: &[u8; 32],
 ) -> Result<Reply, String> {
-    if req.workload_uid == [0; 16] {
-        return Ok(reply.with_diag(result::BAD_REQUEST, "workload_uid is zero"));
+    if req.owner_uid == [0; 16] {
+        return Ok(reply.with_diag(result::BAD_REQUEST, "owner_uid is zero"));
     }
     if req.idempotency_id == [0; 16] {
         return Ok(reply.with_diag(result::BAD_REQUEST, "idempotency_id is zero"));
     }
-    if req.op == op::APPLY && req.desired_bundle_digest == [0; 32] {
-        return Ok(reply.with_diag(result::BAD_REQUEST, "desired_bundle_digest is zero"));
+    if req.op == op::APPLY && req.desired_package_digest == [0; 32] {
+        return Ok(reply.with_diag(result::BAD_REQUEST, "desired_package_digest is zero"));
     }
 
     // Before the descriptor is looked at: a request already done is answered
@@ -480,7 +478,7 @@ fn mutate<S: Storage>(
     let records = load_records(store)?;
     let existing = records
         .iter()
-        .find(|r| r.is_for(&req.workload_uid, &req.idempotency_id));
+        .find(|r| r.is_for(&req.owner_uid, &req.idempotency_id));
     let mut already_committed = false;
     if let Some(rec) = existing {
         if rec.request_digest != request_digest {
@@ -513,15 +511,15 @@ fn mutate<S: Storage>(
             match admit(req, ctx) {
                 Ok(w) => Some(w),
                 Err(refusal) => {
-                    observe(req.workload_uid, store, &mut reply)?;
+                    observe(req.owner_uid, store, &mut reply)?;
                     return Ok(reply.with_diag(refusal.0, refusal.1));
                 }
             }
         } else {
-            if !present(store, &req.workload_uid)? {
+            if !present(store, &req.owner_uid)? {
                 // Already gone: nothing to commit, and no generation to rebuild
                 // the other workloads for.
-                observe(req.workload_uid, store, &mut reply)?;
+                observe(req.owner_uid, store, &mut reply)?;
                 return Ok(reply);
             }
             None
@@ -531,7 +529,7 @@ fn mutate<S: Storage>(
         save_record(
             store,
             IdempotencyRecord {
-                workload_uid: hex(&req.workload_uid),
+                owner_uid: hex(&req.owner_uid),
                 idempotency_id: hex(&req.idempotency_id),
                 request_digest: request_digest.clone(),
                 generation: next,
@@ -541,14 +539,14 @@ fn mutate<S: Storage>(
         let outcome = match workload {
             Some(w) => upsert_workload_and_commit(store, w, &ctx.capacity),
             None => {
-                remove_workload_and_commit(store, req.workload_uid, ctx.remove_grace, &ctx.capacity)
+                remove_workload_and_commit(store, req.owner_uid, ctx.remove_grace, &ctx.capacity)
             }
         };
         match outcome {
             Ok(_) => {}
             Err(AgentError::Compose(e)) => {
-                forget_record(store, &req.workload_uid, &req.idempotency_id)?;
-                observe(req.workload_uid, store, &mut reply)?;
+                forget_record(store, &req.owner_uid, &req.idempotency_id)?;
+                observe(req.owner_uid, store, &mut reply)?;
                 return Ok(reply.with_diag(result::REFUSED_ADMISSION, format!("{e:?}")));
             }
             Err(AgentError::Store(e)) => return Err(store_fault(e)),
@@ -558,12 +556,12 @@ fn mutate<S: Storage>(
     publish_committed_plan(store, &ctx.publish)
         .map_err(|e| format!("publish {}: {e}", ctx.publish.display()))?;
     record_publish_path(store, &ctx.publish).map_err(store_fault)?;
-    observe(req.workload_uid, store, &mut reply)?;
+    observe(req.owner_uid, store, &mut reply)?;
     let generation = reply.generation;
     save_record(
         store,
         IdempotencyRecord {
-            workload_uid: hex(&req.workload_uid),
+            owner_uid: hex(&req.owner_uid),
             idempotency_id: hex(&req.idempotency_id),
             request_digest,
             generation,
@@ -588,9 +586,9 @@ fn store_fault(e: StoreError) -> String {
 /// Does the desired set already say what `req` asks?
 fn desired_is<S: Storage>(store: &GenStore<S>, req: &Request) -> Result<bool, String> {
     let desired = load_desired(store).map_err(store_fault)?;
-    let row = desired.iter().find(|w| w.workload_uid == req.workload_uid);
+    let row = desired.iter().find(|w| w.owner_uid == req.owner_uid);
     Ok(if req.op == op::APPLY {
-        row.is_some_and(|w| w.workload_digest == req.desired_bundle_digest)
+        row.is_some_and(|w| w.workload_digest == req.desired_package_digest)
     } else {
         row.is_none()
     })
@@ -599,38 +597,38 @@ fn desired_is<S: Storage>(store: &GenStore<S>, req: &Request) -> Result<bool, St
 /// Is the workload in the desired set or the committed plan?
 fn present<S: Storage>(store: &GenStore<S>, uid: &[u8; 16]) -> Result<bool, String> {
     let desired = load_desired(store).map_err(store_fault)?;
-    if desired.iter().any(|w| w.workload_uid == *uid) {
+    if desired.iter().any(|w| w.owner_uid == *uid) {
         return Ok(true);
     }
     Ok(load_committed_plan(store)
-        .is_some_and(|p| p.assignments.iter().any(|a| a.workload_uid == *uid)))
+        .is_some_and(|p| p.assignments.iter().any(|a| a.owner_uid == *uid)))
 }
 
 /// Resolve the desired workload package by digest and put it through admission: the
 /// workload to commit, or the result and diagnostic that refuse it.
 fn admit(req: &Request, ctx: &AgentContext) -> Result<WorkloadDesired, (u8, String)> {
-    let dir = ctx.bundles.join(hex(&req.desired_bundle_digest));
+    let dir = ctx.packages.join(hex(&req.desired_package_digest));
     let manifest = match std::fs::read(dir.join("workload.json")) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err((
-                result::BUNDLE_MISSING,
-                format!("no bundle at {}", dir.display()),
+                result::PACKAGE_MISSING,
+                format!("no package at {}", dir.display()),
             ));
         }
         Err(e) => {
             return Err((
                 result::REFUSED_ADMISSION,
-                format!("bundle {}: workload.json: {e}", dir.display()),
+                format!("package {}: workload.json: {e}", dir.display()),
             ));
         }
     };
     let actual = sha256(&manifest);
-    if actual != req.desired_bundle_digest {
+    if actual != req.desired_package_digest {
         return Err((
             result::REFUSED_ADMISSION,
             format!(
-                "bundle {}: workload.json hashes to {}",
+                "package {}: workload.json hashes to {}",
                 dir.display(),
                 hex(&actual)
             ),
@@ -638,7 +636,7 @@ fn admit(req: &Request, ctx: &AgentContext) -> Result<WorkloadDesired, (u8, Stri
     }
     let package = resolve_package(&dir).map_err(|d| (result::REFUSED_ADMISSION, d))?;
     Ok(WorkloadDesired {
-        workload_uid: req.workload_uid,
+        owner_uid: req.owner_uid,
         namespace: "default".to_string(),
         name: package.name,
         workload_digest: package.workload_digest,
@@ -661,16 +659,13 @@ fn observe<S: Storage>(
     let desired = load_desired(store).map_err(store_fault)?;
     let workload_digest = desired
         .iter()
-        .find(|w| w.workload_uid == uid)
+        .find(|w| w.owner_uid == uid)
         .map(|w| w.workload_digest);
     let uid_hex = hex(&uid);
-    let row = status
-        .workloads
-        .iter()
-        .find(|w| w.workload_uid_hex == uid_hex);
+    let row = status.workloads.iter().find(|w| w.owner_uid_hex == uid_hex);
 
     reply.generation = status.generation.unwrap_or(0);
-    reply.desired_bundle_digest = workload_digest.unwrap_or([0; 32]);
+    reply.desired_package_digest = workload_digest.unwrap_or([0; 32]);
     reply.phase = row.map_or(phase::ABSENT, phase_of);
     reply.observed_activation_digest = [0; 32];
 
@@ -759,7 +754,7 @@ pub fn handle_in_dir(record: &[u8], peer: Peer, ctx: &AgentContext, store_dir: &
         .and_then(|lock| FsStorage::open(store_dir).map(|storage| (lock, storage)));
     match opened {
         Ok((_lock, storage)) => handle(record, peer, ctx, &mut GenStore::new(storage)),
-        Err(e) => Reply::new(ctx.target_id).with_diag(result::FAULT, format!("open store: {e}")),
+        Err(e) => Reply::new(ctx.node_id).with_diag(result::FAULT, format!("open store: {e}")),
     }
 }
 
@@ -845,7 +840,7 @@ pub fn serve_stream(
             Frame::Record(fp, record) => (fp, handle_in_dir(&record, peer_of(fp), ctx, store_dir)),
             Frame::Oversize(fp) => (
                 fp,
-                Reply::new(ctx.target_id)
+                Reply::new(ctx.node_id)
                     .with_diag(result::BAD_REQUEST, "record over the protocol's maximum"),
             ),
         };
@@ -929,7 +924,7 @@ impl std::fmt::Display for CallError {
 }
 
 /// Take a controller's answer from one received frame. The response is used
-/// only if it answers `req` and its `target_id` is the identity that matters:
+/// only if it answers `req` and its `node_id` is the identity that matters:
 /// the fingerprint the transport stamped on the frame when the transport
 /// `verified` one, and `expected`, the identity the controller was told to reach.
 pub fn accept_response(
@@ -940,23 +935,23 @@ pub fn accept_response(
     expected: Option<&[u8; 32]>,
 ) -> Result<Reply, CallError> {
     let reply = Reply::decode(record).map_err(|e| CallError::Malformed(format!("{e:?}")))?;
-    if verified && reply.target_id != *stamped {
+    if verified && reply.node_id != *stamped {
         return Err(CallError::NodeMismatch {
-            stated: reply.target_id,
+            stated: reply.node_id,
             verified: *stamped,
         });
     }
     if let Some(want) = expected {
-        if reply.target_id != *want {
+        if reply.node_id != *want {
             return Err(CallError::NodeMismatch {
-                stated: reply.target_id,
+                stated: reply.node_id,
                 verified: *want,
             });
         }
     }
     // A malformed request cannot be echoed, so a BAD_REQUEST names none.
     if reply.result != result::BAD_REQUEST
-        && (reply.workload_uid != req.workload_uid || reply.idempotency_id != req.idempotency_id)
+        && (reply.owner_uid != req.owner_uid || reply.idempotency_id != req.idempotency_id)
     {
         return Err(CallError::WrongRequest);
     }
@@ -971,8 +966,8 @@ mod tests {
         Request {
             op: op::APPLY,
             flags: 0,
-            workload_uid: [1; 16],
-            desired_bundle_digest: [2; 32],
+            owner_uid: [1; 16],
+            desired_package_digest: [2; 32],
             descriptor_revision: [3; 32],
             idempotency_id: [4; 16],
             fence_epoch: 5,
@@ -983,14 +978,14 @@ mod tests {
     fn response(diag: &[u8]) -> Response<'_> {
         Response {
             result: result::OK,
-            target_id: [1; 32],
-            workload_uid: [2; 16],
+            node_id: [1; 32],
+            owner_uid: [2; 16],
             descriptor_revision: [3; 32],
             idempotency_id: [4; 16],
             fence_epoch: 5,
             fence_seq: 6,
             observed_activation_digest: [7; 32],
-            desired_bundle_digest: [8; 32],
+            desired_package_digest: [8; 32],
             phase: phase::RUNNING,
             generation: 9,
             diag,

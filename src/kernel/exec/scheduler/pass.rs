@@ -210,7 +210,7 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
                 sched.pass_module_steps[i] = 0;
             }
         }
-        // ── 4. Pre-tick slot, once ───────────────────────────────────────
+        // ── 4. Pre-pass, once ───────────────────────────────────────────
         let ds = &sched.domains[domain];
         ds.pacer_work.store(false, Ordering::Relaxed);
         ds.pacer_burst.store(false, Ordering::Relaxed);
@@ -268,7 +268,7 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
         }
         let mut woken = crate::kernel::ipc::event::take_wake_in_mask(&e.mask);
         let wake = !woken.is_empty();
-        let is_system = e.slot == 0;
+        let is_node_graph = e.slot == 0;
 
         // The graph's periodic modules: any due now, and the soonest not.
         let mut any_due = false;
@@ -285,10 +285,10 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
 
         let prior_runnable = graph_pacer_runnable(e.slot, e.generation, domain as u8);
         let must_tick = e.mask.intersects(&cx.must_tick);
-        let backstop_due = !is_system
+        let backstop_due = !is_node_graph
             && !e.idle_safe
             && (e.backstop_next_due_us == 0 || now >= e.backstop_next_due_us);
-        let base_runnable = is_system
+        let base_runnable = is_node_graph
             || !idle_skip
             || !e.primed
             || prior_runnable
@@ -313,7 +313,7 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
         let mut backstop = e.backstop_next_due_us;
         let (mut work, burst, last_burst) = if runnable {
             let r = step_graph(modules, sched, &mut cx, &e, domain, &woken, false);
-            if !is_system && !e.idle_safe {
+            if !is_node_graph && !e.idle_safe {
                 backstop = now.wrapping_add(u64::from(bounds.tick_max_us));
             }
             mark_graph_stepped(gi, backstop);
@@ -349,7 +349,7 @@ pub fn run(domain: usize, kind: PassKind<'_>) -> PassResult {
         if must_tick {
             merge.runnable(bounds.nominal_us);
         }
-        if !is_system && !e.idle_safe {
+        if !is_node_graph && !e.idle_safe {
             merge.runnable(
                 backstop
                     .saturating_sub(now)
@@ -625,14 +625,14 @@ pub fn domain_budget_overruns(domain_id: usize) -> u32 {
     unsafe { (*core::ptr::addr_of!(SCHED)).domains.get(domain_id) }.map_or(0, |d| d.budget_overruns)
 }
 
-/// Pre-tick budget overruns of `domain_id` since boot.
+/// Pre-pass budget overruns of `domain_id` since boot.
 pub fn domain_pre_pass_overruns(domain_id: usize) -> u32 {
     // SAFETY: scheduler-thread read.
     unsafe { (*core::ptr::addr_of!(SCHED)).domains.get(domain_id) }
         .map_or(0, |d| d.pre_pass_overruns)
 }
 
-/// Pre-tick modules assigned to `domain_id`.
+/// Pre-pass modules assigned to `domain_id`.
 pub fn domain_pre_pass_count(domain_id: usize) -> usize {
     // SAFETY: scheduler-thread read.
     unsafe { (*core::ptr::addr_of!(SCHED)).domains.get(domain_id) }

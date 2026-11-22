@@ -1484,12 +1484,12 @@ pub fn grant_names(grants: [u64; 2]) -> Vec<&'static str> {
     out
 }
 
-/// Lowest tag a built-in `[[params]]` entry may claim. Tags below this
+/// Lowest tag a native module `[[params]]` entry may claim. Tags below this
 /// belong to the TLV framing and to fixed low-numbered fields, so a
 /// parameter must not occupy them.
 pub const PARAM_TAG_MIN: u8 = 10;
 
-/// Highest tag a built-in `[[params]]` entry may claim. 0xED..=0xFF are
+/// Highest tag a native module `[[params]]` entry may claim. 0xED..=0xFF are
 /// reserved for kernel, protection and policy metadata (0xED a workload's
 /// env bind record, 0xEE raw arena use, 0xEF the instance's heap cap, 0xFD
 /// voice-preset blobs, 0xFE TLV magic, 0xFF terminator among them).
@@ -1506,13 +1506,13 @@ pub enum ManifestParamType {
     Enum,
 }
 
-/// A single `[[params]]` entry from a built-in's `manifest.toml`.
+/// A single `[[params]]` entry from a native module's `manifest.toml`.
 /// Defaults are stored as 32-bit unsigned integers when numeric, or as
 /// a string for `str`/`enum`.
 #[derive(Debug, Clone)]
 pub struct ManifestParam {
     /// TLV tag — declared explicitly by the manifest (`tag = N`) and
-    /// permanent once a built-in ships. The tag, not the declaration
+    /// permanent once a native module ships. The tag, not the declaration
     /// position, is the wire identity of the parameter, so entries may
     /// be reordered or inserted without changing any encoding.
     /// Legal range is [`PARAM_TAG_MIN`]..=[`PARAM_TAG_MAX`]; tags below
@@ -1920,8 +1920,8 @@ pub struct Manifest {
     /// where the default builds for speed is the alternative to making every
     /// module slower, or to leaving the one that is nearly over with no room.
     pub opt_level: Option<String>,
-    /// Built-in parameter declarations from `[[params]]` (toml-only).
-    /// `.fmod` modules carry their schema embedded in the binary; built-ins
+    /// Native parameter declarations from `[[params]]` (toml-only).
+    /// `.fmod` modules carry their schema embedded in the binary; native modules
     /// declare it here so the config tool can validate YAML and pack TLV.
     pub params: Vec<ManifestParam>,
     /// How the module's timekeeping relates to the scheduler tick. Default
@@ -2027,7 +2027,7 @@ pub struct InstrumentDecl {
     /// (16 buckets, the last implicit `+Inf`). Empty for scalar kinds.
     pub bounds_us: Vec<u64>,
     /// Declared dimension keys, in composite-index order: `dim_id =
-    /// ((i0·s1)+i1)·s2+…` over the domain sizes.
+    /// ((i0·s1)+i1)·s2+…` over the range sizes.
     pub dimensions: Vec<DimensionDecl>,
 }
 
@@ -2068,11 +2068,11 @@ pub struct DimensionDecl {
     /// Attribute key — OTel semconv or `fluxor.*` (vocabulary enforced by
     /// `fluxor lint observability`).
     pub key: String,
-    pub domain: DimDomain,
+    pub kind: DimKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DimDomain {
+pub enum DimKind {
     /// Values `0..max` pass through as the component index.
     Numeric { max: u32 },
     /// Declared value set; the component index is the declared position. A
@@ -2080,11 +2080,11 @@ pub enum DimDomain {
     Enum { values: Vec<String> },
 }
 
-impl DimDomain {
+impl DimKind {
     pub fn size(&self) -> u32 {
         match self {
-            DimDomain::Numeric { max } => *max,
-            DimDomain::Enum { values } => values.len() as u32,
+            DimKind::Numeric { max } => *max,
+            DimKind::Enum { values } => values.len() as u32,
         }
     }
 }
@@ -2095,7 +2095,7 @@ impl DimDomain {
 pub const DIM_MAX_PRODUCT: u32 = 65534;
 
 /// Convert one TOML instrument row into the typed declaration, rejecting
-/// unknown kinds/domains and domain/field mismatches at parse.
+/// unknown kinds and kind/field mismatches at parse.
 fn convert_instrument(t: TomlInstrument) -> Result<InstrumentDecl> {
     let ctx = |msg: String| Error::Module(format!("observability instrument '{}': {msg}", t.name));
     let kind = match t.kind.as_str() {
@@ -2111,18 +2111,18 @@ fn convert_instrument(t: TomlInstrument) -> Result<InstrumentDecl> {
     };
     let mut dimensions = Vec::new();
     for d in t.dimension.unwrap_or_default() {
-        let domain = match d.domain.as_str() {
+        let dim_kind = match d.kind.as_str() {
             "numeric" => {
                 if d.values.is_some() {
                     return Err(ctx(format!(
-                        "dimension '{}': `values` belongs to domain = \"enum\"",
+                        "dimension '{}': `values` belongs to kind = \"enum\"",
                         d.key
                     )));
                 }
-                DimDomain::Numeric {
+                DimKind::Numeric {
                     max: d.max.ok_or_else(|| {
                         ctx(format!(
-                            "dimension '{}': numeric domain requires `max`",
+                            "dimension '{}': numeric kind requires `max`",
                             d.key
                         ))
                     })?,
@@ -2131,14 +2131,14 @@ fn convert_instrument(t: TomlInstrument) -> Result<InstrumentDecl> {
             "enum" => {
                 if d.max.is_some() {
                     return Err(ctx(format!(
-                        "dimension '{}': `max` belongs to domain = \"numeric\"",
+                        "dimension '{}': `max` belongs to kind = \"numeric\"",
                         d.key
                     )));
                 }
-                DimDomain::Enum {
+                DimKind::Enum {
                     values: d.values.ok_or_else(|| {
                         ctx(format!(
-                            "dimension '{}': enum domain requires `values`",
+                            "dimension '{}': enum kind requires `values`",
                             d.key
                         ))
                     })?,
@@ -2146,12 +2146,15 @@ fn convert_instrument(t: TomlInstrument) -> Result<InstrumentDecl> {
             }
             other => {
                 return Err(ctx(format!(
-                    "dimension '{}': unknown domain '{other}' (numeric | enum)",
+                    "dimension '{}': unknown kind '{other}' (numeric | enum)",
                     d.key
                 )))
             }
         };
-        dimensions.push(DimensionDecl { key: d.key, domain });
+        dimensions.push(DimensionDecl {
+            key: d.key,
+            kind: dim_kind,
+        });
     }
     Ok(InstrumentDecl {
         name: t.name,
@@ -2194,25 +2197,25 @@ fn validate_instruments(obs: &Observability) -> Result<()> {
         }
         let mut product: u64 = 1;
         for d in &inst.dimensions {
-            let sz = d.domain.size();
+            let sz = d.kind.size();
             if sz == 0 {
-                return Err(ctx(format!("dimension '{}' has an empty domain", d.key)));
+                return Err(ctx(format!("dimension '{}' has an empty range", d.key)));
             }
-            match &d.domain {
-                DimDomain::Enum { values } => {
+            match &d.kind {
+                DimKind::Enum { values } => {
                     let mut vs: Vec<&str> = values.iter().map(String::as_str).collect();
                     vs.sort_unstable();
                     if vs.windows(2).any(|w| w[0] == w[1]) {
                         return Err(ctx(format!("dimension '{}' repeats a value", d.key)));
                     }
                 }
-                DimDomain::Numeric { .. } => {}
+                DimKind::Numeric { .. } => {}
             }
             product = product.saturating_mul(sz as u64);
         }
         if product > DIM_MAX_PRODUCT as u64 {
             return Err(ctx(format!(
-                "declared dimension domains multiply to {product} series, over the                  {DIM_MAX_PRODUCT} the composite u16 index can carry;                  shrink a domain — cardinality is a declared resource bound"
+                "declared dimension ranges multiply to {product} series, over the                  {DIM_MAX_PRODUCT} the composite u16 index can carry;                  shrink a range — cardinality is a declared resource bound"
             )));
         }
     }
@@ -2486,7 +2489,7 @@ impl Manifest {
     /// invocation, including negative lookups.
     ///
     /// Search paths are the layer list (`MODULE_LAYERS`), covering both
-    /// PIC modules and kernel-resident built-ins (under
+    /// PIC modules and native modules (under
     /// `modules/platform/<platform>/<name>/`). See
     /// `docs/architecture/abi_layers.md` for what each tree is for.
     pub fn from_source_tree(module_type: &str) -> Result<Option<Self>> {
@@ -2509,7 +2512,7 @@ impl Manifest {
         //      `$FLUXOR_PROJECT_ROOT` override).
         //   2. Install root (`$FLUXOR_INSTALL_ROOT` or exe-prefix
         //      derivation). Downstream consumers point this at a
-        //      sibling fluxor checkout so builtin modules resolve
+        //      sibling fluxor checkout so native modules resolve
         //      without requiring a fully-synced registry.
         //   3. Bare CWD as the final fallback so existing call sites
         //      that ran from fluxor's repo root continue to work.
@@ -2969,15 +2972,15 @@ impl Manifest {
         let builtin = toml_val.builtin.unwrap_or(false);
 
         let raw_params = toml_val.params.unwrap_or_default();
-        // `[[params]]` belongs to built-ins. PIC (`.fmod`) modules carry
+        // `[[params]]` belongs to native modules. PIC (`.fmod`) modules carry
         // their schema in the binary via the `define_params!` macro;
         // declaring it again in the manifest would create two sources
         // of truth for the same wire layout.
         if !builtin && !raw_params.is_empty() {
             return Err(Error::Module(format!(
-                "[[params]] is only valid on built-in modules (`builtin = true`). \
+                "[[params]] is only valid on native modules (`builtin = true`). \
                  PIC modules embed their schema via `define_params!`. \
-                 Got {} param(s) on a non-builtin manifest.",
+                 Got {} param(s) on a non-native manifest.",
                 raw_params.len(),
             )));
         }
@@ -2989,7 +2992,7 @@ impl Manifest {
             // inserting an entry must not re-point a shipped encoding.
             let tag = p.tag.ok_or_else(|| {
                 Error::Module(format!(
-                    "param '{}': missing `tag = N`. Built-in parameter tags \
+                    "param '{}': missing `tag = N`. Native parameter tags \
                      are explicit and permanent — pick an unused value in \
                      {PARAM_TAG_MIN}..={PARAM_TAG_MAX} and never reuse a \
                      retired one.",
@@ -3008,7 +3011,7 @@ impl Manifest {
             if let Some(prev) = params.iter().find(|q: &&ManifestParam| q.tag == tag) {
                 return Err(Error::Module(format!(
                     "param '{}': tag {tag} is already claimed by param '{}'. \
-                     Each built-in parameter needs its own tag — two entries \
+                     Each native parameter needs its own tag — two entries \
                      sharing one tag collide on the wire.",
                     p.name, prev.name,
                 )));
@@ -4130,10 +4133,10 @@ struct TomlInstrument {
 #[serde(deny_unknown_fields)]
 struct TomlDimension {
     key: String,
-    domain: String,
-    /// `domain = "numeric"`: values are 0..max.
+    kind: String,
+    /// `kind = "numeric"`: values are 0..max.
     max: Option<u32>,
-    /// `domain = "enum"`: the declared value set, index = declared position.
+    /// `kind = "enum"`: the declared value set, index = declared position.
     values: Option<Vec<String>>,
 }
 
@@ -4210,7 +4213,7 @@ struct TomlManifest {
     /// `[[requires_when]]` — a target-provided capability this module needs
     /// only under one of its own parameter values. See `RequiresWhen`.
     requires_when: Option<Vec<TomlRequiresWhen>>,
-    /// `[[params]]` declarations — built-in modules only. PIC modules
+    /// `[[params]]` declarations — native modules only. PIC modules
     /// embed schema in their .fmod and these are ignored.
     params: Option<Vec<TomlParam>>,
     /// `timer_class = "agnostic"|"wall_clock"|"tick_counted"|"guaranteed"` —
@@ -4567,7 +4570,7 @@ pub fn check_target_capabilities(manifest_requires: TomlRequires, runtime: &str)
 struct TomlParam {
     name: String,
     /// `tag = N` — the permanent TLV tag for this parameter. Required on
-    /// every built-in entry; see `ManifestParam::tag`.
+    /// every native entry; see `ManifestParam::tag`.
     tag: Option<u8>,
     /// One of: u8, u16, u32, str, enum
     #[serde(rename = "type")]
@@ -6025,7 +6028,7 @@ default = true
     }
 
     #[test]
-    fn rejects_params_on_non_builtin_manifest() {
+    fn rejects_params_on_non_native_manifest() {
         let src = r#"
 version = "1.0.0"
 hardware_targets = ["linux"]
@@ -6044,13 +6047,13 @@ default = 1
         let err = parse_toml(src).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("[[params]] is only valid on built-in modules"),
+            msg.contains("[[params]] is only valid on native modules"),
             "unexpected message: {msg}",
         );
     }
 
     #[test]
-    fn accepts_params_on_builtin_manifest() {
+    fn accepts_params_on_native_manifest() {
         let src = r#"
 version = "1.0.0"
 hardware_targets = ["linux"]
@@ -6422,23 +6425,23 @@ store_subscriptions = 1
         assert!(err.contains("not a runtime"), "{err}");
     }
 
-    // ── Built-in parameter schema lock ──────────────────────────────────
+    // ── Native parameter schema lock ──────────────────────────────────
     //
-    // A built-in's configuration reaches the platform as a TLV blob keyed
+    // A native module's configuration reaches the platform as a TLV blob keyed
     // by tag, so the `(name, type, tag)` tuple of every `[[params]]` entry
     // is a wire contract: rename a parameter and a config stops resolving,
     // change its type and the value is decoded as something else, move its
     // tag and a deployed encoding starts meaning a different field.
     //
-    // `RELEASED_LAYOUT` pins that tuple for every shipped built-in.
+    // `RELEASED_LAYOUT` pins that tuple for every shipped native module.
     // Changing a released parameter means changing this table in the same
     // commit — an explicit, reviewable edit rather than a side effect of
     // editing a manifest.
 
-    /// The built-in manifest trees, relative to the repository root.
-    const BUILTIN_TREES: [&str; 2] = ["modules/platform/linux", "modules/platform/wasm"];
+    /// The native manifest trees, relative to the repository root.
+    const NATIVE_TREES: [&str; 2] = ["modules/platform/linux", "modules/platform/wasm"];
 
-    /// Every released built-in parameter: `(module, name, type, tag)`.
+    /// Every released native parameter: `(module, name, type, tag)`.
     ///
     /// Adding a parameter adds a row. Removing one removes its row — and
     /// retires its tag permanently, because a deployed config may still
@@ -6526,12 +6529,12 @@ store_subscriptions = 1
         }
     }
 
-    /// Load every built-in manifest that declares `[[params]]`, in tree
+    /// Load every native manifest that declares `[[params]]`, in tree
     /// then directory order, as `(module, name, type, tag)` rows.
-    fn actual_builtin_layout() -> Vec<(String, String, &'static str, u8)> {
+    fn actual_native_layout() -> Vec<(String, String, &'static str, u8)> {
         let root = repo_root();
         let mut rows = Vec::new();
-        for tree in BUILTIN_TREES {
+        for tree in NATIVE_TREES {
             let dir = root.join(tree);
             let mut modules: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
@@ -6562,7 +6565,7 @@ store_subscriptions = 1
     }
 
     #[test]
-    fn released_builtin_parameters_match_the_pinned_schema() {
+    fn released_native_parameters_match_the_pinned_schema() {
         let expected: Vec<(String, String, &str, u8)> = RELEASED_LAYOUT
             .iter()
             .map(|(m, n, t, g)| ((*m).to_string(), (*n).to_string(), *t, *g))
@@ -6571,13 +6574,13 @@ store_subscriptions = 1
         // Compare as sorted sets: the tag, not the declaration position,
         // is the identity, so a reordered manifest must NOT register as a
         // change.
-        let mut a = actual_builtin_layout();
+        let mut a = actual_native_layout();
         let mut e = expected;
         a.sort();
         e.sort();
         assert_eq!(
             a, e,
-            "built-in parameter schema drifted.\n\
+            "native parameter schema drifted.\n\
              Each row is (module, name, type, tag) and is a wire contract: a\n\
              rename, a type change, or a tag reassignment changes what a\n\
              deployed config means. If the change is intended, migrate it\n\
@@ -6586,9 +6589,9 @@ store_subscriptions = 1
     }
 
     #[test]
-    fn every_builtin_tag_is_unique_and_in_range() {
+    fn every_native_tag_is_unique_and_in_range() {
         let mut seen: Vec<(String, u8)> = Vec::new();
-        for (module, name, _, tag) in actual_builtin_layout() {
+        for (module, name, _, tag) in actual_native_layout() {
             assert!(
                 (PARAM_TAG_MIN..=PARAM_TAG_MAX).contains(&tag),
                 "{module}.{name}: tag {tag} outside {PARAM_TAG_MIN}..={PARAM_TAG_MAX}",
@@ -6602,12 +6605,12 @@ store_subscriptions = 1
         }
     }
 
-    fn builtin_with_params(params: &str) -> String {
+    fn native_with_params(params: &str) -> String {
         format!("version = \"1.0.0\"\nbuiltin = true\n{params}")
     }
 
-    fn builtin_param_parse_err(params: &str) -> String {
-        let src = builtin_with_params(params);
+    fn native_param_parse_err(params: &str) -> String {
+        let src = native_with_params(params);
         let err =
             Manifest::from_toml_str_for_target(&src, None).expect_err("expected a manifest error");
         format!("{err}")
@@ -6619,11 +6622,11 @@ store_subscriptions = 1
     /// cannot.
     #[test]
     fn a_reordered_or_extended_params_table_leaves_released_tags_alone() {
-        let before = builtin_with_params(
+        let before = native_with_params(
             "[[params]]\nname = \"width\"\ntag = 10\ntype = \"u32\"\n\n\
              [[params]]\nname = \"height\"\ntag = 11\ntype = \"u32\"\n",
         );
-        let after = builtin_with_params(
+        let after = native_with_params(
             "[[params]]\nname = \"width\"\ntag = 10\ntype = \"u32\"\n\n\
              [[params]]\nname = \"mode\"\ntag = 12\ntype = \"u8\"\n\n\
              [[params]]\nname = \"height\"\ntag = 11\ntype = \"u32\"\n",
@@ -6643,8 +6646,8 @@ store_subscriptions = 1
     }
 
     #[test]
-    fn a_missing_builtin_tag_is_rejected() {
-        let msg = builtin_param_parse_err("[[params]]\nname = \"width\"\ntype = \"u32\"\n");
+    fn a_missing_native_tag_is_rejected() {
+        let msg = native_param_parse_err("[[params]]\nname = \"width\"\ntype = \"u32\"\n");
         assert!(
             msg.contains("param 'width'") && msg.contains("missing `tag = N`"),
             "unexpected message: {msg}",
@@ -6652,8 +6655,8 @@ store_subscriptions = 1
     }
 
     #[test]
-    fn a_duplicate_builtin_tag_is_rejected() {
-        let msg = builtin_param_parse_err(
+    fn a_duplicate_native_tag_is_rejected() {
+        let msg = native_param_parse_err(
             "[[params]]\nname = \"width\"\ntag = 10\ntype = \"u32\"\n\n\
              [[params]]\nname = \"height\"\ntag = 10\ntype = \"u32\"\n",
         );
@@ -6664,9 +6667,9 @@ store_subscriptions = 1
     }
 
     #[test]
-    fn a_reserved_or_out_of_range_builtin_tag_is_rejected() {
+    fn a_reserved_or_out_of_range_native_tag_is_rejected() {
         for tag in [0u16, 9, 0xF0, 0xFE, 0xFF] {
-            let msg = builtin_param_parse_err(&format!(
+            let msg = native_param_parse_err(&format!(
                 "[[params]]\nname = \"width\"\ntag = {tag}\ntype = \"u32\"\n"
             ));
             assert!(
@@ -6677,9 +6680,9 @@ store_subscriptions = 1
     }
 
     #[test]
-    fn a_builtin_tag_beyond_a_byte_is_rejected() {
+    fn a_native_tag_beyond_a_byte_is_rejected() {
         let msg =
-            builtin_param_parse_err("[[params]]\nname = \"width\"\ntag = 256\ntype = \"u32\"\n");
+            native_param_parse_err("[[params]]\nname = \"width\"\ntag = 256\ntype = \"u32\"\n");
         assert!(
             msg.contains("invalid manifest TOML"),
             "unexpected message: {msg}",
@@ -6753,16 +6756,16 @@ store_subscriptions = 1
         let src = obs_manifest(
             "[[observability.instrument]]\nname = \"lag\"\nkind = \"updown\"\n\
              [[observability.instrument.dimension]]\nkey = \"messaging.destination.partition.id\"\n\
-             domain = \"numeric\"\nmax = 64\n\
+             kind = \"numeric\"\nmax = 64\n\
              [[observability.instrument.dimension]]\nkey = \"messaging.consumer.group.name\"\n\
-             domain = \"enum\"\nvalues = [\"ingest\", \"audit\"]\n",
+             kind = \"enum\"\nvalues = [\"ingest\", \"audit\"]\n",
         );
         let m = Manifest::from_toml_str_for_target(&src, None).expect("parses");
         let inst = &m.observability.instruments[0];
         assert_eq!(inst.kind, InstrumentKind::UpDown);
         assert_eq!(inst.dimensions.len(), 2);
-        assert_eq!(inst.dimensions[0].domain.size(), 64);
-        assert_eq!(inst.dimensions[1].domain.size(), 2);
+        assert_eq!(inst.dimensions[0].kind.size(), 64);
+        assert_eq!(inst.dimensions[1].kind.size(), 2);
     }
 
     #[test]
@@ -6772,9 +6775,9 @@ store_subscriptions = 1
         let src = obs_manifest(
             "[[observability.instrument]]\nname = \"lag\"\nkind = \"updown\"\n\
              [[observability.instrument.dimension]]\nkey = \"messaging.destination.partition.id\"\n\
-             domain = \"numeric\"\nmax = 64\n\
+             kind = \"numeric\"\nmax = 64\n\
              [[observability.instrument.dimension]]\nkey = \"messaging.consumer.group.name\"\n\
-             domain = \"numeric\"\nmax = 1024\n",
+             kind = \"numeric\"\nmax = 1024\n",
         );
         let err = Manifest::from_toml_str_for_target(&src, None).expect_err("must refuse");
         assert!(err.to_string().contains("65534"), "{err}");

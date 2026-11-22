@@ -96,8 +96,8 @@ pub enum BindingValue {
 pub enum ArtifactRef {
     /// Single file. `path` is absolute.
     File { path: String },
-    /// Multi-file bundle rooted at `path` (absolute directory).
-    Bundle { path: String },
+    /// Multi-file directory rooted at `path` (absolute directory).
+    Dir { path: String },
 }
 
 // ── Actuator result ────────────────────────────────────────────────────────

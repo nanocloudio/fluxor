@@ -79,7 +79,7 @@ pub(crate) fn collect_ctrl_channels(edges: &[Edge], module_idx: usize, out: &mut
 /// any direction (a config error).
 ///
 /// Used by platform setup paths that don't go through
-/// `instantiate_one_module` — e.g. hosted built-ins that aren't in the
+/// `instantiate_one_module` — e.g. hosted native modules that aren't in the
 /// loader.
 pub fn populate_module_ports_from_edges(module_idx: usize, instantiated: usize) -> bool {
     if module_idx >= module_slots() || instantiated >= module_slots() {

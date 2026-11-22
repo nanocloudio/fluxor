@@ -2,7 +2,8 @@ version = "1.0.0"
 hardware_targets = ["bcm2712", "linux"]
 
 # Fixture for heap zeroing off the step path: grows its elastic heap on its
-# steps, 16 KiB a step, holding every chunk, until the heap's cap refuses;
+# steps, 16 KiB a step, holding every chunk, until the heap's cap refuses
+# (it declares one chunk; its graph grants the cap, `heap.arena_bytes`);
 # then frees them all and grows again. Each growth past what the heap has
 # committed carves a new segment from the state arena on the step, which is
 # what `heap_zero_step_bytes` counts when the arena has to zero it; the heap

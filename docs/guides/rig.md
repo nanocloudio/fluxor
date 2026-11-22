@@ -109,7 +109,7 @@ WIFI_PASSWORD = "${env:WIFI_PASSWORD}"
 
 The project recipe (`~/.config/fluxor/projects/fluxor/rig.toml`) must
 produce the firmware image — kernel, node image header, modules and config — with
-`fluxor build <config> --emit=combined --firmware <kernel.uf2>`. A
+`fluxor build <config> --emit=firmware --firmware <kernel.uf2>`. A
 kernel-only UF2 boots and then has nothing to load, which reads like a
 dead board.
 

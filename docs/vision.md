@@ -76,8 +76,8 @@ protocol.
 
 ## One Execution Model, Many Workloads
 
-The same execution primitives (modules, typed channels, topological
-walk, stream time, bounded arenas) express workloads across a wide
+The same execution primitives (modules, typed channels, a fixed
+step order, stream time, bounded arenas) express workloads across a wide
 range:
 
 - microcontroller firmware driving displays, audio, and motor I/O
@@ -88,13 +88,12 @@ range:
 - hardware-timed control loops in interrupt-mode domains
 - browser-hosted wasm bundles consuming the same module outputs
 
-None of these required changing the graph model. Each required
-building modules and, in some cases, extending the execution model
-with additional execution modes: `timer` domains for hard real-time
-control, `poll` domains for throughput-bound workloads.
-The core
-abstraction, modules connected by typed channels, executed with
-explicit timing and validated before deployment, stayed the same.
+Each is a set of modules in the same graph model. What differs is the
+execution mode of the domain the modules run in: `timer` and `irq`
+domains for hard real-time control, `poll` domains for throughput-bound
+work, `tick` domains for everything else. The core abstraction, modules
+connected by typed channels, executed with explicit timing and validated
+before deployment, is the same in all of them.
 
 That property is what makes the capability story credible. If a
 capability like audio playback must be expressible on a Pico W with
@@ -181,12 +180,12 @@ The inference pipeline on every target is the same graph shape: sensor
 → preprocess → inference → postprocess → action. Only the inference
 module and its resource budget differ.
 
-## What Exists Today
+## What the Tree Implements
 
-Each part of the argument corresponds to something concrete in the
-current tree:
+Each part of the argument corresponds to something concrete in this
+tree:
 
-- the graph runtime, scheduler, and channel model run today across
+- the graph runtime, scheduler, and channel model run across
   microcontroller, application-processor bare-metal, Linux-hosted,
   and browser-hosted targets
 - interrupt-mode (`timer`, `irq`) and cooperative (`tick`, `poll`)
@@ -200,7 +199,7 @@ current tree:
   across process and network boundaries
 
 These are working primitives; the capability-centric composition
-described above is the direction they are being combined towards.
+described above is the direction they combine towards.
 
 ## Summary
 

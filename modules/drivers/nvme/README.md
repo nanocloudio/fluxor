@@ -1,6 +1,7 @@
-# nvme — NVMe block driver (Pi 5, PCIe1 external slot)
+# nvme — NVMe block driver
 
-NVMe driver for the Pi 5 NVMe HAT+. Implements NVMe 1.4 controller
+NVMe driver for a controller on PCIe: the Pi 5's PCIe1 external slot
+(the NVMe HAT+), or a cloud instance's volumes (`dma_window_gib: 0`). Implements NVMe 1.4 controller
 initialisation, Identify Controller / Namespace, and block
 read/write at the namespace's logical block size (512 B to 4 KiB; the
 `storage.block` `READ_STREAM` op requires 512 B) on one admin queue plus up to `MAX_IO_QUEUES` (4) I/O
@@ -9,22 +10,18 @@ queue pairs (`io_queue_count` parameter, default 1). With
 brcmstb MSI mux; otherwise the CQ is drained by polling in
 `step_ready`.
 
-See also: `nvme_trace/` for the userspace trace that defines the
-expected controller init sequence.
-
 ---
 
 ## Log transport
 
-Every `log::info!` in this module flows through the kernel log ring
-and out over whatever transport `platform.debug.to` selects. On the
-pi5 rig we use `{ to: net, monitor: true }` and consume with
-`fluxor rig monitor --net :6666` — no UART cable required. See
-`.../memory/pi5_netconsole.md` for the bus details.
+Every log line this module writes flows through the kernel log ring
+and out over whatever transport `platform.debug.to` selects. With
+`{ to: net, monitor: true }` the log is read with
+`fluxor rig monitor --net <addr:port>`, no UART cable required.
 
 The exception handler is a separate path that writes PL011 directly,
 so a catastrophic MMU/SError during NVMe bring-up still prints over
-UART even if the log_net module isn't running yet.
+UART even if the `log_net` module is not running yet.
 
 ---
 
@@ -35,8 +32,6 @@ UART even if the log_net module isn't running yet.
   (Identify Namespace).
 - Reference implementations: SPDK `lib/nvme/nvme_ctrlr.c`;
   NetBSD `sys/dev/ic/nvme.c`.
-- Baseline trace tool at `nvme_trace/` — captures the init +
-  Identify Controller sequence with ns-accurate timestamps.
 
 ---
 
@@ -67,7 +62,7 @@ stay claimed until the completion lands.
 | Family | CIDs | Reuse rule |
 | --- | --- | --- |
 | Admin | `0x0001..` | one command at a time, issued once |
-| Stream read | `0x0005` | one at a time |
+| Stream read (`ReadLba0`, then `READ_STREAM`) | `0x0005` | one at a time |
 | Channel writes | `0x0100 + (queue << CID_SLOT_BITS) + slot` | ring slot, freed in order |
 | v1 request | `0x0500 + slot` (16 slots) | slot freed when its completion is reaped (or abandoned and then landed) |
 | v1 preflush Flush | `0x0510 + slot` (4 slots) | rotating allocation; a slot is free only after its completion; `EAGAIN` when all are outstanding |
@@ -125,15 +120,18 @@ is counted and dropped; it never completes a request.
                     ┌───────────────┐
                     │  CreateIoSQ   │  admin 0x01
                     └──────┬────────┘
-                           │ returns Ready(3) here — unblocks fat32
                            ▼
                     ┌───────────────┐
-                    │    Ready      │  serve block I/O
+                    │   ReadLba0    │  read LBA 0 once, log what it holds
+                    └──────┬────────┘
+                           ▼
+                    ┌───────────────┐
+                    │    Ready      │  returns StepReturn::Ready once, then serves block I/O
                     └──────┬────────┘
                            │ on error →
                            ▼
                     ┌───────────────┐
-                    │  Fault(code)  │  permanent — UART logs code
+                    │  Fault(code)  │  logs `[nvme] Fault`; code 1 retries
                     └───────────────┘
 ```
 
@@ -156,7 +154,6 @@ command completion) read once per step and return `Continue`.
 - **Exit:** handle ≥ 0 → `MapBars`.
 - **Return:** `Continue` while waiting; `Continue` on transition.
 - **Spec:** N/A (platform-specific).
-- **Trace row:** none (pre-NVMe).
 - **Timing:** depends on link training; bounded by scheduler ticks.
 
 ### `MapBars`
@@ -165,7 +162,6 @@ command completion) read once per step and return `Continue`.
 - **Behaviour:** `provider_call(pcie_handle, BAR_MAP, [bar_idx=0, …])` → `bar0_virt`.
 - **Exit:** `bar0_virt != 0` → `Reset`; else `Fault`.
 - **Spec:** N/A.
-- **Trace row:** `mmap_bar0`.
 - **Timing:** single syscall; < 1 ms.
 
 ### `Reset`
@@ -180,7 +176,6 @@ command completion) read once per step and return `Continue`.
        `ConfigQueues`. If `CSTS.CFS == 1`, go to `Fault`.
     4. Each step reads CSTS once and returns `Continue`.
 - **Spec:** NVMe 1.4 §7.6.1 step 2; §3.1.6 CSTS.
-- **Trace rows:** `w32 0x14` (CC.EN=0), `r32 0x1C` loop.
 - **Timing budget:** `CAP.TO` is in 500 ms units. Typical ≈ 30 ms;
   worst case several seconds. Anchor against `dev_millis()`, not
   step count.
@@ -196,7 +191,6 @@ command completion) read once per step and return `Continue`.
     4. Write `ACQ` (64-bit) with CQ phys addr.
 - **Exit:** → `Enable`.
 - **Spec:** NVMe 1.4 §7.6.1 step 3; §3.1.8/9/10 AQA/ASQ/ACQ.
-- **Trace rows:** 3× `dma_alloc`, `w32 0x24`, `w64 0x28`, `w64 0x30`.
 - **Timing:** micro-seconds per register write; budget 1 step per
   register.
 
@@ -210,7 +204,6 @@ command completion) read once per step and return `Continue`.
     3. Poll `CSTS.RDY`. When 1, → `IdentifyController`.
        If `CFS == 1` or timeout, → `Fault`.
 - **Spec:** NVMe 1.4 §7.6.1 step 4–5; §3.1.5 CC.
-- **Trace rows:** `w32 0x14` (CC.EN=1), `r32 0x1C` loop.
 - **Timing budget:** same as `Reset` (CAP.TO).
 
 ### `IdentifyController`
@@ -229,7 +222,6 @@ command completion) read once per step and return `Continue`.
 - **Exit:** → `IdentifyNamespace`.
 - **Spec:** NVMe 1.4 §4.2 SQE; §4.6 CQE; §5.15 Admin Commands;
   §5.15.2.1 Identify Controller.
-- **Trace rows:** `sqe`, `w32 0x1000`, `cqe`, `w32 0x1004`.
 - **Timing budget:** typical < 1 ms between doorbell and completion
   for Identify; poll-once-per-step is fine.
 
@@ -246,21 +238,28 @@ the ring. See NVMe 1.4 §5.4, §5.5.
 
 ### `Ready`
 
-Per step:
-1. Try to read 16 B from `requests` channel.
-2. If a request is in-flight and I/O CQ has a new phase-flipped CQE,
-   deliver 512 B to `blocks` channel and clear in-flight slot.
-   Return `Burst` if more CQEs are pending, else `Continue`.
-3. If no request in flight and we got a new request, submit to I/O
-   SQ, ring doorbell, store CID → request mapping. Return `Continue`.
-4. Apply backpressure: if `blocks` channel is full, retry same CQE
-   next step; do NOT ring CQ0HDBL yet.
+On entry, gives every `storage.block` request slot its DMA page (retried
+each step until all are in hand), then returns `StepReturn::Ready` once —
+the signal that unblocks a consumer such as `fat32`. Each step after:
+
+1. takes any MSI-X ring the mux raised (with `irq_mode = 1`; the CQ is
+   still polled);
+2. harvests write completions and pumps `requests` (below), submitting
+   while some I/O queue has room;
+3. serves the `storage.block` stream read: a consumer's `READ_STREAM`
+   names an LBA, the driver reads it and writes its bytes to `blocks`,
+   abandoning an in-flight block when a new `READ_STREAM` arrives so the
+   next bytes are always from the LBA asked for. A full `blocks` channel
+   holds the completed block until the next step.
 
 ### `Fault(code)`
 
-Permanent state. Log code + last CSTS once. Always return
-`Continue` with no effect. Future: expose fault event for a
-recovery reconfigure.
+Logs `[nvme] Fault` once and returns `Continue`. Fault code 1 (the BAR map
+failed: the link had not trained) is retried: every `RESCAN_INTERVAL_MS` the
+driver asks the kernel to `PCIE_RESCAN` and maps BAR0 again, and once both
+succeed it logs `[nvme] link up, retrying Reset` and re-enters `Reset`.
+Every other fault is permanent; nothing short of a reconfigure recovers the
+controller.
 
 ---
 
@@ -268,23 +267,21 @@ recovery reconfigure.
 
 ### `requests` (input)
 
-16-byte records:
+Writes only. Each record is a 20-byte header followed by its payload:
+
 ```
-offset 0  : u8  opcode     (0=read, 1=write)
-offset 1  : u8  reserved
-offset 2  : u16 request_id (client-chosen; echoed on completion)
-offset 4  : u32 nsid       (typically 1)
-offset 8  : u64 lba        (512-byte block index)
+offset 0  : u32 op     (1 = write; anything else is logged and skipped)
+offset 4  : u64 lba    (512-byte block index)
+offset 12 : u32 nlb    (blocks, 1..=MAX_NLB; out of range is a fault)
+offset 16 : u32 nsid   (0 = the configured `namespace`)
+offset 20 : nlb × 512 bytes of data
 ```
 
 ### `blocks` (output)
 
-For reads: 512-byte records, one per completed read. For writes:
-16-byte ack records mirroring the request shape (shape TBD; v1 may
-just stream reads).
-
-Backpressure: writes return `bytes_actually_written`. If partial,
-retry on next step. State machine does NOT advance on partial writes.
+Serves `storage.block` v1 (`CAPS`, `EXEC`, `SUBMIT`, `REAP`,
+`READ_STREAM`) to the consumer wired to it, and carries the bytes of each
+`READ_STREAM` read.
 
 ---
 
@@ -297,6 +294,7 @@ retry on next step. State machine does NOT advance on partial writes.
 | 3   | queue_depth        | u16  | 32           | I/O queue depth                               |
 | 4   | irq_mode           | u8   | 0            | 0=polled, 1=MSI-X                             |
 | 6   | io_queue_count     | u8   | 1            | I/O queue pairs (1..4)                        |
+| 7   | dma_window_gib     | u32  | 64           | ORed into every DMA address the device is given; 0 on a cloud instance |
 
 Board topology (which root complex, which GIC SPI the MSI mux is routed to)
 lives in the platform's PCIe alias table, not in driver YAML.

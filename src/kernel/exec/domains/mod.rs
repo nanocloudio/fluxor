@@ -407,8 +407,8 @@ pub fn take_domain0_max_deadline_us() -> u32 {
     DOMAIN0_MAX_DEADLINE_US.swap(0, Ordering::Relaxed)
 }
 
-/// The next deadline (µs) each domain's last step chose (the resident-graph
-/// merge, or the single-graph pacer); written by [`domain_step_all`] before
+/// The next deadline (µs) each domain's last tick pass chose (the resident-graph
+/// merge, or the single-graph pacer); written by [`run_domain_passes`] before
 /// [`arm_next_deadline`] reads it in the same pass.
 static DOMAIN_LOOP_DEADLINE_US: [AtomicU32; MAX_DOMAINS] =
     [const { AtomicU32::new(0) }; MAX_DOMAINS];
@@ -473,7 +473,7 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 let woke = timer::read_timer_count_64();
                 interrupts_before_pass = core_interrupts(core_id);
                 let t0 = timer::read_timer_count();
-                domain_step_all(domain_id, platform);
+                run_domain_passes(domain_id, platform);
                 cross::pump(domain_id);
                 let elapsed = timer::read_timer_count().wrapping_sub(t0);
                 // With no core of its own, a polled `timer` domain is fired
@@ -598,7 +598,7 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
 
 /// Run `domain_id`'s tick pass (`pass::run`), then its latched wakes, and
 /// publish the pass's deadline for the core's timer.
-fn domain_step_all(domain_id: usize, platform: &Platform) {
+fn run_domain_passes(domain_id: usize, platform: &Platform) {
     let pass = scheduler::pass::run(domain_id, scheduler::PassKind::Tick);
     let woken = scheduler::pass::take_domain_wakes(domain_id);
     if !woken.is_empty() {

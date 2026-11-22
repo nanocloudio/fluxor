@@ -406,9 +406,9 @@ impl ParamSchema {
         info.schema.as_ref().and_then(|data| Self::from_bytes(data))
     }
 
-    /// Build a schema from a built-in module's `manifest.toml` `[[params]]`
+    /// Build a schema from a native module's `manifest.toml` `[[params]]`
     /// section. This lets the same TLV packer used for `.fmod` modules
-    /// produce per-instance params for kernel built-ins (which have no
+    /// produce per-instance params for native modules (which have no
     /// `.fmod` to embed schema bytes into).
     pub fn from_manifest(m: &crate::manifest::Manifest) -> Option<Self> {
         if m.params.is_empty() {
@@ -1527,7 +1527,7 @@ fn pack_voice_inner(
 /// Three outcomes, deliberately distinguishable:
 ///   - `Ok(Some(schema))` — a schema was read.
 ///   - `Ok(None)` — this module legitimately has no `.fmod`-borne schema: a
-///     built-in (schema lives in its `manifest.toml`), a module declaring no
+///     native module (schema lives in its `manifest.toml`), a module declaring no
 ///     params, or an unpinned module whose `.fmod` simply isn't built (the
 ///     module-table builder reports that one separately).
 ///   - `Err` — the module IS pinned in `fluxor.lock` but its pinned artifact
@@ -2402,9 +2402,9 @@ mod tests {
     }
 
     /// The other two outcomes stay `Ok(None)`: a module the pins don't cover
-    /// and whose `.fmod` isn't on disk is "no schema here" — the built-in
+    /// and whose `.fmod` isn't on disk is "no schema here" — the native module
     /// lookup and the module-table builder handle that case, so turning it
-    /// into an error would break every built-in module.
+    /// into an error would break every native module.
     #[test]
     fn unpinned_module_without_fmod_reports_no_schema() {
         let (project, store, modules_dir) = pinned_but_missing_fixture();

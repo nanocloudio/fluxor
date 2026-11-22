@@ -182,7 +182,7 @@ pub fn wire_artifact(artifact: &ArtifactPlan) -> Option<ArtifactRef> {
         ArtifactPlan::File { path, .. } => Some(ArtifactRef::File {
             path: path.display().to_string(),
         }),
-        ArtifactPlan::Bundle { root, .. } => Some(ArtifactRef::Bundle {
+        ArtifactPlan::Dir { root, .. } => Some(ArtifactRef::Dir {
             path: root.display().to_string(),
         }),
         ArtifactPlan::Unresolved { .. } => None,

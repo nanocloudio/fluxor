@@ -14,7 +14,7 @@
 //     * `modules/foundation/button`    — external GPIO switch
 //
 //   wasm:
-//     * `wasm_browser_button` built-in — DOM tap on player surface
+//     * `wasm_browser_button` native module — DOM tap on player surface
 //
 //   future (bcm2712 via RP1, linux via evdev, etc.) — same contract
 //

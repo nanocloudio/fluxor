@@ -52,13 +52,13 @@ use crate::kernel::workload::owner::OwnerHandle;
 /// at boot with the sandbox table ([`size_workloads`]).
 const MAX_WORKLOADS: usize = MAX_SANDBOXES;
 const _: () = assert!(
-    MAX_WORKLOADS <= GRAPH_SLOT_BASE as usize,
-    "host-process workload slots must stay below the graph backend's"
+    crate::kernel::workload::owner::MAX_OWNERS <= HOST_SLOT_BASE as usize,
+    "the graph backend's workload slots must stay below the host-process backend's"
 );
 
 /// One admitted workload: its owner and the host-process backend slot it maps
-/// to (the host-process backend's; a graph workload's handles are the graph
-/// backend's, above [`GRAPH_SLOT_BASE`]).
+/// to (the host-process backend's; its handle index is its slot above
+/// [`HOST_SLOT_BASE`], a graph workload's is the graph backend's own slot).
 #[derive(Clone, Copy)]
 struct WorkloadSlot {
     in_use: bool,
@@ -96,6 +96,7 @@ unsafe fn release_slot(idx: usize) -> i32 {
     let slot = slots[idx];
     let rc = hp_destroy(slot.backend_idx);
     slots[idx] = WORKLOAD_EMPTY;
+    retire_handles(idx);
     if slot.allocated {
         free_allocated_owner(slot.owner);
     }
@@ -738,11 +739,21 @@ unsafe fn slot_by_identity(identity: &[u8]) -> Option<usize> {
     })
 }
 
-/// First index of the module-graph backend's workloads. A workload whose source
-/// is an fmod graph is staged into this runtime's own live graph by the
-/// kernel's module-graph backend, the one bare metal runs; its slots are
-/// offset here so they never collide with the host-process backend's.
-const GRAPH_SLOT_BASE: i32 = 0x1000;
+/// First handle index of the host-process backend's workloads. A workload
+/// whose source is an fmod graph is staged into this runtime's own live graph
+/// by the kernel's module-graph backend, the one bare metal runs, and its
+/// handle index is that backend's slot, as on metal (the backend retires the
+/// handles naming a slot as it frees it); host-process slots are offset here
+/// so they never collide with it.
+const HOST_SLOT_BASE: i32 = 0x1000;
+
+/// Retire every handle naming host-process slot `idx`, freed.
+fn retire_handles(idx: usize) {
+    crate::kernel::module::provider::retire_routes_naming(
+        crate::abi::registry::workload::ID,
+        HOST_SLOT_BASE + idx as i32,
+    );
+}
 
 /// `workload` provider dispatch. CREATE is `handle = -1`; lifecycle ops are
 /// handed the workload's index (what its handle's route carries).
@@ -785,13 +796,10 @@ unsafe fn workload_dispatch_on_thread(
             arg.get(17),
             Some(&wl::SOURCE_FMOD_GRAPH) | Some(&wl::SOURCE_FMOD_PACK)
         ) {
-            let rc = workload_graph::workload_dispatch(-1, opcode, arg, data.reborrow());
-            if rc < 0 {
-                return rc;
-            }
-            return GRAPH_SLOT_BASE + rc;
+            return workload_graph::workload_dispatch(-1, opcode, arg, data.reborrow());
         }
-        return workload_create(arg);
+        let rc = workload_create(arg);
+        return if rc < 0 { rc } else { HOST_SLOT_BASE + rc };
     }
     if opcode == wl::CAPS {
         return crate::abi::kernel_abi::caps_word::answer(arg, workload_caps());
@@ -808,11 +816,7 @@ unsafe fn workload_dispatch_on_thread(
     if opcode == wl::LOOKUP || (opcode == wl::DESTROY && handle < 0) {
         let rc = workload_graph::workload_dispatch(-1, opcode, arg, data.reborrow());
         if rc != errno::ENOENT {
-            return if opcode == wl::LOOKUP && rc >= 0 {
-                GRAPH_SLOT_BASE + rc
-            } else {
-                rc
-            };
+            return rc;
         }
         let Some(id) = arg.get(..16) else {
             return errno::EINVAL;
@@ -829,20 +833,15 @@ unsafe fn workload_dispatch_on_thread(
             let out = &mut arg[..6];
             out[0..2].copy_from_slice(&owner.slot.to_le_bytes());
             out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
-            return idx as i32;
+            return HOST_SLOT_BASE + idx as i32;
         }
         return release_slot(idx);
     }
 
-    let raw = handle;
-    if raw >= GRAPH_SLOT_BASE {
-        return workload_graph::workload_dispatch(
-            raw - GRAPH_SLOT_BASE,
-            opcode,
-            arg,
-            data.reborrow(),
-        );
+    if (0..HOST_SLOT_BASE).contains(&handle) {
+        return workload_graph::workload_dispatch(handle, opcode, arg, data.reborrow());
     }
+    let raw = handle.saturating_sub(HOST_SLOT_BASE);
     let bidx = match workload_backend_idx(raw) {
         Ok(b) => b,
         Err(e) => return e,
@@ -906,10 +905,11 @@ pub fn linux_workload_close_owner(owner: OwnerHandle) {
     // backend slots it owns.
     unsafe {
         let slots = &mut *core::ptr::addr_of_mut!(LINUX_WORKLOADS);
-        for slot in slots.iter_mut() {
+        for (idx, slot) in slots.iter_mut().enumerate() {
             if slot.in_use && slot.owner == owner {
                 hp_destroy(slot.backend_idx);
                 *slot = WORKLOAD_EMPTY;
+                retire_handles(idx);
             }
         }
     }

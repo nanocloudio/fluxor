@@ -9,16 +9,16 @@ Source: `src/kernel/ipc/event.rs`
 1. **Pure mechanism** — no device semantics. Events are generic flags. The kernel has no knowledge of WiFi, sensors, or any device protocol.
 2. **ISR-safe** — `event_signal_from_isr()` is bounded: one atomic store, one atomic RMW, one Signal. No allocation, no validation, no channel writes.
 3. **Cooperative** — events trigger intra-tick module stepping. No preemption, no blocking, no priority inversion.
-4. **Static pool** — 32 event slots, atomically allocated. No heap. Deterministic memory.
+4. **Bounded pool** — event slots are a planned kernel table (32 by default), allocated atomically. No heap. See [limit_register.md](limit_register.md) for how the table is sized.
 
 ## Why Events Exist
 
-Without events, modules poll for hardware changes every 1ms tick. This works but has two problems:
+A module that polls for a hardware change on every tick pays twice:
 
-1. **Latency** — a GPIO edge that fires 0.5ms after a tick isn't seen until the next tick.
-2. **Wasted work** — modules that are waiting for hardware run `step()` every tick even when nothing happened.
+1. **Latency** — an edge that fires just after a tick pass is not seen until the next one.
+2. **Wasted work** — a module waiting on hardware runs `module_step` on every tick even when nothing happened.
 
-Events solve both: the scheduler only steps a module when its event fires, and a wake breaks out of the 1 ms sleep for sub-tick response.
+Events remove both: a signal latches the owning module's wake bit, a wake pass steps that module alone, and a wake ends the domain loop's sleep early for a sub-tick response.
 
 ## Architecture
 
@@ -29,8 +29,8 @@ Hardware edge
 poll_gpio_edges()  ──>  doorbell_ring(doorbell)
                               |
                          sets signaled = true
-                         sets EVENT_WAKE_PENDING bit for owner module
-                         signals SCHEDULER_WAKE
+                         latches the owner module's wake bit
+                         wakes the scheduler
                               |
                               v
                     domain loop detects wake
@@ -48,8 +48,8 @@ ISR context
 event_signal_from_isr(handle)
     |
     sets signaled = true
-    sets EVENT_WAKE_PENDING bit
-    signals SCHEDULER_WAKE  ──>  breaks the sleep early
+    latches the owner module's wake bit
+    wakes the scheduler  ──>  breaks the sleep early
                                       |
                                       v
                             wake pass runs immediately
@@ -61,9 +61,9 @@ event_signal_from_isr(handle)
 
 ```rust
 // In module_new or module_step:
-let evt = (sys.provider_call)(-1, event::CREATE, core::ptr::null_mut(), 0);
+let evt = (sys.provider_call)(-1, event::CREATE, core::ptr::null_mut(), 0, core::ptr::null_mut(), 0);
 // evt >= 0: event handle
-// evt < 0: error (ENOSPC if pool exhausted)
+// evt < 0: error (ENOSPC when the event table is full)
 ```
 
 The event is owned by the currently executing module. When signaled, the scheduler knows which module to wake.
@@ -72,17 +72,17 @@ The event is owned by the currently executing module. When signaled, the schedul
 
 ```rust
 // From the module that owns the event:
-let rc = (sys.provider_call)(evt, event::SIGNAL, core::ptr::null_mut(), 0);
+let rc = (sys.provider_call)(evt, event::SIGNAL, core::ptr::null_mut(), 0, core::ptr::null_mut(), 0);
 ```
 
-Sets the signaled flag, marks the owning module for wake, and pokes `SCHEDULER_WAKE`. The owning module will be stepped in the same tick cycle (intra-tick wake). Every event op checks that the caller owns the event; an event handle names its slot at a generation, so a handle kept past `DESTROY` names nothing (`EBADF`). Another module, a provider or the platform signals a module through a doorbell instead (below).
+Sets the signaled flag, latches the owning module's wake bit, and wakes the scheduler. The owning module is stepped by the wake pass that follows the current pass, before the domain loop sleeps. Every event op checks that the caller owns the event; an event handle names its slot at a generation, so a handle kept past `DESTROY` names nothing (`EBADF`). Another module, a provider or the platform signals a module through a doorbell instead (below).
 
 ### Poll
 
 ```rust
 // In module_step, check if event fired:
-let fired = (sys.provider_call)(evt, event::POLL, core::ptr::null_mut(), 0);
-// fired == 1: was signaled (now cleared)
+let fired = (sys.provider_call)(evt, event::POLL, core::ptr::null_mut(), 0, core::ptr::null_mut(), 0);
+// fired == 1: signaled (the poll clears it)
 // fired == 0: not signaled
 // fired < 0: error
 ```
@@ -93,30 +93,35 @@ Poll is atomic: it clears the signaled flag and returns the previous value. This
 
 ```rust
 // In module cleanup:
-let rc = (sys.provider_call)(evt, event::DESTROY, core::ptr::null_mut(), 0);
+let rc = (sys.provider_call)(evt, event::DESTROY, core::ptr::null_mut(), 0, core::ptr::null_mut(), 0);
 ```
 
-Unbinds any IRQ subscription, clears the slot.
+Frees the slot and moves its generation, so the handle, and any IRQ still bound to it, names nothing: such an IRQ signals no event.
 
 ## IRQ Subscription
 
-Events can be bound to hardware IRQ sources. This document shows GPIO edge detection as the reference binding pattern.
+An event can be bound to a hardware interrupt line (`BIND_IRQ`, aarch64
+targets with a GIC); a GPIO edge is watched through the GPIO contract's
+doorbell instead (below).
 
-### GPIO Edge Binding
+### IRQ binding
 
 ```rust
-// Bind event to GIC IRQ 187 (example) so the kernel signals the event
+// Bind the event to GIC IRQ 187 (example) so the kernel signals the event
 // on fire. `ack` says how the kernel quiets the device behind the line
 // first: `event::ack::NONE` leaves it to the driver, `VIRTIO_MMIO`
 // acknowledges the machine's virtio-mmio transport on that line.
 let mut args = [0u8; 5];
 args[..4].copy_from_slice(&187u32.to_le_bytes());  // IRQ number
 args[4] = event::ack::NONE;
-let rc = (sys.provider_call)(evt, event::BIND_IRQ, args.as_mut_ptr(), 5);
+let rc = (sys.provider_call)(evt, event::BIND_IRQ, args.as_mut_ptr(), 5, core::ptr::null_mut(), 0);
 ```
 
-After binding, the kernel's ISR signals the event whenever the IRQ
-fires. The module does not need to poll — just poll the event.
+After binding, the kernel's interrupt handler signals the event whenever
+the line fires, and the module polls the event rather than the device. The
+line must be a shared peripheral interrupt (INTID 32 or above): an event
+binding is serviced on core 0. An SGI or PPI, or an `ack` the machine has
+no such device behind, is `EINVAL`.
 
 GPIO edge-triggered wakes go through a doorbell: the GPIO contract's
 `WATCH_EDGE` opcode on a claimed pin mints a watch handle that polls
@@ -139,33 +144,18 @@ answers `POLL_IN` once per ring — the poll takes it. Closing the handle closes
 the provider's index and frees the slot; the doorbell's generation moves, so
 a ring after the close rings nothing.
 
-### Release
-
-Destroying the event releases any IRQ binding. There is no separate
-unsubscribe opcode.
-
-```rust
-(sys.provider_call)(evt, event::DESTROY, core::ptr::null_mut(), 0);
-```
-
 ### Constraints
 
-- For GPIO edge wakes, the pin must already be claimed by the module (via `provider_open(HAL_GPIO, gpio::CLAIM, ...)`)
-- One event per IRQ source (returns `EBUSY` if already bound)
-- One IRQ source per event (destroy the event and create a new one to re-bind)
-
-### Lifecycle Hygiene
-
-- Modules unsubscribe IRQ bindings before event destroy.
-- Modules destroy all event handles during shutdown/reconfigure.
-- Events remain the only scheduler wake mechanism for hardware-to-module notification paths.
+- A GPIO edge watch needs the pin already claimed by the module (`gpio::CLAIM`); the watch is made on the claim's handle.
+- There is no unbind opcode: `DESTROY` ends what the event receives, and a GPIO watch ends when its handle is closed.
+- Every event op checks that the caller owns the event; a module's events are released with the module.
 
 ## Scheduler Wake Integration
 
 Every loop drives one pass engine (`src/kernel/exec/scheduler/pass.rs`):
 `pass::run(domain, kind)` steps one domain, either a full tick
 (`PassKind::Tick`) or only the woken modules (`PassKind::Wake(&mask)`).
-A single-core loop (RP, Linux) runs every domain in order through
+A single-core loop (RP, Linux, wasm) runs every domain in order through
 `pass::tick_all()` and `pass::wake_all()`, then sleeps until the
 deadline the tick pass returned or a wake, whichever comes first:
 
@@ -180,9 +170,9 @@ loop {
     // 3. Intra-tick wake: events latched during the tick pass
     pass::wake_all();
 
-    // 4. Sleep until the pass deadline OR an event signal
+    // 4. Sleep for the pass's deadline_us (µs from now) OR until a wake
     SCHEDULER_WAKE.take();
-    wait_for_wake(&SCHEDULER_WAKE, now + pass.deadline_us, ...);
+    wait_for_wake(&SCHEDULER_WAKE, now_us() + pass.deadline_us, ...);
 
     // 5. Post-sleep wake: events from ISR during sleep
     pass::wake_all();
@@ -211,9 +201,9 @@ modules alone:
 
 | Source | Latency | Mechanism |
 |--------|---------|-----------|
-| GPIO edge (software polled) | Same tick cycle (~0-1ms) | `poll_gpio_edges()` → `event_signal()` → wake pass |
-| Module-to-module signal | Same tick cycle | Module A signals → wake pass runs before sleep |
-| ISR sources | Sub-tick | ISR → `event_signal_from_isr()` → `SCHEDULER_WAKE` breaks the sleep |
+| GPIO edge (software polled, RP) | Within one loop iteration | `poll_gpio_edges()` → `doorbell_ring()` → wake pass |
+| Module signal or doorbell ring | Before the loop sleeps | the signal latches a wake → the wake pass after the tick pass |
+| Bound IRQ | Sub-tick | interrupt → `event_signal_from_isr()` → the wake ends the sleep |
 
 ### Channel readiness and stream state
 
@@ -239,28 +229,28 @@ does, so data cuts an idle sleep short.
 
 `event_signal_from_isr()` contains exactly:
 
-1. Bounds check (`handle < MAX_EVENTS`)
+1. Handle lookup in the committed event table: the slot is live and its
+   generation matches, or nothing is signalled (no owner check)
 2. `slot.signaled.store(true, Release)` — one atomic store
-3. A wake-latch RMW into the owner's `EVENT_WAKE_PENDING` word; if the
-   owning module is paused, the wake is deferred and the doorbell
-   suppressed
+3. A wake-latch RMW into the owner's wake word; if the owning module is
+   paused, the wake is deferred and the scheduler wake suppressed
 4. `hal::wake_scheduler()` — on RP this sets the scheduler wake latch and
    raises `SEV`, so a core parked in `WFE` returns and re-checks
 
-No validation beyond bounds. No allocation. No channel writes. No driver logic. Called at most once per ISR entry (coalesced), not per-pin.
+No allocation, no table growth, no channel writes, no driver logic.
 
 ## GPIO Event Binding Model
 
 GPIO edge watches on RP targets use software polling via
-`poll_gpio_edges()` (same-tick-cycle response, ~1 ms worst case), which
+`poll_gpio_edges()`, once per loop iteration before the tick pass, which
 rings each watch's doorbell. This model
 is suitable for buttons, sensors, and most GPIO-driven peripherals.
 
 It is also the model the RP platform commits to: `IO_IRQ_BANK0` is not
-hooked, so GPIO edges are observed by the step loop rather than by an
+hooked, so GPIO edges are observed by the domain loop rather than by an
 interrupt.
 
-For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` works directly from ISR context, giving these sources a sub-tick wake.
+An interrupt source bound with `BIND_IRQ` signals through `event_signal_from_isr()` directly from interrupt context, giving it a sub-tick wake.
 
 ## Timers
 
@@ -318,89 +308,66 @@ a signalling handle's doorbell).
 | Code | Name | When |
 |------|------|------|
 | `-28` | `ENOSPC` | No free event slots — an accounted capacity denial (`resource_ledger`, PSTATUS `POOL` records) |
-| `-16` | `EBUSY` | Event already has an IRQ binding |
-| `-19` | `ENODEV` | GPIO pin not claimed |
-| `-22` | `EINVAL` | Invalid handle, edge value, or source |
-| `-38` | `ENOSYS` | Unknown source_type |
+| `-9` | `EBADF` | The handle names no live event of the caller's |
+| `-22` | `EINVAL` | `BIND_IRQ`: an argument shorter than 5 bytes, an unknown `ack`, an SGI/PPI line, or an `ack` with no such device behind the line |
+| `-12` | `ENOMEM` | `BIND_IRQ`: the interrupt controller's binding table is full |
 
 ## Driver Pattern: Event-Driven GPIO Module
 
-This example shows a complete driver module that uses events for GPIO edge detection. This is the pattern for any hardware driver that can be written as a cooperative state machine with event notifications — running entirely as a module with zero kernel knowledge of the device.
+A driver that waits on a GPIO edge claims the pin, watches its edge, and
+polls the watch handle; the watch's doorbell wakes it. This is the pattern
+of `modules/drivers/gt911` (its INT pin) and of any hardware driver that can
+be written as a cooperative state machine with event notifications —
+running entirely as a module with zero kernel knowledge of the device.
 
 ```rust
 #[repr(C)]
 struct ButtonState {
     syscalls: *const SyscallTable,
     out_chan: i32,
-    gpio_pin: u8,
-    event_handle: i32,
-    state: u8,
-    debounce_timer: i32,
-    last_level: u8,
+    pin_handle: i32,   // the pin's claim
+    watch: i32,        // the edge watch: polls POLL_IN once per edge
+    phase: u8,
 }
 
-const ST_INIT: u8 = 0;
-const ST_CLAIM_PIN: u8 = 1;
-const ST_CREATE_EVENT: u8 = 2;
-const ST_SUBSCRIBE: u8 = 3;
-const ST_RUNNING: u8 = 4;
+const PH_WATCH: u8 = 0;
+const PH_RUNNING: u8 = 1;
 
 fn module_step(state: *mut u8) -> StepReturn {
     let s = unsafe { &mut *(state as *mut ButtonState) };
     let sys = unsafe { &*s.syscalls };
 
-    match s.state {
-        ST_INIT => {
-            // Claim GPIO pin as input with pull-up
-            let rc = (sys.provider_call)(s.gpio_pin as i32, gpio::CLAIM, ...);
-            if rc < 0 { return StepReturn::error(rc); }
-            s.state = ST_CREATE_EVENT;
+    match s.phase {
+        PH_WATCH => {
+            // Watch both edges of the claimed pin (claimed in module_new).
+            let mut edge = [gpio::edge::BOTH];
+            s.watch = unsafe {
+                (sys.provider_call)(
+                    s.pin_handle, gpio::WATCH_EDGE,
+                    edge.as_mut_ptr(), 1,
+                    core::ptr::null_mut(), 0,
+                )
+            };
+            if s.watch < 0 { return StepReturn::error(s.watch); }
+            s.phase = PH_RUNNING;
             StepReturn::Continue
         }
-        ST_CREATE_EVENT => {
-            // Create an event object
-            let evt = (sys.provider_call)(-1, event::CREATE, core::ptr::null_mut(), 0);
-            if evt < 0 { return StepReturn::error(evt); }
-            s.event_handle = evt;
-            s.state = ST_SUBSCRIBE;
-            StepReturn::Continue
-        }
-        ST_SUBSCRIBE => {
-            // Ask GPIO contract to signal our event on either edge of the pin.
-            let args: [u8; 5] = [
-                3, // edge: 1=rising, 2=falling, 3=both
-                (s.event_handle as u32).to_le_bytes()[0],
-                (s.event_handle as u32).to_le_bytes()[1],
-                (s.event_handle as u32).to_le_bytes()[2],
-                (s.event_handle as u32).to_le_bytes()[3],
-            ];
-            let rc = (sys.provider_call)(
-                s.pin_handle, gpio::WATCH_EDGE,
-                args.as_ptr() as *mut u8, 5,
-            );
-            if rc < 0 { return StepReturn::error(rc); }
-            s.state = ST_RUNNING;
-            StepReturn::Continue
-        }
-        ST_RUNNING => {
-            // Poll event — only does work when GPIO edge detected
-            let fired = (sys.provider_call)(
-                s.event_handle, event::POLL,
-                core::ptr::null_mut(), 0,
-            );
-            if fired == 1 {
-                // Edge detected — read current level, emit control event
-                let level = (sys.provider_call)(s.gpio_pin as i32, gpio::GET_LEVEL, ...);
-                // ... debounce logic, emit to out_chan ...
+        PH_RUNNING => {
+            // An edge since the last poll; the poll takes it.
+            let ready = unsafe { dev_fd_poll(sys, s.watch, POLL_IN) };
+            if ready > 0 && ready & POLL_IN as i32 != 0 {
+                // read the level (gpio::GET_LEVEL), debounce, emit to out_chan
             }
             StepReturn::Continue
         }
-        _ => StepReturn::error(-1),
+        _ => StepReturn::error(errno::EINVAL),
     }
 }
 ```
 
-The module never runs in interrupt context. The kernel signals its event when a GPIO edge is detected. The scheduler steps the module in the same tick cycle. The module reads the pin level and processes the change as a normal cooperative state machine step.
+The module never runs in interrupt context. The doorbell latches its wake
+when an edge is detected, the wake pass steps it, and it reads the pin level
+and processes the change as a normal cooperative step.
 
 ## Litmus Test
 
@@ -425,18 +392,18 @@ The kernel does NOT provide:
 | `src/kernel/ipc/event.rs` | Event pool, create/signal/poll/destroy; IRQ binding stored per-event |
 | `src/kernel/ipc/handle.rs` | Native handle resolution (`resolve_owned`) and `fd_poll` / `fd_poll_multi` |
 | `src/kernel/ipc/timer.rs` | Timer slots and `timer_pump()` |
-| `crates/fluxor-abi/src/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
+| `crates/fluxor-abi/registry/registry.toml` | The `event` contract (`0x04`) and its ops, re-exported as `kernel_abi::event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` |
 | `crates/fluxor-abi/src/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
 | `src/kernel/module/syscalls.rs` | Event contract dispatch |
-| `src/platform/rp/io.rs` | `poll_gpio_edges()` and the per-pin edge bindings (RP) |
+| `src/platform/rp/io.rs` | `poll_gpio_edges()` and the per-pin edge watches (RP) |
+| `src/arch/aarch64/gic.rs` | `irq_bind`: the `BIND_IRQ` line table (aarch64) |
 | `src/kernel/exec/scheduler/pass.rs` | the pass engine: `pass::run` tick and wake passes, `take_domain_wakes()` |
 
 ## Limits
 
 | Resource | Default | Notes |
 |----------|---------|-------|
-| Event slots | 32 | `MAX_EVENTS` in `src/kernel/ipc/event.rs` |
-| Timer slots | 16 | `MAX_TIMERS` in `src/kernel/ipc/fd.rs` |
+| Event slots | 32 | `MAX_EVENTS` in `src/kernel/ipc/event.rs`: the plan's `events` pool, sized at boot (a static table on wasm) |
+| Timer slots | 16 | `MAX_TIMERS` in `src/kernel/ipc/timer.rs`: the plan's `timers` pool, sized at boot (a static table on wasm) |
 | Modules (wake mask) | Sized to `MAX_MODULES` per target | `ModuleMask` of 64-bit words, one bit per module slot |
-| IRQ source types | GPIO (type 0) | Extensible per HAL |
-| GPIO pins per binding | 1 event per pin, 1 pin per event | Enforced at `WATCH_EDGE` bind time |
+| GPIO edge watches | one watch handle per `WATCH_EDGE` on a claimed pin | closing the handle stops the detection |

@@ -1893,11 +1893,11 @@ fn build_workloads_counted(
             .get("modules")
             .and_then(|m| m.as_array())
             .ok_or_else(|| Error::Config(format!("workload {pi}: missing `modules:` array")))?;
-        // Deterministic workload_uid: 0xD0 marker + index (host composer / kernel both
+        // Deterministic owner_uid: 0xD0 marker + index (host composer / kernel both
         // treat the UID as opaque identity; uniqueness within the graph suffices).
-        let mut workload_uid = [0u8; 16];
-        workload_uid[0] = 0xD0;
-        workload_uid[1] = pi as u8;
+        let mut owner_uid = [0u8; 16];
+        owner_uid[0] = 0xD0;
+        owner_uid[1] = pi as u8;
         let mut name_to_local: HashMap<String, u8> = HashMap::new();
         let mut modules = Vec::new();
         // The workload's own instances (each under its local name) and
@@ -1924,8 +1924,8 @@ fn build_workloads_counted(
                 &format!("workload {pi} module '{mname}'"),
             )?;
             // PIC-only: a workload's modules are admitted via the loader by
-            // name_hash; a built-in has no .fmod for apply_add to load.
-            if crate::modules::is_builtin_module(mtype) {
+            // name_hash; a native module has no .fmod for apply_add to load.
+            if crate::modules::is_native_module(mtype) {
                 if WORKLOAD_NET_ENDS.contains(&mtype) {
                     return Err(Error::Config(format!(
                         "workload {pi} module '{mname}': `{mtype}` is the node's network, not a \
@@ -1934,7 +1934,7 @@ fn build_workloads_counted(
                     )));
                 }
                 return Err(Error::Config(format!(
-                    "workload {pi} module '{mtype}' is a kernel built-in; resident workloads are PIC-only \
+                    "workload {pi} module '{mtype}' is a native module; resident workloads are PIC-only \
                      (no .fmod for apply_add to load). Use a PIC module, or place it in the node graph."
                 )));
             }
@@ -2012,7 +2012,7 @@ fn build_workloads_counted(
             validate_variant_key(m, mname)?;
             let integers = integer_params(param_schema.as_ref());
             let params = if let Some(param_schema) = param_schema {
-                // tls / quic peer names: checked and packed as a base
+                // tls / quic peer names: checked and packed as a node
                 // graph's are, an `{env: NAME}` binding left for CREATE.
                 let declares = |key: &str| param_schema.find(key).is_some();
                 let m = &normalize_peer_names(mname, mtype, m.clone(), declares)?;
@@ -2192,7 +2192,7 @@ fn build_workloads_counted(
         )
         .map_err(|why| Error::Config(format!("workload {pi}: {why}")))?;
         workloads.push(crate::add_subgraph::Workload {
-            workload_uid,
+            owner_uid,
             state_cap,
             buffer_cap,
             graph,

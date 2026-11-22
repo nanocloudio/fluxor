@@ -31,7 +31,7 @@
 //! - `STORE` → `ENOSYS`. A non-extractable token cannot import an
 //!   external private key; `DESCRIBE_SUITE` reports a private length of 0
 //!   and no `IMPORT`, so consumers know to use `GENERATE`.
-//! - `TIER` → `PROCESS_HW`: a host process talking to a token isolates
+//! - `CUSTODY` → `PROCESS_HW`: a host process talking to a token isolates
 //!   the key from host-memory compromise to the extent the token does.
 //! - `OPEN_OR_GENERATE` / `OPEN` → `C_FindObjects` on the key's token
 //!   name, then — for `OPEN_OR_GENERATE` with nothing found — the
@@ -346,7 +346,7 @@ fn open_vault(module: &str, token: &TokenSelector, pin: &str) -> Result<HsmVault
 /// Activate the PKCS#11 backend if the environment configures one: register
 /// it behind the KEY_VAULT router. Returns `true` when it registered; on
 /// `false` the software backend serves everything alone (a consumer
-/// requiring hardware sees `TIER = SOFTWARE` and refuses — the vault never
+/// requiring hardware sees `CUSTODY = SOFTWARE` and refuses — the vault never
 /// silently overclaims).
 pub fn try_register_from_env() -> bool {
     let Some((module, token, pin)) = config_from_env() else {
@@ -357,7 +357,7 @@ pub fn try_register_from_env() -> bool {
         Err(e) => {
             log::error!(
                 "hsm_key_vault: PKCS#11 backend configured but unavailable ({e}); \
-                 KEY_VAULT stays on the kernel software backend (TIER=SOFTWARE)"
+                 KEY_VAULT stays on the kernel software backend (CUSTODY=SOFTWARE)"
             );
             return false;
         }
@@ -368,7 +368,7 @@ pub fn try_register_from_env() -> bool {
     }
     // SAFETY: platform boot, before any module runs.
     unsafe { crate::kernel::security::key_vault_router::register_hardware(hsm_key_vault_dispatch) };
-    log::info!("hsm_key_vault: PKCS#11 backend registered (module {module}, TIER=PROCESS_HW)");
+    log::info!("hsm_key_vault: PKCS#11 backend registered (module {module}, CUSTODY=PROCESS_HW)");
     true
 }
 
@@ -830,11 +830,11 @@ pub fn hsm_key_vault_dispatch(
             arg[..ds::LEN].copy_from_slice(&ds::encode(&r));
             ds::LEN as i32
         }
-        dev_key_vault::TIER => {
+        dev_key_vault::CUSTODY => {
             let Some(t) = arg.first_mut() else {
                 return EINVAL;
             };
-            *t = dev_key_vault::tier::PROCESS_HW;
+            *t = dev_key_vault::custody::PROCESS_HW;
             1
         }
         // Import is unavailable against a non-extractable token, which
@@ -1133,13 +1133,13 @@ pub fn hsm_key_vault_dispatch(
                     .map_or((0, false), |slot| (slot.usage, slot.persisted)),
                 Err(_) => return ERROR,
             };
-            // Reported beside the tier and meaning something else: a token
+            // Reported beside the custody and meaning something else: a token
             // object comes back in the next process; a session object does
             // not.
             let d = dev_key_vault::describe::Described {
                 suite: dev_key_vault::suite::P256,
                 usage,
-                tier: dev_key_vault::tier::PROCESS_HW,
+                custody: dev_key_vault::custody::PROCESS_HW,
                 persisted: u8::from(persisted),
             };
             let Some(out) = arg.get_mut(..dev_key_vault::describe::ARG_LEN) else {

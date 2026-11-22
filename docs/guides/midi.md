@@ -25,23 +25,18 @@ platform:
 
 Every variant exchanges the `input::midi` contract on its `events`
 ports: pre-decoded 4-byte channel-voice messages, carried on channels
-with content type `MidiEvents`. The per-target drivers are:
+with content type `MidiEvents`. The stack resolves:
 
-- `linux_alsa_midi` on the Linux host: an ALSA sequencer client.
-  `mode` follows the requested direction; `port_filter` matches an
-  ALSA `client:port` name (empty selects the first available match);
-  `client_name` names the client.
-- `wasm_browser_midi_in` / `wasm_browser_midi_out` in the browser,
-  over the Web MIDI API.
-- `usb_midi_host` on pico2w, picow, and pi5: a class-compliant
-  USB-MIDI host exposing a device's virtual cables as one logical
-  port.
+- `linux_alsa_midi` on the Linux host, with the params `mode` (following
+  the requested direction), `port_filter` (an ALSA `client:port` name;
+  empty selects the first match) and `client_name`;
+- `wasm_browser_midi_in` / `wasm_browser_midi_out` in the browser;
+- `usb_midi_host` on pico2w and pi5.
 
-Status: the stack's shape and vocabulary are final, but every variant
-currently resolves to a stub. Configs load and run cleanly (stubs
-drain their inputs so producers do not backpressure, and log a STUB
-marker on instantiation); real MIDI activity awaits each platform's
-integration.
+Every variant is a stub: no MIDI traffic flows. A stub registers so a
+graph that requests MIDI composes, loads and runs; it logs a `STUB`
+marker once, and a variant with an input port drains it every step so a
+producer wired to it never stalls on backpressure.
 
 ## Event handling
 

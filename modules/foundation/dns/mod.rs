@@ -1813,8 +1813,16 @@ unsafe fn ensure_do_bit(s: &DnsState, buf: *mut u8, pkt_len: usize, question_end
 /// key that is not base64 and a zone that is not a name each say so in the
 /// log; a numeric field that is not a number, and a key too long for
 /// `MAX_ANCHOR_RDATA`, are dropped without one. The algorithm and protocol
-/// are read as decimal and kept as the low byte.
+/// are read as decimal and kept as the low byte. An empty anchor, which is
+/// what an unset `dnssec_anchor` arrives as, is no anchor and says nothing.
 unsafe fn parse_dnssec_anchor(s: &mut DnsState, d: *const u8, len: usize) {
+    if len == 0
+        || core::slice::from_raw_parts(d, len)
+            .iter()
+            .all(|&b| b == b' ')
+    {
+        return;
+    }
     if RESOLVER {
         s.unserved = 1;
         return;

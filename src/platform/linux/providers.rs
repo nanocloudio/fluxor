@@ -2,7 +2,7 @@
 // Linux FS Provider — real file I/O via libc
 // ============================================================================
 
-use super::builtin_params::instance_state;
+use super::native_params::instance_state;
 use crate::abi::fence::{DeviceId, Fence};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::user_span::UserSpan;
@@ -116,7 +116,7 @@ fn free_slot_for(
     files: &[LinuxFileSlot],
     owner: crate::kernel::workload::owner::OwnerHandle,
 ) -> Option<usize> {
-    if !owner.is_system()
+    if !owner.is_node()
         && files
             .iter()
             .filter(|s| s.in_use && s.owner == owner)
@@ -1573,7 +1573,7 @@ pub fn linux_proc_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserS
             // owner acting with it spawn one, a workload never does. The
             // child is the spawning owner's, and goes with it.
             let owner = crate::kernel::exec::scheduler::caller_owner();
-            if !crate::kernel::exec::scheduler::caller_authority().is_system() {
+            if !crate::kernel::exec::scheduler::caller_authority().is_node() {
                 return errno::EACCES;
             }
             let line = match core::str::from_utf8(line) {
@@ -1686,7 +1686,7 @@ pub fn linux_proc_dispatch(handle: i32, opcode: u32, arg: &mut [u8], data: UserS
 }
 
 // ============================================================================
-// linux_net built-in module — channel-based net_proto framing via libc sockets
+// linux_net native module — channel-based net_proto framing via libc sockets
 // ============================================================================
 
 // The stream and datagram surfaces this provider serves
@@ -1749,7 +1749,7 @@ const CONN_TYPE_UDP_BOUND: u8 = 2;
 
 /// Connection slots (listeners + clients) when the graph does not set
 /// `max_conns`. The table is a heap `Vec` sized once at instantiation
-/// from the built-in's `max_conns` param, capped at
+/// from the native module's `max_conns` param, capped at
 /// `LINUX_NET_MAX_CONNS_CAP` because net_proto carries the slot index
 /// as `u16 LE`. A slot holds no buffer until a send backs up, so a large
 /// table of idle connections costs only the fixed per-slot fields.
@@ -1942,12 +1942,12 @@ struct AttachedLane {
 }
 
 /// linux_net keeps per-instance state in a `Box<LinuxNetState>` like
-/// every other host built-in. Two `linux_net` modules in one graph
+/// every other host native module. Two `linux_net` modules in one graph
 /// would each get their own connection table and channel handles —
 /// but they would still race for OS-level listen ports and fds. That's
 /// a config-time concern (don't bind two listeners on port 9000), not
 /// a state-aliasing one. Per-instance ownership matches the rest of
-/// the host built-in family and makes the dispatch path uniform.
+/// the host native module family and makes the dispatch path uniform.
 pub struct LinuxNetState {
     /// The slot the instance runs in.
     slot: usize,
@@ -2575,7 +2575,7 @@ static mut LINUX_NET_REGISTRY: Vec<*mut LinuxNetState> = Vec::new();
 /// where they are absent). The first instance is the node's net provider,
 /// the one a workload staged at runtime attaches its lanes to.
 pub fn build_linux_net(slot: usize, params: &[u8]) -> Result<Box<LinuxNetState>, i32> {
-    use super::builtin_params::{tlv_u32, walk_tlv};
+    use super::native_params::{tlv_u32, walk_tlv};
     use crate::abi::platform::native::linux::linux_net as tags;
     use crate::kernel::exec::scheduler;
     let mut net_ins = [-1i32; LINUX_NET_MAX_INBOUND];
@@ -2645,7 +2645,7 @@ pub fn build_linux_net(slot: usize, params: &[u8]) -> Result<Box<LinuxNetState>,
     Ok(state)
 }
 
-impl super::builtin_params::HostNative for LinuxNetState {
+impl super::native_params::HostNative for LinuxNetState {
     fn build(slot: usize, params: &[u8]) -> Result<Box<Self>, i32> {
         build_linux_net(slot, params)
     }
@@ -2653,7 +2653,7 @@ impl super::builtin_params::HostNative for LinuxNetState {
 
 /// The `linux_net` native module.
 pub static LINUX_NET: crate::kernel::exec::scheduler::NativeVtable =
-    super::builtin_params::host_vtable::<LinuxNetState>(
+    super::native_params::host_vtable::<LinuxNetState>(
         linux_net_step,
         crate::abi::platform::native::linux::linux_net::STATE_BYTES,
     );
@@ -3016,7 +3016,7 @@ fn linux_net_new_bind_refusal(
     protocol: u8,
     port: u16,
 ) -> Option<u8> {
-    if commander.is_system() {
+    if commander.is_node() {
         return None;
     }
     if !crate::kernel::exec::scheduler::owners_mut().authorize_admit(commander) {
@@ -3028,7 +3028,7 @@ fn linux_net_new_bind_refusal(
     }
     if crate::kernel::exec::scheduler::owners()
         .authority_of(commander)
-        .is_system()
+        .is_node()
     {
         return None;
     }
@@ -4740,7 +4740,7 @@ unsafe fn linux_net_refuse_oversized(
     }
 }
 
-/// One step of the built-in `linux_net` module.
+/// One step of the native module `linux_net` module.
 ///
 /// # Safety
 /// `state` is the module's per-instance arena, holding a `LinuxNetState`

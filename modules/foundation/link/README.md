@@ -8,47 +8,26 @@ Link — bidirectional audio/control transport over UART.
 - `mod.rs`
 - `params_def.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `audio_in` | input | `AudioSample` |  |
+| `audio_out` | output | `AudioSample` |  |
+| `ctrl_fwd` | output | `FmpMessage` |  |
+| `control` | ctrl_input | `FmpMessage` |  |
 
-[[ports]]
-name = "audio_in"
-direction = "input"
-content_type = "AudioSample"
-
-[[ports]]
-name = "audio_out"
-direction = "output"
-content_type = "AudioSample"
-
-[[ports]]
-name = "ctrl_fwd"
-direction = "output"
-content_type = "FmpMessage"
-
-[[ports]]
-name = "control"
-direction = "ctrl_input"
-content_type = "FmpMessage"
-
-[[resources]]
-requires_contract = "uart"
-access = "exclusive"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
-- `baud`
-- `block_size`
-- `jitter_depth`
-- `mode`
-- `pipeline_latency`
-- `uart_bus`
+- `uart_bus` (u8, default 0): UART bus.
+- `baud` (u32, default 3000000).
+- `block_size` (u16, default 512): samples per audio block.
+- `jitter_depth` (u8, default 3, clamped to 2–6): blocks of jitter buffer.
+- `pipeline_latency` (u16, default 1024): samples TX runs ahead of the master.
+- `mode` (u8, default 0): 0 = TX (audio from `audio_in` to the UART), 1 = RX
+  (audio from the UART to `audio_out`), 2 = both. A value above 2 reads as 0.
 
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01
+The module declares `deferred_ready`: TX reports Ready once its UART is
+configured, RX and bidirectional mode once the jitter buffer has filled.

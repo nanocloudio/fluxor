@@ -25,7 +25,7 @@
 //! placeholder lands as its own argv element:
 //!
 //! ```toml
-//! command = ["fluxor", "build", "${scenario.config}", "--emit=combined", "-o", "out.img"]
+//! command = ["fluxor", "build", "${scenario.config}", "--emit=firmware", "-o", "out.img"]
 //! ```
 //!
 //! The kernel hands the value to the executable as one `argv[i]` with
@@ -38,7 +38,7 @@
 //! ```toml
 //! command = [
 //!     "bash", "-c",
-//!     "fluxor build \"$1\" --emit=combined --firmware fw.bin -o out.img",
+//!     "fluxor build \"$1\" --emit=firmware --firmware fw.bin -o out.img",
 //!     "_",
 //!     "${scenario.config}",
 //! ]
@@ -177,7 +177,7 @@ config = "{path}"
             "fluxor".to_string(),
             "build".to_string(),
             "${scenario.config}".to_string(),
-            "--emit=combined".to_string(),
+            "--emit=firmware".to_string(),
             "-o".to_string(),
             "packed.img".to_string(),
         ];
@@ -249,7 +249,7 @@ config = "{path}"
         let cmd = vec![
             "bash".to_string(),
             "-c".to_string(),
-            "fluxor build ${scenario.config} --emit=combined --firmware fw.bin -o out.img"
+            "fluxor build ${scenario.config} --emit=firmware --firmware fw.bin -o out.img"
                 .to_string(),
         ];
         let err = substitute_command(&cmd, &scenario).unwrap_err();
@@ -294,14 +294,14 @@ config = "{path}"
         let cmd = vec![
             "bash".to_string(),
             "-c".to_string(),
-            "fluxor build \"$1\" --emit=combined --firmware fw.bin -o out.img".to_string(),
+            "fluxor build \"$1\" --emit=firmware --firmware fw.bin -o out.img".to_string(),
             "_".to_string(),
             "${scenario.config}".to_string(),
         ];
         let out = substitute_command(&cmd, &scenario).unwrap();
         assert_eq!(
             out[2],
-            "fluxor build \"$1\" --emit=combined --firmware fw.bin -o out.img"
+            "fluxor build \"$1\" --emit=firmware --firmware fw.bin -o out.img"
         );
         assert_eq!(out[3], "_");
         // Path with spaces is preserved verbatim — the shell will not

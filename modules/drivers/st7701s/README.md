@@ -9,30 +9,13 @@ ST7701S Display Driver PIC Module
 - `init_seq.rs`
 - `pio_programs.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `pixels` | input | `VideoRaster` |  |
 
-[[ports]]
-name = "pixels"
-direction = "input"
-content_type = "VideoRaster"
-required = false
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
-
-[[resources]]
-requires_contract = "pio"
-access = "exclusive"
-
-[[resources]]
-requires_contract = "timer"
-access = "write"
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
@@ -52,8 +35,3 @@ access = "write"
 - `source_rows`
 - `vsync_pin`
 - `width`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

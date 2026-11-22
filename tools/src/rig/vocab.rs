@@ -184,7 +184,7 @@ impl std::fmt::Display for Capability {
 pub const ARTIFACT_CLASSES: &[&str] = &[
     "uf2",
     "kernel8_img",
-    "boot_bundle",
+    "firmware_image",
     // A GPT disk image with one FAT ESP: the UEFI loader and the packed
     // kernel image. What a cloud or an emulator boots.
     "uefi_disk",
@@ -193,10 +193,10 @@ pub const ARTIFACT_CLASSES: &[&str] = &[
     "hosted_bundle",
 ];
 
-/// Every class but `boot_bundle` is one file; a recipe that produces a
-/// directory can only serve a bundle class.
+/// Every class but `firmware_image` is one file; a recipe that produces a
+/// directory can only serve a directory class.
 pub fn artifact_class_is_single_file(class: &str) -> bool {
-    class != "boot_bundle"
+    class != "firmware_image"
 }
 
 pub fn validate_artifact_class(s: &str) -> Result<()> {
@@ -231,7 +231,7 @@ mod tests {
             validate_artifact_class(class).unwrap();
             assert!(artifact_class_is_single_file(class));
         }
-        assert!(!artifact_class_is_single_file("boot_bundle"));
+        assert!(!artifact_class_is_single_file("firmware_image"));
     }
 
     #[test]
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn artifact_classes() {
         assert!(validate_artifact_class("uf2").is_ok());
-        assert!(validate_artifact_class("boot_bundle").is_ok());
+        assert!(validate_artifact_class("firmware_image").is_ok());
         assert!(validate_artifact_class("exe").is_err());
     }
 }

@@ -24,7 +24,7 @@
 //! recipient key agrees an envelope's secret inside its token; that secret
 //! crosses only bounded kernel scratch, zeroed on every path, into the
 //! software session key the reconstruction makes. The key made is reported
-//! as the software tier it is.
+//! as the software custody it is.
 
 use crate::abi::contracts::key_vault as kv;
 use crate::abi::errno::{EACCES, EINPROGRESS, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE};
@@ -142,9 +142,9 @@ unsafe fn route(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSpan<'_>
                 ENOENT
             }
         }
-        // The tier of the backend that holds the identity keys a node
+        // The custody of the backend that holds the identity keys a node
         // attests with; each key's own custody is its `DESCRIBE`.
-        kv::TIER => match hardware() {
+        kv::CUSTODY => match hardware() {
             Some(hw) => hw(handle, opcode, arg, data),
             None => software::provider_dispatch(handle, opcode, arg, data),
         },
@@ -564,7 +564,7 @@ unsafe fn attest_key(subject: i32, args: &[u8], out: &mut [u8]) -> i32 {
     let mut record = [0u8; a::RECORD_LEN];
     record[..4].copy_from_slice(&a::MAGIC);
     record[a::R_CHALLENGE..a::R_CHALLENGE + 32].copy_from_slice(&args[..32]);
-    record[a::R_TIER] = d.tier;
+    record[a::R_CUSTODY] = d.custody;
     record[a::R_PERSISTED] = u8::from(d.persisted != kv::persisted::NO);
     record[a::R_SUITE..a::R_SUITE + 2].copy_from_slice(&d.suite.to_le_bytes());
     record[a::R_USAGE..a::R_USAGE + 4].copy_from_slice(&d.usage.to_le_bytes());
@@ -593,7 +593,7 @@ unsafe fn attest_key(subject: i32, args: &[u8], out: &mut [u8]) -> i32 {
         record[a::R_COMMITMENT..a::R_COMMITMENT + 32].copy_from_slice(&facts.commitment);
         record[a::R_THUMBPRINT..a::R_THUMBPRINT + 32].copy_from_slice(&facts.public_thumbprint);
     }
-    let Some(composition) = software::composition_digest(d.tier) else {
+    let Some(composition) = software::composition_digest(d.custody) else {
         return ENOMEM;
     };
     record[a::R_COMPOSITION..a::R_COMPOSITION + 32].copy_from_slice(&composition);
@@ -602,7 +602,7 @@ unsafe fn attest_key(subject: i32, args: &[u8], out: &mut [u8]) -> i32 {
 }
 
 /// `ATTEST_COMPOSITION` with a hardware signer: the kernel's composition
-/// record, ending in the hardware tier, its SHA-256 signed inside the token.
+/// record, ending in the hardware custody, its SHA-256 signed inside the token.
 ///
 /// # Safety
 /// As [`route`].
@@ -627,7 +627,7 @@ unsafe fn attest_composition(signer: i32, args: &mut [u8], out: &mut [u8]) -> i3
     let Some(challenge) = a::parse(args) else {
         return EINVAL;
     };
-    let Some(record) = software::composition_record(&challenge, d.tier) else {
+    let Some(record) = software::composition_record(&challenge, d.custody) else {
         return ENOMEM;
     };
     let need = record.len() + sig_len;

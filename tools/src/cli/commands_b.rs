@@ -152,7 +152,7 @@ fn cmd_validate(
             // The hosted builds compile the config with no module
             // capabilities (`cmd_generate`), the packed images with them.
             let packed_image = !matches!(target_desc.family.as_str(), "linux" | "wasm");
-            if let Err(e) = check_ring_demand_unbuilt(
+            if let Err(e) = check_arenas_unbuilt(
                 &config,
                 &blob,
                 &modules_dir,
@@ -198,14 +198,16 @@ fn cmd_validate(
     }
 }
 
-/// The buffer-arena check of `fluxor build`, for a graph whose `.fmod`s may
-/// not be at hand. With them it is the build's own check: what the loader
-/// would hold for each, over `blob` — or, for a packed image
-/// (`packed_image`), the config compiled again with their capabilities, as
-/// the image build compiles it (in-place chains grouped). Without them, the
-/// source manifests stand in, every module counted as not mailbox-safe, so no
-/// ring is aliased: the sum is then an upper bound.
-fn check_ring_demand_unbuilt(
+/// The arena checks of `fluxor build` ([`check_arenas`]), for a graph whose
+/// `.fmod`s may not be at hand. With them (and the fans its composed graphs
+/// run) it is the build's own check: what the kernel would carve for each, and
+/// what the loader would hold for each over `blob` — or, for a packed image
+/// (`packed_image`), the config compiled again with their capabilities, as the
+/// image build compiles it (in-place chains grouped). Without them there is no
+/// state figure to charge, so only the rings are checked, the source
+/// manifests standing in, every module counted as not mailbox-safe, so no ring
+/// is aliased: the sum is then an upper bound.
+fn check_arenas_unbuilt(
     config: &serde_json::Value,
     blob: &[u8],
     modules_dir: &Path,
@@ -215,14 +217,16 @@ fn check_ring_demand_unbuilt(
     packed_image: bool,
 ) -> Result<()> {
     let store_fb = store_cli::lock_store_resolver(project_root, target.module_abi(), None);
-    if let Ok(packed) = parse_modules_from_config_multi(
-        config,
-        modules_dir,
-        extra_dirs,
-        store_fb.as_deref().map(|f| f as _),
-    ) {
+    let store = || store_fb.as_deref().map(|f| f as _);
+    let built = parse_modules_from_config_multi(config, modules_dir, extra_dirs, store())
+        .and_then(|mut packed| {
+            let fans = config::fan_types(blob)?;
+            crate::modules::add_fan_modules(&mut packed, &fans, modules_dir, extra_dirs, store())?;
+            Ok(packed)
+        });
+    if let Ok(packed) = built {
         if !packed_image {
-            return check_ring_demand(config, blob, &packed, target, extra_dirs, project_root);
+            return check_arenas(config, blob, &packed, target, extra_dirs, project_root);
         }
         let caps: Vec<ModuleCaps> = packed
             .iter()
@@ -244,7 +248,7 @@ fn check_ring_demand_unbuilt(
             Some(&target.id),
             project_root,
         )?;
-        return check_ring_demand(
+        return check_arenas(
             config,
             &recompiled,
             &packed,
@@ -1354,9 +1358,9 @@ fn module_table_bytes(
         &[],
         store_fb.as_deref().map(|f| f as _),
     )?;
-    // All-builtin configs (e.g. linux_display + host_image_codec) leave
-    // `modules` empty; emit a valid 16-byte header-only table so the
-    // host loader sees module_count=0 and instantiates only built-ins.
+    // A config of native modules only (e.g. linux_display + host_image_codec)
+    // leaves `modules` empty; emit a valid 16-byte header-only table so the
+    // host loader sees module_count=0 and instantiates only native modules.
     let programs = crate::modules::collect_programs(&config)?;
     let table = crate::modules::build_module_table_with_programs(&modules, &programs)?;
     Ok((
@@ -1528,7 +1532,7 @@ fn build_one_from(
             }
             "linux" => {
                 let mut p = PathBuf::from(format!("target/linux/{name}"));
-                p.push("graph.img");
+                p.push("node.img");
                 p
             }
             "wasm" => {

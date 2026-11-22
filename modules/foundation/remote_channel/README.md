@@ -13,6 +13,33 @@ module authenticates and encrypts nothing itself.
 Sources: `mod.rs` (behaviour), `wire.rs` (the protocol), `manifest.toml`
 (ports and parameters).
 
+## Parameters
+
+The manifest's parameter table states each in full.
+
+| Tag | Name | Default | Meaning |
+|---|---|---|---|
+| 1 | `transport` | `net` | `net`: `net_proto` toward the clear side of `tls`; `mux`: the mux contract toward `quic`, one stream per channel |
+| 2 | `role` | `listen` | `net` only: `listen` binds `port`; `dial` connects to `authority` and redials after a close |
+| 3 | `port` | 9100 | `listen`: the port bound |
+| 4 | `authority` | — | `dial`: `host[:port]` (port 9100 when omitted), at most 128 bytes |
+| 5 | `channels` | — | The channel table ([Channels](#channels)); may be empty with `exchange` set |
+| 6 | `require_peer` | 1 | A session is used only once the transport's peer identity binds, and belongs to that peer |
+| 7 | `redial_ms` | 1000 | `dial`: wait after a close or a failed dial |
+| 8 | `exchange` | `none` | `near`, `far` or `none` ([Exchange endpoint](#exchange-endpoint)) |
+| 9 | `resume` | 0 | 1: number, retain and resume records across sessions ([Resume](#resume)) |
+| 10 | `window` | 0 | `resume`: retained bytes per channel; 0 is four records at the channel's maximum |
+| 11 | `keepalive_ms` | 1000 | `resume`: idle acknowledgement period; three silent periods end the session. 0: never |
+| 12 | `sessions` | 1 | `net` `listen`: sessions served at once, 1..=`SESSIONS_MAX` |
+| 13 | `peer_tag` | 0 | 1: every local record carries a 32-byte peer fingerprint prefix |
+| 14 | `retain_ms` | derived | `resume` with several sessions: how long a peer with no session keeps its slot |
+
+A session that has not bound its peer and exchanged tables 10 s after the
+transport session came up is closed. Each channel's reassembly ring (and,
+under `resume`, its retained window) is carved per session from
+`REASSEMBLY_BYTES` (1 MiB on aarch64, 256 KiB on wasm, 32 KiB on an MCU); an
+instance that does not fit is refused at construction.
+
 ## Channels
 
 The `channels` table, `content_type:framing:max_record;…`, names each
@@ -44,7 +71,7 @@ so a stalled consumer holds up its own channel and no other, and nothing is
 dropped under backpressure. A record whose sending had begun when its
 session ended is lost and counted; one not yet begun waits for the next
 session. The `session` output says when a session opens and ends
-(`contracts/mesh/remote_session.rs`).
+(`crates/fluxor-abi/src/contracts/mesh/remote_session.rs`).
 
 ## Sessions
 
@@ -88,8 +115,8 @@ every peer whose streams are held (with `peer_tag`, the one its prefix
 names), and is taken off the input only once every one of them has room: a
 peer gone holds the channel once its window is full, for at most
 `retain_ms`. A peer with no session for `retain_ms` (by default 30 × the
-larger of `keepalive_ms` and `redial_ms`, at least 30 s; 0 keeps it for
-ever) gives its slot and retained streams up (`peers_expired`): what was
+larger of `keepalive_ms` and `redial_ms`, at least 30 s, `RETAIN_FLOOR_MS`;
+0 keeps it for ever) gives its slot and retained streams up (`peers_expired`): what was
 retained for it, and a record being taken for it, is counted `lost`, and the
 channel's input goes on to the peers still held — or, with none held, waits
 for the next. A new peer finding every slot held takes the slot of the peer

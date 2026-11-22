@@ -78,11 +78,10 @@ Each silicon target has its own HAL implementation under `src/platform/`:
 
 | Target | Platform file | Runtime model |
 |--------|--------------|---------------|
-| RP2040 | `src/platform/rp.rs` | Cortex-M0+; synchronous step loop |
-| RP2350 | `src/platform/rp.rs` | Cortex-M33; synchronous step loop |
-| BCM2712 | `src/platform/bcm2712.rs` | Synchronous polling (Cortex-A76, EL1) |
-| Pi 5 | `src/platform/bcm2712.rs` (board overlay) | Synchronous polling |
-| UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo` at EL1 or EL2 (aarch64); execution domain N on the Nth core it starts, a pass per tick |
+| RP2040 | `src/platform/rp.rs` | Cortex-M0+; one synchronous loop runs every domain |
+| RP2350 | `src/platform/rp.rs` | Cortex-M33; one synchronous loop runs every domain |
+| BCM2712 (Pi 5, QEMU `virt`) | `src/platform/bcm2712.rs` | Cortex-A76 at EL1; one domain loop per core, domain d on core d |
+| UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo` at EL1 or EL2 (aarch64); one domain loop per core, domain d on core d |
 
 The two RP families share `rp.rs` because both run on a Cortex-M core with
 the same peripheral families. The two bcm2712 boards share `bcm2712.rs`:
@@ -184,11 +183,11 @@ polling.
 
 ```rust
 // Acquire a pin as an input with pull-up
-let mut arg = [pin_number, GPIO_PULL_UP];
-let handle = (sys.provider_open)(HAL_GPIO, gpio::SET_INPUT, arg.as_mut_ptr(), 2);
+let arg = [pin_number, GPIO_PULL_UP];
+let handle = (sys.provider_open)(GPIO, gpio::SET_INPUT, arg.as_ptr(), 2);
 
 // Read the level
-let level = (sys.provider_call)(handle, gpio::GET_LEVEL, null, 0);
+let level = (sys.provider_call)(handle, gpio::GET_LEVEL, null_mut(), 0, null_mut(), 0);
 ```
 
 The HAL on each target is responsible for the actual MMIO writes that
@@ -202,10 +201,11 @@ frequency, mode) comes from the config; modules open a handle to a
 configured bus and a CS pin, then issue transfers.
 
 ```rust
-let mut spi = SpiOpenArgs { bus, cs_handle, freq_hz, mode };
-let handle = (sys.provider_open)(HAL_SPI, spi::OPEN, &mut spi as *mut _ as *mut u8,
-                            core::mem::size_of::<SpiOpenArgs>());
-(sys.provider_call)(handle, spi::TRANSFER, transfer_args, args_len);
+let handle = (sys.provider_open)(SPI, spi::OPEN, open_arg.as_ptr(), open_arg.len());
+// arg: the transfer's flat record; data: the bytes it moves
+(sys.provider_call)(handle, spi::TRANSFER_START, arg.as_mut_ptr(), arg.len(),
+                    buf.as_mut_ptr(), buf.len());
+// a later step: spi::TRANSFER_POLL until it completes
 ```
 
 Async transfers use start/poll: the module starts a DMA-backed transfer,
@@ -221,20 +221,21 @@ device addresses on a configured bus.
 
 ### PIO
 
-Programmable I/O state machines (RP2040, RP2350 only). The HAL exposes
-two distinct services:
+Programmable I/O state machines (RP2040, RP2350 only), served by the
+`pio_rp` provider module over the RP raw register bridges
+(`abi::platform::rp::pio`). It exposes two distinct services:
 
 - **PIO stream**: double-buffered DMA streaming for protocols where the
-  state machine consumes a continuous data feed (I2S audio, WS2812 LEDs,
-  CYW43 gSPI bursts). The kernel manages the double-buffer flip and
-  surfaces `StreamTime` for synchronisation.
+  state machine consumes a continuous data feed (I2S audio, WS2812 LEDs).
+  The PIO provider (`pio_rp`) manages the double-buffer flip and answers
+  `STREAM_TIME` for synchronisation.
 
 - **PIO command**: bidirectional transfers where the state machine sends
   a command and reads a response (gSPI for the cyw43 module, custom
   protocols).
 
-PIO programs are compiled into the module that uses them — the HAL just
-loads bytes into the instruction memory and starts the state machine.
+PIO programs are compiled into the module that uses them — the provider
+just loads bytes into the instruction memory and starts the state machine.
 
 On targets without PIO (BCM2712, Pi 5), modules that depend on PIO are
 declared incompatible at config-validation time and the build fails with
@@ -249,10 +250,11 @@ are declared in the config and brought up before module instantiation.
 
 ### Timers
 
-Monotonic millisecond and microsecond clocks via `millis()`, `micros()`,
-and `stream_time()`. Async delays use `timer_start` / `timer_poll`
-sequences. The HAL on each silicon backs these with the chip's own
-timer hardware.
+Monotonic millisecond and microsecond clocks (`timer::MILLIS`,
+`timer::MICROS`) and the stream clock (`STREAM_TIME`). A delay is a timer
+handle (`timer::CREATE`, `SET`) that polls ready when it fires (see
+[events.md](events.md#timers)). The HAL on each silicon backs these with
+the chip's own timer hardware.
 
 ### DMA
 
@@ -295,42 +297,11 @@ Source: `crates/fluxor-abi/src/kernel_abi.rs`
 
 The syscall table (`SyscallTable`) is a `#[repr(C)]` struct of
 function pointers passed to each module at `module_init`. It is the
-only ABI surface PIC modules see.
-
-The table contains exactly:
-
-| Group | Functions |
-|-------|----------|
-| Channel I/O | `channel_read`, `channel_write`, `channel_poll`, `channel_peek`, `channel_discard` |
-| Heap | `heap_alloc`, `heap_free`, `heap_realloc` |
-| Provider dispatch | `provider_open`, `provider_call`, `provider_query`, `provider_close` |
-
-Channel I/O and heap are hot-path typed syscalls. Everything else
-routes through the `provider_*` entries:
-
-- `provider_open(contract, open_op, config, len)` returns a handle
-  bound to that contract. The kernel tracks the handle → contract
-  mapping in a per-scheduler-reset table.
-- `provider_call(handle, op, arg, len)` routes through the bound
-  contract's vtable. For handle=-1 global operations and untracked
-  handles, the opcode's high byte carries the contract id and
-  dispatch routes directly through the class chain.
-- `provider_open(contract, kernel::BIND, arg)` binds one provider of a
-  contract: `[NAME][len][name]` an instance-keyed layer (for example a
-  volume name on the storage surface), or, for the reserved name
-  `platform`, the platform's own provider beneath every module layer;
-  `[PORT][port_type][index]` the module at the other end of one of the
-  caller's ports, for an edge contract. Every op through the bound
-  handle reaches that provider, and a handle one mints is returned
-  routed, so later ops on it reach the provider that minted it; a handle
-  minted elsewhere is refused (`EBADF`).
-- `provider_query(handle, key, out, len)` reads introspection state.
-- `provider_close(handle)` invokes the contract's default close
-  opcode (if any) and releases the tracking entry.
-
-The `provider_*` set is the complete dispatch API. See
-[abi_layers.md](abi_layers.md) for the contract inventory and opcode
-namespace.
+only ABI surface PIC modules see: direct channel I/O, the per-module
+heap, and the four `provider_*` entries through which every other
+operation is dispatched by handle. [abi_layers.md](abi_layers.md#kernel-primitives--kernel_abi)
+lists the table and the six-word `provider_call` convention; the contract
+inventory and opcode namespace follow it there.
 
 ## What the Kernel Owns vs What Modules Own
 
@@ -365,49 +336,34 @@ that talks PIO and exchanges Ethernet frames over a channel.
 
 ## Module Examples
 
-### Driver Module: WS2812 (RP2350)
+### Driver Module: a WS2812 strip (sketch)
 
-The WS2812 driver compiles a small PIO program into a module, claims a
-GPIO pin, configures the PIO stream service, and pushes 32-bit color
-values:
+A WS2812 driver compiles a small PIO program into the module, claims a
+GPIO pin, configures a PIO stream, and pushes 32-bit colour values:
 
 ```rust
-// PIO program produces WS2812 timing from 24-bit GRB words
-static WS2812_PROGRAM: [u16; 4] = [ /* compiled instructions */ ];
+// PIO program producing WS2812 timing from 24-bit GRB words
+const WS2812_PROGRAM: [u16; 4] = [ /* compiled instructions */ ];
 
-fn module_new(...) -> i32 {
-    // Claim the pin
-    let mut pin_arg = [pin, 0];
-    (sys.provider_open)(HAL_GPIO, gpio::SET_OUTPUT, pin_arg.as_mut_ptr(), 2);
+// module_new: claim the pin, allocate a stream, load and configure it.
+let pin_arg = [pin];
+s.pin = (sys.provider_open)(GPIO, gpio::SET_OUTPUT, pin_arg.as_ptr(), 1);
+s.stream = (sys.provider_open)(PIO, pio::STREAM_ALLOC, null(), 0);
+(sys.provider_call)(s.stream, pio::STREAM_LOAD_PROGRAM, prog_arg.as_mut_ptr(), prog_arg.len(),
+                    program_bytes.as_mut_ptr(), program_bytes.len());
+(sys.provider_call)(s.stream, pio::STREAM_CONFIGURE, cfg.as_mut_ptr(), cfg.len(),
+                    null_mut(), 0);
 
-    // Allocate a PIO stream (provider_open tracks stream → HAL_PIO
-    // so subsequent provider_call(stream, …) routes via the PIO vtable).
-    let stream = (sys.provider_open)(HAL_PIO, pio::STREAM_ALLOC, null, 0);
-    (sys.provider_call)(stream, pio::LOAD_PROGRAM,
-                   WS2812_PROGRAM.as_ptr() as *mut u8,
-                   WS2812_PROGRAM.len() * 2);
-
-    // Configure clock divider, pin, and FIFO mode
-    let mut cfg = PioConfig { /* ... */ };
-    (sys.provider_call)(stream, pio::CONFIGURE, &mut cfg as *mut _ as *mut u8,
-                   core::mem::size_of::<PioConfig>());
-    0
-}
-
-fn module_step(state: *mut u8) -> StepReturn {
-    // Read color values from input channel and push to PIO
-    let n = (sys.channel_read)(in_chan, color_buf.as_mut_ptr(), buf_max);
-    if n > 0 {
-        (sys.provider_call)(stream, pio::PUSH, color_buf.as_ptr(), n as usize);
-    }
-    StepReturn::Continue
+// module_step: move colours from the input channel to the stream.
+let n = (sys.channel_read)(s.in_chan, buf.as_mut_ptr(), buf.len());
+if n > 0 {
+    (sys.provider_call)(s.stream, pio::STREAM_PUSH, null_mut(), 0, buf.as_mut_ptr(), n as usize);
 }
 ```
 
 The same module compiles and runs unchanged on RP2040 (Cortex-M0+) and
-RP2350 (Cortex-M33), and on any RP part with PIO. It would not run
-on BCM2712 because BCM2712 has no PIO peripheral — and the config
-validator catches this at build time, not at runtime.
+RP2350 (Cortex-M33). It cannot be placed on BCM2712, which has no PIO
+peripheral, and the composer refuses that graph at build time.
 
 ### Driver Module: ST7701S display (RP2350 + BCM2712)
 

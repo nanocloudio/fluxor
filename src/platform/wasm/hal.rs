@@ -248,7 +248,7 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     // as `HostReadable`, which is a stronger claim than the truth. bcm2712
     // has OTP fuses that could back `DeviceUnique` — claiming it requires
     // actually deriving from them, and a provenance that overstates itself
-    // raises a vault's isolation tier and with it what a deployment
+    // raises a vault's custody and with it what a deployment
     // believes about keys it has not protected.
     seal_provenance: || crate::kernel::sys::hal::SealProvenance::None,
     signing_root: crate::kernel::security::root::image_root,

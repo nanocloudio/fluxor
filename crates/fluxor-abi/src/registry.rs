@@ -282,7 +282,7 @@ pub mod key_vault {
     pub const DESTROY: u32 = 0x0504;
     pub const GENERATE: u32 = 0x0505;
     pub const PUBLIC: u32 = 0x0506;
-    pub const TIER: u32 = 0x0507;
+    pub const CUSTODY: u32 = 0x0507;
     pub const OPEN_OR_GENERATE: u32 = 0x0508;
     pub const OPEN: u32 = 0x0509;
     pub const DESTROY_BY_LABEL: u32 = 0x050a;

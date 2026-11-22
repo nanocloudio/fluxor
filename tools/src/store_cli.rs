@@ -1,5 +1,5 @@
 //! CLI glue for the local OCI artifact store: `fluxor publish
-//! bundle|stack|image|firmware|workload` and `fluxor store
+//! package|stack|node|firmware|workload` and `fluxor store
 //! ls|rm|snapshot|push|pull|adopt|fsck|gc`. Project artifacts
 //! publish through `fluxor publish` (`fluxor_tools::store_publish`), and
 //! read-only artifact display is `fluxor inspect <ref>`.
@@ -163,9 +163,9 @@ fn provenance_flag(published: bool) -> &'static str {
     }
 }
 
-// ── fluxor publish bundle ─────────────────────────────────────────────
+// ── fluxor publish package ────────────────────────────────────────────
 
-/// `fluxor publish bundle <dir | workload.toml>`.
+/// `fluxor publish package <dir | workload.toml>`.
 ///
 /// A source manifest is checked where the sweep finds it
 /// (`packaging/<service|applet>/<name>/workload.toml`) and emitted first.
@@ -311,7 +311,7 @@ pub fn cmd_package_publish(
         .map_err(|e| Error::Config(e.to_string()))?;
     if !report.is_empty() {
         eprint!(
-            "\npublish bundle {ref_name} — displacement report{}",
+            "\npublish package {ref_name} — displacement report{}",
             oci_store::render_displacement(&report)
         );
     }
@@ -439,7 +439,7 @@ pub fn cmd_stack_publish(
     Ok(())
 }
 
-// ── fluxor publish image|firmware ─────────────────────────────────────
+// ── fluxor publish node|firmware ──────────────────────────────────────
 
 /// Publish a device artifact (node image / firmware image). For a
 /// node image the FXSL header supplies epoch + ABI pin, mirrored into
@@ -471,7 +471,7 @@ pub fn cmd_device_artifact_publish(
             || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != FXSL_MAGIC
         {
             return Err(Error::Config(format!(
-                "{} is not a node image (missing FXSL header) — build it with `fluxor build <config> --emit=image`",
+                "{} is not a node image (missing FXSL header) — build it with `fluxor build <config> --emit=node`",
                 file.display()
             )));
         }

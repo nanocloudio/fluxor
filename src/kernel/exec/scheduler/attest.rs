@@ -15,11 +15,11 @@
 //!                      [name_hash u32][domain u8][params_sha256 32]
 //! [edge_count u16]     per graph edge, config order:
 //!                      [from_id u16][from_port u8][to_id u16][to_port_kind u8][to_port u8]
-//! [vault_tier u8]
+//! [vault_custody u8]
 //! ```
 //!
 //! The vault signs it (`KEY_VAULT::ATTEST_COMPOSITION`) and reports the
-//! tier its key is held at, so the signature's meaning travels with it:
+//! custody its key is held at, so the signature's meaning travels with it:
 //! `DEVICE_HW` says this hardware runs this closure; `SOFTWARE` says a
 //! process that could be read runs it. The **composition digest** is the
 //! SHA-256 of the record with the challenge zeroed — the stable identity a
@@ -81,12 +81,12 @@ fn put(out: &mut [u8], pos: &mut usize, bytes: &[u8]) -> bool {
 }
 
 /// Write the record for `challenge` into `out`, returning its length;
-/// `None` when `out` is too small. `tier` is the vault's answer for the
+/// `None` when `out` is too small. `custody` is the vault's answer for the
 /// key that will sign it.
 ///
 /// Costs one SHA-256 pass over every loaded module blob, so it is made at
 /// activation, not per request.
-pub fn write_record(challenge: &[u8; 32], tier: u8, out: &mut [u8]) -> Option<usize> {
+pub fn write_record(challenge: &[u8; 32], custody: u8, out: &mut [u8]) -> Option<usize> {
     let mut pos = 0usize;
     if !put(out, &mut pos, &MAGIC) || !put(out, &mut pos, &[VERSION]) {
         return None;
@@ -190,7 +190,7 @@ pub fn write_record(challenge: &[u8; 32], tier: u8, out: &mut [u8]) -> Option<us
         i += 1;
     }
 
-    if !put(out, &mut pos, &[tier]) {
+    if !put(out, &mut pos, &[custody]) {
         return None;
     }
     Some(pos)
@@ -212,7 +212,7 @@ pub fn composition_digest_of(record: &[u8]) -> [u8; 32] {
 
 /// This composition's digest, as a peer's attestation of it would carry.
 /// `None` when the record cannot be built.
-pub fn composition_digest(tier: u8, scratch: &mut [u8]) -> Option<[u8; 32]> {
-    let len = write_record(&[0u8; 32], tier, scratch)?;
+pub fn composition_digest(custody: u8, scratch: &mut [u8]) -> Option<[u8; 32]> {
+    let len = write_record(&[0u8; 32], custody, scratch)?;
     Some(composition_digest_of(&scratch[..len]))
 }

@@ -50,8 +50,8 @@ use crate::rig::matcher;
 use crate::rig::plan::{ArtifactPlan, Plan, DEFAULT_ACTUATOR_TIMEOUT_S};
 use crate::rig::profile::{BindingTable, BindingValue, RigProfile};
 use crate::rig::record::{
-    hash_artifact_bundle, hash_artifact_file, ActuatorRecord, GitIdentity, RunRecord,
-    TeardownRecord, Verdict,
+    hash_artifact_dir, hash_artifact_file, ActuatorRecord, GitIdentity, RunRecord, TeardownRecord,
+    Verdict,
 };
 use crate::rig::vocab::{Capability, Surface};
 
@@ -189,7 +189,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     record.artifact_git = project_root_of(plan).and_then(GitIdentity::probe);
     record.artifact_sha256 = match &built {
         Some(ArtifactOutput::File(path)) => hash_artifact_file(path).ok(),
-        Some(ArtifactOutput::Bundle(root)) => hash_artifact_bundle(root).ok(),
+        Some(ArtifactOutput::Dir(root)) => hash_artifact_dir(root).ok(),
         None => plan.run_record.artifact_sha256.clone(),
     };
 
@@ -1438,12 +1438,12 @@ fn if_final(outcome: matcher::MatcherOutcome) -> Option<MatchOutcome> {
 
 enum ArtifactOutput {
     File(PathBuf),
-    Bundle(PathBuf),
+    Dir(PathBuf),
 }
 
 fn project_root_of(plan: &Plan) -> Option<&Path> {
     match &plan.artifact {
-        ArtifactPlan::File { project_root, .. } | ArtifactPlan::Bundle { project_root, .. } => {
+        ArtifactPlan::File { project_root, .. } | ArtifactPlan::Dir { project_root, .. } => {
             Some(project_root)
         }
         ArtifactPlan::Unresolved { .. } => None,
@@ -1465,11 +1465,11 @@ fn run_build(
             project_root,
             path,
         } => (command, project_root, ArtifactOutput::File(path.clone())),
-        ArtifactPlan::Bundle {
+        ArtifactPlan::Dir {
             command,
             project_root,
             root,
-        } => (command, project_root, ArtifactOutput::Bundle(root.clone())),
+        } => (command, project_root, ArtifactOutput::Dir(root.clone())),
         ArtifactPlan::Unresolved { reason } => {
             return Err(Error::Config(format!(
                 "rig run: cannot build — artifact is unresolved: {reason}"
@@ -1578,7 +1578,7 @@ fn merge_tables(base: &mut toml::Table, over: &toml::Table) {
 fn plan_artifact_to_output(plan: &Plan) -> Option<ArtifactOutput> {
     match &plan.artifact {
         ArtifactPlan::File { path, .. } => Some(ArtifactOutput::File(path.clone())),
-        ArtifactPlan::Bundle { root, .. } => Some(ArtifactOutput::Bundle(root.clone())),
+        ArtifactPlan::Dir { root, .. } => Some(ArtifactOutput::Dir(root.clone())),
         ArtifactPlan::Unresolved { .. } => None,
     }
 }

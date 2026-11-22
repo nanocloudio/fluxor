@@ -11,7 +11,7 @@ graph config into a concrete driver-and-foundation module graph.
 
 This architecture defines:
 
-- the four declaration fields in a module's `manifest.toml`
+- the declaration fields in a module's `manifest.toml`
 - port content types and the on-wire content-type byte table
 - the capability registry (`capabilities = [...]`)
 - the provider-contract and provider-surface registries
@@ -48,7 +48,7 @@ declarable and checkable.
 
 Source: `tools/src/manifest.rs`, `contracts/src/vocabulary.rs`.
 
-A module's `manifest.toml` separates four concerns into four fields:
+A module's `manifest.toml` declares its surfaces in these fields:
 
 - top-level `provides = [...]` — services or storage surfaces this module
   offers to consumers. Validated against the registry's manifest contracts plus
@@ -210,8 +210,8 @@ Every content type carries a default rate class — `control`, `audio`,
 `video`, `bulk`, or `transaction` — describing the sustained-throughput
 demand of a stream. A wiring edge can override the default with a `rate:`
 key. The config compiler validates each edge's granted ring against its
-class floor at build time, and the kernel derives per-step pump budgets
-from the class.
+class floor at build time, and the scheduler derives each input port's
+per-step consumption budget from the class.
 
 ## Capability Registry
 
@@ -292,14 +292,6 @@ model these support):
 | `transport.anchor.datagram` | Stable datagram-facing anchor |
 | `transport.anchor.mux` | Stable multiplexed-session anchor. quic declares `aead = "on_wire_sequence"` |
 
-The transport and anchor branches name different roles, and one module may
-carry both. `quic` declares `transport.mux.quic` and `transport.anchor.mux`
-because its connection state is both at once: the mux that migrates
-natively when the peer changes address, and the anchor that owns the
-client-visible transport. The two branches are siblings under `transport`,
-so neither satisfies the other; a rule that needs the mux asks for
-`transport.mux`, and a module that is the mux says so, rather than an
-anchor role standing in for a transport it may not carry.
 | `session.worker` | Movable session / application worker |
 | `session.directory` | Placement and continuity metadata service |
 | `session.resume` | Resumable session state support. Facts `scope` (`local`: the ticket names state only the minting host holds; `fleet`: the ticket is the state, sealed under a vault key any admitted host with that generation opens) and `early_data` (`off`, or `local_single_use` against the minting host's single-use record). quic declares `local` / `local_single_use` |
@@ -308,6 +300,15 @@ anchor role standing in for a transport it may not carry.
 | `security.key_wrap` | Session-key custody wrapped under a KEK the storage layer cannot read |
 | `fence.enforceable` | Emission fence for a local address: after the fence answers, nothing sourced from the address is handed onward, and ARP for it is not answered. Fact `cutoff`: `ring_handoff` (the ip module's boundary — frames already in the driver ring may still leave) or `wire` (the driver drained on request and reported its completed transmit count). Provided by `ip` over the `net::identity` `ADDR_FENCE` verb with a per-install token minted from the CSPRNG and the boot incarnation; the manifest declares `ring_handoff` and the composer raises it to `wire` on a target whose NIC driver answers the `tx_drain` query (bcm2712). An out-of-band fence agent — a member placed on another node whose cut is power or the fabric port, `modules/fixtures/fence_agent/` being the reference — answers the same verbs and declares `wire` for itself |
 | `durable.rpo_zero` | Synchronous quorum-durable-before-acknowledge write path for security-relevant session state |
+
+The transport and anchor branches name different roles, and one module may
+carry both. `quic` declares `transport.mux.quic` and `transport.anchor.mux`
+because its connection state is both at once: the mux that migrates
+natively when the peer changes address, and the anchor that owns the
+client-visible transport. The two branches are siblings under `transport`,
+so neither satisfies the other; a rule that needs the mux asks for
+`transport.mux`, and a module that is the mux says so, rather than an
+anchor role standing in for a transport it may not carry.
 
 The anchor roles share one fact schema, declared on the
 `transport.anchor` parent they descend from rather than repeated on each.
@@ -501,20 +502,22 @@ operation families accepted in `[[resources]].requires_contract` and, for
 service providers, in `provides`:
 
 ```
-gpio  spi  i2c  pio  channel  timer  platform_nic_ring  platform_dma
-fs  buffer  event  uart  adc  pwm  platform_dma_fd  pcie_device
-storage.namespace  storage.object  usb_host  proc  workload  trust
-net_policy  host_mount  net_route  image_decode
+channel  timer  stream_select  event  key_vault  gpio  spi  i2c  pio
+uart  adc  pwm  fs  storage.namespace  storage.object  trust  net_policy
+net_route  workload  host_mount  proc  usb_host  pcie_device
+platform_nic_ring  platform_dma  platform_dma_fd  metal_device
+storage.custody  storage.block  net_tx_drain  image_decode
 ```
 
-Naming is lowercase `snake_case`, with the two storage contracts in their
+Naming is lowercase `snake_case`, with the storage contracts in their
 dotted spelling because they mirror the public semantic storage surfaces.
 Their numeric ids live beside them in the registry and reach the tools
 through the generated `abi::registry::contract_of_name`.
 
-`PROVIDER_SURFACES` extends the `provides` vocabulary with the storage
-surface family that providers advertise but that is not class-byte
-dispatched: `storage.block` and `file.data`.
+`PROVIDER_SURFACES` (`storage.block`, `file.data`) extends the `provides`
+vocabulary with the storage surfaces a provider advertises by name.
+`storage.block` is also a contract (`0x002A`): a consumer reaches the
+module at the other end of its `blocks` port through it.
 
 Validation applied by the config tool:
 
@@ -692,7 +695,7 @@ by platform stack expansion, and application wiring is explicit.
   modules and wiring before the kernel sees the graph; injected modules
   are indistinguishable from user-declared ones at runtime.
 
-The machine-readable rename map for this vocabulary (old spelling to
-canonical spelling) is generated into `contracts/vocabulary_map.toml`
-from `contracts/src/vocabulary.rs` (`RENAME_MAP`); sibling projects
-consume the generated file rather than hand-copying constant lists.
+`contracts/vocabulary_map.toml`, generated from `RENAME_MAP` in
+`contracts/src/vocabulary.rs`, maps every non-canonical spelling of a
+vocabulary name to its one canonical spelling; projects that build against
+this vocabulary read that file rather than copying constant lists.

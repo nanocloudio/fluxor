@@ -51,6 +51,10 @@ The loader path, implemented in `validate_module`:
    runs only at a gated level; asked to run privileged, it is refused
    (`Unattested`).
 
+What a verified module may then call is its grant set, which comes only
+from its signed manifest: the kernel checks one grant per op and refuses
+the rest `EACCES` ([abi_layers.md](abi_layers.md#grants)).
+
 The signing root is one 32-byte Ed25519 public key in a 40-byte item of
 the kernel image (`src/kernel/security/root.rs`, laid out by
 `abi::wire::image_root`). The kernel is built with it all zero, which is
@@ -80,7 +84,7 @@ trust profiles:
 Per-source signature policy (for example, always requiring a signature on
 network-staged images) lives in the platform-side code that calls
 `init_from_blob`; the loader applies the same integrity and signature
-checks to every non-built-in source.
+checks to every source but a native module, whose code is the kernel image.
 
 ### Signing Tool
 
@@ -111,15 +115,13 @@ the signing command and what is refused are in
 
 Source: `src/kernel/security/crypto/`.
 
-Both hashes and the signature check run on kernel-owned code with no
-external crypto crates. SHA-256 and SHA-512 are `include!` shims over the
-single-source SDK implementations in `crates/fluxor-sdk/src/crypto/`, so the kernel
-and module sides cannot drift. The Ed25519 + SHA-512 verifier is written
-in-tree because it is the root of trust: nothing else in the image can be
-trusted until verify returns true, and pulling an external crate into that
-path widens the supply chain that must be reviewed. The field arithmetic
-ports the 16-limb signed-radix representation from TweetNaCl (public
-domain); the implementation conforms to RFC 8032.
+Both hashes and the signature check are in-tree code linked into the
+kernel, with no external crypto crates: nothing else in the image can be
+trusted until verify returns true, and an external crate in that path
+widens the supply chain that must be reviewed. The kernel links the SDK's
+implementations (`crates/fluxor-sdk/src/crypto/`) as a crate, so the
+loader and every module run one SHA-256, one SHA-512 and one Ed25519 (RFC
+8032) and cannot drift (§Cryptography ownership).
 
 ## KEY_VAULT (contract id `0x0005`)
 
@@ -148,11 +150,11 @@ and how big each answer is. Opcodes:
 | `0x0504` | `DESTROY` | Zeroise and free the slot. |
 | `0x0505` | `GENERATE` | Generate a key in-backend; the private half never exists outside it. Public half in `data`. |
 | `0x0506` | `PUBLIC` | Export the public half of a slot's key into `data`. |
-| `0x0507` | `TIER` | Report the backend tier (software vs hardware-backed). |
+| `0x0507` | `CUSTODY` | Report the backend custody (software vs hardware-backed). |
 | `0x0508` | `OPEN_OR_GENERATE` | Open the slot filed under a label, generating it if absent. |
 | `0x0509` | `OPEN` | Open the slot filed under a label. |
 | `0x050A` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label, and remove its sealed record. |
-| `0x050B` | `DESCRIBE` | Report a slot's suite, usage mask, tier and whether it is persisted. |
+| `0x050B` | `DESCRIBE` | Report a slot's suite, usage mask, custody and whether it is persisted. |
 | `0x050C` | `DESCRIBE_SUITE` | From a cursor: the next supported suite's usage mask, private, public, signature and secret lengths, import/generate/resumable-sign flags. |
 | `0x050D` | `ATTEST_COMPOSITION` | Sign the running-composition record (§ Composition Attestation). |
 | `0x050E` | `KEY_WRAP` | Wrap a slot's key for one destination composition. |
@@ -165,12 +167,13 @@ and how big each answer is. Opcodes:
 | `0x0515` | `SHARE_SPLIT` | Split a 32-byte symmetric key 2-of-3 and seal each share to its own recipient. |
 | `0x0516` | `SHARE_REWRAP` | Open one share envelope and seal the share to a new recipient under a new grant, in place. |
 | `0x0517` | `SHARE_COMBINE` | One envelope per call: the first share is held (`EINPROGRESS`), the second reconstructs the key into a new, never-persisted handle. |
-| `0x0518` | `ATTEST_KEY` | The challenge-bound record of a key's suite, uses, owner and tier, and a commitment to it; the caller signs it. |
+| `0x0518` | `ATTEST_KEY` | The challenge-bound record of a key's suite, uses, owner and custody, and a commitment to it; the caller signs it. |
 
 Every op is one flat `arg` record and at most one `data` span; no field is
 an address or a handle. A module that calls the vault claims it in its
-manifest (`[[resources]] requires_contract = "key_vault"`), so a graph
-without one is refused when composed. `SIGN` for P-256, RSA and ML-DSA runs
+manifest (`[[resources]] requires_contract = "key_vault"`), which is also
+what grants it the contract's ops ([abi_layers.md](abi_layers.md#grants)),
+and a graph without a vault is refused when composed. `SIGN` for P-256, RSA and ML-DSA runs
 as a job the vault keeps against the key: the call that starts it answers
 `EAGAIN`, the caller repeats the identical call each step until the
 signature comes back, and a different `SIGN` on the key meanwhile answers
@@ -215,7 +218,7 @@ Neither a share nor the key is ever written to a caller.
 record carries:
 - the caller's challenge;
 - the composition digest;
-- the key's backend, tier, persistence, suite, uses and owner namespace;
+- the key's backend, custody, persistence, suite, uses and owner namespace;
 - a commitment to the key, HMAC-SHA256 under the key itself, so the same
   key always commits the same way and the commitment reveals nothing of it.
 
@@ -279,7 +282,7 @@ A labelled key asked to persist is sealed through the platform HAL.
   provisioned — and a board with no such key persists nothing and says so
   once. `none`: records are kept readable under `FXVC` (`FXVR` for a
   workload's), whoever holds the medium holds the keys, and `DESCRIBE`
-  reports `persisted::CLEAR` with tier `SOFTWARE` (as does `TIER`), so a
+  reports `persisted::CLEAR` with custody `SOFTWARE` (as does `CUSTODY`), so a
   consumer that needs a key protected at rest refuses it. A sealed store
   never takes a readable record as a key: one found there is absent.
 - **Destroy.** Destroying a label removes its record, so the key does not
@@ -311,10 +314,9 @@ A key is zeroised by `DESTROY`, and once its owning module is gone: when the
 scheduler slot it was made in holds a new occupancy (restart, replacement or
 graph rebuild), the vault zeroises the key before it next allocates a slot or
 looks a label up. Slot contents are never surfaced through any introspection
-API. Crypto runs against the kernel-side
-`src/kernel/security/crypto/`: `p256.rs` (field/group/scalar ops plus
-HMAC-SHA256 for the RFC 6979 nonce), `ed25519.rs`, and `ml_dsa.rs` over
-`sha3.rs`.
+API. The backend's primitives are those `src/kernel/security/crypto/`
+names (§Cryptography ownership): P-256 with RFC 6979 nonces, Ed25519, and
+ML-DSA over SHA-3.
 
 ML-DSA is a per-target capability, the `pq-vault` Cargo feature. Its
 polynomial scratch is a backend static dimensioned for the widest parameter
@@ -337,9 +339,9 @@ ceiling, checks `p·q = n` and the CRT fields, and prepares the moduli;
 `PUBLIC` answers the `RSAPublicKey` DER at its exact length; `GENERATE`
 is `ENOSYS` — the vault imports RSA keys and never mints them. `SIGN` is
 RSASSA-PSS-SHA256 over a 32-byte digest with a 32-byte salt from the
-kernel's entropy, and it is the vault's one resumable operation: a private
-operation is milliseconds on the fastest target and the call runs inside
-the caller's step, so the first `SIGN` starts a job and answers `EAGAIN`
+kernel's entropy, and it is resumable as P-256 and ML-DSA signing are: a
+private operation is milliseconds on the fastest target and the call runs
+inside the caller's step, so the first `SIGN` starts a job and answers `EAGAIN`
 after a bounded number of Montgomery rows, each further `SIGN` with the
 same digest advances it, and the last answers the signature; another slot
 or digest meanwhile is `EBUSY`. `VERIFY` is not extended to RSA: the tls
@@ -364,14 +366,14 @@ cannot be opened leaves the software backend alone.
 | `OPEN`, `OPEN_OR_GENERATE` for a suite the token serves | Software if it holds the label, else the token if it does; a new key is made in the token when it is asked to `PERSIST` with uses the token permits, in software otherwise. A workload's: software alone, since the token's labels name no realm |
 | `DESTROY_BY_LABEL` | Both: removed wherever the label is held (a workload's: software) |
 | Other labels, `STORE`, symmetric and every other suite | Software |
-| `TIER` | The token when present: the backend that holds identity keys |
+| `CUSTODY` | The token when present: the backend that holds identity keys |
 | `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The router, reaching each key through `ECDH`, `PUBLIC` and `DESCRIBE` on its own backend |
 
 A key's own custody is its `DESCRIBE`. A volume key reconstructed from
 shares opened by a token recipient key is a software session key:
 - the agreed secrets cross only bounded kernel scratch, zeroed on every
   path;
-- `DESCRIBE` and `ATTEST_KEY` report it `SOFTWARE`, never the token's tier.
+- `DESCRIBE` and `ATTEST_KEY` report it `SOFTWARE`, never the token's custody.
 
 The token's keys come in two lifetimes. An unlabelled `GENERATE` key is a
 PKCS#11 session object, gone with the process whatever its mask says: it has
@@ -647,9 +649,9 @@ and are described at the top of `modules/foundation/ip/tcp.rs`.
 The TLS module's P-256 scalar multiplication is broken into chunks so a
 single handshake cannot block a second concurrent handshake for the full
 duration of its ladder. `crates/fluxor-sdk/src/crypto/p256.rs::ScalarMulState`
-tracks the ladder position; the key-derivation pump initialises it on
-first entry, advances `bits_per_step` ladder bits per pump tick, and
-finalises once the ladder completes. The `tls` module exposes an
+tracks the ladder position; the handshake initialises it on first entry,
+advances `bits_per_step` ladder bits per step, and finalises once the
+ladder completes. The `tls` module exposes an
 `ecdh_bits_per_step` parameter (default 256 — full ladder in one call,
 appropriate for bcm2712; drop to 64 on slower silicon).
 
@@ -666,7 +668,8 @@ and keeps nothing, so the ciphertext exists once. On such a connection
 - `MSG_RETX_REQUEST(conn_id, from_seq)` — replay data from this sequence.
 
 The TLS module holds each emitted ciphertext record of a `RETX`-granted
-connection in a per-session `retx_buf` (default 4 KB). Until the first
+connection in a per-session `retx_buf` (16 KiB on aarch64, 4 KiB
+elsewhere: two of the largest records the target writes). Until the first
 `MSG_RETX_ACK` its base counts stream bytes; the first one anchors
 `retx_base_seq` at `isn` plus that offset, so the window is placed exactly
 whatever was sent before it arrived, and each acknowledgement truncates it
@@ -691,18 +694,24 @@ workload network lane, the owner `NET_LANE_TAKE` handed the provider. No
 record names an owner, so a consumer cannot bind as, or command the
 endpoint of, an owner it is not.
 
-## Horizontal Scaling and Trust Domains
+## Horizontal Scaling
 
 Because Fluxor's scaling answer is "more modules, not more threads", a
 multi-lane HTTPS deployment is:
 
 ```yaml
+execution:
+  domains:
+    - {name: nic}
+    - {name: lane0}
+    - {name: lane1}
 modules:
   - {name: demux, domain: nic}
   - {name: ip_0, type: ip, domain: lane0}
   - {name: tls_0, type: tls, domain: lane0}
   - {name: ip_1, type: ip, domain: lane1}
   - {name: tls_1, type: tls, domain: lane1}
+# wiring: the NIC to demux, each demux lane to its ip, each ip to its tls
 ```
 
 `modules/foundation/demux/` 4-tuple-hashes inbound TCP/IPv4 frames to
@@ -731,35 +740,30 @@ across lanes.
 
 ## Cryptography ownership
 
-Two crypto bodies exist by design:
+Source: `src/kernel/security/crypto/mod.rs`.
 
-- **Kernel** (`src/kernel/security/crypto/`) — the loader/key-vault
-  root of trust. The loader's signature check runs *before* any PIC module
-  is admitted, so this code cannot depend on modules or external crates,
-  and it stays readable and portable in preference to fast (an Ed25519
-  verify runs at most once per module load).
-- **SDK** (`crates/fluxor-sdk/src/crypto/`) — module-side crypto for protocol
-  workloads (TLS, QUIC), NEON-accelerated where it pays.
+There is one body of crypto, the SDK's (`crates/fluxor-sdk/src/crypto/`):
+module-side protocol code (TLS, QUIC) and the kernel's root of trust (the
+loader's signature check, the key vault) link the same files. The loader's
+check runs *before* any PIC module is admitted, so the kernel takes the
+code as a crate it links, never through a module. Every kernel use is
+load-bearing: `ed25519` backs the loader signature verify, `sha512` its
+inner hash, `p256` the key-vault ECDSA/ECDH, `ml_dsa` the vault's
+post-quantum signing and `sha3` the SHAKE stream it expands everything
+from, `rsa` the vault's RSA suites, and `chacha20`, `aes_gcm` and `hmac`
+its sealing and derivation.
 
-The rule: where an implementation is identical, it has one source (kernel
-`sha256.rs`, `sha512.rs`, `sha3.rs` and `ml_dsa.rs` are `include!` shims
-over the SDK files — the two sides cannot drift); where the trust domain
-demands divergence, the duplication is deliberate (Ed25519 and P-256
-differ: the kernel versions are minimal and audit-oriented, the SDK
-versions carry protocol-driven surface such as incremental ECDSA). Every
-kernel primitive is load-bearing: `ed25519` backs the loader signature
-verify, `p256` the key-vault ECDSA/ECDH, `sha512` the Ed25519 inner hash,
-`ml_dsa` the vault's post-quantum signing and `sha3` the SHAKE stream it
-expands everything from. If a kernel primitive and its SDK counterpart
-converge to the same surface, they merge to one source per the rule.
+The one exception is P-256 on RP2040: the kernel links a compact P-256
+(`p256_rp2040.rs`, constant-time per layer as its header states) a quarter
+the size of the SDK's, because RP2040's flash cannot hold the SDK's.
 
-ML-DSA and SHA-3 are shared rather than duplicated for a reason particular
-to them: the vault signs with the same file a TLS module verifies with, so
-a disagreement between signer and verifier over FIPS 204 or FIPS 202 is not
-expressible. Both files derive their constants — Keccak's round constants
-and rho offsets from the FIPS 202 recurrences, the NTT twiddles from
-ζ = 1753 — instead of shipping the tables a reference implementation would,
-so the definitions in the standard are what the code runs.
+One source matters most for ML-DSA and SHA-3: the vault signs with the
+same file a TLS module verifies with, so a disagreement between signer and
+verifier over FIPS 204 or FIPS 202 is not expressible. Both files derive
+their constants — Keccak's round constants and rho offsets from the FIPS
+202 recurrences, the NTT twiddles from ζ = 1753 — instead of shipping the
+tables a reference implementation would, so the definitions in the
+standard are what the code runs.
 
 ## Related Documentation
 
@@ -784,9 +788,9 @@ builds the running-composition record from what the kernel holds — the
 boot incarnation, the caller's challenge, the kernel's ABI-surface
 digest, the SHA-256 of every loaded module blob with its size, every
 instantiated module's name and parameter digest, every graph edge — ends
-it with the vault's tier byte, and signs it with the named slot in that
+it with the vault's custody byte, and signs it with the named slot in that
 suite's convention. The challenge makes an answer unreplayable; the
-incarnation makes it unable to outlive the boot; the tier byte says what
+incarnation makes it unable to outlive the boot; the custody byte says what
 the signature is worth (`DEVICE_HW`: this hardware runs exactly this
 closure; `SOFTWARE`: a process that could be read does). The
 **composition digest** — the record with the challenge zeroed — is the

@@ -37,11 +37,11 @@ enum Commands {
     /// Emit forms (flash/deploy encodings — never store artifacts):
     ///   uf2       config UF2 for drag-drop flashing
     ///   bin       raw config binary
-    ///   combined  firmware + node image in one UF2. Dev-flash
+    ///   firmware  firmware image: firmware + node image in one UF2. Dev-flash
     ///             convenience only: the node image placed after the
     ///             firmware is NOT an OTA path — OTA devices update
-    ///             runtime modules exclusively through `--emit=image`.
-    ///   image     node image (modules + config + header): the
+    ///             runtime modules exclusively through `--emit=node`.
+    ///   node      node image (modules + config + header): the
     ///             packaged deployable graph — what an RP flash A/B
     ///             graph slot holds and what an OTA device pulls;
     ///             excludes firmware. The ONLY sanctioned
@@ -54,17 +54,17 @@ enum Commands {
         /// Omit for the lifecycle build.
         path: Option<PathBuf>,
         /// Output file (default: auto-derived from target; required
-        /// for --emit=combined|image|table).
+        /// for --emit=firmware|node|table).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Emit a device encoding: uf2|bin|combined|image|table.
+        /// Emit a device encoding: uf2|bin|firmware|node|table.
         #[arg(long)]
         emit: Option<String>,
         /// Validate the config against target constraints and exit
         /// without building anything.
         #[arg(long)]
         check: bool,
-        /// --emit=combined: the firmware UF2 to combine with.
+        /// --emit=firmware: the firmware UF2 to combine with.
         #[arg(long)]
         firmware: Option<PathBuf>,
         /// Directory holding the `.fmod` modules to use, instead of the
@@ -74,15 +74,15 @@ enum Commands {
         /// at least one `.fmod`; it is never silently replaced.
         #[arg(long, value_name = "DIR")]
         module_root: Option<PathBuf>,
-        /// Target override (--check / --emit=image; default: read from
+        /// Target override (--check / --emit=node; default: read from
         /// the config's `target:` field).
         #[arg(short, long)]
         target: Option<String>,
-        /// --emit=image: epoch to embed in the image header. Must
+        /// --emit=node: epoch to embed in the image header. Must
         /// exceed the live image's epoch for activation to succeed.
         #[arg(long, default_value = "1")]
         epoch: u64,
-        /// --emit=image: sign the image with this key -- a 32-byte Ed25519
+        /// --emit=node: sign the image with this key -- a 32-byte Ed25519
         /// seed file, as `fluxor modules keygen --key <file>` makes and
         /// whose public key it prints. The signature covers the header's
         /// first 96 bytes (epoch, regions, payload digest, ABI pin); a
@@ -511,14 +511,14 @@ enum Commands {
     /// checked first, so one that cannot be published refuses the sweep
     /// before anything is written.
     ///
-    /// `publish stack <file>` and `publish bundle <manifest>` publish one
+    /// `publish stack <file>` and `publish package <manifest>` publish one
     /// of each on its own.
     Publish {
         #[command(subcommand)]
         action: Option<PublishAction>,
         /// Restrict the publish sweep to artifact kinds:
         /// `source` (aliases: abi, sdk, common), `fmod`, `runtime`,
-        /// `stack`, `bundle`. Repeat or comma-separate. Empty = everything
+        /// `stack`, `package`. Repeat or comma-separate. Empty = everything
         /// publishable. Rejected alongside a subcommand (which already
         /// names the kinds).
         #[arg(long, value_delimiter = ',')]
@@ -550,7 +550,7 @@ enum Commands {
     /// (`<dep>/meta:latest`) and rewrite the `[[artifact]]` pin set —
     /// the dependencies' modules, sources and runtimes, plus every stack
     /// a graph includes by name (with the module references it carries)
-    /// and every package `[uses] bundles` lists. The deliberate "take
+    /// and every package `[uses] packages` lists. The deliberate "take
     /// upstream's new state" verb — `sync` only re-resolves workspace
     /// members.
     Update {
@@ -566,7 +566,7 @@ enum Commands {
     /// Materialise `fluxor.lock` into the tree from the OCI store:
     /// fmods → `target/fluxor/<abi>/modules/`, source trees →
     /// `target/fluxor/<name>/`, runtimes → `target/<triple>/release/`,
-    /// packages → `target/fluxor/bundles/<name>/`; a pinned stack, which
+    /// packages → `target/fluxor/packages/<name>/`; a pinned stack, which
     /// the build reads from the store, is checked present and intact.
     /// Workspace members' pins re-resolve `:latest` (write-through);
     /// everyone else's pins replay verbatim. Digest- and
@@ -650,7 +650,7 @@ enum PublishAction {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Publish a built node image (`fluxor build --emit=image`) as a
+    /// Publish a built node image (`fluxor build --emit=node`) as a
     /// device artifact: the packaged deployable graph a device pulls
     /// from a registry (`fluxor store push` serves it onward). Target,
     /// epoch and ABI pin are read from the FXSL header and mirrored as
@@ -659,7 +659,7 @@ enum PublishAction {
     /// offsets annotated) so registries deduplicate module content and
     /// devices fetch only what changed; `--packed` keeps the single
     ///-blob form (the RP flash-slot path's shape).
-    Image {
+    Node {
         /// The node image file.
         file: PathBuf,
         /// Publish as one packed blob instead of exploded layers.
@@ -703,7 +703,7 @@ enum PublishAction {
     /// (`packaging/<service|applet>/<name>/workload.toml`, checked and
     /// emitted first) or a package directory. The package
     /// carries the `.fmod` bytes of every module `workload.json` pins.
-    Bundle {
+    Package {
         /// Source manifest or package directory.
         package: PathBuf,
         /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
@@ -1015,7 +1015,7 @@ enum ModulesAction {
     /// Inventory every module discovered under the layer directories —
     /// `<layer>/<name>/manifest.toml`.
     ///
-    /// A declaration-only manifest — a kernel-resident built-in, with
+    /// A declaration-only manifest — a kernel-resident native module, with
     /// no PIC artefact to build — is marked `entry=<builtin>` in the
     /// text output and carries `builtin: true` in `--json`.
     List {
@@ -1086,7 +1086,7 @@ enum ModulesAction {
     /// root, `fluxor build --root`)
     /// and ensures the 32-byte private seed exists at `--key` (generated 0600
     /// from the OS RNG if absent). The matching seed is what
-    /// `fluxor modules sign` and `fluxor build --emit=image --sign-key`
+    /// `fluxor modules sign` and `fluxor build --emit=node --sign-key`
     /// consume. Idempotent:
     /// re-running with an existing key just re-prints its pubkey (use
     /// `--force` to rotate).

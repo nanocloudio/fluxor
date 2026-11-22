@@ -85,7 +85,7 @@ contracts without ambiguity.
 |                       Network Drivers                            |
 |                                                                  |
 |  cyw43 (PIO gSPI WiFi)     enc28j60 (SPI Ethernet)               |
-|  rp1_gem (Pi 5 Ethernet)   virtio_net (MMIO)                     |
+|  rp1_gem (Pi 5 Ethernet)   virtio_net (MMIO)   ena (EC2)         |
 |  e810 (PCIe, skeleton)     ch9120 (UART TCP offload bridge)      |
 +------------------------------------------------------------------+
 ```
@@ -251,8 +251,8 @@ sixty seconds.
 A consumer that already keeps what it sends — `tls`, whose retransmission
 window holds the encrypted records — declares `retains_send` on its input
 port. The composer marks every edge into such a port (the edge record's
-`retains_send` flag), the kernel carries the mark through a fan only when every fanned
-edge has it, and `ip` reads it for its own channel with `channel::FACTS`.
+`retains_send` flag), marks the edge into a fan only when every edge
+out of the fan has it, and `ip` reads it for its own channel with `channel::FACTS`.
 On such a channel `ip` keeps no copy: it grants `RETX`, reports each
 movement of `SND.UNA` (`MSG_RETX_ACK`, whose `isn` places the consumer's
 bytes in sequence space however many it sent before the first report),
@@ -307,7 +307,7 @@ consumers attached to two different provider instances can both hold
 `conn_id 7` without conflict.
 
 The table behind the handles has a ceiling (`MAX_TCP_CONNS`, the id
-space on the host profile) and a lazily backed body (`ip/conn_arena.rs`).
+space on the host profile) and a lazily backed body (`modules/foundation/ip/conn_arena.rs`).
 The first 512 connections live inline in module state; when they are all
 taken, the allocator asks the kernel elastic region for one more
 256-connection chunk and hands out its lowest slot. A chunk, once
@@ -430,7 +430,8 @@ interface upward is uniform.
 | `cyw43` | PIO gSPI | RP2040, RP2350 (Pico W, Pico 2 W) | Onboard WiFi; paired with the `wifi` control module |
 | `rp1_gem` | RP1 GEM | Pi 5 | Onboard gigabit Ethernet |
 | `enc28j60` | SPI | Any | Discrete Ethernet PHY |
-| `virtio_net` | MMIO | aarch64 (QEMU virt) | Paravirtualised NIC |
+| `virtio_net` | MMIO | aarch64 (QEMU virt, QEMU UEFI) | Paravirtualised NIC |
+| `ena` | PCIe | aarch64 UEFI (EC2) | Elastic Network Adapter; one polled queue pair |
 | `e810` | PCIe | aarch64 server | Intel 800-series; skeleton, RX/TX poll stubbed |
 | `ch9120` | UART | Any | Hardware TCP/IP offload; transparent byte bridge, see below |
 
@@ -624,7 +625,7 @@ consumers wire to whichever instance they belong to.
 ### Table-sized work
 
 Nothing on the ip module's step is allowed to grow with the connection
-table. Lookups go through the hash indexes (`ip/index.rs`); the timer
+table. Lookups go through the hash indexes (`modules/foundation/ip/index.rs`); the timer
 sweep walks a slice proportional to the time elapsed in its 50 ms
 window and never more than `SWEEP_SLICE_MAX` records in one step, so a
 window owed after a stall is repaid over several steps rather than as
@@ -638,16 +639,15 @@ a SYN flood at the ceiling never walks the table per SYN; loopback pairs
 take their slots from the same allocator as accepted connections. The
 step guard is what makes this a correctness rule rather than a
 preference: a step that walks the whole table on a 65,536-record profile
-ends the module. (Measured on a Pi 5: a free-slot cursor scan degenerates
-to a full walk per SYN as the table fills, and the 65,535-connection rung
-ended the board at ~63,000 connections.)
+ends the module.
 
 The same rule reaches the wiring around the module. A consumer port
 shared by two readers — `debug: to: net` puts `log_net` beside the
-application on `net_out` and `net_in` — is served by a kernel fan
-(`_tee` on the way out, `_merge` on the way in), and what the fan moves
-per step is then the ceiling on every accept, delivery and send. A fan
-moves whole frames, up to `FAN_FRAMES_PER_STEP` of them per step, and
+application on `net_out` and `net_in` — is joined by a fan module the
+composer inserts (`tee` on the way out, `merge` on the way in), and what
+the fan moves per step is then the ceiling on every accept, delivery and
+send. A fan moves whole frames, up to its `frames_per_step` (64 by
+default) per step, and
 consumes nothing while any reader's ring is full, so every reader on a
 fanned port must drain what it does not want (`log_net` discards up to
 its own per-step budget) or the port stalls for all of them. Nor does
@@ -667,7 +667,7 @@ instantiates it.
 
 A graph that needs the stack itself — the transport-continuity surfaces
 checkpoint connections `ip` owns, which a host socket is not — runs `ip`
-over the `linux_eth` built-in instead: an Ethernet frame driver on a Linux
+over the `linux_eth` native module instead: an Ethernet frame driver on a Linux
 interface, either an `AF_PACKET` socket bound to an existing one (with no
 address of its own, in a network namespace the runtime owns) or a TAP.
 
@@ -729,7 +729,7 @@ both surfaces on a lane:
 - A bind lands as the lane's owner: on every address that owner holds,
   IPv4 and IPv6 alike, when it has any, on the node's shared addresses
   otherwise, never as an owner a command names. The kernel admits it (`NET_LANE_ADMIT`) by the gate a
-  built-in provider applies — refused while the owner drains or is gone,
+  native provider applies — refused while the owner drains or is gone,
   and refused for a port the committed plan does not lease to it.
 - A port another lane listens on at an overlapping address is
   `EADDRINUSE`, so no two lanes are offered the same connections.
@@ -752,8 +752,8 @@ both surfaces on a lane:
 
 A `net=own` workload's traffic takes the same lanes. Its CREATE installs
 its address in the node's net-identity provider (`IP_ADDR_ADD` on `ip`'s
-`addr_ctl`, tagged with the workload's owner) and nothing else: there is
-no second path into the provider and no spare lane. The workload's graph
+`addr_ctl`, tagged with the workload's owner) and nothing else: its traffic enters
+the provider only through its lanes. The workload's graph
 names `Net(key)` edges like any other; the splice hands each lane to `ip`
 as a lane of that same owner, and `ip` sources the lane's traffic from the
 address the owner holds. The net-identity provider and the lane provider
@@ -762,20 +762,27 @@ are one module, whichever registers first (`NET_IDENT_PROVIDER` and
 DESTROY detaches the owner's lanes and removes its address
 (`IP_ADDR_DEL`).
 
-Lanes are a shared, bounded resource: `ip` states its capacity
-(`lane_cap`, 16 on aarch64) and `linux_net` holds 32. A workload takes as
-many lanes as its graph has `Net` keys, and a CREATE whose lanes the
-provider cannot all take is refused `EBUSY` with no owner, address or lane
-left behind. Placing workloads so that each finds its lanes is the node
-agent's capacity planning; the node offers the agent no read of the
-provider's capacity or free lanes today, so the agent learns it from the
-node's graph (`ip`'s `lane_cap`) or from that refusal.
+Lanes are a shared, bounded resource: `ip` states its capacity when it
+claims the provider role (its `lanes` parameter: 16 by default on aarch64,
+0 on the RPs, which have no workload backend) and `linux_net` holds 32. A
+workload takes as many lanes as its graph has `Net` keys, and a CREATE
+whose lanes the provider cannot all take is refused `EBUSY` with no owner,
+address or lane left behind. Placing workloads so that each finds its
+lanes is the node agent's capacity planning; the node offers no read of the
+provider's capacity or free lanes, so the agent learns it from the node's
+graph (`ip`'s `lanes`) or from that refusal.
+
+A workload acting with its own authority reaches the node's modules only
+through `Net`, `Caller` and
+`Tap` ends: an edge that names a module of the node's graph as an
+existing end of its own is refused `EACCES` at admission, since such an
+end would rebuild that module's ports
+([scheduler.md](scheduler.md) covers admission).
 
 A connection on a workload-owned address or lane is not migratable:
 transport continuity is the node graph's, and `ip` refuses `PAIR_PREPARE`,
 the checkpoint import and the cut of such a connection `UNSUPPORTED`,
-leaving any shadow as it was. Workload-scoped continuity needs its own
-design.
+leaving any shadow as it was.
 
 ## TLS as a Channel Transformer
 
@@ -847,7 +854,7 @@ Both are off unless their manifest parameter is set.
 forwarding profile. The prefix is any RFC 6052 §2.2 length — /32, /40, /48,
 /56, /64 or /96, no bits past it, the `u` octet zero — and the IPv4 address
 is embedded around the `u` octet exactly as the NAT64 translator embeds it
-(`cores/nat.rs` `nat64_embed`), so the address a client is told and the one
+(`crates/fluxor-sdk/src/cores/nat.rs` `nat64_embed`), so the address a client is told and the one
 the translator answers for are one. A native AAAA answer is relayed as
 received, except that an AAAA in the IPv4-mapped range `::ffff:0:0/96` is
 treated as absent (RFC 6147 §5.1.4's mandatory exclusion) and synthesized
@@ -912,7 +919,7 @@ own modules (`seam_shard`, `fwd_split`, `rescue_tunnel`), no module here
 is a translator, chain hop or tunnel end — those modules are the
 consumer's.
 
-- **NAT44 / NAT64** (`cores/nat.rs`). In-place NAT44 rewrite of a source or
+- **NAT44 / NAT64** (`crates/fluxor-sdk/src/cores/nat.rs`). In-place NAT44 rewrite of a source or
   destination with RFC 1624 incremental checksums — the IPv4 header, TCP and
   UDP (a zero UDP checksum stays zero, a computed zero goes as 0xFFFF), the
   ICMP query identifier, and for a returning ICMP error the embedded
@@ -981,7 +988,7 @@ consumer's.
   order, back pressure reaching `ip`; a record no output names, or longer
   than an output's buffer, is dropped and counted.
 - **The ingress cell's rescue tunnel** (`rescue_tunnel`,
-  `cores/rescue_tunnel.rs`). A director that finds a flow's anchor on
+  `modules/foundation/rescue_tunnel/tunnel.rs`). A director that finds a flow's anchor on
   another host disposes `TUNNEL` `[anchor_id][flow_epoch]`; the ingress end
   seals the IP packet whole with the service, route generation, flow epoch,
   anchor and ingress host under the cell's key and a per-ingress-host
@@ -1008,14 +1015,14 @@ consumer's.
   fails its tag or its window is refused and counted by reason.
 - **A frame-level module beside `ip` on one NIC.** A chain hop or tunnel
   end that writes whole Ethernet frames wires its output to the NIC's
-  `frames_tx` beside `ip.frames_tx`. That fan-in is the kernel's `_merge`,
-  and since `EthernetFrame` edges carry `[len: u16 LE][frame]` the wiring
-  gives it `FRAME_KIND_ETH`: it peeks each lane's length and moves one
-  whole frame at a time, never one its output cannot hold, so sharing a
-  NIC needs no module of its own. A fan into a port with no manifest of its
-  own (the NIC, stdout) takes its framing from the producers only when every
-  one that declares a framing declares the same (`agreed_frame_kind`);
-  mixed producers — a `NetProto` port and an `OctetStream` one merged into
+  `frames_tx` beside `ip.frames_tx`. That fan-in is a `merge` module the
+  composer inserts, and since `EthernetFrame` edges carry
+  `[len: u16 LE][frame]` the composer gives it the Ethernet frame kind
+  (`FrameKind::Eth`): it peeks each input's length and moves one whole
+  frame at a time, never one its output cannot hold, so sharing a NIC
+  needs no module beyond the fan. A fan on a port that declares no framing
+  of its own (the NIC, stdout) takes its framing from its peers only when
+  every one that declares a framing declares the same; mixed producers — a `NetProto` port and an `OctetStream` one merged into
   stdout — make a byte fan that keeps each write whole, where a framed fan
   would read the stream as `NetProto` headers and stall for everyone. A frame-level module receives through the seam (its frames are
   forwarded to it), not through a tee of `frames_rx`, which would hand
@@ -1042,7 +1049,7 @@ platform:
 ```
 
 The build tool selects a stack variant by board: `virtio_net` + `ip` on
-QEMU virt, `cyw43` + `wifi` + `ip` on Pico W / Pico 2 W (WiFi
+QEMU virt and QEMU UEFI, `ena` + `ip` on EC2, `cyw43` + `wifi` + `ip` on Pico W / Pico 2 W (WiFi
 credentials from the `WIFI_SSID` / `WIFI_PASSWORD` / `WIFI_SECURITY`
 environment), `rp1_gem` + `conn_guard` + `ip` on Pi 5, and `linux_net`
 on Linux. The variant supplies the driver↔IP frame wiring; the app
@@ -1767,15 +1774,15 @@ the moved flow by the same name.
 
 A connection `ip` retains for (§Send retention) carries its
 unacknowledged bytes in the FXTC record, after the IPv6 addresses:
-`[send_len u32][bytes from SND.UNA]`, at most one send block (1460 B on
-RP2040, 2920 B on RP2350, 16 KiB on aarch64; a cut with more in flight is
-`NOT_READY`). Send deltas carry each segment's bytes, and the standby's
+`[send_len u32][bytes from SND.UNA]`, at most one default send block on the
+RPs (1460 B on RP2040, 2920 B on RP2350) and 16 KiB on aarch64 (a cut with
+more in flight is `NOT_READY`). Send deltas carry each segment's bytes, and the standby's
 `ip` imports them into a block of its own pool, so after a takeover it
 retransmits them byte for byte from `SND.UNA`. A tls-paired flow — the
 one the anchor surface moves — carries an empty send section, since `tls`
 holds those bytes; the provider refuses a non-empty one there. The layout
 label (`TCP_CODEC_LAYOUT`, `...:timers:send`) is what PAIR_PREPARE binds,
-so a standby built with the old layout refuses to pair.
+so a standby built with another layout refuses to pair.
 
 ### QUIC under the anchor surface (`quic_continuity`)
 
@@ -1817,7 +1824,7 @@ flow), its block above everything the connection granted itself; the
 connection is bound by its connection ID if no pairing has bound it yet.
 
 With `cid_route_key` / `cid_route` every connection ID `quic` issues is a
-19-byte routable ID (`cores/cid_route.rs`): a six-byte routing token
+19-byte routable ID (`modules/foundation/quic/cid_route.rs`): a six-byte routing token
 enciphered under the route key by a synthetic-IV construction over AES-128,
 with a 64-bit tag and a fresh four-byte nonce. The keystream derives from
 the tag, so a repeated nonce reveals only that two IDs share it, and any
@@ -1839,7 +1846,7 @@ and the authority enrols each host's custody identity by its public half
 vault and prints its public half) before it accepts evidence that identity
 signed.
 
-The destination-bound key wrap is an SDK core (`cores/custody_wrap.rs`):
+The destination-bound key wrap is one pure core (`src/kernel/security/custody_wrap.rs`):
 the kernel vault's `KEY_WRAP` and `KEY_UNWRAP` seal and open the `FXKW`
 object with it (an HKDF-SHA256 KEK salted with the destination's
 composition digest over the ECDH secret, ChaCha20-Poly1305 under it with

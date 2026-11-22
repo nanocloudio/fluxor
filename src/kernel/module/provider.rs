@@ -266,8 +266,7 @@ pub fn provider_open(contract: ContractId, open_op: u32, config: &[u8]) -> i32 {
     // opens for its modules' `module_new` (`authorize_own_admit`).
     // Node-owned modules are unaffected.
     let owner = crate::kernel::exec::scheduler::caller_owner();
-    if !owner.is_system()
-        && !crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner)
+    if !owner.is_node() && !crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner)
     {
         log::warn!(
             "[provider] open refused: owner slot {} draining/revoked",
@@ -799,7 +798,7 @@ fn register_edge_server(
 /// edges: an edge contract only, its dispatch the platform's own code and
 /// `state` the module's instance state. `EINVAL` for a contract that is not
 /// an edge contract; otherwise as a PIC module's registration.
-pub fn register_builtin_edge_server(
+pub fn register_native_edge_server(
     contract: ContractId,
     module_idx: ModuleId,
     dispatch: ModuleProviderDispatchFn,
@@ -1164,7 +1163,7 @@ fn pool_provider_layer(pool: u16) -> Option<(ModuleId, ModuleProviderDispatchFn,
         let entry = &(*p)[idx];
         for i in (0..entry.depth as usize).rev() {
             if let Some(ref layer) = entry.chain[i] {
-                if layer.selector == 0 && layer.owner.is_system() {
+                if layer.selector == 0 && layer.owner.is_node() {
                     return Some((layer.module_idx, layer.dispatch, layer.state));
                 }
             }
@@ -1520,7 +1519,7 @@ fn node_default_layer(entry: &ProviderEntry) -> Option<&ProviderLayer> {
     (0..entry.depth as usize).rev().find_map(|i| {
         entry.chain[i]
             .as_ref()
-            .filter(|l| l.selector == 0 && l.owner.is_system())
+            .filter(|l| l.selector == 0 && l.owner.is_node())
     })
 }
 
@@ -2057,6 +2056,32 @@ fn retire_route(idx: u32, generation: u16) {
         if r.event >= 0 {
             crate::kernel::ipc::event::doorbell_release(r.event);
         }
+    }
+}
+
+/// Retire every route to the platform's provider of `contract` that names its
+/// index `inner`. A platform provider that frees an index other than by the
+/// handle's close (a workload's `DESTROY`, through any handle naming it or by
+/// identity) calls this as it frees it: no handle outlives what it named, and
+/// none names whatever the index is handed to next.
+pub fn retire_routes_naming(contract: ContractId, inner: i32) {
+    let mut i = 0usize;
+    loop {
+        let next = routes()
+            .live()
+            .find(|(idx, _, r)| {
+                *idx as usize >= i
+                    && r.contract == contract
+                    && r.module_idx == ROUTE_PLATFORM
+                    && !r.bound
+                    && r.inner == inner
+            })
+            .map(|(idx, generation, _)| (idx, generation));
+        let Some((idx, generation)) = next else {
+            break;
+        };
+        retire_route(idx, generation);
+        i = idx as usize + 1;
     }
 }
 

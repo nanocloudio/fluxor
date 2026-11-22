@@ -1,4 +1,4 @@
-# flash Module
+# flash_rp Module
 
 Flash Module — BOOTSEL Button + Blob Serving + Runtime Parameter Store + Data Store
 
@@ -7,27 +7,15 @@ Flash Module — BOOTSEL Button + Blob Serving + Runtime Parameter Store + Data 
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
-grants = ["flash"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `raw` | output | `OctetStream` |  |
+| `stream` | output | `OctetStream` | serves `stream_select` |
+| `store` | output | `OctetStream` | serves `storage.block` |
 
-[[ports]]
-name = "events"
-direction = "output"
-content_type = "FmpMessage"
-
-[[ports]]
-name = "stream"
-index = 1
-direction = "output"
-content_type = "OctetStream"
-
-[commands]
-emits = ["toggle", "next", "prev", "long_press", "on", "off"]
-```
+Builds for: `rp2350`, `rp2040`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Data store (`store`, out[2])
 
@@ -51,18 +39,11 @@ RP2350, 4 KiB on an RP2040.
 
 ## Parameters
 
-- `click`
-- `debounce_ms`
-- `double_click`
-- `item_count`
-- `long_press_cmd`
-- `long_press_ms`
-- `mode`
-- `multi_click_ms`
-- `presets`
-- `triple_click`
+- `debounce_ms` (u16, default 50): BOOTSEL debounce window.
+- `presets` (blob): inline blobs served on `stream`, up to 8 blobs and 4 KiB
+  in all.
 
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01
+`raw` carries one byte per debounced BOOTSEL transition (`0x01` pressed,
+`0x00` released), the `input::button` shape `gesture` consumes. `stream`
+sends the blob its consumer selects by index (`stream_select`) in 512-byte
+records, then `SET_HUP`.

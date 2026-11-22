@@ -3673,11 +3673,12 @@ impl DynamicModule {
         crate::kernel::mem::heap::reset_module_heap(inst_idx);
         {
             // An ungated module on a profile with elastic heaps commits its
-            // heap's first segment here (`fluxor_contracts::state_arena::
-            // first_heap_segment`, which the build charges) and the rest as
-            // it allocates (`kernel::mem::heap`); its cap is recorded for
-            // owner accounting. Growth past the first segment, in `module_new`
-            // or later, is the module's own allocation: a failure there is the
+            // declared heap here, whole (the type's arena, which the build
+            // charges by `fluxor_contracts::state_arena::first_heap_segment`
+            // with one segment), and grows past it, up to the instance's cap,
+            // as it allocates (`kernel::mem::heap`); its cap is recorded for
+            // owner accounting. Growth past the declaration, in `module_new`
+            // or later, is room the graph granted: a failure there is the
             // module's, which no state-arena budget predicts.
             let elastic = arena_size > 0 && !gated && crate::kernel::mem::heap::elastic_heaps();
             if elastic {
@@ -3689,14 +3690,17 @@ impl DynamicModule {
                 let committed = if raw {
                     crate::kernel::mem::heap::commit_whole(inst_idx).is_some()
                 } else {
-                    crate::kernel::mem::heap::commit_first(inst_idx)
+                    crate::kernel::mem::heap::commit_declared(
+                        inst_idx,
+                        module.manifest_arena_bytes(),
+                    )
                 };
                 if !committed {
                     log::error!(
                         "[loader] {}: heap {} commit failed cap={arena_size} (state \
                          used={}, cap={})",
                         name,
-                        if raw { "arena" } else { "first segment" },
+                        if raw { "arena" } else { "declared heap" },
                         arena_usage().0,
                         arena_usage().1
                     );

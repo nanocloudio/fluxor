@@ -4,7 +4,7 @@
 // ones in `src/platform/wasm.rs`) corresponds to a function here.
 //
 // The wasm kernel imports ALL host_* functions unconditionally at
-// link time — every built-in is registered at boot, even when its
+// link time — every native module is registered at boot, even when its
 // graph YAML doesn't wire it. Missing any one of them causes
 // `WebAssembly.instantiate` to throw "LinkError: import 'env.host_X'
 // is not defined", so the host page must provide the full set.
@@ -1532,7 +1532,7 @@ registerProcessor('pcm-ring', PcmRing);
     // activated media/transport/gallery control:
     //   { hash: fnv1a32(action_id), value: <number> }
     // `host_action_pop` serialises it as [hash:u32 LE][value:f32 LE]
-    // (8 bytes); the built-in maps the hash to an FMP verb.
+    // (8 bytes); the native module maps the hash to an FMP verb.
     const actionQueue = window.__fluxor_action_queue
       || (window.__fluxor_action_queue = []);
     const actionShim = {
@@ -2130,7 +2130,7 @@ registerProcessor('pcm-ring', PcmRing);
     //
     // A job decodes encoded image bytes to a `width`×`height` RGB565 buffer
     // with createImageBitmap + OffscreenCanvas; `recv` drains it. The bytes
-    // come from the kernel (`host_image_decode_open`, the codec built-in) or
+    // come from the kernel (`host_image_decode_open`, the codec native module) or
     // from the object store (`host_image_decode_object`, the image_decode
     // provider), so encoded images never enter wasm memory on that path.
     const imageDecodes = new Map();

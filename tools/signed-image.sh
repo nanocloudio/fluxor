@@ -57,6 +57,6 @@ echo "[signed] building and signing modules for $SILICON..."
 fluxor modules build --target "$SILICON"
 
 echo "[signed] combining $CONFIG -> $IMG with the key's root..."
-fluxor build "$CONFIG" --emit=combined \
+fluxor build "$CONFIG" --emit=firmware \
     --firmware "target/$TARGET/firmware.bin" -o "$IMG"
 echo "[signed] done: $IMG (unsigned/tampered modules run gated or not at all)"

@@ -34,9 +34,12 @@ direction = "input"
 content_type = "MidiEvents"
 required = false
 
+# The claim is optional while the module is a scaffold: its step reaches no
+# `usb_host` operation, and no target provides the contract yet.
 [[resources]]
 requires_contract = "usb_host"
 access = "exclusive"
+optional = true
 
 # Module-scope observability — exempt.
 [observability]

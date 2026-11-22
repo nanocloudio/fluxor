@@ -270,7 +270,7 @@ mod tests {
 
     const PI5: &str = r#"
         [rig]
-        artifact = "boot_bundle"
+        artifact = "firmware_image"
         deploy = ["deploy.netboot_tftp"]
         preferred_deploy = "deploy.netboot_tftp"
         console = ["console.serial"]

@@ -385,7 +385,7 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
             }
             Ok(format!("runtime {} → {}", e.name, dest.display()))
         }
-        "bundle" => materialize_package(
+        "package" => materialize_package(
             store,
             e,
             &package_dir(project_root, path_component("package name", &e.name)?),
@@ -407,9 +407,9 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
     }
 }
 
-/// Where a pinned package materialises: `target/fluxor/bundles/<name>/`.
+/// Where a pinned package materialises: `target/fluxor/packages/<name>/`.
 pub fn package_dir(project_root: &Path, name: &str) -> PathBuf {
-    project_root.join("target/fluxor/bundles").join(name)
+    project_root.join("target/fluxor/packages").join(name)
 }
 
 /// Materialise one pinned package into `dest`, flat:
@@ -534,7 +534,7 @@ pub fn ensure_package(project_root: &Path, name: &str) -> Result<Option<PathBuf>
     let Some(e) = lock
         .artifacts
         .iter()
-        .find(|a| a.kind == "bundle" && a.name == name)
+        .find(|a| a.kind == "package" && a.name == name)
     else {
         return Ok(None);
     };
@@ -552,7 +552,7 @@ pub fn pinned_packages(project_root: &Path) -> Vec<String> {
         .map(|l| {
             l.artifacts
                 .into_iter()
-                .filter(|a| a.kind == "bundle")
+                .filter(|a| a.kind == "package")
                 .map(|a| a.name)
                 .collect()
         })

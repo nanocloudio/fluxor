@@ -253,32 +253,10 @@ Anchors and coordinators are not required for solo single-sink groups.
 
 ---
 
-## 5. Telemetry
+## 5. Scope
 
-The `MON_PRESENTATION` text-line format is specified in
-`monitor-protocol.md` and reserved for AV emitters. Status: design
-target, not wired — no module emits these lines yet. High-level events:
-
-- `group_active`, `member_joined`, `member_left`
-- `epoch_advance`, `anchor_rebind`
-- `clock_lost`, `clock_recovered`
-- `latency_report`, `skew_report`
-- `underflow`, `overflow`, `missed_present`
-- `degraded_mode`
-
-The format is forward-compatible: unknown event names and unknown keys
-are ignored, so new transitions can be added without breaking older
-monitor builds. Operator pattern: grep
-`MON_PRESENTATION ... group=<id>` to follow one group across all
-emitters.
-
----
-
-## 6. Scope
-
-This page covers the surface family, the capability vocabulary, the
-`presentation_groups` schema and validator, and the telemetry line
-format. The following adjacent concerns live elsewhere or are not
+This page covers the surface family, the capability vocabulary, and the
+`presentation_groups` schema and validator. The following adjacent concerns live elsewhere or are not
 surfaced through these contracts:
 
 - **Typed payload metadata** — per-buffer side-channel data on decoded
@@ -289,9 +267,8 @@ surfaced through these contracts:
 - **Remote AV transport** — moving any of these surfaces across a
   remote channel is the remote-channel layer's concern; transports
   carry but do not erase these contracts.
-- **`MON_PRESENTATION` emitters** — the format here is the wire
-  contract. Live emission belongs to clock-authority, anchor, and
-  coordinator modules.
+- **Presentation telemetry** — no presentation-group monitor line is
+  defined.
 - **Display `StreamTime`** — audio sinks expose `StreamTime`; display
   sinks do not.
 - **Presentation anchors and group coordinators** — the role

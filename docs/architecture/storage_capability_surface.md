@@ -65,8 +65,9 @@ Event-stream content-type pattern over the mesh Event primitive (§4).
 - The four surfaces appear in `capability_surface.md`'s canonical
   taxonomy.
 - The opcode constants live in `crates/fluxor-abi/src/contracts/storage/`
-  (`fs.rs`, `namespace.rs`, `object.rs`, plus the kernel-private
-  `graph_slot.rs`, `runtime_params.rs`).
+  (`fs.rs`, `namespace.rs`, `object.rs`, `block.rs`, `custody.rs`, the
+  shared `handle.rs`, plus the kernel-private `graph_slot.rs` and
+  `runtime_params.rs`).
 
 ### Declared providers and consumers
 
@@ -74,10 +75,10 @@ Loadable modules carrying `provides = [...]` in their `manifest.toml`:
 
 | Surface             | Declared by (`provides`)                            |
 |---------------------|-----------------------------------------------------|
-| `storage.block`     | `drivers/nvme`, `foundation/sd`, `foundation/file_block`, `foundation/crypt_block` |
-| `file.data`         | `foundation/fat32`, `foundation/mount`              |
-| `storage.namespace` | `foundation/fs_object`, `fixtures/mem_ns` (a RAM test fixture) |
-| `storage.object`    | `foundation/fs_object`                              |
+| `storage.block`     | `modules/drivers/nvme`, `modules/foundation/sd`, `modules/foundation/file_block`, `modules/foundation/crypt_block` |
+| `file.data`         | `modules/foundation/fat32`, `modules/foundation/mount`              |
+| `storage.namespace` | `modules/foundation/fs_object`, `modules/fixtures/mem_ns` (a RAM test fixture) |
+| `storage.object`    | `modules/foundation/fs_object`                              |
 
 The hosts carry no `provides` rows: on Linux and wasm these surfaces are
 served by platform dispatchers inside the runtime (§5) rather than by
@@ -87,12 +88,12 @@ surface.
 The `fs` contract's bulk ops carry their bytes in the call's `data` span
 and take no `arg`: `READ` and `READDIR` fill it and answer the count
 written, `WRITE` and `WRITE_ASYNC` take from it and answer the count taken.
-Every other `fs` op carries one bounded `arg` record (a path, an offset, a
-`STAT` record) and no `data`.
+Every other `fs` op carries at most one bounded `arg` record (a path, an
+offset, a `STAT` record) and no `data`.
 
-Consumers by contract (substitutable): `foundation/fs_bank` and
-`foundation/fs_tap` name `requires_contract = "fs"`;
-`foundation/object_bank` names `requires_contract = "storage.namespace"`
+Consumers by contract (substitutable): `modules/foundation/fs_bank` and
+`modules/foundation/fs_tap` name `requires_contract = "fs"`;
+`modules/foundation/object_bank` names `requires_contract = "storage.namespace"`
 and `"storage.object"`.
 
 ### Multiple volumes: instance-keyed providers + the `mount` module
@@ -406,13 +407,6 @@ answers `FLUSH` only after the source's `FLUSH` completes, and honours `FUA`
 natively or as write-then-flush. Transmission flags, size and block size come
 from `DESCRIBE`. One client at a time; see its README.
 
-ublk is the intended Linux frontend and NBD the portability fallback, but the
-ublk gate is closed on the reference Pi 5 host: its kernel
-(6.18.33+rpt-rpi-2712) is built without `CONFIG_BLK_DEV_UBLK`, so there is no
-`ublk_drv` and no `/dev/ublk-control`, while `nbd.ko` is present
-(`CONFIG_BLK_DEV_NBD=m`) and io_uring is enabled. A ublk frontend would
-consume the same records and replace only the transport.
-
 ---
 
 ## 2. Fence — the orthogonal axis
@@ -531,21 +525,23 @@ if n > 0 {
 ```
 
 `query_key::LAST_FENCE = 8` is a cross-class common key. The kernel
-forwards it as `provider::provider_call(handle, QUERY_OP, out, out_len)`
-so the contract's vtable resolves from the handle's FD tag and strips the
-tag before re-entering the provider. Both kernel-internal providers and
-PIC module providers handle `QUERY_OP` through their existing dispatch
-function; there is no separate query-callback ABI.
+forwards it to the provider that minted the handle as the common opcode
+`QUERY_OP` (`0x00FE`), with the output buffer as the call's `arg`: the
+contract is resolved from the handle, not from the opcode's class byte.
+Both kernel-internal providers and PIC module providers answer `QUERY_OP`
+through their ordinary dispatch function; there is no separate
+query-callback ABI.
 
 **2. Handle=-1 one-shot ops** (e.g. `object::PUT`, `object::HEAD`,
 `object::DELETE`, `object::LIST`, `object::RETAIN`, `namespace::LIST`,
 `namespace::RENAME`,
 `namespace::DELETE`, `namespace::BIND`, `object::PUT_STREAMED_COMMIT`)
-carry a `[fence_out_ptr: u64 LE, fence_out_cap: u16 LE]` pair at the end
-of their arg layout. The provider writes the encoded fence (up to
-`WIRE_MAX_LEN` bytes) into that buffer atomically with returning the op's
-i32 result; callers decode via `Fence::decode`. The fence travels in band
-with the result so a crash between return and query cannot lose it.
+end their `arg` with the fence trailer (`abi::fence::trailer`): the last
+`trailer::LEN` (64) bytes of the record, which the provider writes as
+`[fence_len u16][Fence::encode bytes]` atomically with returning the op's
+result; callers decode via `Fence::decode`. The fence travels in band
+with the result so a crash between return and query cannot lose it, and
+an answer whose fence cannot be delivered is not an answer.
 
 `Fence::decode` returns `None` for an unknown tag. Consumers MUST treat
 decode failure as "no recognised fence" and refuse to proceed; promoting
@@ -623,8 +619,8 @@ files that never coexisted share one.
 Ownership is *reported*, and enforcement of a per-owner policy is a separate
 question answered by `query_key::CALLER_OWNER`: the owner of the module that
 invoked the current provider frame. It is a query rather than an argument on
-`provider_call` because widening that signature is a positional-ABI flag day
-across every module for a fact the kernel already holds.
+`provider_call` because the kernel already holds the fact, and a field every
+call carried could only restate it.
 
 Publication lives on the byte surface rather than moving to
 `storage.namespace` because `OPEN_CREATE` and `MKDIR` are already the
@@ -672,7 +668,7 @@ open again.
 
 `RENAME` has no single-sector form when the two entries fall in different
 sectors, so it is ordered to be recoverable instead. An intent record in
-a spare reserved sector — a region no FAT32 reader interprets — names
+an unused reserved sector — a region no FAT32 reader interprets — names
 both entries together with the exact images they are expected to hold.
 The sequence is: arm the record, publish the destination entry, retire
 the source entry, disarm; every step commits through the device Flush.
@@ -727,7 +723,7 @@ Lifecycle rules:
   capability, lease or revocation state, and their only handle limit is the
   slot table (a full table answers `ENOMEM`).
 - A provider that binds a handle to a verified mesh grant
-  (`contracts/mesh/capability.rs`, [`mesh.md`](mesh.md#authority)) uses
+  (`crates/fluxor-abi/src/contracts/mesh/capability.rs`, [`mesh.md`](mesh.md#authority)) uses
   the vocabulary in `handle.rs`. Storage has no permission vocabulary of
   its own: the handle carries the grant's mesh permission bits, and each
   operation class needs one — `StorageAccess::Read` (`GET`, `HEAD`,
@@ -752,15 +748,17 @@ A module reaches a guarded store through `provider_call`, which has no
 session for the mesh's `MSG_CAP_PRESENT` to ride. So `storage.object` has
 its own presentation op:
 
-1. `PRESENT` (`0x0F2B`) names a scope and carries a capability chain. A
-   scope is a key prefix ending `/` (`photos/`). The chain's leaf names the
+1. `PRESENT` (`0x0F2B`) names a scope in its `arg` and carries a
+   capability chain as its `data` span. A scope is a key prefix ending `/`
+   (`photos/`). The chain's leaf names the
    scope's object, `grant::scope_object`: SHA-256 over a domain tag and the
    scope, truncated to an `ObjectId`. `fluxor modules cap mint --scope
    photos/` issues one.
 2. The store verifies the chain against its roots and its trusted clock
    and answers a grant handle. A refused chain answers `EACCES`, with its
-   `Refusal` written into the request's first byte. The request carries no
-   pointer, so an isolated module can present the longest chain.
+   `Refusal` written into the request's first byte. The chain rides the
+   `data` span, so a chain of any length is presented without growing the
+   record.
 3. Every later op passes the grant as its `handle`: `PUT`, `GET`, `HEAD`,
    `DELETE`, `LIST`, `RETAIN` and `PUT_STREAMED_OPEN`, which otherwise take
    `-1`. The
@@ -828,15 +826,15 @@ stream-kind handle whose Events carry the `event.log` content type.
 
 ### Large-blob writes via event.log
 
-`object::PUT` is single-shot — the body fits in a single arg pointer.
-Larger writes compose through four `storage.object` opcodes
+`object::PUT` is single-shot — the body is the call's `data` span, one
+in-memory blob. Larger writes compose through four `storage.object` opcodes
 (`crates/fluxor-abi/src/contracts/storage/object.rs`):
 
 ```
 PUT_STREAMED_OPEN   (handle = -1)  →  stream handle
 PUT_STREAMED_WRITE  (handle = sh)  →  one chunk appended as one Event
 …
-PUT_STREAMED_COMMIT (handle = sh)  →  atomic promotion + fence_out
+PUT_STREAMED_COMMIT (handle = sh)  →  atomic promotion + fence trailer
 PUT_STREAMED_ABORT  (handle = sh)  →  discard staged events
 ```
 
@@ -855,8 +853,8 @@ A provider maps this onto whatever shape its backing store prefers:
 
 The handle's per-handle fence is `Volatile` during WRITE and upgrades to
 the strongest fence COMMIT achieves; the same encoded fence is also
-written into `fence_out_ptr` on COMMIT so the caller records it in band
-with the success return. `PUT_STREAMED_ABORT` releases the staging
+written into COMMIT's fence trailer (its whole `arg`) so the caller records
+it in band with the success return. `PUT_STREAMED_ABORT` releases the staging
 events; subsequent reads of `<key>` see no trace of the partial sequence.
 
 There is no separate "multipart" surface, and `object::PUT` is not
@@ -1070,9 +1068,8 @@ bytes, `handle.rs`), the longest name either listing carries. A
 precondition kind they do not know, or an `ETAG` without a whole revision,
 is `EINVAL` rather than an unconditional write. `HEAD` into a buffer too
 small for its record answers `ENOMEM`. A `PUT`, `HEAD` or `DELETE` whose
-fence buffer is null or shorter than `fence::WIRE_MAX_LEN` is `EINVAL`,
-refused before the op acts, as the contract states for every op that carries
-a fence pair.
+`arg` cannot hold its fence trailer is `EINVAL`, refused before the op acts,
+as the contract states for every op that carries a fence trailer.
 
 Both keep a monotone revision clock, use a key's revision as the CAS
 token, page `namespace::LIST` and `object::LIST` with a cursor, and serve
@@ -1231,7 +1228,7 @@ consumers share it.
 | `mem_ns` fixture | — | served, over its binding table |
 | `fs_object` | served, by a scan of its directory | served, same scan |
 
-On bare metal, `foundation/fat32` provides `file.data` over a
+On bare metal, `modules/foundation/fat32` provides `file.data` over a
 `storage.block` channel: random-access reads through the FS contract,
 reads and writes both riding `storage.block` requests on its `blocks` input
 port (typically wired from `nvme.blocks`), and directory listing served
@@ -1248,7 +1245,7 @@ arrives first settles the rest before it runs.
 
 ### A store over a filesystem: `fs_object`
 
-`foundation/fs_object` gives a board a store without a storage cluster:
+`modules/foundation/fs_object` gives a board a store without a storage cluster:
 it provides `storage.object` and a key-shaped `storage.namespace` (`LIST`
 and `CAPS` only) over whatever serves the `fs` contract — `fat32` on bare
 metal, the host directory on Linux. Each object is one file under its

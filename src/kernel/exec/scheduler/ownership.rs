@@ -52,7 +52,7 @@ pub fn set_module_owner(module_idx: usize, owner: OwnerHandle) {
 /// Returns true when the target is node-owned or the same owner.
 #[inline]
 pub fn authorize_module_access(caller: OwnerHandle, target_idx: usize) -> bool {
-    crate::kernel::workload::owner::same_or_system(caller, module_owner(target_idx))
+    crate::kernel::workload::owner::same_or_node(caller, module_owner(target_idx))
 }
 
 /// Owner of the currently-executing module (the syscall caller).
@@ -180,7 +180,7 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus]) -> usize {
     // belongs to the previous occupant, not the current one.
     for idx in 0..module_slots() {
         let owner = module_owner(idx);
-        if owner.is_system() {
+        if owner.is_node() {
             continue;
         }
         if let Some(rec) = out[..count]
@@ -201,7 +201,7 @@ pub fn owner_live_status(handle: OwnerHandle) -> Option<OwnerLiveStatus> {
         let p = &raw const SCHED;
         &*p
     };
-    if handle.is_system() {
+    if handle.is_node() {
         return None;
     }
     let mut rec = owner_record(sched, handle.slot as usize)?;
@@ -398,7 +398,7 @@ pub fn channel_consumer_module(ch: i32) -> Option<usize> {
 /// thread only.
 pub fn module_owner_attribution(module_idx: usize) -> Option<([u8; 16], u16, u32)> {
     let handle = module_owner(module_idx);
-    if handle.is_system() {
+    if handle.is_node() {
         return None;
     }
     // SAFETY: scheduler-thread read of the static owner table.

@@ -36,8 +36,8 @@ pub mod vault_suite {
     pub const RSA_4096: u16 = 12;
 }
 
-/// Vault custody values, `crates/fluxor-abi/src/contracts/key_vault.rs::tier`.
-pub mod vault_tier {
+/// Vault custody values, `crates/fluxor-abi/src/contracts/key_vault.rs::custody`.
+pub mod vault_custody {
     pub const SOFTWARE: u8 = 0;
     pub const DEVICE_HW: u8 = 2;
 }
@@ -133,7 +133,7 @@ pub struct TargetFacts {
     /// The highest custody the kernel vault can report here: the custody
     /// `SealProvenance::DeviceUnique` raises it to where the platform reads
     /// a device-unique sealing key, `SOFTWARE` everywhere else.
-    pub vault_tier_ceiling: u8,
+    pub vault_custody_ceiling: u8,
     /// The ip module's ceilings on this target — what a composition
     /// claiming a connection or address count is admitted against.
     pub net: NetCeilings,
@@ -160,7 +160,7 @@ impl TargetFacts {
                 time_wall_source: Some("network_sync"),
                 trust_system: true,
                 vault_suites: SUITES_PQ,
-                vault_tier_ceiling: vault_tier::SOFTWARE,
+                vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
@@ -174,7 +174,7 @@ impl TargetFacts {
                 time_wall_source: Some("network_sync"),
                 trust_system: false,
                 vault_suites: SUITES_PQ,
-                vault_tier_ceiling: vault_tier::DEVICE_HW,
+                vault_custody_ceiling: vault_custody::DEVICE_HW,
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: true,
@@ -187,7 +187,7 @@ impl TargetFacts {
                 time_wall_source: Some("network_sync"),
                 trust_system: false,
                 vault_suites: SUITES_PQ,
-                vault_tier_ceiling: vault_tier::SOFTWARE,
+                vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_HOST,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
@@ -200,7 +200,7 @@ impl TargetFacts {
                 time_wall_source: Some("network_sync"),
                 trust_system: false,
                 vault_suites: SUITES_BASE,
-                vault_tier_ceiling: vault_tier::DEVICE_HW,
+                vault_custody_ceiling: vault_custody::DEVICE_HW,
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
@@ -211,7 +211,7 @@ impl TargetFacts {
                 time_wall_source: None,
                 trust_system: false,
                 vault_suites: SUITES_BASE,
-                vault_tier_ceiling: vault_tier::SOFTWARE,
+                vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
@@ -221,7 +221,7 @@ impl TargetFacts {
                 time_wall_source: None,
                 trust_system: false,
                 vault_suites: SUITES_PQ,
-                vault_tier_ceiling: vault_tier::SOFTWARE,
+                vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_WASM,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
@@ -230,7 +230,7 @@ impl TargetFacts {
                 time_wall_source: None,
                 trust_system: false,
                 vault_suites: SUITES_BASE,
-                vault_tier_ceiling: vault_tier::SOFTWARE,
+                vault_custody_ceiling: vault_custody::SOFTWARE,
                 net: NET_EMBEDDED,
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,

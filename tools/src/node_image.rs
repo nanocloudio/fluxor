@@ -3,8 +3,8 @@
 //! pinned to this tree's ABI surface and, with a key, signed.
 //!
 //! One writer for every image a build emits: an RP flash slot or an OTA image
-//! (`fluxor build --emit=image`), the payload `combine` appends after a
-//! kernel, and the Linux graph file (`graph.img`).
+//! (`fluxor build --emit=node`), the payload `combine` appends after a
+//! kernel, and the Linux graph file (`node.img`).
 
 use fluxor_abi::wire::node_image::{self, Header, Signature};
 use sha2::Digest as _;

@@ -116,8 +116,8 @@ An applet's graph declares no params: an applet takes argv.
 is carried with its includes expanded, its `params:` kept and every
 placeholder it forwards into an include left for a run to render, so its
 module references and state sum cover the stacks' modules
-([stacks.md](../architecture/stacks.md#workload-packages)). A kernel built-in the
-graph names (`cli_in`, `cli_out`, `linux_net`, …) is carried by every
+([stacks.md](../architecture/stacks.md#workload-packages)). A native module the
+graph names (`cli_in`, `cli_out`, `linux_net`, …) is built into every
 runtime: the package pins no `.fmod` for it.
 
 ## Publish, reference, run
@@ -125,27 +125,27 @@ runtime: the package pins no `.fmod` for it.
 ```sh
 # producer
 fluxor publish                    # every package under packaging/, with the rest
-fluxor publish bundle packaging/service/dns_service/workload.toml
+fluxor publish package packaging/service/dns_service/workload.toml
 
 # consumer: fluxor.toml
 #   [dependencies]
 #   dns-producer = "0.1"
 #   [uses]
-#   bundles = ["dns_service"]
+#   packages = ["dns_service"]
 fluxor update
 fluxor run dns_service --param port=15353 --param answer=10.1.2.3
 fluxor run dns_service --params dns.toml --param port=15400
 ```
 
 A package a project runs by name from a script — which no graph names — is
-declared under `[uses] bundles` in `fluxor.toml`. That name is a reference:
+declared under `[uses] packages` in `fluxor.toml`. That name is a reference:
 `fluxor update` pins the package from the dependency in `[dependencies]` that
 publishes it; a name the list does not hold has no pin after the next update. A name
 two dependencies publish is refused as ambiguous. `fluxor sync` materialises
 a pinned package, digest-verified, to:
 
 ```text
-target/fluxor/bundles/<name>/
+target/fluxor/packages/<name>/
   workload.json  graph.yaml  resources.json
   modules/<module>.fmod
   .fluxor-sync-stamp

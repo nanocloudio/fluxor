@@ -160,7 +160,7 @@ pub const MAX_CALLER_LANES: usize = 8;
 /// [`NET_PROTO_TCP`] or [`NET_PROTO_UDP`]. Returns 0; -1 (`EPERM`) when the
 /// owner is gone or draining (it admits nothing new); `EACCES` when the node's
 /// committed plan grants that owner no lease on the port, or for a caller
-/// that is not the provider. The same gate a built-in provider applies.
+/// that is not the provider. The same gate a native provider applies.
 pub use super::super::registry::workload::NET_LANE_ADMIT;
 /// `NET_LANE_TAKE` — the next lane change queued for the provider, as one
 /// [`net_lane`] record into `arg` (at least [`net_lane::RECORD_LEN`] bytes).

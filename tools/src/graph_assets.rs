@@ -610,7 +610,7 @@ fn build_one_asset(
             graph.display()
         ),
     )?;
-    let built = crate::build_one_from(&step_path, Some(&dir.join("graph.img")), None, verbose)
+    let built = crate::build_one_from(&step_path, Some(&dir.join("node.img")), None, verbose)
         .map_err(|e| Error::Config(format!("{what}: building its build-step graph: {e}")))?;
 
     let runtime = crate::project::linux_runtime(project_root);

@@ -4430,7 +4430,7 @@ mod rate_class_resolution_tests {
     #[test]
     fn producer_rate_class_default_used_when_consumer_declares_none() {
         // An `http_ingress.net_out → linux_net.net_in` edge: the consumer
-        // (a fluxor builtin) declares no default, so the producer's own
+        // (a fluxor native module) declares no default, so the producer's own
         // `rate_class_default` is what applies.
         let from = with_default(port("NetProto"), fluxor_contracts::RateClass::Transaction);
         let to = port("NetProto"); // no rate_class_default — e.g. linux_net.net_in
@@ -6842,7 +6842,7 @@ mod boot_plan_tests {
     fn resident_demand_reads_the_encoded_workloads() {
         use crate::add_subgraph::{encode_workload, ComposedModule, Composition, Workload};
         let workload = |n: usize| Workload {
-            workload_uid: [n as u8; 16],
+            owner_uid: [n as u8; 16],
             graph: Composition {
                 modules: (0..n)
                     .map(|_| ComposedModule {
@@ -6866,7 +6866,7 @@ mod boot_plan_tests {
         (s.workloads, s.workload_modules, s.workload_edges) = resident_demand(&records);
         assert_eq!(plan_pool("linux", "owners", &s, NONE, NONE).derived, 3);
         // RP plans its owner table from the same demand. wasm's is a static
-        // table holding the system slot alone, so the kernel refuses the
+        // table holding the node owner's slot alone, so the kernel refuses the
         // resident workloads at boot, and so does the composer.
         assert_eq!(plan_pool("rp2350", "owners", &s, NONE, NONE).derived, 3);
         check_boot_plan("rp2350", &s, NONE, NONE).expect("rp plans its owners");

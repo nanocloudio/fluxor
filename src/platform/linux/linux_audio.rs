@@ -1,4 +1,4 @@
-// linux_audio built-in — PCM sink. Four modes:
+// linux_audio native module — PCM sink. Four modes:
 //   wav      append to a WAV file with periodically-refreshed header
 //   raw      append to a headerless little-endian PCM file
 //   null     drain and discard
@@ -459,7 +459,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> Result<Box<LinuxAudioS
             #[cfg(feature = "host-playback")]
             playback_cap_samples,
         });
-    log::info!("[inst] module {module_idx} = linux_audio (built-in) in={in_chan}");
+    log::info!("[inst] module {module_idx} = linux_audio (native) in={in_chan}");
     Ok(st)
 }
 

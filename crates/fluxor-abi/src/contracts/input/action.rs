@@ -8,7 +8,7 @@
 // the user activates the control, the browser overlay
 // (`browser_overlay_runtime.js`) hashes that id with FNV-1a32 and pushes
 // `[action_hash: u32 LE][value: f32 LE]` onto the host action queue; the
-// `wasm_browser_action` built-in drains the queue and emits the hash
+// `wasm_browser_action` native module drains the queue and emits the hash
 // **unchanged** as the FMP command type.
 //
 // So the wire is a pure conduit: the command a control emits is

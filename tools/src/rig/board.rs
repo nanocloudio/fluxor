@@ -334,7 +334,7 @@ mod tests {
     fn loads_pi5_shape() {
         let toml_src = r#"
             [rig]
-            artifact = "boot_bundle"
+            artifact = "firmware_image"
             deploy = ["deploy.netboot_tftp", "deploy.bootfs_copy"]
             preferred_deploy = "deploy.netboot_tftp"
             console = ["console.serial"]
@@ -346,7 +346,7 @@ mod tests {
             default_timeout_s = 30
         "#;
         let rig = parse_board_rig_str(toml_src, "pi5.toml").unwrap().unwrap();
-        assert_eq!(rig.artifact.as_deref(), Some("boot_bundle"));
+        assert_eq!(rig.artifact.as_deref(), Some("firmware_image"));
         assert_eq!(rig.deploy.len(), 2);
         assert_eq!(rig.default_timeout_s, Some(30));
         assert!(rig.supports(Capability::parse("deploy.netboot_tftp").unwrap()));

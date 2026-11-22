@@ -7,39 +7,15 @@ FS-backed Asset Bank PIC Module (Seekable Version)
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `stream` | output | `OctetStream` | required |
+| `notify` | output | `FmpMessage` |  |
+| `commands` | ctrl_input | `FmpMessage` |  |
 
-[[ports]]
-name = "files"
-direction = "input"
-content_type = "OctetStream"
-required = true
-
-[[ports]]
-name = "stream"
-direction = "output"
-content_type = "OctetStream"
-required = true
-
-[[ports]]
-name = "notify"
-index = 1
-direction = "output"
-content_type = "FmpMessage"
-
-[[ports]]
-name = "commands"
-direction = "ctrl_input"
-content_type = "FmpMessage"
-
-[commands]
-accepts = ["next", "prev", "toggle", "select"]
-emits = ["status"]
-```
+Builds for: `rp2350`, `bcm2712`, `wasm`, `linux`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
@@ -47,8 +23,3 @@ emits = ["status"]
 - `file_count`
 - `initial_index`
 - `mode`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

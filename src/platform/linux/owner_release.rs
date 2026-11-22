@@ -16,7 +16,7 @@ use crate::kernel::workload::owner::OwnerHandle;
 /// the terminal sessions it opened into them, so no host process outlives
 /// it; then its root and what it opened through it (`owner_root::release`).
 pub fn release_owner(owner: OwnerHandle) {
-    if owner.is_system() {
+    if owner.is_node() {
         return;
     }
     super::providers::linux_net_close_owner_conns(owner);

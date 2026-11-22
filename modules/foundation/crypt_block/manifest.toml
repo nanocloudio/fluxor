@@ -39,9 +39,9 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 128
 
-# Attach mode: the attachment bundle ("FXSB" + two share envelopes).
+# Attach mode: the attachment share set ("FXSB" + two share envelopes).
 [[ports]]
-name = "bundle"
+name = "shares"
 direction = "ctrl_input"
 content_type = "OctetStream"
 buffer_size = 1024

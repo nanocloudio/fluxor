@@ -9,8 +9,8 @@
 //! definition, linked by both.
 //!
 //! Three more figures the build charges by are stated here for the same
-//! reason: the first segment an elastic heap commits when its module is
-//! instantiated ([`first_heap_segment`]), the heap a native module seats for
+//! reason: the heap an elastic module commits when it is instantiated, its
+//! declared size as one segment ([`first_heap_segment`]), the heap a native module seats for
 //! its instance ([`heap_seat_bytes`]), and what an isolated module's
 //! allocations take from the isolated-module arena ([`iso_carve_bytes`]).
 
@@ -42,9 +42,10 @@ pub const HEAP_MIN_BLOCK: usize = 16;
 /// at least `quantum` bytes: `cap >> (segments - 1)`, at least the quantum,
 /// never past the cap, in whole 8-byte units; the whole cap where a heap has
 /// one segment. 0 for a cap too small to hold one block (or past `u32`), which
-/// gets no heap. The kernel commits exactly this (`heap::commit_first`), and
-/// the build charges its carve; growth past it is the module's own
-/// allocation, which no budget predicts.
+/// gets no heap. With one segment it is the size committed whole: the
+/// kernel commits a module's declared heap (up to its cap) by it at
+/// instantiation (`heap::commit_declared`), and the build charges its carve;
+/// growth into room a graph grants above the declaration is not budgeted.
 pub const fn first_heap_segment(cap: usize, segments: usize, quantum: usize) -> usize {
     let cap = cap & !(HEAP_BLOCK_HEADER - 1);
     if cap < HEAP_BLOCK_HEADER + HEAP_MIN_BLOCK || cap > u32::MAX as usize {

@@ -21,13 +21,15 @@ contracts to portable application modules.
 
 Source: `crates/fluxor-abi/src/kernel_abi.rs`.
 
-Every PIC module receives a `SyscallTable` at init. It holds exactly:
+Every PIC module receives a `SyscallTable` at init. Beside its `version`
+word it holds exactly:
 
 - `channel_read` / `channel_write` / `channel_poll` — direct channel I/O: one record per write, whole or not at all; reads a byte stream over the records' payload
 - `channel_peek` — copy from the head of a channel without consuming: a FIFO's stream, or a mailbox's READY record (frame-aware consumers inspect a header before committing to consume)
 - `channel_discard` — drop the next `len` bytes of a FIFO's stream without copying, what is buffered now and the rest as it arrives, or release a mailbox's READY record whole (the consuming half of a whole-frame read, and a whole-frame drop)
 - `heap_alloc` / `heap_free` / `heap_realloc` — per-module heap
-- `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch. A module selects one provider of a contract with `provider_open(contract, kernel::BIND, arg)`: `arg = [NAME][len][name]` names an instance-keyed layer (or `platform`, the platform's own provider beneath the graph), `[PORT][port_type][index]` the module at the other end of one of the caller's ports (an edge contract). The bound handle routes every later op to that provider, and a handle an op through it mints comes back routed to the same provider.
+- `telemetry_enabled` — a pointer to the kernel's word that is non-zero while a telemetry consumer is subscribed (null where the module cannot read it, which means emit unconditionally)
+- `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch. `provider_call` takes six words: the handle, the op, one flat `arg` record (direction and maximum from the registry; a small answer is written back into it) and one bulk `data` span, valid for the call only; neither carries an address or a handle. A module selects one provider of a contract with `provider_open(contract, kernel::BIND, arg)`: `arg = [NAME][len][name]` names an instance-keyed layer (or `platform`, the platform's own provider beneath the graph), `[PORT][port_type][index]` the module at the other end of one of the caller's ports (an edge contract). The bound handle routes every later op to that provider, and a handle an op through it mints comes back routed to the same provider.
 
 Everything else goes through `provider_*`. The kernel tracks each
 handle's bound contract and routes calls to the contract's vtable;
@@ -39,9 +41,12 @@ module is built against the current shape.
 
 ## Contracts
 
-Contract ids are 16-bit values in `src/kernel/module/provider.rs::contract`.
-Each id corresponds to a contract file under `crates/fluxor-abi/src/contracts/`
-that defines its opcodes, arg payloads, and response semantics.
+Contract ids are 16-bit values declared in the ABI registry
+(`crates/fluxor-abi/registry/registry.toml`, generated into
+`abi::registry`; the kernel's dispatchers name them through
+`src/kernel/module/provider.rs::contract`). Each id corresponds to a
+contract file under `crates/fluxor-abi/src/contracts/` that defines its
+opcodes, arg payloads, and response semantics.
 
 ### HAL contracts — portable hardware transport
 
@@ -77,11 +82,11 @@ A kernel service contract has one *default* implementation in
 `src/kernel/`, and a platform may re-register the class dispatch and
 vtable at platform boot with an alternate backend. The consumer-visible
 surface never changes; backends differ only in what the contract's own
-discovery opcodes report (for `KEY_VAULT`: `TIER` and `DESCRIBE_SUITE`).
+discovery opcodes report (for `KEY_VAULT`: `CUSTODY` and `DESCRIBE_SUITE`).
 
 Current backends of `KEY_VAULT`:
 
-| Backend | Source | TIER | Selection |
+| Backend | Source | CUSTODY | Selection |
 |---------|--------|------|-----------|
 | Software (default) | `src/kernel/security/key_vault.rs` | `SOFTWARE` | Always available |
 | PKCS#11 HSM (Linux) | `src/platform/linux/hsm_key_vault.rs` | `PROCESS_HW` | `FLUXOR_HSM_PKCS11_MODULE` env at platform boot |
@@ -115,7 +120,7 @@ platform) implements the vtable, and consumers reach it through
 | `PLATFORM_DMA` | `0x001E` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. |
 | `PLATFORM_DMA_FD` | `0x001F` | Kernel (platform) | Async DMA fd with ping-pong queuing. Opcodes under `dma_raw::fd::*`; its handle polls ready when a transfer completes. Separate contract from `PLATFORM_DMA`; see the DMA section below. |
 | `PCIE_DEVICE` | `0x001C` | Kernel (platform) | Handle-scoped PCIe device binding. A privileged module only. |
-| `METAL_DEVICE` | `0x0028` | Kernel (bcm2712, uefi) | Device registers, DMA memory and cache maintenance for bare-metal drivers; register access needs `metal_device.mmio`, a PCIe rescan or config access `metal_device.pcie`, DMA and cache ops `metal_device.dma`. |
+| `METAL_DEVICE` | `0x0024` | Kernel (bcm2712, uefi) | Device registers, DMA memory and cache maintenance for bare-metal drivers; register access needs `metal_device.mmio`, a PCIe rescan or config access `metal_device.pcie`, DMA and cache ops `metal_device.dma`. |
 | `STORAGE_NAMESPACE` | `0x000E` | PIC / platform | Directory-like name-keyed storage surface (opcode class 0x0Exx). See [storage_capability_surface.md](storage_capability_surface.md). |
 | `STORAGE_OBJECT` | `0x000F` | PIC / platform | Whole-blob byte-addressed storage surface (opcode class 0x0Fxx). See [storage_capability_surface.md](storage_capability_surface.md). |
 | `IMAGE_DECODE` | `0x002C` | Platform (wasm) / PIC | Decode a byte range of a `storage.object` object, named by key, to raw pixels at a caller-named size (opcode class 0x2Cxx): `DECODE` mints a job, `RECV` drains its pixels into `data` (`EAGAIN` while decoding), `CLOSE` releases it. |
@@ -413,9 +418,9 @@ access = "exclusive"
 pointing at `grants`; `grants` rejects a name the registry does not have.
 `fluxor modules build` packs both into the manifest's two grant words.
 
-### Manifest schema — built-in module params (`[[params]]`)
+### Manifest schema — native module params (`[[params]]`)
 
-Built-in modules (those with `builtin = true`) declare their parameter
+Native modules (those with `builtin = true`) declare their parameter
 schema directly in `manifest.toml`:
 
 ```toml
@@ -469,20 +474,20 @@ Validation runs at config-build time (`fluxor build`):
   use this for params with no safe default (e.g.
   `host_asset_source.path`). Mutually exclusive with `default`.
 - **Schema source-of-truth boundary**: `[[params]]` is rejected on
-  non-builtin manifests at parse time. PIC modules carry their schema
+  non-native manifests at parse time. PIC modules carry their schema
   in the binary via `define_params!`; declaring it again in the
   manifest would create two sources of truth for the same wire layout.
 
 The wire format is identical to `.fmod` modules — same TLV stream
 (`[0xFE][0x01][len_lo][len_hi][tag][len][value]…`). The tool packs
 manifest defaults explicitly so every declared param shows up in the
-TLV; built-ins don't re-encode defaults in code.
+TLV; native modules don't re-encode defaults in code.
 
 The header's `len` (u16) is advisory. Params have no ceiling, so a blob
 past 65,535 payload bytes carries `0xFFFF` there (writers saturate, never
 wrap), and every reader bounds the stream by the blob's own length (the
 module entry's u32) and ends the basic section at the `0xFF 0x00`
-terminator: the SDK's `parse_tlv`, the kernel's tag scans, the built-in
+terminator: the SDK's `parse_tlv`, the kernel's tag scans, the native-module
 walkers, the runtime-override merges, the extended-entry scanners (tls,
 quic) and the tools.
 
@@ -518,8 +523,8 @@ selected at compile time via `cfg(target_arch)`:
 
 | Profile | Selected for | Sample sizes |
 |---|---|---|
-| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `TARGET_CLASS = HOST`, http `MAX_CONCURRENT_CONNS = 256`, ip `MAX_TCP_CONNS = 65536`, tls `MAX_SESSIONS = 512` |
-| `profile_wasm` | `target_arch = "wasm32"` | `TARGET_CLASS = HOST`, http `MAX_CONCURRENT_CONNS = 256`, ip `MAX_TCP_CONNS = 256` |
+| `profile_host` | `target_arch = "aarch64"` (Linux host, bcm2712, uefi) | `TARGET_CLASS = HOST`, http `MAX_CONCURRENT_CONNS = 256`, ip `MAX_TCP_CONNS = 65536`, tls `MAX_SESSIONS = 512` |
+| `profile_wasm` | `target_arch = "wasm32"` | `TARGET_CLASS = HOST`, http `MAX_CONCURRENT_CONNS = 256`, ip `MAX_TCP_CONNS = 256`, tls `MAX_SESSIONS = 64` |
 | `profile_embedded` | anything else (`thumbv*`) | `TARGET_CLASS = SMALL` (rp2350) / `TINY` (rp2040), http `MAX_CONCURRENT_CONNS = 4` / `1`, ip `MAX_TCP_CONNS = 8` / `2` |
 
 `TARGET_CLASS` (`abi::config::target_class::{TINY, SMALL, HOST}`) is the
@@ -539,7 +544,8 @@ buffer, the log ring, the elastic region, heap segments, module and bridge
 slots, the code-size ceiling — is NOT in this file. (Module params need no
 arena: the kernel borrows them from the config blob in place.) It lives in
 `src/kernel/config.rs`, one profile per kernel platform
-(`profile_linux`, `profile_bcm2712`, `profile_wasm`, `profile_rp`),
+(`profile_linux`, `profile_bcm2712`, `profile_uefi`, `profile_wasm`,
+`profile_rp`),
 selected by the platform feature; the RP arenas come from the silicon
 TOMLs through `build.rs` → `chip_generated.rs` → `platform::chip`.
 Everything in `crates/fluxor-abi` is hashed into the ABI-surface digest, so
@@ -549,7 +555,7 @@ workspace republish though no module reads it.
 A module that needs a kernel figure asks at runtime: the module-slot
 count is `internal::reconfigure::SLOT_CAPACITY` (monitor and reconfigure
 size their per-slot walks by it). A tools gate (`kernel_capacity_gate`)
-fails if a kernel capacity constant reappears in the srcpin's file set
+fails if a kernel capacity constant appears in the srcpin's file set
 or in module source.
 
 ## Platform layer — not public
@@ -637,7 +643,8 @@ provider_contracts = ["pwm"]
 #[cfg_attr(not(feature = "host-test"), export_name = "module_provider_dispatch")]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_dispatch")]
 pub unsafe extern "C" fn pwm_dispatch(
-    state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize,
+    state: *mut u8, handle: i32, opcode: u32,
+    arg: *mut u8, arg_len: usize, data: *mut u8, data_len: usize,
 ) -> i32 { /* ... */ }
 ```
 
@@ -675,7 +682,7 @@ In-repo modules live in one of four trees; app modules live in sibling
 repositories. The tree enforces where a module is *allowed* to reach,
 not what it *happens* to touch. `drivers/`, `foundation/`, and
 `fixtures/` hold PIC modules loaded at runtime as `.fmod` artefacts;
-`modules/platform/<platform>/` holds descriptors for built-ins compiled
+`modules/platform/<platform>/` holds descriptors for native modules compiled
 directly into the kernel binary.
 
 ### Drivers — `modules/drivers/`
@@ -726,9 +733,9 @@ preserves that tree's stable-vocabulary property (shadowing a
 foundation name is a build error; a fixture name carries no such
 weight). Fixtures are not publishable via `fluxor publish`.
 
-### Built-in — `modules/platform/<platform>/<name>/`
+### Native — `modules/platform/<platform>/<name>/`
 
-Manifest-only descriptors for kernel-resident built-ins — modules
+Manifest-only descriptors for kernel-resident native modules — modules
 whose Rust code is linked into the kernel binary rather than shipped
 as a `.fmod`. Each subdirectory holds `manifest.toml` (read by the
 config tool for validation and TLV packing) and `README.md`. The
@@ -738,23 +745,23 @@ The platform subdirectory makes the binding explicit:
 
 | Subtree                 | Binding                                                                                  | Examples                                                |
 |-------------------------|------------------------------------------------------------------------------------------|---------------------------------------------------------|
-| `modules/platform/linux/` | Linux-host APIs (winit, CPAL/ALSA, libc syscalls) plus host-agnostic `std` built-ins   | `linux_net`, `linux_display`, `linux_audio`, `host_asset_source`, `host_image_codec` |
+| `modules/platform/linux/` | Linux-host APIs (winit, CPAL/ALSA, libc syscalls) plus host-agnostic `std` native modules   | `linux_net`, `linux_display`, `linux_audio`, `host_asset_source`, `host_image_codec` |
 | `modules/platform/wasm/`  | Browser APIs (Canvas, WebAudio, DOM, fetch)                                            | `wasm_browser_canvas`, `wasm_browser_audio`, `wasm_browser_keyboard`, `host_browser_fetch` |
 
-Built-in vs PIC is a **deployment** distinction: built-ins compile
+Native vs PIC is a **deployment** distinction: native modules compile
 into the kernel because their platform lacks a PIC loader (wasm) or
 sits below it (Linux runtime sinks). Selection is orthogonal —
 `stacks/*.toml` route logical surfaces (`display`, `audio`, `net`) to
-either a PIC driver or a built-in via board/family/platform match
+either a PIC driver or a native module via board/family/platform match
 keys, with no per-stack-file knowledge of the deployment shape. The
 multi-platform model is documented in
 [wasm_platform.md](wasm_platform.md) and
 [wasm_browser_host.md](wasm_browser_host.md).
 
-Built-in manifests carry `builtin = true`. Their `[[params]]` schema
+Native manifests carry `builtin = true`. Their `[[params]]` schema
 is read by the config tool and packed into the same TLV stream PIC
 modules use; the kernel's deserialiser is identical for both kinds.
-See "Manifest schema — built-in module params" above for the schema
+See "Manifest schema — native module params" above for the schema
 language.
 
 ## What the kernel is
@@ -776,7 +783,7 @@ compile into the kernel binary; everything else is a PIC module:
    platform-overridable backends (CHANNEL, TIMER, EVENT,
    KEY_VAULT) — each backend documented in the backends table above
    with a descriptor under `modules/platform/<platform>/`.
-3. **Built-in modules** — host-API drivers that are manifest-declared
+3. **Native modules** — host-API drivers that are manifest-declared
    under `modules/platform/<platform>/<name>/` and therefore visible to
    the config tool and inventory.
 
@@ -867,19 +874,17 @@ handle table).
 
 ### Source organisation: area directories
 
-Every kernel and SDK source file lives under an area directory; there
-are no loose top-level implementation files. Areas are formed by
-consolidating similar concerns into a small set of coherent
-directories (kernel: `boot exec ipc mem module security sys workload`;
-SDK: `abi contracts cores crypto internal platform runtime wire
-assets`) — not one directory per file, and not flat-until-forced.
-Named exceptions, each justified as an entry point or generated
-artefact that other files path-mount: `crates/fluxor-abi/src/lib.rs` (the
-assembler), `abi_surface.rs` / `abi_surface_srcpin.rs` (the pin
-machinery, path-referenced by `tools/src/abi_pin.rs` — see
-[abi_surface.md](abi_surface.md)), `runtime.rs` (the module-side
-aggregator), `fence.rs` (a cross-cutting ABI value type at the `abi`
-root).
+Kernel source lives under area directories that consolidate similar
+concerns: `src/kernel/{boot,exec,ipc,mem,module,pcie,security,sys,usb,workload}`.
+The kernel root holds only `mod.rs`, the capacity profiles (`config.rs`)
+and the two kernel-served network contracts (`net_policy.rs`,
+`net_route.rs`). The SDK is three crates, each organised by what it
+holds: `crates/fluxor-abi` (`contracts`, `internal`, `platform`, `wire`,
+the registry, and the ABI-surface pin machinery `abi_surface.rs` /
+`abi_surface/srcpin.rs`, path-referenced by `tools/src/abi_pin.rs` — see
+[abi_surface.md](abi_surface.md)), `crates/fluxor-sdk` (`assets`, `cores`,
+`crypto`, `gpu`) and `crates/fluxor-rt` (the module runtime, one file per
+concern).
 
 An area earns a new directory when a concern stops reading as one
 of the existing areas — prefer widening an existing area over
@@ -887,9 +892,11 @@ minting a new one.
 
 ### Host-process semantics live outside the stable native surface
 
-The stable 0x1A workload contract carries only the native core
+The stable workload contract (`0x0017`) carries only the native core
 (CREATE / START / WAIT / portable SIGNAL / DESTROY / PAUSE / RESUME /
-CAPS / OPTIONS plus the header). Host-process mechanics — READ / EXEC /
+LOOKUP / MODULE_DIGESTS / OPTIONS / CAPS, the network-lane ops `LANE` /
+`NET_PROVIDE` / `NET_LANE_TAKE` / `NET_LANE_ADMIT` / `NET_RESOLVER`, plus
+the header). Host-process mechanics — READ / EXEC /
 TTY_* opcodes, SOURCE_HOST_PROCESS and the process-executor class — live
 in the host-scoped class `abi::platform::linux::host_process`, registered
 only by the Linux platform; unregistered = `ENOSYS` = discovery.
@@ -920,7 +927,7 @@ numeric groups and, when flagged, the added capabilities — the layout at
 `abi::platform::linux::host_process::SOURCE_HOST_PROCESS`) rather than a
 workload package directory path. Nanocloud owns the OCI→params mapping — the
 policy half — mirroring how the nanocloud CLI is built: a PIC fmod
-owning logic plus fluxor host built-ins for host facts.
+owning logic plus fluxor host native modules for host facts.
 
 The primitive confines every process of a workload by itself
 (`src/platform/linux/confine.rs`): `no_new_privs`, the capability

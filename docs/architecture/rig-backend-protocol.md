@@ -218,7 +218,7 @@ memory.
 ### 4.3 `artifact`
 
 Populated only for `deploy stage`. `kind` is `file` (single artifact)
-or `bundle` (directory tree). `path` is absolute.
+or `dir` (directory tree). `path` is absolute.
 
 ### 4.4 `args`
 

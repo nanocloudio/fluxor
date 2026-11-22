@@ -1,7 +1,7 @@
 # hsm_key_vault — PKCS#11 KEY_VAULT backend (Linux)
 
 A kernel-resident **contract backend**, not a graph module. It is listed
-under `modules/builtin/linux/` for inventory visibility only; it cannot be
+under `modules/platform/linux/` for inventory visibility only; it cannot be
 instantiated from a graph YAML and declares no ports or params.
 
 ## What it is
@@ -20,9 +20,9 @@ top comment and in `docs/architecture/security.md`.
 
 It registers at platform boot via `try_register_from_env`, replacing the
 kernel software backend's class dispatch + vtable — the platform-
-overridable backend pattern documented in `src/kernel/key_vault.rs`.
+overridable backend pattern documented in `src/kernel/security/key_vault.rs`.
 Consumers notice only through the contract's discovery opcodes:
-`TIER = PROCESS_HW`, `CAPS = GENERATE | PUBLIC | NON_EXTRACTABLE |
+`CUSTODY = PROCESS_HW`, `CAPS = GENERATE | PUBLIC | NON_EXTRACTABLE |
 ALG_P256`.
 
 ## Activation
@@ -41,5 +41,5 @@ It dlopens a host C library (PKCS#11), which the PIC sandbox cannot do.
 Per the kernel-residency rule in `docs/architecture/abi_layers.md`
 ("What may live in the kernel binary"), a service backend like this is
 allowed in `src/platform/<platform>/` only behind an existing kernel
-service contract, with honest `TIER`/`CAPS` advertisement and a
+service contract, with honest `CUSTODY`/`CAPS` advertisement and a
 descriptor here.

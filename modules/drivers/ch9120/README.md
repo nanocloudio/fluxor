@@ -8,31 +8,15 @@ CH9120 UART-to-Ethernet Driver PIC Module
 - `mod.rs`
 - `constants.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `net_tx` | input | `OctetStream` |  |
+| `net_rx` | output | `OctetStream` | required |
+| `netif_state` | output | `FmpMessage` |  |
 
-[[ports]]
-name = "net_tx"
-direction = "input"
-content_type = "OctetStream"
-
-[[ports]]
-name = "net_rx"
-direction = "output"
-content_type = "OctetStream"
-required = true
-
-[[resources]]
-requires_contract = "uart"
-access = "exclusive"
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
-```
+Builds for: `rp2040`, `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
@@ -48,8 +32,3 @@ access = "write"
 - `subnet`
 - `uart_bus`
 - `use_dhcp`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

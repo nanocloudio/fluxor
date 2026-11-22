@@ -8,39 +8,17 @@ ENC28J60 Ethernet Frame Provider PIC Module
 - `mod.rs`
 - `constants.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `frames_tx` | input | `EthernetFrame` |  |
+| `frames_rx` | output | `EthernetFrame` | required |
 
-[[ports]]
-name = "frames_tx"
-direction = "input"
-content_type = "EthernetFrame"
-
-[[ports]]
-name = "frames_rx"
-direction = "output"
-content_type = "EthernetFrame"
-required = true
-
-[[resources]]
-requires_contract = "spi"
-access = "exclusive"
-
-[[resources]]
-requires_contract = "gpio"
-access = "write"
-```
+Builds for: `rp2040`, `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
 - `cs_pin`
 - `int_pin`
 - `spi_bus`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

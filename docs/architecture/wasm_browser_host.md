@@ -1,15 +1,15 @@
 # WASM Browser Host
 
 The browser host runs the WASM platform target inside a browser tab.
-The platform itself is host-agnostic (`wasm_platform.md`); this doc is
+The platform itself is host-agnostic ([wasm_platform.md](wasm_platform.md)); this doc is
 normative only for browser hosts. It defines the host page that loads
 a `.wasm` bundle and drives the kernel, the browser-specific host
 imports above the kernel-uniform set, the catalogue of host-provided
-built-in modules, and the storage, audio, and lifecycle behaviour of
+native modules, and the storage, audio, and lifecycle behaviour of
 the browser embedding.
 
 Everything host-side lives in `src/platform/wasm/host/`; the
-kernel-side halves of the built-ins live in `src/platform/wasm/`.
+kernel-side halves of the native modules live in `src/platform/wasm/`.
 
 ---
 
@@ -62,16 +62,9 @@ the kernel's exports. The invariant is one-to-one: every wasm-side
 extern has a matching `host_*` shim entry, and a missing entry fails
 instantiation with a `LinkError` naming the import.
 
-A child module has its own linear memory, so the bridge copies argument
-bytes between it and the kernel's, and rewrites the output and fence
-pointers a request embeds (`storage.namespace` `LIST`, `RENAME`, `DELETE`,
-`BIND`; `storage.object` `HEAD`, `RANGE_GET`, `DELETE`, `LIST` and the
-streamed commit) to kernel scratch whose results it copies back; a null
-pointer stays null and one past the child's memory is `EINVAL`.
-`storage.object` `PUT` is served from the child's memory directly, under
-the wasm object provider's rules. The buffer primitive's acquire would hand
-back a kernel address, so across the bridge every acquire and release
-answers `ENOTSUP` and the module uses `channel_read` / `channel_write`.
+A child module has its own linear memory, so the bridge copies every
+span through kernel scratch and back, and zero-copy channel lends answer
+`ENOTSUP` across it ([wasm_platform.md §6](wasm_platform.md#6-host-import-surface)).
 
 ### Serving
 
@@ -140,7 +133,8 @@ include, so an unbound name is refused there, naming the line to add.
 
 ### Worker mode
 
-With `?worker=1` on the page URL, the kernel runs off the main thread:
+With `#worker` in the page URL (or a `worker` query parameter, where the
+server answers a path with a query), the kernel runs off the main thread:
 `fluxor-worker.js` loads `host_shims.js` inside a Web Worker (with a
 minimal `window` / `document` stub) and runs `kernel_init` plus the
 `kernel_step` loop there. The page keeps the `AudioContext` and input capture;
@@ -159,24 +153,24 @@ input stay live on the main thread.
 Source: extern declarations in `src/platform/wasm/*.rs`,
 implementations in `src/platform/wasm/host/host_shims.js`.
 
-In addition to the kernel-uniform imports (`wasm_platform.md` §6), the
-browser host provides one import group per capability. Each built-in
+In addition to the kernel-uniform imports ([wasm_platform.md §6](wasm_platform.md#6-host-import-surface)), the
+browser host provides one import group per capability. Each native module
 module's step function calls its group directly; each import lives in
 the kernel-side file of the module that uses it, so adding a
 capability is one Rust file with one extern block plus one shim
 implementation.
 
 ```text
-// Raster present (canvas built-in) — RGB565 pixel buffer.
-host_canvas_present(ptr, len, width: u32, height: u32)
+// Raster present (canvas native module); format 0 = RGB565, 1 = RGBA8888.
+host_canvas_present(ptr, len, width: u32, height: u32, format: u32)
 
 // Realtime audio sink (AudioWorklet ring).
 host_audio_play(ptr, len, sample_rate: u32, channels: u32)
 host_audio_ready() -> i32       // renderer can consume PCM now
 host_audio_lead_us() -> u64     // exact ring fill, from the render thread
 
-// Audio-clock StreamTime snapshot (24-byte record).
-host_stream_time(buf, len) -> i32
+// Audio-clock StreamTime snapshot (24-byte record); 1 once started, else 0.
+host_stream_time(out) -> i32
 
 // Input event queues, one pop import per source class.
 host_input_pop(buf, len) -> i32            // dom_input (keyboard snapshots)
@@ -214,6 +208,7 @@ host_http_close(handle) -> i32
 host_fetch_open(url_ptr, url_len) -> i32
 host_fetch_recv(handle, buf, len) -> i32
 host_fetch_size(handle) -> i32             // four-state, see below
+host_fetch_write(handle, buf, len) -> i32  // stage bytes; published as one file at close
 host_fetch_close(handle) -> i32
 
 // storage.object provider (§5).
@@ -224,7 +219,7 @@ host_object_close / host_object_put / host_object_delete
 host_ns_stat / host_ns_list
 
 // Image decode (createImageBitmap + OffscreenCanvas): the
-// wasm_browser_image_codec built-in and the image_decode provider (§5).
+// wasm_browser_image_codec native module and the image_decode provider (§5).
 host_image_decode_open / host_image_decode_object /
 host_image_decode_size / host_image_decode_recv /
 host_image_decode_close
@@ -236,6 +231,9 @@ host_gpu_service_*                         // the GPU contract's device half
 // Camera capture and decoded-scan display.
 host_camera_frame(buf, len) -> i32         // [w:u16][h:u16][luma w*h] frames
 host_scan_result(ptr, len)
+
+// Shared-surface capture (§4.7): bytes written, 0 none yet, negative = ended.
+host_display_frame(buf, len) -> i32
 
 // Kernel-log scrollback widget.
 host_terminal_emit(ptr, len)
@@ -262,14 +260,14 @@ committing a response code, so a slow `fetch()` failure surfaces as
 
 ---
 
-## 4. Built-in module catalogue
+## 4. Native module catalogue
 
-Built-ins are declared in YAML like modules on any other target and
-registered at `kernel_init` through the scheduler's builtin-module
-path. Each has a manifest under `modules/platform/wasm/<name>/` and a
-kernel-side step function in `src/platform/wasm/`.
+Native modules are declared in YAML like modules on any other target. Each
+is a native module: a manifest under `modules/platform/wasm/<name>/` and
+a vtable in `src/platform/wasm/` that the platform registers at
+`kernel_init`.
 
-Input sources (one per class, per `input_capability_surface.md`):
+Input sources (one per class, per [input_capability_surface.md](input_capability_surface.md)):
 
 | Module | Output port → content type | Notes |
 |--------|----------------------------|-------|
@@ -280,7 +278,7 @@ Input sources (one per class, per `input_capability_surface.md`):
 | `wasm_browser_action`   | `commands` → `FmpMessage` | overlay controls → FNV-hashed semantic commands |
 | `wasm_browser_dom_input`| `events` → `InputBinaryState` | keyboard-state snapshots on a single port |
 | `wasm_browser_surface_traits` | `events` → `SurfaceTraits` | viewport / modality / audio-config authority |
-| `wasm_browser_midi_in` / `wasm_browser_midi_out` | `events` ↔ `MidiEvents` | Web MIDI. Status: stub, not functional |
+| `wasm_browser_midi_in` / `wasm_browser_midi_out` | `events` ↔ `MidiEvents` | registered stubs: `midi_in` emits nothing, `midi_out` drains and discards its input; Web MIDI is not wired |
 
 Two further modules sit alongside the sources rather than in the
 output-port table: `wasm_browser_surface_traits_probe` is a demo
@@ -296,7 +294,7 @@ Media, transport, and diagnostics:
 | `wasm_browser_audio`    | `audio` in (`AudioSample`) | §4.1 |
 | `wasm_browser_canvas`   | `pixels` in (`VideoRaster`) | §4.2 |
 | `wasm_browser_image_codec` | `encoded` in (`OctetStream`) → `pixels` out (`VideoRaster`) | §4.3 |
-| `wasm_browser_gpu`      | `commands` in (`OctetStream`) | §4.4 |
+| `wasm_browser_gpu`      | `commands` in (`OctetStream`); params `width`, `height` (default 800 × 600) | §4.4 |
 | `wasm_browser_compute`  | `commands` in (`GpuCommand`), `outcomes` out (`GpuOutcome`) | §4.4 |
 | `wasm_browser_websocket`| `tx` in / `rx` out (`OctetStream`) | §4.5 |
 | `wasm_browser_ws_source`| `bytes` out (`VideoRaster`) | §4.5 |
@@ -307,7 +305,7 @@ Media, transport, and diagnostics:
 | `wasm_browser_display_capture` | `pixels` out (`VideoRaster`) | `SRF1` RGB565 frames of a surface the person chose to share, from `getDisplayMedia`; §4.7 |
 | `wasm_browser_scan_out` | `result` in (`OctetStream`) | surfaces a decoded byte result (e.g. a scanned token) in the page |
 | `wasm_browser_terminal` | none | drains the kernel log ring (`LOG_RING_DRAIN`) into a DOM scrollback via `host_terminal_emit`; the wasm analogue of UART logging |
-| `wasm_browser_video_codec` | `encoded` in (`OctetStream`) | Status: manifest declared, not registered; design target for WebCodecs decode |
+| `wasm_browser_video_codec` | `encoded` in (`OctetStream`) | a manifest only: no module is registered under the name, so a graph naming it does not load |
 
 ### 4.1 `wasm_browser_audio` — AudioWorklet PCM sink
 
@@ -344,10 +342,14 @@ rp2350 audio sinks.
 Source: `src/platform/wasm/canvas.rs`.
 
 Params: `width` (u16, required), `height` (u16, required), `header`
-(u16, default 0). Pixel format is RGB565 little-endian, the same as
-`st7701s` and `linux_display`. The shim converts to RGBA in JS and
-presents with Canvas 2D `putImageData`. The module declares
-`capabilities = ["video.raster", "display.scanout",
+(u16, default 0). Without a header every frame is `width` × `height`
+RGB565 little-endian, the same as `st7701s` and `linux_display`. With
+`header` set, each frame opens with a 10-byte SRF1 header,
+`[magic "SRF1"][w: u16 LE][h: u16 LE][fmt: u8][flags: u8]`, and takes its
+size from it, bounded by the configured `width` × `height`; `fmt` is 0
+for RGB565 or 1 for RGBA8888 (alpha carried and ignored). The shim
+converts to RGBA in JS and presents with Canvas 2D `putImageData`. The
+module declares `capabilities = ["video.raster", "display.scanout",
 "presentation.clock"]`.
 
 ### 4.3 `wasm_browser_image_codec` — encoded image → RGB565
@@ -376,7 +378,7 @@ shaders as data and describes the work as a command stream.
   decision — pace it on the audio `STREAM_TIME` clock for A/V sync.
 - **Contract** (`wasm_browser_compute`, `capabilities =
   ["gpu.compute", "gpu.render"]`) → `host_gpu_service_*`: the generic
-  GPU contract (`docs/architecture/gpu_contract.md`) — program packs,
+  GPU contract ([gpu_contract.md](gpu_contract.md)) — program packs,
   buffers, textures and bounded views, compute and raster pipelines,
   dependency-ordered submissions, fences, structured outcomes,
   readback and device reset. Validation, handles, sealing, residency,
@@ -404,7 +406,7 @@ them, shipping the program pack the target accepts. Application-specific
 GPU pipelines (a console rasteriser, a scientific kernel) are
 applications that consume these surfaces; they live out of tree.
 
-### 4.5 WebSocket built-ins
+### 4.5 WebSocket native modules
 
 Source: `src/platform/wasm/websocket.rs`,
 `src/platform/wasm/ws_source.rs`.
@@ -453,12 +455,12 @@ Source: `src/platform/wasm/fetch.rs`.
 Streams one URL's response body into a `bytes` output port via
 `host_fetch_open` / `host_fetch_recv`. The `host_*` prefix marks it as
 a host-provided capability in the same family as the Linux host
-built-ins. One in-flight request per module instance; for parallel
+native modules. One in-flight request per module instance; for parallel
 fetches, instantiate one module per URL.
 
 `wasm_browser_http` (`src/platform/wasm/http.rs`) is the browser as an
 HTTP exchange provider: a provider of the exchange contract
-(`exchange.md`) speaking its HTTP binding and declaring
+([exchange.md](exchange.md)) speaking its HTTP binding and declaring
 `stream.ordered_ack.exchange`, answering with the same records and
 statuses a socket-backed HTTP client does, so a
 requester moves between the two by wiring alone. Request records arrive
@@ -497,9 +499,10 @@ API for it, so capture is JS and the graph side is a pump.
 Params: `width` / `height` (u16, required) and `header` (u16, default
 1). The dimensions are the *backing* size, not the shared size: the
 person choosing what to share decides the geometry and may change it
-mid-session, so frames carry an `SRF1` header
-(`sector/modules/common/sector_raster.rs`) and the buffer bounds what a
-frame may claim. Larger surfaces are scaled to fit rather than refused.
+mid-session, so frames carry the SRF1 header (§4.2) and the buffer
+bounds what a frame may claim. Larger surfaces are scaled to fit rather
+than refused. The module declares `capabilities = ["video.raster",
+"display.capture"]`.
 
 Frames are RGB565-LE, so `capture.pixels -> display.pixels` resolves
 against `linux_display`, `st7701s`, and `wasm_browser_canvas` with no
@@ -641,38 +644,38 @@ A browser-host integration is healthy when:
 
 - The same `<config>.wasm` runs with no rebuild wherever the host
   imports are provided; only the host layer differs.
-- Application modules upstream of `wasm_browser_*` built-ins consume
+- Application modules upstream of `wasm_browser_*` native modules consume
   native AV / input / control content types; nothing knows it is a
   browser.
 - Audio scheduling is implemented once in the shim's worklet ring; no
   application code touches WebAudio.
-- Input identity is preserved end-to-end; the input built-ins emit
+- Input identity is preserved end-to-end; the input native modules emit
   source-side records with no application mapping.
 - Every kernel-side wasm extern has a matching `host_*` shim entry,
-  and the shims behave as the built-ins above rely on when driven from
+  and the shims behave as the native modules above rely on when driven from
   a fake linear memory under `node` — the `wasm-host-shims (node)`
   phase of `fluxor ci`, which reports itself skipped rather than
   passed when no `node` is on the path.
-- Adding a new built-in requires a kernel-side step function, a
-  manifest, and a shim implementation, with no kernel-ABI or
-  platform-doc changes.
+- A native module is a kernel-side half, a manifest, and a shim
+  implementation; adding one changes neither the kernel ABI nor the
+  platform contract.
 
 ---
 
 ## 8. Related documentation
 
-- `wasm_platform.md` — the platform target this host
-  runs. Owns the module envelope, bundle format, kernel-uniform host
-  imports, and tick model.
-- `av_capability_surface.md` — surfaces
+- [wasm_platform.md](wasm_platform.md) — the platform target this host
+  runs. Owns the module envelope, wasm bundle format, kernel-uniform
+  host imports, and how the host drives the kernel.
+- [av_capability_surface.md](av_capability_surface.md) — surfaces
   `wasm_browser_audio` and `wasm_browser_canvas` consume.
-- `input_capability_surface.md` — surfaces the input
-  built-ins produce, and their record shapes.
-- `storage_capability_surface.md` — the storage surfaces
-  the §5 providers implement.
-- `protocol_surfaces.md` — protocol substrate the
-  WebSocket built-ins feed.
-- `browser_capability_surface.md` — the browser as a
-  pure-JS endpoint, without a WASM kernel.
-- `endpoint_capability_surface.md` — the generic
-  endpoint surface that path follows.
+- [input_capability_surface.md](input_capability_surface.md) — surfaces
+  the input native modules produce, and their record shapes.
+- [storage_capability_surface.md](storage_capability_surface.md) — the
+  storage surfaces the §5 providers implement.
+- [protocol_surfaces.md](protocol_surfaces.md) — protocol substrate the
+  WebSocket native modules feed.
+- [browser_capability_surface.md](browser_capability_surface.md) — the
+  browser as a pure-JS endpoint, without a WASM kernel.
+- [endpoint_capability_surface.md](endpoint_capability_surface.md) — the
+  generic endpoint surface that path follows.

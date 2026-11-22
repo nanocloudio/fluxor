@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::compose::{ResourceProfile, WorkloadUid};
+use crate::compose::{OwnerUid, ResourceProfile};
 use crate::params::ParamSpec;
 
 fn default_role() -> String {
@@ -262,7 +262,7 @@ impl ValidationReport {
 
 /// Is `name` a workload name: an ASCII letter or digit, then letters,
 /// digits, `.`, `_` or `-`, at most 64 bytes. A name becomes a path
-/// component (`target/fluxor/<name>/`, `target/fluxor/bundles/<name>/`) and
+/// component (`target/fluxor/<name>/`, `target/fluxor/packages/<name>/`) and
 /// an OCI tag, so it can hold no separator and cannot be `.` or `..`.
 pub fn is_workload_name(name: &str) -> bool {
     let mut bytes = name.bytes();
@@ -489,13 +489,13 @@ pub fn select_implementation<'a>(
 // ============================================================================
 
 /// Qualify a workload-local module name into its globally-unique composed-graph name
-/// `workload/<namespace>/<workload-uid-hex>/<module>`. Deterministic and collision-free
-/// across workloads (the Workload UID disambiguates), so two workloads can declare a module of
+/// `workload/<namespace>/<owner-uid-hex>/<module>`. Deterministic and collision-free
+/// across workloads (the owner uid disambiguates), so two workloads can declare a module of
 /// the same local name without clashing in the composed device graph.
-pub fn qualify_module(namespace: &str, workload_uid: &WorkloadUid, module: &str) -> String {
+pub fn qualify_module(namespace: &str, owner_uid: &OwnerUid, module: &str) -> String {
     use std::fmt::Write;
     let mut hex = String::with_capacity(32);
-    for b in workload_uid {
+    for b in owner_uid {
         let _ = write!(hex, "{b:02x}");
     }
     format!("workload/{namespace}/{hex}/{module}")
@@ -505,12 +505,12 @@ pub fn qualify_module(namespace: &str, workload_uid: &WorkloadUid, module: &str)
 /// (deterministic — the order feeds the composition layout).
 pub fn qualify_implementation_modules(
     namespace: &str,
-    workload_uid: &WorkloadUid,
+    owner_uid: &OwnerUid,
     imp: &Implementation,
 ) -> Vec<String> {
     imp.modules
         .iter()
-        .map(|m| qualify_module(namespace, workload_uid, &m.name))
+        .map(|m| qualify_module(namespace, owner_uid, &m.name))
         .collect()
 }
 

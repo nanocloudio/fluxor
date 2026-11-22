@@ -2,7 +2,7 @@
 //! RP flash graph-slot A/B path.
 //!
 //! A module (normally `ota_registry`) streams a NODE IMAGE (`fluxor
-//! build --emit=image`: the `wire::node_image` header, the module table
+//! build --emit=node`: the `wire::node_image` header, the module table
 //! and the config) into the inactive one of two RAM staging buffers via
 //! `OTA_STAGE_WRITE`, then commits it with `OTA_STAGE_CTRL`. Commit admits
 //! the image as boot admits one (`boot::node_image::admit`: header shape,

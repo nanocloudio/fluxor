@@ -26,7 +26,7 @@ fn linux_disable_interrupts() -> u32 {
 }
 fn linux_restore_interrupts(_state: u32) {}
 
-/// Main-loop thread handle, captured before stepping starts.
+/// Domain-loop thread handle, captured before the first pass.
 /// `linux_wake_scheduler` clones and unparks it so an event signaled
 /// from any thread (or from an ISR-equivalent callback) can interrupt
 /// the runtime's `park_timeout` and run woken modules — the host analogue
@@ -173,13 +173,13 @@ fn linux_seal_blob_read(label: &[u8], out: &mut [u8]) -> Option<usize> {
 /// The key is derived from `FLUXOR_SEAL_KEY` or a file under the store
 /// directory — both readable by anything running as this user. Sealing
 /// therefore protects a stored key from a compromised MODULE and not from a
-/// compromised HOST, and the vault's tier stays `SOFTWARE` because of it.
+/// compromised HOST, and the vault's custody stays `SOFTWARE` because of it.
 ///
 /// A Linux box with a TPM could report `DeviceUnique` by sealing to the
 /// storage root key. That is a real path and deliberately not taken here on
 /// the quiet: claiming it requires actually talking to the TPM, and a
 /// provenance that overstates itself is worse than no sealing at all — it
-/// raises a vault's tier and, with it, what a deployment believes about
+/// raises a vault's custody and, with it, what a deployment believes about
 /// keys it has not actually protected.
 fn linux_seal_provenance() -> fluxor::kernel::sys::hal::SealProvenance {
     if linux_seal_key().is_some() {
@@ -517,7 +517,7 @@ fn linux_init_providers() {
     // re-register both KEY_VAULT dispatch paths over the kernel software
     // default. Runs after the kernel-core registrations, so the override
     // wins; unconfigured or failed, the software backend stays live and
-    // reports TIER=SOFTWARE.
+    // reports CUSTODY=SOFTWARE.
     #[cfg(feature = "host-hsm")]
     fluxor::platform::linux::hsm_key_vault::try_register_from_env();
 }

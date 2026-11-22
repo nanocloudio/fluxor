@@ -1,0 +1,13 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Fixture for the declared-heap commit: declares a fixed arena and takes one
+# block near it in `module_new`, the one-block pattern heap.md recommends for a
+# type's tables. Its construction fails (-12) when the heap cannot serve that
+# block, so an instance that loads is one whose declared heap was committed
+# whole. The shape is a key-value worker's command log: a 147,488 B arena and
+# one 131,106 B block.
+timer_class = "agnostic"
+
+[observability]
+exempt = "fixture whose evidence is that it constructs"

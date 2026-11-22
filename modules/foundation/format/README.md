@@ -7,24 +7,14 @@ Format PIC Module
 - `manifest.toml`
 - `mod.rs`
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `raw_audio` | input | `OctetStream` | required |
+| `audio` | output | `AudioSample` | required |
 
-[[ports]]
-name = "raw_audio"
-direction = "input"
-content_type = "OctetStream"
-required = true
-
-[[ports]]
-name = "audio"
-direction = "output"
-content_type = "AudioSample"
-required = true
-```
+Builds for: `rp2350`. [manifest.toml](manifest.toml) is the declaration.
 
 ## Parameters
 
@@ -33,8 +23,3 @@ required = true
 - `input_channels`
 - `input_rate`
 - `output_rate`
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01

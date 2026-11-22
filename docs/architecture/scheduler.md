@@ -243,10 +243,11 @@ The walk is the one `parse_protection_config` uses: entries after the
 counts. Extended entries after the end marker (`[tag][0][len BE]`, such as
 `tls` credentials) are not read as tags.
 
-The heap flags `0xF8` (zero on free), `0xF9` (fault on alloc failure) and
-`0xFA` (canary) are allowed. They change how the module's own heap behaves
-and size nothing. That heap is the module's arena, and the add charges the
-module's state plus arena to its owner's `state_cap`.
+The heap tags `0xF8` (zero on free), `0xF9` (fault on alloc failure),
+`0xFA` (canary), `0xEF` (the instance's heap cap) and `0xEE` (raw arena use)
+are allowed. They change how the module's own heap behaves and how large it
+may grow, and the add charges the module's state plus its heap, at its cap,
+to its owner's `state_cap`.
 
 The build refuses the same things first. A workload module may not declare
 `trust_class`, `protection`, `device_window`, `isr_budget_cycles`, `irq`
@@ -431,8 +432,10 @@ its `rate_hz`, required and a whole number of microseconds per period
 A graph declares at most `MAX_DOMAINS` (4) domains, indexed 0..3 in
 declaration order. A domain's core is its index: on the SMP targets
 (bcm2712, uefi) domain d runs on core d, and on RP, Linux and wasm every
-domain runs on the one thread, in index order. There is no `cores:` key;
-the builder refuses it as an unknown key.
+domain runs on the one thread, in index order. The core follows from the
+index and is never declared: a domain entry takes `name`, `exec`, its
+cadence and its adaptive settings, and the builder refuses `cores:`,
+`tier:` and `exec_mode:` on one.
 
 The build-time validators (`validate_interrupt_admission` and
 `validate_pre_pass_admission` in `tools/src/config/builder.rs`)
@@ -473,9 +476,9 @@ pre_pass = true       # run in the domain's pre-pass (tick only).
 byte; `pre_pass` rides bit 3. Both round-trip through the `.fmod`
 file format.
 
-`pre_pass` is also carried in the boot-config module record's flags
-(`MODULE_FLAG_PRE_PASS`) so `prepare_graph` can read it without
-re-parsing the `.fmod` manifest.
+`pre_pass` is also carried in the composed graph's module record flags
+(`fluxor_contracts::graph::MODULE_FLAG_PRE_PASS`) so admission can read it
+without re-parsing the `.fmod` manifest.
 
 ## Interrupt-mode I/O contract
 
@@ -516,7 +519,7 @@ Source: `src/kernel/module/syscalls.rs`,
 
 1. **Build-time admission.** `validate_interrupt_admission` and
    `validate_pre_pass_admission` reject ill-formed graphs before
-   a `.cfg.bin` is emitted.
+   an image is emitted.
 2. **Cooperative skip.** `step_one_module` returns early for any
    module whose domain's `ExecMode` is in the interrupt family (`timer`
    or `irq`; its dispatcher handles it instead). Pre-pass modules are
@@ -656,14 +659,14 @@ terminated or finished module is never dispatched again.
    and routes the module into the domain's pre-pass order instead of
    `domain_exec_order[d]`.
 2. The tick pass (`pass::run`) runs the pre-pass once, before the regular
-   `exec_order` rotation. It snapshot-restores the domain budget
+   `domain_exec_order` rotation. It snapshot-restores the domain budget
    accumulator so pre-pass cost does not leak into the regular
    per-domain budget accounting.
 3. If the combined pre-pass budget (`PRE_PASS_BUDGET_SHARE`: 1/20 of
    the domain's tick, 5 µs at 100 µs) is exceeded, the pre-pass emits an
    overrun monitor record, counts the overrun against the domain, and
    stops iterating; the remaining pre-pass modules wait until the next
-   pass. The regular `exec_order` rotation continues uninterrupted — an
+   pass. The regular `domain_exec_order` rotation continues uninterrupted — an
    overrun does not abort the pass, and the pre-pass recovers on the
    next pass.
 

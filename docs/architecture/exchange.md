@@ -222,7 +222,7 @@ whether it runs in the same graph or across a network: embedding or going
 remote is a placement choice, not a different client. The front holds the
 resource; its requesters do not.
 
-`foundation/object_exchange` is the front of `storage.object`, the contract
+`modules/foundation/object_exchange` is the front of `storage.object`, the contract
 the key stores, `fs_object` and replicated stores all serve. It is a provider
 that never collects a request whole — a body runs to whatever the store takes —
 so it streams instead of using `Collector`: a request body moves to the
@@ -270,7 +270,7 @@ surface is the module's
 
 Where a provider runs is a placement choice: the requester reaches a
 provider on another node with the same records it uses on a local edge,
-wired to a stand-in instead of the provider. `foundation/remote_channel`
+wired to a stand-in instead of the provider. `modules/foundation/remote_channel`
 carries one exchange across its authenticated sessions. With
 `exchange: near` it stands in for the remote provider, with the provider's
 ports (`request_in`, `response_out`); with `exchange: far`, on the

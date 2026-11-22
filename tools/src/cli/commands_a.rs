@@ -375,7 +375,7 @@ fn cmd_generate(
         } else {
             return Err(error::Error::Config(
                 "A config UF2 is only produced combined with a firmware image: \
-                 use `--emit=combined --firmware <UF2>`, or `--emit=bin` for the \
+                 use `--emit=firmware --firmware <UF2>`, or `--emit=bin` for the \
                  raw config binary."
                     .into(),
             ));
@@ -397,7 +397,7 @@ fn cmd_generate(
 }
 
 /// The boot config a hosted build (Linux, wasm) compiles from the graph at
-/// `config_path`, its rings charged against the target's buffer arena.
+/// `config_path`, admitted against the target's arenas.
 fn generate_config_bytes(
     config_path: &Path,
     module_root: Option<&std::path::Path>,
@@ -455,9 +455,9 @@ fn generate_config_bytes(
         &crate::project::root_for_config(config_path),
     )?;
 
-    // The hosted builds (Linux, wasm) compile their config here: charge its
-    // rings against the target's buffer arena, as an image build does.
-    check_ring_demand_unbuilt(
+    // The hosted builds (Linux, wasm) compile their config here: admit it
+    // against the target's arenas, as an image build does.
+    check_arenas_unbuilt(
         &config,
         &binary_data,
         &modules_dir,
@@ -623,8 +623,13 @@ fn check_state_budget(
                 target.isolation.exception_frame_bytes as u64,
                 model,
             ),
-            _ if state == 0 => 0,
-            _ => kernel.module(state, heap, raw_arena(params)),
+            _ if state == 0 && kernel.module_host.is_none() => 0,
+            _ => kernel.module(
+                state,
+                heap,
+                m.manifest.arena_bytes as u64,
+                raw_arena(params),
+            ),
         };
         if bytes == 0 {
             unknown.push(m.name.as_str());
@@ -728,8 +733,8 @@ struct KernelCarves<'a> {
     runtime: &'a str,
     /// The kernel commits a module's heap whole at instantiation.
     commits_heaps: bool,
-    /// The kernel grows heaps in segments, `(segments, quantum)`, committing
-    /// the first at instantiation.
+    /// The kernel grows heaps in segments, `(segments, quantum)`, past the
+    /// declared heap it commits at instantiation.
     elastic: Option<(usize, usize)>,
     /// Every module runs through a module host taking `(state, scratch)`
     /// from the arena in place of the module's own (wasm).
@@ -754,12 +759,15 @@ impl KernelCarves<'_> {
         Some(state + seat)
     }
 
-    /// A module instance of `state` bytes with a heap cap of `heap` bytes,
-    /// `raw` when it declares raw arena use (params tag 0xEE: an elastic heap
-    /// committed whole at instantiation). `state` is not zero. An elastic
-    /// heap is charged the first segment it commits at instantiation; what it
-    /// grows by later is the module's own allocation, not the budget's.
-    fn module(&self, state: u64, heap: u64, raw: bool) -> u64 {
+    /// A module instance of `state` bytes with a heap cap of `heap` bytes and
+    /// a declared heap of `declared` bytes (its type's arena, or the size its
+    /// params give), `raw` when it declares raw arena use (params tag 0xEE).
+    /// `state` is not zero. On an elastic profile the kernel commits the
+    /// declared heap whole at instantiation (all of the cap for a raw one),
+    /// by `first_heap_segment` with one segment, and that is what is charged;
+    /// room the graph grants above the declaration grows on demand and is not
+    /// budgeted.
+    fn module(&self, state: u64, heap: u64, declared: u64, raw: bool) -> u64 {
         use crate::capacity::state_carve;
         use fluxor_contracts::state_arena::first_heap_segment;
         if let Some((host_state, scratch)) = self.module_host {
@@ -767,17 +775,12 @@ impl KernelCarves<'_> {
         }
         let heap_carve = match self.elastic {
             _ if heap == 0 => 0,
-            Some((segments, quantum)) => {
-                let cap = usize::try_from(heap).unwrap_or(usize::MAX);
-                let seg = if raw {
-                    first_heap_segment(cap, 1, quantum)
-                } else {
-                    first_heap_segment(cap, segments, quantum)
-                };
-                if seg == 0 {
-                    0
-                } else {
-                    state_carve(seg as u64)
+            Some((_, quantum)) => {
+                let commit = if raw { heap } else { declared.min(heap) };
+                let commit = usize::try_from(commit).unwrap_or(usize::MAX);
+                match first_heap_segment(commit, 1, quantum) {
+                    0 => 0,
+                    seg => state_carve(seg as u64),
                 }
             }
             None if self.commits_heaps => state_carve(heap),
@@ -829,13 +832,16 @@ fn native_names(config: &serde_json::Value) -> std::collections::HashMap<u32, St
         .collect()
 }
 
-/// Charge a compiled graph's channel rings against the target's buffer arena
-/// and REFUSE an image whose rings do not fit (`ring_demand`).
+/// Charge a compiled graph against the target's two arenas and REFUSE an
+/// image that does not fit either: its modules' state against the state arena
+/// ([`check_state_budget`]), then its channel rings against the buffer arena
+/// (`ring_demand`). Every build and `--check` that has the `.fmod`s admits its
+/// graph here, so the loader's refusals are the build's.
 ///
 /// `modules` are the `.fmod`s the image carries: the loader holds exactly
 /// their manifests, so a module the kernel runs built in sizes none of its
 /// ports. The source manifests only name the ports in the table.
-fn check_ring_demand(
+fn check_arenas(
     config: &serde_json::Value,
     config_data: &[u8],
     modules: &[modules::ModuleInfo],
@@ -843,6 +849,7 @@ fn check_ring_demand(
     extra_dirs: &[&std::path::Path],
     project_root: &std::path::Path,
 ) -> Result<()> {
+    check_state_budget(modules, config, config_data, target)?;
     let facts: std::collections::HashMap<u32, crate::ring_demand::ModuleFacts<'_>> = modules
         .iter()
         .map(|m| {
@@ -1281,8 +1288,7 @@ fn cmd_combine(
     )?;
 
     check_code_ceiling(&modules, &target_desc)?;
-    check_state_budget(&modules, &config, &config_data, &target_desc)?;
-    check_ring_demand(
+    check_arenas(
         &config,
         &config_data,
         &modules,
@@ -1570,8 +1576,7 @@ fn build_packaged_blobs(
     )?;
 
     check_code_ceiling(&modules, target_desc)?;
-    check_state_budget(&modules, config, &config_data, target_desc)?;
-    check_ring_demand(
+    check_arenas(
         config,
         &config_data,
         &modules,
@@ -2059,25 +2064,30 @@ mod state_budget_tests {
         assert!(e.contains("`no_such_native`"), "{e}");
     }
 
-    /// On an elastic profile the kernel commits a heap's first segment at
-    /// instantiation (`first_heap_segment` of its cap), and the whole cap for
-    /// a module that declares raw arena use (params tag 0xEE); that is what
-    /// is charged beside the state. Growth past the first segment is not.
+    /// On an elastic profile the kernel commits a module's declared heap whole
+    /// at instantiation, and that is what is charged beside the state: a
+    /// fixed arena its whole declaration, however large. A graph cap above the
+    /// declaration (params tag 0xEF) is room that grows on demand and adds
+    /// nothing to the charge; a module that declares raw arena use (params tag
+    /// 0xEE) is committed, and charged, its whole cap.
     #[test]
-    fn an_elastic_heap_is_charged_its_first_segment() {
-        use fluxor_contracts::state_arena::first_heap_segment;
+    fn an_elastic_heap_is_charged_its_declared_arena() {
         let target = linux();
-        let (segments, quantum) =
-            crate::capacity::kernel_elastic_heaps("linux").expect("linux heaps are elastic");
-        let cap = 1024 * 1024;
-        let first = first_heap_segment(cap as usize, segments, quantum) as u32;
-        assert_eq!(first, 64 * 1024, "a 1 MiB cap commits one 64 KiB quantum");
-        let mods = [module_with_heap("a", 128, cap)];
-        let plain = image(&[("a", &[])]);
-        let raw: &[u8] = &[0xFE, 0x01, 3, 0, 0xEE, 1, 1, 0xFF, 0x00];
-        let raw = image(&[("a", raw)]);
+        let declared: u32 = 147_488;
+        let cap: u32 = 1024 * 1024;
+        let mods = [module_with_heap("a", 128, declared)];
+        let fixed = image(&[("a", &[])]);
+        let mut granted = vec![0xFE, 0x01, 6, 0, 0xEF, 4];
+        granted.extend_from_slice(&cap.to_le_bytes());
+        granted.extend_from_slice(&[0xFF, 0x00]);
+        let granted = image(&[("a", &granted)]);
+        let mut raw = vec![0xFE, 0x01, 9, 0, 0xEF, 4];
+        raw.extend_from_slice(&cap.to_le_bytes());
+        raw.extend_from_slice(&[0xEE, 1, 1, 0xFF, 0x00]);
+        let raw = image(&[("a", &raw)]);
         for (graph, need) in [
-            (&plain, carve(128) + carve(first)),
+            (&fixed, carve(128) + carve(declared)),
+            (&granted, carve(128) + carve(declared)),
             (&raw, carve(128) + carve(cap)),
         ] {
             let fits = json!({"capacity": {"state_arena": need}});
@@ -2148,18 +2158,19 @@ mod state_budget_tests {
         let target = wasm();
         let (host, scratch) =
             crate::capacity::kernel_module_host("wasm").expect("wasm hosts its modules");
-        let mods = [module_with_heap("a", 4096, 8192)];
+        // `z` publishes no state size: its state lives in its own linear
+        // memory, so the host's carve is all it takes from the arena.
+        let mods = [module_with_heap("a", 4096, 8192), module("z", 0)];
         // width 320 (tag 10), height 200 (tag 11).
         let wh: &[u8] = &[0xFE, 0x01, 10, 0, 10, 2, 0x40, 0x01, 11, 2, 0xC8, 0x00, 0xFF, 0x00];
-        let graph = image(&[("a", &[]), ("wasm_browser_canvas", wh)]);
+        let graph = image(&[("a", &[]), ("z", &[]), ("wasm_browser_canvas", wh)]);
         let [base, per_pixel, ..] = canvas::HEAP_SEAT;
         let seat = base + per_pixel * 320 * 200;
         assert_eq!(
             fluxor_contracts::state_arena::heap_seat_bytes(&canvas::HEAP_SEAT, wh),
             Some(seat as usize)
         );
-        let need = carve(host as u32)
-            + carve(scratch as u32)
+        let need = 2 * (carve(host as u32) + carve(scratch as u32))
             + carve(canvas::STATE_BYTES)
             + carve(seat);
         let cfg = json!({"capacity": {"state_arena": need}});

@@ -232,7 +232,8 @@ Each dynamic module follows this lifecycle:
 2. `module_init(syscalls)` receives the syscall table.
 3. `module_new(...)` binds channels, parses params, and initialises module state.
 4. `module_step(state)` advances the state machine cooperatively.
-5. Module teardown occurs by graph reset/reconfigure and arena reset.
+5. Teardown comes with a graph rebuild, or with the release of the
+   module's owner.
 
 This contract keeps modules loadable, relocatable, and independent of
 board-specific firmware code.
@@ -255,9 +256,10 @@ The runtime loader enforces a concrete module binary contract:
   `observes_owner_release`, `samples_pool`, plus `DRAIN` / `ISR` for the
   entry points it defines). A module whose manifest states no state size is
   refused at load.
-- The header (`abi::wire::fmod::header`, named fields) carries schema and
-  manifest section sizes, the flag byte, the step period and phase, and the
-  required capability bits
+- The header (`abi::wire::fmod::header`, 56 bytes of named fields) carries
+  the module's ABI version and dataflow role, the code, data, export,
+  schema and manifest sizes, the flag byte (below), the step period and
+  phase, and the type name
 - Parameter schema and manifest payloads are embedded in the `.fmod` image
 - The manifest section (`FXMF`) carries a SHA-256 integrity hash over
   code+data, an Ed25519 signature over that hash, and the signer's
@@ -269,6 +271,23 @@ The runtime loader enforces a concrete module binary contract:
   [security.md](security.md) for the trust chain and
   [network_boot.md](network_boot.md) for the deployment-time use of the
   same signing key.
+
+#### Header flags
+
+The header's flag byte (`abi::wire::fmod::header::flag`, byte 7) carries
+the module facts the kernel reads without asking the module. The packer
+sets each from the manifest, or from the entry point being present:
+
+| Bit | Fact | Meaning |
+|-----|------|---------|
+| 0 | `mailbox_safe` | Consumes from mailbox channels safely |
+| 1 | `in_place_writer` | Transforms a mailbox record in place (`ACQUIRE_INPLACE`) |
+| 2 | `deferred_ready` | Needs init time before its downstream runs |
+| 3 | `DRAIN` | Exports `module_drain` (live reconfigure) |
+| 4 | `ISR` | Exports `module_isr_entry` (`irq` mode) |
+| 5 | `WASM_PAYLOAD` | The body is a wasm payload |
+| 6 | `observes_owner_release` | A provider told when a consumer's owner is released ([reconfigure.md](reconfigure.md#releasing-an-owners-resources)) |
+| 7 | `samples_pool` | A provider the resource ledger asks for a pool's in-use figure ([reconfigure.md](reconfigure.md#reporting-a-pool-the-provider-serves)) |
 
 #### Position-independent data
 
@@ -291,13 +310,12 @@ That holds because of how `fluxor modules build` compiles a module:
 `--crate-type=staticlib -C relocation-model=pie`. A module is a leaf whose
 only exports are its `#[no_mangle]` entry points, and `staticlib` makes every
 other item internal; `pie` makes even those entry points non-preemptible.
-Built as a `lib` under `pic` — as modules once were — every `pub` item
-reachable from the crate root is exported and preemptible, and the SDK is
-mounted textually at each module's crate root, so code reached each
-`pub static` through a GOT entry: a link-time address the loader never
-relocates, in a `.got` the packer does not carry. The read faulted (or, where
-the linker happened to relax that particular access, worked, so the defect
-came and went with instruction scheduling).
+A `lib` built under `pic` would export every `pub` item reachable from the
+crate root as preemptible, so code would reach each `pub static` through a
+GOT entry: a link-time address the loader never relocates, in a `.got` the
+packer does not carry. The read would fault, or, where the linker happened
+to relax that particular access, work, so the defect would come and go with
+instruction scheduling.
 
 What is not safe is data that *contains* an address: a `const` array of
 `&[u8]` or function pointers, and a `static` holding a reference — including a
@@ -310,7 +328,7 @@ instead, which needs no relocation — so the same source is correct on
 bcm2712 and wrong on an RP die, and a module that targets both has to be
 written for the RP case.
 
-Hold names in a `name_table!` (`runtime/names.rs`): the strings are one run
+Hold names in a `name_table!` (`crates/fluxor-rt/src/names.rs`): the strings are one run
 of bytes with integer end offsets, built at compile time, so the only
 address in play is the table's own. Otherwise act in each arm rather than
 returning the literal from it.
@@ -355,7 +373,7 @@ module holding an allocated section the image does not carry (anything but
 
 #### What a module cannot link
 
-A module links against the SDK's runtime (`runtime/intrinsics.rs`) and no
+A module links against the module runtime (`crates/fluxor-rt/src/intrinsics.rs`) and no
 other: no `core` panic machinery, no soft-float library, no
 `compiler_builtins`. The runtime provides `memcpy`, `memmove`, `memset`,
 `memcmp`; on 32-bit Arm the `__aeabi_*` integer division, 64-bit shift and
@@ -390,17 +408,16 @@ On rp2350 the kernel is built `thumbv8m.main-none-eabihf` but modules are
 built `thumbv8m.main-none-eabi`, the soft-float ABI. The RP kernel does not
 grant the coprocessor, so any VFP instruction a module reached would be a
 NOCP UsageFault (CFSR bit 19) that parks the node — every module on the
-board, not just its own. Under the hard-float ABI a module reached them
+board, not just its own. Under the hard-float ABI a module would reach them
 without asking: `f32` lowers to VFP instructions and links, and every `f64`
 passed between functions moves through VFP registers, so even a module that
-supplies its own soft-float routines faulted. Under the soft-float ABI `f32`
+supplied its own soft-float routines would fault. Under the soft-float ABI `f32`
 is an undefined symbol at link, as on rp2040, and a module that needs
 floating point brings its own `__aeabi_*` routines and runs. Nothing floating
 crosses the module boundary, so the two ABIs never meet. The FPU stays off by
 design: enabling it means lazy FP context stacking on every exception (72
 more bytes on the kernel stack each time) and scrubbing the FP registers
-between modules, for no module that needs it. A rig scenario holds this on
-the silicon, issuing the one VFP instruction by hand.
+between modules, for no module that needs it.
 
 The build holds this table true: a check builds one module per construct
 for each die and fails the moment any row stops matching, so a toolchain
@@ -512,17 +529,17 @@ No module mounts their source with `#[path]` or `include!`; the `sdk-mount`
 hygiene rule refuses it. A module elsewhere links the same crates, built
 from the trees `fluxor sync` stages under `target/fluxor/`.
 
-**Built-in modules** (`builtin = true` in their `manifest.toml`) are
+**Native modules** (`builtin = true` in their `manifest.toml`) are
 compiled directly into the kernel binary rather than shipped as
 `.fmod` images. Since there is no `.fmod` to embed a `define_params!`
-schema into, built-ins declare their parameter schema in the manifest
+schema into, native modules declare their parameter schema in the manifest
 TOML under a `[[params]]` section: the same wire format (TLV) as PIC
 modules, but the schema is read off disk at config-build time.
 
-Built-in manifests live under `modules/platform/<platform>/<name>/`,
+Native manifests live under `modules/platform/<platform>/<name>/`,
 with `linux/` for Linux-host APIs and `host/` for host-OS-agnostic
 pure-Rust modules. The Rust implementation sits in
-`src/platform/<platform>/<name>.rs`. Built-in vs PIC is a
+`src/platform/<platform>/<name>.rs`. Native vs PIC is a
 deployment distinction (linked-in vs loaded-at-runtime), not a
 selection one: `stacks/*.toml` route logical surfaces to either kind
 transparently.
@@ -530,7 +547,7 @@ transparently.
 See [abi_layers.md](abi_layers.md) for the schema, validation rules
 (unknown-key/range/required), the runtime-feature cross-check, and
 the full module-categories layout. The kernel itself sees only the
-resulting TLV bytes; built-in vs PIC is invisible at the wire layer.
+resulting TLV bytes; native vs PIC is invisible at the wire layer.
 
 See `src/kernel/module/loader.rs`, `crates/fluxor-rt/module.ld`, and
 `tools/src/modules.rs` for the loader, linker script, and pack tool.
@@ -590,7 +607,7 @@ nothing else of the section.
 
 - `0`: Continue (yield, no terminal state)
 - `1`: Done (module reached terminal completion)
-- `2`: Burst (request immediate re-step in the same scheduler cycle)
+- `2`: Burst (request immediate re-step in the same tick pass)
 - `3`: Ready (initialisation complete, downstream may run)
 - `<0`: Error (errno-style failure)
 
@@ -637,23 +654,23 @@ it.
 
 Source: `src/kernel/exec/step_guard.rs`
 
-Modules can be assigned a protection level at config time:
+Every module runs under the step guard, which detects a step that overruns
+its deadline, at one protection level assigned at config time
+(`protection:`):
 
-- **Level 0 (None)** — direct call, no isolation.
-- **Level 1 (Guarded)** — step guard timer detects timeouts. A module
-  that overruns its step deadline is marked as faulted.
-- **Level 2 (Contained)** and **Level 3 (Isolated)** — the gated levels.
+- **`privileged`** (0) — called directly.
+- **`contained`** (1) and **`isolated`** (2) — the gated levels.
   The module runs unprivileged, reaching only its own private region
   (stack, state, heap) and its code — all of flash when contained — and
   the kernel only through the gateway; any other access raises a fault.
-  Implemented on rp2040 and rp2350 (MPU) and on the Pi 5 (EL0 under a
+  Implemented on rp2040 and rp2350 (MPU) and on bcm2712 (EL0 under a
   per-module page table, isolated only). A request is a floor: the target
   provides the weakest level it implements at or above it, and refuses one
   above everything it implements. See
   [module_isolation.md](module_isolation.md).
 
-Faulted modules transition through `Running → Faulted → Recovering`
-(or `Terminated`) according to a per-module fault policy:
+A faulted module moves `Running → Faulted → Recovering` (or `Terminated`)
+according to a per-module fault policy:
 
 | Policy | Behaviour |
 |--------|----------|
@@ -662,7 +679,8 @@ Faulted modules transition through `Running → Faulted → Recovering`
 | `Tolerate` | Record step-deadline overruns (fault counter, log, fault ring) without faulting the module; step errors still fault normally. For modules whose synchronous device operations have a legitimate heavy tail |
 
 Recovery is bounded by a per-module restart count and exponential
-backoff. The kernel records `FaultStats` per module, exposed as a
+backoff; [scheduler.md](scheduler.md#deadline-enforcement) states the
+windows. The kernel records `FaultStats` per module, exposed as a
 snapshot through the provider query surface for telemetry.
 
 ### Async I/O Pattern
@@ -777,7 +795,7 @@ channels, and the domain loop steps every module of its domain each pass.
 +-------------------------------------------------------------+
 |                      DOMAIN LOOP                             |
 |  setup() -> graph instantiation -> passes                    |
-|  Automatic tee/merge insertion for fan-out/fan-in           |
+|  Fan-out/fan-in: tee/merge modules the composer inserted    |
 +-------------------------------------------------------------+
 ```
 

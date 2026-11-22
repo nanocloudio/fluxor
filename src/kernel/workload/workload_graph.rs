@@ -976,7 +976,7 @@ fn addr_ctl_channel() -> i32 {
 /// Single-writer gate: the backend is the *sole* writer of `addr_ctl`, so
 /// the node graph must leave the channel producer-less (no module edged into
 /// it). `channel_producer_owner` returns `OWNER_NODE` for a producer-less (or
-/// benign system-anchored) channel; a non-system producer means a mis-wired base
+/// benign node-anchored) channel; a non-node producer means a mis-wired node
 /// graph — `channel_write` on an SPSC FIFO with a second producer violates the
 /// invariant, so we refuse rather than double-write.
 fn addr_ctl_writable(ch: i32) -> bool {
@@ -2190,12 +2190,18 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: &mut [u8], mut data: UserSp
 
 /// Tear workload slot `widx` down: remove its net identity (ADDR_DEL) before
 /// freeing the owner (a zero or cleared address is a no-op: host-shared, or
-/// already removed by SIG_KILL), then free the slot.
+/// already removed by SIG_KILL), then free the slot and every handle naming
+/// it. A slot's index is the handle index the platform's provider answers
+/// for it on every platform.
 unsafe fn destroy_slot(widx: usize) -> i32 {
     let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
     remove_identity(&slots[widx].net_addr);
     let _ = live::free_owner(slots[widx].owner); // idempotent — stale handle is fine
     slots[widx] = WL_EMPTY;
+    crate::kernel::module::provider::retire_routes_naming(
+        crate::abi::registry::workload::ID,
+        widx as i32,
+    );
     0
 }
 

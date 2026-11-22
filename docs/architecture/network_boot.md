@@ -9,9 +9,9 @@ registry serves.
 
 Two delivery paths exist:
 
-- **Pi-5-class targets** netboot their firmware image over TFTP, then pull
-  node images over TLS from an OCI registry and stage them in RAM
-  through a kernel staging surface.
+- **Pi 5** netboots its firmware image over TFTP, then pulls node images
+  over TLS from an OCI registry and stages them in RAM through a kernel
+  staging surface (which a hosted Linux runtime also provides).
 - **RP-class targets** stage node images into on-flash A/B graph
   slots through the `ota_ingest` / `graph_slot` module pair.
 
@@ -23,7 +23,7 @@ Source: `crates/fluxor-abi/src/wire/node_image.rs` (header and codec),
 `modules/foundation/graph_slot/` and `modules/foundation/ota_ingest/`
 (readers).
 
-`fluxor build <config> --emit=image --output <file>` produces a node
+`fluxor build <config> --emit=node --output <file>` produces a node
 image: a 256-byte FXSL header; from the first 4 KiB boundary, the module
 table (FXMT format, one FXMD entry per module) followed by the graph's
 program section when its modules own programs (see
@@ -48,7 +48,7 @@ The same header opens every graph a kernel runs: an RP flash slot, an
 OTA image staged in RAM, the node image a firmware image carries
 after the kernel (RP UF2, Pi 5 and uefi raw images: the header on the
 first 256-byte boundary past the kernel's file-backed end), and the
-`graph.img` file `fluxor build` writes for Linux and `fluxor-linux
+`node.img` file `fluxor build` writes for Linux and `fluxor-linux
 --image` runs. Every reader admits it the same way: the header is well
 formed for the bytes holding it, the ABI-surface digest equals the
 running kernel's, the signature verifies under a signing root (below),
@@ -76,7 +76,7 @@ Signing an image takes a 32-byte Ed25519 seed:
 
 ```sh
 fluxor modules keygen --key slot.key        # creates the seed, prints the public key
-fluxor build graph.yaml --emit=image --output graph.img --sign-key slot.key
+fluxor build graph.yaml --emit=node --output node.img --sign-key slot.key
 ```
 
 `--sign-key` is refused with any other `--emit` form, and the tool never
@@ -100,7 +100,7 @@ kernel image with a root:
 A kernel built without a root checks no signature: signed and unsigned
 images are admitted alike, on their structure, ABI pin, digest and epoch.
 `fluxor build` signs the node image a firmware image or a Linux
-`graph.img` carries with the workspace signing key, whose public half is
+`node.img` carries with the workspace signing key, whose public half is
 the root it writes, and refuses a `--root` the workspace holds no key
 for, since that kernel would refuse its own graph.
 
@@ -111,7 +111,7 @@ Source: `tools/src/store_cli.rs`, `tools/src/oci_store.rs`,
 
 Node images and firmware images are OCI artefacts in the local store:
 
-- `fluxor publish image <file>` publishes a built node image (media
+- `fluxor publish node --target <id> <file>` publishes a built node image (media
   type `application/vnd.nanocloud.fluxor.image.v1`). By default the
   image is exploded into layers — a skeleton (header + module-table
   header), one layer per `.fmod`, the program section
@@ -124,7 +124,7 @@ Node images and firmware images are OCI artefacts in the local store:
   are mirrored from the header into the `io.fluxor.image.epoch` and
   `io.fluxor.abi-surface` annotations so a consumer can admit an image
   from the manifest alone.
-- `fluxor publish firmware <file>` publishes a firmware image (for
+- `fluxor publish firmware --target <id> <file>` publishes a firmware image (for
   example the Pi 5 `kernel_2712.img`) for staging hosts — TFTP roots
   and SD writers — to pull.
 - `fluxor store push <ref> <host[:port]/repo:tag> [--ca <pem>]` and
@@ -140,7 +140,7 @@ or select per-device content beyond the tag.
 
 ## Firmware Image and Netboot
 
-Source: `targets/boards/pi5.toml`, `memory-bcm2712.x`.
+Source: `targets/boards/pi5.toml`, `linker/memory-bcm2712.x`.
 
 A firmware image is the kernel with a node image (module table and
 compiled config) appended in the platform's payload window: the node
@@ -255,18 +255,20 @@ Source: `src/kernel/module/ota_stage.rs`,
 Staging is a kernel surface reached through two `reconfigure` opcodes,
 available to modules holding the `reconfigure.ota` grant:
 
-- `OTA_STAGE_WRITE` (`0x2020`) — payload `[offset: u32 LE][bytes]`.
-  Forward gaps are zero-filled; backward offsets are rejected.
-- `OTA_STAGE_CTRL` (`0x2021`) — `COMMIT` (0), `ABORT` (1), `EPOCH`
-  (2, returns the live epoch).
+- `OTA_STAGE_WRITE` (`0x2020`) — `arg` is `[offset: u32 LE]`, `data` the
+  bytes to stage there. Offset 0 begins a fresh stage; a forward gap is
+  zero-filled; an offset below the bytes already staged is `-EINVAL`,
+  and a write past the stage's capacity `-ENOSPC`.
+- `OTA_STAGE_CTRL` (`0x2021`) — `arg` is one command byte: `COMMIT` (0),
+  `ABORT` (1), `EPOCH` (2, returns the live epoch).
 
-The stage is RAM: two 8 MiB, 16 KiB-aligned static buffers used
-alternately A/B. `COMMIT` validates the staged image — FXSL magic and
-version, region bounds, SHA-256 over modules ‖ config against the
-header, strict ABI-surface-pin equality against the running kernel
-(`-EACCES` on mismatch), on a kernel image with a signing root the
-header's signature (`-EACCES`), and an epoch above the live one
-(`-EBUSY`) — then flips the region non-writable and executable via the
+The stage is RAM: two 8 MiB, 64 KiB-aligned static buffers used
+alternately A/B. `COMMIT` admits the staged image as boot admits one —
+FXSL magic and version, region bounds and SHA-256 over modules ‖ config
+against the header (`-EINVAL`), strict ABI-surface-pin equality against
+the running kernel and, on a kernel image with a signing root, the
+header's signature (`-EACCES`) — and requires an epoch above the live
+one (`-EBUSY`); it then flips the region non-writable and executable via the
 platform HAL, re-points the static loader at it, and requests a
 scheduler graph rebuild. Staged code is never executed before
 validation, and is loaded from the same buffer that was validated.
@@ -279,8 +281,8 @@ construction. The live epoch is held in RAM and starts at 0 each boot:
 within a boot an older or equal epoch is refused, and after a power
 cycle any image with an epoch of 1 or more is accepted. Recovering an
 older version means a power cycle and a re-pull, or publishing it under
-a newer epoch. On targets without the RAM stage (RP, WASM) the
-surface returns `ENOSYS`.
+a newer epoch. On every other target (RP, uefi, wasm) both opcodes
+return `ENOSYS`.
 
 Activating a new node image restarts the graph. For graphs holding
 storage state, treat activation as reboot-class maintenance rather
@@ -302,21 +304,22 @@ from two numbers: the flash the board fits (`[hardware.flash] size` in
 the board TOML, the silicon's `[memory] flash_size` when a board names
 none) and the flash the silicon reserves for the kernel (`[memory]
 kernel_flash_reserve`). From the top: the last 4 KiB sector is the
-runtime parameter store; below it lie slot B and then slot A, equal in
-size; from offset 0 up to slot A lies the firmware region, the kernel
-and the graph it was deployed with. Each slot is a third of what the
-kernel's reserve leaves, sector-aligned, so the firmware region holds the
-kernel and a graph as large as a slot: any graph a board can be deployed
-with can also be sent over the air, and the reverse. A 4 MB Pico 2 W has
-two 1,148 KiB slots at `0x1C1000` and `0x2E0000`; a 2 MB Pico W two of
-508 KiB at `0x101000` and `0x180000`; a 16 MB board two of some 5 MiB. A
-flash too small to leave two slots has none, and every OTA request on
-such a board is refused.
+runtime parameter store; below it the 16 KiB data store (the key vault's
+image slots, served by `flash_rp`); below that slot B and then slot A,
+equal in size; from offset 0 up to slot A lies the firmware region, the
+kernel and the graph it was deployed with. Each slot is a third of what
+the data store and the kernel's reserve leave, sector-aligned, so the
+firmware region holds the kernel and a graph as large as a slot: any
+graph a board can be deployed with can also be sent over the air, and
+the reverse. A 4 MB Pico 2 W has two 1,144 KiB slots at `0x1BF000` and
+`0x2DD000`; a 2 MB Pico W two of 500 KiB at `0x101000` and `0x17E000`; a
+16 MB board two of some 5 MiB. A flash too small to leave two slots has
+none, and every OTA request on such a board is refused.
 
 The kernel is built for one board and computes its partition from that
 board's size, so it is the one authority: `FLASH_LAYOUT` answers it to a
-module as `[flash_size][slot_a][slot_b][slot_size][param_store]`, each a
-`u32` LE offset from the XIP base, and `graph_slot`, `ota_ingest` and
+module as `[flash_size][slot_a][slot_b][slot_size][param_store][data_store]`,
+each a `u32` LE offset from the XIP base, and `graph_slot`, `ota_ingest` and
 `flash_rp` ask rather than compile a geometry in, so one module build
 serves every board of a silicon. The tool computes the same partition
 from the same TOMLs: it bounds the node image it emits by the board's
@@ -393,7 +396,7 @@ and activates only images the root's key signed, and the signed epoch
 cannot be raised to replay an old one. On a kernel built without one,
 registry compromise is bounded by the TLS trust root and the
 digest/ABI/epoch checks only. Module-level Ed25519 signatures are a
-separate, per-module check in the loader, described in `security.md`.
+separate, per-module check in the loader, described in [security.md](security.md).
 
 ## Where It Fits
 
@@ -405,7 +408,7 @@ from and where they are staged.
 
 ## Related Documentation
 
-- `module_architecture.md` — FXMT/FXMD module table and `.fmod` format
-- `security.md` — loader trust profiles, KEY_VAULT, signing model
-- `reconfigure.md` — graph rebuild and drain semantics
-- `abi_surface.md` — the ABI-surface digest that pins kernel to graph
+- [module_architecture.md](module_architecture.md) — FXMT/FXMD module table and `.fmod` format
+- [security.md](security.md) — loader trust profiles, KEY_VAULT, signing model
+- [reconfigure.md](reconfigure.md) — graph rebuild and drain semantics
+- [abi_surface.md](abi_surface.md) — the ABI-surface digest that pins kernel to graph

@@ -482,7 +482,7 @@ unsafe fn attach(a: &[u8]) -> i32 {
 /// what every owner's traffic meets, and ATTACH vouches for it, so a module
 /// acting for a workload owner is refused all three whatever it holds.
 fn node_authority() -> bool {
-    crate::kernel::exec::scheduler::caller_authority().is_system()
+    crate::kernel::exec::scheduler::caller_authority().is_node()
 }
 
 /// The contract's dispatch, for a provider whose platform realizes `caps` and

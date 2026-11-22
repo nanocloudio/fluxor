@@ -25,7 +25,7 @@ implementation accepts, not merely one this provider can read back.
 
 ## Capabilities
 
-`CAPS` (0x09FF) reports what this provider serves. Two things about it are
+`CAPS` (0x0DFF) reports what this provider serves. Two things about it are
 load-bearing for consumers:
 
 - **It returns `EAGAIN` until the volume is mounted.** `RENAME` is derived
@@ -42,10 +42,9 @@ Served: `OPEN`, `OPENDIR`, `OPEN_CREATE`, `WRITE`, `FSYNC`, `UNLINK`,
 `TRUNCATE`, `MKDIR`, `RMDIR`, `PREALLOCATE`, `FSYNC_ASYNC`, `FSYNC_NAME`,
 and `RENAME` where the volume permits.
 
-Not served, and the bits stay clear: `STAT_OBJECT`, `LINK` and `SYMLINK`.
-FAT32 has no inode and no second name for a file, so a 32-byte `STAT` gets
-16 bytes back and the count saying so — which is what
-lets a caller tell "not answered" from a zero. In particular a start cluster
+Not served, and the bits stay clear: `LINK` and `SYMLINK`. FAT32 has no
+inode and no second name for a file, so `STAT` answers `ino` 0 ("this volume
+has no stable file identity") and `nlink` 1. In particular a start cluster
 is **not** an inode number: this provider reuses freed clusters, so two files
 that never coexisted share one.
 
@@ -89,7 +88,8 @@ without decoding it, so only matching and generation are bounded.
 
 The vocabulary is the contract's — byte durability and name durability are
 separate, and file `FSYNC` does not publish a name. See
-`crates/fluxor-abi/src/contracts/storage/fs.rs`.
+[storage_capability_surface.md](../../../docs/architecture/storage_capability_surface.md#byte-durability-and-name-durability-are-separate-fences)
+and `crates/fluxor-abi/src/contracts/storage/fs.rs`.
 
 - **Names** are published by `FSYNC_NAME`, or atomically by `RENAME`.
 - **`RENAME`** has no atomic primitive in the format: the new entry and the
@@ -117,9 +117,8 @@ Every path that stops referencing storage hands it back:
 - `UNLINK` and create-over-existing queue the chain for background
   reclamation, and **refuse with `EAGAIN` when the queue is full** rather
   than stranding it. Reclamation is deferred out of the operation because
-  walking an N-cluster chain inside one `provider_call` blows the
-  cooperative step budget — deferring is what keeps a large unlink from
-  stalling every other module on the lane.
+  walking an N-cluster chain inside one `provider_call` would hold the
+  caller's step for as long as the chain is long.
 - `OPEN_CREATE` reserves nothing. The chain starts at the first byte
   written, so a create that is abandoned leaves nothing behind.
 - Appends link **one cluster at a time**. FAT32 describes a file's extent
@@ -144,43 +143,52 @@ look like data and are not.
 
 ## Bounded work
 
-Every operation is synchronous device I/O inside one `provider_call`, and
-the scheduler gives that call a step budget. Four things keep it bounded:
+No operation waits on the device inside a `provider_call` (the `fs`
+contract's rule). Three mechanisms make that hold:
 
-- A directory walk reads at most `DIR_SCAN_BUDGET_SECTORS` sectors, then
-  returns `EAGAIN` with its position saved. The contract already defines
-  `EAGAIN` as "ask again"; a directory large enough to matter is not exotic.
-- A free-cluster scan reads at most `FAT_SCAN_BUDGET_SECTORS` FAT sectors,
-  then returns `EAGAIN` with its cursor saved. The FAT of a full or badly
-  fragmented volume is far too large to walk in one dispatch, and the
-  cursor is what makes a retry converge rather than restart. A scan that
-  has been all the way round *stays* answered until something is freed, so
-  a full volume costs one `ENOSPC` rather than a full-FAT read per request.
-  The two answers are kept apart deliberately: `ENOSPC` tells a consumer to
-  stop, `EAGAIN` tells it to ask again, and collapsing either into the
-  other either spins forever or fails a write that would have succeeded.
-- `block_buf` and `fat_buf` are tagged with the sector they hold, so a
-  chain walk that follows 128 links in one FAT sector reads it once, and a
-  read-modify-write of a sector already staged costs nothing. The two
-  buffers are separate because directory walking interleaves directory and
-  FAT reads, which thrashes a single buffer.
-- **FAT sectors are written back, not through.** `fat_buf` is the only
-  buffer through which a FAT sector is read or written, and it carries a
-  dirty mark. A sequential append crosses 128 cluster boundaries inside one
-  512-byte FAT sector; writing through charges `num_fats` sector writes at
-  every one of them and every write after the first is redundant. It is
-  flushed before any directory sector is published, before any device flush
-  or fence, and before the volume is marked clean.
+- **A sector cache.** Every metadata sector — FAT, directory, FSINFO, the
+  rename intent record — lives in a cache slot (`CACHE_SLOTS`: 128 on
+  aarch64, 24 on a microcontroller). A read of a sector the cache does not
+  hold submits a `storage.block` read and the operation answers `EAGAIN`; a
+  later ask finds it. A write only changes the slot and marks it dirty.
+- **Epochs.** A dirty slot carries the epoch it was written in. The engine,
+  run at every dispatch and every step, writes one epoch and starts the
+  next only once every write of it has completed — and, where the boundary
+  was declared durable, once a `FLUSH` submitted after them has completed.
+  An operation states its ordering as boundaries ("zero the cluster,
+  durable boundary, link it") and the engine puts them on the media in that
+  order over as many steps as the device takes. A sector written again in a
+  later epoch gets a new slot, so the older image reaches the device first.
+- **Transactions.** An operation's cache writes are tentative and the state
+  it may change is saved. If a sector it needed was not cached, or the
+  cache or epoch window was momentarily full, it aborts: tentative slots are
+  dropped, the state is put back, and it answers `EAGAIN` with nothing
+  consumed. Once everything it touches is cached, the whole operation runs
+  against memory inside one call and commits.
 
-  The ordering is what makes the deferral safe rather than the deferral
-  being harmless. A directory entry is the thing that *references* clusters,
-  so publishing one over links that are still only in memory could leave a
-  size claiming bytes the chain cannot reach — the one failure direction
-  that is corruption rather than a shorter file. With the flush ordered
-  ahead of it, a crash can only lose links nothing refers to yet, which is
-  the allocation-before-publish window already declared below, made
-  narrower: links that never reached media cannot leak the clusters they
-  described.
+What an operation promises to have made durable — `FSYNC`, `RENAME`,
+`TRUNCATE`, `PREALLOCATE`, `FSYNC_NAME` — is decided by its last durable
+boundary reaching the device; until then it answers `EINPROGRESS`, and the
+caller asks again with the same request.
+
+Scans are bounded by CPU and cache pins rather than device waits:
+
+- A directory walk reads at most `DIR_SCAN_BUDGET_SECTORS` sectors (32 on
+  aarch64, 6 on a microcontroller), then returns `EAGAIN` with its position
+  saved. A directory large enough to matter is not exotic.
+- A free-cluster scan reads at most `FAT_SCAN_BUDGET_SECTORS` (32) FAT
+  sectors, then returns `EAGAIN` with its cursor saved, so a retry converges
+  rather than restarts. A scan that has been all the way round *stays*
+  answered until something is freed, so a full volume costs one `ENOSPC`
+  rather than a full-FAT read per request. `ENOSPC` tells a consumer to
+  stop, `EAGAIN` to ask again; collapsing either into the other either spins
+  forever or fails a write that would have succeeded.
+
+A directory entry is what *references* clusters, so the FAT sectors holding
+its chain's links are ordered ahead of the directory sector that publishes
+it. A crash can then only lose links nothing refers to yet — the
+allocation-before-publish window under Limits — and never leave a size
+claiming bytes the chain cannot reach.
 
 ## Seeding a volume
 
@@ -192,10 +200,11 @@ carries no second implementation of its own write path.
 
 ## Mounting and formatting
 
-A writable `storage.block` source (`nvme`, `crypt_block`, `file_block`) is
-mounted through its requests; a read-only or streaming one (`sd`) through its
-stream. A transform such as `crypt_block` has no stream at all, which is why
-the choice follows the source rather than a parameter.
+A writable `storage.block` source with no read stream (`crypt_block`,
+`file_block`, `sd`) is mounted through its requests; a source that offers
+`F_READ_STREAM` (`nvme` on a 512-byte format), or is not writable, through
+its stream. A transform such as `crypt_block` has no stream at all, which is
+why the choice follows the source rather than a parameter.
 
 `format: 1` lays a FAT32 volume across the whole source when its first sector
 is entirely zero: a blank device, such as a fresh `crypt_block` container.
@@ -209,8 +218,9 @@ below that the specification types a volume as FAT16 whatever it says.
 
 The reserved region, both FATs and the root cluster are zeroed at most 64
 requests per step (discard runs, 8-sector pipelined writes or single sectors,
-by what the source offers), then the metadata is written behind a flush and the boot sector last,
-behind another. A format cut short leaves the first sector unsigned, and the
+by what the source offers), then the metadata is written behind a flush and
+the boot sector last, behind another. `format_cluster_sectors` overrides the
+cluster size (a power of two up to 128 sectors). A format cut short leaves the first sector unsigned, and the
 next mount formats from the start. Log: `[fat32] formatting`, `[fat32]
 formatted`, then the ordinary `[fat32] boot ok`.
 
@@ -221,10 +231,11 @@ formatted`, then the ordinary `[fat32] boot ok`.
 | `path`, `pattern` | Directory and glob for the enumeration surface. |
 | `volume` | Instance selector for multi-volume routing (`mount` binds by name). `platform` is reserved: the build and the kernel refuse it. |
 | `format` | 1 = lay a fresh volume on a source that holds none (see Mounting and formatting). |
-| `namespace` | NVMe namespace id. |
+| `format_cluster_sectors` | Sectors per cluster for `format`; 0 (default) = the specification's table. |
+| `namespace` | NVMe namespace id the block requests carry (default 1; 0 = the source's own default). |
 | `expect_volume_id` | Volume serial this graph expects. Refuses every operation on a mismatch, and **gates the destructive parameters below**. |
 | `max_open_per_owner` | Handles one owner may hold at once. 0 = provider-wide table only. |
-| `init_free_hint` | Seed the free-cluster scan. |
+| `init_free_hint` | Cluster the free-cluster scan starts from, also written as FSINFO's next-free hint. Clusters from it on must be free. |
 | `clean_root` | **Destructive.** Truncates the root directory. Requires `expect_volume_id`. |
 | `clear_free_region` | **Destructive.** Zeroes a FAT span. Requires `clean_root`. |
 
@@ -254,10 +265,7 @@ mismatch reports what is on the device against what was expected.
   buffer selects. The *volume* is capped there; where it sits is not — the
   partition base is 64-bit and every sector number in this provider is an
   offset within the volume, so a FAT32 partition beyond 2 TiB on a large
-  device is ordinary. Mount discovery is the one exception: it rides the
-  streaming channel's 32-bit seek, because a source that has only that
-  (sd) must still be mountable, so a volume whose boot sector sits past
-  2 TiB is refused rather than aliased.
+  device is ordinary.
 - **512-byte device blocks only.** The provider asks the block source for
   its logical block size and refuses to mount when it is not 512. Every
   failure-atomicity claim here is a claim about a 512-byte sector; on a 4Kn
@@ -280,10 +288,8 @@ mismatch reports what is on the device against what was expected.
   generation is held with the slot: a reused owner slot is a different owner.
   Without a ceiling the tables are still provider-wide, and a diagnostic
   names the holders when one fills.
-- **No object model.** FAT32 has no inode and no hard links, so `STAT`'s
-  32-byte form is not served and `STAT_OBJECT`, `LINK` and `SYMLINK` stay
-  clear. A 32-byte request gets 16 bytes and the count
-  saying so, which is what lets a caller tell "not answered" from a zero.
+- **No object model.** FAT32 has no inode and no hard links: `STAT`
+  answers `ino` 0 and `nlink` 1, and `LINK` and `SYMLINK` stay clear.
   Nothing here fabricates an identity — in particular a start cluster is not
   an inode number, because this provider reuses freed clusters.
 - **A crash can still leak storage**, in two bounded windows: between
@@ -299,21 +305,6 @@ mismatch reports what is on the device against what was expected.
   storage still attached, which `fsck` reports and repairs. The reverse
   order would leave a size claiming bytes the chain cannot reach, so this is
   the direction to fail in.
-
-## Verification
-
-- **Volume integrity**, the gate. Fixtures are real `mkfs.vfat` images
-  mounted through the provider's own boot-sector parser, mutations are
-  checked with `fsck.vfat` **against the platter** at every crash point,
-  and cluster usage is compared across create/unlink cycles to catch leaks,
-  which are not inconsistencies and so are invisible to `fsck` alone.
-- **Rename**: the intent record at every crash point.
-- **Async fence**: the two-stage data-then-metadata fence.
-- **Write, unlink and KV-run storage** contracts.
-
-Checking the platter rather than the visible image is the point: the visible
-image includes writes still in the device's volatile cache, and a provider
-that reports durable over those passes a visible-image check trivially.
 
 ## If you are adding ext2/3/4
 
@@ -334,8 +325,8 @@ accident would then be the seam:
 
 What is worth reusing from here is the *lower* half — the sector cache and
 its write chokepoints, the bounded resumable-scan shape, the fence and
-ticket machinery, the errno taxonomy, and the host volume harness (which is
-filesystem-agnostic apart from naming `mkfs.vfat`). What is not worth reusing is anything above that:
+ticket machinery, and the errno taxonomy. What is not worth reusing is
+anything above that:
 FAT's path resolution, its directory format and its allocation model have
 nothing in common with an inode-and-extent filesystem, and a shared
 abstraction over both would be shaped by whichever came first.

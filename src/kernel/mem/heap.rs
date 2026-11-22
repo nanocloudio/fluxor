@@ -19,20 +19,26 @@
 //!   gated module (its heap must sit where its protection regions cover it)
 //!   and every module on a profile with one heap segment (`HEAP_SEGMENTS`
 //!   == 1: RP and wasm, whose small static arenas are planned up front).
-//! - **Elastic**: nothing is carved at instantiation. The first allocation
-//!   carves a segment from the state arena, and a later allocation that no
-//!   segment can serve carves the next, each at least as large as everything
-//!   committed so far, until the committed total reaches the cap. Memory is
-//!   committed only as the module uses it, so a reader type declared for the
-//!   largest object it might touch costs each instance only what it touches.
+//! - **Elastic**: the module's DECLARED heap — its type's arena, or for a type
+//!   that sizes its heap from its params the size its params give (which the
+//!   composer writes as the instance's cap) — is its working set, committed
+//!   whole as the first segment at instantiation (`commit_declared`, sized by
+//!   `fluxor_contracts::state_arena::first_heap_segment` with one segment,
+//!   which the build charges), so any single allocation within the declared
+//!   size fits. Room the graph grants above the declaration (a cap from tag
+//!   0xEF larger than it) is elastic: an allocation no segment can serve
+//!   carves the next, each at least as large as everything committed so far,
+//!   until the committed total reaches the cap, and the build does not budget
+//!   it. An instance whose params carry tag 0xEE (it reads its arena raw, or
+//!   its type sizes its heap from its params) has its whole cap committed at
+//!   instantiation as one segment (`commit_whole`).
 //!
 //! Elastic growth is bounded work: a carve is one state-arena allocation (a
 //! first fit over that allocator's bounded free list, else a bump) plus
-//! zeroing exactly the bytes carved, and the segment table is fixed. The
-//! first segment is `cap >> (HEAP_SEGMENTS - 1)` (at least the platform
-//! quantum) and each carve at least doubles what is committed, so
-//! `HEAP_SEGMENTS` carves always reach the cap; the last slot takes all that
-//! is left. Growth that cannot be satisfied — the cap reached, or the state
+//! zeroing exactly the bytes carved, and the segment table is fixed. A carve
+//! is at least `cap >> (HEAP_SEGMENTS - 1)` (and the platform quantum) and at
+//! least doubles what is committed, and the last slot takes all that is left,
+//! so `HEAP_SEGMENTS` carves always reach the cap. Growth that cannot be satisfied — the cap reached, or the state
 //! arena exhausted — fails LOUDLY: the allocation returns null, `fail_count`
 //! and `grow_denied` count it, the kernel logs it (rate-limited to powers of
 //! two), and a module declaring `heap.alloc_failure_policy = "fault"` faults.
@@ -986,21 +992,26 @@ impl ModuleHeap {
         Some((base, size))
     }
 
-    /// Commit an elastic heap's first segment, before its module runs: the
-    /// segment `fluxor_contracts::state_arena::first_heap_segment` sizes from
-    /// the cap, which the build charges. `false` when the state arena cannot
-    /// seat it; `true` with nothing carved for a heap that is not elastic (a
-    /// cap too small to hold a block gets none) or has a segment already.
+    /// Commit an elastic heap's declared size whole, before its module runs:
+    /// `declared` (its type's arena, or the size its params give) up to the
+    /// cap, sized by `fluxor_contracts::state_arena::first_heap_segment` with
+    /// one segment, which the build charges. Room the cap holds above it grows
+    /// in segments as the module allocates. `false` when the state arena
+    /// cannot seat it; `true` with nothing carved for a heap that is not
+    /// elastic, has a segment already, or declares too little to hold a block.
     #[cfg(not(any(feature = "rp", feature = "host-wasm")))]
-    fn commit_first(&mut self) -> bool {
+    fn commit_declared(&mut self, declared: usize) -> bool {
         if !self.elastic || self.seg_count != 0 {
             return true;
         }
         let size = fluxor_contracts::state_arena::first_heap_segment(
-            self.cap as usize,
-            HEAP_SEGMENTS,
+            declared.min(self.cap as usize),
+            1,
             MIN_SEGMENT,
         );
+        if size == 0 {
+            return true;
+        }
         let Ok(base) = crate::kernel::module::loader::alloc_state(size) else {
             return false;
         };
@@ -1105,8 +1116,8 @@ pub fn init_module_heap(module_idx: usize, arena_ptr: *mut u8, arena_size: usize
 }
 
 /// Initialize a module's elastic heap with a cap of `cap` bytes: nothing is
-/// committed until its first segment is (`commit_first`, at instantiation) or
-/// it allocates.
+/// committed until its declared size is (`commit_declared`, at instantiation)
+/// or it allocates.
 pub fn init_module_heap_elastic(module_idx: usize, cap: usize) {
     let Some(h) = heap_at(module_idx) else {
         return;
@@ -1182,21 +1193,21 @@ pub fn commit_whole(module_idx: usize) -> Option<(*mut u8, usize)> {
     r
 }
 
-/// Commit module `module_idx`'s elastic heap's first segment at its
-/// instantiation (`ModuleHeap::commit_first`). `false` when the state arena
+/// Commit module `module_idx`'s elastic heap's declared size whole at its
+/// instantiation (`ModuleHeap::commit_declared`). `false` when the state arena
 /// cannot seat it; `true` for a heap that is not elastic.
 #[cfg(not(any(feature = "rp", feature = "host-wasm")))]
-pub fn commit_first(module_idx: usize) -> bool {
+pub fn commit_declared(module_idx: usize, declared: usize) -> bool {
     let Some(h) = heap_at(module_idx) else {
         return true;
     };
     // SAFETY: instantiation context; the module does not run yet.
-    unsafe { (*h).commit_first() }
+    unsafe { (*h).commit_declared(declared) }
 }
 
 /// A one-segment profile (RP, wasm) has no elastic heap: nothing to commit.
 #[cfg(any(feature = "rp", feature = "host-wasm"))]
-pub fn commit_first(_module_idx: usize) -> bool {
+pub fn commit_declared(_module_idx: usize, _declared: usize) -> bool {
     true
 }
 

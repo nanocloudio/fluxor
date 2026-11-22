@@ -37,7 +37,7 @@ published, though any graph can include it by path. Example and test
 graphs anywhere else are checked by the `examples` phase and the project's
 tests, and never published.
 
-`fluxor publish --only source|fmod|runtime|stack|bundle` narrows the sweep;
+`fluxor publish --only source|fmod|runtime|stack|package` narrows the sweep;
 `fluxor publish --dry-run` lists everything it would publish and writes
 nothing.
 
@@ -53,7 +53,7 @@ are declared in `fluxor.toml`:
 storage = "0.1"
 
 [uses]
-bundles = ["object-store"]
+packages = ["object-store"]
 
 [uses.stacks]
 file_server = "static_files"     # what `fluxor run`'s browser host includes

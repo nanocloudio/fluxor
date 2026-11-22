@@ -1,6 +1,10 @@
 # ip Module
 
-IP Stack Service Module
+The node's IPv4/IPv6 network stack over an Ethernet frame driver: ARP, DHCP,
+ICMP, TCP and UDP, served to consumers over `net_proto` and to workloads over
+their lanes. Two variants: `full` (the default) and `small_table`, whose
+connection table holds four slots (or the profile's, where that is smaller)
+for a graph whose traffic is a few datagrams.
 
 ## Files
 
@@ -28,24 +32,25 @@ IP Stack Service Module
 - `send_pool.rs` — the send buffers: one pool of blocks, each what one
   connection has sent and the peer not yet acknowledged
 
-## Interface (manifest)
+## Interface
 
-```toml
-version = "1.0.0"
-hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux"]
+| Port | Direction | Content type | |
+|---|---|---|---|
+| `frames_rx` | input | `EthernetFrame` | required |
+| `frames_tx` | output | `EthernetFrame` | required |
+| `net_out` | output | `NetProto` |  |
+| `net_in` | input | `NetProto` |  |
+| `addr_ctl` | input | `NetProto` |  |
+| `addr_evt` | output | `NetProto` |  |
+| `packet_in` | input | `NetProto` |  |
+| `packet_out` | output | `NetProto` |  |
+| `packet_fwd` | output | `NetProto` |  |
+| `cont_in` | input | `OctetStream` |  |
+| `cont_out` | output | `OctetStream` |  |
+| `auth_rsp` | input | `OctetStream` |  |
+| `auth_req` | output | `OctetStream` |  |
 
-[[ports]]
-name = "frames_rx"
-direction = "input"
-content_type = "EthernetFrame"
-required = true
-
-[[ports]]
-name = "frames_tx"
-direction = "output"
-content_type = "EthernetFrame"
-required = true
-```
+Builds for: `rp2040`, `rp2350`, `bcm2712`, `linux`, `uefi`. [manifest.toml](manifest.toml) is the declaration.
 
 The optional ports — `net_in` / `net_out`, `addr_ctl` / `addr_evt`, the
 pre-transport decision seam and the continuity pair — and the contracts it
@@ -63,7 +68,9 @@ declares (`workload`, `net_route`, `net_policy`) are described in
   the time left to seven eighths (T2) and then to its end, at least a
   minute apart, and given up at its end or on a NAK.
 - `expected_dhcp_server` — accept replies only from this server (0 = any).
-- `trace_sample_permille` — ingress head-sampling rate.
+- `trace_sample_permille` — ingress head-sampling rate (default 1000).
+- `tcp_idle_s` — close an established connection silent this many seconds
+  (default 0: never).
 - `tcp_send_buf` (65536 / 2920 / 1460 bytes) — the send buffer a connection
   whose consumer keeps no copy is held to (see Retransmission); 0 keeps
   nothing, allowed only when no consumer of `net_out` leaves retention here.
@@ -105,14 +112,16 @@ Defaults are aarch64's, with the MCU-class figure after the slash:
 - `policy_tables` (comma-separated names), `policy_bytes` (8192 / 1024) —
   the `net.policy` tables this instance enforces and translates.
 
-Decision seam (`docs/architecture/protocol_surfaces.md` §Pre-transport
-decision seam):
+Decision seam ([protocol_surfaces.md, Pre-transport decision
+seam](../../../docs/architecture/protocol_surfaces.md#pre-transport-decision-seam)):
 
 - `packet_decision` (`off` / `pre_transport`), `packet_hold_ms` (50) — the
   seam, and how long a packet waits for its disposition.
-- `packet_holds` (32 on aarch64, 8 on wasm, 4 on embedded) — packets the
-  seam holds at once, one whole frame each in this module's heap; at most
-  256 (the slots a `pkt_id` names), refused at construction past it. A
+- `packet_holds` (default 0) — packets the seam holds at once, one whole
+  frame each in this module's heap. Required with the seam on and refused
+  with it off; the profile's figure (`MAX_PACKET_HOLD`) is 32 on aarch64, 8
+  on wasm, 4 on embedded. At most 256 (the slots a `pkt_id` names), refused
+  at construction past it. A
   burst past them is refused and counted (`hold_refused`): declare what a
   director's decision time times the offered rate needs. A packet the
   holds have room for is never refused for the director's ring: held with
@@ -141,7 +150,7 @@ IPv6 (aarch64; `v6t.rs`):
   has an address.
 - `arm_authority` (`off` / `required`) — every arm of a secondary address
   waits for the VIP authority's verdict on its emission token (`auth_req` /
-  `auth_rsp`, `contracts/net/identity.rs`); installs are disarmed whatever
+  `auth_rsp`, `crates/fluxor-abi/src/contracts/net/identity.rs`); installs are disarmed whatever
   they ask.
 
 ## Connecting by name
@@ -180,7 +189,7 @@ pinned for the lookup), from its own address when the server is inside its
 cluster, under its search list; an answer is claimed only from the server
 the query was pinned to, at the address it left from. The
 `dns` module is a server; it does not resolve for siblings, and the wire
-codec the two share is `sdk/contracts/net/dns_wire.rs`.
+codec the two share is `crates/fluxor-abi/src/contracts/net/dns_wire.rs`.
 
 `CMD_DG_SEND_TO` takes the same `AF_NAME`: a cached name sends at once; a
 name not in hand starts the lookup and the datagram is dropped without a
@@ -245,12 +254,12 @@ and realizes what the node agent writes to the kernel:
 
 The hosted runtime ordinarily uses `linux_net` (host sockets) and no `ip`.
 A graph that needs a stack owning its connections — the transport-continuity
-surfaces checkpoint them — runs `ip` over the `linux_eth` built-in frame
+surfaces checkpoint them — runs `ip` over the `linux_eth` native frame
 driver instead.
 
 ## Transport continuity
 
-`continuity.rs` answers the per-layer surface of `session_ctrl.rs`
+`continuity.rs` answers the per-layer surface of `crates/fluxor-abi/src/contracts/net/session_ctrl.rs`
 §Transport continuity for TCP (`FXTC`). A primary's `CR_PAIR_PREPARED`
 carries the live connection's id after the shadow-slot field, the id `tls`
 names the same connection by. A segment for a tuple held as a shadow, or one
@@ -315,8 +324,8 @@ number, so its window is placed exactly), is asked to resend from a sequence
 number on the same triggers (`MSG_RETX_REQUEST`), and answers with
 `CMD_RETX_RESEND`, sent again at its own sequence numbers rather than
 allocated anew. The RTO is RFC 6298's in milliseconds (one-second floor,
-sixty-second ceiling, doubled per expiry). See `docs/architecture/network.md`
-§Downstream messages.
+sixty-second ceiling, doubled per expiry). See [network.md, Downstream
+messages](../../../docs/architecture/network.md#downstream-messages-provider--consumer).
 
 ## Supported profile
 
@@ -329,7 +338,7 @@ gateway, and with neither is not sent; ARP mappings are created only by a
 correlated ARP reply; one transmit frame per datagram, no packet past the
 1500-byte link MTU (`EMSGSIZE` past it). `net.policy` tables name IPv4
 addresses: while one judges packets, an IPv6 flow it would judge is dropped.
-See the module doc comment and `docs/architecture/network.md`.
+See the module doc comment and [network.md](../../../docs/architecture/network.md).
 
 Inbound TCP segments pass one admissibility gate before any state branch:
 receive-window acceptability over the segment's full sequence extent,
@@ -386,7 +395,3 @@ option: emitted headers are 20 bytes (`TCP_DATA_OFFSET_BYTE`, guarded by a
 compile-time assertion), and a SYN that carries an option area is refused
 rather than answered from a cookie. Counters `tcp_syn_cookie_{sent,ok,bad}`
 and the option refusal print on the `[ip] cookie` line.
-
-## Notes
-
-- Keep this file aligned with `manifest.toml` and parameter definitions in source.

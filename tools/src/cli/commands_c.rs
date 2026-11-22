@@ -236,7 +236,7 @@ fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
             }
         }
 
-        // Per-mode-value checks for built-ins where the mode picks an
+        // Per-mode-value checks for native modules where the mode picks an
         // optional backend.
         let mode_value = entry
             .get("mode")
@@ -2217,9 +2217,9 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
     };
     // Only a node image carries a signature: asking to sign anything else
     // is refused rather than answered with an unsigned artifact.
-    if flags.sign_key.is_some() && flags.emit.as_deref() != Some("image") {
+    if flags.sign_key.is_some() && flags.emit.as_deref() != Some("node") {
         return Err(Error::Config(
-            "--sign-key signs a node image; use it with --emit=image".into(),
+            "--sign-key signs a node image; use it with --emit=node".into(),
         ));
     }
     if flags.check {
@@ -2267,12 +2267,12 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             flags.module_root.as_deref(),
             true,
         ),
-        Some("combined") => {
+        Some("firmware") => {
             let firmware = flags
                 .firmware
                 .as_ref()
-                .ok_or_else(|| Error::Config("--emit=combined requires --firmware <UF2>".into()))?;
-            let output = require_output("combined")?;
+                .ok_or_else(|| Error::Config("--emit=firmware requires --firmware <UF2>".into()))?;
+            let output = require_output("firmware")?;
             cmd_combine(
                 firmware,
                 path,
@@ -2281,8 +2281,8 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
                 verbose,
             )
         }
-        Some("image") => {
-            let output = require_output("image")?;
+        Some("node") => {
+            let output = require_output("node")?;
             cmd_node_image(
                 path,
                 &output,
@@ -2302,7 +2302,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             cmd_workload_image(path, &output, flags.module_root.as_deref(), verbose)
         }
         Some(other) => Err(Error::Config(format!(
-            "unknown --emit form '{other}' (expected uf2|bin|combined|image|table|workload)"
+            "unknown --emit form '{other}' (expected uf2|bin|firmware|node|table|workload)"
         ))),
     }
 }

@@ -959,7 +959,7 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
         }
         log::info!("[boot] ready modules={module_count}");
         scheduler::log_arena_usage();
-        if rp_run_main_loop(module_count as usize) {
+        if rp_run_domain_loop(module_count as usize) {
             log::info!("[reconfigure] domain loop yielded, rebuilding graph");
             scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
         } else {
@@ -1042,7 +1042,7 @@ fn crash_info_once() {
 /// earlier of the pacer's deadline and the device stack's. Nothing here can
 /// wait on anything else, which is what keeps the USB pump serviced under
 /// every module's behaviour.
-fn rp_run_main_loop(module_count: usize) -> bool {
+fn rp_run_domain_loop(module_count: usize) -> bool {
     use fluxor::kernel::exec::bare_metal::wait_for_wake;
 
     let tick_period_us = scheduler::tick_us() as u64;

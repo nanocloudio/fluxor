@@ -48,8 +48,9 @@ the image it mounts.
 
 ## Behaviour
 
-- `CAPS`: write, flush, discard (reads back zeros), pipelined; up to 64
-  blocks per request; queue depth 8. No `F_WRITE_COPIES`: a queued write's
+- `CAPS`: `F_WRITE | F_FLUSH | F_DISCARD | F_DISCARD_ZEROES | F_ASYNC`
+  (a discarded block reads back as zeros); up to 16 KiB per request (32
+  blocks of 512 bytes); queue depth 8. No `F_WRITE_COPIES`: a queued write's
   buffer is read when its turn comes, so it stays lent until reaped.
 - The `fs` contract never waits on the device inside a call, so a request
   is a resumable job. `SUBMIT` queues it; the queue runs in submission

@@ -47,7 +47,7 @@ pub use super::super::registry::reconfigure::SET_PHASE;
 /// constant. Gated by the `reconfigure` permission.
 pub use super::super::registry::reconfigure::SLOT_CAPACITY;
 /// Request a graph rebuild. The domain loop consumes this after the
-/// current step_modules returns.
+/// current pass returns.
 /// handle=-1, arg=[config_ptr:usize, config_len:usize] (platform pointer size).
 /// Returns 0.
 pub use super::super::registry::reconfigure::TRIGGER_REBUILD;
@@ -69,7 +69,7 @@ pub use super::super::registry::reconfigure::TRIGGER_REBUILD;
 /// negative errno otherwise. The on-wire form
 /// carries PIC modules (by `name_hash` + params), each loaded within the
 /// call: a module whose load cannot complete synchronously refuses the add
-/// `EAGAIN`. In-process callers use `scheduler::apply_add` directly (built-in
+/// `EAGAIN`. In-process callers use `scheduler::apply_add` directly (native module
 /// or already-resident modules).
 pub use super::super::registry::reconfigure::APPLY_ADD;
 /// Composed-graph header flag: the new owner acts with its creator's
@@ -141,7 +141,7 @@ pub const OWNER_RELEASED_ARG_LEN: usize = 8;
 
 // ── OTA RAM staging (Pi 5 / hosted Linux) ────────────────────────────────────
 // The RAM-staged counterpart of the RP flash graph-slot pair: a module
-// streams a NODE IMAGE (`fluxor build --emit=image`) into the kernel's
+// streams a NODE IMAGE (`fluxor build --emit=node`) into the kernel's
 // inactive staging buffer, then commits it. Commit validates header,
 // payload SHA-256, ABI-surface pin, and epoch monotonicity, then swaps
 // loader+config to the staged blobs and fires the rebuild bridge.

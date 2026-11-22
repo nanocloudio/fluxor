@@ -14,7 +14,7 @@
 //! live add admits.
 //!
 //! A RESIDENT WORKLOAD is a workload-owned subgraph declared in a graph YAML's
-//! `workloads:` section and admitted by the kernel at boot, alongside the base
+//! `workloads:` section and admitted by the kernel at boot, alongside the node
 //! graph rather than inside it. Each workload gets its own owner handle, its
 //! own state/buffer caps, and is scheduled as an independent resident graph.
 //! Workloads are self-contained: edges between the workload's own modules
@@ -149,7 +149,7 @@ pub fn plan_ports(manifest: &Manifest) -> Vec<PlanPort> {
 pub struct GraphModule {
     /// Its instance name, for refusals.
     pub name: String,
-    /// FNV-1a of its type, the `.fmod` (or built-in) it runs as.
+    /// FNV-1a of its type, the `.fmod` (or native module) it runs as.
     pub name_hash: u32,
     pub domain: u8,
     /// It runs in its domain's pre-pass (`pre_pass` in its manifest).
@@ -459,7 +459,7 @@ pub fn check_net_lanes(edges: &[EdgeRecord]) -> Result<(), String> {
 /// One resident workload (a workload-owner subgraph admitted via `apply_add`).
 #[derive(Clone, Debug, Default)]
 pub struct Workload {
-    pub workload_uid: [u8; 16],
+    pub owner_uid: [u8; 16],
     pub state_cap: u32,
     pub buffer_cap: u32,
     /// The workload's graph, composed.
@@ -496,7 +496,7 @@ pub fn encode_workload(workload: &Workload) -> Result<Vec<u8>, String> {
     let records = g.records();
     graph::encode(&GraphSpec {
         creator_authority: false,
-        owner_uid: workload.workload_uid,
+        owner_uid: workload.owner_uid,
         state_cap: workload.state_cap,
         buffer_cap: workload.buffer_cap,
         ..g.spec(&records)
@@ -563,7 +563,7 @@ mod tests {
 
     fn workload(modules: Vec<GraphModule>, edges: Vec<EdgeRecord>) -> Workload {
         Workload {
-            workload_uid: [7u8; 16],
+            owner_uid: [7u8; 16],
             state_cap: 4096,
             buffer_cap: 8192,
             graph: composed(&modules, &edges, true).expect("composes"),

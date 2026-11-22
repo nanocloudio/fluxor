@@ -1,6 +1,6 @@
 # linux_net
 
-Linux-only built-in network surface. Bridges the stream surface
+Linux-only native network surface. Bridges the stream surface
 contract (`net_proto`) to host TCP/UDP sockets via `libc`.
 
 Implements the kernel-side dispatch for `CMD_BIND` / `CMD_CONNECT_TO` /
@@ -43,27 +43,32 @@ set, so most YAMLs do not name `linux_net` explicitly — they wire
 
 ## Configuration
 
-This module has no `[[params]]`. Bind/connect/close commands flow as
-runtime FMP messages on the `net_in` channel; nothing is set at
-config-build time.
+| Param | Tag | Type | Default | Range | Meaning |
+|---|---|---|---|---|---|
+| `max_conns` | 10 | u32 | 128 | 2..=65535 | Connection slots (listeners, accepted clients and outbound connects share one table); the ceiling is the `u16` connection id `net_proto` carries |
+| `write_buf_kib` | 11 | u32 | 128 | 1..=65536 | Per-connection unsent-byte backlog cap, KiB, grown as a send backs up and released with the slot |
+| `listen_backlog` | 12 | u32 | 128 | 1..=65535 | `listen()` backlog |
+
+A value outside its range is refused at instantiation. Bind, connect and
+close are runtime commands on `net_in`.
 
 ## Behaviour
 
-- Up to 24 concurrent connections (TCP listeners + accepted clients +
-  outbound connects, sharing one slot table).
+- An idle slot holds no buffer. Commands stop being read — back-pressure
+  on the shared upstream channel — only while some connection's backlog is
+  full, so a peer slow to read is buffered up to `write_buf_kib` without
+  holding up the others.
 - Listener sockets set `SO_REUSEADDR`, so a graph that crashes mid-run
-  rebinds without `TIME_WAIT` waits on the next start.
-- Accepted client sockets are non-blocking; a recv that returns
-  `EAGAIN` becomes "no data this tick" rather than blocking the
-  scheduler.
-- Per-instance `Box<LinuxNetState>` — see
-  `docs/architecture/abi_layers.md`'s built-in section for the boxed
-  state pattern. Two `linux_net` modules in one process would still
-  collide on OS listen ports (config-time concern), but their
-  in-memory connection tables are independent.
+  rebinds on the next start without waiting out `TIME_WAIT`.
+- Sockets are non-blocking: a receive with nothing to read is "no data
+  this step", never a blocked domain loop.
+- Each instance owns its connection table, held through the one
+  state-arena word its manifest declares (`state_bytes_64 = 1`). Two
+  `linux_net` instances in one process have independent tables but share
+  the host's ports.
 
 ## Source
 
-Implementation lives in [src/platform/linux/providers.rs](../../../../src/platform/linux/providers.rs).
-The directory you're reading is a manifest-only descriptor that the
-config tool reads to validate wiring; nothing here gets compiled.
+The implementation is [src/platform/linux/providers.rs](../../../../src/platform/linux/providers.rs).
+This directory holds the manifest the build reads to validate the graph;
+nothing here is compiled.

@@ -57,47 +57,48 @@ the module and the platform profile (`HEAP_SEGMENTS` in
   contained` or `isolated`: its heap must lie where its protection regions
   cover it) and every module on a one-segment profile (RP and wasm, whose
   small arenas are planned up front).
-- **Elastic** — linux, bcm2712 and uefi (`HEAP_SEGMENTS = 8`). The first
-  segment is carved at instantiation, before the module runs: `cap >> 7`
-  bytes, at least the 64 KiB quantum, never past the cap
-  (`fluxor_contracts::state_arena::first_heap_segment`, by which the build
-  also charges it). An allocation no segment can serve carves the next, each
-  at least as large as everything committed so far, until the committed
-  total reaches the cap. Eight carves always reach the cap; the last takes
-  what is left.
+- **Elastic** — linux, bcm2712 and uefi (`HEAP_SEGMENTS = 8`). A module's
+  **declared** heap is its working set, committed whole as its first
+  segment at instantiation, before the module runs: the arena its module
+  facts declare (`arena_bytes`), or, for a type that sizes its heap from its
+  params (`[capacities] heap_from_params` or `heap_per_param`), the size its
+  params give. The build charges exactly that carve
+  (`fluxor_contracts::state_arena::first_heap_segment` with one segment, which
+  the kernel commits by too). Only room a graph grants **above** the
+  declaration — a cap (`heap.arena_bytes`, params tag `0xEF`) larger than it —
+  is elastic: an allocation no segment can serve carves the next, each at
+  least as large as everything committed so far, until the committed total
+  reaches the cap. Eight carves always reach the cap; the last takes what is
+  left. The build does not budget that room.
 - **Elastic, committed whole** — an instance whose params carry tag `0xEE`
   has its whole cap carved as one segment at instantiation, and is charged
-  the whole cap. The composer marks every instance of a type that sizes its
-  heap from its params (`[capacities] heap_from_params` or
-  `heap_per_param`, the fans among them) and every type or instance that
-  declares raw arena use (`[capacities] raw_arena`, `heap.raw_arena`). A
-  type that sizes its heap from its params takes its tables at
-  construction, as one block near the cap ("One block for several tables"
-  below); after an eager first segment the next segment could only be what
-  remains of the cap, which that block does not fit, so it is committed
-  whole instead.
+  the whole cap. The composer marks every type or instance that declares raw
+  arena use (`[capacities] raw_arena`, `heap.raw_arena`), and every instance
+  of a type that sizes its heap from its params, whose cap the composer
+  writes from its params and which is therefore its declaration.
 
 ```
 STATE_ARENA
-  +---------+ +------------+ +------------------------+
-  | seg 0   | | seg 1      | | seg 2                  |  ... up to 8,
-  | cap/128 | | >= seg 0   | | >= seg 0 + seg 1       |  sum <= cap
-  +---------+ +------------+ +------------------------+
-   carved at    carved when    carved when 0 and 1
-   instantiation seg 0 is full cannot serve a request
+  +-----------+ +------------+ +------------------------+
+  | seg 0     | | seg 1      | | seg 2                  |  ... up to 8,
+  | declared  | | >= seg 0   | | >= seg 0 + seg 1       |  sum <= cap
+  +-----------+ +------------+ +------------------------+
+   carved at     carved when    carved when 0 and 1
+   instantiation seg 0 is full  cannot serve a request
 ```
 
-An elastic heap costs its module only its first segment and what it touches
-past it: a reader type declared for the largest object it might ever hold
-commits, per instance, what that instance actually reads.
+Any single allocation within the declared size fits the first segment, so the
+one-block pattern below ("One block for several tables") holds for a block up
+to the declaration. A graph that wants an instance to grow past its type's
+working set grants the room, and pays for it only as it is touched.
 
 The build's state-arena budget (`fluxor build`) charges the fixed carves —
-each module's state, each committed heap, each elastic heap's first segment
+each module's state, each committed heap, each elastic heap's declared size
 (or its whole cap where the module declares raw arena use) — and nothing
-past them. Growth beyond the first segment, in `module_new` or later, is the
-module's own allocation: where the arena cannot serve it the allocation
-fails (and a module whose `module_new` fails on it is refused at load), which
-is the module's failure, not a budget the build could predict.
+past them. Growth beyond the declaration, in `module_new` or later, is room
+the graph granted: where the arena cannot serve it the allocation fails (and
+a module whose `module_new` fails on it is refused at load), which is the
+module's failure, not a budget the build could predict.
 
 Elastic growth follows the bare-metal rules:
 
@@ -113,8 +114,8 @@ Elastic growth follows the bare-metal rules:
   ran) stays 0 under growth. On the other zero-initialised arenas (wasm, RP)
   only memory below the mark is zeroed.
 - **From the device tree's DRAM on bcm2712.** The state arena is the
-  largest reservation-free DRAM zone the device tree describes above the boot
-  image (above 1 GB on the Pi 5), less the kernel tables carved from its top
+  largest reservation-free DRAM zone the device tree describes above the
+  firmware image (above 1 GB on the Pi 5), less the kernel tables carved from its top
   (`kernel::mem::carve`). Boot zeroes none of it. The arena keeps a **zeroed
   frontier** ahead of the memory it has handed out — claimed by one domain at a
   time, advanced in each execution domain's slack (`limit − consumed` of its
@@ -243,9 +244,9 @@ placeholder cap on each such instance — its type's figure without the
 per-demand bytes — and the planned cap is written over it once the demand is
 counted. A workload image (`--emit=workload`) is planned the same way, from
 its own workload's demand and its target's reserve. On an elastic heap the
-larger cap costs only its first segment until it is used: the first segment
-is `cap >> 7` (at least the 64 KiB quantum) and the heap grows with use. A committed-heap
-profile carves the whole cap, for every instance of the type.
+per-demand bytes are room above the type's declared arena, which is what is
+committed at instantiation; the heap grows into the rest with use. A
+committed-heap profile carves the whole cap, for every instance of the type.
 
 ### Per-param cap: `[capacities] heap_per_param`
 
@@ -473,7 +474,11 @@ the heaps commit has to fit, and a heap that cannot grow fails loudly.
 | RP2040 | 64 KiB | 1-4 KiB per module |
 | RP2350 | 240 KiB | 4-32 KiB per module |
 | BCM2712, Linux | 1 GiB | KiB to MiB per module (elastic) |
+| UEFI | 512 MiB | KiB to MiB per module (elastic) |
 | wasm | 96 MiB | KiB to MiB per module |
+
+[limit_register.md](limit_register.md) holds the arena figures and how each
+platform sizes its arena at boot.
 
 The heap is opt-in and bounded. Modules that do not use it pay
 nothing.

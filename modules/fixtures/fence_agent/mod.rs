@@ -111,7 +111,7 @@ mod params_def {
         AgentState;
         // A variable-length parameter carries no default the schema can
         // hold, so `set_defaults` applies it as a zero-length value. Zero
-        // length therefore means "the graph named none", and the built-in
+        // length therefore means "the graph named none", and the native module
         // binding below stands.
         1, fence_cmd, str, 0 => |s, d, len| {
             let n = if len > CMD_MAX { CMD_MAX } else { len };
